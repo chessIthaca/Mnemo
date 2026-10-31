@@ -207,7 +207,7 @@ fn steps_to_text(steps: Vec<StepInput>) -> Vec<String> {
 /// `\n\n## Kind\nresearch` would re-parse as a real section header — so a
 /// multi-line value must never reach the file verbatim (section injection /
 /// silent truncation, review HIGH 2).
-fn collapse_whitespace(s: &str) -> String {
+pub(crate) fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -220,7 +220,7 @@ fn collapse_whitespace(s: &str) -> String {
 /// leading backslash defuses the marker while keeping the recipe
 /// readable; the escape alters the line's own leading character, so the
 /// parser's trim-before-match cannot bypass it.
-fn escape_section_markers(text: &str) -> String {
+pub(crate) fn escape_section_markers(text: &str) -> String {
     text.lines()
         .map(|line| {
             let trimmed = line.trim_start();
@@ -286,7 +286,7 @@ fn referenced_module_dirs(texts: &[&str]) -> usize {
 /// `check_evidence = false` and runs the rule over the APPENDED text alone, so
 /// a plan accepted before the rule stays updatable). Returns the first
 /// violation, if any.
-fn context_issue(
+pub(crate) fn context_issue(
     context: &str,
     kind: PlanKind,
     detailed_steps: Option<&str>,
@@ -333,7 +333,7 @@ fn context_issue(
 /// checklist); update_plan's Reviewing append window (backlog 37f8631a)
 /// passes false so appended follow-on steps meet the same bar as every
 /// other step. Returns the first violation, if any.
-fn step_issue(steps: &[String], bug_skeleton_exempt: bool) -> Option<String> {
+pub(crate) fn step_issue(steps: &[String], bug_skeleton_exempt: bool) -> Option<String> {
     if bug_skeleton_exempt {
         return None;
     }
@@ -537,7 +537,7 @@ fn validate_plan_resumability(
 /// Format resumability-gate issues into the single actionable error the
 /// tools return — every violation numbered in one message so the retry
 /// fixes all of them at once (the `backlog_add` UX).
-fn resumability_gate_error(prefix: &str, issues: &[String]) -> String {
+pub(crate) fn resumability_gate_error(prefix: &str, issues: &[String]) -> String {
     let numbered = issues
         .iter()
         .enumerate()
@@ -553,7 +553,7 @@ fn resumability_gate_error(prefix: &str, issues: &[String]) -> String {
 /// backlog #38); a non-numeric string fails with an actionable error.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum StepNumber {
+pub(crate) enum StepNumber {
     /// A step number given as a JSON integer.
     Number(u32),
     /// A step number given as a (numeric) string.
@@ -563,7 +563,7 @@ enum StepNumber {
 impl StepNumber {
     /// Parse into the 1-indexed step number, rejecting non-numeric strings
     /// with an actionable message.
-    fn parse(self) -> Result<u32, String> {
+    pub(crate) fn parse(self) -> Result<u32, String> {
         match self {
             StepNumber::Number(n) => Ok(n),
             StepNumber::Text(s) => s
@@ -1929,6 +1929,226 @@ struct FinishArgs {
     regression_test: Option<String>,
 }
 
+/// The `bug_fixing` close gate shared by `finish` and the Mnemo2 plan board:
+/// a recorded regression test that resolves in the code graph (self-freshening
+/// on a miss), plus the landed-design amendment when one was declared. Other
+/// plan kinds pass. Gate notes land in `notes`; `Err` carries the refusal.
+pub(crate) async fn bug_fixing_gate(
+    plan: &crate::memory::plan_format::PlanFile,
+    codegraph: Option<&Arc<crate::codegraph::CodeGraph>>,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    if plan.kind != crate::app::workflow::PlanKind::BugFixing {
+        return Ok(());
+    }
+    let test = plan
+        .regression_test
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(test) = test else {
+        return Err(
+            "bug_fixing plan has no regression test recorded — the verify step \
+             must call update_plan with regression_test before finish".to_string(),
+        );
+    };
+    // (a2) Landed-design gate (backlog e5a84ce9): a feature-scale
+    // fix records landed_design=true — the plan context must then
+    // carry a "Landed design" amendment (the constitution's
+    // documentation expectations: architecture, deviations from
+    // the sketch, measured numbers, invariants). The marker is a
+    // prose paragraph, not a "## " header (the plan-file parser
+    // treats those as section starts).
+    if plan.landed_design {
+        if !plan.context.contains("Landed design") {
+            return Err(
+                "landed_design is set but the plan context carries no \
+                 'Landed design' amendment — update_plan append a paragraph \
+                 starting \"Landed design —\" (architecture, deviations from \
+                 the sketch, measured numbers, invariants to preserve) before \
+                 finish (agent.md 'Documentation expectations')".to_string(),
+            );
+        }
+        notes.push(
+            "landed_design recorded with its context amendment — at finish, \
+             also write a SPEC memory (architecture + invariants) and amend \
+             the BUG record with the landed outcome (agent.md 'Documentation \
+             expectations')"
+                .to_string(),
+        );
+    }
+    // (b) Code-graph gate: the recorded test name must resolve to
+    // a real symbol. Skipped (with a note) when no graph is wired.
+    if let Some(graph) = codegraph {
+        // Resolve against the last-indexed snapshot; on a miss,
+        // self-freshen before failing: one incremental index pass
+        // (content-hash based — cheap when the graph is fresh)
+        // and one retry. A regression test written moments ago
+        // (no file watcher running, or finish racing the
+        // watcher's debounce) must not block on a stale index
+        // (backlog #91 — no more manual reindex dance). A
+        // still-miss escalates to a forced re-index below
+        // (backlog 648e0ad5 — the incremental pass can no-op on
+        // fresh meta rows with missing symbol rows).
+        let found_in_snapshot = graph
+            .view()
+            .ok()
+            .map(|view| !view.resolve(test).is_empty())
+            .unwrap_or(false);
+        let (mut found, refreshed) = if found_in_snapshot {
+            (true, false)
+        } else {
+            let g = graph.clone();
+            // No lock is held across this await (the view
+            // snapshot above was dropped; a reindex failure or
+            // panic fails closed below).
+            let reindexed = tokio::task::spawn_blocking(move || g.index(None))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .is_some();
+            let found_after = reindexed
+                && graph
+                    .view()
+                    .ok()
+                    .map(|view| !view.resolve(test).is_empty())
+                    .unwrap_or(false);
+            (found_after, found_after)
+        };
+        if !found {
+            // (backlog 648e0ad5) The incremental pass above can
+            // NO-OP: it is mtime/hash-based, so a DB whose meta
+            // rows are fresh but whose SYMBOL rows are stale or
+            // missing (a partial write, schema drift, or a prior
+            // best-effort skip) never re-parses the file — the
+            // retry misses and the gate would error on a symbol
+            // that exists on disk (live case 2027-01-08:
+            // 'checkFillContract'), sending the agent after a
+            // phantom rename. Escalate to a GUARANTEED re-index:
+            // force a re-parse of every source file whose
+            // on-disk content contains the test name, then
+            // re-resolve once more. Only a symbol absent after
+            // THAT errors — with a message naming the case.
+            let g = graph.clone();
+            let t = test.to_string();
+            let forced = tokio::task::spawn_blocking(move || {
+                g.reindex_files_containing(&t)
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+            match forced {
+                Some(outcome) => {
+                    found = graph
+                        .view()
+                        .ok()
+                        .map(|view| !view.resolve(test).is_empty())
+                        .unwrap_or(false);
+                    if !found {
+                        if outcome.matched == 0
+                            && outcome.matched_unparsed == 0
+                        {
+                            // The name is absent from every code
+                            // file on disk — the wrong-test-name
+                            // case, verified after the forced
+                            // re-index.
+                            return Err(format!(
+                                "regression test symbol '{test}' not found in \
+                                 the code graph and no code file on disk \
+                                 contains the name (verified after a forced \
+                                 re-index) — the verify step must record the \
+                                 actual test function name"
+                            ));
+                        }
+                        if outcome.matched_unparsed > 0 {
+                            // The name is on disk in code file(s)
+                            // whose language no grammar parses
+                            // — the symbol can never resolve in
+                            // the graph. Word-bounded disk
+                            // containment is the evidence the
+                            // recorded name is real (a
+                            // hallucinated name appears in no
+                            // code file; a comment mention in
+                            // a non-indexed language can still
+                            // pass — the transparent note
+                            // carries that residual): pass
+                            // instead of erroring on a test
+                            // that exists and is runnable.
+                            found = true;
+                            notes.push(format!(
+                                "regression test symbol '{test}' not \
+                                 graph-indexed — found on disk in {} code \
+                                 file(s) in languages the graph does not \
+                                 parse; symbol check satisfied by disk \
+                                 containment",
+                                outcome.matched_unparsed
+                            ));
+                        } else if outcome.reparsed == 0 {
+                            // (review LOW-1, 2026-09-08) Files
+                            // contain the name but every re-parse
+                            // failed (a store write failure) —
+                            // inconclusive, NOT absent: erroring
+                            // "no source file contains the name"
+                            // here would steer the agent to the
+                            // phantom rename this fix exists to
+                            // prevent.
+                            return Err(format!(
+                                "code graph could not be refreshed to verify \
+                                 the regression test symbol '{test}' — the \
+                                 symbol check is inconclusive ({} file(s) \
+                                 contain the name but their re-parse failed); \
+                                 re-run finish, do not rename the test",
+                                outcome.matched
+                            ));
+                        } else {
+                            return Err(format!(
+                                "regression test symbol '{test}' not found in \
+                                 the code graph even after a forced re-index \
+                                 of {} file(s) containing the name{} — the verify \
+                                 step must record the actual test function name",
+                                outcome.reparsed,
+                                if outcome.capped {
+                                    format!(
+                                        " (re-parse budget capped — {} of {} \
+                                         matching file(s) re-parsed; the absence \
+                                         verdict is inconclusive for the rest)",
+                                        outcome.reparsed, outcome.matched
+                                    )
+                                } else {
+                                    String::new()
+                                }
+                            ));
+                        }
+                    }
+                    if found && outcome.reparsed > 0 {
+                        notes.push(format!(
+                            "code graph symbol rows were stale — {} \
+                             file(s) force re-parsed before the symbol check",
+                            outcome.reparsed
+                        ));
+                    }
+                }
+                None => {
+                    return Err(format!(
+                        "code graph could not be refreshed to verify the \
+                         regression test symbol '{test}' — the symbol check is \
+                         inconclusive (the forced re-index failed); re-run \
+                         finish, do not rename the test"
+                    ));
+                }
+            }
+        }
+        if refreshed {
+            notes.push(
+                "code graph was stale — refreshed before the symbol check".into(),
+            );
+        }
+    } else {
+        notes.push("code graph unwired — regression-test symbol check skipped".into());
+    }
+    Ok(())
+}
+
 /// The parsed review verdict — the report's first non-blank line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -2183,212 +2403,8 @@ impl Tool for FinishTool {
         // it (the fix is unverifiable).
         let mut notes: Vec<String> = Vec::new();
         if let Some(plan) = &plan {
-            if plan.kind == crate::app::workflow::PlanKind::BugFixing {
-                let test = plan
-                    .regression_test
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let Some(test) = test else {
-                    return ToolResult::error(
-                        "bug_fixing plan has no regression test recorded — the verify step \
-                         must call update_plan with regression_test before finish",
-                    );
-                };
-                // (a2) Landed-design gate (backlog e5a84ce9): a feature-scale
-                // fix records landed_design=true — the plan context must then
-                // carry a "Landed design" amendment (the constitution's
-                // documentation expectations: architecture, deviations from
-                // the sketch, measured numbers, invariants). The marker is a
-                // prose paragraph, not a "## " header (the plan-file parser
-                // treats those as section starts).
-                if plan.landed_design {
-                    if !plan.context.contains("Landed design") {
-                        return ToolResult::error(
-                            "landed_design is set but the plan context carries no \
-                             'Landed design' amendment — update_plan append a paragraph \
-                             starting \"Landed design —\" (architecture, deviations from \
-                             the sketch, measured numbers, invariants to preserve) before \
-                             finish (agent.md 'Documentation expectations')",
-                        );
-                    }
-                    notes.push(
-                        "landed_design recorded with its context amendment — at finish, \
-                         also write a SPEC memory (architecture + invariants) and amend \
-                         the BUG record with the landed outcome (agent.md 'Documentation \
-                         expectations')"
-                            .to_string(),
-                    );
-                }
-                // (b) Code-graph gate: the recorded test name must resolve to
-                // a real symbol. Skipped (with a note) when no graph is wired.
-                if let Some(graph) = &self.codegraph {
-                    // Resolve against the last-indexed snapshot; on a miss,
-                    // self-freshen before failing: one incremental index pass
-                    // (content-hash based — cheap when the graph is fresh)
-                    // and one retry. A regression test written moments ago
-                    // (no file watcher running, or finish racing the
-                    // watcher's debounce) must not block on a stale index
-                    // (backlog #91 — no more manual reindex dance). A
-                    // still-miss escalates to a forced re-index below
-                    // (backlog 648e0ad5 — the incremental pass can no-op on
-                    // fresh meta rows with missing symbol rows).
-                    let found_in_snapshot = graph
-                        .view()
-                        .ok()
-                        .map(|view| !view.resolve(test).is_empty())
-                        .unwrap_or(false);
-                    let (mut found, refreshed) = if found_in_snapshot {
-                        (true, false)
-                    } else {
-                        let g = graph.clone();
-                        // No lock is held across this await (the view
-                        // snapshot above was dropped; a reindex failure or
-                        // panic fails closed below).
-                        let reindexed = tokio::task::spawn_blocking(move || g.index(None))
-                            .await
-                            .ok()
-                            .and_then(|r| r.ok())
-                            .is_some();
-                        let found_after = reindexed
-                            && graph
-                                .view()
-                                .ok()
-                                .map(|view| !view.resolve(test).is_empty())
-                                .unwrap_or(false);
-                        (found_after, found_after)
-                    };
-                    if !found {
-                        // (backlog 648e0ad5) The incremental pass above can
-                        // NO-OP: it is mtime/hash-based, so a DB whose meta
-                        // rows are fresh but whose SYMBOL rows are stale or
-                        // missing (a partial write, schema drift, or a prior
-                        // best-effort skip) never re-parses the file — the
-                        // retry misses and the gate would error on a symbol
-                        // that exists on disk (live case 2027-01-08:
-                        // 'checkFillContract'), sending the agent after a
-                        // phantom rename. Escalate to a GUARANTEED re-index:
-                        // force a re-parse of every source file whose
-                        // on-disk content contains the test name, then
-                        // re-resolve once more. Only a symbol absent after
-                        // THAT errors — with a message naming the case.
-                        let g = graph.clone();
-                        let t = test.to_string();
-                        let forced = tokio::task::spawn_blocking(move || {
-                            g.reindex_files_containing(&t)
-                        })
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok());
-                        match forced {
-                            Some(outcome) => {
-                                found = graph
-                                    .view()
-                                    .ok()
-                                    .map(|view| !view.resolve(test).is_empty())
-                                    .unwrap_or(false);
-                                if !found {
-                                    if outcome.matched == 0
-                                        && outcome.matched_unparsed == 0
-                                    {
-                                        // The name is absent from every code
-                                        // file on disk — the wrong-test-name
-                                        // case, verified after the forced
-                                        // re-index.
-                                        return ToolResult::error(format!(
-                                            "regression test symbol '{test}' not found in \
-                                             the code graph and no code file on disk \
-                                             contains the name (verified after a forced \
-                                             re-index) — the verify step must record the \
-                                             actual test function name"
-                                        ));
-                                    }
-                                    if outcome.matched_unparsed > 0 {
-                                        // The name is on disk in code file(s)
-                                        // whose language no grammar parses
-                                        // — the symbol can never resolve in
-                                        // the graph. Word-bounded disk
-                                        // containment is the evidence the
-                                        // recorded name is real (a
-                                        // hallucinated name appears in no
-                                        // code file; a comment mention in
-                                        // a non-indexed language can still
-                                        // pass — the transparent note
-                                        // carries that residual): pass
-                                        // instead of erroring on a test
-                                        // that exists and is runnable.
-                                        found = true;
-                                        notes.push(format!(
-                                            "regression test symbol '{test}' not \
-                                             graph-indexed — found on disk in {} code \
-                                             file(s) in languages the graph does not \
-                                             parse; symbol check satisfied by disk \
-                                             containment",
-                                            outcome.matched_unparsed
-                                        ));
-                                    } else if outcome.reparsed == 0 {
-                                        // (review LOW-1, 2026-09-08) Files
-                                        // contain the name but every re-parse
-                                        // failed (a store write failure) —
-                                        // inconclusive, NOT absent: erroring
-                                        // "no source file contains the name"
-                                        // here would steer the agent to the
-                                        // phantom rename this fix exists to
-                                        // prevent.
-                                        return ToolResult::error(format!(
-                                            "code graph could not be refreshed to verify \
-                                             the regression test symbol '{test}' — the \
-                                             symbol check is inconclusive ({} file(s) \
-                                             contain the name but their re-parse failed); \
-                                             re-run finish, do not rename the test",
-                                            outcome.matched
-                                        ));
-                                    } else {
-                                        return ToolResult::error(format!(
-                                            "regression test symbol '{test}' not found in \
-                                             the code graph even after a forced re-index \
-                                             of {} file(s) containing the name{} — the verify \
-                                             step must record the actual test function name",
-                                            outcome.reparsed,
-                                            if outcome.capped {
-                                                format!(
-                                                    " (re-parse budget capped — {} of {} \
-                                                     matching file(s) re-parsed; the absence \
-                                                     verdict is inconclusive for the rest)",
-                                                    outcome.reparsed, outcome.matched
-                                                )
-                                            } else {
-                                                String::new()
-                                            }
-                                        ));
-                                    }
-                                }
-                                if found && outcome.reparsed > 0 {
-                                    notes.push(format!(
-                                        "code graph symbol rows were stale — {} \
-                                         file(s) force re-parsed before the symbol check",
-                                        outcome.reparsed
-                                    ));
-                                }
-                            }
-                            None => {
-                                return ToolResult::error(format!(
-                                    "code graph could not be refreshed to verify the \
-                                     regression test symbol '{test}' — the symbol check is \
-                                     inconclusive (the forced re-index failed); re-run \
-                                     finish, do not rename the test"
-                                ));
-                            }
-                        }
-                    }
-                    if refreshed {
-                        notes.push(
-                            "code graph was stale — refreshed before the symbol check".into(),
-                        );
-                    }
-                } else {
-                    notes.push("code graph unwired — regression-test symbol check skipped".into());
-                }
+            if let Err(message) = bug_fixing_gate(plan, self.codegraph.as_ref(), &mut notes).await {
+                return ToolResult::error(message);
             }
         }
 

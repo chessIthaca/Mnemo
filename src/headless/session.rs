@@ -28,6 +28,11 @@ use crate::runtime::channels::{
 };
 use crate::runtime::AgentCommand;
 
+/// Pending responders by interaction id, each tagged with the agent whose
+/// event raised it — the engine is shared, so a session's snapshot reports
+/// only its own (or its spawned descendants') interactions.
+pub(crate) type PendingMap<T> = Mutex<HashMap<String, (AgentId, oneshot::Sender<T>)>>;
+
 /// Shared engine state the sessions + the pump hold: the host core, the
 /// live-session registry (the closed check), and the pending responder
 /// maps (the pump stashes, `Approve`/`Answer` resolve).
@@ -37,15 +42,15 @@ pub(crate) struct EngineInner {
     /// Live sessions (SessionId → the agent id).
     pub(crate) sessions: Mutex<HashMap<SessionId, AgentId>>,
     /// Approval responders by request id.
-    pub(crate) pending_approvals: Mutex<HashMap<String, oneshot::Sender<Approval>>>,
+    pub(crate) pending_approvals: PendingMap<Approval>,
     /// Question responders by question id.
-    pub(crate) pending_questions: Mutex<HashMap<String, oneshot::Sender<UserAnswer>>>,
+    pub(crate) pending_questions: PendingMap<UserAnswer>,
     /// Host-tool outcome responders by call id (3c/G2) — the pump stashes
     /// them; `SessionCommand::HostToolResult` resolves.
-    pub(crate) pending_host_tools: Mutex<HashMap<String, oneshot::Sender<HostToolOutcome>>>,
+    pub(crate) pending_host_tools: PendingMap<HostToolOutcome>,
     /// Policy-hook answer responders by hook id (3c/G6 tier 3) — the pump
     /// stashes them; `SessionCommand::PolicyAnswer` resolves.
-    pub(crate) pending_hooks: Mutex<HashMap<String, oneshot::Sender<PolicyAnswer>>>,
+    pub(crate) pending_hooks: PendingMap<PolicyAnswer>,
     /// Engine-registered Rust custom tools (3c/G2, §5.9.2) — the Host
     /// group, joined into every subsequent spawn's registry (in-process
     /// execution like any kernel tool — NOT a spec-based host tool; no
@@ -74,6 +79,11 @@ pub(crate) struct EngineInner {
     /// like `parked` (the pump is the single writer); `std::sync` —
     /// the fold is sync, so `stats()` never awaits.
     pub(crate) tallies: std::sync::Mutex<HashMap<AgentId, SessionStats>>,
+    /// Whether worktree-less sessions share the project's main plans dir
+    /// (`<state_dir>/plans`) instead of a private `agents/<id>` one. Off by
+    /// default; a host opts in with `Engine::use_project_plans`. Worktree-bound
+    /// sessions always keep their own plans dir inside their checkout.
+    pub(crate) shared_plans: std::sync::atomic::AtomicBool,
 }
 
 /// §5.3 :350-354 — the constant answer a zero-subscriber question gets
@@ -159,7 +169,7 @@ pub(crate) async fn pump_task(
                     .pending_approvals
                     .lock()
                     .await
-                    .insert(tool_call_id.clone(), responder);
+                    .insert(tool_call_id.clone(), (agent, responder));
             }
         }
         // The question responder — zero subscribers means the constant
@@ -176,7 +186,7 @@ pub(crate) async fn pump_task(
                     .pending_questions
                     .lock()
                     .await
-                    .insert(question_id.clone(), responder);
+                    .insert(question_id.clone(), (agent, responder));
             }
         }
         // Stash the host-tool responder for SessionCommand::HostToolResult
@@ -189,7 +199,7 @@ pub(crate) async fn pump_task(
                     .pending_host_tools
                     .lock()
                     .await
-                    .insert(call_id.clone(), responder);
+                    .insert(call_id.clone(), (agent, responder));
             }
         }
         // Stash the policy-hook responder for SessionCommand::PolicyAnswer
@@ -201,7 +211,7 @@ pub(crate) async fn pump_task(
                     .pending_hooks
                     .lock()
                     .await
-                    .insert(hook_id.clone(), responder);
+                    .insert(hook_id.clone(), (agent, responder));
             }
         }
         // Best-effort broadcast: zero subscribers → the event drops.
@@ -276,7 +286,13 @@ impl AgentSession {
                 request_id,
                 decision,
             } => {
-                let responder = self.inner.pending_approvals.lock().await.remove(&request_id);
+                let responder = self
+                    .inner
+                    .pending_approvals
+                    .lock()
+                    .await
+                    .remove(&request_id)
+                    .map(|(_, responder)| responder);
                 match responder {
                     Some(responder) => responder.send(decision).map_err(|_| {
                         EngineError::unknown_request("the approval already resolved")
@@ -290,7 +306,13 @@ impl AgentSession {
                 question_id,
                 answer,
             } => {
-                let responder = self.inner.pending_questions.lock().await.remove(&question_id);
+                let responder = self
+                    .inner
+                    .pending_questions
+                    .lock()
+                    .await
+                    .remove(&question_id)
+                    .map(|(_, responder)| responder);
                 match responder {
                     Some(responder) => responder.send(answer).map_err(|_| {
                         EngineError::unknown_request("the question already resolved")
@@ -317,7 +339,13 @@ impl AgentSession {
                         )))
                     }
                 };
-                let responder = self.inner.pending_host_tools.lock().await.remove(&call_id);
+                let responder = self
+                    .inner
+                    .pending_host_tools
+                    .lock()
+                    .await
+                    .remove(&call_id)
+                    .map(|(_, responder)| responder);
                 match responder {
                     Some(responder) => responder.send(outcome).map_err(|_| {
                         EngineError::unknown_request("the host-tool call already resolved")
@@ -328,7 +356,13 @@ impl AgentSession {
                 }
             }
             SessionCommand::PolicyAnswer { hook_id, answer } => {
-                let responder = self.inner.pending_hooks.lock().await.remove(&hook_id);
+                let responder = self
+                    .inner
+                    .pending_hooks
+                    .lock()
+                    .await
+                    .remove(&hook_id)
+                    .map(|(_, responder)| responder);
                 match responder {
                     Some(responder) => responder.send(answer).map_err(|_| {
                         EngineError::unknown_request("the policy hook already resolved")
@@ -410,32 +444,19 @@ impl AgentSession {
         // The four pending maps in a fixed order (approval → question →
         // host tool → policy hook): only one interaction kind is normally
         // live at a time, and the snapshot reports the first it finds.
-        let pending = {
-            let approvals = self.inner.pending_approvals.lock().await;
-            if let Some(id) = approvals.keys().next() {
-                Some(PendingInteraction::Approval {
-                    request_id: id.clone(),
-                })
-            } else {
-                let questions = self.inner.pending_questions.lock().await;
-                if let Some(id) = questions.keys().next() {
-                    Some(PendingInteraction::Question {
-                        question_id: id.clone(),
-                    })
-                } else {
-                    let host_tools = self.inner.pending_host_tools.lock().await;
-                    if let Some(id) = host_tools.keys().next() {
-                        Some(PendingInteraction::HostToolCall {
-                            call_id: id.clone(),
-                        })
-                    } else {
-                        let hooks = self.inner.pending_hooks.lock().await;
-                        hooks.keys().next().map(|id| PendingInteraction::PolicyHook {
-                            hook_id: id.clone(),
-                        })
-                    }
-                }
-            }
+        // The maps are engine-wide, so only this session's own (or its
+        // spawned descendants') entries count — a sibling session on a
+        // shared engine never shows up as this session's pending.
+        let pending = if let Some(id) = self.first_owned(&self.inner.pending_approvals).await {
+            Some(PendingInteraction::Approval { request_id: id })
+        } else if let Some(id) = self.first_owned(&self.inner.pending_questions).await {
+            Some(PendingInteraction::Question { question_id: id })
+        } else if let Some(id) = self.first_owned(&self.inner.pending_host_tools).await {
+            Some(PendingInteraction::HostToolCall { call_id: id })
+        } else {
+            self.first_owned(&self.inner.pending_hooks)
+                .await
+                .map(|id| PendingInteraction::PolicyHook { hook_id: id })
         };
         Ok(SessionSnapshot {
             transcript,
@@ -444,6 +465,43 @@ impl AgentSession {
             max_tokens,
             pending,
         })
+    }
+
+    /// The id of the first entry in `map` raised by this session's agent
+    /// or one of its spawned descendants (whose interactions only this
+    /// session's host can answer — children get no session handle).
+    async fn first_owned<T>(&self, map: &PendingMap<T>) -> Option<String> {
+        let candidates: Vec<(String, AgentId)> = map
+            .lock()
+            .await
+            .iter()
+            .map(|(id, (agent, _))| (id.clone(), *agent))
+            .collect();
+        for (id, agent) in candidates {
+            if self.owns_agent(agent).await {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Whether `agent` is this session's agent or a descendant of it (a
+    /// walk up the manager's parent chain, bounded against a malformed
+    /// cycle).
+    async fn owns_agent(&self, agent: AgentId) -> bool {
+        if agent == self.agent {
+            return true;
+        }
+        let manager = self.inner.host.manager.lock().await;
+        let mut current = agent;
+        for _ in 0..64 {
+            match manager.parent_id(current) {
+                Some(parent) if parent == self.agent => return true,
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// §5.7's live session stats — the running totals the pump folded

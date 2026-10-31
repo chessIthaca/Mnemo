@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ArrowRight, FolderOpen, GitBranch, Plus } from "@lucide/svelte";
+  import { ArrowRight, FolderOpen, GitBranch, Plus, Settings } from "@lucide/svelte";
   import { actions, app } from "../lib/store";
   import ModelBadge from "./ModelBadge.svelte";
   import Sheet from "./Sheet.svelte";
+  import SettingsDialog from "./SettingsDialog.svelte";
 
   let projectName = $state("");
+  let settingsOpen = $state(false);
   const cleanupProject = $derived($app.projects.find((project) => project.id === $app.cleanupProjectId) ?? null);
 
   onMount(() => {
@@ -21,7 +23,10 @@
 <main class="start-screen">
   <header class="start-nav">
     <a class="brand" href="/" aria-label="Mnemo2 home"><span class="brand-mark">M</span><span>Mnemo2</span></a>
-    <span class="phase-label">LEAD + TEAM</span>
+    <div class="start-nav-end">
+      <span class="phase-label">LEAD + TEAM</span>
+      <button class="icon-button" aria-label="Settings" onclick={() => (settingsOpen = true)}><Settings size={15} /></button>
+    </div>
   </header>
 
   <section class="start-main">
@@ -93,12 +98,15 @@
   </div>
 </Sheet>
 
+<SettingsDialog open={settingsOpen} onclose={() => (settingsOpen = false)} />
+
 <style>
   .start-screen { min-height: 100vh; min-height: 100dvh; overflow-y: auto; background: var(--canvas); }
   .start-nav { display: flex; align-items: center; justify-content: space-between; width: min(100%, 860px); margin: 0 auto; padding: 24px 32px; }
   .brand { display: inline-flex; align-items: center; gap: 9px; color: var(--ink); font-size: 12px; font-weight: 680; text-decoration: none; }
   .brand-mark, .project-monogram { display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--accent-strong); font-family: var(--font-prose); }
   .brand-mark { width: 28px; height: 28px; font-size: 17px; }
+  .start-nav-end { display: flex; align-items: center; gap: 14px; }
   .phase-label { color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: 0.13em; }
   .start-main { width: min(100%, 860px); margin: 0 auto; padding: 48px 32px 80px; }
   .picker-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 14px; }

@@ -1,9 +1,14 @@
 <script lang="ts">
   import { CheckCircle2, ChevronRight, LoaderCircle, XCircle } from "@lucide/svelte";
-  import { liveTailPreview, toolErrorSummary } from "../../../frontend/src/lib/toolCardPaths";
+  import { untrack } from "svelte";
+  import { toolErrorSummary } from "../../../frontend/src/lib/toolCardPaths";
+  import { parseAnsi, stripAnsi, terminalTail } from "../lib/ansi";
+  import { app } from "../lib/store";
+  import { prettyArguments } from "../lib/toolArguments";
   import { toolSummary } from "../lib/toolSummary";
   import type { LeadEntry } from "../lib/types";
   import ElapsedTime from "./ElapsedTime.svelte";
+  import TerminalText from "./TerminalText.svelte";
 
   type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
 
@@ -15,18 +20,25 @@
   const statusLabel = $derived(
     status === "running" ? "Running" : status === "completed" ? "Completed" : "Failed",
   );
-  const summary = $derived(toolSummary(entry.toolName, entry.arguments));
-  const errorSummary = $derived(
-    entry.result && !entry.result.success ? toolErrorSummary(entry.result.output) : "",
+  const summary = $derived(
+    toolSummary(entry.toolName, entry.arguments, (workerId) =>
+      $app.workers.find((worker) => worker.id === workerId)?.name ?? workerId,
+    ),
   );
-  const livePreview = $derived(liveTailPreview(entry.liveOutput));
-  const argumentsPreview = $derived.by(() => {
-    try {
-      return JSON.stringify(JSON.parse(entry.arguments), null, 2);
-    } catch {
-      return entry.arguments;
-    }
+  const errorSummary = $derived(
+    entry.result && !entry.result.success ? toolErrorSummary(stripAnsi(entry.result.output)) : "",
+  );
+  /** The live preview's rows: it grows with the output up to this, never shrinks. */
+  const LIVE_ROWS = 5;
+  const liveLines = $derived(terminalTail(entry.liveOutput, LIVE_ROWS));
+  let liveRows = $state(1);
+  $effect(() => {
+    const rows = liveLines.length;
+    untrack(() => {
+      if (rows > liveRows) liveRows = rows;
+    });
   });
+  const argumentsPreview = $derived(prettyArguments(entry.arguments));
 </script>
 
 <article class="tool-card" data-status={status} aria-label={`${summary} — ${statusLabel}`}>
@@ -60,13 +72,13 @@
         {#if entry.result === null && entry.liveOutput}
           <section class="tool-detail-section">
             <h4>Live output</h4>
-            <pre>{entry.liveOutput}</pre>
+            <pre><TerminalText lines={parseAnsi(entry.liveOutput)} /></pre>
           </section>
         {/if}
         {#if entry.result && entry.result.output}
           <section class="tool-detail-section">
             <h4>{entry.result.success ? "Result" : "Error"}</h4>
-            <pre>{entry.result.output}</pre>
+            <pre><TerminalText lines={parseAnsi(entry.result.output)} /></pre>
           </section>
         {/if}
       </div>
@@ -74,7 +86,7 @@
   </details>
 
   {#if !expanded && status === "running" && entry.liveOutput}
-    <pre class="tool-live" aria-live="polite">{livePreview}</pre>
+    <pre class="tool-live" aria-live="polite" style:--live-rows={liveRows}><TerminalText lines={liveLines} clip /></pre>
   {/if}
   {#if !expanded && errorSummary}
     <p class="tool-error">{errorSummary}</p>
@@ -106,7 +118,9 @@
   .tool-detail-section h4 { margin: 0 0 5px; color: var(--muted); font-size: 9px; font-weight: 600; }
   .tool-detail-section pre, .tool-live { max-height: 240px; margin: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
   .tool-detail-section pre { padding: 10px 12px; }
-  .tool-live { margin: 4px 0 2px 26px; padding: 6px 10px; }
+  /* A fixed-height window on the newest lines: it grows to LIVE_ROWS as output
+     arrives and never shrinks, so the conversation below does not jump. */
+  .tool-live { box-sizing: content-box; height: calc(var(--live-rows, 1) * 1lh); margin: 4px 0 2px 26px; padding: 6px 10px; overflow: hidden; }
   .tool-error { margin: 4px 0 4px 26px; color: var(--danger); font-size: 11px; line-height: 1.5; }
   .tool-spinner { display: grid; place-items: center; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }

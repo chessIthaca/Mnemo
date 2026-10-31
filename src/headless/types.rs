@@ -102,6 +102,12 @@ pub struct SpawnOptions {
     pub name: Option<String>,
     /// A forced model — an "endpoint/model" string; `None` = routing.
     pub model: Option<String>,
+    /// The forced model's reasoning effort (`"max"`, `"high"`, `"medium"`,
+    /// `"low"`, `"minimal"`, `"off"`); `None` keeps the model's configured
+    /// default. Normalized like the toolbar override: the endpoint's
+    /// support gate and the model's allow-list clamp. Requires `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// A worktree binding (the agent's root override).
     pub worktree: Option<PathBuf>,
     /// A per-session permission override of the engine default (§5.4).
@@ -232,6 +238,16 @@ pub struct SessionEvent {
     /// when `None` (the pre-3b.5 JSON shape is unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rates: Option<crate::headless::stats::UsageRates>,
+}
+
+impl SessionEvent {
+    /// Whether `session`'s own agent emitted this event. The engine's bus
+    /// is shared: every subscription sees every session's events, tagged,
+    /// so a host driving several sessions on one engine filters with this
+    /// (the same check `run_to_completion` makes) before acting on one.
+    pub fn is_from(&self, session: SessionId) -> bool {
+        self.agent == session.0
+    }
 }
 
 /// The receive error for [`EventReceiver::recv`] (§5.3 :341).

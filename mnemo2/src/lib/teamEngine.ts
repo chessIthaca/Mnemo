@@ -8,6 +8,7 @@ import type {
   TeamReviewEvidence,
   TeamSnapshot,
   TeamWorkerRecord,
+  WorkerDeletionPreview,
 } from "./teamState";
 
 /** The channel emitted by the native team runtime. */
@@ -21,12 +22,22 @@ export interface TeamTransportBindings {
 /** The frontend's typed view of the native team commands. */
 export interface TeamTransport {
   snapshot(): Promise<TeamSnapshot>;
-  dispatch(brief: string, model?: string | null, workerId?: string | null): Promise<TeamWorkerRecord>;
+  dispatch(
+    brief: string,
+    planId: string,
+    /** 1-based board step. */
+    step: number,
+    model?: string | null,
+    workerId?: string | null,
+    reasoningEffort?: string | null,
+  ): Promise<TeamWorkerRecord>;
   message(workerId: string, text: string): Promise<TeamWorkerRecord>;
   pause(workerId: string): Promise<TeamWorkerRecord>;
   interrupt(workerId: string): Promise<TeamWorkerRecord>;
   stop(workerId: string): Promise<TeamWorkerRecord>;
   resume(workerId: string): Promise<TeamWorkerRecord>;
+  /** Move a worker to another model (null effort = the model's default). */
+  setModel(workerId: string, model: string, reasoningEffort: string | null): Promise<TeamWorkerRecord>;
   compact(workerId: string): Promise<TeamWorkerRecord>;
   review(
     workerId: string,
@@ -59,6 +70,8 @@ export interface TeamTransport {
   revertMerge(workerId: string): Promise<TeamWorkerRecord>;
   stopAll(): Promise<void>;
   setSlots(slots: number): Promise<TeamSnapshot>;
+  deletePreview(workerIds: string[]): Promise<WorkerDeletionPreview[]>;
+  deleteWorkers(workerIds: string[], discardWork: boolean): Promise<TeamSnapshot>;
   messages(): Promise<TeamMessage[]>;
   onEvent(handler: (event: TeamEvent) => void): Promise<UnlistenFn>;
 }
@@ -69,10 +82,13 @@ export function createTauriTeamTransport(
 ): TeamTransport {
   return {
     snapshot: () => bindings.invoke<TeamSnapshot>("team_snapshot"),
-    dispatch: (brief, model, workerId) =>
+    dispatch: (brief, planId, step, model, workerId, reasoningEffort) =>
       bindings.invoke<TeamWorkerRecord>("team_dispatch", {
         brief,
+        planId,
+        step,
         model: model ?? null,
+        reasoningEffort: reasoningEffort ?? null,
         workerId: workerId ?? null,
       }),
     message: (workerId, text) =>
@@ -85,6 +101,8 @@ export function createTauriTeamTransport(
       bindings.invoke<TeamWorkerRecord>("team_stop", { workerId }),
     resume: (workerId) =>
       bindings.invoke<TeamWorkerRecord>("team_resume", { workerId }),
+    setModel: (workerId, model, reasoningEffort) =>
+      bindings.invoke<TeamWorkerRecord>("team_set_model", { workerId, model, reasoningEffort }),
     compact: (workerId) =>
       bindings.invoke<TeamWorkerRecord>("team_compact", { workerId }),
     review: (workerId, summary, findings, evidence) =>
@@ -125,6 +143,10 @@ export function createTauriTeamTransport(
       bindings.invoke<TeamWorkerRecord>("team_revert_merge", { workerId }),
     stopAll: () => bindings.invoke<void>("team_stop_all"),
     setSlots: (slots) => bindings.invoke<TeamSnapshot>("team_set_slots", { slots }),
+    deletePreview: (workerIds) =>
+      bindings.invoke<WorkerDeletionPreview[]>("team_delete_preview", { workerIds }),
+    deleteWorkers: (workerIds, discardWork) =>
+      bindings.invoke<TeamSnapshot>("team_delete", { workerIds, discardWork }),
     messages: () => bindings.invoke<TeamMessage[]>("team_messages"),
     onEvent: (handler) =>
       bindings.listen<TeamEvent>(TEAM_EVENT_CHANNEL, (event) =>

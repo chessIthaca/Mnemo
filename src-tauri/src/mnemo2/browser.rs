@@ -31,10 +31,25 @@ struct BrowserState {
     webview: Option<Webview>,
     rect: BrowserRect,
     visible: bool,
+    /// The sequence of the newest visibility request applied so far.
+    visible_seq: u64,
     overlay_depth: u32,
 }
 
 impl BrowserState {
+    /// Apply a sequenced visibility request; an older one that arrives late
+    /// (async commands run concurrently) is ignored. Returns whether it applied.
+    fn request_visible(&mut self, visible: bool, seq: Option<u64>) -> bool {
+        if let Some(seq) = seq {
+            if seq < self.visible_seq {
+                return false;
+            }
+            self.visible_seq = seq;
+        }
+        self.visible = visible;
+        true
+    }
+
     fn should_show(&self) -> bool {
         self.visible
             && self.overlay_depth == 0
@@ -370,14 +385,21 @@ pub async fn browser_set_rect(
 }
 
 /// Keep the native HWND behind every other tab, drawer, or screenshot preview.
+/// `seq` orders the requests: the native pane always reflects the newest one,
+/// even when an older "show" is processed after a newer "hide".
 #[tauri::command]
 pub async fn browser_set_visible(
     state: State<'_, BrowserController>,
     visible: bool,
+    seq: Option<u64>,
 ) -> Result<(), String> {
     let mut browser = state.state.lock().await;
+    if !browser.request_visible(visible, seq) {
+        return Ok(());
+    }
+    // Hide first: a layout heal must never be the reason a hide is skipped.
+    browser.apply_visibility();
     heal_rect(&state, &mut browser)?;
-    browser.visible = visible;
     browser.apply_visibility();
     Ok(())
 }
@@ -462,6 +484,31 @@ mod tests {
         assert!(!state.should_show());
         state.visible = true;
         state.rect.width = 0;
+        assert!(!state.should_show());
+    }
+
+    /// Regression: show/hide are separate async commands with no ordering, so
+    /// a "show" sent before a tab switch could be applied after the switch's
+    /// "hide" and leave the native pane covering the Plan or Diff tab.
+    #[test]
+    fn a_late_older_visibility_request_never_overrides_a_newer_one() {
+        let mut state = BrowserState {
+            rect: BrowserRect {
+                x: 1,
+                y: 2,
+                width: 300,
+                height: 400,
+            },
+            ..Default::default()
+        };
+        assert!(state.request_visible(true, Some(1)));
+        assert!(state.request_visible(false, Some(2)));
+        assert!(!state.request_visible(true, Some(1)), "the stale show is ignored");
+        assert!(!state.should_show());
+        assert!(state.request_visible(true, Some(3)));
+        assert!(state.should_show());
+        // Unsequenced callers keep the old last-write-wins behavior.
+        assert!(state.request_visible(false, None));
         assert!(!state.should_show());
     }
 

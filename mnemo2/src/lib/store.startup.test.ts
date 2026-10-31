@@ -25,6 +25,9 @@ const team = vi.hoisted(() => ({
   snapshots: 0,
 }));
 
+const board = vi.hoisted(() => ({ subscriptions: 0, snapshots: 0 }));
+const indexing = vi.hoisted(() => ({ subscriptions: 0, snapshots: 0 }));
+
 const NO_OPEN_LEAD = "Mnemo2 has no open lead; call lead_open first";
 
 vi.mock("./leadEngine", () => ({
@@ -54,6 +57,40 @@ vi.mock("./teamEngine", () => ({
     },
   }),
 }));
+
+vi.mock("./boardEngine", () => ({
+  createBoardTransport: () => ({
+    onChanged: async () => {
+      board.subscriptions += 1;
+      if (!team.leadOpen) throw new Error(NO_OPEN_LEAD);
+      return () => {};
+    },
+    snapshot: async () => {
+      board.snapshots += 1;
+      if (!team.leadOpen) throw new Error(NO_OPEN_LEAD);
+      return { plans: [] };
+    },
+  }),
+}));
+
+vi.mock("./indexingEngine", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./indexingEngine")>();
+  return {
+    ...actual,
+    createIndexingTransport: () => ({
+      onChanged: async () => {
+        indexing.subscriptions += 1;
+        if (!team.leadOpen) throw new Error(NO_OPEN_LEAD);
+        return () => {};
+      },
+      snapshot: async () => {
+        indexing.snapshots += 1;
+        if (!team.leadOpen) throw new Error(NO_OPEN_LEAD);
+        return { revision: 1, firstRun: false, code: null, memory: null };
+      },
+    }),
+  };
+});
 
 vi.mock("./projectEngine", () => ({
   createProjectTransport: () => ({
@@ -122,10 +159,14 @@ describe("Mnemo2 project startup order", () => {
     team.leadOpen = false;
     team.subscriptions = 0;
     team.snapshots = 0;
+    board.subscriptions = 0;
+    board.snapshots = 0;
+    indexing.subscriptions = 0;
+    indexing.snapshots = 0;
     app.set(fixtureState());
   });
 
-  it("project_open_waits_for_lead_before_dependent_ipc", async () => {
+  async function project_open_waits_for_lead_before_dependent_ipc(): Promise<void> {
     let resolveOpen!: () => void;
     const openGate = new Promise<void>((resolve) => {
       resolveOpen = resolve;
@@ -136,10 +177,14 @@ describe("Mnemo2 project startup order", () => {
     const opening = actions.openProject("mnemo");
     await vi.waitFor(() => expect(transport.open).toHaveBeenCalled());
 
-    // lead_open is still in flight: no dependent team IPC may have started.
+    // lead_open is still in flight: no dependent IPC may have started.
     expect(get(app).leadRuntime.status).toBe("opening");
     expect(team.subscriptions).toBe(0);
     expect(team.snapshots).toBe(0);
+    expect(board.subscriptions).toBe(0);
+    expect(board.snapshots).toBe(0);
+    expect(indexing.subscriptions).toBe(0);
+    expect(indexing.snapshots).toBe(0);
     expect(get(app).toast).toBeNull();
 
     team.leadOpen = true;
@@ -149,7 +194,13 @@ describe("Mnemo2 project startup order", () => {
     // Once the lead is open, the dependent startup runs and stays quiet.
     expect(team.subscriptions).toBe(1);
     expect(team.snapshots).toBeGreaterThan(0);
+    expect(board.subscriptions).toBe(1);
+    expect(board.snapshots).toBeGreaterThan(0);
+    expect(indexing.subscriptions).toBe(1);
+    expect(indexing.snapshots).toBeGreaterThan(0);
     expect(get(app).leadRuntime.status).toBe("ready");
     expect(get(app).toast?.message ?? "").not.toMatch(/no open lead/i);
-  });
+  }
+
+  it("project_open_waits_for_lead_before_dependent_ipc", project_open_waits_for_lead_before_dependent_ipc);
 });

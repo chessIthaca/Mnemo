@@ -8,6 +8,7 @@ import type {
   LeadToolResult,
   LeadTranscript,
 } from "./types";
+import { keepActivityCards } from "./teamActivity";
 
 export const TEAM_NOTICE_PREFIX = "[TeamManager notice — not the human] worker_id=";
 
@@ -22,6 +23,7 @@ export function initialLeadRuntime(): LeadRuntimeInfo {
     errorRetrying: false,
     model: null,
     modelId: null,
+    reasoningEffort: null,
     models: [],
     defaultModel: null,
     pending: null,
@@ -132,7 +134,7 @@ function toolArgumentsText(value: unknown): string {
  * when the payload carries no boolean verdict (a transcript tool message with
  * `tool_is_error` absent reads as success).
  */
-function normalizeToolResult(value: unknown, fallbackSuccess = false): LeadToolResult {
+export function normalizeToolResult(value: unknown, fallbackSuccess = false): LeadToolResult {
   const record =
     value && typeof value === "object"
       ? (value as { success?: unknown; output?: unknown; data?: unknown })
@@ -162,6 +164,17 @@ function appendLiveOutputTail(previous: string, text: string): string {
   const kept = joined.slice(-LIVE_OUTPUT_CAP);
   const first = kept.charCodeAt(0);
   return first >= 0xdc00 && first <= 0xdfff ? kept.slice(1) : kept;
+}
+
+/** The interaction id, whichever field the event or snapshot used. */
+function pendingId(pending: LeadPendingInteraction): unknown {
+  return pending.question_id ?? pending.request_id ?? pending.call_id ?? pending.hook_id ?? pending.tool_call_id;
+}
+
+/** Whether two pending records describe the same live interaction. */
+function samePendingInteraction(a: LeadPendingInteraction, b: LeadPendingInteraction): boolean {
+  const id = pendingId(b);
+  return a.kind === b.kind && id !== undefined && pendingId(a) === id;
 }
 
 /** Clear only the approval/host-tool pending state owned by this call. */
@@ -449,10 +462,12 @@ export function applyLeadSnapshot(state: AppState, snapshot: LeadSnapshot): AppS
   });
   const displayedModel = snapshot.model_id ?? snapshot.model;
   const currentPending = state.leadRuntime.pending;
-  const snapshotKind = snapshot.pending?.kind;
+  // Keep the live event's extra fields only for the SAME interaction; a
+  // different id is a different question or approval whose text must not
+  // inherit the previous one's.
   const pending = snapshot.pending
     ? {
-        ...(currentPending && currentPending.kind === snapshotKind
+        ...(currentPending && samePendingInteraction(currentPending, snapshot.pending)
           ? currentPending
           : {}),
         ...snapshot.pending,
@@ -463,7 +478,11 @@ export function applyLeadSnapshot(state: AppState, snapshot: LeadSnapshot): AppS
       ...state,
       plan: snapshot.plan ?? null,
       planItems,
-      leadEntries: leadEntriesFromTranscript(snapshot.transcript, state.leadEntries),
+      // Review/landed cards live outside the transcript: keep them in place.
+      leadEntries: keepActivityCards(
+        leadEntriesFromTranscript(snapshot.transcript, state.leadEntries),
+        state.leadEntries,
+      ),
       leadRuntime: {
         ...state.leadRuntime,
         mode: "native",
@@ -483,6 +502,7 @@ export function applyLeadSnapshot(state: AppState, snapshot: LeadSnapshot): AppS
             : false,
         model: snapshot.model,
         modelId: snapshot.model_id,
+        reasoningEffort: snapshot.reasoning_effort ?? null,
         models: snapshot.models,
         defaultModel: snapshot.default_model,
         pending,

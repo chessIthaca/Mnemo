@@ -4263,9 +4263,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             return Some(path.to_string());
         }
         if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
-            let paths: Vec<&str> = files
+            let paths: Vec<String> = files
                 .iter()
-                .filter_map(|s| s.get("path").and_then(|p| p.as_str()))
+                .filter_map(|s| crate::tool::agent::read_files::parse_spec(s).map(|s| s.path))
                 .collect();
             if !paths.is_empty() {
                 return Some(paths.join(", "));
@@ -4369,7 +4369,10 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             // ExportHistory answers from this (the pinned future holds the
             // live borrow; the snapshot is the conversation as of the
             // request start, missing only the in-flight assistant turn).
-            let history_at_request = messages.to_vec();
+            // The volatile tail + CONTEXT_FOOTER are pushed for THIS request
+            // only and popped after it; an export must not carry them, or a
+            // host that saves/resumes the export makes them permanent history.
+            let history_at_request = prompt::strip_request_scaffolding(messages.to_vec());
             tokio::pin!(complete_fut);
             loop {
                 tokio::select! {

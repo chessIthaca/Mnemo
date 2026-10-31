@@ -37,11 +37,15 @@ use mnemo::{Approval, UserAnswer};
 
 use crate::mnemo2::phase3::{Finding, ReviewEvidence};
 use crate::mnemo2::project::{self, ProjectPreferences, ProjectRecord};
+use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
-    TeamMessage, TeamRuntime, TeamSnapshot, WorkerRecord, TEAM_EVENT_CHANNEL,
+    BoardSignal, BoardSnapshot, TeamMessage, TeamRuntime, TeamSnapshot, WorkerDeletion, WorkerRecord, TEAM_EVENT_CHANNEL,
 };
 use crate::mnemo2::workbench::{self, DiffSnapshot};
+
+/// The Tauri event emitted (no payload) whenever the plan board may have changed.
+pub const BOARD_CHANGED_CHANNEL: &str = "mnemo2://board-changed";
 
 /// The shared Mnemo2 app state: one live lead and its event forwarder.
 #[derive(Default)]
@@ -49,6 +53,8 @@ pub struct Mnemo2State {
     runtime: Mutex<Option<Arc<LeadRuntime>>>,
     forwarder: Mutex<Option<JoinHandle<()>>>,
     team_forwarder: Mutex<Option<JoinHandle<()>>>,
+    board_forwarder: Mutex<Option<JoinHandle<()>>>,
+    indexing_forwarder: Mutex<Option<JoinHandle<()>>>,
     marker_root: Mutex<Option<PathBuf>>,
     preferences: Mutex<Option<(PathBuf, ProjectPreferences)>>,
     notified: Mutex<HashSet<String>>,
@@ -61,6 +67,12 @@ impl Mnemo2State {
             forwarder.abort();
         }
         if let Some(forwarder) = self.team_forwarder.lock().await.take() {
+            forwarder.abort();
+        }
+        if let Some(forwarder) = self.board_forwarder.lock().await.take() {
+            forwarder.abort();
+        }
+        if let Some(forwarder) = self.indexing_forwarder.lock().await.take() {
             forwarder.abort();
         }
         let marker_root = self.marker_root.lock().await.take();
@@ -78,12 +90,21 @@ impl Mnemo2State {
 
 impl Mnemo2State {
     /// Flush the last successfully saved project preferences on native exit.
-    pub async fn save_cached_preferences(&self, app_data: &std::path::Path) -> Result<(), String> {
+    pub async fn save_cached_preferences(&self, owner: &str) -> Result<(), String> {
         let Some((root, preferences)) = self.preferences.lock().await.clone() else {
             return Ok(());
         };
-        project::save_preferences(app_data, &root, &preferences)
+        project::save_preferences(&root, owner, &preferences)
     }
+}
+
+/// This machine's owner id, which stamps and verifies project state folders.
+pub(crate) fn state_owner(app: &AppHandle) -> Result<String, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("could not resolve the Mnemo2 app data dir: {err}"))?;
+    project::machine_owner_id(&app_data)
 }
 
 /// The UI's approval decision on the wire.
@@ -143,7 +164,10 @@ fn notification_for(worker: &WorkerRecord) -> Option<(&'static str, String)> {
         )),
         WorkerStatus::NeedsYou => Some((
             "Worker needs you",
-            format!("{} is waiting for input.", worker.name),
+            match worker.error.as_deref() {
+                Some(reason) => format!("{}: {reason}", worker.name),
+                None => format!("{} is blocked; open it to see why.", worker.name),
+            },
         )),
         WorkerStatus::Failed => Some((
             "Worker failed",
@@ -175,7 +199,6 @@ async fn notify_worker_event(
             | mnemo::SerializableAgentEvent::Error { retrying: false, .. }
             | mnemo::SerializableAgentEvent::ApprovalRequest { .. }
             | mnemo::SerializableAgentEvent::UserQuestion { .. }
-            | mnemo::SerializableAgentEvent::HostToolCall { .. }
     ) {
         return;
     }
@@ -226,11 +249,7 @@ pub async fn project_list(
     app: AppHandle,
     config_dir: Option<String>,
 ) -> Result<Vec<ProjectRecord>, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("could not resolve the Mnemo2 app data dir: {err}"))?;
-    project::list_with_state(config_dir.map(PathBuf::from), &app_data).await
+    project::list_with_state(config_dir.map(PathBuf::from), &state_owner(&app)?).await
 }
 
 /// Create a new project directory on a non-main local Git branch.
@@ -310,11 +329,15 @@ pub async fn project_cleanup(
     if let Some(pid) = attachment.conflict_pid {
         return Err(format!("another Mnemo2 instance (pid {pid}) is using this project"));
     }
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("could not resolve the Mnemo2 app data dir: {err}"))?;
-    let state_dir = project::state_dir(&app_data, &root)?;
+    // Cleanup acts on the worker ledger, so only a verified ledger may steer it.
+    let state_dir = match project::state_owner_checked(&root, &state_owner(&app)?) {
+        Ok(dir) => dir,
+        Err(error) => {
+            project::detach(&root);
+            *state.marker_root.lock().await = None;
+            return Err(error);
+        }
+    };
     let result = crate::mnemo2::team::cleanup_workspace(&root, &state_dir).await;
     project::detach(&root);
     *state.marker_root.lock().await = None;
@@ -345,6 +368,12 @@ pub async fn lead_open(
     if let Some(forwarder) = state.team_forwarder.lock().await.take() {
         forwarder.abort();
     }
+    if let Some(forwarder) = state.board_forwarder.lock().await.take() {
+        forwarder.abort();
+    }
+    if let Some(forwarder) = state.indexing_forwarder.lock().await.take() {
+        forwarder.abort();
+    }
     if let Some(old) = state.runtime.lock().await.take() {
         let old_root = old.workspace_root().to_path_buf();
         old.shutdown().await;
@@ -353,12 +382,20 @@ pub async fn lead_open(
             let _ = browser.close().await;
         }
     }
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("could not resolve the Mnemo2 app data dir: {err}"))?;
-    let project_state = project::state_dir(&app_data, &root)?;
-    let preferences = match project::preferences(&app_data, &root) {
+    let opened = state_owner(&app).and_then(|owner| {
+        let dir = project::open_state_dir(&root, &owner, true)?
+            .ok_or_else(|| "the project state folder could not be created".to_string())?;
+        Ok((owner, dir))
+    });
+    let (owner, project_state) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            project::detach(&root);
+            *state.marker_root.lock().await = None;
+            return Err(error);
+        }
+    };
+    let preferences = match project::preferences(&root, &owner) {
         Ok(preferences) => preferences,
         Err(error) => {
             project::detach(&root);
@@ -415,6 +452,32 @@ pub async fn lead_open(
             return Err(error);
         }
     };
+    let mut board_events = team.subscribe_board();
+    let board_app = app.clone();
+    let board_forwarder = tauri::async_runtime::spawn(async move {
+        loop {
+            match board_events.recv().await {
+                Ok(BoardSignal::Notice { .. }) => {}
+                Ok(BoardSignal::Changed) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = board_app.emit(BOARD_CHANGED_CHANNEL, ());
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    let mut indexing_events = runtime.indexing().subscribe();
+    let indexing_app = app.clone();
+    let indexing_forwarder = tauri::async_runtime::spawn(async move {
+        loop {
+            match indexing_events.recv().await {
+                Ok(snapshot) => {
+                    let _ = indexing_app.emit(INDEXING_CHANNEL, &snapshot);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     let mut team_events = team.subscribe();
     let team_app = app.clone();
     let team_forwarder = tauri::async_runtime::spawn(async move {
@@ -432,7 +495,16 @@ pub async fn lead_open(
     *state.runtime.lock().await = Some(runtime);
     *state.forwarder.lock().await = Some(forwarder);
     *state.team_forwarder.lock().await = Some(team_forwarder);
+    *state.board_forwarder.lock().await = Some(board_forwarder);
+    *state.indexing_forwarder.lock().await = Some(indexing_forwarder);
     Ok(snapshot)
+}
+
+/// The open project's startup indexing status (code index + memory). Later
+/// changes arrive on [`INDEXING_CHANNEL`].
+#[tauri::command]
+pub async fn indexing_snapshot(state: State<'_, Mnemo2State>) -> Result<IndexingSnapshot, String> {
+    Ok(current(&state).await?.indexing().snapshot())
 }
 
 /// Read the current lead snapshot (transcript, model, pending interaction).
@@ -467,8 +539,12 @@ pub async fn lead_interrupt(state: State<'_, Mnemo2State>) -> Result<(), String>
 pub async fn lead_set_model(
     state: State<'_, Mnemo2State>,
     spec: String,
+    reasoning_effort: Option<String>,
 ) -> Result<LeadSnapshot, String> {
-    current(&state).await?.set_model(spec).await
+    current(&state)
+        .await?
+        .set_model(spec, reasoning_effort)
+        .await
 }
 
 /// Resolve a pending approval request.
@@ -503,19 +579,37 @@ pub async fn team_snapshot(state: State<'_, Mnemo2State>) -> Result<TeamSnapshot
     Ok(current_team(&state).await?.snapshot().await)
 }
 
-/// Delegate a real task to a worker.
+/// Read the plan board: every plan with the workers on each step.
+#[tauri::command]
+pub async fn board_snapshot(state: State<'_, Mnemo2State>) -> Result<BoardSnapshot, String> {
+    current_team(&state).await?.board_snapshot().await
+}
+
+/// Delegate a real task to a worker on a board plan step (1-based).
 #[tauri::command]
 pub async fn team_dispatch(
     state: State<'_, Mnemo2State>,
     brief: String,
     model: Option<String>,
+    reasoning_effort: Option<String>,
     worker_id: Option<String>,
     review_risk: Option<String>,
+    plan_id: String,
+    step: usize,
 ) -> Result<WorkerRecord, String> {
     current_team(&state)
         .await?
-        .dispatch_with_id(brief, model, worker_id, review_risk)
+        .dispatch_on_plan(
+            brief,
+            model,
+            reasoning_effort,
+            worker_id,
+            review_risk,
+            &plan_id,
+            step,
+        )
         .await
+        .map(|(worker, _)| worker)
 }
 
 /// Dispatch a fresh read-only independent audit of one worker's current tip.
@@ -579,6 +673,21 @@ pub async fn team_resume(
     worker_id: String,
 ) -> Result<WorkerRecord, String> {
     current_team(&state).await?.resume(&worker_id).await
+}
+
+/// Move a worker to another model and reasoning effort, keeping its
+/// transcript; an idle or stopped worker comes back idle on the new model.
+#[tauri::command]
+pub async fn team_set_model(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .change_model(&worker_id, model, reasoning_effort)
+        .await
 }
 
 /// Compact an idle worker, resuming a blocked/stopped session when needed.
@@ -689,6 +798,28 @@ pub async fn team_stop_all(state: State<'_, Mnemo2State>) -> Result<(), String> 
     current_team(&state).await?.stop_all().await
 }
 
+/// Report what deleting these workers would remove, changing nothing.
+#[tauri::command]
+pub async fn team_delete_preview(
+    state: State<'_, Mnemo2State>,
+    worker_ids: Vec<String>,
+) -> Result<Vec<WorkerDeletion>, String> {
+    current_team(&state).await?.deletion_preview(&worker_ids).await
+}
+
+/// Delete inactive workers with their history, checkout, and branch.
+#[tauri::command]
+pub async fn team_delete(
+    state: State<'_, Mnemo2State>,
+    worker_ids: Vec<String>,
+    discard_work: bool,
+) -> Result<TeamSnapshot, String> {
+    current_team(&state)
+        .await?
+        .delete_workers(&worker_ids, discard_work)
+        .await
+}
+
 /// Persist the project's live-worker cap.
 #[tauri::command]
 pub async fn team_set_slots(
@@ -711,11 +842,7 @@ pub async fn workbench_preferences(
             return Ok(preferences.clone());
         }
     }
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("could not resolve the Mnemo2 app data dir: {err}"))?;
-    project::preferences(&app_data, &root)
+    project::preferences(&root, &state_owner(&app)?)
 }
 
 /// Save the current project's validated workbench preferences.
@@ -732,11 +859,7 @@ pub async fn workbench_preferences_set(
     if requested != current_root {
         return Err("the project changed before preferences could be saved".to_string());
     }
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("could not resolve the Mnemo2 app data dir: {err}"))?;
-    project::save_preferences(&app_data, &requested, &preferences)?;
+    project::save_preferences(&requested, &state_owner(&app)?, &preferences)?;
     *state.preferences.lock().await = Some((requested, preferences));
     Ok(())
 }
@@ -778,6 +901,161 @@ pub async fn lead_close(
 ) -> Result<(), String> {
     state.shutdown().await;
     browser.close().await
+}
+
+// ── Settings: endpoints and model tiers ────────────────────────────────────
+//
+// These work with or without an open lead. With one, the engine's shared
+// config and the lead/team model catalog are refreshed after every save, so
+// the next dispatch sees new endpoints, models, prices and tiers.
+
+/// A `Setup` on the lead's config dir (attached to its engine when a lead is
+/// open), plus the lead for post-save catalog refresh.
+async fn settings_setup(
+    state: &Mnemo2State,
+) -> Result<(mnemo::headless::Setup, Option<Arc<LeadRuntime>>), String> {
+    let runtime = state.runtime.lock().await.clone();
+    match runtime {
+        Some(runtime) => {
+            let setup = mnemo::headless::Setup::open(Some(runtime.config_dir().to_path_buf()))
+                .map_err(|err| err.to_string())?;
+            let engine = runtime.engine_handle().await?;
+            Ok((setup.for_engine(&engine), Some(runtime)))
+        }
+        None => Ok((
+            mnemo::headless::Setup::open(None).map_err(|err| err.to_string())?,
+            None,
+        )),
+    }
+}
+
+async fn settings_refresh(runtime: Option<Arc<LeadRuntime>>) -> Result<(), String> {
+    match runtime {
+        Some(runtime) => runtime.refresh_catalog().await,
+        None => Ok(()),
+    }
+}
+
+/// Every configured endpoint with its models, specs, prices and key presence.
+#[tauri::command]
+pub async fn settings_endpoints(
+    state: State<'_, Mnemo2State>,
+) -> Result<Vec<mnemo::headless::EndpointDetailDto>, String> {
+    let (setup, _) = settings_setup(&state).await?;
+    setup.endpoints_detail().map_err(|err| err.to_string())
+}
+
+/// Create or update one endpoint (rename via `previous_name`); returns the
+/// refreshed endpoint list.
+#[tauri::command]
+pub async fn settings_upsert_endpoint(
+    state: State<'_, Mnemo2State>,
+    endpoint: mnemo::headless::EndpointDetailDto,
+    previous_name: Option<String>,
+) -> Result<Vec<mnemo::headless::EndpointDetailDto>, String> {
+    let (setup, runtime) = settings_setup(&state).await?;
+    setup
+        .upsert_endpoint_detail(endpoint, previous_name)
+        .await
+        .map_err(|err| err.to_string())?;
+    settings_refresh(runtime).await?;
+    setup.endpoints_detail().map_err(|err| err.to_string())
+}
+
+/// Delete an endpoint (its key, tier entries and orphaned prices go too);
+/// returns the refreshed endpoint list.
+#[tauri::command]
+pub async fn settings_remove_endpoint(
+    state: State<'_, Mnemo2State>,
+    name: String,
+) -> Result<Vec<mnemo::headless::EndpointDetailDto>, String> {
+    let (setup, runtime) = settings_setup(&state).await?;
+    setup
+        .remove_endpoint_applied(&name)
+        .await
+        .map_err(|err| err.to_string())?;
+    settings_refresh(runtime).await?;
+    setup.endpoints_detail().map_err(|err| err.to_string())
+}
+
+/// Store an endpoint's API key (write-only; the endpoint must exist).
+#[tauri::command]
+pub async fn settings_set_api_key(
+    state: State<'_, Mnemo2State>,
+    endpoint_name: String,
+    api_key: String,
+) -> Result<(), String> {
+    let (setup, runtime) = settings_setup(&state).await?;
+    setup
+        .set_api_key_applied(&endpoint_name, mnemo::headless::Secret::new(api_key))
+        .await
+        .map_err(|err| err.to_string())?;
+    settings_refresh(runtime).await
+}
+
+/// Probe an endpoint's `/models` with the given or saved credentials.
+#[tauri::command]
+pub async fn settings_test_endpoint(
+    state: State<'_, Mnemo2State>,
+    endpoint_name: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    kind: Option<String>,
+) -> Result<mnemo::headless::EndpointTestDto, String> {
+    let (setup, _) = settings_setup(&state).await?;
+    Ok(setup
+        .test_endpoint_detail(&endpoint_name, base_url, api_key, kind)
+        .await)
+}
+
+/// List the models the provider serves (to pick from when adding models).
+#[tauri::command]
+pub async fn settings_list_provider_models(
+    state: State<'_, Mnemo2State>,
+    endpoint_name: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    kind: Option<String>,
+) -> Result<Vec<mnemo::headless::ProviderModelDto>, String> {
+    let (setup, _) = settings_setup(&state).await?;
+    setup
+        .list_provider_models(&endpoint_name, base_url, api_key, kind)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+/// What still references an endpoint (tier entries, the default model).
+#[tauri::command]
+pub async fn settings_endpoint_usage(
+    state: State<'_, Mnemo2State>,
+    name: String,
+) -> Result<Vec<String>, String> {
+    let (setup, _) = settings_setup(&state).await?;
+    setup.endpoint_usage(&name).map_err(|err| err.to_string())
+}
+
+/// The configured model tiers.
+#[tauri::command]
+pub async fn settings_tiers(
+    state: State<'_, Mnemo2State>,
+) -> Result<mnemo::headless::TiersDto, String> {
+    let (setup, _) = settings_setup(&state).await?;
+    setup.tiers().map_err(|err| err.to_string())
+}
+
+/// Validate and save the model tiers; returns what was stored.
+#[tauri::command]
+pub async fn settings_save_tiers(
+    state: State<'_, Mnemo2State>,
+    tiers: mnemo::headless::TiersDto,
+) -> Result<mnemo::headless::TiersDto, String> {
+    let (setup, runtime) = settings_setup(&state).await?;
+    let saved = setup
+        .set_tiers(tiers)
+        .await
+        .map_err(|err| err.to_string())?;
+    settings_refresh(runtime).await?;
+    Ok(saved)
 }
 
 #[cfg(test)]
@@ -869,5 +1147,36 @@ mod tests {
             notification_for(&worker).map(|notification| notification.0),
             Some("Worker failed")
         );
+    }
+
+    /// Regression: a "needs you" notification said only "is waiting for
+    /// input" — no question, no reason — so the user had nothing to act on.
+    #[test]
+    fn needs_you_notification_says_why() {
+        let mut worker: WorkerRecord = serde_json::from_value(serde_json::json!({
+            "id": "worker1",
+            "name": "Worker one",
+            "brief": "Task",
+            "model": null,
+            "model_id": null,
+            "branch": "wt/agent-worker1",
+            "worktree": ".worktrees/agent-worker1",
+            "status": "needs_you",
+            "generation": 1,
+            "transcript": { "messages": [] },
+            "pending": null,
+            "used_tokens": 0,
+            "max_tokens": 0,
+            "checks": [],
+            "error": "the worker session reached its request limit before finishing",
+        }))
+        .expect("worker record");
+        let (title, body) = notification_for(&worker).expect("a needs-you notification");
+        assert_eq!(title, "Worker needs you");
+        assert!(body.contains("reached its request limit"), "{body}");
+        assert!(!body.contains("waiting for input"), "{body}");
+        worker.error = None;
+        let (_, body) = notification_for(&worker).expect("a needs-you notification");
+        assert!(!body.contains("waiting for input"), "{body}");
     }
 }

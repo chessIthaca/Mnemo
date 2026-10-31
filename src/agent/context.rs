@@ -909,28 +909,14 @@ fn rerun_pointer(name: &str, arguments: &str) -> Option<String> {
     match name {
         "read_files" | "file_read" => {
             // Single `path` (+ optional `start_line`/`max_lines`) and/or a
-            // `files[]` batch of the same shape — the canonical parse lives
-            // in `read_files_paths` (src/agent/dispatch.rs). `file_read`
-            // takes the identical single-path args.
-            let mut entries: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
-            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                entries.push((
-                    p.to_string(),
-                    args.get("start_line").and_then(|v| v.as_u64()),
-                    args.get("max_lines").and_then(|v| v.as_u64()),
-                ));
-            }
-            if let Some(files) = args.get("files").and_then(|v| v.as_array()) {
-                for f in files {
-                    if let Some(p) = f.get("path").and_then(|v| v.as_str()) {
-                        entries.push((
-                            p.to_string(),
-                            f.get("start_line").and_then(|v| v.as_u64()),
-                            f.get("max_lines").and_then(|v| v.as_u64()),
-                        ));
-                    }
-                }
-            }
+            // `files[]` batch of compact strings or objects — the canonical
+            // parse is `read_files::read_specs`. `file_read` takes the
+            // identical single-path args.
+            let entries: Vec<(String, Option<u64>, Option<u64>)> =
+                crate::tool::agent::read_files::read_specs(&args)
+                    .into_iter()
+                    .map(|s| (s.path, s.start_line.map(|n| n as u64), s.max_lines.map(|n| n as u64)))
+                    .collect();
             if entries.is_empty() {
                 return None;
             }

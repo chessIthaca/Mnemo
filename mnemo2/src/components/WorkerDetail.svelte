@@ -8,17 +8,22 @@
     Play,
     Send,
     Square,
+    Trash2,
     XCircle,
   } from "@lucide/svelte";
-  import { actions } from "../lib/store";
+  import { workerPlanLabel } from "../lib/boardState";
+  import { actions, app } from "../lib/store";
   import { canMerge, isAuditWorker } from "../lib/review";
-  import { workerStatusLabel, type Worker } from "../lib/types";
+  import { workerStatusText, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
+  import Collapsible from "./Collapsible.svelte";
   import FindingsPanel from "./FindingsPanel.svelte";
   import Markdown from "./Markdown.svelte";
   import ModelBadge from "./ModelBadge.svelte";
+  import ModelEffortPicker from "./ModelEffortPicker.svelte";
   import ReviewEvidence from "./ReviewEvidence.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
+  import ToolActivity from "./ToolActivity.svelte";
 
   let { worker }: { worker: Worker } = $props();
   let tab = $state<"review" | "thread" | "timeline">("thread");
@@ -26,10 +31,22 @@
   let lastWorkerId = "";
 
   const openFindings = $derived(worker.findings.filter((finding) => finding.status === "open").length);
-  const audit = $derived(isAuditWorker(worker));
-  const highRisk = $derived(worker.reviewRisk === "high");
+  const threadMessages = $derived(worker.messages.filter((entry) => entry.kind !== "tool").length);
+  const planLabel = $derived(workerPlanLabel($app.board, worker));
   const workflow = $derived(deriveTaskWorkflow(worker));
   const mergeEligibility = $derived(canMerge(worker));
+  const audit = $derived(isAuditWorker(worker));
+  const highRisk = $derived(worker.reviewRisk === "high");
+  const models = $derived($app.leadRuntime.models);
+  /** The model the worker was given: its spec, else the configured default. */
+  const modelSpec = $derived(
+    worker.modelSpec ?? models.find((model) => model.is_default)?.spec ?? "",
+  );
+  /** A worker can move to another model unless it is mid-turn or its task is over. */
+  const modelChangeable = $derived(
+    models.some((model) => model.spec === modelSpec) &&
+      !["working", "dispatching", "merging", "merged", "cancelled"].includes(worker.status),
+  );
 
   $effect(() => {
     const id = worker.id;
@@ -60,15 +77,29 @@
       <span class="avatar" style="--hue: {worker.hue}">{worker.initials}</span>
       <div class="worker-heading">
         <div class="worker-title">
-          <h2>{worker.name}<span data-status={worker.status}>{workerStatusLabel[worker.status]}</span></h2>
+          <h2>{worker.name}<span data-status={worker.status}>{workerStatusText(worker)}</span></h2>
           {#if audit}
             <span class="kind-badge" data-kind="audit">Audit</span>
           {/if}
           {#if highRisk}
             <span class="kind-badge" data-risk="high">High risk</span>
           {/if}
-          <ModelBadge model={worker.model} />
+          {#if modelChangeable}
+            <ModelEffortPicker
+              {models}
+              spec={modelSpec}
+              effort={worker.reasoningEffort ?? null}
+              label={worker.name}
+              compact
+              onchange={(spec, effort) => actions.setWorkerModel(worker.id, spec, effort)}
+            />
+          {:else}
+            <span class="model-locked" title="Pause or stop the worker to change its model"><ModelBadge model={worker.model} /></span>
+            {#if worker.reasoningEffort}<span class="effort-pill" title="Reasoning effort">effort: {worker.reasoningEffort}</span>{/if}
+          {/if}
+          {#if worker.tier}<span class="effort-pill" title="Model tier">tier: {worker.tier}</span>{/if}
         </div>
+        {#if planLabel}<p class="worker-plan">{planLabel}</p>{/if}
         <h3>{worker.task}</h3>
         {#if audit}
           <p class="audit-scope">
@@ -89,13 +120,21 @@
         <button class="button button-quiet" onclick={() => actions.resumeWorker(worker.id)}><Play size={11} /> Resume</button>
       {/if}
       <button class="button button-quiet" disabled={["stopped", "merging", "merged", "cancelled"].includes(worker.status)} onclick={() => actions.stopWorker(worker.id)}><Square size={11} /> Stop</button>
+      <button class="button button-quiet" aria-label={`Delete ${worker.name}`} title="Delete this worker and its history" disabled={worker.status === "merging"} onclick={() => actions.requestDeleteWorkers([worker.id])}><Trash2 size={11} /> Delete</button>
     </div>
   </header>
+
+  {#if worker.needsYou}
+    <p class="worker-blocker" role="status">
+      <strong>Needs you:</strong>
+      {worker.summary || "the worker stopped before finishing — read its thread for its last message, then reply, resume, or stop it."}
+    </p>
+  {/if}
 
   <div class="file-areas"><GitBranch size={12} /><code>{worker.branch}</code><span>{worker.files.length} files</span></div>
 
   <nav class="detail-tabs" aria-label="Worker detail sections">
-    <button class:active={tab === "thread"} aria-pressed={tab === "thread"} onclick={() => { tab = "thread"; }}>Thread <span>{worker.messages.length}</span></button>
+    <button class:active={tab === "thread"} aria-pressed={tab === "thread"} onclick={() => { tab = "thread"; }}>Thread <span>{threadMessages}</span></button>
     <button class:active={tab === "review"} aria-pressed={tab === "review"} onclick={() => { tab = "review"; }}>Review {#if openFindings > 0}<span>{openFindings}</span>{/if}</button>
     <button class:active={tab === "timeline"} aria-pressed={tab === "timeline"} onclick={() => { tab = "timeline"; }}>Timeline</button>
   </nav>
@@ -157,11 +196,15 @@
     {:else if tab === "thread"}
       <section class="thread-panel" aria-label={`${worker.name} worker conversation`}>
         <div class="thread-messages">
-          {#each worker.messages as message (message.id)}
-            <div class="thread-message" class:from-lead={message.from === "lead"}>
-              <span>{message.from === "lead" ? "LEAD" : worker.name.toUpperCase()} · {message.time}</span>
-              <div class="thread-message-body"><Markdown source={message.body} onOpenLink={actions.openBrowser} /></div>
-            </div>
+          {#each worker.messages as entry (entry.id)}
+            {#if entry.kind === "tool"}
+              <div class="thread-tool"><ToolActivity {entry} /></div>
+            {:else}
+              <div class="thread-message" class:from-lead={entry.from === "lead"} class:from-harness={entry.from === "harness"}>
+                <span>{entry.from === "lead" ? "LEAD" : entry.from === "harness" ? "HARNESS NOTE" : worker.name.toUpperCase()} · {entry.time}</span>
+                <div class="thread-message-body"><Collapsible maxHeight={160} label="message"><Markdown source={entry.body} onOpenLink={actions.openBrowser} /></Collapsible></div>
+              </div>
+            {/if}
           {/each}
         </div>
         {#if worker.screenshots.length > 0}
@@ -198,31 +241,20 @@
   .worker-identity { display: flex; gap: 12px; min-width: 0; }
   .avatar { display: grid; flex: 0 0 auto; width: 44px; height: 44px; place-items: center; border-radius: 13px; background: hsl(var(--hue) 32% 87%); color: hsl(var(--hue) 30% 32%); font-size: 12px; font-weight: 750; }
   .worker-heading { min-width: 0; }
+  .worker-plan { margin: 2px 0 0; color: var(--accent-strong); font-size: 9px; }
   .worker-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .worker-identity h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--font-prose); font-size: 26px; font-weight: 550; }
   .worker-identity h2 span { padding: 4px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-ui); font-size: 7px; font-weight: 650; }
   .worker-identity h2 span[data-status="in_review"], .worker-identity h2 span[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }
-  .worker-identity h3 { margin: 4px 0 0; color: var(--ink-soft); font-size: 10px; font-weight: 500; }
-  .worker-title :global(.model-badge) { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+  .kind-badge { padding: 3px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-ui); font-size: 7px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; }
+  .kind-badge[data-kind="audit"] { background: var(--accent-soft); color: var(--accent-strong); }
+  .kind-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
   .kind-badge { padding: 3px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-ui); font-size: 7px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; }
   .kind-badge[data-kind="audit"] { background: var(--accent-soft); color: var(--accent-strong); }
   .kind-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
   .audit-scope { margin: 6px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
   .audit-scope code { font-family: var(--font-mono); font-size: 9px; }
-  .worker-heading :global(.task-workflow) { margin-top: 7px; max-width: 470px; }
-  .worker-actions { display: flex; flex-wrap: wrap; gap: 7px; }
-  .file-areas { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
-  .file-areas code { min-width: 0; color: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; overflow-wrap: anywhere; }
-  .file-areas span { padding: 4px 6px; border-radius: 5px; background: var(--surface-soft); font-family: var(--font-mono); font-size: 9px; }
-  .checks-heading { flex-wrap: wrap; }
-  .checks-heading code { flex: 1 1 160px; min-width: 0; font-size: 9px; white-space: normal; overflow-wrap: anywhere; }
-  .detail-tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); }
-  .detail-tabs button { display: inline-flex; align-items: center; gap: 5px; padding: 0 0 10px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 600; }
-  .detail-tabs button.active { border-color: var(--accent); color: var(--ink); }
-  .detail-tabs button span { display: grid; min-width: 15px; height: 15px; place-items: center; border-radius: 8px; background: var(--surface-soft); font-size: 7px; }
-  .detail-body { display: grid; gap: 12px; padding-top: 16px; }
-  .checks-panel, .merge-panel { padding: 14px 16px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); }
-  .checks-heading { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; color: var(--muted); font-size: 7px; letter-spacing: 0.08em; }
+  .effort-pill { padding: 3px 6px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: 8px; font-weight: 600; }
   .checks-heading code { overflow: hidden; font-family: var(--font-mono); font-size: 7px; letter-spacing: 0; text-overflow: ellipsis; white-space: nowrap; }
   .usage-line { margin: -3px 0 10px; color: var(--muted); font-size: 8px; }
   .check-row { display: flex; align-items: center; gap: 9px; }
@@ -238,11 +270,16 @@
   .merge-decision div > span { display: block; max-width: 360px; color: var(--muted); font-size: 8px; line-height: 1.45; }
   .merge-decision button { flex: 0 0 auto; }
   .thread-message-body { margin: 5px 0 0; padding: 10px 12px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--ink-soft); }
-  .thread-message-body :global(.markdown) { font-size: 13px; line-height: 1.55; }
-  .thread-message-body :global(p) { margin-bottom: 10px; }
+  .thread-message-body :global(.markdown) { font-size: 11px; line-height: 1.5; }
+  .thread-message-body :global(p) { margin-bottom: 8px; }
+  .thread-message-body :global(.markdown h1), .thread-message-body :global(.markdown h2), .thread-message-body :global(.markdown h3) { font-size: 12.5px; }
+  .thread-message-body :global(.markdown h4), .thread-message-body :global(.markdown h5), .thread-message-body :global(.markdown h6) { font-size: 11.5px; }
   .thread-message.from-lead { margin-left: auto; }
   .thread-message.from-lead > span { display: block; text-align: right; }
   .thread-message.from-lead .thread-message-body { border-radius: 12px 12px 4px 12px; background: var(--accent-soft); }
+  .thread-message.from-harness .thread-message-body { border: 1px dashed var(--line-strong); background: transparent; color: var(--muted); }
+  .thread-message + .thread-message, .thread-tool + .thread-message { margin-top: 12px; }
+  .thread-tool { min-width: 0; margin: 4px 0; }
   .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
   .screenshot-links > span { color: var(--muted); font-size: 8px; letter-spacing: 0.08em; }
   .screenshot-links > div { display: flex; flex-wrap: wrap; gap: 6px; }

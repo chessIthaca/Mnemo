@@ -1,0 +1,1585 @@
+// Copyright (c) 2026 Carsten Hess
+// SPDX-License-Identifier: MIT
+// See LICENSE in the repository root.
+
+//! The Mnemo2 plan board (`.coding/design/mnemo2.md` Phase 6).
+//!
+//! The lead holds any number of plans at once; each is a Mnemo1-format plan
+//! file under `.coding/plans/` (steps, `## Progress`, `## Decisions`), and
+//! `board.json` beside them records which plans are open, closed, or
+//! abandoned. Plans are the record of intent: they outlive their close and
+//! are digested into project memory.
+//!
+//! Step numbers in this API are 1-based where a model or a worker sees them
+//! (`brief_for`, [`BoardStep::number`]) and 0-based where the host's task
+//! records and the [`TeamLedger`] use them (`tick`, `untick`); each method
+//! says which.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use serde::{Deserialize, Serialize};
+
+use crate::app::team_ledger::{PlanReview, TeamLedger};
+use crate::app::tool::workflow::plan::{
+    bug_fixing_gate, collapse_whitespace, context_issue, escape_section_markers,
+    resumability_gate_error, step_issue,
+};
+use crate::app::workflow::{PlanFile, PlanKind};
+use crate::codegraph::CodeGraph;
+use crate::memory::knowledge::KnowledgeStore;
+use crate::memory::MemoryStoreTrait;
+
+/// The board file name inside the plans dir.
+const BOARD_FILE: &str = "board.json";
+
+/// The header of the step appended when steps run in parallel.
+const INTEGRATION_HEADER: &str = "Integration check";
+const INTEGRATION_STEP: &str = "**Integration check** — run the combined result (build, tests, or launching the entry point) and verify the parallel steps fit together; fix any seam breakage.";
+
+/// Where a board plan stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BoardStatus {
+    /// Being worked; the lead's tail lists it.
+    Open,
+    /// Every step done and the close gates passed; a review report exists.
+    Closed,
+    /// Closed without review, with a recorded reason.
+    Abandoned,
+}
+
+impl BoardStatus {
+    /// The lowercase token the UI and the tools show.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// One step of a board plan, as the lead and the UI see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoardStep {
+    /// 1-based step number.
+    pub number: usize,
+    /// The bold punchline, when the step text starts with one.
+    pub header: Option<String>,
+    /// The full step text.
+    pub text: String,
+    /// Whether the step is checked off.
+    pub done: bool,
+}
+
+/// A board plan: the plan file's steps joined with the board's status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoardPlan {
+    /// The 8-hex plan id (the plan file's stem).
+    pub id: String,
+    pub title: String,
+    pub goal: String,
+    /// `implementation`, `research`, or `bug_fixing`.
+    pub kind: String,
+    pub status: BoardStatus,
+    /// Epoch milliseconds the plan closed or was abandoned.
+    pub closed_at_ms: Option<u64>,
+    /// The closing review report (absolute path), once closed.
+    pub report_path: Option<String>,
+    pub steps: Vec<BoardStep>,
+}
+
+/// What `plan_create` takes.
+#[derive(Debug, Clone, Default)]
+pub struct PlanDraft {
+    pub title: String,
+    pub goal: String,
+    /// Why the work exists, constraints, prior decisions.
+    pub context: String,
+    pub kind: PlanKind,
+    /// The symptom of a `bug_fixing` plan (required for that kind).
+    pub bug: Option<String>,
+    pub steps: Vec<String>,
+    /// Interface contracts (exports, signatures, data shapes, file
+    /// ownership) recorded as dated entries in `## Interfaces`.
+    pub interfaces: Vec<String>,
+}
+
+/// What `plan_update` takes. Nothing already recorded is rewritten.
+#[derive(Debug, Clone, Default)]
+pub struct PlanEdit {
+    /// Appended to the plan's context as a new paragraph.
+    pub context_append: Option<String>,
+    /// Appended as a dated entry to `## Decisions`.
+    pub decision: Option<String>,
+    /// Appended as a dated entry to `## Interfaces`: a contract between
+    /// steps (exports, signatures, data shapes, file ownership).
+    pub interface: Option<String>,
+    /// Appended as a dated line to `## Progress`: execution state (commits,
+    /// review status, what is next). Never part of a worker brief.
+    pub progress_note: Option<String>,
+    /// New steps appended after the existing ones.
+    pub add_steps: Vec<String>,
+    /// The regression test of a `bug_fixing` plan.
+    pub regression_test: Option<String>,
+    /// Declare the fix feature-scale (the close then needs a "Landed design"
+    /// context amendment).
+    pub landed_design: bool,
+}
+
+/// The result of [`PlanBoard::try_close`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// The plan closed; the review report is at `report_path`.
+    /// `retired_notes` counts the plan-scoped memory notes the close
+    /// retired into the report (`memory::plan_scope`).
+    Closed {
+        report_path: String,
+        retired_notes: usize,
+    },
+    /// Steps are still undone.
+    NotReady { reasons: Vec<String> },
+    /// The team review or a kind gate refused; the plan stays open.
+    Blocked { reasons: Vec<String> },
+}
+
+/// One `board.json` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BoardEntry {
+    id: String,
+    status: BoardStatus,
+    created_at_ms: u64,
+    #[serde(default)]
+    closed_at_ms: Option<u64>,
+    #[serde(default)]
+    report_path: Option<String>,
+    #[serde(default)]
+    abandon_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct BoardFile {
+    plans: Vec<BoardEntry>,
+}
+
+/// The plans of one project. Every call takes the interior lock, so
+/// concurrent tool calls and host commands serialize on the files.
+pub struct PlanBoard {
+    plans_dir: PathBuf,
+    reviews_dir: PathBuf,
+    memory: Option<Arc<dyn MemoryStoreTrait>>,
+    knowledge: Option<Arc<KnowledgeStore>>,
+    codegraph: Option<Arc<CodeGraph>>,
+    lock: Mutex<()>,
+}
+
+impl PlanBoard {
+    /// A board over `plans_dir` (`.coding/plans/`) writing close reports to
+    /// `reviews_dir` (`.coding/reviews/`).
+    pub fn new(plans_dir: impl Into<PathBuf>, reviews_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            plans_dir: plans_dir.into(),
+            reviews_dir: reviews_dir.into(),
+            memory: None,
+            knowledge: None,
+            codegraph: None,
+            lock: Mutex::new(()),
+        }
+    }
+
+    /// Wire the memory store the PLAN:/BUG: capture on close writes to.
+    pub fn with_memory(mut self, store: Arc<dyn MemoryStoreTrait>) -> Self {
+        self.memory = Some(store);
+        self
+    }
+
+    /// Wire the knowledge files the BUG: capture lands in.
+    pub fn with_knowledge(mut self, knowledge: Arc<KnowledgeStore>) -> Self {
+        self.knowledge = Some(knowledge);
+        self
+    }
+
+    /// Wire the code graph the `bug_fixing` regression-test gate resolves in.
+    pub fn with_codegraph(mut self, graph: Arc<CodeGraph>) -> Self {
+        self.codegraph = Some(graph);
+        self
+    }
+
+    /// The memory store, for the `plan_create` recall rider.
+    pub fn memory(&self) -> Option<&Arc<dyn MemoryStoreTrait>> {
+        self.memory.as_ref()
+    }
+
+    /// Every board plan: open ones first (oldest first), then closed and
+    /// abandoned ones, most recently closed first. A plan whose file cannot
+    /// be read is skipped.
+    pub fn list(&self) -> Result<Vec<BoardPlan>, String> {
+        let _guard = self.guard();
+        let mut open = Vec::new();
+        let mut done = Vec::new();
+        for entry in self.load_board()?.plans {
+            let Ok(plan) = self.load_plan(&entry.id) else {
+                continue;
+            };
+            let view = board_plan(&entry, &plan);
+            if entry.status == BoardStatus::Open {
+                open.push(view);
+            } else {
+                done.push(view);
+            }
+        }
+        done.sort_by(|a, b| b.closed_at_ms.cmp(&a.closed_at_ms));
+        open.extend(done);
+        Ok(open)
+    }
+
+    /// One board plan.
+    pub fn get(&self, id: &str) -> Result<BoardPlan, String> {
+        let _guard = self.guard();
+        let (entry, plan) = self.load(id)?;
+        Ok(board_plan(&entry, &plan))
+    }
+
+    /// The plan file's markdown, for display.
+    pub fn read_markdown(&self, id: &str) -> Result<String, String> {
+        let _guard = self.guard();
+        self.load(id)?;
+        std::fs::read_to_string(self.plans_dir.join(format!("{id}.md")))
+            .map_err(|e| format!("could not read plan {id}: {e}"))
+    }
+
+    /// Create an open plan and write its plan file.
+    pub fn create(&self, draft: PlanDraft) -> Result<BoardPlan, String> {
+        let title = collapse_whitespace(&draft.title);
+        let goal = draft.goal.trim();
+        let steps = clean_steps(&draft.steps);
+        if title.is_empty() || goal.is_empty() || draft.context.trim().is_empty() {
+            return Err("a plan needs a title, a goal, and a context".to_string());
+        }
+        if steps.is_empty() {
+            return Err("a plan needs at least one step".to_string());
+        }
+        let bug = draft
+            .bug
+            .as_deref()
+            .map(collapse_whitespace)
+            .filter(|b| !b.is_empty());
+        if draft.kind == PlanKind::BugFixing && bug.is_none() {
+            return Err("a bug_fixing plan needs the bug symptom".to_string());
+        }
+        // The same resumability bar create_plan applies. A board plan's steps
+        // are real work (no locked bug skeleton), so every kind gets the
+        // step check.
+        let issues: Vec<String> = context_issue(&draft.context, draft.kind, None, true)
+            .into_iter()
+            .chain(step_issue(&steps, false))
+            .collect();
+        if !issues.is_empty() {
+            return Err(resumability_gate_error(
+                "plan too thin to resume from",
+                &issues,
+            ));
+        }
+        let _guard = self.guard();
+        let mut board = self.load_board()?;
+        let id = self.fresh_id(&board);
+        let mut plan = PlanFile::new(
+            title,
+            escape_section_markers(goal),
+            escape_section_markers(draft.context.trim()),
+            steps,
+        );
+        plan.kind = draft.kind;
+        for interface in &draft.interfaces {
+            let interface = collapse_whitespace(interface);
+            if !interface.is_empty() {
+                push_line(&mut plan.interfaces, format!("- {}: {interface}", today()));
+            }
+        }
+        plan.bug_symptom = bug.filter(|_| draft.kind == PlanKind::BugFixing);
+        std::fs::create_dir_all(&self.plans_dir).map_err(|e| e.to_string())?;
+        self.save_plan(&id, &plan)?;
+        let entry = BoardEntry {
+            id,
+            status: BoardStatus::Open,
+            created_at_ms: now_ms(),
+            closed_at_ms: None,
+            report_path: None,
+            abandon_reason: None,
+        };
+        let view = board_plan(&entry, &plan);
+        board.plans.push(entry);
+        self.save_board(&board)?;
+        Ok(view)
+    }
+
+    /// Edit an open plan: append context, record a decision, add steps, set
+    /// the regression test or the landed-design flag.
+    pub fn update(&self, id: &str, edit: PlanEdit) -> Result<BoardPlan, String> {
+        let _guard = self.guard();
+        let (entry, mut plan) = self.load(id)?;
+        require_open(&entry)?;
+        if let Some(extra) = edit.context_append.as_deref().map(str::trim) {
+            if !extra.is_empty() {
+                plan.context = format!("{}\n\n{}", plan.context, escape_section_markers(extra));
+            }
+        }
+        if let Some(decision) = edit.decision.as_deref().map(collapse_whitespace) {
+            if !decision.is_empty() {
+                push_line(&mut plan.decisions, format!("- {}: {decision}", today()));
+            }
+        }
+        if let Some(interface) = edit.interface.as_deref().map(collapse_whitespace) {
+            if !interface.is_empty() {
+                push_line(&mut plan.interfaces, format!("- {}: {interface}", today()));
+            }
+        }
+        if let Some(note) = edit.progress_note.as_deref().map(collapse_whitespace) {
+            if !note.is_empty() {
+                push_line(&mut plan.progress, format!("- {}: {note}", today()));
+            }
+        }
+        for text in clean_steps(&edit.add_steps) {
+            let index = plan.steps.len();
+            plan.steps.push(crate::app::workflow::Step {
+                index,
+                header: crate::memory::plan_format::extract_bold_header(&text),
+                text,
+                done: false,
+            });
+        }
+        if let Some(test) = edit.regression_test.as_deref().map(collapse_whitespace) {
+            if !test.is_empty() {
+                plan.regression_test = Some(test);
+            }
+        }
+        if edit.landed_design {
+            plan.landed_design = true;
+        }
+        self.save_plan(id, &plan)?;
+        Ok(board_plan(&entry, &plan))
+    }
+
+    /// The worker brief header for `step` (1-based): the plan's title, goal,
+    /// kind, bug, context, decisions, a step list, and the assigned step's
+    /// full text. Refuses an unknown, closed, or abandoned plan, a missing
+    /// step, and a step that is already done.
+    pub fn brief_for(&self, id: &str, step: usize) -> Result<String, String> {
+        let _guard = self.guard();
+        let (entry, plan) = self.load(id)?;
+        require_open(&entry)?;
+        let Some(assigned) = step.checked_sub(1).and_then(|i| plan.steps.get(i)) else {
+            return Err(format!(
+                "plan {id} has no step {step} (it has {} steps, numbered from 1)",
+                plan.steps.len()
+            ));
+        };
+        if assigned.done {
+            return Err(format!("step {step} of plan {id} is already done"));
+        }
+        let mut out = format!(
+            "# Plan: {} ({id})\nGoal: {}\nKind: {}\n",
+            plan.title, plan.goal, plan.kind
+        );
+        if let Some(bug) = &plan.bug_symptom {
+            out.push_str(&format!("Bug symptom: {bug}\n"));
+        }
+        out.push_str(&format!("\n## Context\n{}\n", plan.context));
+        if let Some(decisions) = &plan.decisions {
+            out.push_str(&format!("\n## Decisions\n{decisions}\n"));
+        }
+        if let Some(interfaces) = &plan.interfaces {
+            out.push_str(&format!("\n## Interfaces\n{interfaces}\n"));
+            out.push_str(
+                "\nFollow these interface contracts exactly. If one is wrong or insufficient, \
+                 message the lead instead of changing it.\n",
+            );
+        }
+        out.push_str("\n## Steps\n");
+        for s in &plan.steps {
+            let mark = if s.done { 'x' } else { ' ' };
+            let label = s.header.as_deref().unwrap_or(&s.text);
+            let here = if s.index + 1 == step {
+                "  <- your step"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "- [{mark}] {}. {}{here}\n",
+                s.index + 1,
+                clip(label, 100)
+            ));
+        }
+        out.push_str(&format!("\n## Your step ({step})\n{}\n", assigned.text));
+        out.push_str(&format!(
+            "\nYou are working on step {step} of plan {} ({id}); other steps are handled separately.\n",
+            plan.title
+        ));
+        Ok(out)
+    }
+
+    /// The contract gate for dispatching `step0` (0-based): every OTHER step
+    /// of the plan in `in_flight_steps` (0-based steps with an open task)
+    /// that shares a file path with `step0` needs that path in the plan's
+    /// `## Interfaces`. The step itself is ignored, so re-dispatching it
+    /// never trips the gate against itself.
+    pub fn contract_gate(
+        &self,
+        id: &str,
+        step0: usize,
+        in_flight_steps: &[usize],
+    ) -> Result<(), String> {
+        let _guard = self.guard();
+        let (_, plan) = self.load(id)?;
+        let Some(target) = plan.steps.get(step0) else {
+            return Ok(());
+        };
+        let mine = step_paths(&target.text);
+        if mine.is_empty() {
+            return Ok(());
+        }
+        let contracts = plan.interfaces.as_deref().unwrap_or("").replace('\\', "/");
+        let mut others: Vec<usize> = in_flight_steps
+            .iter()
+            .copied()
+            .filter(|&o| o != step0)
+            .collect();
+        others.sort_unstable();
+        others.dedup();
+        for other in others {
+            let Some(other_step) = plan.steps.get(other) else {
+                continue;
+            };
+            let theirs = step_paths(&other_step.text);
+            let uncovered: Vec<&String> = mine
+                .iter()
+                .filter(|p| theirs.contains(p) && !contracts.contains(p.as_str()))
+                .collect();
+            if !uncovered.is_empty() {
+                let paths = uncovered
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "step {} shares {paths} with step {}, which is already in flight, and the \
+                     plan's Interfaces record no contract for it. Call plan_update with \
+                     `interface` (exports, signatures, data shapes, file ownership) first, then \
+                     dispatch again.",
+                    step0 + 1,
+                    other + 1
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Append the final "Integration check" step unless the plan already has
+    /// one (done or not), recording in `## Decisions` that it was added
+    /// because `parallel_steps` (0-based) ran in parallel. `Ok(true)` when
+    /// the step was added. Every step must be done before the plan closes,
+    /// so this blocks the close until the combined result is verified.
+    pub fn ensure_integration_step(
+        &self,
+        id: &str,
+        parallel_steps: &[usize],
+    ) -> Result<bool, String> {
+        let _guard = self.guard();
+        let (entry, mut plan) = self.load(id)?;
+        require_open(&entry)?;
+        if plan
+            .steps
+            .iter()
+            .any(|s| s.header.as_deref() == Some(INTEGRATION_HEADER))
+        {
+            return Ok(false);
+        }
+        let index = plan.steps.len();
+        let text = INTEGRATION_STEP.to_string();
+        plan.steps.push(crate::app::workflow::Step {
+            index,
+            header: crate::memory::plan_format::extract_bold_header(&text),
+            text,
+            done: false,
+        });
+        let mut numbers: Vec<String> = parallel_steps.iter().map(|s| (s + 1).to_string()).collect();
+        numbers.dedup();
+        push_line(
+            &mut plan.decisions,
+            format!(
+                "- {}: added step {} (Integration check) because steps {} ran in parallel",
+                today(),
+                index + 1,
+                numbers.join(" and ")
+            ),
+        );
+        self.save_plan(id, &plan)?;
+        Ok(true)
+    }
+
+    /// Mark `step` (0-based) done and append `outcome_line` to `## Progress`.
+    /// `Ok(false)` when the step was already done.
+    pub fn tick(&self, id: &str, step: usize, outcome_line: &str) -> Result<bool, String> {
+        let _guard = self.guard();
+        let (entry, mut plan) = self.load(id)?;
+        require_open(&entry)?;
+        let number = step + 1;
+        let Some(target) = plan.steps.get_mut(step) else {
+            return Err(format!("plan {id} has no step {number}"));
+        };
+        if target.done {
+            return Ok(false);
+        }
+        target.done = true;
+        let outcome = collapse_whitespace(outcome_line);
+        push_line(
+            &mut plan.progress,
+            format!("- {} step {number} done: {outcome}", today()),
+        );
+        self.save_plan(id, &plan)?;
+        Ok(true)
+    }
+
+    /// Reopen `step` (0-based), noting why in `## Progress`. A closed plan
+    /// reopens with it. `Ok(false)` when the step was not done.
+    pub fn untick(&self, id: &str, step: usize, note: &str) -> Result<bool, String> {
+        let _guard = self.guard();
+        let mut board = self.load_board()?;
+        let mut plan = self.load_plan(id)?;
+        let Some(entry) = board.plans.iter_mut().find(|e| e.id == id) else {
+            return Err(unknown(id));
+        };
+        if entry.status == BoardStatus::Abandoned {
+            return Err(format!("plan {id} was abandoned"));
+        }
+        let number = step + 1;
+        let Some(target) = plan.steps.get_mut(step) else {
+            return Err(format!("plan {id} has no step {number}"));
+        };
+        if !target.done {
+            return Ok(false);
+        }
+        target.done = false;
+        let note = collapse_whitespace(note);
+        push_line(
+            &mut plan.progress,
+            format!("- {} step {number} reopened: {note}", today()),
+        );
+        self.save_plan(id, &plan)?;
+        if entry.status == BoardStatus::Closed {
+            entry.status = BoardStatus::Open;
+            entry.closed_at_ms = None;
+            entry.report_path = None;
+            self.save_board(&board)?;
+        }
+        Ok(true)
+    }
+
+    /// Close the plan when every step is done, the ledger's team review
+    /// passes, and the kind gates hold: write the review report, mark the
+    /// plan closed, and capture the PLAN:/BUG: digests. Closing an already
+    /// closed plan reports its existing report.
+    pub async fn try_close(&self, id: &str, ledger: &dyn TeamLedger) -> CloseOutcome {
+        let (entry, plan) = {
+            let _guard = self.guard();
+            match self.load(id) {
+                Ok(loaded) => loaded,
+                Err(reason) => {
+                    return CloseOutcome::Blocked {
+                        reasons: vec![reason],
+                    }
+                }
+            }
+        };
+        match entry.status {
+            BoardStatus::Closed => {
+                return CloseOutcome::Closed {
+                    report_path: entry.report_path.unwrap_or_default(),
+                    retired_notes: 0,
+                };
+            }
+            BoardStatus::Abandoned => {
+                return CloseOutcome::Blocked {
+                    reasons: vec![format!("plan {id} was abandoned")],
+                };
+            }
+            BoardStatus::Open => {}
+        }
+        let undone: Vec<String> = plan
+            .steps
+            .iter()
+            .filter(|s| !s.done)
+            .map(|s| {
+                let label = s.header.as_deref().unwrap_or(&s.text);
+                format!("step {} is not done: {}", s.index + 1, clip(label, 80))
+            })
+            .collect();
+        if !undone.is_empty() {
+            return CloseOutcome::NotReady { reasons: undone };
+        }
+        // No lock is held across the awaits below.
+        let report = match ledger.plan_review(id, &plan.title).await {
+            PlanReview::Blocked { reasons } => return CloseOutcome::Blocked { reasons },
+            PlanReview::Ready { report } => report,
+        };
+        if !report.trim_start().starts_with("## Verdict: PASS") {
+            return CloseOutcome::Blocked {
+                reasons: vec!["the team review report does not open with a PASS verdict".into()],
+            };
+        }
+        let mut notes = Vec::new();
+        if let Err(reason) = bug_fixing_gate(&plan, self.codegraph.as_ref(), &mut notes).await {
+            let reason = reason
+                .replace("update_plan", "plan_update")
+                .replace("before finish", "before the plan can close");
+            return CloseOutcome::Blocked {
+                reasons: vec![reason],
+            };
+        }
+        if self.reviews_dir.as_os_str().is_empty() {
+            return CloseOutcome::Blocked {
+                reasons: vec!["no reviews directory is configured".to_string()],
+            };
+        }
+        let report_path = {
+            let _guard = self.guard();
+            match self.write_closed(id, &report) {
+                Ok(Ok(path)) => path,
+                Ok(Err(existing)) => {
+                    return CloseOutcome::Closed {
+                        report_path: existing,
+                        retired_notes: 0,
+                    }
+                }
+                Err(reason) => {
+                    return CloseOutcome::Blocked {
+                        reasons: vec![reason],
+                    }
+                }
+            }
+        };
+        let retired_notes = self.settle_notes(id, &report_path).await;
+        self.capture(id, &plan).await;
+        CloseOutcome::Closed {
+            report_path,
+            retired_notes,
+        }
+    }
+
+    /// Retire the plan's plan-scoped memory notes and append them to the
+    /// closing report, so the lead can re-store their durable parts. Returns
+    /// how many were retired; failures are logged, never block the close.
+    async fn settle_notes(&self, id: &str, report_path: &str) -> usize {
+        let Some(store) = &self.memory else {
+            return 0;
+        };
+        let notes = match crate::memory::plan_scope::settle_plan_memories(store.as_ref(), id).await
+        {
+            Ok(notes) => notes,
+            Err(e) => {
+                eprintln!("plan board: settling plan notes for {id} failed: {e}");
+                return 0;
+            }
+        };
+        if notes.is_empty() {
+            return 0;
+        }
+        let section = crate::memory::plan_scope::render_settled_notes(&notes);
+        let appended = std::fs::read_to_string(report_path).and_then(|report| {
+            std::fs::write(
+                report_path,
+                format!(
+                    "{}
+
+{section}",
+                    report.trim_end()
+                ),
+            )
+        });
+        if let Err(e) = appended {
+            eprintln!("plan board: could not append plan notes to {report_path}: {e}");
+        }
+        notes.len()
+    }
+
+    /// Close an open plan without review, recording `reason`.
+    pub fn abandon(&self, id: &str, reason: &str) -> Result<BoardPlan, String> {
+        let _guard = self.guard();
+        let mut board = self.load_board()?;
+        let mut plan = self.load_plan(id)?;
+        let Some(entry) = board.plans.iter_mut().find(|e| e.id == id) else {
+            return Err(unknown(id));
+        };
+        require_open(entry)?;
+        entry.status = BoardStatus::Abandoned;
+        entry.closed_at_ms = Some(now_ms());
+        entry.abandon_reason = Some(collapse_whitespace(reason));
+        push_line(
+            &mut plan.progress,
+            format!("- {} abandoned: {}", today(), collapse_whitespace(reason)),
+        );
+        self.save_plan(id, &plan)?;
+        let view = board_plan(entry, &plan);
+        self.save_board(&board)?;
+        Ok(view)
+    }
+
+    /// The lead's volatile-tail section: one short line per open plan.
+    pub fn tail_summary(&self) -> String {
+        const SHOWN: usize = 8;
+        let open: Vec<BoardPlan> = self
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.status == BoardStatus::Open)
+            .collect();
+        let mut out = String::from("# PLAN BOARD\n");
+        if open.is_empty() {
+            out.push_str("No open plans.\n");
+            return out;
+        }
+        for plan in open.iter().take(SHOWN) {
+            let todo: Vec<String> = plan
+                .steps
+                .iter()
+                .filter(|s| !s.done)
+                .map(|s| s.number.to_string())
+                .collect();
+            let done = plan.steps.len() - todo.len();
+            out.push_str(&format!(
+                "- {} \"{}\" {done}/{} done; todo {}\n",
+                &plan.id,
+                clip(&plan.title, 60),
+                plan.steps.len(),
+                if todo.is_empty() {
+                    "none (closing)".to_string()
+                } else {
+                    todo.join(",")
+                }
+            ));
+        }
+        if open.len() > SHOWN {
+            out.push_str(&format!(
+                "- ... and {} more (plan_list)\n",
+                open.len() - SHOWN
+            ));
+        }
+        out
+    }
+
+    // ── internals ──────────────────────────────────────────────────────
+
+    fn guard(&self) -> MutexGuard<'_, ()> {
+        self.lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn load_board(&self) -> Result<BoardFile, String> {
+        match std::fs::read_to_string(self.plans_dir.join(BOARD_FILE)) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| format!("{BOARD_FILE} is not valid JSON: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BoardFile::default()),
+            Err(e) => Err(format!("could not read {BOARD_FILE}: {e}")),
+        }
+    }
+
+    fn save_board(&self, board: &BoardFile) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(board).map_err(|e| e.to_string())?;
+        let tmp = self.plans_dir.join(format!("{BOARD_FILE}.tmp"));
+        std::fs::write(&tmp, text)
+            .and_then(|_| std::fs::rename(&tmp, self.plans_dir.join(BOARD_FILE)))
+            .map_err(|e| format!("could not write {BOARD_FILE}: {e}"))
+    }
+
+    fn load_plan(&self, id: &str) -> Result<PlanFile, String> {
+        PlanFile::read_from_file(&self.plans_dir.join(format!("{id}.md")))
+            .map_err(|e| format!("could not read plan {id}: {e}"))
+    }
+
+    fn save_plan(&self, id: &str, plan: &PlanFile) -> Result<(), String> {
+        plan.write_to_dir(&self.plans_dir, id)
+            .map(|_| ())
+            .map_err(|e| format!("could not write plan {id}: {e}"))
+    }
+
+    fn load(&self, id: &str) -> Result<(BoardEntry, PlanFile), String> {
+        let entry = self
+            .load_board()?
+            .plans
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| unknown(id))?;
+        let plan = self.load_plan(id)?;
+        Ok((entry, plan))
+    }
+
+    /// An 8-hex id no plan file or board row uses.
+    fn fresh_id(&self, board: &BoardFile) -> String {
+        loop {
+            let id: String = uuid::Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect();
+            if !board.plans.iter().any(|e| e.id == id)
+                && !self.plans_dir.join(format!("{id}.md")).exists()
+            {
+                return id;
+            }
+        }
+    }
+
+    /// Under the lock: write the report and mark the plan closed. The inner
+    /// `Err` carries the report of a plan another call closed first.
+    fn write_closed(&self, id: &str, report: &str) -> Result<Result<String, String>, String> {
+        let mut board = self.load_board()?;
+        let Some(entry) = board.plans.iter_mut().find(|e| e.id == id) else {
+            return Err(unknown(id));
+        };
+        match entry.status {
+            BoardStatus::Open => {}
+            BoardStatus::Closed => {
+                return Ok(Err(entry.report_path.clone().unwrap_or_default()));
+            }
+            BoardStatus::Abandoned => return Err(format!("plan {id} was abandoned")),
+        }
+        let now = now_ms();
+        let name = format!("team-{id}-{}.md", report_stamp((now / 1000) as i64));
+        let path = self.reviews_dir.join(name);
+        std::fs::create_dir_all(&self.reviews_dir)
+            .and_then(|_| std::fs::write(&path, report))
+            .map_err(|e| {
+                format!(
+                    "could not write the review report '{}': {e}",
+                    path.display()
+                )
+            })?;
+        let report_path = path.to_string_lossy().into_owned();
+        entry.status = BoardStatus::Closed;
+        entry.closed_at_ms = Some(now);
+        entry.report_path = Some(report_path.clone());
+        self.save_board(&board)?;
+        Ok(Ok(report_path))
+    }
+
+    /// The PLAN:/BUG: digests. Best effort: the plan is already closed.
+    async fn capture(&self, id: &str, plan: &PlanFile) {
+        let Some(store) = &self.memory else {
+            return;
+        };
+        let repo_root = self
+            .plans_dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .filter(|root| !root.as_os_str().is_empty());
+        let result = crate::memory::finish_capture::capture_finish(
+            store.as_ref(),
+            plan,
+            id,
+            &self.plans_dir,
+            repo_root,
+            (now_ms() / 1000) as i64,
+            self.knowledge.clone(),
+        )
+        .await;
+        if let Err(e) = result {
+            eprintln!("plan board: capture for {id} failed: {e}");
+        }
+    }
+}
+
+fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
+    BoardPlan {
+        id: entry.id.clone(),
+        title: plan.title.clone(),
+        goal: plan.goal.clone(),
+        kind: plan.kind.to_string(),
+        status: entry.status,
+        closed_at_ms: entry.closed_at_ms,
+        report_path: entry.report_path.clone(),
+        steps: plan
+            .steps
+            .iter()
+            .map(|s| BoardStep {
+                number: s.index + 1,
+                header: s.header.clone(),
+                text: s.text.clone(),
+                done: s.done,
+            })
+            .collect(),
+    }
+}
+
+fn unknown(id: &str) -> String {
+    format!("unknown plan '{id}' — plan_list shows the board")
+}
+
+fn require_open(entry: &BoardEntry) -> Result<(), String> {
+    match entry.status {
+        BoardStatus::Open => Ok(()),
+        BoardStatus::Closed => Err(format!("plan {} is closed", entry.id)),
+        BoardStatus::Abandoned => Err(format!("plan {} was abandoned", entry.id)),
+    }
+}
+
+/// Single-line, non-empty step texts.
+fn clean_steps(steps: &[String]) -> Vec<String> {
+    steps
+        .iter()
+        .map(|s| collapse_whitespace(s))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The file paths a step's text names (`/`-normalized): tokens with a path
+/// separator or a code-file extension, minus URLs, a trailing `:line`, and
+/// surrounding punctuation or markdown.
+fn step_paths(text: &str) -> Vec<String> {
+    const EXTS: [&str; 18] = [
+        "rs", "ts", "tsx", "toml", "md", "json", "js", "jsx", "css", "html", "py", "go", "yml",
+        "yaml", "sql", "sh", "ps1", "svelte",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split_whitespace() {
+        let tok = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';' | '*' | '.' | ':'
+            )
+        });
+        if tok.is_empty() || tok.contains("://") || !tok.chars().any(|c| c.is_alphabetic()) {
+            continue;
+        }
+        let mut tok = tok.replace('\\', "/");
+        // Drop a trailing `:42` or `:42:7` location.
+        while let Some((head, tail)) = tok.rsplit_once(':') {
+            if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+                tok = head.to_string();
+            } else {
+                break;
+            }
+        }
+        let ext_ok = tok
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && EXTS.contains(&ext));
+        let has_sep = tok.contains('/') && tok.rsplit('/').next().is_some_and(|f| f.contains('.'));
+        if (ext_ok || has_sep) && !out.contains(&tok) {
+            out.push(tok);
+        }
+    }
+    out
+}
+
+/// Append one line to an optional section body.
+fn push_line(body: &mut Option<String>, line: String) {
+    match body {
+        Some(existing) => {
+            existing.push('\n');
+            existing.push_str(&line);
+        }
+        None => *body = Some(line),
+    }
+}
+
+/// `text` cut to `max` chars, with an ellipsis when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(max).collect::<String>())
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn today() -> String {
+    crate::tool::memory::format_epoch_date((now_ms() / 1000) as i64)
+}
+
+/// `YYYYMMDD-HHMMSS` (UTC) for a report file name. The crate has no chrono
+/// dependency; the date half reuses the memory tools' civil date formatter.
+fn report_stamp(secs: i64) -> String {
+    let date = crate::tool::memory::format_epoch_date(secs).replace('-', "");
+    let day_secs = secs.rem_euclid(86_400);
+    format!(
+        "{date}-{:02}{:02}{:02}",
+        day_secs / 3600,
+        day_secs % 3600 / 60,
+        day_secs % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::team_ledger::fake::FakeLedger;
+
+    const CONTEXT: &str =
+        "Why: the importer drops rows (src/import.rs).\n## Not a section\nConstraint: keep the CLI flags. Verify: cargo test.";
+
+    fn board(dir: &Path) -> PlanBoard {
+        PlanBoard::new(dir.join("plans"), dir.join("reviews"))
+    }
+
+    fn draft(title: &str) -> PlanDraft {
+        PlanDraft {
+            title: title.to_string(),
+            goal: "Ship the importer fix".to_string(),
+            context: CONTEXT.to_string(),
+            steps: vec![
+                "**Fix parser** — edit src/import.rs".to_string(),
+                "Add tests in tests/import.rs".to_string(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn create(board: &PlanBoard, title: &str) -> BoardPlan {
+        board.create(draft(title)).expect("create")
+    }
+
+    #[test]
+    fn plans_round_trip_through_the_board_and_the_mnemo1_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let a = create(&board, "Importer");
+        let b = create(&board, "Exporter");
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.id.len(), 8);
+        assert_eq!(a.status, BoardStatus::Open);
+        assert_eq!(a.steps[0].header.as_deref(), Some("Fix parser"));
+        assert_eq!(a.steps[1].number, 2);
+
+        let edited = board
+            .update(
+                &a.id,
+                PlanEdit {
+                    decision: Some("Keep the\nCLI flags".to_string()),
+                    context_append: Some("Also: windows paths.".to_string()),
+                    add_steps: vec!["Update the docs".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(edited.steps.len(), 3);
+        board.tick(&a.id, 0, "merged abc123").unwrap();
+
+        // Mnemo1's parser reads the same file: steps, kind, and context
+        // survive, and the new sections round-trip.
+        let path = dir.path().join("plans").join(format!("{}.md", a.id));
+        let parsed = PlanFile::read_from_file(&path).unwrap();
+        assert_eq!(parsed.title, "Importer");
+        assert_eq!(parsed.kind, PlanKind::Implementation);
+        assert_eq!(parsed.steps.len(), 3);
+        assert!(parsed.steps[0].done && !parsed.steps[1].done);
+        assert!(parsed.context.contains("\\## Not a section"));
+        assert!(parsed.context.contains("Also: windows paths."));
+        let decisions = parsed.decisions.clone().expect("decisions");
+        assert!(decisions.contains(": Keep the CLI flags"), "{decisions}");
+        assert!(parsed
+            .progress
+            .clone()
+            .expect("progress")
+            .contains("step 1 done: merged abc123"));
+        assert_eq!(
+            parsed.serialize(),
+            PlanFile::parse(&parsed.serialize()).unwrap().serialize()
+        );
+
+        // list: open plans in creation order.
+        let listed = board.list().unwrap();
+        assert_eq!(
+            listed.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec![a.id.clone(), b.id.clone()]
+        );
+        assert!(board.get(&a.id).unwrap().steps[0].done);
+        assert!(board.get("deadbeef").unwrap_err().contains("unknown plan"));
+        // board.json is the status record.
+        let json = std::fs::read_to_string(dir.path().join("plans/board.json")).unwrap();
+        assert!(json.contains("\"open\""), "{json}");
+    }
+
+    fn shared_file_plan(board: &PlanBoard) -> BoardPlan {
+        board
+            .create(PlanDraft {
+                steps: vec![
+                    "**Game logic** — implement src/game.js and tests/game.test.js".to_string(),
+                    "**UI** — render in src/ui.js, importing src/game.js".to_string(),
+                    "**Docs** — update README.md".to_string(),
+                ],
+                ..draft("Game")
+            })
+            .expect("create")
+    }
+
+    #[test]
+    fn interfaces_are_recorded_and_carried_into_briefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                interfaces: vec!["`src/game.js` — exports `Game` as a named export".to_string()],
+                ..draft("Game")
+            })
+            .unwrap();
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    interface: Some("`src/ui.js` — default export `render(game)`".to_string()),
+                    progress_note: Some("engine committed at abc123, review pending".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let parsed =
+            PlanFile::read_from_file(&dir.path().join("plans").join(format!("{}.md", plan.id)))
+                .unwrap();
+        let interfaces = parsed.interfaces.clone().expect("interfaces");
+        assert_eq!(interfaces.lines().count(), 2, "{interfaces}");
+        assert!(interfaces.contains("exports `Game` as a named export"));
+        let progress = parsed.progress.clone().expect("progress");
+        assert!(
+            progress.contains(": engine committed at abc123, review pending"),
+            "{progress}"
+        );
+
+        let brief = board.brief_for(&plan.id, 1).unwrap();
+        assert!(
+            brief.contains(
+                "## Interfaces
+- "
+            ),
+            "{brief}"
+        );
+        assert!(brief.contains("named export"), "{brief}");
+        assert!(brief.contains("message the lead"), "{brief}");
+        assert!(brief.contains("## Context"), "{brief}");
+        assert!(!brief.contains("## Progress"), "{brief}");
+        assert!(!brief.contains("engine committed"), "{brief}");
+        assert!(brief.find("## Interfaces").unwrap() < brief.find("## Steps").unwrap());
+
+        // A plan without contracts has neither the section nor the sentence.
+        let bare = create(&board, "Bare");
+        let brief = board.brief_for(&bare.id, 1).unwrap();
+        assert!(!brief.contains("Interfaces") && !brief.contains("message the lead"));
+    }
+
+    #[test]
+    fn contract_gate_requires_a_contract_for_shared_paths_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = shared_file_plan(&board);
+        let id = &plan.id;
+
+        // Nothing else in flight, re-dispatch of itself, unrelated step: pass.
+        board.contract_gate(id, 1, &[]).unwrap();
+        board.contract_gate(id, 1, &[1]).unwrap();
+        board.contract_gate(id, 2, &[0, 1]).unwrap();
+
+        // Shared src/game.js with step 1 in flight and no contract: refused.
+        let err = board.contract_gate(id, 1, &[0]).unwrap_err();
+        assert!(err.contains("`src/game.js`"), "{err}");
+        assert!(
+            err.contains("step 2 shares") && err.contains("with step 1"),
+            "{err}"
+        );
+        assert!(
+            err.contains("plan_update") && err.contains("`interface`"),
+            "{err}"
+        );
+        assert!(!err.contains("tests/game.test.js"), "{err}");
+
+        // A step that is not in flight is ignored.
+        board.contract_gate(id, 1, &[2]).unwrap();
+
+        // With the contract recorded, it passes.
+        board
+            .update(
+                id,
+                PlanEdit {
+                    interface: Some("`src/game.js` — exports `Game` (named)".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        board.contract_gate(id, 1, &[0]).unwrap();
+    }
+
+    #[test]
+    fn integration_step_is_appended_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = shared_file_plan(&board);
+        assert!(board.ensure_integration_step(&plan.id, &[1, 0]).unwrap());
+        assert!(!board.ensure_integration_step(&plan.id, &[1, 0]).unwrap());
+        let got = board.get(&plan.id).unwrap();
+        assert_eq!(got.steps.len(), 4);
+        assert_eq!(got.steps[3].header.as_deref(), Some("Integration check"));
+        assert!(!got.steps[3].done);
+        let md = board.read_markdown(&plan.id).unwrap();
+        assert_eq!(md.matches("Integration check").count(), 2, "{md}"); // step + decision
+        assert!(md.contains("because steps 2 and 1 ran in parallel"), "{md}");
+
+        // A done integration step still counts: no second one.
+        board.tick(&plan.id, 3, "verified").unwrap();
+        assert!(!board.ensure_integration_step(&plan.id, &[0, 1]).unwrap());
+        assert_eq!(board.get(&plan.id).unwrap().steps.len(), 4);
+    }
+
+    #[test]
+    fn create_validates_the_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let mut no_steps = draft("T");
+        no_steps.steps = vec!["  ".to_string()];
+        assert!(board
+            .create(no_steps)
+            .unwrap_err()
+            .contains("at least one step"));
+        let mut no_context = draft("T");
+        no_context.context = " ".to_string();
+        assert!(board.create(no_context).is_err());
+        let mut bug = draft("T");
+        bug.kind = PlanKind::BugFixing;
+        assert!(board.create(bug).unwrap_err().contains("bug symptom"));
+        assert!(board.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_applies_the_create_plan_resumability_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let mut thin = draft("T");
+        thin.context = "fix crash".to_string();
+        assert!(board
+            .create(thin)
+            .unwrap_err()
+            .contains("too thin to resume"));
+        let mut pathless = draft("T");
+        pathless.steps = vec!["Do the thing".to_string()];
+        assert!(board
+            .create(pathless)
+            .unwrap_err()
+            .contains("names no file path"));
+        let mut bug = draft("T");
+        bug.kind = PlanKind::BugFixing;
+        bug.bug = Some("rows vanish".to_string());
+        bug.context =
+            "Why: the importer drops rows in src/import.rs when a cell is empty.".to_string();
+        assert!(board
+            .create(bug)
+            .unwrap_err()
+            .contains("regression-test design"));
+        assert!(board.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn brief_for_composes_the_worker_header_and_refuses_bad_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                kind: PlanKind::BugFixing,
+                bug: Some("rows vanish".to_string()),
+                ..draft("Importer")
+            })
+            .unwrap();
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    decision: Some("use serde".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let brief = board.brief_for(&plan.id, 2).unwrap();
+        assert!(brief.contains("# Plan: Importer"));
+        assert!(brief.contains("Goal: Ship the importer fix"));
+        assert!(brief.contains("Kind: bug_fixing"));
+        assert!(brief.contains("Bug symptom: rows vanish"));
+        assert!(brief.contains("Constraint: keep the CLI flags."));
+        assert!(brief.contains("use serde"));
+        assert!(brief.contains("- [ ] 1. Fix parser"));
+        assert!(brief.contains("- [ ] 2. Add tests in tests/import.rs  <- your step"));
+        assert!(brief.contains("## Your step (2)\nAdd tests in tests/import.rs"));
+        assert!(brief.contains(&format!(
+            "You are working on step 2 of plan Importer ({}); other steps are handled separately.",
+            plan.id
+        )));
+
+        assert!(board
+            .brief_for("nope0000", 1)
+            .unwrap_err()
+            .contains("unknown plan"));
+        assert!(board
+            .brief_for(&plan.id, 0)
+            .unwrap_err()
+            .contains("no step 0"));
+        assert!(board
+            .brief_for(&plan.id, 3)
+            .unwrap_err()
+            .contains("no step 3"));
+        board.tick(&plan.id, 0, "done").unwrap();
+        assert!(board
+            .brief_for(&plan.id, 1)
+            .unwrap_err()
+            .contains("already done"));
+        assert!(board
+            .brief_for(&plan.id, 2)
+            .unwrap()
+            .contains("- [x] 1. Fix parser"));
+
+        board.abandon(&plan.id, "obsolete").unwrap();
+        assert!(board
+            .brief_for(&plan.id, 2)
+            .unwrap_err()
+            .contains("abandoned"));
+    }
+
+    #[test]
+    fn tick_untick_and_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = create(&board, "Importer");
+        assert!(board.tick(&plan.id, 0, "merged  abc\nreviewed").unwrap());
+        assert!(!board.tick(&plan.id, 0, "again").unwrap(), "already done");
+        assert!(board
+            .tick(&plan.id, 5, "x")
+            .unwrap_err()
+            .contains("no step 6"));
+        assert!(board.untick(&plan.id, 0, "reverted merge").unwrap());
+        assert!(!board.untick(&plan.id, 0, "again").unwrap(), "already open");
+        assert!(!board.get(&plan.id).unwrap().steps[0].done);
+        let text = board.read_markdown(&plan.id).unwrap();
+        assert!(text.contains("## Progress"), "{text}");
+        assert!(text.contains("step 1 done: merged abc reviewed"), "{text}");
+        assert!(text.contains("step 1 reopened: reverted merge"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn try_close_not_ready_blocked_and_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = create(&board, "Importer");
+
+        let passing = FakeLedger::passing();
+        board.tick(&plan.id, 0, "ok").unwrap();
+        let CloseOutcome::NotReady { reasons } = board.try_close(&plan.id, &passing).await else {
+            panic!("an undone step must not close");
+        };
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("step 2"), "{reasons:?}");
+
+        board.tick(&plan.id, 1, "ok").unwrap();
+        let blocked = FakeLedger::blocked(&["w1abcdef is working"]);
+        let CloseOutcome::Blocked { reasons } = board.try_close(&plan.id, &blocked).await else {
+            panic!("a blocked review must not close");
+        };
+        assert_eq!(reasons, vec!["w1abcdef is working".to_string()]);
+        assert_eq!(board.get(&plan.id).unwrap().status, BoardStatus::Open);
+        assert!(!dir.path().join("reviews").exists());
+
+        let CloseOutcome::Closed { report_path, .. } = board.try_close(&plan.id, &passing).await
+        else {
+            panic!("a ready plan closes");
+        };
+        let report = std::fs::read_to_string(&report_path).unwrap();
+        assert!(report.starts_with("## Verdict: PASS"));
+        let name = Path::new(&report_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with(&format!("team-{}-", plan.id)) && name.ends_with(".md"),
+            "{name}"
+        );
+        let closed = board.get(&plan.id).unwrap();
+        assert_eq!(closed.status, BoardStatus::Closed);
+        assert_eq!(closed.report_path.as_deref(), Some(report_path.as_str()));
+        assert!(closed.closed_at_ms.is_some());
+        // Closing again reports the same report; the plan stays on disk.
+        assert_eq!(
+            board.try_close(&plan.id, &passing).await,
+            CloseOutcome::Closed {
+                report_path: report_path.clone(),
+                retired_notes: 0,
+            }
+        );
+        assert!(dir
+            .path()
+            .join("plans")
+            .join(format!("{}.md", plan.id))
+            .exists());
+        assert!(board
+            .update(&plan.id, PlanEdit::default())
+            .unwrap_err()
+            .contains("closed"));
+
+        // Reverting a merged step reopens the plan.
+        assert!(board.untick(&plan.id, 1, "revert").unwrap());
+        let reopened = board.get(&plan.id).unwrap();
+        assert_eq!(reopened.status, BoardStatus::Open);
+        assert_eq!(reopened.report_path, None);
+    }
+
+    #[tokio::test]
+    async fn closing_retires_plan_scoped_notes_into_the_report() {
+        use crate::memory::{HashEmbedder, Memory, MemoryStore, MemoryTier};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let board = board(dir.path()).with_memory(store.clone());
+        let plan = create(&board, "Importer");
+        let mut note = Memory::new(
+            MemoryTier::Episodic,
+            "SPEC: game contract",
+            "src/game.js exports Game as a named export",
+            100,
+        );
+        note.data =
+            serde_json::json!({"plan_scoped": true, "plan_ids": [plan.id], "branch": false});
+        store.write(note).await.unwrap();
+        board.tick(&plan.id, 0, "ok").unwrap();
+        board.tick(&plan.id, 1, "ok").unwrap();
+        let CloseOutcome::Closed {
+            report_path,
+            retired_notes,
+        } = board.try_close(&plan.id, &FakeLedger::passing()).await
+        else {
+            panic!("expected a close");
+        };
+        assert_eq!(retired_notes, 1);
+        let report = std::fs::read_to_string(&report_path).unwrap();
+        assert!(report.starts_with("## Verdict: PASS"), "{report}");
+        assert!(
+            report.contains("## Plan notes (retired at close)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("exports Game as a named export"),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bug_fixing_plans_need_a_regression_test_to_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                kind: PlanKind::BugFixing,
+                bug: Some("rows vanish".to_string()),
+                context: format!(
+                    "{CONTEXT} Regression test: importer_keeps_rows in tests/import.rs fails without the fix."
+                ),
+                steps: vec!["Fix src/import.rs".to_string()],
+                ..draft("Bug")
+            })
+            .unwrap();
+        board.tick(&plan.id, 0, "merged").unwrap();
+        let ledger = FakeLedger::passing();
+        let CloseOutcome::Blocked { reasons } = board.try_close(&plan.id, &ledger).await else {
+            panic!("no regression test recorded");
+        };
+        assert!(reasons[0].contains("regression test"), "{reasons:?}");
+        assert!(reasons[0].contains("plan_update"), "{reasons:?}");
+
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    regression_test: Some("importer_keeps_rows".to_string()),
+                    landed_design: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let CloseOutcome::Blocked { reasons } = board.try_close(&plan.id, &ledger).await else {
+            panic!("landed design needs its context amendment");
+        };
+        assert!(reasons[0].contains("Landed design"), "{reasons:?}");
+
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    context_append: Some("Landed design — parser split in two.".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            board.try_close(&plan.id, &ledger).await,
+            CloseOutcome::Closed { .. }
+        ));
+    }
+
+    #[test]
+    fn abandon_closes_without_review_and_records_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = create(&board, "Importer");
+        let done = board
+            .abandon(&plan.id, "superseded by\nthe rewrite")
+            .unwrap();
+        assert_eq!(done.status, BoardStatus::Abandoned);
+        assert!(done.closed_at_ms.is_some());
+        assert!(board
+            .read_markdown(&plan.id)
+            .unwrap()
+            .contains("abandoned: superseded by the rewrite"));
+        assert!(board
+            .abandon(&plan.id, "again")
+            .unwrap_err()
+            .contains("abandoned"));
+        assert!(board.tick(&plan.id, 0, "x").is_err());
+    }
+
+    #[test]
+    fn list_orders_open_plans_before_recently_closed_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let first = create(&board, "First");
+        let second = create(&board, "Second");
+        let third = create(&board, "Third");
+        board.abandon(&first.id, "no").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        board.abandon(&third.id, "no").unwrap();
+        let ids: Vec<String> = board.list().unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![second.id, third.id, first.id]);
+    }
+
+    #[test]
+    fn tail_summary_is_compact_and_lists_undone_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        assert_eq!(board.tail_summary(), "# PLAN BOARD\nNo open plans.\n");
+        let plan = create(&board, "Importer");
+        board.tick(&plan.id, 0, "ok").unwrap();
+        let gone = create(&board, "Gone");
+        board.abandon(&gone.id, "no").unwrap();
+        assert_eq!(
+            board.tail_summary(),
+            format!(
+                "# PLAN BOARD\n- {} \"Importer\" 1/2 done; todo 2\n",
+                plan.id
+            )
+        );
+        for n in 0..9 {
+            create(&board, &format!("Extra {n}"));
+        }
+        let tail = board.tail_summary();
+        assert!(tail.contains("... and 2 more (plan_list)"), "{tail}");
+    }
+}

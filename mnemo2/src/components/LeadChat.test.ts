@@ -157,7 +157,7 @@ describe("LeadChat", () => {
     expect(container.querySelector(".lead-stream")?.lastElementChild?.classList.contains("lead-error")).toBe(true);
   });
 
-  it("shows approval and question interactions inline", () => {
+  it("docks an approval on the composer, outside the conversation", () => {
     setRuntime({
       pending: {
         kind: "approval",
@@ -171,10 +171,11 @@ describe("LeadChat", () => {
     expect(approve.disabled).toBe(false);
     expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Stop the lead" })).toBeTruthy();
-    expect(container.querySelector(".lead-stream")?.lastElementChild?.classList.contains("lead-pending")).toBe(true);
+    expect(container.querySelector(".lead-stream .lead-pending")).toBeNull();
+    expect(container.querySelector(".composer-dock .pending-prompt")).not.toBeNull();
   });
 
-  it("shows question options inline", () => {
+  it("docks a question with its options on the composer and keeps the chat readable", () => {
     setRuntime({
       pending: {
         kind: "question",
@@ -183,11 +184,35 @@ describe("LeadChat", () => {
         options: [{ label: "main" }, { label: "wt/mnemo" }],
       },
     });
-    render(LeadChat);
+    const { container } = render(LeadChat);
     expect(screen.getByText("Which branch should I target?")).toBeTruthy();
-    const main = screen.getByRole("button", { name: "main" }) as HTMLButtonElement;
+    expect(container.querySelector(".composer-dock .pending-prompt .markdown")).not.toBeNull();
+    expect(container.querySelector(".lead-scroll .lead-pending")).toBeNull();
+    const main = screen.getByRole("button", { name: /main/ }) as HTMLButtonElement;
     expect(main.disabled).toBe(false);
-    expect(screen.getByRole("button", { name: "wt/mnemo" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /wt\/mnemo/ })).toBeTruthy();
+  });
+
+  it("shows a free-form question and points to the composer for the answer", () => {
+    setRuntime({
+      pending: {
+        kind: "question",
+        question_id: "q-2",
+        question: "What should the first worker build?",
+      },
+    });
+    render(LeadChat);
+    expect(screen.getByText("What should the first worker build?")).toBeTruthy();
+    expect(screen.getByText("Type your answer below and send it.")).toBeTruthy();
+    expect(screen.queryByText("The lead needs input to continue.")).toBeNull();
+  });
+
+  it("names an unanswerable pending kind instead of a bare waiting-for-you banner", () => {
+    setRuntime({ pending: { kind: "policy_hook", hook_id: "hook-1" } });
+    render(LeadChat);
+    expect(screen.queryByText("WAITING FOR YOU")).toBeNull();
+    expect(screen.queryByText("The lead needs input to continue.")).toBeNull();
+    expect(screen.getByText(/paused on a policy hook/)).toBeTruthy();
   });
 
   it("renders human tool headlines and reveals the real details on expansion", async () => {
@@ -322,6 +347,20 @@ describe("LeadChat", () => {
     expect(container.querySelector(".thinking-status")).not.toBeNull();
   });
 
+  it("hides empty lead messages and spaces a tool run from the next message", () => {
+    setLeadEntries([
+      { id: "m1", kind: "message", author: "lead", time: "now", body: "Let me check." },
+      { id: "m2", kind: "message", author: "lead", time: "now", body: "  " },
+      toolEntry({ id: "t1", result: { success: true, output: "ok" } as never }),
+      { id: "m3", kind: "message", author: "lead", time: "now", body: "Done." },
+    ] as LeadEntry[]);
+    const { container } = render(LeadChat);
+    const messages = container.querySelectorAll(".chat-entry");
+    expect(messages).toHaveLength(2);
+    expect(messages[0].classList.contains("before-tool")).toBe(true);
+    expect(container.querySelector(".tool-activity-row")?.classList.contains("before-message")).toBe(true);
+  });
+
   it("connects only consecutive tool entries with an activity-run line", () => {
     setLeadEntries([
       toolEntry({ id: "tool-one", toolCallId: "one" }),
@@ -403,7 +442,7 @@ describe("LeadChat", () => {
     expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
   });
 
-  it("renders inline team updates and reviews as Markdown", async () => {
+  it("shows team updates and reviews as a headline that expands to Markdown", async () => {
     setLeadEntries([
       {
         id: "team-markdown",
@@ -421,8 +460,18 @@ describe("LeadChat", () => {
         body: "Finding `F-1` is **closed**.",
       },
     ]);
-    render(LeadChat);
+    const { container } = render(LeadChat);
     flushFrame();
+    await act();
+
+    const rows = [...container.querySelectorAll<HTMLDetailsElement>("details.event-row")];
+    expect(rows).toHaveLength(2);
+    expect(rows[1].querySelector("summary")?.textContent).toContain("Review complete");
+    expect(screen.queryByText("update")).toBeNull();
+    for (const row of rows) {
+      row.open = true;
+      row.dispatchEvent(new Event("toggle"));
+    }
     await act();
 
     expect((await screen.findByText("update")).tagName).toBe("STRONG");
@@ -452,6 +501,12 @@ describe("LeadChat", () => {
     render(LeadChat);
     flushFrame();
     await act();
+
+    // The detailed evidence lives inside the collapsible review event.
+    const maraSummary = (await screen.findByText("Lead review recorded"))
+      .closest("summary");
+    expect(maraSummary).not.toBeNull();
+    await fireEvent.click(maraSummary!);
 
     expect(await screen.findByText("High risk")).toBeTruthy();
     expect(screen.getByText(/Independent audit linked at the reviewed tip/)).toBeTruthy();
@@ -486,7 +541,38 @@ describe("LeadChat", () => {
     flushFrame();
     await act();
 
+    // Legacy evidence is expanded detail, not part of the collapsed headline.
+    const legacySummary = (await screen.findByText("Lead review recorded"))
+      .closest("summary");
+    expect(legacySummary).not.toBeNull();
+    await fireEvent.click(legacySummary!);
+
     expect(await screen.findByText(/Legacy review · structured evidence is missing/)).toBeTruthy();
+  });
+
+  it("says which workers an idle lead is waiting on", () => {
+    setRuntime({ busy: false });
+    app.update((state) => ({
+      ...state,
+      workers: fixtureState().workers.slice(0, 2).map((worker, index) => ({
+        ...worker,
+        status: index === 0 ? "working" : "merged",
+      })),
+    }));
+    const name = fixtureState().workers[0].name;
+    render(LeadChat);
+    expect(document.body.textContent).toContain(`Waiting on ${name}. The lead picks up when it finishes.`);
+    setRuntime({ busy: true });
+  });
+
+  it("shows no waiting line while the lead is working", () => {
+    setRuntime({ busy: true });
+    app.update((state) => ({
+      ...state,
+      workers: fixtureState().workers.map((worker) => ({ ...worker, status: "working" })),
+    }));
+    render(LeadChat);
+    expect(screen.queryByText(/Waiting on/)).toBeNull();
   });
 
   it("uses the available lead width instead of a centered fixed column", () => {

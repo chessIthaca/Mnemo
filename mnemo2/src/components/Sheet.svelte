@@ -8,12 +8,15 @@
     open,
     title,
     eyebrow = "",
+    wide = false,
     onclose,
     children,
   }: {
     open: boolean;
     title: string;
     eyebrow?: string;
+    /** A large, edge-to-edge body for multi-pane dialogs. */
+    wide?: boolean;
     onclose: () => void;
     children?: Snippet;
   } = $props();
@@ -85,7 +88,7 @@
 {#if open}
   <div class="sheet-layer">
     <button class="sheet-backdrop" aria-label="Close sheet" tabindex="-1" onclick={onclose}></button>
-    <div class="sheet" role="dialog" aria-modal="true" aria-label={title} bind:this={sheetEl}>
+    <div class="sheet" class:wide role="dialog" aria-modal="true" aria-label={title} bind:this={sheetEl}>
       <header>
         <div>
           {#if eyebrow}<p>{eyebrow}</p>{/if}
@@ -93,7 +96,7 @@
         </div>
         <button class="icon-button" aria-label="Close" bind:this={closeButton} onclick={onclose}><X size={16} /></button>
       </header>
-      <div class="sheet-body">{@render children?.()}</div>
+      <div class="sheet-body" class:wide>{@render children?.()}</div>
     </div>
   </div>
 {/if}
@@ -106,5 +109,8 @@
   header p { margin: 0 0 4px; color: var(--muted); font-size: 7px; letter-spacing: 0.11em; }
   header h2 { margin: 0; font-family: var(--font-prose); font-size: 25px; font-weight: 550; }
   .sheet-body { overflow-y: auto; padding: 4px 20px 20px; }
+  .sheet.wide { width: min(960px, calc(100vw - 32px)); height: min(680px, calc(100vh - 48px)); max-height: none; }
+  .sheet.wide header { padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .sheet-body.wide { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; padding: 0; }
   @media (max-width: 560px) { .sheet { top: auto; bottom: 0; left: 0; width: 100%; max-height: 82vh; border-radius: 18px 18px 0 0; transform: none; } }
 </style>

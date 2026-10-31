@@ -4,7 +4,9 @@
   import { actions, app } from "../lib/store";
   import Composer from "./Composer.svelte";
   import Markdown from "./Markdown.svelte";
+  import EventRow from "./EventRow.svelte";
   import MergeCard from "./MergeCard.svelte";
+  import PendingPrompt from "./PendingPrompt.svelte";
   import ToolActivity from "./ToolActivity.svelte";
   import ElapsedTime from "./ElapsedTime.svelte";
 
@@ -21,6 +23,21 @@
       !$app.leadRuntime.pending &&
       !$app.leadRuntime.error &&
       !runningTool,
+  );
+
+  // A lead message with no text (the model often emits one right before a
+  // tool call) would only add a gap.
+  const entries = $derived(
+    $app.leadEntries.filter((entry) => !(entry.kind === "message" && entry.author === "lead" && !entry.body.trim())),
+  );
+
+  // The lead ends its turn while workers run; TeamManager wakes it when one
+  // finishes. Say so, so an idle lead does not read as a stalled one.
+  const runningWorkers = $derived(
+    $app.workers.filter((worker) => ["dispatching", "working", "fixing"].includes(worker.status)),
+  );
+  const showWaiting = $derived(
+    !$app.leadRuntime.busy && !$app.leadRuntime.pending && !$app.leadRuntime.error && runningWorkers.length > 0,
   );
 
   let scroller: HTMLDivElement;
@@ -72,11 +89,14 @@
     <div class="lead-content">
       <div class="lead-stream" bind:this={content}>
       <div class="lead-entries">
-        {#each $app.leadEntries as entry, index (entry.id)}
+        {#each entries as entry, index (entry.id)}
           {#if entry.kind === "message"}
-            <article class:user-entry={entry.author === "user"} class="chat-entry">
+            <article
+              class:user-entry={entry.author === "user"}
+              class:before-tool={entries[index + 1]?.kind === "tool"}
+              class="chat-entry"
+            >
               {#if entry.author === "lead"}
-                <div class="entry-label">LEAD</div>
                 <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
               {:else}
                 {#if entry.body}<p>{entry.body}</p>{/if}
@@ -91,49 +111,54 @@
               {/if}
             </article>
           {:else if entry.kind === "tool"}
-            <div class="tool-activity-row" class:tool-connected={$app.leadEntries[index + 1]?.kind === "tool"}>
+            <div
+              class="tool-activity-row"
+              class:tool-connected={entries[index + 1]?.kind === "tool"}
+              class:before-message={entries[index + 1]?.kind === "message"}
+            >
               <ToolActivity {entry} />
             </div>
           {:else if entry.kind === "team-message"}
-            {@const worker = $app.workers.find((item) => item.id === entry.workerId)}
-            <article class="team-card">
-              <div class="team-card-heading">
-                <span class="team-card-icon"><MessageSquareText size={15} /></span>
-                <div><strong>{worker?.name ?? "Worker"} sent an update</strong><span>TEAM MESSAGE · {entry.time}</span></div>
+            {@const name = $app.workers.find((item) => item.id === entry.workerId)?.name ?? entry.workerName ?? entry.workerId}
+            <EventRow label={`${name} sent an update`}>
+              {#snippet icon()}<MessageSquareText size={13} />{/snippet}
+              {#snippet heading()}{name} sent an update{/snippet}
+              <div class="event-detail">
+                <span class="event-time">{entry.time}</span>
+                <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
+                <button onclick={() => actions.selectWorker(entry.workerId)}>Open {name}’s thread <ArrowUpRight size={13} /></button>
               </div>
-              <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
-              <button onclick={() => actions.selectWorker(entry.workerId)}>Open worker thread <ArrowUpRight size={13} /></button>
-            </article>
+            </EventRow>
           {:else if entry.kind === "review"}
             {@const worker = $app.workers.find((item) => item.id === entry.workerId)}
             {@const evidence = worker?.review?.evidence}
-            <article class="team-card review-card">
-              <div class="team-card-heading">
-                <span class="team-card-icon"><ClipboardCheck size={15} /></span>
-                <div>
-                  <strong>{entry.title}</strong>
-                  <span>LEAD REVIEW · {entry.time}</span>
-                  {#if worker?.reviewRisk === "high"}
-                    <span class="review-risk" data-risk="high">High risk</span>
-                  {/if}
-                </div>
+            {@const name = worker?.name ?? entry.workerName ?? entry.workerId}
+            <EventRow
+              tone="review"
+              label={entry.title.includes(name) ? entry.title : `${entry.title} · ${name}`}
+            >
+              {#snippet icon()}<ClipboardCheck size={13} />{/snippet}
+              {#snippet heading()}{entry.title}{#if !entry.title.includes(name)}<span class="event-subject">{` · ${name}`}</span>{/if}{/snippet}
+              <div class="event-detail">
+                <span class="event-time">{entry.time}</span>
+                {#if worker?.reviewRisk === "high"}
+                  <span class="review-risk" data-risk="high">High risk</span>
+                  <p class="review-audit" data-audited={Boolean(evidence?.independentReviewerId)}>
+                    {#if evidence?.independentReviewerId}
+                      Independent audit linked at the reviewed tip.
+                    {:else}
+                      No independent audit linked yet — this merge is blocked until the lead adjudicates one.
+                    {/if}
+                  </p>
+                {:else if worker?.review && !evidence}
+                  <p class="review-audit" data-audited="legacy">
+                    Legacy review · structured evidence is missing, so a fresh review is required before merge.
+                  </p>
+                {/if}
+                <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
+                <button onclick={() => actions.selectWorker(entry.workerId)}>Review {name}’s delta <ArrowUpRight size={13} /></button>
               </div>
-              <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
-              {#if worker && worker.reviewRisk === "high"}
-                <p class="review-audit" data-audited={Boolean(evidence?.independentReviewerId)}>
-                  {#if evidence?.independentReviewerId}
-                    Independent audit linked at the reviewed tip.
-                  {:else}
-                    No independent audit linked yet — this merge is blocked until the lead adjudicates one.
-                  {/if}
-                </p>
-              {:else if worker?.review && !evidence}
-                <p class="review-audit" data-audited="legacy">
-                  Legacy review · structured evidence is missing, so a fresh review is required before merge.
-                </p>
-              {/if}
-              <button onclick={() => actions.selectWorker(entry.workerId)}>Review {worker?.name ?? "worker"}’s delta <ArrowUpRight size={13} /></button>
-            </article>
+            </EventRow>
           {:else if entry.kind === "merge"}
             <MergeCard {entry} />
           {/if}
@@ -145,6 +170,12 @@
             {#if $app.leadRuntime.turnStartedAtMs !== null}
               <ElapsedTime startedAtMs={$app.leadRuntime.turnStartedAtMs} />
             {/if}
+          </div>
+        {/if}
+        {#if showWaiting}
+          <div class="thinking-status waiting-status" role="status" aria-live="polite">
+            <span class="thinking-dot" aria-hidden="true"></span>
+            <span>{`Waiting on ${runningWorkers.map((worker) => worker.name).join(", ")}. The lead picks up when ${runningWorkers.length === 1 ? "it finishes" : "one finishes"}.`}</span>
           </div>
         {/if}
       </div>
@@ -163,37 +194,22 @@
         </article>
       {/if}
 
-      {#if $app.leadRuntime.pending}
+      {#if $app.leadRuntime.pending && !["question", "approval"].includes($app.leadRuntime.pending.kind)}
         {@const pending = $app.leadRuntime.pending}
         <article class="lead-notice lead-pending" role="status">
-          {#if pending.kind === "approval"}
-            <div class="notice-label">APPROVAL REQUIRED</div>
-            <p>{pending.tool_name ? `${pending.tool_name} is waiting for approval.` : "A gated action is waiting for approval."}</p>
-            <div class="notice-actions">
-              <button class="button button-primary" disabled={!pending.request_id} onclick={() => pending.request_id && actions.approveLead(pending.request_id, "approve")}>Approve</button>
-              <button class="button button-quiet" disabled={!pending.request_id} onclick={() => pending.request_id && actions.approveLead(pending.request_id, "deny")}>Deny</button>
-            </div>
-          {:else if pending.kind === "question"}
-            <div class="notice-label">QUESTION</div>
-            <p>{pending.question ?? "The lead needs an answer."}</p>
-            <div class="notice-actions">
-              {#each pending.options ?? [] as option, index}
-                <button class="button button-quiet" disabled={!pending.question_id} onclick={() => pending.question_id && actions.answerLead(pending.question_id, { kind: "choice", index })}>{option.label}</button>
-              {/each}
-            </div>
-          {:else if pending.kind === "host_tool_call"}
+          {#if pending.kind === "host_tool_call"}
             <div class="notice-label">TEAM WORK IN PROGRESS</div>
             <p>The team runtime is executing {pending.tool_name ?? "a host tool"}. No approval response is required.</p>
           {:else}
-            <div class="notice-label">WAITING FOR YOU</div>
-            <p>The lead needs input to continue.</p>
+            <div class="notice-label">PAUSED</div>
+            <p>The lead is paused on a {String(pending.kind).replaceAll("_", " ")} that has no answer control here. Stop the turn to continue.</p>
           {/if}
         </article>
       {/if}
       </div>
     </div>
   </div>
-  <footer class="composer-dock"><Composer /></footer>
+  <footer class="composer-dock"><PendingPrompt /><Composer /></footer>
 </section>
 
 <style>
@@ -202,11 +218,15 @@
   .lead-content { width: 100%; min-width: 0; margin: 0; padding: 22px 32px 18px; }
   .lead-stream { display: flow-root; min-width: 0; }
   .chat-entry { margin: 0 0 16px; }
+  /* A tool run reads as part of the message that started it: keep it close,
+     then give the next message room to start fresh. */
+  .chat-entry.before-tool:not(.user-entry) { margin-bottom: 6px; }
+  .chat-entry :global(.markdown > :last-child) { margin-bottom: 0; }
   .chat-entry:not(.user-entry) { margin-left: 14px; }
   .chat-entry :global(.markdown p), .chat-entry :global(.markdown li), .chat-entry :global(.markdown blockquote) { max-width: 100ch; }
-  .entry-label { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: 0.08em; }
   .thinking-status { display: flex; align-items: center; gap: 6px; margin: 6px 0 12px 30px; color: var(--muted); font-size: 10px; }
   .thinking-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: thinking-pulse 1.2s ease-in-out infinite; }
+  .waiting-status .thinking-dot { animation-duration: 2.4s; }
   @keyframes thinking-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
   .user-entry { max-width: 100ch; margin: 20px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--line-strong); }
   .user-entry p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
@@ -214,17 +234,13 @@
   .user-images img { width: 72px; height: 72px; border: 1px solid var(--line); border-radius: 10px; object-fit: cover; }
   .user-meta { margin-top: 4px; color: var(--muted); font-size: 8px; letter-spacing: 0.08em; text-align: left; }
   .tool-activity-row { position: relative; min-width: 0; margin-left: 30px; }
+  .tool-activity-row.before-message { margin-bottom: 18px; }
   .tool-activity-row.tool-connected::after { position: absolute; top: 24px; bottom: 0; left: 9px; border-left: 1px dotted var(--line-strong); content: ""; pointer-events: none; }
-  .team-card { margin: 10px 0 10px 30px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
-  .team-card-heading { display: flex; align-items: center; gap: 10px; }
-  .team-card-icon { display: grid; width: 29px; height: 29px; place-items: center; border-radius: 9px; background: var(--surface); color: var(--accent-strong); }
-  .team-card-heading strong, .team-card-heading span { display: block; }
-  .team-card-heading strong { font-size: 11px; font-weight: 650; }
-  .team-card-heading div > span { margin-top: 3px; color: var(--muted); font-size: 7px; letter-spacing: 0.08em; }
-  .team-card :global(.markdown) { margin: 9px 0; color: var(--ink-soft); font-size: 14px; line-height: 1.55; }
-  .team-card button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 9px; font-weight: 650; }
-  .review-card { background: #f4f2ed; }
-  .review-risk { display: inline-block; margin-top: 4px; padding: 2px 6px; border-radius: 5px; background: #f4e4e1; color: var(--danger); font-size: 7px; font-weight: 650; letter-spacing: 0.04em; }
+  .event-detail :global(.markdown) { margin: 4px 0 8px; color: var(--ink-soft); font-size: 13px; line-height: 1.55; }
+  .event-detail button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 10px; font-weight: 650; }
+  .event-time { color: var(--muted); font-size: 9px; }
+  .event-subject { color: var(--muted); font-weight: 500; }
+  .review-risk { display: inline-block; margin: 0 0 6px; padding: 2px 6px; border-radius: 5px; background: #f4e4e1; color: var(--danger); font-size: 7px; font-weight: 650; letter-spacing: 0.04em; }
   .review-audit { margin: 0 0 9px; padding: 6px 9px; border-radius: 8px; background: var(--surface); color: var(--muted); font-size: 9px; line-height: 1.45; }
   .review-audit[data-audited="true"] { color: var(--accent-strong); }
   .review-audit[data-audited="false"], .review-audit[data-audited="legacy"] { color: var(--warning); }
@@ -242,6 +258,6 @@
     .composer-dock { padding: 10px 16px 72px; }
   }
   @media (max-width: 560px) {
-    .chat-entry:not(.user-entry), .tool-activity-row, .team-card { margin-left: 0; }
+    .chat-entry:not(.user-entry), .tool-activity-row { margin-left: 0; }
   }
 </style>

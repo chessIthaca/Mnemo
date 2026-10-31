@@ -32,7 +32,8 @@ export interface BrowserTransport {
   history(direction: "back" | "forward"): Promise<void>;
   reload(): Promise<void>;
   setRect(rect: BrowserRect): Promise<void>;
-  setVisible(visible: boolean): Promise<void>;
+  /** `seq` orders requests so a late, older one can never win natively. */
+  setVisible(visible: boolean, seq?: number): Promise<void>;
   overlay(enter: boolean): Promise<void>;
   close(): Promise<void>;
   openExternal(url: string): Promise<void>;
@@ -49,7 +50,7 @@ export function createTauriBrowserTransport(bindings: BrowserTransportBindings):
     history: (direction) => bindings.invoke<void>("browser_history", { direction }),
     reload: () => bindings.invoke<void>("browser_reload"),
     setRect: (rect) => bindings.invoke<void>("browser_set_rect", { ...rect }),
-    setVisible: (visible) => bindings.invoke<void>("browser_set_visible", { visible }),
+    setVisible: (visible, seq) => bindings.invoke<void>("browser_set_visible", { visible, seq: seq ?? null }),
     overlay: (enter) => bindings.invoke<void>("browser_overlay", { enter }),
     close: () => bindings.invoke<void>("browser_close"),
     openExternal: (url) => bindings.invoke<void>("browser_open_external", { url }),

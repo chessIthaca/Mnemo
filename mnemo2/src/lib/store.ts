@@ -3,10 +3,21 @@ import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } fr
 import { createProjectTransport, type ProjectPreferences, type ProjectRecord, type ProjectTransport } from "./projectEngine";
 import { probeMnemo2Host } from "./runtime";
 import { createTeamTransport, type TeamTransport } from "./teamEngine";
+import { createBoardTransport, type BoardTransport } from "./boardEngine";
+import { createIndexingTransport, newerIndexing, type IndexingSnapshot, type IndexingTransport } from "./indexingEngine";
+import { boardFromSnapshot } from "./boardState";
 import { createWorkbenchTransport, type WorkbenchTransport } from "./workbenchEngine";
 import { createBrowserTransport, type BrowserTransport } from "./browserEngine";
 import { workerScreenshotPaths } from "./workbenchState";
 import {
+  applyWorkerLiveEvent,
+  emptyWorkerLive,
+  STREAM_ONLY_EVENTS,
+  workerThreadFromRecord,
+  type WorkerLive,
+} from "./workerThread";
+import {
+  deletionDiscardsWork,
   emptyProjectUsage,
   findingFromWire,
   findingToWire,
@@ -14,7 +25,10 @@ import {
   reviewEvidenceFrom,
   reviewEvidenceToWire,
   reviewRiskFrom,
+  waitsOnUser,
+  workerDisplayName,
   workerKindFrom,
+  type TeamEvent,
   type TeamMergeRecord,
   type TeamMessage,
   type TeamWorkerRecord,
@@ -25,8 +39,8 @@ import {
   initialLeadRuntime,
   leadEventAffectsUsage,
   leadEventNeedsSnapshot,
-  messageText,
 } from "./leadState";
+import { insertActivityCard, type ActivityCard } from "./teamActivity";
 import type {
   AppState,
   Check,
@@ -54,12 +68,25 @@ let teamTransport: TeamTransport | null = null;
 let teamUnlisten: (() => void) | null = null;
 let teamToken = 0;
 let teamSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let boardTransport: BoardTransport | null = null;
+let boardUnlisten: (() => void) | null = null;
+let boardToken = 0;
+let boardSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let indexingTransport: IndexingTransport | null = null;
+let indexingUnlisten: (() => void) | null = null;
+let indexingToken = 0;
 let workbenchTransport: WorkbenchTransport | null = null;
 let diffRequest = 0;
 let diffSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let browserTransport: BrowserTransport | null = null;
 let browserUnlisten: (() => void)[] = [];
 let browserToken = 0;
+/** Orders native visibility requests (see `browser_set_visible`). */
+let browserVisibilitySeq = 0;
+/** Whether the mounted Browser tab wants its native pane on screen. */
+let browserTabWantsPane = false;
+/** The visibility last sent to the native pane. */
+let browserPaneShown = false;
 let preferenceSave: {
   projectId: string;
   workspaceRoot: string;
@@ -84,6 +111,8 @@ async function disconnectWorkbench(): Promise<void> {
   browserUnlisten = [];
   const browser = browserTransport;
   browserTransport = null;
+  browserTabWantsPane = false;
+  browserPaneShown = false;
   if (browser) await browser.close().catch(() => {});
 }
 
@@ -206,14 +235,17 @@ export function createInitialState(): AppState {
     browserImage: null,
     plan: null,
     planItems: [],
+    board: [],
     diff: null,
     diffFiles: [],
     diffWorkerId: null,
     diffLoading: false,
     diffError: null,
     projectConflict: null,
+    indexing: null,
     cleanupProjectId: null,
     cleanupBusy: false,
+    workerDeletion: null,
     closeProjectPending: false,
     newProjectParent: null,
     creatingProject: false,
@@ -222,6 +254,39 @@ export function createInitialState(): AppState {
 }
 
 export const app = writable<AppState>(createInitialState());
+
+/**
+ * Whether the layout leaves room for the native Browser pane. The pane is an
+ * OS window above the whole UI, so it may only show on the open Browser tab
+ * of the Lead view with no drawer, sheet, or preview over it.
+ */
+function browserPaneAllowed(state: AppState): boolean {
+  return (
+    state.route === "lead" &&
+    state.workbenchOpen &&
+    state.workbenchTab === "browser" &&
+    !state.teamPeekOpen &&
+    !state.browserImage
+  );
+}
+
+/** Send the pane's desired visibility as a new, ordered request. */
+function pushBrowserVisibility(): Promise<void> {
+  const wanted = browserTabWantsPane && browserPaneAllowed(get(app));
+  browserPaneShown = wanted;
+  const seq = ++browserVisibilitySeq;
+  return browserCommand((transport) => transport.setVisible(wanted, seq));
+}
+
+// The layout, not a component's mount/unmount, has the final say: any change
+// that covers the Browser tab (another tab, the team drawer, the Team view,
+// a closed workbench) hides the pane, and uncovering it shows it again.
+app.subscribe((state) => {
+  if (!browserTransport) return;
+  if ((browserTabWantsPane && browserPaneAllowed(state)) !== browserPaneShown) {
+    void pushBrowserVisibility();
+  }
+});
 
 export const currentProject = derived(app, ($app) =>
   $app.projects.find((project) => project.id === $app.projectId) ?? null,
@@ -377,13 +442,18 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
   leadSessionToken += 1;
   await stopNativeLead();
   await disconnectTeam();
+  await disconnectBoard();
+  disconnectIndexing();
   await disconnectWorkbench();
   app.update((state) => ({
     ...state,
+    board: [],
     route: "lead",
     projectId,
     projectConflict: null,
+    indexing: null,
     cleanupProjectId: null,
+    workerDeletion: null,
     closeProjectPending: false,
     leadRuntime: initialLeadRuntime(),
     leadDraft: { text: "", images: [] },
@@ -410,16 +480,16 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
     browserImage: null,
     toast: null,
   }));
-  // Dependent startup IPC (the team snapshot and event subscription) is
-  // rejected by the native host with "Mnemo2 has no open lead; call lead_open
-  // first" until the automatic lead open has completed, so the lead opens
-  // first — ordering only: no timers, no retries, and the backend guard stays
-  // for real misuse. A genuine lead-open failure is already surfaced on the
-  // lead runtime by connectNativeLead.
+  // Dependent startup IPC is rejected until the automatic lead open has
+  // completed, so the lead opens first — no timers, retries, or redundant
+  // user action. A genuine lead-open failure is already surfaced on the lead
+  // runtime by connectNativeLead.
   await connectNativeLead(project, allowConflict);
   // A project switch during the lead open owns the rest of the startup.
   if (get(app).projectId !== projectId) return;
-  await connectTeam();
+  await Promise.all([connectTeam(), connectBoard(), connectIndexing()]);
+  // The runtime (and its indexing status) exists once the lead has opened.
+  await syncIndexing();
   await syncTeam();
   await restoreWorkbench(project);
 }
@@ -470,14 +540,19 @@ async function closeProjectNow(): Promise<void> {
   leadSessionToken += 1;
   await stopNativeLead();
   await disconnectTeam();
+  await disconnectBoard();
+  disconnectIndexing();
   await disconnectWorkbench();
   app.update((state) => ({
     ...state,
+    board: [],
     route: "start",
     projectId: null,
     projectConflict: null,
+    indexing: null,
     cleanupProjectId: null,
     cleanupBusy: false,
+    workerDeletion: null,
     closeProjectPending: false,
     newProjectParent: null,
     creatingProject: false,
@@ -862,7 +937,8 @@ function setBrowserRect(rect: Parameters<BrowserTransport["setRect"]>[0]): Promi
 }
 
 function setBrowserVisible(visible: boolean): Promise<void> {
-  return browserCommand((transport) => transport.setVisible(visible));
+  browserTabWantsPane = visible;
+  return pushBrowserVisibility();
 }
 
 function browserOverlay(enter: boolean): void {
@@ -1194,7 +1270,7 @@ async function answerLead(
   return true;
 }
 
-function setLeadModel(spec: string) {
+function setLeadModel(spec: string, reasoningEffort: string | null = null) {
   const transport = leadTransport;
   if (!transport) return;
   const state = get(app);
@@ -1206,7 +1282,7 @@ function setLeadModel(spec: string) {
   }
   const token = leadSessionToken;
   void transport
-    .setModel(spec)
+    .setModel(spec, reasoningEffort)
     .then((snapshot) => {
       if (token === leadSessionToken) {
         app.update((current) => applyLeadSnapshot(current, snapshot));
@@ -1258,17 +1334,26 @@ function steerWorker(workerId: string) {
   );
 }
 
-async function dispatchWorker(brief: string, model?: string | null): Promise<void> {
+/** Dispatch on a board plan step (1-based); false when the host refused it. */
+async function dispatchWorker(
+  brief: string,
+  planId: string,
+  step: number,
+  model?: string | null,
+  reasoningEffort?: string | null,
+): Promise<boolean> {
   const transport = requireTeam();
-  if (!transport) return;
+  if (!transport) return false;
   const task = brief.trim();
-  if (!task) return;
+  if (!task || !planId) return false;
   try {
-    await transport.dispatch(task, model ?? null);
-    await syncTeam();
+    await transport.dispatch(task, planId, step, model ?? null, null, reasoningEffort ?? null);
   } catch (error) {
     noteTeamError(error);
+    return false;
   }
+  await syncTeam();
+  return true;
 }
 
 function stopWorker(workerId: string) {
@@ -1278,6 +1363,63 @@ function stopWorker(workerId: string) {
     .stop(workerId)
     .then(() => syncTeam())
     .catch(noteTeamError);
+}
+
+/** Statuses of workers whose task is over — what "Delete old workers" offers. */
+export const OLD_WORKER_STATUSES: WorkerStatus[] = ["merged", "cancelled", "stopped", "interrupted", "failed"];
+
+/** Ask what deleting these workers removes, then open the confirmation. */
+async function requestDeleteWorkers(workerIds: string[]): Promise<void> {
+  const transport = requireTeam();
+  if (!transport || workerIds.length === 0) return;
+  try {
+    const previews = await transport.deletePreview(workerIds);
+    app.update((state) => ({ ...state, workerDeletion: { previews, busy: false } }));
+  } catch (error) {
+    noteTeamError(error);
+  }
+}
+
+/** Offer to delete every worker whose task is over. */
+async function requestDeleteOldWorkers(): Promise<void> {
+  const ids = get(app).workers
+    .filter((worker) => OLD_WORKER_STATUSES.includes(worker.status))
+    .map((worker) => worker.id);
+  if (ids.length === 0) {
+    app.update((state) => withToast(state, "There are no old workers to delete."));
+    return;
+  }
+  await requestDeleteWorkers(ids);
+}
+
+function cancelDeleteWorkers(): void {
+  if (!get(app).workerDeletion?.busy) app.update((state) => ({ ...state, workerDeletion: null }));
+}
+
+/** Delete the confirmed workers; blocked ones are left in place. */
+async function confirmDeleteWorkers(): Promise<void> {
+  const request = get(app).workerDeletion;
+  const transport = requireTeam();
+  if (!request || request.busy || !transport) return;
+  const deletable = request.previews.filter((preview) => preview.blocked === null);
+  if (deletable.length === 0) return;
+  app.update((state) => ({
+    ...state,
+    workerDeletion: state.workerDeletion ? { ...state.workerDeletion, busy: true } : null,
+  }));
+  try {
+    await transport.deleteWorkers(
+      deletable.map((preview) => preview.worker_id),
+      deletable.some(deletionDiscardsWork),
+    );
+    app.update((state) => withToast(
+      { ...state, workerDeletion: null },
+      `Deleted ${deletable.length} worker${deletable.length === 1 ? "" : "s"} and ${deletable.length === 1 ? "its" : "their"} history.`,
+    ));
+  } catch (error) {
+    app.update((state) => withToast({ ...state, workerDeletion: null }, `Delete failed: ${leadError(error)}`));
+  }
+  await syncTeam();
 }
 
 function pauseWorker(workerId: string) {
@@ -1296,6 +1438,22 @@ function resumeWorker(workerId: string) {
     .resume(workerId)
     .then(() => syncTeam())
     .catch(noteTeamError);
+}
+
+/** Move a worker to another model; it comes back idle with its transcript. */
+async function setWorkerModel(workerId: string, model: string, reasoningEffort: string | null): Promise<void> {
+  const transport = requireTeam();
+  if (!transport) return;
+  try {
+    const record = await transport.setModel(workerId, model, reasoningEffort);
+    app.update((state) => withToast(
+      state,
+      `${workerDisplayName(record.id, record.name)} now runs on ${model}. Message it to continue.`,
+    ));
+  } catch (error) {
+    noteTeamError(error);
+  }
+  await syncTeam();
 }
 
 async function compactWorker(workerId: string): Promise<void> {
@@ -1433,29 +1591,6 @@ function mergeFromRecord(worker: TeamWorkerRecord, merge: TeamMergeRecord): Merg
   };
 }
 
-function workerMessages(record: TeamWorkerRecord, messages: TeamMessage[]): Worker["messages"] {
-  const transcript: Worker["messages"] = [];
-  record.transcript.messages.forEach((message, index) => {
-    if (message.role !== "user" && message.role !== "assistant") return;
-    const body = messageText(message.content).trim();
-    if (!body) return;
-    transcript.push({
-      id: `worker-${record.id}-${record.generation}-${index}`,
-      from: message.role === "user" ? "lead" : "worker",
-      body,
-      time: "restored",
-    });
-  });
-  const inbox = messages
-    .filter((message) => message.worker_id === record.id)
-    .map((message) => ({
-      id: `team-${message.worker_id}-${message.at_ms}`,
-      from: "worker" as const,
-      body: message.text,
-      time: timeFromMs(message.at_ms),
-    }));
-  return [...transcript, ...inbox];
-}
 
 function workerTimeline(record: TeamWorkerRecord): Worker["timeline"] {
   const time = (milliseconds: number) => milliseconds > 0 ? timeFromMs(milliseconds) : undefined;
@@ -1496,7 +1631,7 @@ function workerTimeline(record: TeamWorkerRecord): Worker["timeline"] {
   if (record.merge) {
     timeline.push({
       id: `${record.id}-merge-${record.merge.commit}`,
-      label: record.merge.revert_commit ? "Merge reverted" : `Merged into ${record.merge.target}`,
+      label: record.merge.revert_commit ? "Merge reverted" : `Landed in ${record.merge.target}`,
       detail: record.merge.revert_commit ?? record.merge.commit,
       status: "done",
       time: time(record.merge.merged_at_ms),
@@ -1509,11 +1644,11 @@ function workerTimeline(record: TeamWorkerRecord): Worker["timeline"] {
       detail: record.error ?? "The branch is retained for review.",
       status: "done",
     });
-  } else if (["failed", "conflict"].includes(record.status)) {
+  } else if (["failed", "conflict", "needs_you"].includes(record.status)) {
     timeline.push({
       id: `${record.id}-attention`,
       label: "Needs attention",
-      detail: record.error ?? "The worker needs attention.",
+      detail: record.error ?? "The worker stopped before finishing; open its thread for its last message.",
       status: "failed",
       time: time(record.last_activity_ms),
     });
@@ -1554,13 +1689,16 @@ function workerFromRecord(
   };
   return {
     id: record.id,
-    name: record.name,
-    initials: record.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "W",
+    name: workerDisplayName(record.id, record.name),
+    initials: workerDisplayName(record.id, record.name).replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "W",
     hue: (index * 47 + 12) % 360,
     task: record.brief,
     summary: record.error ?? "",
     status,
     model: record.model_id ?? record.model ?? "",
+    modelSpec: record.model,
+    tier: record.tier ?? undefined,
+    reasoningEffort: record.reasoning_effort ?? undefined,
     branch: record.branch,
     worktree: record.worktree,
     files: [],
@@ -1572,12 +1710,14 @@ function workerFromRecord(
     progress: progress[status],
     lastActivity: timeFromMs(record.last_activity_ms),
     needsYou:
-      record.pending != null || ["needs_you", "conflict", "failed"].includes(record.status),
+      waitsOnUser(record.pending) || ["needs_you", "conflict", "failed"].includes(record.status),
     fixerFindingId: record.fixer_finding_id ?? undefined,
     kind: workerKindFrom(record.kind),
     reviewRisk: reviewRiskFrom(record.review_risk),
     auditTarget: record.audit_target ?? undefined,
     auditTip: record.audit_tip ?? undefined,
+    planId: record.plan_id ?? null,
+    planStep: record.plan_step ?? null,
     checks: record.checks.map((check) => ({
       name: check.name,
       status:
@@ -1596,7 +1736,7 @@ function workerFromRecord(
           evidence: reviewEvidenceFrom(record.review.evidence),
         }
       : undefined,
-    messages: workerMessages(record, messages),
+    messages: workerThreadFromRecord(record, messages),
     screenshots: workerScreenshotPaths(record.transcript),
     timeline: workerTimeline(record),
     diff: record.merge
@@ -1616,9 +1756,21 @@ function mergeTeamActivity(
   workers: TeamWorkerRecord[],
 ): LeadEntry[] {
   const next = entries.slice();
-  const upsert = (entry: LeadEntry) => {
+  // Each entry keeps the name it was recorded with, so it still names its
+  // worker after that worker leaves the team list.
+  const names = new Map(workers.map((worker) => [worker.id, workerDisplayName(worker.id, worker.name)]));
+  const nameOf = (workerId: string, id: string) => {
+    const known = names.get(workerId);
+    if (known) return known;
+    const previous = next.find((entry) => entry.id === id);
+    return previous && "workerName" in previous && previous.workerName ? previous.workerName : workerId;
+  };
+  // A card already shown keeps its place; a new one goes where it happened,
+  // never just to the bottom (that replayed every review after a restart).
+  const fresh: ActivityCard[] = [];
+  const upsert = (entry: ActivityCard) => {
     const index = next.findIndex((candidate) => candidate.id === entry.id);
-    if (index === -1) next.push(entry);
+    if (index === -1) fresh.push(entry);
     else next[index] = entry;
   };
   for (const message of messages) {
@@ -1637,19 +1789,24 @@ function mergeTeamActivity(
       id,
       kind: "team-message",
       workerId: message.worker_id,
+      workerName: nameOf(message.worker_id, id),
       body: message.text,
       time: timeFromMs(message.at_ms),
+      atMs: message.at_ms,
     });
   }
   for (const worker of workers) {
     if (worker.review) {
+      const name = workerDisplayName(worker.id, worker.name);
       upsert({
         id: `review-${worker.id}-${worker.review.reviewed_at_ms}`,
         kind: "review",
         workerId: worker.id,
-        title: "Lead review recorded",
+        workerName: name,
+        title: `Reviewed ${name}’s work`,
         body: worker.review.summary,
         time: timeFromMs(worker.review.reviewed_at_ms),
+        atMs: worker.review.reviewed_at_ms,
       });
     }
     if (worker.merge) {
@@ -1658,12 +1815,156 @@ function mergeTeamActivity(
         id: record.id,
         kind: "merge",
         workerId: worker.id,
+        workerName: workerDisplayName(worker.id, worker.name),
         record,
         time: record.time,
+        atMs: worker.merge.merged_at_ms,
       });
     }
   }
+  fresh
+    .sort((left, right) => (left.atMs ?? 0) - (right.atMs ?? 0))
+    .forEach((card) => insertActivityCard(next, card));
   return next;
+}
+
+/** Each worker's streamed activity since its transcript was last saved. */
+const workerLive = new Map<string, WorkerLive>();
+/** Each worker's saved thread and the record it came from. */
+const workerSaved = new Map<string, { generation: number; length: number; thread: Worker["messages"] }>();
+
+/** A worker's thread: its saved conversation plus the live tail on top. */
+function composeThread(workerId: string): Worker["messages"] | null {
+  const saved = workerSaved.get(workerId);
+  if (!saved) return null;
+  const live = workerLive.get(workerId);
+  if (!live || live.generation !== saved.generation || live.baseLength !== saved.length) {
+    workerLive.delete(workerId);
+    return saved.thread;
+  }
+  return [...saved.thread, ...live.entries];
+}
+
+/** Stream one worker event into that worker's open thread. */
+function streamWorkerEvent(event: TeamEvent): void {
+  const saved = workerSaved.get(event.worker_id);
+  if (!saved || event.generation < saved.generation) return;
+  let live = workerLive.get(event.worker_id);
+  if (!live || live.generation !== event.generation || live.baseLength !== saved.length) {
+    live = emptyWorkerLive(event.generation, saved.length);
+  }
+  const next = applyWorkerLiveEvent(live, event);
+  if (next === live && workerLive.get(event.worker_id) === live) return;
+  workerLive.set(event.worker_id, next);
+  if (event.generation !== saved.generation) return;
+  const thread = composeThread(event.worker_id);
+  if (!thread) return;
+  app.update((state) => ({
+    ...state,
+    workers: state.workers.map((worker) =>
+      worker.id === event.worker_id ? { ...worker, messages: thread } : worker,
+    ),
+  }));
+}
+
+/** Refetch the plan board; failures keep the last board (it is only a view). */
+async function syncBoard(): Promise<void> {
+  const transport = boardTransport;
+  if (!transport) return;
+  const token = boardToken;
+  try {
+    const snapshot = await transport.snapshot();
+    if (token !== boardToken) return;
+    app.update((state) => ({ ...state, board: boardFromSnapshot(snapshot) }));
+  } catch {
+    // The board is derived state; the next change event refetches it.
+  }
+}
+
+function scheduleBoardSync(): void {
+  if (boardSyncTimer || !boardTransport) return;
+  boardSyncTimer = setTimeout(() => {
+    boardSyncTimer = null;
+    void syncBoard();
+  }, 60);
+}
+
+async function disconnectBoard(): Promise<void> {
+  boardToken += 1;
+  if (boardSyncTimer) {
+    clearTimeout(boardSyncTimer);
+    boardSyncTimer = null;
+  }
+  const unlisten = boardUnlisten;
+  boardUnlisten = null;
+  unlisten?.();
+  boardTransport = null;
+}
+
+async function connectBoard(): Promise<void> {
+  const transport = createBoardTransport();
+  if (!transport) return;
+  if (!(await probeMnemo2Host())) return;
+  await disconnectBoard();
+  const token = boardToken;
+  boardTransport = transport;
+  try {
+    const unlisten = await transport.onChanged(() => {
+      if (token === boardToken) scheduleBoardSync();
+    });
+    if (token !== boardToken) {
+      unlisten();
+      return;
+    }
+    boardUnlisten = unlisten;
+  } catch {
+    // Without the event the board still loads on open and on team changes.
+  }
+  await syncBoard();
+}
+
+function applyIndexing(token: number, snapshot: IndexingSnapshot): void {
+  if (token !== indexingToken) return;
+  app.update((state) => ({ ...state, indexing: newerIndexing(state.indexing, snapshot) }));
+}
+
+/** Fetch the indexing status; a failure keeps the last one (events follow). */
+async function syncIndexing(): Promise<void> {
+  const transport = indexingTransport;
+  if (!transport) return;
+  const token = indexingToken;
+  try {
+    applyIndexing(token, await transport.snapshot());
+  } catch {
+    // No runtime yet (the lead failed to open): nothing is indexing.
+  }
+}
+
+function disconnectIndexing(): void {
+  indexingToken += 1;
+  const unlisten = indexingUnlisten;
+  indexingUnlisten = null;
+  unlisten?.();
+  indexingTransport = null;
+}
+
+async function connectIndexing(): Promise<void> {
+  const transport = createIndexingTransport();
+  if (!transport) return;
+  if (!(await probeMnemo2Host())) return;
+  disconnectIndexing();
+  const token = indexingToken;
+  indexingTransport = transport;
+  try {
+    const unlisten = await transport.onChanged((snapshot) => applyIndexing(token, snapshot));
+    if (token !== indexingToken) {
+      unlisten();
+      return;
+    }
+    indexingUnlisten = unlisten;
+  } catch {
+    // Without the event the status still loads once the lead opens.
+  }
 }
 
 async function syncTeam(): Promise<void> {
@@ -1677,6 +1978,18 @@ async function syncTeam(): Promise<void> {
       transport.messages(),
     ]);
     if (token !== teamToken) return;
+    // Merges tick steps and workers move through statuses; the board follows.
+    const before = new Map(get(app).workers.map((worker) => [worker.id, worker]));
+    const boardStale =
+      snapshot.workers.length !== before.size ||
+      snapshot.workers.some((record) => {
+        const previous = before.get(record.id);
+        return !previous ||
+          previous.status !== record.status ||
+          (previous.planId ?? null) !== (record.plan_id ?? null) ||
+          (previous.planStep ?? null) !== (record.plan_step ?? null);
+      });
+    if (boardStale) scheduleBoardSync();
     app.update((state) => {
       // A snapshot belongs to the project that requested it: a slow response
       // must never repaint (or reprice) a project the human has since opened.
@@ -1686,6 +1999,12 @@ async function syncTeam(): Promise<void> {
         ...state,
         workers: snapshot.workers.map((record, index) => {
           const next = workerFromRecord(record, index, messages);
+          workerSaved.set(record.id, {
+            generation: record.generation,
+            length: record.transcript.messages.length,
+            thread: next.messages,
+          });
+          next.messages = composeThread(record.id) ?? next.messages;
           const previous = state.workers.find((worker) => worker.id === record.id);
           return record.merge ? next : {
             ...next,
@@ -1697,7 +2016,9 @@ async function syncTeam(): Promise<void> {
         teamSlots: snapshot.slots,
         teamActive: snapshot.active,
         projectUsage: projectUsageFrom(snapshot.usage),
-        selectedWorkerId: state.selectedWorkerId ?? snapshot.workers[0]?.id ?? null,
+        selectedWorkerId: snapshot.workers.some((worker) => worker.id === state.selectedWorkerId)
+          ? state.selectedWorkerId
+          : snapshot.workers[0]?.id ?? null,
         diffWorkerId: snapshot.workers.some((worker) => worker.id === diffWorkerId)
           ? diffWorkerId
           : snapshot.workers[0]?.id ?? null,
@@ -1719,6 +2040,8 @@ function scheduleTeamSync(): void {
 
 async function disconnectTeam(): Promise<void> {
   teamToken += 1;
+  workerLive.clear();
+  workerSaved.clear();
   if (teamSyncTimer) {
     clearTimeout(teamSyncTimer);
     teamSyncTimer = null;
@@ -1739,8 +2062,11 @@ async function connectTeam(): Promise<void> {
   const token = teamToken;
   teamTransport = transport;
   try {
-    const unlisten = await transport.onEvent(() => {
-      if (token === teamToken) scheduleTeamSync();
+    const unlisten = await transport.onEvent((event) => {
+      if (token !== teamToken) return;
+      streamWorkerEvent(event);
+      // Streamed content changes no record; only lifecycle events resync.
+      if (!STREAM_ONLY_EVENTS.has(String(event.event?.event?.kind ?? ""))) scheduleTeamSync();
     });
     if (token !== teamToken) {
       unlisten();
@@ -1790,6 +2116,8 @@ function resetDemo() {
   leadSessionToken += 1;
   void stopNativeLead();
   void disconnectTeam();
+  void disconnectBoard();
+  disconnectIndexing();
   void disconnectWorkbench();
   app.set(createInitialState());
 }
@@ -1851,9 +2179,15 @@ export const actions = {
   steerWorker,
   stopWorker,
   pauseWorker,
+  requestDeleteWorkers,
+  requestDeleteOldWorkers,
+  cancelDeleteWorkers,
+  confirmDeleteWorkers,
   resumeWorker,
+  setWorkerModel,
   compactWorker,
   syncTeam,
+  syncBoard,
   reviewWorker,
   recordWorkerCheck,
   resolveFinding,

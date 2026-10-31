@@ -138,7 +138,7 @@ export function deriveTaskWorkflow(worker: Worker): TaskWorkflow {
     case "merged":
       steps.verify = verifyState(worker);
       steps.review = { status: "done", detail: "Review closed" };
-      steps.merge = { status: "done", detail: `Merged into ${worker.merge?.target ?? "the lead branch"}` };
+      steps.merge = { status: "done", detail: worker.merge?.revertCommit ? `Reverted from ${worker.merge.target}` : `Landed in ${worker.merge?.target ?? "the lead branch"}` };
       return build(worker, steps, "merge", "done");
 
     // Other live lifecycle states stay on the task's own implementation lane.

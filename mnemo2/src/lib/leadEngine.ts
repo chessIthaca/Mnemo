@@ -32,7 +32,7 @@ export interface LeadTransport {
    */
   prompt(text: string, images?: string[]): Promise<void>;
   interrupt(): Promise<void>;
-  setModel(spec: string): Promise<LeadSnapshot>;
+  setModel(spec: string, reasoningEffort?: string | null): Promise<LeadSnapshot>;
   approve(requestId: string, decision: LeadApprovalDecision): Promise<void>;
   answer(questionId: string, answer: LeadAnswerInput): Promise<void>;
   close(): Promise<void>;
@@ -69,7 +69,11 @@ export function createTauriLeadTransport(bindings: LeadTransportBindings): LeadT
         images && images.length > 0 ? { text, images } : { text },
       ),
     interrupt: () => bindings.invoke<void>("lead_interrupt"),
-    setModel: (spec) => bindings.invoke<LeadSnapshot>("lead_set_model", { spec }),
+    setModel: (spec, reasoningEffort) =>
+      bindings.invoke<LeadSnapshot>("lead_set_model", {
+        spec,
+        reasoningEffort: reasoningEffort ?? null,
+      }),
     approve: (requestId, decision) =>
       bindings.invoke<void>("lead_approve", { requestId, decision }),
     answer: (questionId, answer) =>

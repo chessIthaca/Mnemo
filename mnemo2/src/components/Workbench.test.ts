@@ -10,17 +10,16 @@ const state = () => get(app);
 describe("Workbench", () => {
   beforeEach(() => {
     const state = fixtureState();
-    state.plan = {
+    state.board = [{
       id: "contract",
       title: "Define the lead/team contract",
-      goal: "Build the actual lead plan view",
-      steps: state.planItems.map((step, index) => ({
-        index,
-        text: step.detail,
-        header: step.title,
-        done: step.status === "done",
-      })),
-    };
+      goal: "Build the board view",
+      kind: "feature",
+      status: "open",
+      closed_at_ms: null,
+      report_path: null,
+      steps: [{ number: 1, header: "Contract", text: "Write it", done: false, workers: [] }],
+    }];
     app.set(state);
     actions.openWorkbench("diff");
   });
@@ -55,13 +54,16 @@ describe("Workbench", () => {
       window.setTimeout(callback, 0));
     vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
     const current = fixtureState();
-    current.plan = {
+    current.board = [{
       id: "contract",
       title: "Plan",
       goal: "Read [Docs](https://example.com/docs)",
+      kind: "feature",
+      status: "open",
+      closed_at_ms: null,
+      report_path: null,
       steps: [],
-    };
-    current.planItems = [];
+    }];
     app.set(current);
     actions.openWorkbench("plan");
     render(Workbench);

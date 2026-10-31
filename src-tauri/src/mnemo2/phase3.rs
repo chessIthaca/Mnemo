@@ -267,6 +267,47 @@ pub async fn require_clean(root: &Path, label: &str) -> Result<(), String> {
     }
 }
 
+/// The bookkeeping the lead keeps in the project, shared with Mnemo1: plan
+/// files (`.coding/plans/`), the closing team review reports
+/// (`.coding/reviews/`), and memory knowledge records (`.coding/knowledge/`),
+/// all committed with the lead's own work.
+const LEAD_BOOKKEEPING_PREFIXES: [&str; 3] =
+    [".coding/plans/", ".coding/reviews/", ".coding/knowledge/"];
+
+fn is_lead_bookkeeping(path: &str) -> bool {
+    LEAD_BOOKKEEPING_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+/// Require a clean lead checkout, ignoring its plan and knowledge bookkeeping: the lead
+/// edits its plan while it works and commits it with its own changes, so a
+/// dirty plan must not block integration. Worker checks stay strict
+/// ([`require_clean`]).
+pub async fn require_clean_lead(root: &Path, label: &str) -> Result<(), String> {
+    let args = ["status", "--porcelain", "-z", "-uall"];
+    let output = git(root, &args).await?;
+    if !output.status.success() {
+        return Err(git_error(&args, &output));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = stdout.split('\0').filter(|entry| !entry.is_empty());
+    while let Some(entry) = entries.next() {
+        let (status, path) = entry.split_at(entry.len().min(3));
+        // A rename or copy is followed by its source path as its own entry.
+        let source = if status.contains(['R', 'C']) {
+            entries.next()
+        } else {
+            None
+        };
+        if is_lead_bookkeeping(path) && source.is_none_or(is_lead_bookkeeping) {
+            continue;
+        }
+        return Err(format!("the {label} working tree must be clean"));
+    }
+    Ok(())
+}
+
 /// Resolve an existing, canonical, symlink-free review-edit source file inside
 /// the worker worktree.
 pub fn review_file(root: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -359,7 +400,12 @@ pub fn validate_findings(findings: &[Finding]) -> Result<(), String> {
             return Err(format!("duplicate finding id '{}'", finding.id));
         }
         if !matches!(finding.severity.as_str(), "high" | "low") {
-            return Err(format!("finding '{}' has an invalid severity", finding.id));
+            return Err(format!(
+                "finding '{}' has an invalid severity \"{}\" (allowed: {})",
+                finding.id,
+                finding.severity,
+                FINDING_SEVERITIES.join(", ")
+            ));
         }
         match finding.status.as_str() {
             "open" => {}
@@ -380,15 +426,205 @@ pub fn validate_findings(findings: &[Finding]) -> Result<(), String> {
                 ));
             }
             "fixed" | "wontfix" => {}
-            _ => return Err(format!("finding '{}' has an invalid status", finding.id)),
+            _ => {
+                return Err(format!(
+                    "finding '{}' has an invalid status \"{}\" (allowed: {})",
+                    finding.id,
+                    finding.status,
+                    FINDING_STATUSES.join(", ")
+                ))
+            }
         }
     }
     Ok(())
 }
 
+/// Allowed finding severities, in the order the tool schema lists them.
+pub const FINDING_SEVERITIES: [&str; 2] = ["high", "low"];
+/// Allowed finding statuses.
+pub const FINDING_STATUSES: [&str; 3] = ["open", "fixed", "wontfix"];
+
+/// Parse a reviewer's `findings` array leniently: common field aliases map to
+/// the canonical names (`path` → `file`, `description`/`message` → `detail`),
+/// `status` defaults to `open`, `line` to 0, a missing `id` derives from the
+/// file and title (stable across re-reviews), and well-known severity words
+/// map to `high`/`low`. Every remaining problem is reported in one error, one
+/// `findings[i].field` line each, with the allowed values for enums.
+pub fn parse_findings(value: &serde_json::Value) -> Result<Vec<Finding>, String> {
+    use serde_json::Value;
+    let Some(items) = value.as_array() else {
+        return Err("findings: must be an array of finding objects".to_string());
+    };
+    let mut errors = Vec::new();
+    let mut findings = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let Some(obj) = item.as_object() else {
+            errors.push(format!("findings[{i}]: must be an object"));
+            continue;
+        };
+        let text = |names: &[&str]| -> Option<String> {
+            names.iter().find_map(|name| {
+                obj.get(*name)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+        };
+        let title = text(&["title", "summary", "name"]);
+        let detail = text(&["detail", "description", "message", "body", "details"]);
+        let file = text(&["file", "path", "file_path", "filename"]);
+        for (present, field) in [
+            (title.is_some(), "title"),
+            (detail.is_some(), "detail (why it matters)"),
+            (file.is_some(), "file (repository-relative path)"),
+        ] {
+            if !present {
+                let (name, hint) = field.split_once(' ').unwrap_or((field, ""));
+                let hint = if hint.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {hint}")
+                };
+                errors.push(format!("findings[{i}].{name}: required{hint}"));
+            }
+        }
+        let severity = match text(&["severity", "priority"]) {
+            None => {
+                errors.push(format!(
+                    "findings[{i}].severity: required (allowed: {})",
+                    FINDING_SEVERITIES.join(", ")
+                ));
+                None
+            }
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "high" | "blocking" | "blocker" | "critical" | "major" | "error" | "must" => {
+                    Some("high")
+                }
+                "low" | "minor" | "nit" | "info" | "warning" | "suggestion" | "should" => {
+                    Some("low")
+                }
+                _ => {
+                    errors.push(format!(
+                        "findings[{i}].severity: invalid \"{raw}\" (allowed: {})",
+                        FINDING_SEVERITIES.join(", ")
+                    ));
+                    None
+                }
+            },
+        };
+        let status = text(&["status"])
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| "open".to_string());
+        if !FINDING_STATUSES.contains(&status.as_str()) {
+            errors.push(format!(
+                "findings[{i}].status: invalid \"{status}\" (allowed: {})",
+                FINDING_STATUSES.join(", ")
+            ));
+        }
+        let line = match obj.get("line") {
+            None | Some(Value::Null) => 0,
+            Some(v) => match v
+                .as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            {
+                Some(n) => u32::try_from(n).unwrap_or(0),
+                None => {
+                    errors.push(format!(
+                        "findings[{i}].line: must be a non-negative integer"
+                    ));
+                    0
+                }
+            },
+        };
+        let (Some(title), Some(detail), Some(file), Some(severity)) =
+            (title, detail, file, severity)
+        else {
+            continue;
+        };
+        let id = text(&["id"]).unwrap_or_else(|| derived_finding_id(&file, &title));
+        findings.push(Finding {
+            id,
+            severity: severity.to_string(),
+            title,
+            detail,
+            file,
+            line,
+            status,
+            fix_commit: text(&["fix_commit"]),
+            evidence: text(&["evidence"]),
+            justification: text(&["justification"]),
+        });
+    }
+    if errors.is_empty() {
+        Ok(findings)
+    } else {
+        Err(format!("invalid findings:\n{}", errors.join("\n")))
+    }
+}
+
+/// A short id from a finding's file and title (FNV-1a), so re-reviewing the
+/// same finding without an explicit id keeps its identity.
+fn derived_finding_id(file: &str, title: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in file
+        .bytes()
+        .chain([0])
+        .chain(title.to_ascii_lowercase().bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("f-{:08x}", hash as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_findings_normalizes_aliases_and_defaults() {
+        let parsed = parse_findings(&serde_json::json!([{
+            "title": "default import",
+            "description": "game.js exports a named Game",
+            "path": "src/main.js",
+            "severity": "blocking"
+        }]))
+        .expect("aliases and defaults");
+        let f = &parsed[0];
+        assert_eq!(
+            (f.file.as_str(), f.detail.as_str()),
+            ("src/main.js", "game.js exports a named Game")
+        );
+        assert_eq!(
+            (f.severity.as_str(), f.status.as_str(), f.line),
+            ("high", "open", 0)
+        );
+        assert!(f.id.starts_with("f-"), "{}", f.id);
+        let again = parse_findings(&serde_json::json!([{
+            "title": "Default import", "detail": "x", "file": "src/main.js", "severity": "low"
+        }]))
+        .unwrap();
+        assert_eq!(again[0].id, f.id, "derived id is stable across re-reviews");
+    }
+
+    #[test]
+    fn parse_findings_reports_every_problem_at_once() {
+        let err = parse_findings(&serde_json::json!([
+            {"title": "a", "severity": "urgent", "status": "done"},
+            "not an object"
+        ]))
+        .expect_err("invalid");
+        for expected in [
+            "findings[0].detail: required",
+            "findings[0].file: required",
+            "findings[0].severity: invalid \"urgent\" (allowed: high, low)",
+            "findings[0].status: invalid \"done\" (allowed: open, fixed, wontfix)",
+            "findings[1]: must be an object",
+        ] {
+            assert!(err.contains(expected), "missing {expected:?} in {err}");
+        }
+    }
 
     fn finding(status: &str) -> Finding {
         Finding {

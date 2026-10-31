@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::memory::auto_typing::{self, TypingDecision};
+use crate::memory::plan_scope;
 use crate::memory::classifier::Classifier;
 use crate::memory::consolidation::consolidate_session;
 use crate::memory::indexer::{index_derived, reindex_knowledge_files};
@@ -264,11 +265,17 @@ impl Tool for MemoryWriteTool {
             None => None,
         };
         let record_type = MemoryRecordType::from_title(&title);
+        // Plan-scoped notes (plan id / branch references) are only true while
+        // the plan lives: file them episodic + tagged, and keep them out of
+        // the durable knowledge store, so closing the plan can retire them.
+        let scope = plan_scope::scoped_tier(tier, &title, &args.content);
+        let rerouted = scope.tier != tier;
+        let tier = scope.tier;
         // Knowledge-backed typed write: the record's FILE is the truth — the
         // body is UNBOUNDED (the indexer budgets the derived digest, so the
         // digest stays a budgeted pointer while the file carries everything).
         let is_knowledge_type = record_type != MemoryRecordType::None
-            && knowledge::dir_for_record_type(record_type).is_some();
+            && knowledge::dir_for_record_type(record_type).is_some() && !scope.is_scoped();
         // Knowledge-backed write: the record's FILE is the truth —
         // write it, reindex the one file (the derived row), and report the
         // deterministic row id. Without a knowledge
@@ -333,7 +340,8 @@ impl Tool for MemoryWriteTool {
             }
         } else {
             let now = (self.now)();
-            let memory = Memory::new(tier, title.clone(), args.content, now);
+            let mut memory = Memory::new(tier, title.clone(), args.content, now);
+            memory.data = scope.data();
             match self.store.write(memory).await {
                 Ok(id) => {
                     // Human-readable confirmation (backlog 2026-08-20: "wrote
@@ -353,10 +361,20 @@ impl Tool for MemoryWriteTool {
                         msg.push_str(" — ");
                         msg.push_str(note);
                     }
+                    if scope.is_scoped() {
+                        msg.push_str(" — filed as a plan-scoped note");
+                        if rerouted {
+                            msg.push_str(" (episodic, not semantic)");
+                        }
+                        msg.push_str("; it references a plan/branch, so it is retired when the plan closes.");
+                        msg.push_str(" Store any durable fact separately, WITHOUT plan or branch references");
+                    }
                     ToolResult::success(msg).with_data(json!({
                         "id": id,
                         "tier": tier.as_str(),
                         "title": title,
+                        "plan_scoped": scope.is_scoped(),
+                        "plan_ids": scope.plan_ids,
                         "auto_typed": typing_note,
                     }))
                 }
@@ -2593,6 +2611,50 @@ mod tests {
         assert!(data["id"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(data["tier"], "semantic");
         assert_eq!(data["title"], "auth fact");
+    }
+
+    /// Plan/branch-referencing notes are filed episodic + tagged with the
+    /// plan id; a plain SPEC stays semantic and untagged.
+    #[tokio::test]
+    async fn plan_scoped_note_is_filed_episodic_and_tagged() {
+        let store = make_store();
+        let tool = MemoryWriteTool::new(store.clone());
+        let r = tool
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: Pac-Man Game module contract",
+                "content": "Plan 64694f06, branch feature/pacman-game. src/game.js exports Game."
+            }))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.output.contains("plan-scoped"), "{}", r.output);
+        assert!(r.output.contains("WITHOUT plan or branch references"), "{}", r.output);
+        let plain = tool
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: Game export",
+                "content": "Game is a named ES-module export."
+            }))
+            .await;
+        assert!(plain.success && !plain.output.contains("plan-scoped"), "{}", plain.output);
+
+        let all = store
+            .list_filtered(&MemoryFilter::new())
+            .await
+            .unwrap();
+        let scoped = all.iter().find(|m| m.title.contains("module contract")).unwrap();
+        assert_eq!(scoped.tier, MemoryTier::Episodic);
+        assert_eq!(scoped.data["plan_ids"][0], "64694f06");
+        let durable = all.iter().find(|m| m.title == "SPEC: Game export").unwrap();
+        assert_eq!(durable.tier, MemoryTier::Semantic);
+        assert!(durable.data.is_null());
+
+        let notes = crate::memory::plan_scope::settle_plan_memories(store.as_ref(), "64694f06")
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        let left = store.list_filtered(&MemoryFilter::new()).await.unwrap();
+        assert_eq!(left.len(), 1);
     }
 
     /// Every tier gets its own human phrase (+ its tier word), and none of

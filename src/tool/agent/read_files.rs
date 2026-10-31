@@ -12,8 +12,11 @@
 //! indexed source file (an extension the code graph parses — any indexed
 //! language: .rs/.ts/.tsx/.js/.py/…)
 //! prepends one SYMBOL NUDGE line pointing at `graph_context(id=...)`, so
-//! the agent takes targeted edges instead of another whole-file dump. Auto-run
-//! (read-only).
+//! the agent takes targeted edges instead of another whole-file dump. With
+//! the `delta_reads` lever on, a whole read of a big source file serves its
+//! signature outline first, and a re-read serves a skeleton or a diff (see
+//! `read_one_delta`). Lines are numbered `{n}: {line}` — no padding, no
+//! trailing whitespace ([`numbered_line`]). Auto-run (read-only).
 
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -23,7 +26,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::optimizer::{estimate_tokens, savings_event};
-use super::read_cache::{diff_if_small, skeleton_for, ReadCache, SKELETON_MAX_LINES};
+use super::read_cache::{diff_if_small, skeleton_for, ReadCache, Skeleton, SKELETON_MAX_LINES};
 use crate::codegraph::walk::Lang;
 use crate::provider::ToolSchema;
 use crate::tool::agent::sandbox::Sandbox;
@@ -39,6 +42,12 @@ pub(crate) const DEFAULT_MAX_LINES: usize = 500;
 /// keep when the agent just swallowed a big chunk of source.
 pub(crate) const READ_NUDGE_MIN_LINES: usize = 300;
 
+/// A FIRST whole-file read of a source file longer than this serves its
+/// signature outline instead of the content (the `delta_reads` lever) —
+/// the agent then reads the region it needs with `start_line`/`max_lines`.
+/// The same "big file" bar as the SYMBOL NUDGE.
+pub(crate) const OUTLINE_MIN_LINES: usize = READ_NUDGE_MIN_LINES;
+
 /// Default maximum output size in bytes per file (~100 KB). Mirrors
 /// `file_read`.
 pub(crate) const DEFAULT_MAX_BYTES: usize = 102_400;
@@ -50,6 +59,21 @@ const MAX_FILES: usize = 10;
 /// Total output byte cap across all files (~500 KB). If the joined output
 /// exceeds this, it is truncated and a note is appended.
 pub(crate) const TOTAL_BYTE_CAP: usize = 512_000;
+
+/// One numbered line of read output: `{n}: {line}` with no column padding
+/// and the line's trailing spaces/tabs dropped (`{n}:` for a blank line).
+/// Both are pure context cost: the padding carries nothing, and the anchor
+/// matcher ignores trailing spaces/tabs — an `old_string` copied from this
+/// view still lands on a line that has them, via the whitespace-normalized
+/// fallback (`edit_ops::resolve_match_variant`). Leading indentation is
+/// KEPT: this view is the only place the model sees it, and every
+/// `new_string` and line-op payload must reproduce it.
+pub(crate) fn numbered_line(n: usize, line: &str) -> String {
+    match line.trim_end_matches([' ', '\t']) {
+        "" => format!("{n}:"),
+        line => format!("{n}: {line}"),
+    }
+}
 
 /// Truncate `s` to at most `max` bytes, backing up to the nearest UTF-8 char
 /// boundary so the result is always valid UTF-8 (a naive `String::truncate`
@@ -123,6 +147,95 @@ struct ReadFilesArgs {
     files: Vec<ReadSpec>,
 }
 
+/// Split a compact read spec — `path`, `path:start`, `path:start+count` or
+/// `path:start-end` (1-indexed, end inclusive) — into (path, start_line,
+/// max_lines). Only a trailing `:<digits>` range suffix is split off: a
+/// Windows drive colon or any other colon stays part of the path. `Err`
+/// names a `start-end` range whose end precedes its start.
+pub(crate) fn parse_compact_spec(s: &str) -> Result<ReadSpec, String> {
+    let s = s.trim();
+    let whole = || ReadSpec { path: s.to_string(), start_line: None, max_lines: None };
+    let Some((path, range)) = s.rsplit_once(':') else {
+        return Ok(whole());
+    };
+    let num = |t: &str| {
+        if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+            t.parse::<usize>().ok()
+        } else {
+            None
+        }
+    };
+    let spec = |start, max_lines| ReadSpec { path: path.to_string(), start_line: Some(start), max_lines };
+    if let Some(start) = num(range) {
+        return Ok(spec(start, None));
+    }
+    if let Some((start, count)) = range.split_once('+').and_then(|(a, b)| Some((num(a)?, num(b)?))) {
+        return Ok(spec(start, Some(count)));
+    }
+    if let Some((start, end)) = range.split_once('-').and_then(|(a, b)| Some((num(a)?, num(b)?))) {
+        if end < start {
+            return Err(format!(
+                "\"{s}\": the range ends at line {end}, before its start line {start} — \
+                 use \"path:start-end\" with end >= start, or \"path:start+count\""
+            ));
+        }
+        return Ok(spec(start, Some(end - start + 1)));
+    }
+    Ok(whole())
+}
+
+/// One `files` entry in either accepted form: the compact string (see
+/// [`parse_compact_spec`]) or the `{path, start_line?, max_lines?}` object.
+/// The single parse every reader of read_files arguments shares (steering,
+/// compaction digests, re-read pointers, the result archive); `None` for an
+/// entry that is neither, or a string whose range is invalid.
+pub(crate) fn parse_spec(item: &serde_json::Value) -> Option<ReadSpec> {
+    match item {
+        serde_json::Value::String(s) => parse_compact_spec(s).ok(),
+        serde_json::Value::Object(o) => {
+            let line = |key: &str| o.get(key).and_then(|v| v.as_u64()).map(|n| n as usize);
+            Some(ReadSpec {
+                path: o.get("path")?.as_str()?.to_string(),
+                start_line: line("start_line"),
+                max_lines: line("max_lines"),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Every spec a read_files (or file_read) call names: the single-file
+/// top-level `path` shorthand first, then each `files` entry.
+pub(crate) fn read_specs(args: &serde_json::Value) -> Vec<ReadSpec> {
+    let mut specs: Vec<ReadSpec> = args.get("path").and_then(|_| parse_spec(args)).into_iter().collect();
+    if let Some(files) = args.get("files").and_then(|v| v.as_array()) {
+        specs.extend(files.iter().filter_map(parse_spec));
+    }
+    specs
+}
+
+/// Expand the compact string entries of a `files` array into the object
+/// form [`ReadSpec`] deserializes; object entries pass through untouched.
+fn expand_compact_specs(mut args: serde_json::Value) -> Result<serde_json::Value, String> {
+    if let Some(files) = args.get_mut("files").and_then(|f| f.as_array_mut()) {
+        for item in files.iter_mut() {
+            if let Some(s) = item.as_str() {
+                let spec = parse_compact_spec(s)?;
+                let mut object = serde_json::Map::new();
+                object.insert("path".into(), json!(spec.path));
+                if let Some(start) = spec.start_line {
+                    object.insert("start_line".into(), json!(start));
+                }
+                if let Some(max) = spec.max_lines {
+                    object.insert("max_lines".into(), json!(max));
+                }
+                *item = serde_json::Value::Object(object);
+            }
+        }
+    }
+    Ok(args)
+}
+
 /// The `read_files` tool — batch read of multiple files.
 pub struct ReadFilesTool {
     sandbox: Sandbox,
@@ -191,14 +304,16 @@ impl Tool for ReadFilesTool {
         ToolSchema::new(
             "read_files",
             format!(
-                "{} An array of up to 10 {{path, start_line?, max_lines?}} specs. \
-                 Read files — one or many, in one call instead of N round-trips. \
-                 Each file comes back under a header with line numbers; start_line + \
-                 max_lines read only the relevant slice. A directory path returns a \
-                 sorted listing. Per-file errors are reported inline, never fatal.",
+                "{} An array of up to 10 file strings, each \"path\", \
+                 \"path:start+count\" (count lines from start) or \"path:start-end\" \
+                 (inclusive), 1-indexed. Read files — one or many, in one call instead \
+                 of N round-trips. Each file comes back under a header with line \
+                 numbers; a range reads only the relevant slice (default: the first \
+                 500 lines). A directory path returns a sorted listing. Per-file errors \
+                 are reported inline, never fatal.",
                 tool_contract::contract(
                     "`files`",
-                    "{\"files\":[{\"path\":\"a.js\",\"start_line\":10,\"max_lines\":40}]}"
+                    "{\"files\":[\"src/main.rs\",\"src/lib.rs:120+40\"]}"
                 )
             ),
             json!({
@@ -207,16 +322,8 @@ impl Tool for ReadFilesTool {
                     "files": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "Read specs (max 10): {path, start_line?, max_lines?} per file. A stringified JSON array (the whole array delivered as a string) is auto-repaired when it parses cleanly; a malformed string recovers well-formed {\"path\": ...} specs with a NOTE, or fails with the byte position of the parse error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string", "description": "Path relative to the project root."},
-                                "start_line": {"type": "integer", "description": "1-indexed start line (optional)."},
-                                "max_lines": {"type": "integer", "description": "Max lines to read (optional, default 500)."}
-                            },
-                            "required": ["path"]
-                        }
+                        "description": "Files to read (max 10): \"path\", \"path:start+count\" or \"path:start-end\", paths relative to the project root.",
+                        "items": {"type": "string"}
                     }
                 },
                 "required": ["files"]
@@ -278,7 +385,7 @@ impl Tool for ReadFilesTool {
                              JSON parse failed at byte {pos}: {reason}. Well-formed \
                              {{\"path\": ...}} specs inside the string are auto-recovered, \
                              but none were{fragments}. Emit files as a native JSON \
-                             array: [{{\"path\":\"src/main.rs\",\"start_line\":10,\"max_lines\":40}}]"
+                             array of strings: [\"src/main.rs:10+40\"]"
                         ));
                     }
                     // A clean "[]": splice the empty array through so the
@@ -304,6 +411,12 @@ impl Tool for ReadFilesTool {
             }
             _ => (args, None),
         };
+        // The advertised compact strings ("path:start+count") expand into
+        // the object form; object specs still deserialize as they are.
+        let args = match expand_compact_specs(args) {
+            Ok(args) => args,
+            Err(e) => return ToolResult::error(e),
+        };
         let args: ReadFilesArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
             Err(e) => {
@@ -316,7 +429,7 @@ impl Tool for ReadFilesTool {
                     &e,
                     &args,
                     &tool_contract::recovery_hint(
-                        "files (an array of {path, start_line?, max_lines?} specs)",
+                        "files (an array of \"path\" or \"path:start+count\" strings)",
                     ),
                 ));
             }
@@ -350,8 +463,8 @@ impl Tool for ReadFilesTool {
             // Token-optimizer lever 1 (backlog e4a50d22): with the flag
             // on, a whole-file RE-read serves a signature skeleton
             // (unchanged file) or a unified diff (changed file) against
-            // the last-served content. First reads serve the full content
-            // and establish the delta baseline.
+            // the last-served content. A first read serves the outline of a
+            // big file, else the full content (the delta baseline).
             let delta_reads = optimizer
                 .as_ref()
                 .map(|c| c.read().map(|c| c.delta_reads).unwrap_or(false))
@@ -435,7 +548,10 @@ fn recover_files_from_string(
     match crate::tool::parse_stringified_sequence(s) {
         Ok(specs) => (specs, Vec::new(), None),
         Err((pos, reason)) => {
-            let (specs, skipped) = extract_path_objects(s);
+            // Specs with a stray quote after a number are recoverable too,
+            // even when another defect fails the whole-array parse.
+            let repaired = crate::tool::drop_stray_quotes_after_numbers(s);
+            let (specs, skipped) = extract_path_objects(repaired.as_deref().unwrap_or(s));
             (specs, skipped, Some((pos, reason)))
         }
     }
@@ -610,7 +726,7 @@ pub(crate) fn read_one_with_count(sandbox: &Sandbox, spec: &ReadSpec) -> (String
         .skip(start)
         .take(max)
         .enumerate()
-        .map(|(i, line)| format!("{:>4}: {}", start + i + 1, line))
+        .map(|(i, line)| numbered_line(start + i + 1, line))
         .collect();
 
     let showed = numbered.len();
@@ -653,8 +769,11 @@ pub(crate) fn read_one_with_count(sandbox: &Sandbox, spec: &ReadSpec) -> (String
 /// e4a50d22, `delta_reads`). Returns the section, the raw content (for the
 /// SYMBOL NUDGE probe), and appends any savings events to `savings`.
 /// Semantics:
-/// - first read of the path → full content, and the content becomes the
-///   delta baseline;
+/// - first read of a source file over [`OUTLINE_MIN_LINES`] lines →
+///   numbered signature outline + a note pointing at ranged reads; no
+///   baseline is recorded (the agent has not seen the content);
+/// - first read of any other path → full content, and the content becomes
+///   the delta baseline;
 /// - re-read, file UNCHANGED → numbered signature skeleton + a note
 ///   pointing at the ranged-read escape hatch;
 /// - re-read, file CHANGED → unified diff against the baseline (full
@@ -688,6 +807,41 @@ fn read_one_delta(
     let before_tokens = estimate_tokens(&full_section);
     match cache.snapshot(&key) {
         None => {
+            // A big file's FIRST whole read serves its outline: the agent
+            // reads the region it needs next instead of swallowing up to
+            // DEFAULT_MAX_LINES lines it mostly won't use. The baseline is
+            // NOT recorded — the agent never saw the content, so a later
+            // whole read must not be answered with a diff against it.
+            let total = content.lines().count();
+            if total > OUTLINE_MIN_LINES && lang != Lang::Html {
+                let sk = skeleton_for(&content, lang);
+                // No signature lines: an empty outline maps nothing.
+                if sk.kept > 0 {
+                    let header = format!(
+                        "=== {} (outline: {} signature lines of {total}) ===",
+                        spec.path, sk.kept
+                    );
+                    let section = skeleton_section(
+                        &header,
+                        sk,
+                        &format!(
+                            "[outline read: a {total}-line file, signature lines only. Read \
+                             the region you need as a \"path:start+count\" range — ranges \
+                             always serve exact lines.]"
+                        ),
+                    );
+                    let after_tokens = estimate_tokens(&section);
+                    if after_tokens < before_tokens {
+                        savings.push(savings_event(
+                            "outline",
+                            &spec.path,
+                            before_tokens,
+                            after_tokens,
+                        ));
+                        return (section, Some(content));
+                    }
+                }
+            }
             cache.record(key, content.clone());
             (full_section, Some(content))
         }
@@ -705,17 +859,12 @@ fn read_one_delta(
                 spec.path,
                 sk.kept
             );
-            let mut body = sk.body;
-            if sk.capped {
-                body.push_str(&format!(
-                    "... (skeleton capped at {SKELETON_MAX_LINES} signature lines)\n"
-                ));
-            }
-            body.push_str(
+            let section = skeleton_section(
+                &header,
+                sk,
                 "[delta read: file is UNCHANGED since your last full read — signature lines \
-                 only. Re-read with start_line/max_lines for exact lines.]",
+                 only. Re-read a \"path:start+count\" range for exact lines.]",
             );
-            let section = format!("{header}\n{body}");
             let after_tokens = estimate_tokens(&section);
             if after_tokens >= before_tokens {
                 // Tiny file: the header + note boilerplate costs more than
@@ -739,8 +888,8 @@ fn read_one_delta(
                     spec.path
                 );
                 let body = format!(
-                    "{diff}\n[delta read: unified diff vs your last full read. Re-read with \
-                     start_line/max_lines for the exact current content.]"
+                    "{diff}\n[delta read: unified diff vs your last full read. Re-read a \
+                     \"path:start+count\" range for the exact current content.]"
                 );
                 let section = format!("{header}\n{body}");
                 let after_tokens = estimate_tokens(&section);
@@ -771,6 +920,19 @@ fn read_one_delta(
             }
         },
     }
+}
+
+/// A skeleton serve's section: the header, the numbered signature lines
+/// (plus the cap note when [`SKELETON_MAX_LINES`] cut them short), then
+/// `note` on how to reach exact lines.
+fn skeleton_section(header: &str, sk: Skeleton, note: &str) -> String {
+    let mut body = sk.body;
+    if sk.capped {
+        body.push_str(&format!(
+            "... (skeleton capped at {SKELETON_MAX_LINES} signature lines)\n"
+        ));
+    }
+    format!("{header}\n{body}{note}")
 }
 
 /// Whether a spec qualifies for the whole-file SYMBOL NUDGE probe: no
@@ -856,31 +1018,33 @@ mod tests {
         );
     }
 
-    /// Backlog c19ec2ff (c): a MALFORMED stringified array (observed
-    /// shape, 2027-01-25: a stray quote after a numeric field) still
-    /// reads the well-formed specs, with a NOTE naming the skipped
-    /// fragment and the byte position of the parse failure.
+    /// Backlog c19ec2ff (c): a MALFORMED stringified array still reads
+    /// its recoverable specs — well-formed ones, and ones whose only defect
+    /// is the observed stray quote after a number (2027-01-25, and again on
+    /// every spec of one call) — with a NOTE naming the skipped fragment
+    /// and the byte position of the parse failure.
     #[tokio::test]
     async fn malformed_stringified_files_recovers_well_formed_specs_with_note() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "alpha content").unwrap();
         std::fs::write(dir.path().join("b.txt"), "beta content").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "gamma content").unwrap();
         let tool = make_tool(dir.path());
         // a.txt's spec carries the stray-quote defect (max_lines: 5");
-        // b.txt's spec is well-formed.
+        // b.txt's spec is well-formed; c.txt's is missing its value.
         let result = tool
             .execute(json!({
-                "files": "[{\"path\": \"a.txt\", \"max_lines\": 5\"}, {\"path\": \"b.txt\"}]"
+                "files": "[{\"path\": \"a.txt\", \"max_lines\": 5\"}, {\"path\": \"b.txt\"}, {\"path\": \"c.txt\", \"max_lines\": }]"
             }))
             .await;
         assert!(result.success, "{}", result.output);
         assert!(
-            result.output.contains("beta content"),
-            "the well-formed spec is read: {}",
+            result.output.contains("alpha content") && result.output.contains("beta content"),
+            "the repaired and well-formed specs are read: {}",
             result.output
         );
         assert!(
-            !result.output.contains("alpha content"),
+            !result.output.contains("gamma content"),
             "the malformed spec must NOT be read: {}",
             result.output
         );
@@ -890,10 +1054,31 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("byte") && result.output.contains("a.txt"),
+            result.output.contains("byte") && result.output.contains("c.txt"),
             "the NOTE names the skipped fragment and the parse byte position: {}",
             result.output
         );
+    }
+
+    /// Every spec carrying a stray quote after a number (observed live)
+    /// is repaired silently: all files read, no NOTE.
+    #[tokio::test]
+    async fn stray_quote_on_every_spec_reads_all_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one
+two
+three").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta content").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "files": "[{\"max_lines\": 1, \"path\": \"a.txt\", \"start_line\": 2\"}, {\"max_lines\": 100, \"path\": \"b.txt\", \"start_line\": 1\"}]"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("two") && !result.output.contains("three"), "{}", result.output);
+        assert!(result.output.contains("beta content"), "{}", result.output);
+        assert!(!result.output.contains("NOTE"), "{}", result.output);
     }
 
     /// Backlog c19ec2ff (c): an unrecoverable string fails with the byte
@@ -965,10 +1150,77 @@ mod tests {
             schema.description
         );
         assert!(
-            schema.description.contains("\"files\":[{\"path\":\"a.js\""),
+            schema.description.contains("\"files\":[\"src/main.rs\",\"src/lib.rs:120+40\"]"),
             "the inline example shows the exact call shape: {}",
             schema.description
         );
+        // Plain strings, not objects: models that stringify nested object
+        // arrays (and grow a stray quote after a number) emit strings
+        // natively — and the schema no longer advertises the repair.
+        assert_eq!(schema.parameters["properties"]["files"]["items"], json!({"type": "string"}));
+        assert!(
+            !schema.parameters["properties"]["files"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("stringified"),
+            "the stringified-array repair stays silent"
+        );
+    }
+
+    #[test]
+    fn compact_specs_split_only_a_trailing_line_range() {
+        let parts = |s: &str| {
+            let spec = parse_compact_spec(s).unwrap();
+            (spec.path, spec.start_line, spec.max_lines)
+        };
+        assert_eq!(parts("src/a.rs"), ("src/a.rs".into(), None, None));
+        assert_eq!(parts("src/a.rs:10"), ("src/a.rs".into(), Some(10), None));
+        assert_eq!(parts("src/a.rs:4270+220"), ("src/a.rs".into(), Some(4270), Some(220)));
+        assert_eq!(parts("src/a.rs:10-19"), ("src/a.rs".into(), Some(10), Some(10)));
+        assert_eq!(parts(" src/a.rs:5-5 "), ("src/a.rs".into(), Some(5), Some(1)));
+        // A colon that is not a trailing range stays in the path.
+        assert_eq!(parts("C:\\repo\\a.rs"), ("C:\\repo\\a.rs".into(), None, None));
+        assert_eq!(parts("C:\\repo\\a.rs:7+3"), ("C:\\repo\\a.rs".into(), Some(7), Some(3)));
+        assert_eq!(parts("notes:draft.md"), ("notes:draft.md".into(), None, None));
+        assert_eq!(parts("a.rs:10+x"), ("a.rs:10+x".into(), None, None));
+        let backwards = parse_compact_spec("a.rs:20-10").unwrap_err();
+        assert!(backwards.contains("a.rs:20-10"), "{backwards}");
+    }
+
+    #[test]
+    fn every_reader_sees_compact_and_object_specs_alike() {
+        let args = json!({"files": ["a.rs:3+2", {"path": "b.rs", "start_line": 4}, 7]});
+        let specs: Vec<_> = read_specs(&args)
+            .into_iter()
+            .map(|s| (s.path, s.start_line, s.max_lines))
+            .collect();
+        assert_eq!(
+            specs,
+            vec![("a.rs".to_string(), Some(3), Some(2)), ("b.rs".to_string(), Some(4), None)]
+        );
+        let shorthand = read_specs(&json!({"path": "c.rs", "max_lines": 9}));
+        assert_eq!(shorthand.len(), 1);
+        assert_eq!((shorthand[0].path.as_str(), shorthand[0].max_lines), ("c.rs", Some(9)));
+    }
+
+    #[tokio::test]
+    async fn compact_string_specs_read_their_slices() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool
+            .execute(json!({"files": ["a.txt:2+2", "a.txt:4-5", "b.txt"]}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("2: two\n3: three"), "{}", result.output);
+        assert!(!result.output.contains("1: one"), "{}", result.output);
+        assert!(result.output.contains("4: four\n5: five"), "{}", result.output);
+        assert!(result.output.contains("beta"), "{}", result.output);
+
+        let backwards = tool.execute(json!({"files": ["a.txt:5-2"]})).await;
+        assert!(!backwards.success);
+        assert!(backwards.output.contains("before its start line"), "{}", backwards.output);
     }
 
     #[tokio::test]
@@ -1035,12 +1287,12 @@ mod tests {
             .await;
         assert!(result.success, "{}", result.output);
         // File A: only lines 2-3.
-        assert!(result.output.contains("   2: l2"));
-        assert!(result.output.contains("   3: l3"));
+        assert!(result.output.contains("\n2: l2"));
+        assert!(result.output.contains("\n3: l3"));
         assert!(!result.output.contains("l1"));
         assert!(!result.output.contains("l4"));
         // File B: full.
-        assert!(result.output.contains("   1: x"));
+        assert!(result.output.contains("\n1: x"));
     }
 
     #[tokio::test]
@@ -1267,9 +1519,9 @@ three
             .await;
         assert!(result.success, "{}", result.output);
         // Line numbers are the original file positions (3, 4), not 1, 2.
-        assert!(result.output.contains("   3: three"));
-        assert!(result.output.contains("   4: four"));
-        assert!(!result.output.contains("   1: "));
+        assert!(result.output.contains("\n3: three"));
+        assert!(result.output.contains("\n4: four"));
+        assert!(!result.output.contains("\n1: "));
     }
 
     #[tokio::test]
@@ -1365,7 +1617,7 @@ three
             .execute(json!({"files": [{"path": "a.txt", "start_line": 0}]}))
             .await;
         assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("   1: a"));
+        assert!(result.output.contains("\n1: a"));
     }
 
     #[tokio::test]
@@ -1649,7 +1901,7 @@ three
         assert!(r2.output.contains("unchanged since your last read"), "{}", r2.output);
         assert!(r2.output.contains("fn f_59() {"), "{}", r2.output);
         assert!(!r2.output.contains("let z = x + y;"), "{}", r2.output);
-        assert!(r2.output.contains("Re-read with start_line/max_lines"), "{}", r2.output);
+        assert!(r2.output.contains("Re-read a \"path:start+count\" range"), "{}", r2.output);
         let savings = r2.data.as_ref().unwrap()["savings"].as_array().unwrap();
         assert_eq!(savings.len(), 1);
         assert_eq!(savings[0]["kind"], "skeleton");
@@ -1720,8 +1972,92 @@ three
             .execute(json!({"files":[{"path":"a.rs","start_line":2,"max_lines":1}]}))
             .await;
         assert!(r2.success, "{}", r2.output);
-        assert!(r2.output.contains("   2: fn b() {}"), "{}", r2.output);
+        assert!(r2.output.contains("\n2: fn b() {}"), "{}", r2.output);
         assert!(!r2.output.contains("unchanged since your last read"), "{}", r2.output);
         assert!(r2.data.is_none());
+    }
+
+    #[tokio::test]
+    async fn numbered_lines_drop_padding_and_trailing_whitespace_but_keep_indentation() {
+        let dir = tempdir().unwrap();
+        let content = "fn f() {  \n\tlet x = 1;\t\n    \n    g();\n}\n";
+        std::fs::write(dir.path().join("a.rs"), content).unwrap();
+        let result = make_tool(dir.path())
+            .execute(json!({"files":[{"path":"a.rs"}]}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.ends_with("\n1: fn f() {\n2: \tlet x = 1;\n3:\n4:     g();\n5: }"),
+            "{}",
+            result.output
+        );
+        // An anchor copied from that view (prefixes off) still lands on
+        // the lines whose trailing whitespace the view dropped.
+        let anchor = "fn f() {\n\tlet x = 1;\n\n    g();";
+        let outcome = crate::tool::agent::edit_ops::literal_splice(
+            content,
+            anchor,
+            "fn f() {\n\tlet x = 2;\n\n    g();",
+            false,
+            1,
+        )
+        .expect("splice")
+        .expect("the copied anchor matches");
+        assert_eq!(outcome.new_content, "fn f() {\n\tlet x = 2;\n\n    g();\n}\n");
+    }
+
+    #[tokio::test]
+    async fn first_whole_read_of_a_big_file_serves_its_outline() {
+        let dir = tempdir().unwrap();
+        write_big_rust_file(dir.path(), "big.rs", 40);
+        let total = std::fs::read_to_string(dir.path().join("big.rs")).unwrap().lines().count();
+        assert!(total > OUTLINE_MIN_LINES, "{total}");
+        let tool = make_delta_tool(dir.path());
+        let whole = json!({"files":[{"path":"big.rs"}]});
+
+        let r1 = tool.execute(whole.clone()).await;
+        assert!(r1.success, "{}", r1.output);
+        assert!(r1.output.contains(&format!("signature lines of {total}) ===")), "{}", r1.output);
+        assert!(r1.output.contains("\n1: pub fn sym_0(x: u32) -> u32 {"), "{}", r1.output);
+        assert!(r1.output.contains("pub fn sym_39("), "{}", r1.output);
+        assert!(!r1.output.contains("let a = x + 0;"), "{}", r1.output);
+        assert!(r1.output.contains("Read the region you need as a \"path:start+count\" range"));
+        let savings = r1.data.as_ref().unwrap()["savings"].as_array().unwrap();
+        assert_eq!(savings[0]["kind"], "outline");
+        assert!(savings[0]["tokens_after"].as_i64() < savings[0]["tokens_before"].as_i64());
+
+        // The region the agent asks for next comes back exact.
+        let ranged = tool
+            .execute(json!({"files":[{"path":"big.rs","start_line":2,"max_lines":1}]}))
+            .await;
+        assert!(ranged.output.ends_with("\n2:     let a = x + 0;"), "{}", ranged.output);
+
+        // No baseline was recorded: a whole re-read is the outline again,
+        // never a skeleton of, or a diff against, content the agent never saw.
+        let r2 = tool.execute(whole.clone()).await;
+        assert_eq!(r2.output, r1.output);
+        let src = std::fs::read_to_string(dir.path().join("big.rs")).unwrap();
+        std::fs::write(dir.path().join("big.rs"), src.replace("x + 7;", "x + 70;")).unwrap();
+        let r3 = tool.execute(whole.clone()).await;
+        assert!(r3.output.contains("(outline:"), "{}", r3.output);
+        assert!(!r3.output.contains("x + 70;"), "{}", r3.output);
+
+        // Lever off: the whole file as before.
+        let full = make_tool(dir.path()).execute(whole).await;
+        assert!(full.output.contains("\n2:     let a = x + 0;"), "{}", full.output);
+        assert!(full.data.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_big_file_without_signatures_serves_in_full() {
+        let dir = tempdir().unwrap();
+        let rows: String = (0..400).map(|i| format!("    {i},\n")).collect();
+        std::fs::write(dir.path().join("table.rs"), &rows).unwrap();
+        let result = make_delta_tool(dir.path())
+            .execute(json!({"files":[{"path":"table.rs"}]}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("\n400:     399,"), "{}", result.output);
+        assert!(result.data.is_none());
     }
 }

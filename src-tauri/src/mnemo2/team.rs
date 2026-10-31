@@ -16,15 +16,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
+use mnemo::app::plan_board::{BoardPlan, BoardStatus, BoardStep, CloseOutcome, PlanBoard};
+use mnemo::app::team_ledger::TeamLedger;
 use mnemo::app::worktrees::{
     agent_branch, agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
 };
 use mnemo::headless::{
-    AgentSession, Engine, EventReceiver, Guardrails, HostToolSpec, PendingInteraction,
-    QuestionPolicy, SessionCommand, SessionEvent, SessionId, SessionLimits, SpawnOptions,
+    AgentSession, Engine, EventReceiver, GateRule, GateVerdict, Guardrails, HostToolSpec,
+    PendingInteraction, QuestionPolicy, SessionCommand, SessionEvent, SessionId, SpawnOptions,
     ToolSelection, Transcript, TurnEndPolicy,
 };
+use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
 use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::{PermissionPolicy, SerializableAgentEvent};
 use serde::{Deserialize, Serialize};
@@ -32,11 +34,10 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewEvidence, ReviewRecord};
-use crate::mnemo2::runtime::LeadRuntime;
-use crate::mnemo2::usage::{
-    event_session, usage_model_key, ProjectUsage, ProjectUsageView,
-};
+use crate::mnemo2::runtime::{LeadModel, LeadRuntime};
+use crate::mnemo2::usage::{event_session, usage_model_key, ProjectUsage, ProjectUsageView};
 
 /// The Tauri event channel emitted by the team runtime.
 pub const TEAM_EVENT_CHANNEL: &str = "mnemo2://team-event";
@@ -46,12 +47,6 @@ const TEAM_STATE_FILE: &str = "team.json";
 
 /// How many transient team events the broadcast bus keeps for a slow consumer.
 const EVENT_BUFFER: usize = 1024;
-
-/// The executor session's per-turn cap (a runaway worker stops on its own).
-const WORKER_MAX_TURNS: u64 = 64;
-
-/// The executor session's wall-clock cap.
-const WORKER_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
 
 /// The default number of concurrently live worker sessions.
 pub const DEFAULT_SLOTS: usize = 3;
@@ -113,12 +108,22 @@ pub struct WorkerRecord {
     pub id: String,
     /// The worker's display name.
     pub name: String,
-    /// The lead's brief — the worker's initial prompt.
+    /// The lead's brief: the task-specific instructions. Idempotent re-dispatch
+    /// compares this, never the composed opening prompt.
     pub brief: String,
+    /// The worker's composed first message (the plan-board brief header, then
+    /// the lead's brief). `None` for a worker dispatched without a plan: its
+    /// first message is the brief itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_prompt: Option<String>,
     /// The selected `endpoint/model` spec, when one was chosen.
     pub model: Option<String>,
     /// The actual model id observed from the live session, when known.
     pub model_id: Option<String>,
+    /// The reasoning effort chosen for this worker; `None` = the model's
+    /// configured default. Every session of the worker (resume, fixes) uses it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// The worker's `wt/agent-*` branch.
     pub branch: String,
     /// The linked worktree checkout.
@@ -190,9 +195,7 @@ pub struct WorkerRecord {
     /// commit moves the tip and makes this audit stale for the new tip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_tip: Option<String>,
-    /// The lead-requested audit reasoning depth, when one was chosen.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+
     /// Durable lead findings.
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -207,6 +210,95 @@ pub struct WorkerRecord {
     pub merge: Option<MergeRecord>,
     /// The last error, when the worker failed or conflicted.
     pub error: Option<String>,
+    /// The board plan this task was dispatched under (validated by the plan
+    /// board at dispatch).
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    /// The 0-based plan step the task was dispatched under.
+    #[serde(default)]
+    pub plan_step: Option<usize>,
+    /// The model tier (`difficult`, `average`, `simple`) the lead chose,
+    /// when it dispatched by tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+}
+
+impl WorkerRecord {
+    /// The first message the worker's session receives.
+    fn first_message(&self) -> &str {
+        self.opening_prompt.as_deref().unwrap_or(&self.brief)
+    }
+}
+
+/// A plan-board signal for the host: the UI refreshes on `Changed`, the lead
+/// is told about a `Notice`.
+#[derive(Clone, Debug)]
+pub enum BoardSignal {
+    /// The board (or the workers stamped on it) may have changed.
+    Changed,
+    /// A deduplicated TeamManager notice for the lead.
+    Notice {
+        /// Dedup key.
+        key: String,
+        /// The notice body.
+        text: String,
+    },
+}
+
+/// A plan and step a task is dispatched under (`step` is 0-based).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlanRef {
+    plan_id: String,
+    step: usize,
+}
+
+/// A worker on a board step, as the Plan tab shows it.
+#[derive(Clone, Debug, Serialize)]
+pub struct BoardWorker {
+    /// The worker id.
+    pub id: String,
+    /// The worker's display name.
+    pub name: String,
+    /// The worker's lifecycle status.
+    pub status: WorkerStatus,
+}
+
+/// One board step plus the workers stamped with it.
+#[derive(Clone, Debug, Serialize)]
+pub struct BoardStepView {
+    /// The step itself.
+    #[serde(flatten)]
+    pub step: BoardStep,
+    /// The workers stamped with this plan and step.
+    pub workers: Vec<BoardWorker>,
+}
+
+/// One board plan as the UI shows it: the report path is project-relative.
+#[derive(Clone, Debug, Serialize)]
+pub struct BoardPlanView {
+    /// The plan id.
+    pub id: String,
+    /// The plan title.
+    pub title: String,
+    /// The plan goal.
+    pub goal: String,
+    /// `implementation`, `research`, or `bug_fixing`.
+    pub kind: String,
+    /// Open, closed, or abandoned.
+    pub status: BoardStatus,
+    /// Epoch milliseconds the plan closed or was abandoned.
+    pub closed_at_ms: Option<u64>,
+    /// The closing report, relative to the project root.
+    pub report_path: Option<String>,
+    /// The steps with their workers.
+    pub steps: Vec<BoardStepView>,
+}
+
+/// The plan board's public snapshot.
+#[derive(Clone, Debug, Serialize)]
+pub struct BoardSnapshot {
+    /// Every board plan.
+    pub plans: Vec<BoardPlanView>,
 }
 
 /// Legacy ledgers carry no review risk; they decode as `standard`.
@@ -266,8 +358,9 @@ pub struct TeamRuntimeOptions {
     pub state_dir: PathBuf,
     /// Explicit cap override; `None` restores the saved cap or the default.
     pub slots: Option<usize>,
-    /// Explicit worker models must belong to this configured inventory.
-    pub model_specs: Vec<String>,
+    /// The configured model inventory: explicit worker models (and their
+    /// reasoning efforts) must belong to it.
+    pub models: Vec<LeadModel>,
     /// Configured per-model prices used to estimate real worker cost.
     pub pricing: Vec<mnemo::config::PricingEntry>,
 }
@@ -392,7 +485,8 @@ pub struct TeamRuntime {
     lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
-    model_specs: Vec<String>,
+    models: std::sync::RwLock<Vec<LeadModel>>,
+    tiers: std::sync::RwLock<mnemo::headless::TiersDto>,
     persistence: TeamPersistence,
     /// The durable per-project usage accumulator (lead + workers).
     usage: Arc<Mutex<ProjectUsage>>,
@@ -400,7 +494,22 @@ pub struct TeamRuntime {
     /// usage recording, and cleanup so no usage report can be lost to a
     /// stale interleaving of concurrent ledger saves.
     save_lock: Arc<Mutex<()>>,
+    board: std::sync::Mutex<Option<Arc<PlanBoard>>>,
+    signals: broadcast::Sender<BoardSignal>,
 }
+
+/// The model tiers the lead may dispatch by, with their one-line purpose.
+const TIER_PURPOSES: [(&str, &str); 3] = [
+    (
+        "difficult",
+        "design, debugging, bug_fixing plans, cross-cutting work, steps touching shared contracts",
+    ),
+    ("average", "typical implementation steps"),
+    (
+        "simple",
+        "single-file mechanical edits, checks, lookups, scaffolding",
+    ),
+];
 
 /// Upper bound for concurrently live worker sessions in one project.
 pub const MAX_WORKER_SLOTS: usize = 32;
@@ -425,6 +534,7 @@ impl TeamRuntime {
             recover_worker(&options.workspace_root, worker).await?;
         }
         let (events, _) = broadcast::channel(EVENT_BUFFER);
+        let (signals, _) = broadcast::channel(EVENT_BUFFER);
         let runtime = Self {
             engine: options.engine,
             workspace_root: options.workspace_root,
@@ -438,10 +548,13 @@ impl TeamRuntime {
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
-            model_specs: options.model_specs,
+            models: std::sync::RwLock::new(options.models),
+            tiers: std::sync::RwLock::new(mnemo::headless::TiersDto::default()),
             persistence,
             usage: Arc::new(Mutex::new(usage)),
             save_lock: Arc::new(Mutex::new(())),
+            board: std::sync::Mutex::new(None),
+            signals,
         };
         runtime.persist().await?;
         Ok(runtime)
@@ -454,15 +567,212 @@ impl TeamRuntime {
             workspace_root: lead.workspace_root().to_path_buf(),
             state_dir,
             slots: None,
-            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
+            models: lead.models(),
             pricing: lead.pricing()?,
         })
         .await
+        .map(|team| {
+            team.set_tiers(lead.tiers());
+            team
+        })
+    }
+
+    /// Replace the model tiers new dispatches resolve against.
+    pub fn set_tiers(&self, tiers: mnemo::headless::TiersDto) {
+        *self.tiers.write().unwrap_or_else(|e| e.into_inner()) = tiers;
+    }
+
+    /// Refresh the model inventory, tiers and prices after a settings save.
+    pub fn set_catalog(
+        &self,
+        models: Vec<LeadModel>,
+        tiers: mnemo::headless::TiersDto,
+        pricing: Vec<mnemo::config::PricingEntry>,
+    ) {
+        *self.models.write().unwrap_or_else(|e| e.into_inner()) = models;
+        self.set_tiers(tiers);
+        *self.pricing.write().expect("pricing lock poisoned") = pricing;
+    }
+
+    fn current_models(&self) -> Vec<LeadModel> {
+        self.models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The tier's configured models that are still available, in order.
+    pub(crate) fn tier_models(&self, tier: &str) -> Vec<LeadModel> {
+        let tiers = self.tiers.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let specs = match tier {
+            "difficult" => tiers.difficult,
+            "average" => tiers.average,
+            "simple" => tiers.simple,
+            _ => Vec::new(),
+        };
+        let models = self.current_models();
+        specs
+            .iter()
+            .filter_map(|spec| models.iter().find(|m| &m.spec == spec).cloned())
+            .collect()
+    }
+
+    /// Every available model some tier names, in tier order, once each.
+    fn tiered_models(&self) -> Vec<LeadModel> {
+        let mut models: Vec<LeadModel> = Vec::new();
+        for (tier, _) in TIER_PURPOSES {
+            for model in self.tier_models(tier) {
+                if !models.iter().any(|known| known.spec == model.spec) {
+                    models.push(model);
+                }
+            }
+        }
+        models
+    }
+
+    /// The model a lead's `tier`/`model` choice runs on. With tiers
+    /// configured the lead stays inside them: an explicit model must be one
+    /// a tier names. `None` when neither was given.
+    fn lead_model_choice(
+        &self,
+        tier: Option<&str>,
+        model: Option<String>,
+    ) -> Result<Option<String>, String> {
+        let model = match (model, tier) {
+            (None, Some(tier)) => match self.tier_models(tier).into_iter().next() {
+                Some(first) => Some(first.spec),
+                None => {
+                    return Err(format!(
+                        "tier '{tier}' has no available models; pass a `model` or another tier"
+                    ));
+                }
+            },
+            (model, _) => model,
+        };
+        let tiered = self.tiered_models();
+        match &model {
+            Some(spec) if !tiered.is_empty() && !tiered.iter().any(|m| &m.spec == spec) => {
+                Err(format!(
+                    "'{spec}' is not in any model tier (Settings > Tiers); pass a `tier`, or a model a tier names: {}",
+                    tiered.iter().map(|m| m.spec.as_str()).collect::<Vec<_>>().join(", ")
+                ))
+            }
+            _ => Ok(model),
+        }
+    }
+
+    /// The refusal for a dispatch with no tier while tiers are configured.
+    fn tier_required(&self) -> Option<String> {
+        self.tier_guidance().map(|guidance| {
+            format!("choose a `tier` for this worker; its model comes from that tier:\n{guidance}")
+        })
+    }
+
+    /// `$in/$out` per 1M tokens for a model, when priced.
+    fn price_label(&self, model: &LeadModel) -> Option<String> {
+        let pricing = self.pricing.read().expect("pricing lock poisoned");
+        pricing
+            .iter()
+            .find(|p| p.model == model.model)
+            .map(|p| format!("${}/${}", p.input_per_1m, p.output_per_1m))
+    }
+
+    /// The tier guidance shown to the lead: each tier with its one-line
+    /// purpose and its models (with prices).
+    fn tier_guidance(&self) -> Option<String> {
+        let mut lines = Vec::new();
+        for (tier, purpose) in TIER_PURPOSES {
+            let models = self.tier_models(tier);
+            if models.is_empty() {
+                continue;
+            }
+            let list = models
+                .iter()
+                .map(|m| match self.price_label(m) {
+                    Some(price) => format!("{} ({price})", m.spec),
+                    None => m.spec.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("{tier} - {purpose}: {list}"));
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     /// Subscribe to every worker event.
     pub fn subscribe(&self) -> broadcast::Receiver<TeamEvent> {
         self.events.subscribe()
+    }
+
+    /// Subscribe to plan-board signals (UI refreshes and lead notices).
+    pub fn subscribe_board(&self) -> broadcast::Receiver<BoardSignal> {
+        self.signals.subscribe()
+    }
+
+    /// Tell subscribers the board may have changed.
+    pub(crate) fn signal_board_changed(&self) {
+        let _ = self.signals.send(BoardSignal::Changed);
+    }
+
+    fn notify_lead(&self, key: String, text: String) {
+        let _ = self.signals.send(BoardSignal::Notice { key, text });
+    }
+
+    /// Share the lead's one plan board with the team.
+    pub(crate) fn attach_board(&self, board: Arc<PlanBoard>) {
+        *self.board.lock().unwrap_or_else(|e| e.into_inner()) = Some(board);
+    }
+
+    fn board(&self) -> Option<Arc<PlanBoard>> {
+        self.board.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Every board plan with the workers stamped on each step. Report paths
+    /// are relative to the project root.
+    pub async fn board_snapshot(&self) -> Result<BoardSnapshot, String> {
+        let board = self
+            .board()
+            .ok_or_else(|| "the plan board is not available".to_string())?;
+        let plans = board.list()?;
+        let workers = self.records.lock().await.clone();
+        let plans = plans
+            .into_iter()
+            .map(|plan: BoardPlan| BoardPlanView {
+                report_path: plan
+                    .report_path
+                    .as_deref()
+                    .map(|path| project_relative(&self.workspace_root, path)),
+                steps: plan
+                    .steps
+                    .into_iter()
+                    .map(|step| {
+                        let on_step = workers
+                            .iter()
+                            .filter(|w| {
+                                w.plan_id.as_deref() == Some(plan.id.as_str())
+                                    && w.plan_step == step.number.checked_sub(1)
+                            })
+                            .map(|w| BoardWorker {
+                                id: w.id.clone(),
+                                name: w.name.clone(),
+                                status: w.status,
+                            })
+                            .collect();
+                        BoardStepView {
+                            step,
+                            workers: on_step,
+                        }
+                    })
+                    .collect(),
+                id: plan.id,
+                title: plan.title,
+                goal: plan.goal,
+                kind: plan.kind,
+                status: plan.status,
+                closed_at_ms: plan.closed_at_ms,
+            })
+            .collect();
+        Ok(BoardSnapshot { plans })
     }
 
     /// Mark the lead non-idle: the merge gate's busy hook, re-armed at
@@ -597,12 +907,62 @@ impl TeamRuntime {
 
     /// The lead's team delegation, review, and repair host tools.
     pub fn lead_host_tools(&self) -> Vec<HostToolSpec> {
-        let worker_arg = json!({"worker_id": {"type": "string"}});
+        let guidance = self.tier_guidance();
+        // With tiers configured the lead picks among the tiers' models only.
+        let lead_models = if guidance.is_some() {
+            self.tiered_models()
+        } else {
+            self.current_models()
+        };
+        let model_description = if guidance.is_some() {
+            "A specific model from the tiers, only when the tier's first model does not fit; it overrides `tier`. Prefer `tier`; models outside the tiers are refused."
+        } else {
+            "The exact endpoint/model spec this worker runs on. Choose it per task: a strong reasoning model for design-heavy, cross-cutting, or debugging work; a fast, inexpensive model for mechanical edits, boilerplate, or test scaffolding. Omit to use the configured default."
+        };
+        let mut model = json!({"type": "string", "description": model_description});
+        let tier_description = match &guidance {
+            Some(text) => format!(
+                "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\n{text}"
+            ),
+            None => "The model tier. No tiers are configured (Settings > Tiers), so omit it and the default model is used.".to_string(),
+        };
+        let tier = json!({
+            "type": "string",
+            "enum": TIER_PURPOSES.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            "description": tier_description,
+        });
+        let specs: Vec<&str> = lead_models
+            .iter()
+            .map(|model| model.spec.as_str())
+            .collect();
+        if !specs.is_empty() {
+            model["enum"] = json!(specs);
+        }
+        let mut efforts: Vec<&str> = Vec::new();
+        for effort in lead_models
+            .iter()
+            .flat_map(|model| &model.reasoning_efforts)
+        {
+            if !efforts.contains(&effort.as_str()) {
+                efforts.push(effort);
+            }
+        }
+        let mut reasoning_effort = json!({
+            "type": "string",
+            "description": "The worker's reasoning effort, chosen with its model: higher for hard design or debugging, lower for mechanical work. Applies to the model `tier` or `model` picks; a value that model does not support is rejected with its allowed list. Omit to use the model's configured default."
+        });
+        if !efforts.is_empty() {
+            reasoning_effort["enum"] = json!(efforts);
+        }
+        let mut dispatch_required = vec!["worker_id", "plan_id", "step", "brief"];
+        if guidance.is_some() {
+            dispatch_required.push("tier");
+        }
         vec![
             HostToolSpec {
                 name: "team_dispatch".to_string(),
-                description: "Delegate one implementation task through TeamManager. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. Mark shared contracts, persistence, concurrency, security, or large/cross-cutting work with review_risk='high'; high-risk dispatch requires the active plan's '## Acceptance scenarios' section with observable bullets. The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"brief":{"type":"string"},"model":{"type":"string"},"review_risk":{"type":"string","enum":["standard","high"]}},"required":["worker_id","brief"]}),
+                description: "Delegate one implementation task through TeamManager to a full executor worker, under a step of a plan on the plan board (plan first: plan_create, then dispatch with its plan_id and 1-based step). The worker receives the plan and its step automatically, so your brief is only the task-specific instructions. A step is checked off when one of its tasks merges and none is still open. Workers run in their own worktree and branch with file_edit, file_write, shell, git, and tests, and have no token or cost budget: give them whole, self-contained implementation tasks (code, tests, verification, commit), never read-only, content-only, or 'send me the file text' briefs. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. Mark shared contracts, persistence, concurrency, security, or large/cross-cutting work with review_risk='high'; high-risk dispatch requires the active plan's '## Acceptance scenarios' section with observable bullets. The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"review_risk":{"type":"string","enum":["standard","high"],"description":"Lead-assigned review risk; high risk requires observable acceptance scenarios and an independent audit before merge."}},"required":dispatch_required}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -622,8 +982,8 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_status".to_string(),
-                description: "Read authoritative TeamManager state for every worker or one exact returned worker_id. This is the only worker lifecycle/ID authority; never infer status from Git, worktrees, timestamps, or files.".to_string(),
-                parameters: json!({"type":"object","properties":worker_arg}),
+                description: "Read authoritative TeamManager state for every worker or one exact returned worker_id. This is the only worker lifecycle/ID authority; never infer status from Git, worktrees, timestamps, or files. Pass plan_id to see one plan's workers (their step, status, findings). Ask when you need it; status is not pushed.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"plan_id":{"type":"string","description":"Only the workers dispatched on this board plan."}}}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -636,8 +996,8 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_resume".to_string(),
-                description: "Resume a stopped/interrupted worker from its saved transcript through TeamManager. Returns the same worker ID with a new session generation.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
+                description: "Resume a stopped, interrupted, or failed worker from its saved transcript through TeamManager. Returns the same worker ID with a new session generation. To move the worker to another model (it failed, or its model does not fit the work), pass `tier` or `model` (and optionally `reasoning_effort`): an idle worker is restarted on it with its transcript kept; a working one must be stopped first. The resumed worker is idle: send it a team_message to continue.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"tier":tier,"model":model,"reasoning_effort":reasoning_effort},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -650,8 +1010,36 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_review".to_string(),
-                description: "Persist your review of the current worker tip and its complete finding list. Review more than the worker's summary: read the diff unanchored first, then record substantive evidence — intent, execution path, integration, test quality, and residual risk. A passing test count alone is not a review. Re-review after every fix.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object"}},"evidence":{"type":"object","properties":{"unanchored_pass":{"type":"boolean"},"intent":{"type":"string"},"execution":{"type":"string"},"integration":{"type":"string"},"test_quality":{"type":"string"},"residual_risk":{"type":"string"},"independent_reviewer_id":{"type":"string"},"audit_adjudication":{"type":"string"}},"required":["unanchored_pass","intent","execution","integration","test_quality","residual_risk"]}},"required":["worker_id","summary","findings","evidence"]}),
+                description: "Persist your review of the current worker tip and its complete finding list. Review more than the worker's summary: read the diff unanchored first, then record substantive evidence — intent, execution path, integration, test quality, and residual risk. A passing test count alone is not a review. Re-review after every fix. Example finding: {\"title\":\"main.js uses a default import\",\"detail\":\"game.js exports Game as a named export, so the page fails to load\",\"file\":\"src/main.js\",\"line\":1,\"severity\":\"high\"}.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string"},
+                    "summary":{"type":"string"},
+                    "findings":{"type":"array","items":{
+                        "type":"object",
+                        "properties":{
+                            "id":{"type":"string","description":"Stable id; derived from file+title when omitted. Reuse it when re-reviewing."},
+                            "title":{"type":"string"},
+                            "detail":{"type":"string","description":"Why it matters."},
+                            "file":{"type":"string","description":"Repository-relative path."},
+                            "line":{"type":"integer","minimum":0,"description":"1-based line; 0 or omitted for file-wide."},
+                            "severity":{"type":"string","enum":crate::mnemo2::phase3::FINDING_SEVERITIES,"description":"Every open finding blocks the merge, whatever its severity."},
+                            "status":{"type":"string","enum":crate::mnemo2::phase3::FINDING_STATUSES,"default":"open"},
+                            "evidence":{"type":"string","description":"Required when status is fixed."},
+                            "justification":{"type":"string","description":"Required when status is wontfix."}
+                        },
+                        "required":["title","detail","file","severity"]
+                    }},
+                    "evidence":{"type":"object","properties":{
+                        "unanchored_pass":{"type":"boolean"},
+                        "intent":{"type":"string"},
+                        "execution":{"type":"string"},
+                        "integration":{"type":"string"},
+                        "test_quality":{"type":"string"},
+                        "residual_risk":{"type":"string"},
+                        "independent_reviewer_id":{"type":"string"},
+                        "audit_adjudication":{"type":"string"}
+                    },"required":["unanchored_pass","intent","execution","integration","test_quality","residual_risk"]}
+                },"required":["worker_id","summary","findings","evidence"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -692,7 +1080,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_revert_merge".to_string(),
-                description: "Revert a worker's earlier local merge only while it remains unlanded on the original non-main lead branch.".to_string(),
+                description: "Revert a worker's earlier merge into the lead branch, only while that merge has not yet reached main.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(120_000),
@@ -722,7 +1110,7 @@ impl TeamRuntime {
                     "team_dispatch requires 'brief' and a caller-chosen stable 'worker_id'",
                 );
             };
-            let model = args
+            let mut model = args
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_string);
@@ -730,15 +1118,48 @@ impl TeamRuntime {
                 .get("review_risk")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
+            model = match self.lead_model_choice(tier.as_deref(), model) {
+                Ok(Some(model)) => Some(model),
+                Ok(None) => match self.tier_required() {
+                    Some(required) => return ToolResult::error(required),
+                    None => None,
+                },
+                Err(err) => return ToolResult::error(err),
+            };
+            let reasoning_effort = args
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let plan_id = args
+                .get("plan_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let step = args
+                .get("step")
+                .and_then(Value::as_u64)
+                .and_then(|step| usize::try_from(step).ok())
+                .unwrap_or(0);
             let result = self
-                .dispatch_request(
+                .dispatch_on_plan(
                     brief.to_string(),
                     model,
+                    reasoning_effort,
                     Some(worker_id.to_string()),
                     review_risk,
+                    plan_id,
+                    step,
                 )
                 .await
                 .map(|(worker, reused)| json!({"worker": worker, "reused": reused}));
+            let result = match (result, tier) {
+                (Ok(mut value), Some(tier)) => {
+                    self.record_tier(worker_id, &tier).await;
+                    value["worker"]["tier"] = json!(tier);
+                    Ok(value)
+                }
+                (result, _) => result,
+            };
             return worker_result(result, "team_dispatch");
         }
         if name == "team_audit_dispatch" {
@@ -748,10 +1169,13 @@ impl TeamRuntime {
             let Some(reviewer_id) = args.get("reviewer_id").and_then(Value::as_str) else {
                 return ToolResult::error("team_audit_dispatch requires a 'reviewer_id' string");
             };
-            let model = args
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            let model = match self.lead_model_choice(
+                None,
+                args.get("model").and_then(Value::as_str).map(str::to_string),
+            ) {
+                Ok(model) => model,
+                Err(err) => return ToolResult::error(err),
+            };
             let reasoning_effort = args
                 .get("reasoning_effort")
                 .and_then(Value::as_str)
@@ -773,11 +1197,28 @@ impl TeamRuntime {
             return worker_result(result, "team_audit_dispatch");
         }
         if name == "team_status" {
-            let result = match args.get("worker_id").and_then(Value::as_str) {
-                Some(id) => self.worker(id).await,
-                None => return worker_result(Ok(self.snapshot().await.workers), "team_status"),
+            let plan_id = args
+                .get("plan_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let in_plan = |worker: &WorkerRecord| {
+                plan_id.is_none_or(|id| worker.plan_id.as_deref() == Some(id))
             };
-            return worker_result(result.map(|worker| vec![worker]), "team_status");
+            let result = match args.get("worker_id").and_then(Value::as_str) {
+                Some(id) => self
+                    .worker(id)
+                    .await
+                    .map(|worker| vec![worker].into_iter().filter(|w| in_plan(w)).collect()),
+                None => Ok(self
+                    .snapshot()
+                    .await
+                    .workers
+                    .into_iter()
+                    .filter(|w| in_plan(w))
+                    .collect::<Vec<_>>()),
+            };
+            return worker_result(result, "team_status");
         }
         let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
             return ToolResult::error(format!("{name} requires a 'worker_id' string"));
@@ -788,7 +1229,37 @@ impl TeamRuntime {
                 None => Err("team_message requires a 'text' string".to_string()),
             },
             "team_stop" => self.stop(worker_id).await,
-            "team_resume" => self.resume(worker_id).await,
+            "team_resume" => {
+                let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
+                let model = args.get("model").and_then(Value::as_str).map(str::to_string);
+                let reasoning_effort = args
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if tier.is_none() && model.is_none() && reasoning_effort.is_none() {
+                    self.resume(worker_id).await
+                } else {
+                    match self.lead_model_choice(tier.as_deref(), model) {
+                        Err(err) => Err(err),
+                        Ok(model) => {
+                            // An effort alone keeps the worker's model.
+                            let model = match model {
+                                Some(model) => Some(model),
+                                None => self.worker(worker_id).await.ok().and_then(|w| w.model),
+                            };
+                            let changed =
+                                self.change_model(worker_id, model, reasoning_effort).await;
+                            match (changed, tier) {
+                                (Ok(_), Some(tier)) => {
+                                    self.record_tier(worker_id, &tier).await;
+                                    self.worker(worker_id).await
+                                }
+                                (changed, _) => changed,
+                            }
+                        }
+                    }
+                }
+            }
             "team_compact" => self.compact(worker_id).await,
             "team_review" => {
                 let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
@@ -803,12 +1274,13 @@ impl TeamRuntime {
                         serde_json::from_value::<ReviewEvidence>(value)
                             .map_err(|err| format!("invalid review evidence: {err}"))
                     });
-                let findings = serde_json::from_value::<Vec<Finding>>(
-                    args.get("findings").cloned().unwrap_or_else(|| json!([])),
+                let findings = phase3::parse_findings(
+                    &args.get("findings").cloned().unwrap_or_else(|| json!([])),
                 );
                 match (evidence, findings) {
                     (Ok(evidence), Ok(findings)) => {
-                        self.review(worker_id, summary.to_string(), findings, evidence).await
+                        self.review(worker_id, summary.to_string(), findings, evidence)
+                            .await
                     }
                     (Ok(_), Err(err)) => Err(format!("invalid findings: {err}")),
                     (Err(err), _) => Err(err),
@@ -862,8 +1334,10 @@ impl TeamRuntime {
                 )
                 .await
             }
-            "team_merge" => self.merge(worker_id).await,
-            "team_revert_merge" => self.revert_merge(worker_id).await,
+            // The lead's own turn is parked on this call, so its busy flag
+            // does not mean it is editing the branch.
+            "team_merge" => self.merge_as(worker_id, true).await,
+            "team_revert_merge" => self.revert_merge_as(worker_id, true).await,
             _ => Err(format!("unknown team host tool '{name}'")),
         };
         worker_result(result, name)
@@ -882,7 +1356,43 @@ impl TeamRuntime {
     async fn persist(&self) -> Result<(), String> {
         save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await
     }
-    /// Delegate one real worker task. The brief is the worker's first prompt.
+    /// The one production dispatch path: a task on a plan step (1-based),
+    /// checked against the board before anything is provisioned. The lead's
+    /// `team_dispatch` tool and the Control Room form both land here.
+    pub async fn dispatch_on_plan(
+        &self,
+        brief: String,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        worker_id: Option<String>,
+        review_risk: Option<String>,
+        plan_id: &str,
+        step: usize,
+    ) -> Result<(WorkerRecord, bool), String> {
+        let plan_id = plan_id.trim();
+        if plan_id.is_empty() || step < 1 {
+            return Err(
+                "team_dispatch requires 'plan_id' (a board plan id) and 'step' (a 1-based integer). Create the plan first with plan_create."
+                    .to_string(),
+            );
+        }
+        let plan = PlanRef {
+            plan_id: plan_id.to_string(),
+            step: step - 1,
+        };
+        self.dispatch_request(
+            brief,
+            model,
+            reasoning_effort,
+            worker_id,
+            Some(plan),
+            review_risk,
+        )
+        .await
+    }
+
+    /// Plan-free dispatch, kept for tests that exercise worker lifecycle only.
+    #[cfg(test)]
     pub async fn dispatch(
         &self,
         brief: String,
@@ -891,7 +1401,7 @@ impl TeamRuntime {
         self.dispatch_with_id(brief, model, None, None).await
     }
 
-    /// Dispatch or recover one logical task, keyed by its actual worker ID.
+    #[cfg(test)]
     pub async fn dispatch_with_id(
         &self,
         brief: String,
@@ -899,7 +1409,34 @@ impl TeamRuntime {
         worker_id: Option<String>,
         review_risk: Option<String>,
     ) -> Result<WorkerRecord, String> {
-        self.dispatch_request(brief, model, worker_id, review_risk)
+        self.dispatch_request(
+            brief,
+            model,
+            None,
+            worker_id,
+            None,
+            review_risk,
+        )
+        .await
+        .map(|(worker, _)| worker)
+    }
+
+    #[cfg(test)]
+    pub async fn dispatch_task(
+        &self,
+        brief: String,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        worker_id: Option<String>,
+    ) -> Result<WorkerRecord, String> {
+        self.dispatch_request(
+            brief,
+            model,
+            reasoning_effort,
+            worker_id,
+            None,
+            None,
+        )
             .await
             .map(|(worker, _)| worker)
     }
@@ -908,7 +1445,34 @@ impl TeamRuntime {
         &self,
         brief: String,
         model: Option<String>,
+        reasoning_effort: Option<String>,
         worker_id: Option<String>,
+        plan: Option<PlanRef>,
+        review_risk: Option<String>,
+    ) -> Result<(WorkerRecord, bool), String> {
+        let result = self
+            .dispatch_locked(
+                brief,
+                model,
+                reasoning_effort,
+                worker_id,
+                plan,
+                review_risk,
+            )
+            .await;
+        if matches!(result, Ok((_, false))) {
+            self.signal_board_changed();
+        }
+        result
+    }
+
+    async fn dispatch_locked(
+        &self,
+        brief: String,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        worker_id: Option<String>,
+        plan: Option<PlanRef>,
         review_risk: Option<String>,
     ) -> Result<(WorkerRecord, bool), String> {
         let _guard = self.merge_lock.lock().await;
@@ -936,32 +1500,70 @@ impl TeamRuntime {
                 records.iter().find(|worker| worker.id == id).cloned()
             };
             if let Some(existing) = existing {
-                if existing.brief != brief || existing.model != model {
+                if existing.brief != brief
+                    || existing.model != model
+                    || existing.reasoning_effort != reasoning_effort
+                    || plan.as_ref().is_some_and(|plan| {
+                        existing.plan_id.as_deref() != Some(plan.plan_id.as_str())
+                            || existing.plan_step != Some(plan.step)
+                    })
+                {
                     return Err(format!(
-                        "worker '{id}' already exists with a different brief or model; use team_status instead of guessing a new ID"
+                        "worker '{id}' already exists with a different brief, model, reasoning effort, or plan step; use team_status instead of guessing a new ID (to move it to another model, use team_resume with `tier` or `model`)"
                     ));
                 }
                 if existing.branch != agent_branch(id) {
                     return Err(format!("worker '{id}' has an invalid branch identity"));
                 }
-                self.validate_model(&existing.model)?;
+                self.validate_model(&existing.model, &existing.reasoning_effort)?;
                 if !existing.brief_sent
                     && !self.live.lock().await.contains_key(id)
-                    && matches!(existing.status, WorkerStatus::Dispatching | WorkerStatus::Failed | WorkerStatus::Interrupted)
+                    && matches!(
+                        existing.status,
+                        WorkerStatus::Dispatching
+                            | WorkerStatus::Failed
+                            | WorkerStatus::Interrupted
+                    )
                 {
                     if !existing.worktree.is_dir() {
                         return Err(format!("worker '{id}' has no recoverable worktree"));
                     }
-                    return self.start_worker(existing).await.map(|worker| (worker, true));
+                    return self
+                        .start_worker(existing)
+                        .await
+                        .map(|worker| (worker, true));
                 }
                 return Ok((existing, true));
             }
         }
-        self.validate_model(&model)?;
+        // The plan board refuses before any record, branch, or worktree exists.
+        let opening = match &plan {
+            Some(plan) => {
+                let board = self
+                    .board()
+                    .ok_or_else(|| "the plan board is not available".to_string())?;
+                let header = board.brief_for(&plan.plan_id, plan.step + 1)?;
+                // Steps of this plan with an open task, other than this one:
+                // parallel work, which needs contracts for shared files.
+                let in_flight = self.in_flight_steps(&plan.plan_id, plan.step).await;
+                board.contract_gate(&plan.plan_id, plan.step, &in_flight)?;
+                Some(format!("{}\n---\n\n{brief}", header.trim_end()))
+            }
+            None => None,
+        };
+        self.validate_model(&model, &reasoning_effort)?;
         if let Some(id) = worker_id.as_deref() {
             let branch = agent_branch(id);
-            if self.records.lock().await.iter().any(|worker| worker.branch == branch) {
-                return Err(format!("worker ID prefix collides with an existing {branch}"));
+            if self
+                .records
+                .lock()
+                .await
+                .iter()
+                .any(|worker| worker.branch == branch)
+            {
+                return Err(format!(
+                    "worker ID prefix collides with an existing {branch}"
+                ));
             }
         }
         let active = self.live.lock().await.len();
@@ -969,10 +1571,38 @@ impl TeamRuntime {
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));
         }
-        self.provision_worker(brief, model, worker_id, review_risk)
-            .await
-            .map(|worker| (worker, false))
+        let placed = plan.as_ref().map(|plan| (plan.plan_id.clone(), plan.step));
+        let result = self
+            .provision_worker(
+                brief,
+                opening,
+                model,
+                reasoning_effort,
+                worker_id,
+                review_risk,
+                plan,
+            )
+            .await;
+        if result.is_ok() {
+            if let Some((plan_id, step)) = &placed {
+                // Parallel work: the seams between the steps need a final
+                // integration check before the plan can close. Best-effort;
+                // the dispatch already succeeded.
+                let in_flight = self.in_flight_steps(plan_id, *step).await;
+                if !in_flight.is_empty() {
+                    if let Some(board) = self.board() {
+                        let mut parallel = in_flight;
+                        parallel.push(*step);
+                        if let Err(e) = board.ensure_integration_step(plan_id, &parallel) {
+                            eprintln!("team: integration step for {plan_id} not added: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        result.map(|worker| (worker, false))
     }
+
 
     /// Dispatch one fresh read-only independent audit of an implementation
     /// worker's current branch/tip.
@@ -1047,7 +1677,7 @@ impl TeamRuntime {
                         "audit worker '{reviewer_id}' inspected an older tip of worker '{worker_id}'; the fix commit moved the tip — dispatch a fresh audit with a new reviewer_id"
                     ));
                 }
-                self.validate_model(&existing.model)?;
+                self.validate_model(&existing.model, &existing.reasoning_effort)?;
                 if !existing.brief_sent
                     && !self.live.lock().await.contains_key(reviewer_id)
                     && matches!(
@@ -1068,7 +1698,11 @@ impl TeamRuntime {
                 return Ok((existing, true));
             }
         }
-        self.validate_model(&model)?;
+        // Without a named model an effort cannot be applied to a session; it
+        // stays in the audit brief as the depth the lead asked for.
+        let depth_hint = reasoning_effort.clone();
+        let reasoning_effort = reasoning_effort.filter(|_| model.is_some());
+        self.validate_model(&model, &reasoning_effort)?;
         let branch = agent_branch(reviewer_id);
         if self
             .records
@@ -1089,7 +1723,7 @@ impl TeamRuntime {
             &plan_id,
             &plan_doc,
             brief.as_deref(),
-            reasoning_effort.as_deref(),
+            depth_hint.as_deref(),
         )
         .await?;
         let active = self.live.lock().await.len();
@@ -1142,6 +1776,10 @@ impl TeamRuntime {
             fixer_finding_id: None,
             merge: None,
             error: None,
+            opening_prompt: None,
+            plan_id: None,
+            plan_step: None,
+            tier: None,
         };
         self.start_audit_worker(record, base_tip)
             .await
@@ -1184,13 +1822,76 @@ impl TeamRuntime {
         self.start_worker(record).await
     }
 
-    fn validate_model(&self, model: &Option<String>) -> Result<(), String> {
-        if let Some(spec) = model {
-            if !self.model_specs.iter().any(|configured| configured == spec) {
-                return Err(format!(
-                    "'{spec}' is not a configured model; choose a model returned by list_models"
-                ));
+    /// The other steps (0-based) of `plan_id` with an open task: a worker not
+    /// merged, cancelled, or stopped (the ledger's notion of closed).
+    async fn in_flight_steps(&self, plan_id: &str, except_step: usize) -> Vec<usize> {
+        let records = self.records.lock().await;
+        let mut steps: Vec<usize> = records
+            .iter()
+            .filter(|w| w.plan_id.as_deref() == Some(plan_id) && !ledger::is_closed(w))
+            .filter_map(|w| w.plan_step)
+            .filter(|step| *step != except_step)
+            .collect();
+        steps.sort_unstable();
+        steps.dedup();
+        steps
+    }
+
+    /// Stamp the tier the lead dispatched by onto the worker's record.
+    async fn record_tier(&self, worker_id: &str, tier: &str) {
+        {
+            let mut records = self.records.lock().await;
+            match records.iter_mut().find(|w| w.id == worker_id) {
+                Some(worker) if worker.tier.as_deref() != Some(tier) => {
+                    worker.tier = Some(tier.to_string());
+                }
+                _ => return,
             }
+        }
+        let _ = self.persist().await;
+    }
+
+    fn validate_model(
+        &self,
+        model: &Option<String>,
+        reasoning_effort: &Option<String>,
+    ) -> Result<(), String> {
+        let models = self.current_models();
+        let configured = match model {
+            Some(spec) => Some(
+                models
+                    .iter()
+                    .find(|configured| &configured.spec == spec)
+                    .ok_or_else(|| {
+                        format!("'{spec}' is not a configured model; choose one from team_dispatch's model list")
+                    })?,
+            ),
+            None => None,
+        };
+        let Some(effort) = reasoning_effort else {
+            return Ok(());
+        };
+        let Some(configured) = configured else {
+            return Err(format!(
+                "reasoning_effort '{effort}' needs an explicit model to apply to"
+            ));
+        };
+        if configured.reasoning_efforts.is_empty() {
+            return Err(format!(
+                "'{}' does not support a reasoning effort; omit reasoning_effort",
+                configured.spec
+            ));
+        }
+        if !configured
+            .reasoning_efforts
+            .iter()
+            .any(|allowed| allowed == effort)
+        {
+            return Err(format!(
+                "'{}' does not support reasoning_effort '{effort}'; choose one of: {}",
+                configured.spec,
+                configured.reasoning_efforts.join(", ")
+            ));
         }
         Ok(())
     }
@@ -1198,25 +1899,31 @@ impl TeamRuntime {
     async fn provision_worker(
         &self,
         brief: String,
+        opening_prompt: Option<String>,
         model: Option<String>,
+        reasoning_effort: Option<String>,
         worker_id: Option<String>,
         review_risk: String,
+        plan: Option<PlanRef>,
     ) -> Result<WorkerRecord, String> {
         let base_ref = current_branch(&self.workspace_root).map_err(|err| {
             format!(
                 "cannot dispatch a tracked worker: the selected project is not a usable Git checkout. Open the repository root (the folder containing .git), then retry. Git reported: {err}"
             )
         })?;
-        let id = match worker_id {
-            Some(id) => id,
+        // The lead names its workers (`ghostai0001`): that id is the name. A
+        // generated id is opaque, so it shows as "Worker <short id>".
+        let (id, name) = match worker_id {
+            Some(id) => (id.clone(), id),
             None => {
                 let seq = self.next_worker.fetch_add(1, Ordering::SeqCst);
                 let millis = phase3::now_ms();
-                format!("{seq:08x}{millis:012x}")
+                let id = format!("{seq:08x}{millis:012x}");
+                let name = format!("Worker {}", agent_short_id(&id));
+                (id, name)
             }
         };
         let millis = phase3::now_ms();
-        let name = format!("Worker {}", agent_short_id(&id));
         let (worktree, branch) =
             provision_agent_worktree(self.workspace_root.clone(), id.clone(), base_ref).await?;
         let base_tip = phase3::tip(&worktree).await?;
@@ -1224,8 +1931,10 @@ impl TeamRuntime {
             id: id.clone(),
             name,
             brief,
+            opening_prompt,
             model,
             model_id: None,
+            reasoning_effort,
             branch,
             worktree,
             status: WorkerStatus::Dispatching,
@@ -1248,15 +1957,19 @@ impl TeamRuntime {
             last_activity_ms: millis,
             checks: Vec::new(),
             review_risk,
+            review: None,
+
             kind: "implementation".to_string(),
             audit_target: None,
             audit_tip: None,
-            reasoning_effort: None,
             findings: Vec::new(),
-            review: None,
+
             fixer_finding_id: None,
             merge: None,
             error: None,
+            plan_id: plan.as_ref().map(|plan| plan.plan_id.clone()),
+            plan_step: plan.map(|plan| plan.step),
+            tier: None,
         };
         self.records.lock().await.push(record.clone());
         if let Err(err) = self.persist().await {
@@ -1307,6 +2020,7 @@ impl TeamRuntime {
             .spawn_worker_session(
                 record.name.clone(),
                 record.model.clone(),
+                record.reasoning_effort.clone(),
                 record.worktree.clone(),
                 Some(record.transcript.clone()),
                 record.kind.as_str(),
@@ -1315,7 +2029,9 @@ impl TeamRuntime {
         {
             Ok(session) => session,
             Err(err) => {
-                let error = format!("{err}; worker '{id}' retains its checkout; retry with the same worker ID");
+                let error = format!(
+                    "{err}; worker '{id}' retains its checkout; retry with the same worker ID"
+                );
                 self.fail_worker(&id, error.clone()).await;
                 return Err(error);
             }
@@ -1340,14 +2056,16 @@ impl TeamRuntime {
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {
-                text: record.brief.clone(),
+                text: record.first_message().to_string(),
                 images: Vec::new(),
             })
             .await
         {
             pump.abort();
             let _ = session.close().await;
-            let error = format!("could not send the brief to worker '{id}': {err}; retry with the same worker ID");
+            let error = format!(
+                "could not send the brief to worker '{id}': {err}; retry with the same worker ID"
+            );
             self.fail_worker(&id, error.clone()).await;
             return Err(error);
         }
@@ -1379,6 +2097,7 @@ impl TeamRuntime {
         &self,
         name: String,
         model: Option<String>,
+        reasoning_effort: Option<String>,
         worktree: PathBuf,
         resume: Option<Transcript>,
         kind: &str,
@@ -1387,6 +2106,7 @@ impl TeamRuntime {
             .spawn(SpawnOptions {
                 name: Some(name),
                 model,
+                reasoning_effort,
                 worktree: Some(worktree),
                 permissions: Some(PermissionPolicy::OverridePermissions),
                 policy: None,
@@ -1422,10 +2142,14 @@ impl TeamRuntime {
         }
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Cancelled {
-            return Err("a cleaned worker cannot accept new work; review its retained branch".to_string());
+            return Err(
+                "a cleaned worker cannot accept new work; review its retained branch".to_string(),
+            );
         }
         if record.compacting {
-            return Err("wait for the worker's compaction to finish before messaging it".to_string());
+            return Err(
+                "wait for the worker's compaction to finish before messaging it".to_string(),
+            );
         }
         let (busy, idle, sent) = {
             let live = self.live.lock().await;
@@ -1550,7 +2274,9 @@ impl TeamRuntime {
                         }
                     } else if worker.transcript.messages.is_empty() && worker.brief_sent {
                         worker.transcript = Transcript {
-                            messages: vec![mnemo::provider::Message::user_text(worker.brief.clone())],
+                            messages: vec![mnemo::provider::Message::user_text(
+                                worker.first_message().to_string(),
+                            )],
                         };
                     }
                 })
@@ -1580,7 +2306,9 @@ impl TeamRuntime {
         }
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Cancelled {
-            return Err("a cleaned worker cannot be resumed; review its retained branch".to_string());
+            return Err(
+                "a cleaned worker cannot be resumed; review its retained branch".to_string(),
+            );
         }
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be resumed".to_string());
@@ -1596,6 +2324,7 @@ impl TeamRuntime {
             .spawn_worker_session(
                 record.name.clone(),
                 record.model.clone(),
+                record.reasoning_effort.clone(),
                 record.worktree.clone(),
                 Some(record.transcript.clone()),
                 record.kind.as_str(),
@@ -1639,6 +2368,52 @@ impl TeamRuntime {
         self.worker(worker_id).await
     }
 
+    /// Move a worker to another model (and reasoning effort), keeping its
+    /// transcript, branch, and worktree. An idle live session is restarted
+    /// on the new model; a stopped, interrupted, or failed one is resumed on
+    /// it; a worker whose brief never reached a session is started with it.
+    /// A working worker is refused: stop or pause it first.
+    pub async fn change_model(
+        &self,
+        worker_id: &str,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Result<WorkerRecord, String> {
+        let _guard = self.merge_lock.lock().await;
+        let record = self.worker(worker_id).await?;
+        if record.status == WorkerStatus::Cancelled {
+            return Err("a cleaned worker cannot change its model".to_string());
+        }
+        if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
+            return Err("a merged worker cannot change its model".to_string());
+        }
+        self.validate_model(&model, &reasoning_effort)?;
+        if self.worker_is_busy(worker_id).await {
+            return Err(format!(
+                "worker '{worker_id}' is working; pause or stop it before changing its model"
+            ));
+        }
+        if self.live.lock().await.contains_key(worker_id) {
+            self.stop_inner(worker_id).await?;
+        }
+        self.update_worker(worker_id, |worker| {
+            worker.model = model.clone();
+            worker.model_id = None;
+            worker.reasoning_effort = reasoning_effort.clone();
+            worker.tier = None;
+        })
+        .await;
+        self.persist().await?;
+        let record = self.worker(worker_id).await?;
+        if !record.brief_sent {
+            if !record.worktree.is_dir() {
+                return Err(format!("worker '{worker_id}' has no recoverable worktree"));
+            }
+            return self.start_worker(record).await;
+        }
+        self.resume_inner(worker_id).await
+    }
+
     /// Compact a quiescent worker. Blocked or stopped sessions are resumed once.
     pub async fn compact(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
@@ -1646,7 +2421,8 @@ impl TeamRuntime {
         if record.compacting {
             return Err(format!("worker '{worker_id}' is already compacting"));
         }
-        if record.status == WorkerStatus::NeedsYou && self.live.lock().await.contains_key(worker_id) {
+        if record.status == WorkerStatus::NeedsYou && self.live.lock().await.contains_key(worker_id)
+        {
             self.stop_inner(worker_id).await?;
             record = self.worker(worker_id).await?;
         }
@@ -1661,7 +2437,9 @@ impl TeamRuntime {
                     | WorkerStatus::NeedsYou
                     | WorkerStatus::Idle
             ) {
-                return Err(format!("worker '{worker_id}' cannot be compacted in its current state"));
+                return Err(format!(
+                    "worker '{worker_id}' cannot be compacted in its current state"
+                ));
             }
             record = self.resume_inner(worker_id).await?;
         }
@@ -1671,7 +2449,9 @@ impl TeamRuntime {
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
             if live.busy.swap(true, Ordering::SeqCst) {
-                return Err(format!("worker '{worker_id}' is busy; compact it when it becomes idle"));
+                return Err(format!(
+                    "worker '{worker_id}' is busy; compact it when it becomes idle"
+                ));
             }
             live.busy.clone()
         };
@@ -1684,7 +2464,8 @@ impl TeamRuntime {
         .await;
         if let Err(error) = self.persist().await {
             busy.store(false, Ordering::SeqCst);
-            self.update_worker(worker_id, |worker| *worker = previous.clone()).await;
+            self.update_worker(worker_id, |worker| *worker = previous.clone())
+                .await;
             let _ = self.persist().await;
             return Err(error);
         }
@@ -1697,13 +2478,15 @@ impl TeamRuntime {
         };
         let Some(sent) = sent else {
             busy.store(false, Ordering::SeqCst);
-            self.update_worker(worker_id, |worker| *worker = previous.clone()).await;
+            self.update_worker(worker_id, |worker| *worker = previous.clone())
+                .await;
             self.persist().await?;
             return Err(format!("worker '{worker_id}' stopped before compaction"));
         };
         if let Err(error) = sent {
             busy.store(false, Ordering::SeqCst);
-            self.update_worker(worker_id, |worker| *worker = previous).await;
+            self.update_worker(worker_id, |worker| *worker = previous)
+                .await;
             self.persist().await?;
             return Err(format!("could not compact the worker: {error}"));
         }
@@ -1720,7 +2503,10 @@ impl TeamRuntime {
             }
             return phase3::git_value(
                 &self.workspace_root,
-                &["rev-parse", &format!("refs/heads/{}^{{commit}}", worker.branch)],
+                &[
+                    "rev-parse",
+                    &format!("refs/heads/{}^{{commit}}", worker.branch),
+                ],
             )
             .await;
         }
@@ -2027,8 +2813,20 @@ impl TeamRuntime {
 
     /// Merge one reviewed worker into the clean, idle, non-main lead branch.
     pub async fn merge(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        self.merge_as(worker_id, false).await
+    }
+
+    /// `by_lead` is true when the lead itself asked, from inside its turn.
+    async fn merge_as(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
+        let worker = self.merge_locked(worker_id, by_lead).await?;
+        self.after_merge(&worker).await;
+        self.signal_board_changed();
+        Ok(worker)
+    }
+
+    async fn merge_locked(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
-        if self.lead_busy.load(Ordering::SeqCst) {
+        if !by_lead && self.lead_busy.load(Ordering::SeqCst) {
             return Err("the lead must be idle before merge".to_string());
         }
         if self.worker_is_busy(worker_id).await {
@@ -2039,7 +2837,7 @@ impl TeamRuntime {
         if target == "main" {
             return Err("Mnemo2 never merges a worker directly into main".to_string());
         }
-        phase3::require_clean(&self.workspace_root, "lead").await?;
+        phase3::require_clean_lead(&self.workspace_root, "lead").await?;
         let worker = self.worker(worker_id).await?;
         if worker.kind == "audit" {
             return Err(
@@ -2118,7 +2916,7 @@ impl TeamRuntime {
                 return Err(diagnostic);
             }
             if let Err(err) =
-                phase3::require_clean(&self.workspace_root, "lead after conflict").await
+                phase3::require_clean_lead(&self.workspace_root, "lead after conflict").await
             {
                 self.update_worker(worker_id, |current| current.error = Some(err.clone()))
                     .await;
@@ -2162,13 +2960,28 @@ impl TeamRuntime {
         self.worker(worker_id).await
     }
 
-    /// Revert a previous local worker merge before the branch is landed.
+    /// Revert a worker merge on the lead branch before it reaches main.
     pub async fn revert_merge(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        self.revert_merge_as(worker_id, false).await
+    }
+
+    async fn revert_merge_as(
+        &self,
+        worker_id: &str,
+        by_lead: bool,
+    ) -> Result<WorkerRecord, String> {
+        let worker = self.revert_locked(worker_id, by_lead).await?;
+        self.after_revert(&worker).await;
+        self.signal_board_changed();
+        Ok(worker)
+    }
+
+    async fn revert_locked(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
-        if self.lead_busy.load(Ordering::SeqCst) {
+        if !by_lead && self.lead_busy.load(Ordering::SeqCst) {
             return Err("the lead must be idle before revert".to_string());
         }
-        phase3::require_clean(&self.workspace_root, "lead").await?;
+        phase3::require_clean_lead(&self.workspace_root, "lead").await?;
         let worker = self.worker(worker_id).await?;
         if worker.status != WorkerStatus::Merged {
             return Err("only a merged worker can be reverted".to_string());
@@ -2198,7 +3011,7 @@ impl TeamRuntime {
         )
         .await?;
         if landed.status.success() {
-            return Err("the worker merge has already landed on main".to_string());
+            return Err("the worker merge has already reached main".to_string());
         }
         let output = phase3::git(
             &self.workspace_root,
@@ -2224,6 +3037,121 @@ impl TeamRuntime {
         self.worker(worker_id).await
     }
 
+    /// After a merge: tick the worker's plan step once its tasks are all
+    /// closed with at least one merged, then try to close the plan. Board
+    /// errors never fail the merge; they go to the lead in the notice.
+    async fn after_merge(&self, worker: &WorkerRecord) {
+        let (Some(plan_id), Some(step)) = (worker.plan_id.as_deref(), worker.plan_step) else {
+            return;
+        };
+        let Some(board) = self.board() else {
+            return;
+        };
+        let _guard = self.merge_lock.lock().await;
+        let tasks: Vec<WorkerRecord> = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|w| w.plan_id.as_deref() == Some(plan_id) && w.plan_step == Some(step))
+            .cloned()
+            .collect();
+        let number = step + 1;
+        let mut lines = Vec::new();
+        if !tasks.iter().any(ledger::merged) {
+            return;
+        }
+        if tasks.iter().any(|w| !ledger::is_closed(w)) {
+            return;
+        }
+        let outcome = merge_outcome_line(number, worker);
+        let mut notice = None;
+        match board.tick(plan_id, step, &outcome) {
+            Ok(true) => {
+                lines.push(format!("Plan {plan_id} step {number} is done: {outcome}"));
+                notice = Some(format!(
+                    "tick:{}:{}",
+                    worker.id,
+                    worker.merge.as_ref().map_or("", |m| m.commit.as_str())
+                ));
+            }
+            Ok(false) => {}
+            Err(err) => {
+                lines.push(format!(
+                    "Plan {plan_id} step {number} could not be ticked: {err}"
+                ));
+                notice = Some(format!("tick-error:{}:{}", worker.id, now_key()));
+            }
+        }
+        let ledger = RecordsLedger::new(self.records.clone());
+        // `tick` released the board lock; closing reads the records again.
+        match board.try_close(plan_id, &ledger as &dyn TeamLedger).await {
+            CloseOutcome::Closed {
+                report_path,
+                retired_notes,
+            } => {
+                let relative = project_relative(&self.workspace_root, &report_path);
+                lines.push(format!(
+                    "Plan {plan_id} is closed. Review report: {relative}"
+                ));
+                if retired_notes > 0 {
+                    lines.push(format!(
+                        "{retired_notes} plan-scoped memory note(s) were retired into that report. Read them and re-store any durable fact without plan or branch references."
+                    ));
+                }
+                notice = Some(format!("closed:{plan_id}:{relative}"));
+            }
+            CloseOutcome::Blocked { reasons } => {
+                lines.push(format!(
+                    "Plan {plan_id} cannot close yet: {}",
+                    reasons.join("; ")
+                ));
+                notice = Some(format!("blocked:{plan_id}:{}", reasons.join("|")));
+            }
+            CloseOutcome::NotReady { .. } => {}
+        }
+        if let Some(key) = notice {
+            self.notify_lead(
+                format!("board:{key}"),
+                format!(
+                    "{}\nUse plan_show for the plan's current state.",
+                    lines.join("\n")
+                ),
+            );
+        }
+    }
+
+    /// After a revert: reopen the step when no other merged task remains.
+    async fn after_revert(&self, worker: &WorkerRecord) {
+        let (Some(plan_id), Some(step)) = (worker.plan_id.as_deref(), worker.plan_step) else {
+            return;
+        };
+        let Some(board) = self.board() else {
+            return;
+        };
+        let _guard = self.merge_lock.lock().await;
+        let still_merged = self.records.lock().await.iter().any(|w| {
+            w.plan_id.as_deref() == Some(plan_id) && w.plan_step == Some(step) && ledger::merged(w)
+        });
+        if still_merged {
+            return;
+        }
+        let number = step + 1;
+        let note = format!(
+            "{} ({}) was reverted, so no merged task remains for it",
+            worker.name, worker.id
+        );
+        let text = match board.untick(plan_id, step, &note) {
+            Ok(true) => format!("Plan {plan_id} step {number} is reopened: {note}"),
+            Ok(false) => return,
+            Err(err) => format!("Plan {plan_id} step {number} could not be reopened: {err}"),
+        };
+        self.notify_lead(
+            format!("board:untick:{}:{}", worker.id, now_key()),
+            format!("{text}\nUse plan_show for the plan's current state."),
+        );
+    }
+
     /// Stop every live worker while preserving merged audit records.
     pub async fn stop_all(&self) -> Result<(), String> {
         let _guard = self.merge_lock.lock().await;
@@ -2232,6 +3160,180 @@ impl TeamRuntime {
             self.stop_inner(&id).await?;
         }
         Ok(())
+    }
+
+    /// Describe what deleting these workers would remove, changing nothing.
+    pub async fn deletion_preview(
+        &self,
+        worker_ids: &[String],
+    ) -> Result<Vec<WorkerDeletion>, String> {
+        let _guard = self.merge_lock.lock().await;
+        let mut previews = Vec::with_capacity(worker_ids.len());
+        for worker_id in worker_ids {
+            previews.push(self.inspect_deletion(worker_id, worker_ids).await?);
+        }
+        Ok(previews)
+    }
+
+    /// Delete workers and their history: the ledger record (brief,
+    /// transcript, telemetry, review, findings), inbox messages, checkout,
+    /// and `wt/agent-*` branch. A live session is stopped first. Every
+    /// worker is checked before any is deleted; work the lead branch lacks
+    /// (uncommitted changes, unmerged commits) is discarded only when
+    /// `discard_work` confirms it.
+    pub async fn delete_workers(
+        &self,
+        worker_ids: &[String],
+        discard_work: bool,
+    ) -> Result<TeamSnapshot, String> {
+        let _guard = self.merge_lock.lock().await;
+        for worker_id in worker_ids {
+            self.check_deletion(worker_id, worker_ids, discard_work)
+                .await?;
+        }
+        for worker_id in worker_ids {
+            if self.live.lock().await.contains_key(worker_id) {
+                self.stop_inner(worker_id).await?;
+            }
+        }
+        // Re-check after stopping: a session may have written more work
+        // between the preview and its stop.
+        let mut deletions = Vec::with_capacity(worker_ids.len());
+        for worker_id in worker_ids {
+            deletions.push(
+                self.check_deletion(worker_id, worker_ids, discard_work)
+                    .await?,
+            );
+        }
+        for deletion in deletions {
+            self.delete_one(&deletion).await?;
+        }
+        Ok(self.snapshot().await)
+    }
+
+    async fn check_deletion(
+        &self,
+        worker_id: &str,
+        batch: &[String],
+        discard_work: bool,
+    ) -> Result<WorkerDeletion, String> {
+        let deletion = self.inspect_deletion(worker_id, batch).await?;
+        if let Some(reason) = &deletion.blocked {
+            return Err(format!("{} cannot be deleted: {reason}", deletion.name));
+        }
+        if deletion.discards_work() && !discard_work {
+            return Err(format!(
+                "{} has unmerged or uncommitted work on {}; confirm discarding it to delete the worker",
+                deletion.name, deletion.branch
+            ));
+        }
+        Ok(deletion)
+    }
+
+    /// Inspect one worker of a deletion `batch`. Git state shared with a
+    /// record outside the batch is never counted or touched.
+    async fn inspect_deletion(
+        &self,
+        worker_id: &str,
+        batch: &[String],
+    ) -> Result<WorkerDeletion, String> {
+        let record = self.worker(worker_id).await?;
+        let shared_branch = self.records.lock().await.iter().any(|other| {
+            other.id != record.id
+                && other.branch == record.branch
+                && !batch.iter().any(|id| id == &other.id)
+        });
+        let mut deletion = WorkerDeletion {
+            worker_id: record.id.clone(),
+            name: record.name.clone(),
+            branch: record.branch.clone(),
+            live: self.live.lock().await.contains_key(worker_id),
+            checkout: false,
+            uncommitted: false,
+            unmerged_commits: 0,
+            shared_branch,
+            blocked: None,
+        };
+        if record.status == WorkerStatus::Merging {
+            deletion.blocked = Some("a merge is in progress".to_string());
+            return Ok(deletion);
+        }
+        if deletion.shared_branch || !owns_its_branch(&record) {
+            // A shared or malformed legacy record: only the record itself is
+            // removed; no Git state another record (or no record) owns is
+            // touched.
+            return Ok(deletion);
+        }
+        let checkout = worker_checkout(&self.workspace_root, &record.id);
+        if checkout.exists() {
+            deletion.checkout = true;
+            match current_branch(&checkout) {
+                Ok(branch) if branch == record.branch => {}
+                Ok(branch) => {
+                    deletion.blocked = Some(format!(
+                        "its checkout is on '{branch}', not {}",
+                        record.branch
+                    ));
+                    return Ok(deletion);
+                }
+                Err(error) => {
+                    deletion.blocked = Some(format!("its checkout could not be read: {error}"));
+                    return Ok(deletion);
+                }
+            }
+            let status = phase3::git_value(&checkout, &["status", "--porcelain", "-uall"]).await?;
+            deletion.uncommitted = !status.is_empty();
+        }
+        if branch_exists(&self.workspace_root, &record.branch).await {
+            let range = format!("HEAD..refs/heads/{}", record.branch);
+            let count =
+                phase3::git_value(&self.workspace_root, &["rev-list", "--count", &range]).await?;
+            deletion.unmerged_commits = count.parse().unwrap_or(0);
+        }
+        Ok(deletion)
+    }
+
+    /// Remove one checked worker. Git state goes first and the record last,
+    /// so a failure leaves a record that a retry can finish deleting.
+    async fn delete_one(&self, deletion: &WorkerDeletion) -> Result<(), String> {
+        let record = self.worker(&deletion.worker_id).await?;
+        if !deletion.shared_branch && owns_its_branch(&record) {
+            let checkout = worker_checkout(&self.workspace_root, &record.id);
+            let mut last_error = String::new();
+            for _ in 0..12 {
+                if !checkout.exists() {
+                    break;
+                }
+                // `worktree remove --force`: discarding was confirmed above.
+                match remove_agent_worktree(self.workspace_root.clone(), record.id.clone()).await {
+                    Ok(()) => break,
+                    Err(error) => last_error = error,
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if checkout.exists() {
+                return Err(format!(
+                    "could not remove {}'s checkout: {last_error}",
+                    record.name
+                ));
+            }
+            if branch_exists(&self.workspace_root, &record.branch).await {
+                phase3::git_value(&self.workspace_root, &["branch", "-D", &record.branch])
+                    .await
+                    .map_err(|error| {
+                        format!("could not delete {}'s branch: {error}", record.name)
+                    })?;
+            }
+        }
+        self.records
+            .lock()
+            .await
+            .retain(|worker| worker.id != record.id);
+        self.messages
+            .lock()
+            .await
+            .retain(|message| message.worker_id != record.id);
+        self.persist().await
     }
 
     /// Stop every live worker. The shared engine is owned by the lead and is
@@ -2248,6 +3350,30 @@ impl TeamRuntime {
         }
         let _ = self.persist().await;
     }
+}
+
+/// Whether a record's branch is exactly the one its id names, so Git
+/// cleanup can never touch a branch the worker does not own.
+fn owns_its_branch(record: &WorkerRecord) -> bool {
+    !record.id.is_empty()
+        && record
+            .id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+        && record.branch == agent_branch(&record.id)
+}
+
+/// The worker's registered checkout path inside the project.
+fn worker_checkout(root: &Path, worker_id: &str) -> PathBuf {
+    root.join(".worktrees")
+        .join(format!("agent-{}", agent_short_id(worker_id)))
+}
+
+async fn branch_exists(root: &Path, branch: &str) -> bool {
+    let revision = format!("refs/heads/{branch}^{{commit}}");
+    phase3::git_value(root, &["rev-parse", "--verify", "--quiet", &revision])
+        .await
+        .is_ok()
 }
 
 async fn cleanup_agent_worktree(root: &std::path::Path, worker_id: &str) -> Result<(), String> {
@@ -2313,9 +3439,7 @@ async fn merge_conflicts_only(root: &Path) -> Result<bool, String> {
     let status = phase3::git_value(root, &["status", "--porcelain", "-uall"]).await?;
     let mut conflicts = false;
     for line in status.lines().filter(|line| !line.is_empty()) {
-        if line.len() < 3
-            || !matches!(&line[..2], "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU")
-        {
+        if line.len() < 3 || !matches!(&line[..2], "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU") {
             return Ok(false);
         }
         conflicts = true;
@@ -2362,13 +3486,13 @@ async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Re
                         .to_string(),
                 );
             }
-            phase3::require_clean(root, "lead after completed merge").await?;
+            phase3::require_clean_lead(root, "lead after completed merge").await?;
             if merge_head.status.success() {
                 let reset = phase3::git(root, &["reset", "--merge"]).await?;
                 if !reset.status.success() {
                     return Err(phase3::git_error(&["reset", "--merge"], &reset));
                 }
-                phase3::require_clean(root, "lead after stale merge cleanup").await?;
+                phase3::require_clean_lead(root, "lead after stale merge cleanup").await?;
             }
             let record = merge_record_from_git(root, worker, lead_tip, target).await?;
             worker.status = WorkerStatus::Merged;
@@ -2395,14 +3519,14 @@ async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Re
             if !abort.status.success() {
                 return Err(phase3::git_error(&["merge", "--abort"], &abort));
             }
-            phase3::require_clean(root, "lead after merge abort").await?;
+            phase3::require_clean_lead(root, "lead after merge abort").await?;
             worker.status = WorkerStatus::Conflict;
             worker.error = Some(
                 "the interrupted merge was aborted; resolve the conflict and review the worker tip again"
                     .to_string(),
             );
         } else {
-            phase3::require_clean(root, "lead after interrupted merge").await?;
+            phase3::require_clean_lead(root, "lead after interrupted merge").await?;
             worker.status = WorkerStatus::Conflict;
             worker.error = Some(
                 "the interrupted merge left no verifiable merge commit; inspect the lead and worker before retrying"
@@ -2524,7 +3648,20 @@ async fn pump_worker(
     persistence: TeamPersistence,
 ) {
     let mut turn_active = false;
-    while let Ok(event) = receiver.recv().await {
+    loop {
+        let event = match receiver.recv().await {
+            Ok(event) => event,
+            // A slow consumer skips what it missed rather than abandoning
+            // the worker's ledger mid-turn.
+            Err(mnemo::headless::RecvError::Lagged(_)) => continue,
+            Err(mnemo::headless::RecvError::Closed) => break,
+        };
+        // The engine bus is shared with the lead and every other worker:
+        // only this worker's own events may answer its host tools or touch
+        // its record (status, telemetry, model, errors).
+        if !event.is_from(session_id) {
+            continue;
+        }
         if let SerializableAgentEvent::HostToolCall {
             call_id,
             name,
@@ -2669,13 +3806,9 @@ async fn pump_worker(
                         worker.status = WorkerStatus::NeedsYou;
                         changed = true;
                     }
-                    SerializableAgentEvent::HostToolCall { call_id, .. } => {
-                        worker.pending = Some(PendingInteraction::HostToolCall {
-                            call_id: call_id.clone(),
-                        });
-                        worker.status = WorkerStatus::NeedsYou;
-                        changed = true;
-                    }
+                    // A worker's host tool (`message_parent`) was answered
+                    // above, before this fold: it is ordinary progress, never
+                    // a wait on the user.
                     SerializableAgentEvent::CompactStarted => {
                         worker.compacting = true;
                         busy.store(true, Ordering::SeqCst);
@@ -2687,7 +3820,12 @@ async fn pump_worker(
                         if worker.compacting {
                             worker.compacting = false;
                             busy.store(false, Ordering::SeqCst);
-                            if !matches!(worker.status, WorkerStatus::Paused | WorkerStatus::Interrupted | WorkerStatus::Stopped) {
+                            if !matches!(
+                                worker.status,
+                                WorkerStatus::Paused
+                                    | WorkerStatus::Interrupted
+                                    | WorkerStatus::Stopped
+                            ) {
                                 worker.status = if worker.pending.is_some() {
                                     WorkerStatus::NeedsYou
                                 } else {
@@ -2698,6 +3836,22 @@ async fn pump_worker(
                             changed = true;
                         }
                         refresh = true;
+                    }
+                    SerializableAgentEvent::Finished {
+                        reason: mnemo::provider::FinishReason::LimitReached { which },
+                    } => {
+                        // The session parked on its runaway guard: the work is
+                        // unfinished, so it must not read as completed.
+                        turn_active = false;
+                        worker.compacting = false;
+                        busy.store(false, Ordering::SeqCst);
+                        worker.pending = None;
+                        worker.status = WorkerStatus::NeedsYou;
+                        worker.error = Some(format!(
+                            "the worker session reached a {} limit before finishing; team_stop then team_resume continues it in a fresh session",
+                            limit_label(*which)
+                        ));
+                        terminal = true;
                     }
                     SerializableAgentEvent::Finished { .. } => {
                         let completed_turn = turn_active;
@@ -2740,7 +3894,9 @@ async fn pump_worker(
                                 | WorkerStatus::Cancelled
                         ) {
                             worker.status = WorkerStatus::Interrupted;
-                            worker.error = Some("the worker session exited before completing its turn".to_string());
+                            worker.error = Some(
+                                "the worker session exited before completing its turn".to_string(),
+                            );
                         }
                         terminal = true;
                     }
@@ -2767,7 +3923,12 @@ async fn pump_worker(
                         if worker.compacting {
                             worker.compacting = false;
                             busy.store(false, Ordering::SeqCst);
-                            if !matches!(worker.status, WorkerStatus::Paused | WorkerStatus::Interrupted | WorkerStatus::Stopped) {
+                            if !matches!(
+                                worker.status,
+                                WorkerStatus::Paused
+                                    | WorkerStatus::Interrupted
+                                    | WorkerStatus::Stopped
+                            ) {
                                 worker.status = if worker.pending.is_some() {
                                     WorkerStatus::NeedsYou
                                 } else {
@@ -2876,6 +4037,38 @@ async fn save_workers(
     })
 }
 
+/// What deleting one worker removes, reported before anything is deleted so
+/// the user can see exactly which unmerged work would be discarded.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct WorkerDeletion {
+    /// The worker's id.
+    pub worker_id: String,
+    /// The worker's display name.
+    pub name: String,
+    /// The worker's `wt/agent-*` branch.
+    pub branch: String,
+    /// The worker's session is live; deleting stops it first.
+    pub live: bool,
+    /// The worker's checkout still exists and will be removed.
+    pub checkout: bool,
+    /// That checkout has uncommitted changes.
+    pub uncommitted: bool,
+    /// Commits on the branch that the lead branch does not contain.
+    pub unmerged_commits: u32,
+    /// Another worker record (outside this deletion) uses the same branch,
+    /// so the branch and checkout are kept and only this record goes.
+    pub shared_branch: bool,
+    /// Why the worker cannot be deleted right now, when it cannot.
+    pub blocked: Option<String>,
+}
+
+impl WorkerDeletion {
+    /// Whether deleting this worker discards work the lead branch lacks.
+    pub fn discards_work(&self) -> bool {
+        self.uncommitted || self.unmerged_commits > 0
+    }
+}
+
 /// Outcome of conservative start-screen cleanup.
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct CleanupReport {
@@ -2911,8 +4104,13 @@ pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupR
         }
         let id = worker.id.clone();
         let branch = worker.branch.clone();
-        if branch != agent_branch(&id) || id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
-            report.skipped.push(format!("{branch}: invalid worker identity"));
+        if branch != agent_branch(&id)
+            || id.is_empty()
+            || !id.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            report
+                .skipped
+                .push(format!("{branch}: invalid worker identity"));
             continue;
         }
         let checkout = root
@@ -2932,38 +4130,51 @@ pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupR
             checkout.clone()
         };
         if recorded != expected {
-            report.skipped.push(format!("{branch}: checkout is outside its registered worktree"));
+            report.skipped.push(format!(
+                "{branch}: checkout is outside its registered worktree"
+            ));
             continue;
         }
         let revision = format!("refs/heads/{branch}^{{commit}}");
         if let Err(error) = phase3::git_value(root, &["rev-parse", "--verify", &revision]).await {
-            report.skipped.push(format!("{branch}: retained checkout because the branch cannot be verified: {error}"));
+            report.skipped.push(format!(
+                "{branch}: retained checkout because the branch cannot be verified: {error}"
+            ));
             continue;
         }
         if checkout.exists() {
             match phase3::git_value(&checkout, &["status", "--porcelain", "-uall"]).await {
                 Ok(status) if status.trim().is_empty() => {}
                 Ok(_) => {
-                    report.skipped.push(format!("{branch}: uncommitted work is retained for review"));
+                    report
+                        .skipped
+                        .push(format!("{branch}: uncommitted work is retained for review"));
                     continue;
                 }
                 Err(error) => {
-                    report.skipped.push(format!("{branch}: cleanliness could not be verified: {error}"));
+                    report.skipped.push(format!(
+                        "{branch}: cleanliness could not be verified: {error}"
+                    ));
                     continue;
                 }
             }
             if let Err(error) = remove_agent_worktree(root.to_path_buf(), id).await {
-                report.skipped.push(format!("{branch}: cleanup failed: {error}"));
+                report
+                    .skipped
+                    .push(format!("{branch}: cleanup failed: {error}"));
                 continue;
             }
             report.removed.push(branch.clone());
         } else {
-            report.skipped.push(format!("{branch}: checkout was already absent; branch retained"));
+            report.skipped.push(format!(
+                "{branch}: checkout was already absent; branch retained"
+            ));
         }
         worker.status = WorkerStatus::Cancelled;
         worker.pending = None;
         worker.worktree = PathBuf::new();
-        worker.error = Some("inactive checkout cleaned; the branch is retained for review".to_string());
+        worker.error =
+            Some("inactive checkout cleaned; the branch is retained for review".to_string());
         persistence.save(&ledger)?;
     }
     Ok(report)
@@ -2971,7 +4182,9 @@ pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupR
 
 fn validate_worker_id(worker_id: &str) -> Result<(), String> {
     if !(8..=64).contains(&worker_id.len())
-        || !worker_id.chars().all(|character| character.is_ascii_alphanumeric())
+        || !worker_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
     {
         return Err(
             "worker_id must contain 8-64 ASCII letters or digits; reuse the ID returned by team_dispatch"
@@ -2996,6 +4209,52 @@ fn without_transcripts(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn now_key() -> u128 {
+    phase3::now_ms() as u128
+}
+
+/// `path` relative to the project root with forward slashes; the path as-is
+/// when it is not under the root.
+fn project_relative(root: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    let relative = path
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .ok()
+        .or_else(|| {
+            // The same location spelled differently (short names, `\\?\`).
+            let root = std::fs::canonicalize(root).ok()?;
+            let path = std::fs::canonicalize(path).ok()?;
+            path.strip_prefix(root).map(Path::to_path_buf).ok()
+        })
+        .unwrap_or_else(|| path.to_path_buf());
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+/// One `## Progress` line for a merged task: step, worker, model, merge
+/// commit, and the review summary when one was recorded.
+fn merge_outcome_line(number: usize, worker: &WorkerRecord) -> String {
+    let merge = worker.merge.as_ref();
+    let model = merge
+        .and_then(|m| m.worker_model.clone())
+        .or_else(|| worker.model_id.clone())
+        .or_else(|| worker.model.clone())
+        .unwrap_or_else(|| "default model".to_string());
+    let commit = merge.map_or("", |m| m.commit.as_str());
+    let short: String = commit.chars().take(8).collect();
+    let mut line = format!(
+        "step {number} merged: {} ({}) on {model}, merge commit {short}",
+        worker.name, worker.id
+    );
+    if let Some(summary) = merge
+        .map(|m| m.review_summary.trim())
+        .filter(|summary| !summary.is_empty())
+    {
+        line.push_str(&format!("; review: {summary}"));
+    }
+    line
 }
 
 fn worker_result<T: Serialize>(result: Result<T, String>, action: &str) -> ToolResult {
@@ -3150,12 +4409,16 @@ fn validate_merge(worker: &WorkerRecord, tip: &str, records: &[WorkerRecord]) ->
     Ok(())
 }
 
-/// The worker's hard session limits.
-fn executor_limits() -> SessionLimits {
-    SessionLimits {
-        max_turns: Some(WORKER_MAX_TURNS),
-        wall_clock_ms: Some(WORKER_WALL_CLOCK_MS),
-        ..SessionLimits::default()
+/// A human label for the session limit a worker hit.
+fn limit_label(which: mnemo::provider::LimitKind) -> &'static str {
+    use mnemo::provider::LimitKind;
+    match which {
+        LimitKind::MaxTurns | LimitKind::MaxRequests => "request",
+        LimitKind::MaxPromptTokens => "prompt-token",
+        LimitKind::MaxCompletionTokens => "completion-token",
+        LimitKind::MaxCostMicros => "cost",
+        LimitKind::WallClock => "wall-clock",
+        LimitKind::Idle => "idle",
     }
 }
 
@@ -3194,8 +4457,12 @@ fn executor_guardrails() -> Guardrails {
         prompt: Some(executor_prompt()),
         tools,
         route: vec!["free".to_string()],
-        limits: Some(executor_limits()),
-        gate_rules: Vec::new(),
+        // No session limits: no request, token, cost, or wall-clock cap.
+        // Workers do the bulk of the implementation and idle for long
+        // stretches while the lead reviews them; the lead or user stops
+        // a worker explicitly.
+        limits: None,
+        gate_rules: executor_gate_rules(),
         question_policy: QuestionPolicy::Deny,
         turn_end: TurnEndPolicy::Stop,
     }
@@ -3210,8 +4477,6 @@ fn guardrails_for(kind: &str) -> Guardrails {
         executor_guardrails()
     }
 }
-
-/// The Mnemo2 independent-audit identity: a fresh read-only reviewer that
 /// never touches lifecycle state.
 pub(crate) fn audit_prompt() -> PromptSpec {
     PromptSpec {
@@ -3266,7 +4531,7 @@ fn audit_guardrails() -> Guardrails {
         prompt: Some(audit_prompt()),
         tools,
         route: vec!["free".to_string()],
-        limits: Some(executor_limits()),
+        limits: None,
         gate_rules: Vec::new(),
         question_policy: QuestionPolicy::Deny,
         turn_end: TurnEndPolicy::Stop,
@@ -3436,11 +4701,87 @@ fn validate_audit_linkage(
     Ok(())
 }
 
+/// The refusal text every executor gate rule carries.
+const EXECUTOR_GIT_DENY: &str = concat!(
+    "TeamManager owns branches and integration: workers never push, merge, rebase, ",
+    "switch or delete branches, manage worktrees, or use `gh pr`. Commit on your own ",
+    "branch and report with message_parent."
+);
+
+/// Where a shell command starts inside the JSON-serialized `shell` args: the
+/// `command` value, then any text up to a command boundary (start, whitespace
+/// or shell punctuation, or an escaped newline/tab/quote) before the program.
+const SHELL_CMD_PREFIX: &str =
+    r#"(?i)"command":"(?:(?:[^"\\]|\\.)*?(?:\\[ntr"]|[^A-Za-z0-9_.\-\\"]))?"#;
+
+/// `git` plus its global options, ending at whitespace before the subcommand
+/// (`git -C dir push`, `git -c k=v merge`, `git --no-pager rebase`).
+const SHELL_GIT: &str = r#"git(?:\s+(?:-C\s+\S+|-c\s+\S+|--[A-Za-z-]+(?:=\S+)?|-[pP]))*\s+"#;
+
+/// One shell argument that is not the bare `--` path separator.
+const SHELL_ARG_NOT_DASHDASH: &str =
+    r#"(?:--[^\s;&|\\"]+|-[^-\s;&|\\"][^\s;&|\\"]*|-|[^-\s;&|\\"][^\s;&|\\"]*)"#;
+
+/// The end of one shell command inside the serialized args.
+const SHELL_CMD_END: &str = r#"\s*(?:[;&|)]|\\[ntr"]|")"#;
+
+fn deny_rule(tool: &str, pattern: String) -> GateRule {
+    GateRule {
+        tool: tool.to_string(),
+        arg_pattern: Some(pattern),
+        verdict: GateVerdict::Deny {
+            message: EXECUTOR_GIT_DENY.to_string(),
+        },
+    }
+}
+
+/// Deny rules that keep executor workers out of integration. A deny is a veto,
+/// so these hold under `OverridePermissions`. Patterns match the call's
+/// JSON-serialized args (see `DeclarativePolicy::gate_call`).
+fn executor_gate_rules() -> Vec<GateRule> {
+    let mut rules = Vec::new();
+    // The structured `git` tool. `checkout` takes a branch, never paths
+    // (paths go through `restore`), so every checkout is a branch switch.
+    rules.push(deny_rule(
+        "git",
+        r#"(?i)"subcommand":"(?:push|merge|checkout|delete)""#.to_string(),
+    ));
+    rules.push(deny_rule("git", r#"(?i)"action":"delete""#.to_string()));
+    // `action` alone can carry the subcommand, except for `stash` + `push`.
+    rules.push(GateRule {
+        tool: "git".to_string(),
+        arg_pattern: Some(r#"(?i)"subcommand":"stash""#.to_string()),
+        verdict: GateVerdict::Allow,
+    });
+    rules.push(deny_rule(
+        "git",
+        r#"(?i)"action":"(?:push|merge|checkout)""#.to_string(),
+    ));
+    // The `shell` tool: any git invocation, however chained or qualified.
+    let pre = SHELL_CMD_PREFIX;
+    let git = SHELL_GIT;
+    for sub in [
+        r"(?:push|merge|rebase|switch|worktree)\b",
+        // Branch deletion: `-d`, `-D`, a combined short flag, or `--delete`.
+        r#"branch\s+(?:[^;&|\\"]*\s)?(?:-[A-Za-z]*[dD][A-Za-z]*|--delete)(?:\s|[;&|\\"]|$)"#,
+    ] {
+        rules.push(deny_rule("shell", format!("{pre}{git}{sub}")));
+    }
+    // `checkout` of a branch; `checkout -- paths` and `checkout rev -- paths`
+    // restore files and stay allowed.
+    rules.push(deny_rule(
+        "shell",
+        format!("{pre}{git}checkout(?:\\s+{SHELL_ARG_NOT_DASHDASH})+{SHELL_CMD_END}"),
+    ));
+    rules.push(deny_rule("shell", format!(r"{pre}gh\s+pr\b")));
+    rules
+}
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
+
     async fn phase_two_ledgers_load_with_phase_three_defaults() {
         let legacy = json!({
             "workers": [{
@@ -3488,6 +4829,115 @@ mod tests {
         assert!(persisted.workers[0].error.is_none());
         assert_eq!(persisted.workers[0].total_tokens, 120);
         assert_eq!(persisted.workers[0].prompt_tokens, 120);
+    }
+
+    /// Workers do the bulk of the work and run without any session limit.
+    /// The old 64-request cap and 30-minute wall clock (counted from spawn,
+    /// idle review time included) parked real implementation workers
+    /// mid-task.
+    #[test]
+    fn executor_sessions_have_no_limits() {
+        assert_eq!(executor_guardrails().limits, None);
+    }
+
+    /// Runs a call through the executor's declarative gate and reports
+    /// whether it was denied.
+    async fn executor_denies(tool: &str, args: Value) -> bool {
+        use mnemo::agent::policy::{AgentPolicy, DeclarativePolicy};
+        let policy =
+            DeclarativePolicy::new(Arc::new(executor_guardrails())).expect("rules compile");
+        matches!(
+            policy.gate_call(tool, &args).await,
+            GateVerdict::Deny { message } if message.contains("TeamManager owns")
+        )
+    }
+
+    #[tokio::test]
+    async fn executor_gate_denies_integration_through_the_git_tool() {
+        for args in [
+            json!({"subcommand": "push"}),
+            json!({"subcommand": "PUSH", "branch": "main"}),
+            json!({"action": "push"}),
+            json!({"subcommand": "merge", "branch": "wt/other"}),
+            json!({"subcommand": "checkout", "branch": "main"}),
+            json!({"subcommand": "branch", "action": "delete", "branch": "x"}),
+            json!({"subcommand": "delete", "branch": "x"}),
+        ] {
+            assert!(executor_denies("git", args.clone()).await, "{args}");
+        }
+        for args in [
+            json!({"subcommand": "status"}),
+            json!({"subcommand": "diff", "args": ["--stat"]}),
+            json!({"subcommand": "log", "args": ["-5"]}),
+            json!({"subcommand": "commit", "message": "push the button"}),
+            json!({"subcommand": "stash", "action": "push"}),
+            json!({"subcommand": "branch", "action": "list"}),
+            json!({"subcommand": "restore", "paths": ["src/lib.rs"]}),
+        ] {
+            assert!(!executor_denies("git", args.clone()).await, "{args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_gate_denies_integration_through_the_shell() {
+        for command in [
+            "git push",
+            "git push origin HEAD",
+            "git -C ../repo push",
+            "git -c user.name=x push --force",
+            "git --no-pager merge wt/other",
+            "cargo test && git push",
+            "cargo test;git push",
+            "echo hi\ngit push",
+            "bash -c \"git push\"",
+            "git rebase main",
+            "git switch main",
+            "git checkout main",
+            "git checkout -b feature",
+            "git checkout -- a.rs && git checkout main",
+            "git branch -d old",
+            "git branch -D old",
+            "git branch --delete old",
+            "git branch -f x -D y",
+            "git worktree add ../x",
+            "git worktree remove ../x",
+            "gh pr create",
+            "GIT push",
+        ] {
+            assert!(
+                executor_denies("shell", json!({"command": command, "purpose": "p"})).await,
+                "{command}"
+            );
+        }
+        for command in [
+            "git status",
+            "git diff --stat",
+            "git log -5 --oneline",
+            "git add -A",
+            "git commit -m \"push the fix, merge later\"",
+            "git checkout -- a.rs",
+            "git checkout HEAD~1 -- a.rs b.rs",
+            "git -C ../repo checkout abc123 -- src/",
+            "git branch --list",
+            "git branch -a -v",
+            "cargo test --workspace",
+            "echo digit push",
+            "ls .git",
+            "gh issue list",
+        ] {
+            assert!(
+                !executor_denies("shell", json!({"command": command, "purpose": "p"})).await,
+                "{command}"
+            );
+        }
+        // The purpose text is not a command.
+        assert!(
+            !executor_denies(
+                "shell",
+                json!({"command": "ls", "purpose": "never git push"})
+            )
+            .await
+        );
     }
 
     #[test]
@@ -3556,10 +5006,19 @@ mod tests {
             .current_dir(root)
             .output()
             .expect("git process");
-        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    fn cleanup_worker(id: &str, branch: &str, worktree: &Path, status: WorkerStatus) -> WorkerRecord {
+    fn cleanup_worker(
+        id: &str,
+        branch: &str,
+        worktree: &Path,
+        status: WorkerStatus,
+    ) -> WorkerRecord {
         serde_json::from_value(serde_json::json!({
             "id": id,
             "name": format!("Worker {id}"),
@@ -3576,7 +5035,8 @@ mod tests {
             "max_tokens": 1000,
             "checks": [],
             "error": null,
-        })).expect("worker fixture")
+        }))
+        .expect("worker fixture")
     }
 
     #[tokio::test]
@@ -3594,44 +5054,196 @@ mod tests {
             root.to_path_buf(),
             "clean001".to_string(),
             "wt/test".to_string(),
-        ).await.expect("clean worktree");
+        )
+        .await
+        .expect("clean worktree");
         let (dirty_path, dirty_branch) = provision_agent_worktree(
             root.to_path_buf(),
             "dirty002".to_string(),
             "wt/test".to_string(),
-        ).await.expect("dirty worktree");
+        )
+        .await
+        .expect("dirty worktree");
         std::fs::write(clean_path.join("file.txt"), "worker\n").expect("clean edit");
         lifecycle_git(&clean_path, &["add", "file.txt"]);
         lifecycle_git(&clean_path, &["commit", "-m", "clean change"]);
         std::fs::write(dirty_path.join("uncommitted.txt"), "keep me\n").expect("dirty edit");
-        let clean = cleanup_worker("clean001", &clean_branch, &clean_path, WorkerStatus::Stopped);
-        let dirty = cleanup_worker("dirty002", &dirty_branch, &dirty_path, WorkerStatus::InReview);
+        let clean = cleanup_worker(
+            "clean001",
+            &clean_branch,
+            &clean_path,
+            WorkerStatus::Stopped,
+        );
+        let dirty = cleanup_worker(
+            "dirty002",
+            &dirty_branch,
+            &dirty_path,
+            WorkerStatus::InReview,
+        );
         let persistence = TeamPersistence::new(state.path());
-        persistence.save(&PersistedTeam {
-            workers: vec![clean.clone(), dirty.clone()],
-            slots: Some(4),
-            usage: ProjectUsage::default(),
-        }).expect("ledger");
+        persistence
+            .save(&PersistedTeam {
+                workers: vec![clean.clone(), dirty.clone()],
+                slots: Some(4),
+                usage: ProjectUsage::default(),
+            })
+            .expect("ledger");
 
-        let report = cleanup_workspace(root, state.path()).await.expect("cleanup");
+        let report = cleanup_workspace(root, state.path())
+            .await
+            .expect("cleanup");
         assert_eq!(report.removed, vec![clean_branch.clone()]);
-        assert!(report.skipped.iter().any(|reason| reason.contains("uncommitted")));
+        assert!(report
+            .skipped
+            .iter()
+            .any(|reason| reason.contains("uncommitted")));
         assert!(!clean_path.exists());
         assert!(dirty_path.join("uncommitted.txt").exists());
         let restored = persistence.load().expect("ledger").expect("saved team");
         assert_eq!(restored.slots, Some(4));
-        let cleaned = restored.workers.iter().find(|worker| worker.id == clean.id).expect("clean record");
+        let cleaned = restored
+            .workers
+            .iter()
+            .find(|worker| worker.id == clean.id)
+            .expect("clean record");
         assert_eq!(cleaned.status, WorkerStatus::Cancelled);
         assert!(cleaned.worktree.as_os_str().is_empty());
-        let dirty_after = restored.workers.iter().find(|worker| worker.id == dirty.id).expect("dirty record");
+        let dirty_after = restored
+            .workers
+            .iter()
+            .find(|worker| worker.id == dirty.id)
+            .expect("dirty record");
         assert_eq!(dirty_after.status, WorkerStatus::InReview);
         assert!(dirty_after.worktree.exists());
         let diff = crate::mnemo2::workbench::worker_diff(root, cleaned)
             .await
             .expect("the cleaned branch remains reviewable");
         assert_eq!(diff.total_files, 1);
-        assert!(phase3::git_value(root, &["rev-parse", &clean_branch]).await.is_ok());
-        assert!(phase3::git_value(root, &["rev-parse", &dirty_branch]).await.is_ok());
+        assert!(phase3::git_value(root, &["rev-parse", &clean_branch])
+            .await
+            .is_ok());
+        assert!(phase3::git_value(root, &["rev-parse", &dirty_branch])
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_lead_clean_check_ignores_plans_but_the_worker_check_does_not() {
+        let repo = tempfile::tempdir().expect("repo");
+        let root = repo.path();
+        lifecycle_git(root, &["init", "-b", "wt/test"]);
+        lifecycle_git(root, &["config", "user.name", "Test"]);
+        lifecycle_git(root, &["config", "user.email", "test@example.invalid"]);
+        std::fs::create_dir_all(root.join(".coding/plans")).expect("plans dir");
+        std::fs::create_dir_all(root.join(".coding/knowledge")).expect("knowledge dir");
+        std::fs::write(root.join("file.txt"), "base").expect("base");
+        std::fs::write(root.join(".coding/plans/tracked.md"), "plan").expect("tracked plan");
+        std::fs::write(root.join(".coding/plans/moved.md"), "plan").expect("moved plan");
+        lifecycle_git(root, &["add", "."]);
+        lifecycle_git(root, &["commit", "-m", "base"]);
+
+        // Edited, new, renamed, and staged plan files do not dirty the lead.
+        std::fs::write(root.join(".coding/plans/tracked.md"), "edited").expect("edit plan");
+        std::fs::write(root.join(".coding/plans/new.md"), "new").expect("new plan");
+        lifecycle_git(
+            root,
+            &["mv", ".coding/plans/moved.md", ".coding/plans/renamed.md"],
+        );
+        phase3::require_clean_lead(root, "lead")
+            .await
+            .expect("plans are ignored");
+        let strict = phase3::require_clean(root, "worker")
+            .await
+            .expect_err("strict check");
+        assert!(strict.contains("must be clean"), "{strict}");
+
+        // Knowledge records are lead bookkeeping too; a source change still
+        // blocks.
+        std::fs::write(root.join(".coding/knowledge/note.md"), "note").expect("knowledge");
+        phase3::require_clean_lead(root, "lead")
+            .await
+            .expect("knowledge records are lead bookkeeping too");
+        std::fs::remove_file(root.join(".coding/knowledge/note.md")).expect("remove note");
+        std::fs::write(root.join("file.txt"), "changed").expect("change source");
+        phase3::require_clean_lead(root, "lead")
+            .await
+            .expect_err("source change");
+        lifecycle_git(root, &["checkout", "--", "file.txt"]);
+        // A rename out of the plans dir is not a plan-only change.
+        lifecycle_git(root, &["mv", ".coding/plans/renamed.md", "stolen.md"]);
+        phase3::require_clean_lead(root, "lead")
+            .await
+            .expect_err("rename out of plans");
+    }
+
+    /// Mnemo1 owns `runall-*` worktrees and `wt/runall-*` branches in the same
+    /// `.worktrees/` directory; Mnemo2's cleanup only ever acts on its own
+    /// `agent-*` records and refuses anything else, even a forged record.
+    #[tokio::test]
+    async fn cleanup_never_touches_mnemo1_runall_worktrees() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = tempfile::tempdir().expect("state");
+        let root = repo.path();
+        lifecycle_git(root, &["init", "-b", "main"]);
+        lifecycle_git(root, &["config", "user.name", "Test"]);
+        lifecycle_git(root, &["config", "user.email", "test@example.invalid"]);
+        std::fs::write(root.join("file.txt"), "base").expect("base");
+        lifecycle_git(root, &["add", "file.txt"]);
+        lifecycle_git(root, &["commit", "-m", "base"]);
+        lifecycle_git(root, &["checkout", "-b", "wt/lead"]);
+        let (runall_path, runall_branch) = mnemo::app::worktrees::provision_item_worktree(
+            root.to_path_buf(),
+            "abcd1234-item".to_string(),
+        )
+        .await
+        .expect("runall worktree");
+        assert!(runall_branch.starts_with("wt/runall-"), "{runall_branch}");
+        assert!(runall_path.ends_with("runall-abcd1234"), "{runall_path:?}");
+        let (agent_path, agent_branch) = provision_agent_worktree(
+            root.to_path_buf(),
+            "agent001".to_string(),
+            "wt/lead".to_string(),
+        )
+        .await
+        .expect("agent worktree");
+        let agent = cleanup_worker(
+            "agent001",
+            &agent_branch,
+            &agent_path,
+            WorkerStatus::Stopped,
+        );
+        // A forged record pointing at the runall checkout is refused.
+        let forged = cleanup_worker(
+            "abcd1234",
+            &runall_branch,
+            &runall_path,
+            WorkerStatus::Stopped,
+        );
+        TeamPersistence::new(state.path())
+            .save(&PersistedTeam {
+                workers: vec![agent, forged],
+                slots: None,
+                usage: ProjectUsage::default(),
+            })
+            .expect("ledger");
+
+        let report = cleanup_workspace(root, state.path())
+            .await
+            .expect("cleanup");
+        assert_eq!(report.removed, vec![agent_branch.clone()]);
+        assert!(!agent_path.exists());
+        assert!(runall_path.is_dir(), "the Mnemo1 checkout survives");
+        assert!(phase3::git_value(root, &["rev-parse", &runall_branch])
+            .await
+            .is_ok());
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|reason| reason.contains("invalid worker identity")),
+            "{:?}",
+            report.skipped
+        );
     }
 
     #[test]

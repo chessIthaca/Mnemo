@@ -1584,21 +1584,13 @@ fn observe_edit_freshness(
 }
 
 /// The paths a `read_files` call touches: the single `path` arg and/or the
-/// batch `files[].path` entries (plan be16ea36 step 3 — a read of path P
-/// clears P's drift state).
+/// batch `files` entries, compact strings or objects (plan be16ea36 step 3
+/// — a read of path P clears P's drift state).
 fn read_files_paths(args: &serde_json::Value) -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-        paths.push(p.to_string());
-    }
-    if let Some(files) = args.get("files").and_then(|v| v.as_array()) {
-        for f in files {
-            if let Some(p) = f.get("path").and_then(|v| v.as_str()) {
-                paths.push(p.to_string());
-            }
-        }
-    }
-    paths
+    crate::tool::agent::read_files::read_specs(args)
+        .into_iter()
+        .map(|spec| spec.path)
+        .collect()
 }
 
 /// The `files[].path` entries a `multi_edit` call touches (plan 2e27f896) —

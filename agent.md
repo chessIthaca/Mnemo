@@ -19,7 +19,9 @@ command.
   `shell` tool.
 - The project root is `C:\AgenticCoder\AgenticCoder`.
 - Never commit to `main` — commit to the current feature branch.
+<!-- mnemo:classic -->
 - `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase` — on `shell`, the `git` tool having no fetch/pull subcommand), then merges the branch — on repos WITHOUT a main-protection ruleset. Since 2026-09-21 this repo's `main` is protected by ruleset 23755694 (pull_request, required_approving_review_count: 1): the skill detects it up-front (`gh api .../rulesets`), pushes the working branch, opens a PR against `main`, reports the URL, and STOPS — the human approves and merges (the author cannot self-approve); never bypass (no force-push/admin/ruleset edits). The **Mnemo1 agent workflow** keeps the hard gate: `git` core operations (`merge`/`push`) performed by the agent MUST go through the approval-gated `git` tool, and a shell-invoked `git merge`/`push` is gated identically (`GitTool::never_auto_for` covers the tool path; since 2027-01-11 `ShellTool::never_auto_for` matches a `git` executable in a command position) — no unprompted run in Autonomous mode either way. **Mnemo2** is an application-level integration queue, not an Mnemo1 agent workflow; its scoped merge policy is in **Mnemo2 team merge policy** under Branch policy. The skill also writes its landing records BEFORE the final commit — never after the push (see the record-phrasing rule in Branch policy).
+<!-- /mnemo:classic -->
 - **Do not pipe a command through a cmdlet and then trust the reported exit
   code** — it's the *pipe's* code, not the command's, and can read `1` even
   when the command succeeded. To check whether a command actually failed,
@@ -38,10 +40,12 @@ command.
 
 - Follow the existing code style in this repository.
 - All public functions must have doc comments.
+<!-- mnemo:classic -->
 - Run `cargo test --workspace` before marking a workflow step complete
   (root-only `cargo test` builds only the root package — it never compiles
   src-tauri, so app-crate breaks pass unnoticed; job 4 D9 review round 1,
   commit 3373096).
+<!-- /mnemo:classic -->
 - A **feature-gated** dependency bump additionally requires the feature-enabled
   run — `cargo test --features embeddings` (fastembed/ONNX) or `--features
   browser` (chromiumoxide), whichever tree the bump touches. Plain `cargo test`
@@ -70,6 +74,7 @@ command.
   add `#[allow(...)]` to silence a warning — fix the root cause (remove the dead
   code, drop the unused import, drop the unneeded `mut`, etc.).
 
+<!-- mnemo:classic -->
 ## Documentation expectations
 
 - When a bug_fixing fix turns out FEATURE-SCALE mid-flight (new pub types,
@@ -84,6 +89,7 @@ command.
   documenting the architecture + invariants, and amend the BUG record with
   the landed outcome. The finish gate blocks a `landed_design` plan whose
   context carries no "Landed design" amendment.
+<!-- /mnemo:classic -->
 
 ## File mutation policy
 
@@ -109,11 +115,14 @@ command.
 ## Branch policy (working-branch topology)
 
 - One `wt/*` working branch per agent directory (worktree), reused across plans — the working line; `main` is protected and only receives merges — directly via the `merge_to_main` skill on unprotected repos, or through the human's chosen PR merge method where a main-protection ruleset applies (this repo since 2026-09-21, ruleset 23755694: the skill detects it up-front, pushes the branch, opens the PR, and stops for the human approving review; the `new_release` skill performs the same ruleset-aware landing inline as its step 2). On the direct path the skill syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase`, before the branch merge — a stale `main` otherwise surfaces later as a rejected push); the sync runs on the shell tool, the merge and push on the approval-gated `git` tool (the PR path's branch push runs on the `git` tool, equally gated). The old `develop` integration tier was removed (2026-08-24).
+<!-- mnemo:classic -->
 - **Landing bookkeeping is written BEFORE the commit (2026-09-26).** `merge_to_main` — and `new_release` inline, as its step 2 — writes its status records while still on the branch and commits them into that branch (order: write records → commit → land), because a write issued after the push can never land: protected `main` rejects it and the branch that could have carried it is merged and deleted, so it dangles uncommitted and rides an unrelated branch. For the same reason landing records are phrased on pre-landing facts — title tail `— MERGED into main (branch <name>, <date>)`, body naming the branch's work tip, never the merge sha (a commit cannot contain its own hash) and never the PR number (it exists only after `gh pr create`); on the PR path the record ships inside the PR, so it becomes true exactly when the human merges. The skill's final check is an empty `git status --short`.
 - `create_plan` auto-forks the per-directory `wt/*` branch from `main` when on `main` (no `branch` arg) and reuses the current branch when already on one — work never silently stays on `main`. The `branch` param is reserved for an explicit user request for a specific branch name; the agent never passes it automatically. On the direct path `merge_to_main` deletes the merged branch after landing it; on the PR path the branch is deleted after the human merges the PR — no branches accumulate either way.
+<!-- /mnemo:classic -->
 - `.coding/` is the mergeable side-car: knowledge files (`.coding/knowledge/`), plans, reviews, and `backlog.jsonl` (git union merge driver) travel with git and merge across instances; `memory.db`/`codegraph.db` (rebuildable caches) and `plans/stack.json` + `instance.json` (per-instance local state) are gitignored — never committed.
 - After a git merge, the memory index converges automatically at the next project open (startup reconciliation re-derives on content-hash drift); in-session, Settings → Memory → "Rebuild index from files".
 - Never commit to main — commit to the current feature branch.
+<!-- mnemo:classic -->
 - Parallel run-all (plan ffd7a86f) adds per-item worktree branches
   (`wt/runall-<item8>`, forked from main into `.worktrees/runall-<item8>`)
   for concurrently dispatched backlog items. These are app-managed: the
@@ -131,7 +140,9 @@ command.
   Spawned items' reviewer reports land
   in the main tree's `.coding/reviews/` (shared by design); they are not
   carried by the item's branch merge.
+<!-- /mnemo:classic -->
 
+<!-- mnemo:team -->
 ### Mnemo2 team merge policy (supervisor/worker app)
 
 Mnemo2 is a separate application built on the headless engine, not an Mnemo1 agent workflow. Its **TeamManager** may auto-merge a completed worker branch into the lead's **local working branch** only after all of the following hold:
@@ -143,10 +154,9 @@ Mnemo2 is a separate application built on the headless engine, not an Mnemo1 age
 - the lead's working tree is clean and the lead is idle; the merge is serialized (one branch at a time).
 
 It halts on conflicts, never pushes, and never merges into `main`. Landing to `main` remains the repository's protected-PR path (ruleset 23755694; the human approves the PR). Worker branches are per-agent `wt/agent-*` worktrees forked from the lead's working-branch tip at dispatch; a base that goes stale while a worker runs is never auto-rebased — the conflict-halt and route-back rule handles it. The TeamManager performs the merge, not the agent's `git` tool. The compiled agent git gate still applies to the agent's own `git merge`/`git push` calls.
-
 ### Mnemo2 review evidence and independent audits
 
-This policy is **Mnemo2 only**. Mnemo1's read-only reviewer workflow in **Review expectations** below is unchanged: this section neither narrows nor replaces it. The lead remains Mnemo2's reviewer of record, but a worker summary plus passing checks is not a review — the lead must record what it actually inspected and concluded.
+This policy is **Mnemo2 only**. Mnemo1's unchanged read-only reviewer workflow below is neither narrowed nor replaced by this section. The lead remains Mnemo2's reviewer of record, but a worker summary plus passing checks is not a review — the lead must record what it actually inspected and concluded.
 
 **Acceptance scenarios first.** A new plan that will dispatch `review_risk: "high"` MUST contain a `## Acceptance scenarios` section with at least one **observable** bullet — a command, a persistence state, a concurrency outcome, a security property, or a UI behavior a reviewer can check without trusting the worker. Other plans are encouraged to include the section. `team_dispatch` with `review_risk: "high"` is rejected when that section is missing or has no observable bullet. Scenarios are written before implementation and re-verified at closing integration; they are never restated from the worker's own claims.
 
@@ -168,7 +178,9 @@ A **standard** review requires `unanchored_pass: true` and all five assessment s
 **Adjudication and staleness.** The lead links the completed audit with `review.evidence.independent_reviewer_id` and records a nonempty `audit_adjudication`: what the audit found, what the lead accepted or rejected, and why. At both review and merge the host validates that the linked worker is an `audit` worker, targets the same implementation worker, inspected the exact tip, and is terminal non-failed. Worker records carry `kind` (`"implementation"` / `"audit"`, default implementation), `review_risk`, optional `audit_target`, and `audit_tip` (the implementation tip the reviewer inspected). Any fix commit — `review_fix`, a worker fix, or a routed fixer — invalidates the prior lead review and makes the previous audit tip **stale**; the review (and, for high risk, a fresh audit at the new tip) must be repeated. Legacy ledger records deserialize as `kind: "implementation"` / `review_risk: "standard"` with no evidence, so an in-flight worker from before this policy needs a fresh review — plus an audit if its risk is high — before merge.
 
 **Closing verification.** The closing review keeps the structured evidence rather than discarding it at merge, and the lead re-verifies the original user scenarios end to end on the integrated tree — including the plan's `## Acceptance scenarios` when present — before `finish`. A closing record that only cites passing tests does not close the plan.
+<!-- /mnemo:team -->
 
+<!-- mnemo:classic -->
 ## Review expectations
 
 The reviewer (the read-only subagent spawned before every implementation plan
@@ -228,3 +240,4 @@ project-specific checks.
   `spawn_agent` refuses a blind reviewer respawn while a reviewer failure is
   pending. An un-completable review is escaped via `abandon_plan` (returns
   to Planning) — the main agent is never stuck in Reviewing.
+<!-- /mnemo:classic -->

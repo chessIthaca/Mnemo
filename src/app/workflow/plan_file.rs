@@ -65,6 +65,9 @@ impl PlanFile {
             landed_design: false,
             detailed_steps: None,
             reviews: Vec::new(),
+            decisions: None,
+            interfaces: None,
+            progress: None,
             steps,
         }
     }
@@ -99,6 +102,18 @@ impl PlanFile {
             for stamp in &self.reviews {
                 out.push_str(&format!("{} {}\n", stamp.round, stamp.base));
             }
+        }
+        if let Some(decisions) = &self.decisions {
+            out.push_str(&format!("\n## Decisions\n{decisions}\n"));
+        }
+        if let Some(interfaces) = &self.interfaces {
+            out.push_str(&format!("
+## Interfaces
+{interfaces}
+"));
+        }
+        if let Some(progress) = &self.progress {
+            out.push_str(&format!("\n## Progress\n{progress}\n"));
         }
         out
     }
@@ -1155,5 +1170,35 @@ C
         // A header containing `*` (e.g. a glob) is still extracted.
         let plan4 = PlanFile::new("T", "G", "C", vec!["**src/*.rs** — clean up".into()]);
         assert_eq!(plan4.steps[0].header.as_deref(), Some("src/*.rs"));
+    }
+
+    #[test]
+    fn decisions_and_progress_sections_roundtrip_and_stay_optional() {
+        let mut plan = PlanFile::new("T", "G", "C", vec!["one".into(), "two".into()]);
+        plan.steps[0].done = true;
+        plan.decisions = Some("- 2026-10-29: use serde\n- 2026-10-30: drop the cache".into());
+        plan.interfaces = Some("- 2026-10-29: `src/game.js` — exports `Game` (named)".into());
+        plan.progress = Some("- 2026-10-30 step 1 done: merged abc".into());
+        let text = plan.serialize();
+        assert!(text.contains("
+## Interfaces
+- 2026-10-29: `src/game.js`"), "{text}");
+        assert!(text.contains("\n## Decisions\n- 2026-10-29: use serde\n"), "{text}");
+        let parsed = PlanFile::parse(&text).unwrap();
+        assert_eq!(parsed.decisions, plan.decisions);
+        assert_eq!(parsed.interfaces, plan.interfaces);
+        assert_eq!(parsed.progress, plan.progress);
+        assert_eq!(parsed.steps.len(), 2);
+        assert!(parsed.steps[0].done);
+        assert_eq!(parsed.context, "C");
+        assert_eq!(parsed.serialize(), text);
+
+        // Mnemo1 plans carry neither section, and serialize without them.
+        let old = PlanFile::new("T", "G", "C", vec!["one".into()]);
+        assert!(old.decisions.is_none() && old.progress.is_none());
+        assert!(old.interfaces.is_none());
+        assert!(!old.serialize().contains("## Decisions"));
+        assert!(!old.serialize().contains("## Interfaces"));
+        assert!(!old.serialize().contains("## Progress"));
     }
 }

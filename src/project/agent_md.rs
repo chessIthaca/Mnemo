@@ -47,6 +47,107 @@ impl Constitution {
             ConstitutionMode::None => Constitution::default(),
         }
     }
+
+    /// The constitution as a session in `scope` reads it
+    /// (`.coding/design/mnemo2.md` Phase 5.2): text wrapped in
+    /// `<!-- mnemo:classic -->` … `<!-- /mnemo:classic -->` applies only to
+    /// Mnemo1's Classic workflow, text wrapped in `<!-- mnemo:team -->` …
+    /// `<!-- /mnemo:team -->` only to Mnemo2 (its lead and workers), and
+    /// unmarked text to everyone.
+    pub fn scoped(&self, scope: ConstitutionScope) -> Constitution {
+        Constitution {
+            global: scope_text(&self.global, scope),
+            project: scope_text(&self.project, scope),
+        }
+    }
+}
+
+/// Which workflow's marked `agent.md` sections a session reads
+/// ([`Constitution::scoped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstitutionScope {
+    /// Mnemo1's plan-first workflow: drops `mnemo:team` sections.
+    Classic,
+    /// The Mnemo2 lead and its executor workers: drops `mnemo:classic`
+    /// sections.
+    Team,
+}
+
+/// Marker lines of the two scoped section kinds: `(open, close)`.
+const CLASSIC_MARKERS: (&str, &str) = ("<!-- mnemo:classic -->", "<!-- /mnemo:classic -->");
+const TEAM_MARKERS: (&str, &str) = ("<!-- mnemo:team -->", "<!-- /mnemo:team -->");
+
+/// What a marker line (trimmed) is.
+enum Marker {
+    Open(ConstitutionScope),
+    Close(ConstitutionScope),
+}
+
+fn parse_marker(line: &str) -> Option<Marker> {
+    let line = line.trim();
+    if !line.starts_with("<!-- ") {
+        return None;
+    }
+    if line == CLASSIC_MARKERS.0 {
+        Some(Marker::Open(ConstitutionScope::Classic))
+    } else if line == CLASSIC_MARKERS.1 {
+        Some(Marker::Close(ConstitutionScope::Classic))
+    } else if line == TEAM_MARKERS.0 {
+        Some(Marker::Open(ConstitutionScope::Team))
+    } else if line == TEAM_MARKERS.1 {
+        Some(Marker::Close(ConstitutionScope::Team))
+    } else {
+        None
+    }
+}
+
+/// Filter one constitution text for `scope`. Text with no marker line comes
+/// back byte-identical. Marker lines are always dropped; a section of the
+/// other scope is dropped with its body; an unterminated open marker keeps
+/// its body (over-include rather than silently lose rules). A removed
+/// section never leaves a run of 3+ blank lines.
+fn scope_text(text: &str, scope: ConstitutionScope) -> String {
+    if !text.lines().any(|l| parse_marker(l).is_some()) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    // The section kind we're inside, if any (sections don't nest).
+    // The section kind we're inside, if any (sections don't nest).
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut inside: Option<ConstitutionScope> = None;
+    let mut blank_run = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        match parse_marker(line) {
+            Some(Marker::Open(kind)) => {
+                // Only a terminated section can drop text.
+                let closed = lines[i + 1..]
+                    .iter()
+                    .any(|l| matches!(parse_marker(l), Some(Marker::Close(k)) if k == kind));
+                inside = closed.then_some(kind);
+                continue;
+            }
+            Some(Marker::Close(kind)) => {
+                if inside == Some(kind) {
+                    inside = None;
+                }
+                continue;
+            }
+            None => {}
+        }
+        if matches!(inside, Some(kind) if kind != scope) {
+            continue;
+        }
+        if line.trim().is_empty() {
+            blank_run += 1;
+            if blank_run > 2 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// A live constitution source that re-reads from disk when a file changes.
@@ -325,5 +426,88 @@ mod tests {
         // ticks — unlike the same-mtime-same-tick case the other test covers.
         assert!(src.reload_if_changed());
         assert_eq!(src.constitution().project, "NEW PROJECT");
+    }
+
+    const MIXED: &str = "intro\n\n<!-- mnemo:classic -->\nCLASSIC RULE\n<!-- /mnemo:classic -->\n\n<!-- mnemo:team -->\nTEAM RULE\n<!-- /mnemo:team -->\n\noutro\n";
+
+    #[test]
+    fn scoped_classic_drops_team_sections() {
+        let c = Constitution { global: MIXED.into(), project: String::new() };
+        let g = c.scoped(ConstitutionScope::Classic).global;
+        assert!(g.contains("CLASSIC RULE") && !g.contains("TEAM RULE"));
+        assert!(g.contains("intro") && g.contains("outro"));
+        assert!(!g.contains("mnemo:"), "marker lines are dropped: {g}");
+    }
+
+    #[test]
+    fn scoped_team_drops_classic_sections() {
+        let c = Constitution { global: MIXED.into(), project: String::new() };
+        let g = c.scoped(ConstitutionScope::Team).global;
+        assert!(g.contains("TEAM RULE") && !g.contains("CLASSIC RULE"));
+        assert!(!g.contains("mnemo:"));
+    }
+
+    #[test]
+    fn scoped_without_markers_is_identity() {
+        let text = "a\r\n\n\n\n\nb <!-- not a marker line -->\n";
+        let c = Constitution { global: text.into(), project: "p".into() };
+        for scope in [ConstitutionScope::Classic, ConstitutionScope::Team] {
+            let s = c.scoped(scope);
+            assert_eq!(s.global, text);
+            assert_eq!(s.project, "p");
+        }
+    }
+
+    #[test]
+    fn scoped_unterminated_marker_keeps_text() {
+        let c = Constitution {
+            global: "a\n<!-- mnemo:team -->\nKEEP ME\n".into(),
+            project: String::new(),
+        };
+        assert_eq!(c.scoped(ConstitutionScope::Classic).global, "a\nKEEP ME\n");
+        assert_eq!(c.scoped(ConstitutionScope::Team).global, "a\nKEEP ME\n");
+    }
+
+    #[test]
+    fn scoped_tolerates_marker_whitespace_and_crlf() {
+        let c = Constitution {
+            global: "a\r\n  <!-- mnemo:classic -->  \r\nC\r\n\t<!-- /mnemo:classic -->\r\nb\r\n".into(),
+            project: String::new(),
+        };
+        assert_eq!(c.scoped(ConstitutionScope::Classic).global, "a\r\nC\r\nb\r\n");
+        assert_eq!(c.scoped(ConstitutionScope::Team).global, "a\r\nb\r\n");
+    }
+
+    #[test]
+    fn scoped_filters_global_and_project() {
+        let c = Constitution { global: MIXED.into(), project: MIXED.into() };
+        let t = c.scoped(ConstitutionScope::Team);
+        assert!(!t.global.contains("CLASSIC RULE") && !t.project.contains("CLASSIC RULE"));
+        assert!(t.global.contains("TEAM RULE") && t.project.contains("TEAM RULE"));
+    }
+
+    #[test]
+    fn scoped_blank_runs_collapse_after_removal() {
+        let c = Constitution {
+            global: "a\n\n\n\n<!-- mnemo:team -->\nT\n<!-- /mnemo:team -->\n\n\n\nb\n".into(),
+            project: String::new(),
+        };
+        assert_eq!(c.scoped(ConstitutionScope::Classic).global, "a\n\n\nb\n");
+    }
+
+    #[test]
+    fn real_agent_md_scopes_for_team() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/agent.md");
+        let text = std::fs::read_to_string(path).unwrap();
+        let c = Constitution { global: String::new(), project: text };
+        let team = c.scoped(ConstitutionScope::Team).project;
+        let classic = c.scoped(ConstitutionScope::Classic).project;
+        assert!(!team.contains("update_plan"), "classic-only rule leaked");
+        assert!(!team.contains("Review expectations"));
+        assert!(team.contains("File mutation policy"), "universal rule lost");
+        assert!(team.contains("### Mnemo2 team merge policy"));
+        assert!(classic.contains("Review expectations"));
+        assert!(!classic.contains("### Mnemo2 team merge policy"));
+        assert!(!team.contains("mnemo:") && !classic.contains("mnemo:"));
     }
 }

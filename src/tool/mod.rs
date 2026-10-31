@@ -308,15 +308,74 @@ fn sanitize_stringified_nulls(schema: &Value, args: &mut Value) {
 /// (trimming shifted them) — and serde's line-relative column is
 /// converted to the absolute offset, so multi-line payloads point at
 /// the real defect, not a byte of the wrong line.
+///
+/// A payload that fails only because of stray quotes after numeric values
+/// (observed on every spec of one call: `{"start_line": 3530"}`) is
+/// repaired and parsed; any other failure reports the original position.
 pub(crate) fn parse_stringified_sequence(s: &str) -> Result<Vec<Value>, (usize, String)> {
-    match serde_json::from_str::<Value>(s) {
-        Ok(Value::Array(elements)) => Ok(elements),
-        Ok(other) => Err((0, format!("parses to {}, not an array", json_kind(&other)))),
-        Err(e) => Err((
-            absolute_byte_position(s, e.line(), e.column()),
-            e.to_string(),
-        )),
+    fn parse(s: &str) -> Result<Vec<Value>, (usize, String)> {
+        match serde_json::from_str::<Value>(s) {
+            Ok(Value::Array(elements)) => Ok(elements),
+            Ok(other) => Err((0, format!("parses to {}, not an array", json_kind(&other)))),
+            Err(e) => Err((
+                absolute_byte_position(s, e.line(), e.column()),
+                e.to_string(),
+            )),
+        }
     }
+    parse(s).or_else(|err| match drop_stray_quotes_after_numbers(s) {
+        Some(repaired) => parse(&repaired).map_err(|_| err),
+        None => Err(err),
+    })
+}
+
+/// Drop each `"` that directly follows an object's numeric value and
+/// precedes `,`, `}` or `]` — `{"start_line": 3530"}` becomes
+/// `{"start_line": 3530}`. Well-formed JSON never has a quote outside a
+/// string right after a number, so a valid payload is never changed.
+/// `None` when there was nothing to drop.
+pub(crate) fn drop_stray_quotes_after_numbers(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let follows_number_value = |quote: usize| {
+        let mut i = quote;
+        while i > 0 && (bytes[i - 1].is_ascii_digit() || b".-+eE".contains(&bytes[i - 1])) {
+            i -= 1;
+        }
+        if i == quote || !bytes[quote - 1].is_ascii_digit() {
+            return false;
+        }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i > 0 && bytes[i - 1] == b':'
+    };
+    let precedes_delimiter = |quote: usize| {
+        bytes[quote + 1..]
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|b| b",}]".contains(b))
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' if in_string => in_string = false,
+            b'"' if follows_number_value(i) && precedes_delimiter(i) => {
+                out.push_str(&s[copied..i]);
+                copied = i + 1;
+            }
+            b'"' => in_string = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    (copied > 0).then(|| {
+        out.push_str(&s[copied..]);
+        out
+    })
 }
 
 /// Convert serde's 1-based, line-relative `line`/`column` (review L1,
@@ -1624,6 +1683,26 @@ mod tests {
         let (pos, reason) = parse_stringified_sequence("{\"a\": 1}").unwrap_err();
         assert_eq!(pos, 0);
         assert!(reason.contains("object"), "reason: {reason}");
+    }
+
+    /// A stray quote after every numeric value (observed live, both specs
+    /// of one read_files call) is repaired; quotes inside strings and
+    /// well-formed payloads are left alone.
+    #[test]
+    fn stray_quotes_after_numbers_are_repaired() {
+        let raw = r#"[{"max_lines": 100, "path": "C:/a/factory.rs", "start_line": 3530"}, {"max_lines": 100, "path": "b.rs", "start_line": 4010"}]"#;
+        assert_eq!(
+            Value::Array(parse_stringified_sequence(raw).unwrap()),
+            serde_json::json!([
+                {"max_lines": 100, "path": "C:/a/factory.rs", "start_line": 3530},
+                {"max_lines": 100, "path": "b.rs", "start_line": 4010}
+            ])
+        );
+        let valid = r#"[{"path": "notes: 12", "n": 1.5e3}, "x: 7\"]"]"#;
+        assert_eq!(drop_stray_quotes_after_numbers(valid), None);
+        // Not after an object value, or not before a delimiter: untouched.
+        assert!(parse_stringified_sequence("[1, 2\"").is_err());
+        assert_eq!(drop_stray_quotes_after_numbers(r#"{"a": 1"x"}"#), None);
     }
 
     #[test]

@@ -62,6 +62,7 @@ fn public_types_serde_roundtrip() {
     roundtrip(&SpawnOptions {
         name: Some("worker".into()),
         model: Some("local/m2".into()),
+        reasoning_effort: Some("high".into()),
         worktree: Some("/tmp/wt".into()),
         permissions: Some(PermissionPolicy::OverridePermissions),
         policy: Some("mnemo.workflow".into()),

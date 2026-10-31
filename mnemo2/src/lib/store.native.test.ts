@@ -121,7 +121,7 @@ describe("native lead store path", () => {
     await new Promise((resolve) => setTimeout(resolve, 40));
     actions.setLeadModel("test/scripted-b");
     await vi.waitFor(() =>
-      expect(harness.transport.setModel).toHaveBeenCalledWith("test/scripted-b"),
+      expect(harness.transport.setModel).toHaveBeenCalledWith("test/scripted-b", null),
     );
     await vi.waitFor(() => expect(get(app).leadRuntime.modelId).toBe("scripted-b"));
     expect(get(app).leadRuntime.generation).toBe(2);

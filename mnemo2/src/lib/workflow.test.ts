@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createWorkers } from "../test/fixtures";
 import { deriveTaskWorkflow } from "./workflow";
-import type { Worker } from "./types";
+import { workerStatusText, type Worker } from "./types";
 
 const worker = (id: string): Worker => {
   const found = createWorkers().find((item) => item.id === id);
@@ -72,6 +72,17 @@ describe("deriveTaskWorkflow", () => {
     expect(deriveTaskWorkflow(worker("liv")).state).toBe("cancelled");
     expect(deriveTaskWorkflow(worker("ren")).state).toBe("done");
     expect(deriveTaskWorkflow(worker("ren")).steps.every((item) => item.status === "done")).toBe(true);
+  });
+
+  it("calls a merged task landed in the lead branch, or reverted once undone", () => {
+    const merge = { ...worker("ren").merge!, target: "wt/mnemo" };
+    const landed: Worker = { ...worker("ren"), merge };
+    expect(workerStatusText(landed)).toBe("Landed");
+    expect(step(deriveTaskWorkflow(landed), "merge")?.detail).toBe("Landed in wt/mnemo");
+
+    const reverted: Worker = { ...landed, merge: { ...merge, revertCommit: "9f3e2d1" } };
+    expect(workerStatusText(reverted)).toBe("Reverted");
+    expect(step(deriveTaskWorkflow(reverted), "merge")?.detail).toBe("Reverted from wt/mnemo");
   });
 
   it("maps real Phase 2 runtime statuses without faking review or merge", () => {

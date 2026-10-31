@@ -8,5 +8,6 @@
 
 pub mod ask_user;
 pub mod backlog;
+pub mod board;
 pub mod plan;
 pub mod skill;

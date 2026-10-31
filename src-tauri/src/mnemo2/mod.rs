@@ -16,11 +16,17 @@ pub mod runtime;
 /// Durable Phase 3 review and merge records.
 pub mod phase3;
 
+/// The project's startup code-index and memory passes, as one status.
+pub mod indexing;
+
 /// The real worker team runtime.
 pub mod team;
 
 /// Durable per-project usage and cost accounting.
 pub mod usage;
+
+/// The lead's team ledger for the TeamLead workflow.
+pub(crate) mod ledger;
 
 /// The typed Tauri command surface for the lead conversation.
 pub mod ipc;
@@ -93,6 +99,7 @@ pub fn run() {
             mnemo2_host_ping,
             ipc::lead_open,
             ipc::lead_snapshot,
+            ipc::indexing_snapshot,
             ipc::lead_prompt,
             ipc::lead_interrupt,
             ipc::lead_set_model,
@@ -100,6 +107,16 @@ pub fn run() {
             ipc::lead_answer,
             ipc::lead_close,
             ipc::team_snapshot,
+            ipc::board_snapshot,
+            ipc::settings_endpoints,
+            ipc::settings_upsert_endpoint,
+            ipc::settings_remove_endpoint,
+            ipc::settings_set_api_key,
+            ipc::settings_test_endpoint,
+            ipc::settings_list_provider_models,
+            ipc::settings_endpoint_usage,
+            ipc::settings_tiers,
+            ipc::settings_save_tiers,
             ipc::team_dispatch,
             ipc::team_audit_dispatch,
             ipc::team_message,
@@ -107,6 +124,7 @@ pub fn run() {
             ipc::team_interrupt,
             ipc::team_stop,
             ipc::team_resume,
+            ipc::team_set_model,
             ipc::team_compact,
             ipc::team_review,
             ipc::team_record_check,
@@ -117,6 +135,8 @@ pub fn run() {
             ipc::team_revert_merge,
             ipc::team_stop_all,
             ipc::team_set_slots,
+            ipc::team_delete_preview,
+            ipc::team_delete,
             ipc::team_messages,
             ipc::project_list,
             ipc::project_add,
@@ -148,8 +168,8 @@ pub fn run() {
                 let state = app.state::<ipc::Mnemo2State>();
                 let browser = app.state::<browser::BrowserController>();
                 let _ = tauri::async_runtime::block_on(async {
-                    if let Ok(app_data) = app.path().app_data_dir() {
-                        let _ = state.save_cached_preferences(&app_data).await;
+                    if let Ok(owner) = ipc::state_owner(app) {
+                        let _ = state.save_cached_preferences(&owner).await;
                     }
                     state.shutdown().await;
                     let _ = browser.close().await;

@@ -33,6 +33,11 @@ use crate::config::keys::{KeySource, Secret};
 use crate::config::mcp::McpServerWire;
 use crate::config::settings_dto::{SettingsSaveDto, VisionModelDto};
 
+mod endpoint_detail;
+pub use endpoint_detail::{
+    EndpointDetailDto, EndpointTestDto, ModelDetailDto, PriceDto, ProviderModelDto, TiersDto,
+};
+
 /// Which agent.md a Setup method addresses (§5.8 :557): the install's
 /// GLOBAL one (under the config dir) or a PROJECT's root one.
 #[derive(Debug, Clone, PartialEq)]
@@ -1312,16 +1317,43 @@ impl Setup {
             default_model.as_deref(),
         )
         .map_err(EngineError::start_failed)?;
-        let new_config = crate::config::patch::apply_endpoints(
+        let mut new_config = crate::config::patch::apply_endpoints(
             &current,
             built,
             default_provider,
             default_model,
             &api_keys,
         );
+        // Prices no remaining endpoint needs go with the endpoint.
+        let served: std::collections::HashSet<String> = new_config
+            .endpoints
+            .iter()
+            .flat_map(|e| e.models.iter().map(|m| m.id.clone()))
+            .collect();
+        let gone: Vec<String> = current
+            .endpoints
+            .iter()
+            .filter(|e| e.name == name)
+            .flat_map(|e| e.models.iter().map(|m| m.id.clone()))
+            .collect();
+        new_config
+            .pricing
+            .retain(|p| !gone.contains(&p.model) || served.contains(&p.model));
+        // Tier entries naming the endpoint drop with it.
+        let tiers_path = self.config_dir.join("endpoints.toml");
+        let old_tiers = crate::config::endpoints::load_tiers(&tiers_path);
+        let mut tiers = old_tiers.clone();
+        let prefix = format!("{name}/");
+        for list in tiers.lists_mut() {
+            list.retain(|s| !s.starts_with(&prefix));
+        }
         new_config
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(e.to_string()))?;
+        if tiers != old_tiers {
+            crate::config::endpoints::save_tiers(&tiers_path, &tiers)
+                .map_err(|e| EngineError::start_failed(e.to_string()))?;
+        }
         Ok(())
     }
 

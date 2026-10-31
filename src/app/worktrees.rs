@@ -1020,6 +1020,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runall_sweep_never_touches_mnemo2_agent_worktrees() {
+        // Mnemo2 team workers provision `<root>/.worktrees/agent-<id8>` on
+        // `wt/agent-<id8>`. The runall sweep must never see them: a worker
+        // branch whose tip IS an ancestor of origin/main (the sweep's
+        // deletion criterion) is kept only by the `wt/runall-` prefix gate,
+        // and its worktree survives. A merged runall branch in the same
+        // repo proves the sweep actually ran.
+        let repo = init_repo();
+        // Bare upstream OUTSIDE the working tree (see the sweep test above).
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let upstream = upstream_dir.path().join("upstream.git");
+        git_raw(repo.path(), &["init", "--bare", upstream.to_str().unwrap()]).unwrap();
+        git_raw(
+            repo.path(),
+            &["remote", "add", "origin", upstream.to_str().unwrap()],
+        )
+        .unwrap();
+        git_raw(repo.path(), &["push", "-u", "origin", "main"]).unwrap();
+
+        let (agent_worktree, agent_branch) = provision_agent_worktree(
+            repo.path().to_path_buf(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent_branch, "wt/agent-abcdef12");
+        assert!(agent_worktree.ends_with(".worktrees/agent-abcdef12"));
+        // The agent branch's tip is in origin/main — it satisfies the
+        // sweep's deletion criterion, so only the prefix gate protects it.
+        git_raw(
+            repo.path(),
+            &["merge-base", "--is-ancestor", &agent_branch, "origin/main"],
+        )
+        .unwrap();
+        // A merged runall branch (tip in origin/main) that the sweep SHOULD
+        // delete, so the sweep demonstrably ran over the same listing.
+        git_raw(repo.path(), &["branch", "wt/runall-aaaaaaaa"]).unwrap();
+
+        let swept = sweep_merged_runall_branches(repo.path().to_path_buf()).await;
+        assert_eq!(swept, vec!["wt/runall-aaaaaaaa".to_string()]);
+
+        // The agent branch survives, its worktree directory survives, and
+        // git still lists the worktree (the sweep's `worktree prune` only
+        // drops entries whose directory is missing).
+        assert!(
+            !git_raw(repo.path(), &["branch", "--list", &agent_branch])
+                .unwrap()
+                .is_empty(),
+            "the agent branch must survive the runall sweep"
+        );
+        assert!(agent_worktree.join("a.txt").exists());
+        let listing = git_raw(repo.path(), &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(
+            listing.contains("agent-abcdef12"),
+            "git still lists the agent worktree"
+        );
+    }
+
+    #[tokio::test]
     async fn land_syncs_main_with_its_upstream_before_merging() {
         // Follow-up B (plan f69317d4, 2027-01-11): the app-managed landing used
         // to merge into a possibly STALE local main — the same defect plan

@@ -61,6 +61,7 @@ describe("native lead transport", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(4, "lead_interrupt");
     expect(invokeMock).toHaveBeenNthCalledWith(5, "lead_set_model", {
       spec: "test/scripted-b",
+      reasoningEffort: null,
     });
     expect(invokeMock).toHaveBeenNthCalledWith(6, "lead_approve", {
       requestId: "req-1",

@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::provider::ToolSchema;
-use crate::tool::agent::read_files::invalid_args_error;
+use crate::tool::agent::read_files::{invalid_args_error, numbered_line};
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
@@ -101,7 +101,7 @@ impl Tool for FileReadTool {
                 let hint = if args.get("files").is_some() {
                     "If you meant to read several files in one call, use \
                      read_files (plural): it takes a \"files\" array of \
-                     {path, start_line?, max_lines?} specs."
+                     \"path\" or \"path:start+count\" strings."
                 } else {
                     ""
                 };
@@ -155,7 +155,7 @@ impl Tool for FileReadTool {
                 .skip(start)
                 .take(max)
                 .enumerate()
-                .map(|(i, line)| format!("{:>4}: {}", start + i + 1, line))
+                .map(|(i, line)| numbered_line(start + i + 1, line))
                 .collect();
 
             let showed = numbered.len();
@@ -205,7 +205,7 @@ mod tests {
         let result = tool.execute(json!({"path": "a.txt"})).await;
         assert!(result.success);
         // Output now includes line numbers.
-        assert_eq!(result.output, "   1: hello\n   2: world");
+        assert_eq!(result.output, "1: hello\n2: world");
     }
 
     #[tokio::test]
@@ -218,7 +218,7 @@ mod tests {
             .await;
         assert!(result.success);
         // Line numbers reflect the original file positions.
-        assert_eq!(result.output, "   2: line2\n   3: line3");
+        assert_eq!(result.output, "2: line2\n3: line3");
     }
 
     #[tokio::test]
@@ -329,9 +329,8 @@ mod tests {
         );
         assert!(result.output.contains("3000 lines total"));
         assert!(result.output.contains("showed 500"));
-        // The last visible line should be line 500 (1-indexed). With {:>4}
-        // formatting, 500 is 3 chars (one leading space).
-        assert!(result.output.contains(" 500: line499"));
+        // The last visible line should be line 500 (1-indexed).
+        assert!(result.output.contains("\n500: line499"));
         // Line 501 should NOT be in the output (it was truncated).
         assert!(!result.output.contains("line500"));
     }

@@ -12,7 +12,6 @@ use mnemo::config::projects::ProjectRegistry;
 use mnemo::config::resolve_config_dir;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::mnemo2::phase3::git_value;
 use crate::mnemo2::team::{DEFAULT_SLOTS, MAX_WORKER_SLOTS};
@@ -176,12 +175,148 @@ pub fn detach(root: &Path) {
     }
 }
 
-/// One stable state directory per canonical project, not a shared global `lead/`.
-pub fn state_dir(app_data: &Path, root: &Path) -> Result<PathBuf, String> {
+/// The folder under a project's `.coding/` that holds all of Mnemo2's state
+/// for that project.
+pub const STATE_SUBDIR: &str = "mnemo2";
+
+/// Keeps the state folder out of the project's commits: its contents are
+/// per-machine (absolute worktree paths, multi-MB transcripts), and a lead
+/// save must never dirty the checkout that merges and cleanup require clean.
+const STATE_GITIGNORE: &str = "# Mnemo2 per-machine session state; never committed.\n*\n";
+
+/// The stamp inside a state folder naming the machine that created it.
+const OWNER_FILE: &str = "owner";
+
+/// This machine's owner id, kept in the app-data dir — the one piece of
+/// Mnemo2 data outside projects. It proves a project's state folder was
+/// created here: a folder that arrived with a repository or archive cannot
+/// carry it, so its transcript is never resumed as the lead's own history.
+const OWNER_ID_FILE: &str = "state-owner-id";
+
+/// A project's Mnemo2 state lives inside the project, in `.coding/mnemo2/`:
+/// the lead transcript, worker ledger, workbench preferences, and engine
+/// workspace. Deleting the project deletes its state with it. This is the
+/// path only — read or write it through [`open_state_dir`].
+pub fn state_dir(root: &Path) -> Result<PathBuf, String> {
+    Ok(canonical_root(root)?.join(".coding").join(STATE_SUBDIR))
+}
+
+/// This machine's owner id, created once (atomically) in `app_data`.
+pub fn machine_owner_id(app_data: &Path) -> Result<String, String> {
+    let path = app_data.join(OWNER_ID_FILE);
+    let read = || {
+        std::fs::read_to_string(&path)
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    if let Some(id) = read() {
+        return Ok(id);
+    }
+    std::fs::create_dir_all(app_data)
+        .map_err(|err| format!("could not create {}: {err}", app_data.display()))?;
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(id.as_bytes())
+                .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+            Ok(id)
+        }
+        // Another instance created it first: use theirs.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            read().ok_or_else(|| format!("{} is unreadable", path.display()))
+        }
+        Err(err) => Err(format!("could not create {}: {err}", path.display())),
+    }
+}
+
+/// The verified state folder for a read-only operation, or its would-be path
+/// when the project has no state yet (readers then simply find nothing).
+pub fn state_owner_checked(root: &Path, owner: &str) -> Result<PathBuf, String> {
+    match open_state_dir(root, owner, false)? {
+        Some(dir) => Ok(dir),
+        None => state_dir(root),
+    }
+}
+
+/// Reject a path that is a symlink/junction or not a folder; `Ok(false)` when
+/// it does not exist.
+fn real_folder(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "{} is a link; Mnemo2 keeps project state only in a real folder inside the project",
+            path.display()
+        )),
+        Ok(meta) if !meta.is_dir() => Err(format!("{} is not a folder", path.display())),
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("could not inspect {}: {err}", path.display())),
+    }
+}
+
+/// Write a small file, refusing to follow a link planted in its place.
+fn write_plain_file(path: &Path, contents: &str) -> Result<(), String> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return Err(format!("{} is not a plain file", path.display()));
+        }
+    }
+    std::fs::write(path, contents).map_err(|err| format!("could not write {}: {err}", path.display()))
+}
+
+/// The project's state folder, verified before any of it is trusted:
+/// - neither `.coding` nor `.coding/mnemo2` is a link, and the folder resolves
+///   inside the project, so no write can land elsewhere;
+/// - it carries this machine's owner stamp. An unstamped folder holding state
+///   came from somewhere else (a cloned repository, an archive) and is refused,
+///   never resumed. An unstamped folder with no state is simply new.
+///
+/// With `create`, a missing or new folder is created and stamped and its
+/// `.gitignore` rewritten; without it, `Ok(None)` means "no state yet".
+pub fn open_state_dir(root: &Path, owner: &str, create: bool) -> Result<Option<PathBuf>, String> {
     let root = canonical_root(root)?;
-    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
-    let key = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    Ok(app_data.join("projects").join(key))
+    let coding = root.join(".coding");
+    let dir = coding.join(STATE_SUBDIR);
+    // Check before creating: create_dir_all would follow a planted link.
+    if !real_folder(&coding)? || !real_folder(&dir)? {
+        if !create {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+        real_folder(&coding)?;
+        real_folder(&dir)?;
+    }
+    let resolved = dunce::canonicalize(&dir)
+        .map_err(|err| format!("could not resolve {}: {err}", dir.display()))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!("{} resolves outside the project", dir.display()));
+    }
+    let stamp = dir.join(OWNER_FILE);
+    let stamped = std::fs::symlink_metadata(&stamp).is_ok_and(|meta| meta.is_file())
+        && std::fs::read_to_string(&stamp).is_ok_and(|id| id.trim() == owner);
+    if !stamped {
+        let holds_state = std::fs::read_dir(&dir)
+            .map_err(|err| format!("could not read {}: {err}", dir.display()))?
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() != ".gitignore");
+        if holds_state {
+            return Err(format!(
+                "{} was not created by Mnemo2 on this machine (it may have come with the repository), so its conversation and worker history are not loaded. Delete or rename that folder to start a fresh session here.",
+                dir.display()
+            ));
+        }
+        if !create {
+            return Ok(None);
+        }
+        write_plain_file(&stamp, owner)?;
+    }
+    if create {
+        // Always rewrite: never trust an existing ignore file's contents.
+        write_plain_file(&dir.join(".gitignore"), STATE_GITIGNORE)?;
+    }
+    Ok(Some(dir))
 }
 
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
@@ -242,24 +377,26 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Str
 }
 
 /// Load and validate a project's saved workbench preferences.
-pub fn preferences(app_data: &Path, root: &Path) -> Result<ProjectPreferences, String> {
-    let path = state_dir(app_data, root)?.join("preferences.json");
-    let preferences = read_json::<ProjectPreferences>(&path)?.unwrap_or_default();
+pub fn preferences(root: &Path, owner: &str) -> Result<ProjectPreferences, String> {
+    let Some(dir) = open_state_dir(root, owner, false)? else {
+        return Ok(ProjectPreferences::default());
+    };
+    let preferences = read_json::<ProjectPreferences>(&dir.join("preferences.json"))?
+        .unwrap_or_default();
     preferences.validate()?;
     Ok(preferences)
 }
 
 /// Persist validated preferences through the backup-recoverable replacement path.
 pub fn save_preferences(
-    app_data: &Path,
     root: &Path,
+    owner: &str,
     preferences: &ProjectPreferences,
 ) -> Result<(), String> {
     preferences.validate()?;
-    write_json(
-        &state_dir(app_data, root)?.join("preferences.json"),
-        preferences,
-    )
+    let dir = open_state_dir(root, owner, true)?
+        .ok_or_else(|| "the project state folder could not be created".to_string())?;
+    write_json(&dir.join("preferences.json"), preferences)
 }
 
 /// List registered projects without inventing session metadata.
@@ -358,7 +495,7 @@ pub async fn create(
     add(config_dir, &root)
 }
 
-async fn inspect(mut record: ProjectRecord, app_data: &Path) -> Result<ProjectRecord, String> {
+async fn inspect(mut record: ProjectRecord, owner: &str) -> Result<ProjectRecord, String> {
     let root = match canonical_root(Path::new(&record.path)) {
         Ok(root) => root,
         Err(error) => {
@@ -371,7 +508,15 @@ async fn inspect(mut record: ProjectRecord, app_data: &Path) -> Result<ProjectRe
     if let Ok(branch) = git_value(&root, &["symbolic-ref", "--short", "HEAD"]).await {
         record.branch = branch;
     }
-    let state = state_dir(app_data, &root)?;
+    let state = match open_state_dir(&root, owner, false) {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok(record),
+        Err(error) => {
+            // Shown on the start screen; untrusted state is never summarized.
+            record.state_error = Some(error);
+            return Ok(record);
+        }
+    };
     match read_json::<serde_json::Value>(&state.join("lead.json")) {
         Ok(Some(lead)) => {
             record.last_session_ms = lead.get("updated_at_ms").and_then(|value| value.as_u64()).map(u128::from);
@@ -415,11 +560,11 @@ async fn inspect(mut record: ProjectRecord, app_data: &Path) -> Result<ProjectRe
 /// List registry entries enriched with actual Git and per-project saved state.
 pub async fn list_with_state(
     config_dir: Option<PathBuf>,
-    app_data: &Path,
+    owner: &str,
 ) -> Result<Vec<ProjectRecord>, String> {
     let mut records = list(config_dir)?;
     for record in &mut records {
-        *record = inspect(record.clone(), app_data).await?;
+        *record = inspect(record.clone(), owner).await?;
     }
     Ok(records)
 }
@@ -428,6 +573,8 @@ pub async fn list_with_state(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const OWNER: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
     fn registry_round_trip_and_duplicate_names_work() {
@@ -482,13 +629,12 @@ mod tests {
 
     #[test]
     fn state_is_project_scoped_and_preferences_recover_the_last_good_backup() {
-        let app_data = tempdir().expect("app data");
         let one = tempdir().expect("one");
         let two = tempdir().expect("two");
-        let first = state_dir(app_data.path(), one.path()).expect("first state");
-        let second = state_dir(app_data.path(), two.path()).expect("second state");
+        let first = state_dir(one.path()).expect("first state");
+        let second = state_dir(two.path()).expect("second state");
         assert_ne!(first, second);
-        assert_eq!(state_dir(app_data.path(), one.path()).expect("stable"), first);
+        assert_eq!(state_dir(one.path()).expect("stable"), first);
         let preferences = ProjectPreferences {
             workbench_open: true,
             workbench_tab: "diff".to_string(),
@@ -496,23 +642,128 @@ mod tests {
             browser_url: "http://localhost:3000/".to_string(),
             diff_worker_id: Some("worker1".to_string()),
         };
-        save_preferences(app_data.path(), one.path(), &preferences).expect("save");
+        save_preferences(one.path(), OWNER, &preferences).expect("save");
         let mut newer = preferences.clone();
         newer.workbench_width = 700;
-        save_preferences(app_data.path(), one.path(), &newer).expect("second save");
+        save_preferences(one.path(), OWNER, &newer).expect("second save");
         assert!(first.join("preferences.json.bak").exists(), "the last good backup must survive replacement");
         std::fs::write(first.join("preferences.json"), "broken").expect("corrupt primary");
-        assert_eq!(super::preferences(app_data.path(), one.path()).expect("backup"), preferences);
+        assert_eq!(super::preferences(one.path(), OWNER).expect("backup"), preferences);
         let mut invalid = preferences;
         invalid.browser_url = "file:///etc/passwd".to_string();
-        assert!(save_preferences(app_data.path(), one.path(), &invalid).is_err());
+        assert!(save_preferences(one.path(), OWNER, &invalid).is_err());
+    }
+
+    /// Regression: state lived in the app-data dir keyed by a hash of the
+    /// project path, so deleting a project's contents and reopening the same
+    /// folder resurrected its old chat and worker history. It now lives in
+    /// the project's own `.coding/mnemo2/`, ignored by Git so lead saves
+    /// never dirty the checkout that merges and cleanup require clean.
+    #[test]
+    fn project_state_lives_in_dot_coding_and_never_dirties_git() {
+        let project = tempdir().expect("project");
+        let root = canonical_root(project.path()).expect("root");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git runs");
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        git(&["init", "-b", "main"]);
+        let dir = open_state_dir(project.path(), OWNER, true)
+            .expect("state dir")
+            .expect("created");
+        assert_eq!(dir, root.join(".coding").join(STATE_SUBDIR));
+        write_json(&dir.join("lead.json"), &serde_json::json!({ "transcript": { "messages": [] } }))
+            .expect("lead state");
+        assert!(git(&["status", "--porcelain", "--untracked-files=all"]).trim().is_empty());
+
+        // Removing the project's files removes its state: nothing elsewhere
+        // brings the old conversation back.
+        std::fs::remove_dir_all(root.join(".coding")).expect("delete project state");
+        assert!(read_json::<serde_json::Value>(&state_dir(project.path()).expect("dir").join("lead.json"))
+            .expect("read")
+            .is_none());
+    }
+
+    /// Security: a repository or archive can ship its own `.coding/mnemo2/`.
+    /// Resuming that `lead.json` would inject a conversation into the lead,
+    /// and a planted `team.json` would steer worktree cleanup. Only folders
+    /// stamped by this machine are trusted.
+    #[tokio::test]
+    async fn shipped_or_foreign_state_is_refused_never_loaded() {
+        let config = tempdir().expect("config");
+        let parent = tempdir().expect("parent");
+        let created = create(Some(config.path().to_path_buf()), parent.path(), "cloned".to_string())
+            .await
+            .expect("create");
+        let root = Path::new(&created.path);
+        let shipped = root.join(".coding").join(STATE_SUBDIR);
+        std::fs::create_dir_all(&shipped).expect("shipped dir");
+        std::fs::write(shipped.join("lead.json"), r#"{"transcript":{"messages":[]}}"#).expect("planted lead");
+
+        let refused = open_state_dir(root, OWNER, true).expect_err("unstamped state is refused");
+        assert!(refused.contains("not created by Mnemo2 on this machine"), "{refused}");
+        assert!(super::preferences(root, OWNER).is_err());
+        assert!(!shipped.join("owner").exists(), "a refused folder is never stamped");
+        let listed = list_with_state(Some(config.path().to_path_buf()), OWNER).await.expect("list");
+        assert!(listed[0].state_error.as_deref().is_some_and(|error| error.contains("not created by Mnemo2")));
+        assert_eq!(listed[0].last_session_ms, None, "untrusted state is never summarized");
+
+        // Another machine's stamp is just as foreign.
+        std::fs::write(shipped.join("owner"), "ffffffffffffffffffffffffffffffff").expect("foreign stamp");
+        assert!(open_state_dir(root, OWNER, false).is_err());
+
+        // Renaming it away starts fresh; the new folder is stamped and trusted.
+        std::fs::rename(&shipped, root.join(".coding").join("mnemo2.shipped")).expect("rename");
+        let fresh = open_state_dir(root, OWNER, true).expect("fresh").expect("created");
+        assert_eq!(std::fs::read_to_string(fresh.join("owner")).expect("stamp"), OWNER);
+        assert_eq!(open_state_dir(root, OWNER, false).expect("trusted"), Some(fresh));
+    }
+
+    #[test]
+    fn the_ignore_file_is_always_rewritten() {
+        let project = tempdir().expect("project");
+        let dir = open_state_dir(project.path(), OWNER, true).expect("dir").expect("created");
+        std::fs::write(dir.join(".gitignore"), "!*\n").expect("tamper");
+        open_state_dir(project.path(), OWNER, true).expect("reopen");
+        assert_eq!(std::fs::read_to_string(dir.join(".gitignore")).expect("ignore"), STATE_GITIGNORE);
+    }
+
+    /// A `.coding` link would redirect every state write outside the project.
+    #[cfg(windows)]
+    #[test]
+    fn a_linked_coding_folder_is_refused() {
+        let project = tempdir().expect("project");
+        let elsewhere = tempdir().expect("elsewhere");
+        let link = project.path().join(".coding");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(elsewhere.path())
+            .output()
+            .expect("cmd runs");
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let refused = open_state_dir(project.path(), OWNER, true).expect_err("linked .coding");
+        assert!(refused.contains("is a link"), "{refused}");
+        assert!(std::fs::read_dir(elsewhere.path()).expect("target").next().is_none(), "nothing was written through the link");
+    }
+
+    #[test]
+    fn the_machine_owner_id_is_created_once_and_reused() {
+        let app_data = tempdir().expect("app data");
+        let first = machine_owner_id(app_data.path()).expect("created");
+        assert_eq!(first.len(), 32);
+        assert_eq!(machine_owner_id(app_data.path()).expect("reused"), first);
     }
 
     #[tokio::test]
     async fn create_initializes_a_non_main_repository_and_lists_real_metadata() {
         let config = tempdir().expect("config");
         let parent = tempdir().expect("parent");
-        let app_data = tempdir().expect("app data");
         let created = create(Some(config.path().to_path_buf()), parent.path(), "demo".to_string())
             .await
             .expect("create");
@@ -520,7 +771,9 @@ mod tests {
         assert!(create(Some(config.path().to_path_buf()), parent.path(), "demo".to_string())
             .await
             .is_err());
-        let state = state_dir(app_data.path(), parent.path().join("demo").as_path()).expect("state");
+        let state = open_state_dir(parent.path().join("demo").as_path(), OWNER, true)
+            .expect("state")
+            .expect("created");
         write_json(&state.join("lead.json"), &serde_json::json!({
             "model": "local/model",
             "updated_at_ms": 1234,
@@ -530,7 +783,7 @@ mod tests {
             "slots": 5,
             "workers": [{ "id": "one", "status": "interrupted", "merge": null }]
         })).expect("team metadata");
-        let records = list_with_state(Some(config.path().to_path_buf()), app_data.path())
+        let records = list_with_state(Some(config.path().to_path_buf()), OWNER)
             .await
             .expect("metadata");
         assert_eq!(records[0].branch, "wt/project");

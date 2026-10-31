@@ -104,13 +104,7 @@ export function argPaths(args: string, toolName?: string): string[] {
   if (toolName === "read_files" || toolName === "multi_edit") {
     const files = parsed.files;
     if (Array.isArray(files)) {
-      return files
-        .map((f) =>
-          f && typeof f === "object" && typeof (f as Record<string, unknown>).path === "string"
-            ? (f as Record<string, string>).path
-            : null,
-        )
-        .filter((p): p is string => !!p);
+      return files.map((f) => readSpec(f)?.path ?? null).filter((p): p is string => !!p);
     }
   }
   // write_review_report takes a BARE filename — the tool writes it under
@@ -136,6 +130,32 @@ export interface PathLine {
   line: number | null;
 }
 
+/** The 1-based line a read starts at: a positive `start_line`, else 1. */
+function startLineOf(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.floor(value) : 1;
+}
+
+/**
+ * One `read_files` `files` entry as its path and start line, in either form
+ * the tool accepts: the compact string `"path"`, `"path:start+count"` or
+ * `"path:start-end"` (the advertised one), or the `{path, start_line?}`
+ * object. Only a trailing numeric range is split off, as in
+ * `parse_compact_spec` (src/tool/agent/read_files.rs).
+ */
+export function readSpec(entry: unknown): PathLine | null {
+  if (typeof entry === "string") {
+    const spec = entry.trim();
+    if (!spec) return null;
+    const range = /^(.*):(\d+)(?:[+-]\d+)?$/.exec(spec);
+    return range ? { path: range[1], line: startLineOf(parseInt(range[2], 10)) } : { path: spec, line: 1 };
+  }
+  if (entry !== null && typeof entry === "object" && typeof (entry as Record<string, unknown>).path === "string") {
+    const spec = entry as Record<string, unknown>;
+    return { path: spec.path as string, line: startLineOf(spec.start_line) };
+  }
+  return null;
+}
+
 /**
  * Extract the file paths referenced by a tool call's args, each paired with
  * the 1-based line a `read_files` spec started at (`start_line ?? 1`) so its
@@ -155,26 +175,13 @@ export function argPathLines(args: string, toolName?: string): PathLine[] {
     // Malformed JSON: fall back to argPaths' literal-salvage extraction.
     return argPaths(args, toolName).map((path) => ({ path, line: null }));
   }
-  const lineOf = (spec: Record<string, unknown>): number | null =>
-    typeof spec.start_line === "number" && Number.isFinite(spec.start_line) && spec.start_line >= 1
-      ? Math.floor(spec.start_line)
-      : 1;
   const files = parsed.files;
   if (Array.isArray(files)) {
-    const out: PathLine[] = [];
-    for (const f of files) {
-      if (f !== null && typeof f === "object" && typeof (f as Record<string, unknown>).path === "string") {
-        out.push({
-          path: (f as Record<string, unknown>).path as string,
-          line: lineOf(f as Record<string, unknown>),
-        });
-      }
-    }
-    return out;
+    return files.map(readSpec).filter((spec): spec is PathLine => spec !== null);
   }
   // Single-file shorthand: top-level path (+ optional start_line).
   const path = typeof parsed.path === "string" ? parsed.path : null;
-  return path !== null ? [{ path, line: lineOf(parsed) }] : [];
+  return path !== null ? [{ path, line: startLineOf(parsed.start_line) }] : [];
 }
 
 /** A header chip for a ToolCard: a clickable file link (`path !== null`), a
@@ -978,7 +985,7 @@ export function argLabel(args: string, toolName?: string): string | null {
     const files = parsed.files;
     if (Array.isArray(files)) {
       const names = files
-        .map((f) => (f && typeof f === "object" && typeof (f as Record<string, unknown>).path === "string" ? (f as Record<string, string>).path : null))
+        .map((f) => readSpec(f)?.path ?? null)
         .filter((p): p is string => !!p)
         .map((p) => basename(p));
       if (names.length === 0) return null;

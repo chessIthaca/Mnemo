@@ -1,3 +1,7 @@
+import type { IndexingSnapshot } from "./indexingEngine";
+import type { BoardPlan } from "./boardState";
+import type { WorkerDeletionPreview } from "./teamState";
+
 export type Route = "start" | "lead" | "team";
 export type WorkbenchTab = "browser" | "diff" | "plan";
 export type TeamFilter = "all" | "needs" | "active" | "done";
@@ -31,11 +35,16 @@ export const workerStatusLabel: Record<WorkerStatus, string> = {
   in_review: "In review",
   fixing: "Fixing",
   merging: "Merging",
-  merged: "Merged",
+  merged: "Landed",
   conflict: "Conflict",
   failed: "Failed",
   cancelled: "Cancelled",
 };
+
+/** A worker's status as shown: a landed merge that was later reverted reads "Reverted". */
+export function workerStatusText(worker: Pick<Worker, "status" | "merge">): string {
+  return worker.status === "merged" && worker.merge?.revertCommit ? "Reverted" : workerStatusLabel[worker.status];
+}
 
 export type StepStatus = "done" | "active" | "queued" | "failed";
 
@@ -134,10 +143,15 @@ export interface ReviewRecord {
 
 export interface WorkerMessage {
   id: string;
-  from: "worker" | "lead";
+  kind?: "message";
+  /** "harness" marks a harness note injected into the worker's context. */
+  from: "worker" | "lead" | "harness";
   body: string;
   time: string;
 }
+
+/** One item of a worker's thread: a Markdown message or a tool activity. */
+export type WorkerThreadEntry = WorkerMessage | Extract<LeadEntry, { kind: "tool" }>;
 
 export interface DiffStats {
   files: number;
@@ -172,6 +186,12 @@ export interface Worker {
   summary: string;
   status: WorkerStatus;
   model: string;
+  /** The `endpoint/model` spec the worker was given; null = the configured default. */
+  modelSpec?: string | null;
+  /** The model tier it was dispatched or moved by, when one was used. */
+  tier?: string;
+  /** The worker's chosen reasoning effort, when one was set. */
+  reasoningEffort?: string;
   branch: string;
   worktree: string;
   files: string[];
@@ -192,10 +212,14 @@ export interface Worker {
   /** For an audit worker: the exact implementation tip it inspected. */
   auditTip?: string;
   fixerFindingId?: string;
+  /** The board plan this worker's task belongs to. */
+  planId?: string | null;
+  /** The 0-based step of that plan. */
+  planStep?: number | null;
   checks: Check[];
   findings: Finding[];
   review?: ReviewRecord;
-  messages: WorkerMessage[];
+  messages: WorkerThreadEntry[];
   screenshots: string[];
   timeline: TimelineStep[];
   diff: DiffStats;
@@ -255,14 +279,22 @@ export type LeadEntry =
       id: string;
       kind: "team-message";
       time: string;
+      /** When it happened (Unix ms), used to place it in the lead chat. */
+      atMs?: number;
       workerId: string;
+      /** The worker's name when this was recorded. */
+      workerName?: string;
       body: string;
     }
   | {
       id: string;
       kind: "review";
       time: string;
+      /** When it happened (Unix ms), used to place it in the lead chat. */
+      atMs?: number;
       workerId: string;
+      /** The worker's name when this was recorded. */
+      workerName?: string;
       title: string;
       body: string;
     }
@@ -270,7 +302,11 @@ export type LeadEntry =
       id: string;
       kind: "merge";
       time: string;
+      /** When it happened (Unix ms), used to place it in the lead chat. */
+      atMs?: number;
       workerId: string;
+      /** The worker's name when this was recorded. */
+      workerName?: string;
       record: MergeRecord;
     };
 
@@ -323,8 +359,13 @@ export interface ToastMessage {
 export interface LeadModel {
   endpoint: string;
   model: string;
+  /** The explicit `endpoint/model` spec the engine runs. */
   spec: string;
   is_default: boolean;
+  /** Reasoning efforts this model accepts; empty = it takes none. */
+  reasoning_efforts?: string[];
+  /** The effort it runs at when none is chosen. */
+  default_effort?: string | null;
 }
 
 /** The UI's answer to a native `ask_user` question. */
@@ -337,6 +378,8 @@ export interface LeadPendingInteraction {
   kind: "approval" | "question" | "host_tool_call" | "policy_hook" | (string & {});
   request_id?: string;
   question_id?: string;
+  call_id?: string;
+  hook_id?: string;
   tool_call_id?: string;
   tool_name?: string;
   question?: string;
@@ -384,6 +427,7 @@ export interface LeadSnapshot {
   generation: number;
   model: string | null;
   model_id: string | null;
+  reasoning_effort?: string | null;
   models: LeadModel[];
   default_model: string | null;
   transcript: LeadTranscript;
@@ -445,6 +489,8 @@ export interface LeadRuntimeInfo {
   errorRetrying: boolean;
   model: string | null;
   modelId: string | null;
+  /** The lead's chosen reasoning effort; null = the model's default. */
+  reasoningEffort: string | null;
   models: LeadModel[];
   defaultModel: string | null;
   pending: LeadPendingInteraction | null;
@@ -473,6 +519,12 @@ export interface ProjectUsage {
   costMicros: number;
   /** Models with recorded usage but no configured or vendor price. */
   unpricedModels: string[];
+}
+
+/** A pending worker deletion awaiting the user's confirmation. */
+export interface WorkerDeletionRequest {
+  previews: WorkerDeletionPreview[];
+  busy: boolean;
 }
 
 export interface AppState {
@@ -504,14 +556,20 @@ export interface AppState {
   browserImage: { dataUrl: string; label: string } | null;
   plan: LeadPlan | null;
   planItems: PlanItem[];
+  /** Every plan on the board (open first), from the native host. */
+  board: BoardPlan[];
   diff: DiffSnapshot | null;
   diffFiles: DiffFile[];
   diffWorkerId: string | null;
   diffLoading: boolean;
   diffError: string | null;
   projectConflict: ProjectConflict | null;
+  /** The open project's startup code-index and memory passes. */
+  indexing: IndexingSnapshot | null;
   cleanupProjectId: string | null;
   cleanupBusy: boolean;
+  /** An open worker-deletion confirmation with what each delete removes. */
+  workerDeletion: WorkerDeletionRequest | null;
   closeProjectPending: boolean;
   newProjectParent: string | null;
   creatingProject: boolean;

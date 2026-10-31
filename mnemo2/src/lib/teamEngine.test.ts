@@ -8,11 +8,23 @@ describe("teamEngine", () => {
       invoke: invoke as never,
       listen: vi.fn(async () => () => {}) as never,
     });
-    await transport.dispatch("do it", "test/scripted-a", "worker0001");
+    await transport.dispatch("do it", "plan0001", 2, "test/scripted-a", "worker0001");
     expect(invoke).toHaveBeenCalledWith("team_dispatch", {
       brief: "do it",
+      planId: "plan0001",
+      step: 2,
       model: "test/scripted-a",
+      reasoningEffort: null,
       workerId: "worker0001",
+    });
+    await transport.dispatch("do it", "plan0001", 1, "test/scripted-a", null, "high");
+    expect(invoke).toHaveBeenLastCalledWith("team_dispatch", {
+      brief: "do it",
+      planId: "plan0001",
+      step: 1,
+      model: "test/scripted-a",
+      reasoningEffort: "high",
+      workerId: null,
     });
   });
 

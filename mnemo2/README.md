@@ -62,21 +62,42 @@ feature-enabled Mnemo2 lib tests.
   by legacy callers, and a busy lead receives the submission as a queued
   steer (`SessionCommand::Steer`, same payload) injected at the next safe
   turn boundary instead of an error.
-- **State.** App-owned state lives under the Tauri app-data directory for
-  `com.mnemo.mnemo2`, in `projects/<sha256-of-canonical-project-path>/`.
-  `lead.json` holds the model spec, project identity, transcript, and save time;
-  `team.json` holds the worker ledger and live-session cap; `preferences.json`
-  holds workbench preferences. `workspace/` contains the per-session plan
-  directory. These are not tracked project files. Endpoints and models come
-  from the normal Mnemo config directory (`$MNEMO_HOME` or `~/.mnemo`).
-- **Models.** The picker lists the configured `endpoints.toml` model specs for
-  the selected project. The lead header, composer, and project settings show
-  the actual serving model id reported by the session. A model change is allowed
-  only while idle and resumes the saved transcript.
+- **State.** All of a project's Mnemo2 state lives inside the project, in
+  `.coding/mnemo2/`, so deleting the project deletes its history.
+  `lead.json` holds the model spec, reasoning effort, project identity,
+  transcript, and save time; `team.json` holds the worker ledger and
+  live-session cap; `preferences.json` holds workbench preferences.
+  `workspace/` contains the per-session plan directory. The folder carries its
+  own `.gitignore` (`*`): its contents are per-machine (absolute worktree
+  paths, multi-MB transcripts), and a lead save must never dirty the checkout
+  that merges and cleanup require clean. Because a repository or archive can
+  ship its own `.coding/mnemo2/`, the folder is trusted only when stamped
+  (`owner`) with this machine's random id (`state-owner-id`, the one Mnemo2
+  file kept in the app-data dir): an unstamped or foreign-stamped folder that
+  holds state is refused, never resumed, and the start screen says why. The
+  `.coding` and `mnemo2` folders must be real folders (no links/junctions)
+  resolving inside the project, and the `.gitignore` is rewritten on every
+  open. Earlier builds kept this state in the app-data directory
+  (`com.mnemo.mnemo2/projects/<sha256>/`); it is no longer read. Endpoints and models come from the normal Mnemo config directory
+  (`$MNEMO_HOME` or `~/.mnemo`).
+- **Models.** The picker lists every configured `endpoints.toml` model as
+  `endpoint / model` (the configured default is marked), so equal model ids on
+  different endpoints never look alike. Beside it, a reasoning-effort picker
+  offers that model's allowed efforts (`reasoning_efforts`, or the standard
+  list plus `off`) and a "default" entry showing its configured effort; it is
+  hidden for endpoints without `supports_reasoning_effort`. The lead's model
+  and effort persist in `lead.json`; a change is allowed only while idle and
+  resumes the saved transcript (`lead_set_model { spec, reasoningEffort }`).
+  Mission Control's dispatch bar uses the same picker, and `team_dispatch`
+  takes an explicit `reasoning_effort` validated against the chosen model and
+  kept on the worker record for every later session.
 - **Interaction.** The composer sends through the real session. While a turn
   runs, the send button becomes a stop button; `lead_interrupt` cancels the
   generation without closing the session. Errors render inline with **Retry**;
-  pending approvals and questions render inline with their actions.
+  pending approvals and questions render inline with their actions. The lead
+  snapshot carries the question text, options, and approval tool name (the
+  engine snapshot keeps only the id), and while a question is open the
+  composer sends a free-form answer.
 - **Restore.** The transcript is persisted when a turn finishes or parks and is
   resumed on the next native open.
 - **Projects.** `project_list` / `project_add` / `project_pick_folder` read and
@@ -96,22 +117,40 @@ feature-enabled Mnemo2 lib tests.
   original Mnemo workflow's read-only reviewer profile. They run with
   `ToolSelection::all()` minus `create_plan`, `update_plan`, `finish`,
   `spawn_agent`, and `ask_user`; planning and review stay on the lead's main
-  thread. Worker sessions get hard turn and wall-clock limits. **Audit workers**
-  (independent reviewers for high-risk work) are read-only: no file mutation, no
-  commits, no merge, no spawning, no user questions, and no plan steps.
+  thread. Workers do the bulk of the implementation: the lead's team rules tell
+  it to delegate every self-contained task, never to brief a worker as
+  read-only or content-only, and to pick each worker's model per task. Worker
+  sessions run without any session limit (no request, token, cost, or
+  wall-clock cap); the lead or user stops a worker explicitly. **Audit
+  workers** (independent reviewers for high-risk work) are read-only: no file
+  mutation, no commits, no merge, no spawning, no user questions, and no plan
+  steps.
 - **Events.** Worker events are forwarded on `mnemo2://team-event` as
   `{ worker_id, generation, event }`. The frontend ignores stale generations.
+  The engine bus is shared by the lead and every worker, so each pump keeps
+  only its own session's events (`SessionEvent::is_from`); a worker's
+  auto-answered `message_parent` call never counts as needing the user.
+- **Worker thread.** A worker's Thread renders like the lead conversation:
+  the brief and lead replies, the worker's Markdown, its `message_parent`
+  reports as messages, every tool call as an activity card, and `[harness …]`
+  notes labeled as such (system prompts are hidden). Streamed text, tool calls,
+  output, and results appear live from the event stream; when the turn's
+  transcript is saved, the saved conversation replaces the live tail. Stream
+  deltas never refetch the team ledger. The engine keeps the per-request
+  workflow tail and context footer out of every export and strips any an older
+  build leaked into a saved transcript on resume.
 - **Commands.** `team_snapshot`, `team_dispatch`, `team_message`, `team_pause`,
   `team_interrupt`, `team_stop`, `team_resume`, `team_compact`, `team_review`,
   `team_record_check`, `team_resolve_finding`, `team_review_fix`,
   `team_route_fix`, `team_merge`, `team_revert_merge`, `team_stop_all`,
-  `team_set_slots`, and `team_messages`.
+  `team_set_slots`, `team_delete_preview`, `team_delete`, and `team_messages`.
 - **Host tools.** The lead gets `team_dispatch`, `team_message`, `team_status`,
   `team_stop`, `team_resume`, `team_compact`, `team_review`, `team_check`,
   `team_resolve_finding`, `review_fix`, `team_route_fix`, `team_audit_dispatch`,
   `team_merge`, and `team_revert_merge`. Dispatch accepts a caller-stable worker
   ID, an optional `review_risk` (`standard`/`high`), and returns a
-  model-facing JSON receipt with its real ID/status. Retrying that ID with the
+  model-facing JSON receipt with its real ID/status. Its `model` parameter is
+  an enum of the exact configured `endpoint/model` specs. Retrying that ID with the
   same brief/model cannot duplicate the worker. Unknown explicit models are
   rejected before provisioning. TeamManager state is authoritative; the lead
   must not infer lifecycle from Git/files or edit `team.json`. Generic
@@ -121,6 +160,15 @@ feature-enabled Mnemo2 lib tests.
 - **State.** `team.json` in the project's app-owned state directory is the
   app-owned worker ledger and stores the live-worker cap across restarts. Only
   TeamManager mutates that state.
+- **Deleting workers.** **Delete** in a worker's detail, or **Delete old** in
+  Mission Control (merged, cancelled, stopped, interrupted, and failed workers),
+  first shows a `team_delete_preview` of what goes: the record, transcript,
+  telemetry, review, inbox messages, checkout, and `wt/agent-*` branch. A live
+  session is stopped first; a merge in progress blocks deletion. Unmerged
+  commits and uncommitted changes are discarded only when the confirmation
+  says so (`team_delete` with `discard_work`). A branch that another worker
+  record still uses (legacy ids sharing an 8-character prefix) is kept until
+  its last record is deleted. The lead has no delete tool.
 
 ## Native workbench and project lifecycle
 
@@ -134,7 +182,12 @@ feature-enabled Mnemo2 lib tests.
   invent worker assignments.
 - **Browser** is a native WebView2 child on Windows, with address navigation,
   real back/forward/reload, URL/title synchronization, and modal/resize
-  visibility handling. There is no iframe or CDP browser path. Other platforms
+  visibility handling. Because the pane is an OS window above the whole UI,
+  the store only lets it show on the open Browser tab of the Lead view with no
+  team drawer or screenshot over it, and every visibility request carries a
+  sequence number (`browser_set_visible { visible, seq }`) so a late, older
+  "show" can never override a newer "hide". There is no iframe or CDP browser
+  path. Other platforms
   offer an external-open fallback. Worker screenshot chips open actual sandbox
   PNG previews, and chat links open the Browser pane.
 - **Persistence** isolates state by a hash of the canonical project path.
@@ -279,10 +332,10 @@ reviewer workflow is unchanged.
   merges without auto-resolution, never pushes, and supports guarded revert
   before landing. Successful merge closes the worker session, removes a verified
   clean worktree, and keeps the branch for audit; new dirty work is retained.
-- **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`) and
-  worker turn/wall-clock limits. There is no per-lead-turn delegation cap
-  (removed by user decision 2026-10-31) and no cumulative worker token or
-  cost budget.
+- **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`).
+  There is no per-lead-turn delegation cap (removed by user decision 2026-10-31)
+  and no cumulative worker token or cost budget. Worker sessions have no
+  request, token, cost, turn, or wall-clock limit.
   Requests, prompt/completion/cached tokens, turns, and elapsed time come from
   real events and never trigger a budget pause. Cost is shown only when model
   pricing is configured; unknown cost remains unknown, and usage is always shown.

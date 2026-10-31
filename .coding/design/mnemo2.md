@@ -1,6 +1,8 @@
 # Mnemo2 — Lead + Team (design v0.2)
 
-Status: Phase 4 implemented — the native host runs one real streaming lead
+Status: Phase 6 (plan board) implemented on top of Phase 5 (coexistence with
+Mnemo1) — see §11 Phases 5 and 6.
+Phase 4 implemented — the native host runs one real streaming lead
 session and a real parallel worker team on one shared headless engine, with
 per-worker branches and linked worktrees, durable reviews/findings, exact-tip
 checks, serialized local merge/revert, and cumulative telemetry without token
@@ -145,6 +147,11 @@ checks, and Git commits remain available for implementation tasks.
 The lead's plan is the plan of record. This is the biggest cost lever: one
 planning loop, not one per worker.
 
+A worker can choose neither its branch nor its integration: executor gate
+rules deny `git push`, `merge`, `rebase`, branch switching, and branch
+deletion through both the `git` tool and the shell (Phase 5). The deny is a
+veto, so it holds under the workers' `OverridePermissions`.
+
 ### Audit reviewer (high risk)
 
 An independent, read-only **audit worker** is required for `review_risk: "high"`
@@ -259,15 +266,6 @@ The lead's review is itself a cost center. It reviews small diffs directly; a
 large or high-risk diff gets the independent audit above rather than an
 unreviewed pre-read.
 
-**Check binding.** The checks precondition binds to the **branch tip being merged**. After a `review_fix` or worker fix commit, the lead runs the affected scope in the worker worktree and records real outcomes through `team_check`; TeamManager stamps the server-observed current tip. The affected checks, the review evidence, and any high-risk audit must all match that tip and pass before the merge card becomes mergeable. For this repository the check scope is `cargo test --workspace`.
-
-**Closing verification.** The closing review keeps the structured evidence (it is not discarded at merge), and the lead re-verifies the original user scenarios end to end on the integrated tree — including the plan's `## Acceptance scenarios` when present. A closing record that only cites passing tests does not close the plan.
-
-## 4. Auto-merge
-
-When the review is closed and the worker's checks pass, the TeamManager merges
-the worker branch into the lead's **local working branch**:
-
 - The lead and worker are idle and both working trees are clean. Review,
   checks, dispatch, messaging, stop/resume, and merge/revert share one operation
   lock, so exact-tip evidence cannot change after validation. A busy lead or
@@ -304,15 +302,15 @@ policy (see `agent.md`).
 
 The team has operational session limits, not per-agent spending budgets.
 
-- **Operational limits**: `DEFAULT_SLOTS = 3` live worker sessions, 64
-  worker turns and 30 minutes per session. There is no cumulative worker
-  token or cost budget and no budget-increase flow. There is no
-  per-lead-turn delegation limit (the four-per-turn cap was removed by
-  user decision 2026-10-31) — the concurrent slot limit is the only
-  spawn limit. Prompt, completion, cached, and context-window usage
-  never pause a worker or block a message/resume. Provider context
-  limits and parked sessions remain actual lifecycle outcomes, not
-  spending limits.
+- **Operational limits**: `DEFAULT_SLOTS = 3` live worker sessions. There is no
+  per-lead-turn delegation limit (the four-per-turn cap was removed by user
+  decision 2026-10-31); the concurrent slot limit is the only spawn limit.
+  Worker sessions have no turn, wall-clock, token, or cost limit
+  (`limits: None`); the lead or the user stops a worker explicitly. There is no
+  cumulative worker token or cost budget and no budget-increase flow. Prompt,
+  completion, cached, and context-window usage never pause a worker or block a
+  message/resume. Provider context limits and parked sessions remain actual
+  lifecycle outcomes, not spending limits.
 - **Tracked, idempotent dispatch**: the lead chooses a stable worker ID for each
   logical task and retains the returned JSON receipt and authoritative status.
   Reusing that ID with the same brief/model returns the existing worker rather
@@ -322,8 +320,12 @@ The team has operational session limits, not per-agent spending budgets.
 - **API authority**: TeamManager records and `team_status` are the only worker
   lifecycle/ID authority. The lead never infers lifecycle from Git/files or
   edits `team.json`; TeamManager owns its ledger and Git operations internally.
-- **Model routing**: strong lead, cheap/default workers, configured reviewer;
-  the lead can pick a cheaper model for mechanical work via `list_models`.
+- **Model routing**: strong lead, worker model and reasoning effort chosen per
+  task. `team_dispatch` advertises the configured `endpoint/model` specs and
+  the effort levels as schema enums; omitting them uses the configured
+  defaults. The UI picker shows endpoint, model, and effort unambiguously.
+  From Phase 5 the lead routes on one `lead` slot instead of per workflow
+  state, so its model never changes silently between Planning and Executing.
 - **Model identity**: the project stores the lead model; every task stores its
   worker model. The composer/settings show the lead model and compact badges
   identify worker models in task rows, delegation cards, and merge records.
@@ -343,6 +345,13 @@ The team has operational session limits, not per-agent spending budgets.
   Cost is derived only from configured model pricing; unknown cost is never
   shown as zero. The aggregate chip reports actual usage/cost without a token
   denominator. Workers support pause/resume/stop and real context compaction.
+- **Deletion**: the user can delete one or more workers with their record,
+  transcript, checkout, and branch (a branch another worker still uses is
+  kept). A live session is stopped first. The confirmation sheet names what
+  each delete removes and warns about unmerged commits or uncommitted changes
+  the lead branch lacks.
+- **Needs you**: every Needs-you banner and row carries the actual question,
+  approval, or blocking reason, never a bare "needs your attention".
 
 ## 6. Mission Control
 
@@ -429,6 +438,10 @@ States: **Dispatching**, **Working**, **Needs you**, **Idle**, **Paused**,
   `MNEMO2_TEAM_RULES` when generic spawning is blocked, explaining tracked
   delegation, exact-tip review/checks, tiny-fix scope, and why the lead must not
   call `git merge` or `git push` itself.
+- Phase 5 replaces the classic lifecycle map and closing sequence in the lead's
+  head with team versions (§11 Phase 5.1) and scopes `agent.md` sections by
+  workflow mode (Phase 5.2), so neither the lead nor a worker reads rules for
+  tools it does not have.
 - The tool-level gate (`GitTool::never_auto_for`,
   `ShellTool::never_auto_for`) remains for the agent; the TeamManager uses
   app-level git operations, not the agent's git tool.
@@ -440,6 +453,13 @@ States: **Dispatching**, **Working**, **Needs you**, **Idle**, **Paused**,
   re-tasking path.
 - Whether workers may message the user directly or only the lead.
 - Main landing UX (PR button vs the existing `merge_to_main` skill).
+- A read-only reviewer pre-pass for large diffs, as a TeamManager-tracked worker
+  with a reviewer profile (it would add its report to the plan's team review).
+- Seeding each worker worktree's code graph from the lead's
+  `.coding/codegraph.db` instead of letting it index from scratch.
+- Whether Mnemo1's runall and Mnemo2's team should ever share one landing
+  helper (today runall lands `wt/runall-*` on `main` or a PR; TeamManager merges
+  `wt/agent-*` into the lead branch).
 
 ## 11. Phases
 
@@ -506,8 +526,9 @@ Shipped in the native host:
   `WorktreeBinding`, so the worker's sandbox, project root, plans dir, and code
   graph all resolve inside its own checkout.
 - **Executor surface:** `ToolSelection::all()` minus `create_plan`,
-  `update_plan`, `finish`, `spawn_agent`, and `ask_user`, plus hard turn and
-  wall-clock limits. Planning and review stay the lead's job.
+  `update_plan`, `finish`, `spawn_agent`, and `ask_user`. The original turn and
+  wall-clock limits were later removed (§5). Planning and review stay the
+  lead's job.
 - **Messaging:** the lead gets `team_dispatch` / `team_message` / `team_status`
   host tools; workers get `message_parent`, whose messages land in a lead inbox
   and render in the lead conversation. A worker's direct `spawn_agent` is denied
@@ -574,12 +595,12 @@ Shipped in the native host:
   hiding. No iframe or CDP path exists. Other platforms offer external open.
   Worker screenshots are read only from the sandbox screenshot directory and
   shown as actual image previews; chat links open the same Browser pane.
-- **Per-project persistence:** `projects/<sha256-of-canonical-path>/` holds
-  `lead.json`, `team.json`, `preferences.json`, and the engine workspace.
-  Lead transcripts carry project identity and save time. Worker slots and
-  workbench preferences survive restart, with backup recovery. Legacy shared
-  `lead/` state is left untouched; older records without a project identity
-  are not assigned automatically to a possibly different project.
+- **Per-project persistence:** `<project>/.coding/mnemo2/` (gitignored, with
+  an owner stamp naming the canonical project) holds `lead.json`, `team.json`,
+  `preferences.json`, and the engine workspace. It replaced the original
+  app-data `projects/<sha256>/` location; the old app-data history was wiped
+  rather than migrated. Lead transcripts carry project identity and save time.
+  Worker slots and workbench preferences survive restart, with backup recovery.
 - **Lifecycle:** real Git/session metadata, new-project creation, Resume /
   Review / Clean, same-instance warnings, close confirmation, and conservative
   cleanup of only inactive clean worktrees. Every branch is retained;
@@ -593,6 +614,315 @@ Shipped in the native host:
   narrow-layout spacing keep the native pane from covering controls.
 - **Acceptance:** a real project opens, sessions survive restart, the browser is
   a native pane, and no mock data path remains.
+
+### Phase 5 — Coexistence with Mnemo1 (implemented)
+
+Mnemo1 and Mnemo2 share one engine, one prompt head, and one set of plan
+tools. Through Phase 4 the Mnemo2 lead ran Mnemo1's classic workflow
+unchanged with a team-rules block appended. Several classic rules contradict
+the team model, and three of them break it:
+
+| Collision | Effect before Phase 5 |
+|---|---|
+| `finish` needs a reviewer-written `.coding/reviews/` report. Only a `spawn_agent` reviewer can write one, and Mnemo2 blocks `spawn_agent`. | An implementation plan can never leave Reviewing; only `abandon_plan` escapes. |
+| Executing/Reviewing turns auto-continue up to 12 times. Team workers are not tracked descendants, and a finished worker turn sends no notice. | The lead polls or does the worker's task itself instead of idling. |
+| Workers run under `OverridePermissions` with no gate rules. | A worker's `git push` or `git merge` runs with only an audit event. |
+| The engine starts with memory disabled and no code graph, while the head marks memory and graph tools MANDATORY. | Dead mandates. Mnemo2 neither reads nor feeds the project memory. |
+| APP_RULES say "the main agent can NEVER author a review"; Mnemo2 makes the lead the reviewer of record. | Contradictory authority and two review record systems. |
+| Team host tools are AutoRun, so the Planning/Complete filters admit them. | Dispatch and merge without a plan. |
+| `complete_step` knows nothing about tasks. | Steps tick before their work merges. |
+| Lead plans live in the gitignored `.coding/mnemo2/workspace`. | Invisible to Mnemo1; the plan file stops being the crash-resumption document. |
+| Workers inherit all of `agent.md`. | Mnemo1-only process rules for tools workers lack. |
+| The lead routes its model per workflow state. | With no pinned model, the lead's model can change between states. |
+
+**Principle: one engine, two workflow modes.** The workflow is a policy
+choice: `WorkflowMode::Classic` for Mnemo1 and `WorkflowMode::TeamLead` for the
+Mnemo2 lead. Executor workers keep their declarative guardrails. The universal
+rules stay shared and byte-identical for Mnemo1: tool-call discipline, file
+tools, never commit to `main`, the approval gate on the lead's own git core
+operations, and memory hygiene. Only the workflow-specific text and gates
+differ.
+
+#### 5.1 TeamLead workflow mode (engine)
+
+> Superseded in part by Phase 6. The single-active-plan state gate, the
+> `complete_step` gate, and the ledger-backed `finish` gave way to the plan
+> board. The team head, turn-end Stop, `lead` routing, and the ledger seam
+> remain.
+
+- **Construction.** `WorkflowPolicyFactory::team_lead(ledger, plan_gated_tools)`
+  replaces `with_blocked_tools(["spawn_agent"])`. It builds `WorkflowPolicy` in
+  `TeamLead` mode, with `spawn_agent` blocked and a `TeamLedger` handle. That
+  trait lives in `src/app/team_ledger.rs`; the Mnemo2 host implements it over
+  `TeamRuntime`. Classic behavior stays byte-identical, pinned by the existing
+  head and tail tests.
+- **Stable head.** TeamLead swaps two blocks:
+  - `TEAM_WORKFLOW_LIFECYCLE` replaces the lifecycle map.
+  - `TEAM_APP_RULES` keeps the universal rules but replaces the closing
+    sequence: every task stamped with the plan is merged or cancelled, the
+    checks pass on the lead tip, the lead commits its own changes, then
+    `finish`.
+
+  It also drops the `spawn_agent` strategy line and keeps
+  `MNEMO2_TEAM_RULES`.
+- **Volatile tail.**
+  - EXECUTING: dispatch the current step's tasks, end the turn, act on
+    TeamManager notices, review and merge, then `complete_step`.
+  - REVIEWING: confirm with `team_status` that every plan task is merged or
+    cancelled, run the checks, commit, then `finish` — TeamManager evidence is
+    the review gate.
+- **Turn end.** `on_turn_end` returns Stop while the ledger reports a live
+  worker turn (Dispatching, Working, Fixing, or Merging); TeamManager notices
+  wake the lead. With no live worker turn the classic Continue rule applies,
+  so a lead mid-step with no delegated work still makes progress.
+- **State gate.** In Planning and Complete, `gate_call` denies the mutating team
+  tools: `team_dispatch`, `review_fix`, `team_route_fix`, `team_merge`, and
+  `team_revert_merge`. The host passes this list. Observing and managing
+  workers stays available in every state, so the lead can still handle a
+  straggler after a plan closes.
+- **Step gate.** `complete_step` is denied while the ledger reports an open task
+  for that plan and step. A task is open until it is merged or cancelled; the
+  denial names the open tasks.
+- **Finish.** In TeamLead mode `review_report` is optional.
+  - Without it, `finish` asks the ledger for the plan's team review. Any
+    unmerged, uncancelled task or open finding blocks finish.
+  - Otherwise the ledger returns a Markdown report opening `## Verdict: PASS`:
+    tasks, worker models, merge commits, findings with evidence or `wontfix`
+    justification, and checks.
+  - `finish` writes that report to
+    `.coding/reviews/team-<plan8>-<timestamp>.md`, then runs the normal gates:
+    the bug regression test, landed design, and the PLAN:/BUG: capture.
+  - An explicit `review_report` still works.
+
+  Mnemo1 and Mnemo2 reports share one record system in `.coding/reviews/`.
+- **Routing.** TeamLead routes the lead on a single `lead` slot that falls back
+  to the default model, not a per-state slot. A pinned model still wins.
+
+#### 5.2 Host wiring (Mnemo2)
+
+- **Executor gate rules.** `executor_guardrails` gains Deny rules for the `git`
+  tool and `shell`: push, merge, rebase, branch switch (`switch`, and a
+  `checkout` of a branch rather than of paths), branch deletion, worktree
+  commands, and `gh pr`. Each message says that TeamManager owns integration. A
+  deny is a veto, so it holds under `OverridePermissions`.
+- **Completion notice.** A worker turn that ends Completed sends the lead a
+  deduplicated TeamManager notice ("finished its turn — review it"), like the
+  existing blocked, failed, and message notices. Together with the turn-end
+  Stop, this is what lets the lead idle.
+- **Plan stamping.** `team_dispatch` records the lead's active plan id and
+  current step index on the worker record. The host reads them from the lead
+  session's plan, never from model arguments. A dispatch outside a plan
+  records none and is refused by the state gate anyway.
+- **Ledger.** `TeamRuntime` implements `TeamLedger`: live worker turns, open
+  tasks per plan and step, and the plan's team review report.
+- **Shared project knowledge.** The Mnemo2 engine uses the project's own
+  `.coding/memory.db`, `.coding/knowledge/`, and `.coding/codegraph.db` — the
+  same stores Mnemo1 uses — so both apps learn from and feed one memory. The
+  policy factory gets the memory, knowledge, code graph, and `.coding/reviews/`
+  handles, so `create_plan` recall and the `finish` capture work. Workers share
+  the memory store; each worktree's code graph keeps Phase 2's binding.
+- **Lead plans.** The lead's plans live in `<project>/.coding/plans/`, the same
+  stack Mnemo1 uses, and stay stable across lead respawns and model switches.
+  A plan started in either app is visible in the other, and the plan file is
+  again the git-tracked crash-resumption document. The merge's clean-lead check
+  ignores `.coding/plans/` and `.coding/knowledge/` changes; the lead commits
+  them with its own work.
+  Concurrent use of one project by both apps stays behind the existing shared
+  same-project marker and its explicit confirmation.
+- **Constitution scope.** `agent.md` wraps Mnemo1-only process rules in
+  `<!-- mnemo:classic -->` … `<!-- /mnemo:classic -->` and Mnemo2-only rules
+  in `<!-- mnemo:team -->` … `<!-- /mnemo:team -->`. The loader drops team
+  sections for Classic sessions and classic sections for the TeamLead and
+  executor workers. Unmarked text applies to everyone.
+- **Worktree isolation.** Each app provisions and cleans only its own
+  `.worktrees/` prefix (`runall-*` for Mnemo1, `agent-*` for Mnemo2), and tests
+  pin this.
+
+#### 5.3 Rollout
+
+1. Safety and liveness: executor gate rules and the completion notice.
+2. TeamLead mode in the engine (5.1), with unit tests; Classic stays
+   byte-identical.
+3. Host wiring (5.2): ledger, plan stamping, shared knowledge, lead plans
+   directory, constitution scope, and worktree isolation.
+4. Verification: `cargo test --workspace`, the `mnemo-app` mnemo2 tests,
+   `npm --prefix mnemo2 test`, and this document's results.
+
+#### 5.4 Acceptance
+
+- A Mnemo2 implementation plan reaches Complete through `finish` with no
+  `spawn_agent`. The generated report lands in `.coding/reviews/`, and the
+  PLAN digest lands in the project memory Mnemo1 reads.
+- After dispatching, the lead ends its turn and the completion notice wakes it;
+  no synthetic continue fires while a worker turn runs.
+- A worker's `git push` or `git merge`, through the git tool or the shell, is
+  refused.
+- `team_dispatch` in Planning or Complete is refused, and `complete_step` with
+  an open task is refused.
+- Mnemo1's Classic head and tail bytes are unchanged.
+
+#### 5.5 Landed decisions and verification
+
+- **Stopped counts as closed.** The lead's `team_stop` ends in Stopped; only
+  the user's workspace cleanup reaches Cancelled. The plan gates therefore
+  treat Merged, Cancelled, and Stopped as closed. Stopped and
+  merged-then-reverted tasks are listed under "Not merged" in the team review
+  report, and findings on abandoned tasks do not block.
+- **Shared stores through the state dir.** The Mnemo2 engine workspace is now
+  `Workspace::new(root)`, so its state dir is `<project>/.coding`. Memory,
+  knowledge, code graph, plans, and reviews all derive from it, which keeps the
+  memory reconcile and the plan stack consistent. The code graph follows
+  `general.codegraph` as in Mnemo1. The engine also reads the project's
+  `.coding/safety.toml`, `mcp.toml`, and `logs/`. `start_engine` adds Mnemo1's
+  managed ignore entries to `.git/info/exclude` so database files never dirty
+  the lead checkout. New engine accessors: `memory_store_handle`,
+  `knowledge_store_handle`, `codegraph_handle`, `reviews_dir`.
+- **Lead plans.** `Engine::use_project_plans()` (default off) makes
+  worktree-less spawns use the project's `.coding/plans/`. `SpawnOptions` is
+  unchanged.
+- **Executor gate rules.** The `git` tool has no rebase, switch, or worktree
+  operations, so its rules cover push, merge, checkout, and branch deletion.
+  Shell rules cover the full list, including chained, `-C`, and `bash -c`
+  forms. They match only the `command` field.
+- **Constitution.** In this repository's `agent.md`, classic-only sections are
+  Documentation expectations, Review expectations, the `merge_to_main`, landing
+  bookkeeping, create_plan auto-fork, and run-all bullets, and the "before
+  marking a workflow step complete" test rule. The Mnemo2 team merge policy is
+  team-only. Workers run the checks named in their brief.
+- **Verification.** `cargo test --workspace`: 3544 passed, 0 failed. This
+  includes the prompt goldens, which show the Classic head and tail unchanged,
+  and the boundary test (`GateVerdict` is now re-exported from
+  `mnemo::headless`). `cargo test -p mnemo-app --features mnemo2 --lib mnemo2`:
+  88 passed. `cargo build -p mnemo-app --features mnemo2 --bin mnemo2`: passed.
+  `npm --prefix mnemo2 test`: 156 passed. No live-provider run has exercised a
+  full plan through `finish` yet.
+
+### Phase 6 — Plan board (implemented)
+
+Phase 5 kept the lead on Mnemo1's one-active-plan state machine. That turned
+out stricter than intended: the lead could not run several plans at once, and
+every dispatch, step, and `finish` hung off a single active plan. Phase 6
+keeps "plan first" but lets the lead hold any number of plans and run them in
+parallel through its workers.
+
+**Why plans matter here.** A plan is the record of intent: why the work
+exists, its constraints, the decisions taken along the way, and how each step
+turned out. Code does not carry any of that. Plans are therefore mandatory for
+all delegated work, written to `.coding/plans/` in Mnemo1's plan-file format,
+kept after they close, and digested into project memory.
+
+#### 6.1 Rules
+
+- **Plan first.** The lead plans before it delegates. `team_dispatch` requires
+  a `plan_id` and a 1-based `step`, and refuses an unknown plan, a closed plan,
+  a missing step, or a step that is already done. The lead's head tells it to
+  plan all work first, but the lead's own small direct edits are not gated.
+- **Many plans.** The lead creates any number of plans; each is open until it
+  closes. No plan is "active", and no workflow state locks the lead's tools.
+- **Workers get the plan.** TeamManager builds every brief from the plan file:
+  the plan's title, goal, kind, bug symptom, and context, the full text of the
+  assigned step, a step list for orientation, and the line "You are working on
+  step N of plan <title> (<id>); other steps are handled separately". The
+  lead's brief adds only the task-specific instructions. Several tasks may work
+  on one step.
+- **Steps tick on merge.** A step is checked off in the plan file once at least
+  one of its tasks merged and none is still open. Reverting the last merged
+  task for a step unticks it. A step with no worker task (lead-only work) is
+  ticked by the lead with `plan_step_done`, which is refused while that step
+  has open tasks.
+- **Outcomes are recorded.** Each tick appends one outcome line to the plan's
+  `## Progress` section: step, worker, model, merge commit, and the review
+  summary. The lead records decisions with `plan_update`, which appends dated
+  entries to `## Decisions` and may edit context and add steps. Neither edit
+  rewrites what is already recorded.
+- **Plans close on their own.** When every step is done, no task stamped with
+  the plan is open, and no finding is open, TeamManager closes the plan:
+  1. writes the team review report (`## Verdict: PASS`) to `.coding/reviews/`;
+  2. runs the plan-kind gates (a `bug_fixing` plan needs a recorded regression
+     test that resolves in the code graph);
+  3. captures the PLAN digest (and BUG digest) into project memory;
+  4. marks the plan closed and sends the lead a notice.
+
+  If a gate fails, the plan stays open and the notice says what is missing.
+  `plan_abandon` closes a plan without review and records why.
+- **Board state.** Each plan file carries its own steps, progress, and
+  decisions. `.coding/plans/board.json` lists the board plans with
+  open/closed/abandoned status and the closing report path. The task ↔ step link
+  stays on the worker records in `team.json`.
+
+#### 6.2 Engine
+
+- `src/app/plan_board.rs`: `PlanBoard` over the plans and reviews directories
+  plus optional memory, knowledge, and code-graph handles. It creates, reads,
+  lists, updates, ticks, unticks, closes, and abandons plans, reusing the plan-file
+  parser/serializer and the `finish` capture helpers.
+- TeamLead mode no longer wraps the Mnemo1 workflow state. The lead's tool
+  surface is free, and the classic plan tools (`create_plan`, `update_plan`,
+  `complete_step`, `finish`, `abandon_plan`) are hidden. The board tools
+  replace them: `plan_create`, `plan_update`, `plan_show`, `plan_list`,
+  `plan_step_done`, `plan_abandon`. The volatile tail lists the open plans with
+  their progress. Turn end always stops: worker notices and the user drive the
+  lead.
+- Removed: the Planning/Complete team-tool gate, the `complete_step` gate, and
+  the ledger-backed `finish` path. Mnemo1's Classic workflow is unchanged.
+
+#### 6.3 Host and UI
+
+- `team_dispatch` takes `plan_id` and `step`, validates them on the board,
+  composes the brief, and stamps the worker. A merge ticks the step and tries
+  to close the plan; a revert unticks the step. Ticks, closes, and blocked
+  closes reach the lead as TeamManager notices.
+- The workbench Plan tab shows the board: every open plan with its steps, done
+  state, and the workers on each step, plus recently closed plans. Worker rows
+  and thread headers show their plan and step.
+
+#### 6.4 Landed decisions and verification
+
+- **Plan quality.** `plan_create` applies `create_plan`'s resumability checks:
+  context of at least 40 characters, a file path in every step, and a
+  regression-test design in a `bug_fixing` plan's context. The schema asks for
+  the why, the constraints, and the key decisions.
+- **Hidden tools.** Besides the classic plan tools, the lead's `current_plan`
+  is hidden; it only read the old single plan.
+- **Dispatch.** The lead's `team_dispatch` requires `plan_id` and `step` and
+  validates them before any record, branch, or worktree exists. The worker's
+  first message is the board header, `---`, then the lead's brief. The record
+  keeps the lead's brief separately (`opening_prompt` holds the composed text),
+  so idempotency compares the lead's brief, model, effort, and plan step.
+  The Control Room's manual dispatch goes through the same plan-checked path
+  (`TeamRuntime::dispatch_on_plan`): plan and undone-step pickers, defaulting to
+  the first open plan's first undone step. With no open plan it shows "No open
+  plan — ask the lead to plan the work first." Plan-free dispatch exists only
+  in tests.
+- **Ticks.** A step ticks when at least one non-reverted merged task exists and
+  none is open (Stopped counts as closed). Revert unticks a step only when no
+  other merged task remains. The tick, close, and revert hooks live in
+  `TeamRuntime::merge`/`revert_merge`, so the tool and the GUI share them.
+  Board errors never fail a merge; they reach the lead as a notice.
+- **Lead bookkeeping.** The clean-lead check ignores `.coding/plans/`,
+  `.coding/knowledge/`, and `.coding/reviews/`, so closing reports do not block
+  the next merge.
+- **Plan-file format.** `## Decisions` and `## Progress` are additive sections;
+  old plan files parse and serialize byte-identically. Mnemo1 can open a board
+  plan when it has no plan stack of its own.
+- **Verification.** `cargo test --workspace`: 3555 passed, 0 failed.
+  `cargo test -p mnemo-app --features mnemo2 --lib mnemo2`: 93 passed. The
+  `mnemo2` binary builds. `npm --prefix mnemo2 test`: 176 passed; `check`: 0
+  errors and 0 warnings; `build`: passed. No live-provider run has driven a
+  plan through dispatch, merge, and close yet.
+
+#### 6.5 Seam hardening (from the first live team run)
+
+A live run with two parallel steps, a game engine and its UI, broke at the seam between them: the UI used a default import of a named export. That run also showed the lead storing execution state in Context, and working out the `team_review` finding format by trial and error. The fixes:
+
+- **Interfaces.** Plans have an additive `## Interfaces` section for contracts (exports, signatures, data shapes, file ownership). It is set via `plan_create.interfaces` and `plan_update.interface`, and `brief_for` copies it into every worker brief.
+- **Contract gate.** `PlanBoard::contract_gate` refuses a dispatch whose step shares a file with another step of the same plan that is still in flight, unless the Interfaces section names that file. The check runs in `dispatch_locked`, before anything is provisioned.
+- **Integration check.** Dispatching a step while another step of the same plan is in flight appends an "Integration check" step once (`ensure_integration_step`), with a Decisions line explaining why. The plan cannot close until that step is done.
+- **Progress, not Context.** `plan_update.progress` adds a dated line to `## Progress`. Context is stable intent, because briefs carry it and never carry Progress.
+- **Status is pulled, not pushed.** `team_status` takes an optional `plan_id`. The lead's per-turn summary carries no live worker status.
+- **Milestone notices.** A worker's completed turn notifies the lead with its plan step and the next move: review, close the findings, or merge.
+- **Review format.** `team_review` publishes the full finding schema with its enums and an example. `parse_findings` maps aliases (`path`→`file`, `description`→`detail`, `blocking`→`high`), defaults `status` to `open`, and derives a stable id from the file and title. It reports every problem in one error, with `findings[i].field` paths and the allowed values.
+- **Plan-scoped memory.** A memory that names a plan id (adjacent to the word "plan") or a branch is filed Episodic, not Semantic, and tagged in `Memory.data`. When the plan closes, `memory::plan_scope::settle_plan_memories` quarantines that plan's notes and appends them to the closing report, and the lead is told to re-store their durable facts without plan or branch references.
 
 ## 12. References
 

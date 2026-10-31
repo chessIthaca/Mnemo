@@ -169,6 +169,63 @@ describe("lead event reducer", () => {
     });
   });
 
+  it("never pins an old question's text onto a different pending question", () => {
+    const pending = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "user_question",
+          question_id: "q-1",
+          question: "Which branch?",
+          options: [{ label: "main" }],
+        },
+      },
+    });
+    const merged = applyLeadSnapshot(pending, {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: { kind: "question", question_id: "q-2", question: "Which model for the UI worker?" },
+      busy: true,
+    });
+    expect(merged.leadRuntime.pending).toEqual({
+      kind: "question",
+      question_id: "q-2",
+      question: "Which model for the UI worker?",
+    });
+  });
+
+  it("shows the question a snapshot carries when the live event was missed", () => {
+    const restored = applyLeadSnapshot(nativeState(3), {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: {
+        kind: "question",
+        question_id: "q-9",
+        question: "Ship it?",
+        options: [{ label: "yes" }, { label: "no" }],
+      },
+      busy: true,
+    });
+    expect(restored.leadRuntime.pending).toMatchObject({
+      question_id: "q-9",
+      question: "Ship it?",
+      options: [{ label: "yes" }, { label: "no" }],
+    });
+  });
+
   it("restores the transcript and configured model from a snapshot", () => {
     const snapshot: LeadSnapshot = {
       generation: 7,

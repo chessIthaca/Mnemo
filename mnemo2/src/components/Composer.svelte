@@ -5,6 +5,7 @@
   import { fileToAttachedDataUrl } from "../../../frontend/src/lib/attachImages";
   import { actions, app } from "../lib/store";
   import type { LeadAnswerInput } from "../lib/types";
+  import IndexingStatus from "./IndexingStatus.svelte";
   import LeadModelPicker from "./LeadModelPicker.svelte";
 
   let stopping = $state(false);
@@ -54,6 +55,10 @@
   const freeformMode = $derived(
     pendingQuestion !== null &&
       freeformQuestionId === pendingQuestion.question_id,
+  );
+  /** The open `ask_user` question this box answers, if any. */
+  const questionId = $derived(
+    $app.leadRuntime.pending?.kind === "question" ? $app.leadRuntime.pending.question_id ?? null : null,
   );
 
   $effect(() => {
@@ -287,6 +292,7 @@
       {#if attaching}<span>Attaching image</span>{/if}
       {#if freeformMode}<span>Freeform answer — Enter to send, Esc to cancel</span>{/if}
       {#if submitting}<span>Sending</span>{/if}
+      <IndexingStatus />
     </div>
   </div>
 </form>
@@ -374,6 +380,6 @@
   .stop-button:hover { border-color: var(--line-strong); background: var(--line); }
   .stop-button:disabled { cursor: wait; }
   .composer-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 14px; padding: 8px 4px 0; }
-  .composer-status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 8px; font-weight: 600; letter-spacing: 0.04em; }
+  .composer-status { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 8px; font-weight: 600; letter-spacing: 0.04em; }
   @media (max-width: 560px) { .composer { width: 100%; } }
 </style>

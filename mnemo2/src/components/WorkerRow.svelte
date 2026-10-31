@@ -1,6 +1,8 @@
 <script lang="ts">
   import { AlertCircle, ChevronRight } from "@lucide/svelte";
-  import { workerStatusLabel, type Worker } from "../lib/types";
+  import { workerPlanLabel } from "../lib/boardState";
+  import { app } from "../lib/store";
+  import { workerStatusText, type Worker } from "../lib/types";
   import ModelBadge from "./ModelBadge.svelte";
 
   let {
@@ -14,6 +16,8 @@
     compact?: boolean;
     onSelect: (workerId: string) => void;
   } = $props();
+
+  const planLabel = $derived(workerPlanLabel($app.board, worker));
 </script>
 
 <button
@@ -28,11 +32,12 @@
   <span class="avatar" style="--hue: {worker.hue}">{worker.initials}</span>
   <span class="worker-copy">
     <span class="worker-name"><strong>{worker.name}</strong>{#if worker.needsYou}<AlertCircle size={11} />{/if}{#if worker.kind === "audit"}<span class="row-badge" data-kind="audit">Audit</span>{/if}{#if worker.reviewRisk === "high"}<span class="row-badge" data-risk="high">High risk</span>{/if}<ModelBadge model={worker.model} /></span>
+    {#if planLabel}<span class="worker-plan">{planLabel}</span>{/if}
     <span class="worker-task">{worker.task}</span>
     {#if !compact}<span class="worker-progress"><span style={`width: ${worker.progress}%`}></span></span>{/if}
   </span>
   <span class="worker-meta">
-    <span class="status-label" data-status={worker.status}>{workerStatusLabel[worker.status]}</span>
+    <span class="status-label" data-status={worker.status}>{workerStatusText(worker)}</span>
     <small>{#if worker.cost != null}${worker.cost.toFixed(2)}{:else}{worker.tokens} tokens{/if} · {worker.elapsed || "—"}</small>
   </span>
   <ChevronRight class="row-chevron" size={13} />
@@ -52,10 +57,7 @@
   .row-badge { flex: 0 0 auto; padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: 7px; font-weight: 650; }
   .row-badge[data-kind="audit"] { background: var(--accent-soft); color: var(--accent-strong); }
   .row-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
-  .worker-task { display: block; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-  .worker-progress { display: block; height: 2px; margin-top: 7px; overflow: hidden; border-radius: 2px; background: var(--line); }
-  .worker-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
-  .worker-meta { flex: 0 0 auto; text-align: right; }
+  .worker-plan { display: block; margin-top: 2px; overflow: hidden; color: var(--accent-strong); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
   .worker-meta small { display: block; margin-top: 4px; color: var(--muted); font-size: 7px; white-space: nowrap; }
   .status-label { display: inline-flex; padding: 3px 6px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: 7px; font-weight: 650; white-space: nowrap; }
   .status-label[data-status="in_review"], .status-label[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }

@@ -90,6 +90,7 @@ export interface TeamWorkerRecord {
   brief: string;
   model: string | null;
   model_id: string | null;
+  reasoning_effort?: string | null;
   branch: string;
   worktree: string;
   status: TeamWorkerStatus;
@@ -114,6 +115,11 @@ export interface TeamWorkerRecord {
   findings: TeamFinding[];
   review: TeamReviewRecord | null;
   fixer_finding_id: string | null;
+  /** The board plan this task belongs to, and its 0-based step. */
+  plan_id?: string | null;
+  plan_step?: number | null;
+  /** The model tier the lead dispatched by, when it used one. */
+  tier?: string | null;
   merge: TeamMergeRecord | null;
   error: string | null;
   /** Serde-defaulted on the host: absent means an implementation worker. */
@@ -140,6 +146,30 @@ export interface ProjectUsageView {
   output_tokens: number;
   cost_micros: number;
   unpriced_models: string[];
+}
+
+/** What deleting one worker removes (`team_delete_preview`). */
+export interface WorkerDeletionPreview {
+  worker_id: string;
+  name: string;
+  branch: string;
+  /** The session is live; deleting stops it first. */
+  live: boolean;
+  /** The checkout still exists and will be removed. */
+  checkout: boolean;
+  /** That checkout has uncommitted changes. */
+  uncommitted: boolean;
+  /** Commits on the branch that the lead branch does not contain. */
+  unmerged_commits: number;
+  /** Another record uses the same branch, so it is kept. */
+  shared_branch: boolean;
+  /** Why this worker cannot be deleted now. */
+  blocked: string | null;
+}
+
+/** Whether deleting this worker discards work the lead branch lacks. */
+export function deletionDiscardsWork(preview: WorkerDeletionPreview): boolean {
+  return preview.uncommitted || preview.unmerged_commits > 0;
 }
 
 export interface TeamSnapshot {
@@ -367,10 +397,29 @@ export function findingToWire(finding: Finding): TeamFinding {
   };
 }
 
+/**
+ * Whether a worker's pending interaction actually waits on a person. A
+ * worker's host-tool call (`message_parent`) is answered by the runtime
+ * itself, so it is progress, never a reason to ask for attention.
+ */
+export function waitsOnUser(pending: LeadPendingInteraction | null | undefined): boolean {
+  return pending != null && pending.kind !== "host_tool_call";
+}
+
+/**
+ * A worker's display name. The lead names its workers by id (`ghostai0001`);
+ * records saved before that stored "Worker <first 8 chars>", which cut such a
+ * name short. Only a generated id (20 hex digits) keeps the short form.
+ */
+export function workerDisplayName(id: string, name: string): string {
+  const generated = /^[0-9a-f]{20}$/.test(id);
+  return !generated && name === `Worker ${id.slice(0, 8)}` ? id : name;
+}
+
 function toView(record: TeamWorkerRecord): TeamWorkerView {
   return {
     id: record.id,
-    name: record.name,
+    name: workerDisplayName(record.id, record.name),
     brief: record.brief,
     model: record.model,
     modelId: record.model_id,
@@ -391,7 +440,7 @@ function toView(record: TeamWorkerRecord): TeamWorkerView {
     elapsedMs: record.elapsed_ms,
     turns: record.turns,
     lastActivityMs: record.last_activity_ms,
-    needsYou: record.status === "needs_you" || record.pending != null,
+    needsYou: record.status === "needs_you" || waitsOnUser(record.pending),
     pending: record.pending,
     checks: record.checks,
     findings: record.findings.map(findingFromWire),
@@ -481,7 +530,6 @@ export function applyTeamEvent(state: TeamViewState, event: TeamEvent): TeamView
       break;
     case "approval_request":
     case "user_question":
-    case "host_tool_call":
       next.status = "needs_you";
       next.needsYou = true;
       break;

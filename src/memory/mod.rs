@@ -19,6 +19,7 @@ pub mod indexer;
 pub mod knowledge;
 pub mod maintenance;
 pub mod plan_format;
+pub mod plan_scope;
 pub mod schema;
 pub mod strength;
 pub mod types;

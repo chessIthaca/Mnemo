@@ -1278,7 +1278,223 @@ async fn host_tool_round_trip_and_timeout_row_31() {
         tool_msg.contains("timed out after 150 ms"),
         "the model sees the abandoned-call error: {tool_msg}"
     );
-}/// Row 32 (G6 tier 3, §5.9.6): the external policy's three legs, one
+}
+
+/// A provider that holds the request open until released — the window
+/// between the turn pushing its request scaffolding and the first byte.
+struct HeldLlm {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    caps: Capabilities,
+}
+
+#[async_trait]
+impl LlmClient for HeldLlm {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "held"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<ToolChoice>,
+    ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(Box::pin(futures::stream::iter(g5_text_turn(&["done"]))))
+    }
+}
+
+fn is_scaffolding(message: &Message) -> bool {
+    let text = message.content.as_text();
+    text == mnemo::agent::prompt::CONTEXT_FOOTER || text.contains("# WORKFLOW STATE")
+}
+
+/// Regression: a snapshot taken while a provider request was in flight
+/// returned the turn's transient volatile tail + CONTEXT_FOOTER; Mnemo2
+/// saved that export (worker stop, model switch), so the scaffolding became
+/// permanent history — shown as lead messages and resumed into the model's
+/// context. The export now excludes it, and resume strips any that leaked.
+#[tokio::test]
+async fn request_scaffolding_never_reaches_exports_or_resumed_history() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    let llm = std::sync::Arc::new(HeldLlm {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        caps: Capabilities::openai(),
+    });
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm.clone())
+    .start()
+    .await
+    .expect("engine starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let mut rx = session.events();
+    session
+        .send(SessionCommand::Prompt {
+            text: "hello".into(),
+            images: Vec::new(),
+        })
+        .await
+        .expect("prompt");
+    tokio::time::timeout(std::time::Duration::from_secs(5), llm.entered.notified())
+        .await
+        .expect("the request is in flight");
+    let mid_request = session.snapshot().await.expect("mid-request snapshot");
+    assert!(
+        mid_request
+            .transcript
+            .messages
+            .iter()
+            .any(|message| message.content.as_text() == "hello"),
+        "the export still carries the conversation: {:?}",
+        mid_request.transcript.messages
+    );
+    assert!(
+        !mid_request.transcript.messages.iter().any(|message| {
+            message.content.as_text() == mnemo::agent::prompt::CONTEXT_FOOTER
+        }),
+        "the in-flight request scaffolding leaked into the export: {:?}",
+        mid_request.transcript.messages
+    );
+    llm.release.notify_one();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the turn finishes")
+            .expect("event");
+        if matches!(event.event, SerializableAgentEvent::Finished { .. }) {
+            break;
+        }
+    }
+
+    // A transcript saved by an older build, scaffolding included, resumes
+    // without it.
+    let leaked = Transcript {
+        messages: vec![
+            Message::user_text("first task"),
+            Message::assistant_text("first answer"),
+            Message::user_text("# WORKFLOW STATE\n\nCurrent state: Executing"),
+            Message::user_text(mnemo::agent::prompt::CONTEXT_FOOTER),
+            Message::user_text("second task"),
+        ],
+    };
+    let resumed = engine
+        .spawn(SpawnOptions {
+            resume: Some(leaked),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("resume");
+    let history = resumed.history().await.expect("history");
+    assert!(!history.messages.iter().any(is_scaffolding), "{:?}", history.messages);
+    let texts: Vec<String> = history.messages.iter().map(|m| m.content.as_text()).collect();
+    assert!(texts.contains(&"first answer".to_string()) && texts.contains(&"second task".to_string()), "{texts:?}");
+    engine.shutdown().await.expect("engine shuts down");
+}
+
+/// Two sessions on ONE engine (Mnemo2's lead + workers): the shared bus
+/// delivers session A's events to session B's subscription too, so
+/// `SessionEvent::is_from` must tell them apart, and B's snapshot must
+/// never report A's pending interaction. Regression: a worker's
+/// `message_parent` call was answered by the lead's handler (and the
+/// lead's `team_dispatch` by a worker's), and the lead's snapshot showed
+/// a worker's id-only pending as its own "waiting for you" banner.
+#[tokio::test]
+async fn shared_engine_scopes_events_and_pending_per_session() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    let llm = RecordingLlm::new(vec![
+        g5_tool_turn("get_weather", r#"{"city": "Oslo"}"#),
+        g5_text_turn(&["sunny"]),
+    ]);
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm.clone())
+    .start()
+    .await
+    .expect("engine starts");
+    let weather = HostToolSpec {
+        name: "get_weather".into(),
+        description: "Get the current weather for a city".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        }),
+        safety: SafetyLevel::AutoRun,
+        timeout_ms: None,
+    };
+    let caller = engine
+        .spawn(SpawnOptions {
+            host_tools: vec![weather.clone()],
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn the calling session");
+    let bystander = engine
+        .spawn(SpawnOptions {
+            host_tools: vec![weather],
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn the idle session");
+    // The bystander's subscription is the one that used to cross-route.
+    let mut rx = bystander.events();
+    let answer = async {
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("events keep flowing")
+                .expect("event arrives");
+            if let SerializableAgentEvent::HostToolCall { call_id, .. } = &ev.event {
+                assert!(ev.is_from(caller.id()), "the call is tagged with its session");
+                assert!(
+                    !ev.is_from(bystander.id()),
+                    "another session's call is not the bystander's"
+                );
+                let theirs = bystander.snapshot().await.expect("bystander snapshot").pending;
+                assert!(
+                    theirs.is_none(),
+                    "a sibling's pending call never shows as the bystander's: {theirs:?}"
+                );
+                let ours = caller.snapshot().await.expect("caller snapshot").pending;
+                assert!(
+                    matches!(&ours, Some(PendingInteraction::HostToolCall { call_id: id }) if id == call_id),
+                    "the caller still reports its own pending call: {ours:?}"
+                );
+                caller
+                    .send(SessionCommand::HostToolResult {
+                        call_id: call_id.clone(),
+                        result: Some(ToolResult::success("sunny".to_string())),
+                        error: None,
+                    })
+                    .await
+                    .expect("the caller resolves its own call");
+                return;
+            }
+        }
+    };
+    let (outcome, ()) = tokio::join!(caller.run_to_completion("weather in Oslo?"), answer);
+    assert_eq!(outcome.expect("turn completes").final_text, "sunny");
+    engine.shutdown().await.expect("engine shuts down");
+}
+
+/// Row 32 (G6 tier 3, §5.9.6): the external policy's three legs, one
 /// engine, a fresh session each. (a) A selected ToolGate answered with
 /// Deny vetoes the call BEFORE the host-tool branch — the model sees
 /// the deny message as the call's result (no `HostToolCall` ever

@@ -34,6 +34,8 @@ flate2 = "1"
 # uv release-asset digest verification (ipc/laya.rs verify_sha256) — same
 # version the mnemo lib pins for oauth PKCE, so the crate unifies.
 sha2 = "0.11"
+# The per-machine owner id that stamps project state folders (mnemo2).
+uuid = { version = "1", features = ["v4"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

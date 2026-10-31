@@ -64,6 +64,7 @@ function makeTeam(initial: ProjectUsageView) {
     interrupt: vi.fn(),
     stop: vi.fn(),
     resume: vi.fn(),
+    setModel: vi.fn(),
     compact: vi.fn(),
     review: vi.fn(),
     recordCheck: vi.fn(),
@@ -74,6 +75,13 @@ function makeTeam(initial: ProjectUsageView) {
     revertMerge: vi.fn(),
     stopAll: vi.fn(),
     setSlots: vi.fn(async (): Promise<TeamSnapshot> => ({
+      workers: [],
+      slots: 2,
+      active: 0,
+      usage,
+    })),
+    deletePreview: vi.fn(async () => []),
+    deleteWorkers: vi.fn(async (): Promise<TeamSnapshot> => ({
       workers: [],
       slots: 2,
       active: 0,

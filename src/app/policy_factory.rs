@@ -17,8 +17,12 @@ use crate::agent::policy::{
     AgentPolicyFactory, KernelError, PolicyBuildCtx, PolicyBuildResult, PolicyFactoryCtx,
 };
 use crate::app::backlog::BacklogStore;
+use crate::app::plan_board::PlanBoard;
 use crate::app::tool::workflow::ask_user::AskUserTool;
 use crate::app::tool::workflow::backlog::{BacklogAddTool, BacklogListTool, BacklogStatusTool};
+use crate::app::tool::workflow::board::{
+    PlanAbandonTool, PlanCreateTool, PlanListTool, PlanShowTool, PlanStepDoneTool, PlanUpdateTool,
+};
 use crate::app::tool::workflow::plan::{
     AbandonPlanTool, CompleteStepTool, CreatePlanTool, CurrentPlanTool, FinishTool, UpdatePlanTool,
 };
@@ -26,7 +30,7 @@ use crate::app::tool::workflow::skill::{
     AbandonSkillTool, SkillCreateTool, SkillEndTool, SkillReloadTool, SkillStartTool,
 };
 use crate::app::workflow::Workflow;
-use crate::app::workflow_policy::WorkflowPolicy;
+use crate::app::workflow_policy::{WorkflowPolicy, TEAM_HIDDEN_TOOLS};
 use crate::tool::ToolRegistry;
 
 /// The shared backlog wiring handed to every `backlog_add` tool: the store
@@ -54,6 +58,17 @@ pub struct WorkflowPolicyFactory {
     skills: Option<Arc<crate::app::skill::SkillLibrary>>,
     /// Tools the lead must refuse outright (Mnemo2 blocks `spawn_agent`).
     blocked_tools: Vec<String>,
+    /// The Mnemo2 TeamLead wiring (`with_team_lead`); `None` = Classic.
+    team_lead: Option<TeamLeadWiring>,
+}
+
+/// The TeamLead mode's host wiring (`.coding/design/mnemo2.md` Phase 6).
+#[derive(Clone)]
+pub struct TeamLeadWiring {
+    /// The lead's read-only view of its team.
+    pub ledger: Arc<dyn crate::app::team_ledger::TeamLedger>,
+    /// The plans the lead runs in parallel.
+    pub board: Arc<PlanBoard>,
 }
 
 impl WorkflowPolicyFactory {
@@ -72,12 +87,28 @@ impl WorkflowPolicyFactory {
             reviews_dir,
             skills,
             blocked_tools: Vec::new(),
+            team_lead: None,
         }
     }
 
     /// Add outright tool vetoes for every policy this factory builds.
     pub fn with_blocked_tools(mut self, blocked: Vec<String>) -> Self {
         self.blocked_tools = blocked;
+        self
+    }
+
+    /// Build every policy in the Mnemo2 TeamLead mode: a free tool surface,
+    /// the plan-board tools instead of the classic plan tools and
+    /// `spawn_agent` (both unregistered and refused), the board head text,
+    /// and turn-end Stop.
+    pub fn with_team_lead(
+        mut self,
+        ledger: Arc<dyn crate::app::team_ledger::TeamLedger>,
+        board: Arc<PlanBoard>,
+    ) -> Self {
+        self.blocked_tools
+            .extend(TEAM_HIDDEN_TOOLS.iter().map(|name| name.to_string()));
+        self.team_lead = Some(TeamLeadWiring { ledger, board });
         self
     }
 
@@ -176,8 +207,11 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         // The concrete policy stays app-side; the tail attach rides the
         // returned closure (the 2a.6 loop back-ref — idempotent OnceLock,
         // the first attach wins).
-        let policy =
-            Arc::new(WorkflowPolicy::new(workflow).with_blocked_tools(self.blocked_tools.clone()));
+        let mut policy = WorkflowPolicy::new(workflow).with_blocked_tools(self.blocked_tools.clone());
+        if let Some(wiring) = &self.team_lead {
+            policy = policy.with_team_lead(wiring.clone());
+        }
+        let policy = Arc::new(policy);
         let concrete: Arc<WorkflowPolicy> = Arc::clone(&policy);
         Ok(PolicyBuildResult {
             policy,
@@ -261,6 +295,20 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
             workflow.clone(),
             ctx.plans_dir.clone(),
         )));
+        // The Mnemo2 lead's plan board (the classic plan tools above are
+        // unregistered for it in `finalize_tools`).
+        if let Some(wiring) = &self.team_lead {
+            let board = &wiring.board;
+            registry.register(Box::new(PlanCreateTool::new(Arc::clone(board))));
+            registry.register(Box::new(PlanUpdateTool::new(Arc::clone(board))));
+            registry.register(Box::new(PlanShowTool::new(Arc::clone(board))));
+            registry.register(Box::new(PlanListTool::new(Arc::clone(board))));
+            registry.register(Box::new(PlanStepDoneTool::new(
+                Arc::clone(board),
+                Arc::clone(&wiring.ledger),
+            )));
+            registry.register(Box::new(PlanAbandonTool::new(Arc::clone(board))));
+        }
         // ask_user is always available (not gated by ToolFilter — like memory
         // tools) so the agent can ask a question in any workflow state. The
         // pause is driven from dispatch, not the tool's execute().

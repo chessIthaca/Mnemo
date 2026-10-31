@@ -24,4 +24,4 @@ pub mod git_ops;
 pub mod scaffold;
 pub mod skills_seed;
 
-pub use agent_md::{Constitution, ConstitutionSource};
+pub use agent_md::{Constitution, ConstitutionScope, ConstitutionSource};

@@ -4,6 +4,7 @@ import type { TeamTransport } from "./teamEngine";
 import {
   emptyProjectUsageView,
   findingFromWire,
+  type TeamEvent,
   type TeamFinding,
   type TeamMergeRecord,
   type TeamWorkerRecord,
@@ -112,14 +113,21 @@ function nativeWorker(overrides: Partial<TeamWorkerRecord> = {}): TeamWorkerReco
 
 function makeTransport(initial: TeamWorkerRecord) {
   let current = initial;
+  let deleted = false;
   const transport: TeamTransport = {
-    snapshot: vi.fn(async () => ({ workers: [current], slots: 3, active: 1, usage: emptyProjectUsageView() })),
+    snapshot: vi.fn(async () => ({
+      workers: deleted ? [] : [current],
+      slots: 3,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    })),
     dispatch: vi.fn(async () => current),
     message: vi.fn(async () => current),
     pause: vi.fn(async () => current),
     interrupt: vi.fn(async () => current),
     stop: vi.fn(async () => current),
     resume: vi.fn(async () => current),
+    setModel: vi.fn(async () => current),
     review: vi.fn(async () => current),
     recordCheck: vi.fn(async () => current),
     resolveFinding: vi.fn(async () => current),
@@ -138,6 +146,21 @@ function makeTransport(initial: TeamWorkerRecord) {
     }),
     stopAll: vi.fn(async () => {}),
     setSlots: vi.fn(async () => ({ workers: [current], slots: 3, active: 1, usage: emptyProjectUsageView() })),
+    deletePreview: vi.fn(async (ids: string[]) => ids.map((id) => ({
+      worker_id: id,
+      name: current.name,
+      branch: current.branch,
+      live: false,
+      checkout: true,
+      uncommitted: false,
+      unmerged_commits: 2,
+      shared_branch: false,
+      blocked: null,
+    }))),
+    deleteWorkers: vi.fn(async () => {
+      deleted = true;
+      return { workers: [], slots: 3, active: 0, usage: emptyProjectUsageView() };
+    }),
     compact: vi.fn(async () => current),
     messages: vi.fn(async () => []),
     onEvent: vi.fn(async () => () => {}),
@@ -175,7 +198,7 @@ describe("native Phase 3 store integration", () => {
       review: { tip: "tip-1" },
     });
     expect(ana.findings[0].id).toBe("F-1");
-    expect(ana.messages.map((message) => message.body)).toEqual([
+    expect(ana.messages.map((message) => (message.kind === "tool" ? message.toolName : message.body))).toEqual([
       "Implement the real task",
       "Implemented",
     ]);
@@ -205,6 +228,90 @@ describe("native Phase 3 store integration", () => {
 
     await actions.stopAll();
     expect(transport.stopAll).toHaveBeenCalled();
+  });
+
+  it("streams a working worker's Markdown and tools live, then shows the saved turn", async () => {
+    const working = { ...nativeWorker(), status: "working" };
+    const transport = makeTransport(working);
+    let emit: (event: TeamEvent) => void = () => {};
+    transport.onEvent = vi.fn(async (handler: (event: TeamEvent) => void) => {
+      emit = handler;
+      return () => {};
+    });
+    await openNativeTeam(transport);
+    const saved = get(app).workers[0].messages.length;
+    const send = (kind: string, extra: Record<string, unknown> = {}) =>
+      emit({ worker_id: "ana", generation: 1, event: { agent: 4, event: { kind, ...extra } } });
+
+    const fetches = vi.mocked(transport.snapshot).mock.calls.length;
+    send("text_delta", { text: "## Progress\n\nParser **done**" });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Streaming text alone never refetches the whole team ledger.
+    expect(transport.snapshot).toHaveBeenCalledTimes(fetches);
+    send("tool_call_start", { index: 0, id: "live-call", name: "shell" });
+    send("tool_result", { tool_call_id: "live-call", result: { success: true, output: "3 passing" } });
+    const live = get(app).workers[0].messages;
+    expect(live).toHaveLength(saved + 2);
+    expect(live[saved]).toMatchObject({ from: "worker", body: "## Progress\n\nParser **done**" });
+    expect(live[saved + 1]).toMatchObject({ kind: "tool", toolName: "shell", result: { success: true } });
+
+    // The turn ends and its transcript is saved: the live tail gives way.
+    transport.snapshot = vi.fn(async () => ({
+      workers: [{
+        ...working,
+        status: "completed",
+        transcript: {
+          messages: [
+            ...working.transcript.messages,
+            { role: "assistant", content: "## Progress\n\nParser **done**" },
+          ],
+        },
+      }],
+      slots: 3,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    }));
+    send("finished");
+    await vi.waitFor(() => expect(get(app).workers[0].status).toBe("completed"));
+    const final = get(app).workers[0].messages;
+    expect(final.filter((entry) => entry.kind !== "tool" && entry.body === "## Progress\n\nParser **done**")).toHaveLength(1);
+    expect(final.some((entry) => entry.kind === "tool" && entry.toolCallId === "live-call")).toBe(false);
+  });
+
+  it("previews a worker deletion, then deletes only on confirmation", async () => {
+    const transport = makeTransport(nativeWorker());
+    await openNativeTeam(transport);
+    actions.selectWorker("ana");
+
+    await actions.requestDeleteWorkers(["ana"]);
+    expect(transport.deletePreview).toHaveBeenCalledWith(["ana"]);
+    expect(get(app).workerDeletion?.previews[0]).toMatchObject({ worker_id: "ana", unmerged_commits: 2 });
+    expect(transport.deleteWorkers).not.toHaveBeenCalled();
+
+    await actions.confirmDeleteWorkers();
+    // The preview showed unmerged commits, so the confirmed delete discards them.
+    expect(transport.deleteWorkers).toHaveBeenCalledWith(["ana"], true);
+    expect(get(app).workerDeletion).toBeNull();
+    expect(get(app).workers).toHaveLength(0);
+    expect(get(app).selectedWorkerId).toBeNull();
+  });
+
+  it("offers only finished workers for bulk deletion", async () => {
+    const active = makeTransport(nativeWorker());
+    await openNativeTeam(active);
+    await actions.requestDeleteOldWorkers();
+    expect(active.deletePreview).not.toHaveBeenCalled();
+    expect(get(app).workerDeletion).toBeNull();
+    actions.closeProject();
+
+    app.set(fixtureState());
+    const stopped = makeTransport({ ...nativeWorker(), status: "stopped" });
+    await openNativeTeam(stopped);
+    await actions.requestDeleteOldWorkers();
+    expect(stopped.deletePreview).toHaveBeenCalledWith(["ana"]);
+    actions.cancelDeleteWorkers();
+    expect(get(app).workerDeletion).toBeNull();
+    expect(stopped.deleteWorkers).not.toHaveBeenCalled();
   });
 
   it("routes every finding and check operation through the real transport", async () => {

@@ -1,12 +1,14 @@
 <script lang="ts">
   import { app } from "./lib/store";
   import ControlRoom from "./components/ControlRoom.svelte";
+  import FirstIndexOverlay from "./components/FirstIndexOverlay.svelte";
   import LeadChat from "./components/LeadChat.svelte";
   import StartScreen from "./components/StartScreen.svelte";
   import TeamPeek from "./components/TeamPeek.svelte";
   import Toast from "./components/Toast.svelte";
   import TopBar from "./components/TopBar.svelte";
   import Workbench from "./components/Workbench.svelte";
+  import WorkerDeleteSheet from "./components/WorkerDeleteSheet.svelte";
 </script>
 
 <svelte:head>
@@ -29,6 +31,8 @@
       {/if}
     </div>
     {#if $app.teamPeekOpen && $app.route === "lead"}<TeamPeek />{/if}
+    <WorkerDeleteSheet />
+    <FirstIndexOverlay />
   </div>
 {/if}
 <Toast />

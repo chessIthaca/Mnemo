@@ -287,10 +287,8 @@ impl Engine {
             .and_then(|g| g.limits.clone())
             .or(opts.limits);
         let name = opts.name.unwrap_or_else(|| "session".to_string());
-        let model = match opts.model.as_deref() {
-            Some(spec) => Some(parse_model_ref(spec).map_err(EngineError::spawn_failed)?),
-            None => None,
-        };
+        let model = forced_model_ref(opts.model.as_deref(), opts.reasoning_effort)
+            .map_err(EngineError::spawn_failed)?;
         let permission = opts
             .permissions
             .unwrap_or_else(|| self.default_permissions.clone());
@@ -348,15 +346,23 @@ impl Engine {
             SessionOptions {
                 model,
                 role: None, // no role
-                // own plans dir (a parentless session agent)
-                own_plans_dir: true,
+                // own plans dir (a parentless session agent) unless the host
+                // opted into the project's shared plans dir
+                own_plans_dir: !self
+                    .inner
+                    .shared_plans
+                    .load(std::sync::atomic::Ordering::SeqCst),
                 // 3c: a worktree-bound session gets its own sandbox, root,
                 // plans dir, and graph (Mnemo2 workers / run-all agents).
                 worktree,
                 permission: Some(permission),
                 // 3a.6 (G5): the resume seed — the transcript's messages
                 // become the initial conversation (§5.9.5 :693-695).
-                initial_messages: opts.resume.map(|transcript| transcript.messages),
+                // Scaffolding an older export leaked into the saved
+                // transcript is dropped, never resumed as history.
+                initial_messages: opts.resume.map(|transcript| {
+                    crate::agent::prompt::strip_request_scaffolding(transcript.messages)
+                }),
                 // 3a.7 (G7, §5.9.7) + 3c/G6 tier 2: the per-session limits —
                 // the guardrails' limits override the option's.
                 limits: effective_limits,
@@ -475,6 +481,37 @@ impl Engine {
         // takeable rather than left alive with the struct (§7 row 15).
         let _ = self.bus.lock().expect("session bus lock poisoned").take();
         Ok(())
+    }
+
+    /// Let worktree-less sessions use the project's main plans dir
+    /// (`<state_dir>/plans`, the stack Mnemo1's main agent uses) instead of a
+    /// private `agents/<id>` dir, so plans survive respawns and are shared
+    /// with other hosts of the project. Affects sessions spawned afterwards;
+    /// worktree-bound sessions keep their in-checkout plans dir.
+    pub fn use_project_plans(&self) {
+        self.inner
+            .shared_plans
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The project memory store the brain wired, if memory is enabled.
+    pub fn memory_store_handle(&self) -> Option<std::sync::Arc<dyn crate::memory::MemoryStoreTrait>> {
+        self.brain.factory.memory_handle()
+    }
+
+    /// The project knowledge store (`<state_dir>/knowledge`), if wired.
+    pub fn knowledge_store_handle(&self) -> Option<std::sync::Arc<crate::memory::knowledge::KnowledgeStore>> {
+        self.brain.factory.knowledge_handle()
+    }
+
+    /// The engine's own code graph, if `index_codegraph` opened one.
+    pub fn codegraph_handle(&self) -> Option<std::sync::Arc<crate::codegraph::CodeGraph>> {
+        self.brain.factory.codegraph_handle()
+    }
+
+    /// The directory the `finish` tool writes review reports to.
+    pub fn reviews_dir(&self) -> std::path::PathBuf {
+        self.brain.factory.reviews_dir()
     }
 
     /// §5.6's memory data API — the debug/read + maintenance surface,
@@ -685,6 +722,7 @@ async fn start_inner(
         policy_registry: std::sync::Mutex::new(HashMap::new()),
         parked: Mutex::new(HashSet::new()),
         tallies: std::sync::Mutex::new(HashMap::new()),
+        shared_plans: std::sync::atomic::AtomicBool::new(false),
     });
     let pump = tokio::spawn(pump_task(fanin, bus.clone(), inner.clone()));
 
@@ -744,9 +782,44 @@ fn parse_model_ref(spec: &str) -> Result<crate::config::ModelRef, String> {
     })
 }
 
+/// The spawn's forced model with its optional reasoning effort. An effort
+/// needs a model to apply to — it is refused rather than silently dropped.
+fn forced_model_ref(
+    spec: Option<&str>,
+    reasoning_effort: Option<String>,
+) -> Result<Option<crate::config::ModelRef>, String> {
+    match (spec, reasoning_effort) {
+        (Some(spec), effort) => Ok(Some(crate::config::ModelRef {
+            reasoning_effort: effort,
+            ..parse_model_ref(spec)?
+        })),
+        (None, Some(effort)) => Err(format!(
+            "reasoning_effort '{effort}' needs an explicit model to apply to"
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::worktree_binding;
+    use super::{forced_model_ref, worktree_binding};
+
+    #[test]
+    fn forced_model_carries_the_requested_reasoning_effort() {
+        let forced = forced_model_ref(Some("Kimi/kimi-k3.1-pro"), Some("high".into()))
+            .expect("valid spec")
+            .expect("a forced model");
+        assert_eq!(forced.endpoint, "Kimi");
+        assert_eq!(forced.model, "kimi-k3.1-pro");
+        assert_eq!(forced.reasoning_effort.as_deref(), Some("high"));
+        let default_effort = forced_model_ref(Some("Kimi/kimi-k3.1-pro"), None)
+            .expect("valid spec")
+            .expect("a forced model");
+        assert_eq!(default_effort.reasoning_effort, None);
+        assert!(forced_model_ref(None, None).expect("routing").is_none());
+        let refused = forced_model_ref(None, Some("high".into())).expect_err("no model");
+        assert!(refused.contains("needs an explicit model"), "{refused}");
+    }
 
     #[test]
     fn worktree_binding_uses_the_worktree_checkout() {

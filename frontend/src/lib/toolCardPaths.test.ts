@@ -1093,6 +1093,20 @@ describe("argPathLines", () => {
     ]);
   });
 
+  it("reads the compact string specs the tool advertises", () => {
+    const args = JSON.stringify({
+      files: ["src/main.rs", "src/lib.rs:120+40", "C:\\repo\\a.rs:7-9", "notes:draft.md"],
+    });
+    expect(argPathLines(args, "read_files")).toEqual([
+      { path: "src/main.rs", line: 1 },
+      { path: "src/lib.rs", line: 120 },
+      { path: "C:\\repo\\a.rs", line: 7 },
+      { path: "notes:draft.md", line: 1 },
+    ]);
+    expect(argPaths(args, "read_files")).toEqual(["src/main.rs", "src/lib.rs", "C:\\repo\\a.rs", "notes:draft.md"]);
+    expect(argLabel(args, "read_files")).toBe("main.rs, lib.rs, a.rs +1");
+  });
+
   it("handles the single-file shorthand (top-level path + start_line)", () => {
     expect(argPathLines('{"path":"src/main.rs","start_line":42}', "read_files")).toEqual([
       { path: "src/main.rs", line: 42 },

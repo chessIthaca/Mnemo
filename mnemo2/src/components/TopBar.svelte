@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { ChevronDown, MessageSquare, PanelsTopLeft, UsersRound, Wallet } from "@lucide/svelte";
+  import { ChevronDown, MessageSquare, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
   import { actions, app, currentProject, needsYouCount } from "../lib/store";
   import { formatTokenCount, formatUsageCost, usageIsPartial, usageTotalTokens } from "../lib/usage";
   import AvatarStack from "./AvatarStack.svelte";
   import LeadModelPicker from "./LeadModelPicker.svelte";
   import Sheet from "./Sheet.svelte";
+  import SettingsDialog from "./SettingsDialog.svelte";
 
   const visibleWorkers = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing"].includes(worker.status)));
   const activeCount = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing", "merging"].includes(worker.status)).length);
@@ -17,6 +18,7 @@
   );
   let settingsOpen = $state(false);
   let usageTipOpen = $state(false);
+  let appSettingsOpen = $state(false);
 
   function handleTeam() {
     // Team always opens Mission Control directly — never the right-side peek.
@@ -59,6 +61,7 @@
         onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench("browser"))}
       ><PanelsTopLeft size={15} /></button>
     {/if}
+    <button class="icon-button" aria-label="Settings" onclick={() => (appSettingsOpen = true)}><Settings size={15} /></button>
     <div class="usage-chip">
       <button
         class="budget-chip"
@@ -103,6 +106,8 @@
     <button class="button button-primary" onclick={() => (settingsOpen = false)}>Done</button>
   </div>
 </Sheet>
+
+<SettingsDialog open={appSettingsOpen} onclose={() => (appSettingsOpen = false)} />
 
 <Sheet open={$app.closeProjectPending} title="Close project and stop the team?" eyebrow="ACTIVE SESSIONS" onclose={actions.cancelCloseProject}>
   <p class="settings-copy">The lead and any live workers will stop. Branches, worktrees, and transcripts remain available for review.</p>

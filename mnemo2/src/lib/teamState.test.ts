@@ -8,6 +8,7 @@ import {
   reviewEvidenceFrom,
   reviewEvidenceToWire,
   type TeamEvent,
+  workerDisplayName,
   type TeamWorkerRecord,
 } from "./teamState";
 
@@ -173,6 +174,28 @@ describe("teamState", () => {
     state = applyTeamEvent(state, event("finished"));
     expect(state.workers[0].needsYou).toBe(false);
     expect(state.workers[0].status).toBe("completed");
+  });
+
+  it("treats a worker's auto-answered host-tool call as progress, not needs-you", () => {
+    let state = applyTeamSnapshot({
+      workers: [worker],
+      slots: 2,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    state = applyTeamEvent(
+      state,
+      event("host_tool_call", { call_id: "c1", name: "message_parent", args: { text: "halfway" } }),
+    );
+    expect(state.workers[0].needsYou).toBe(false);
+    expect(state.workers[0].status).toBe("working");
+    const restored = applyTeamSnapshot({
+      workers: [{ ...worker, pending: { kind: "host_tool_call", call_id: "c1" } }],
+      slots: 2,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    expect(restored.workers[0].needsYou).toBe(false);
   });
 
   it("tracks compaction completion and failure without a synthetic budget pause", () => {
@@ -389,5 +412,17 @@ describe("teamState", () => {
       testQuality: "test quality",
       residualRisk: "residual risk",
     }))).toMatchObject({ unanchoredPass: true, intent: "intent" });
+  });
+});
+
+describe("workerDisplayName", () => {
+  it("shows the full name the lead chose, even from records saved in the short form", () => {
+    expect(workerDisplayName("ghostai0001", "Worker ghostai0")).toBe("ghostai0001");
+    expect(workerDisplayName("ghostai0001", "ghostai0001")).toBe("ghostai0001");
+  });
+
+  it("keeps the short form for a generated id and any other name as is", () => {
+    expect(workerDisplayName("0000000a019a1b2c3d4e", "Worker 0000000a")).toBe("Worker 0000000a");
+    expect(workerDisplayName("w1", "Ana")).toBe("Ana");
   });
 });

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import BrowserTab from "./BrowserTab.svelte";
+import Workbench from "./Workbench.svelte";
 import type { BrowserSnapshot } from "../lib/browserEngine";
 
 const { transport } = vi.hoisted(() => ({
@@ -70,7 +71,7 @@ describe("native Browser tab", () => {
       x: 20, y: 40, width: 640, height: 400,
     }, page.url);
     expect(await screen.findByText("Real local page")).toBeTruthy();
-    expect(transport.setVisible).toHaveBeenCalledWith(true);
+    expect(transport.setVisible).toHaveBeenCalledWith(true, expect.any(Number));
     const ensureCalls = transport.ensure.mock.calls.length;
     app.update((state) => ({ ...state, browserTitle: "Unrelated title update" }));
     await Promise.resolve();
@@ -79,5 +80,42 @@ describe("native Browser tab", () => {
     expect(transport.history).toHaveBeenCalledWith("back");
     await fireEvent.click(screen.getByRole("button", { name: "Reload" }));
     expect(transport.reload).toHaveBeenCalled();
+  });
+
+  /** The newest visibility request (the native pane applies the highest seq). */
+  function lastVisibility(): { visible: boolean; seq: number } {
+    const calls = transport.setVisible.mock.calls as [boolean, number][];
+    const [visible, seq] = calls.reduce((latest, call) => (call[1] > latest[1] ? call : latest));
+    return { visible, seq };
+  }
+
+  it("hides the native pane when another workbench tab is chosen", async () => {
+    app.update((state) => ({ ...state, route: "lead", browserSupported: true }));
+    render(Workbench);
+    await vi.waitFor(() => expect(transport.ensure).toHaveBeenCalled());
+    expect(lastVisibility().visible).toBe(true);
+    const shown = lastVisibility().seq;
+    await fireEvent.click(screen.getByRole("button", { name: /Plan/ }));
+    await vi.waitFor(() => expect(lastVisibility().seq).toBeGreaterThan(shown));
+    expect(lastVisibility().visible).toBe(false);
+  });
+
+  it("hides the pane under the team drawer and shows it again when the drawer closes", async () => {
+    app.update((state) => ({ ...state, route: "lead", browserSupported: true }));
+    render(Workbench);
+    await vi.waitFor(() => expect(transport.ensure).toHaveBeenCalled());
+    expect(lastVisibility().visible).toBe(true);
+    actions.toggleTeamPeek();
+    await vi.waitFor(() => expect(lastVisibility().visible).toBe(false));
+    actions.toggleTeamPeek();
+    await vi.waitFor(() => expect(lastVisibility().visible).toBe(true));
+  });
+
+  it("hides the pane when the lead view gives way to Mission Control", async () => {
+    app.update((state) => ({ ...state, route: "lead", browserSupported: true }));
+    render(Workbench);
+    await vi.waitFor(() => expect(transport.ensure).toHaveBeenCalled());
+    app.update((state) => ({ ...state, route: "team" }));
+    await vi.waitFor(() => expect(lastVisibility().visible).toBe(false));
   });
 });

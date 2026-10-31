@@ -2,15 +2,114 @@ import { fireEvent, render, screen } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
+import type { BoardPlan } from "../lib/boardState";
 import { fixtureState } from "../test/fixtures";
 import ControlRoom from "./ControlRoom.svelte";
 
 const workerRows = () => screen.getAllByRole("button", { name: /Open .* worker thread/ });
 
+const plan = (id: string, title: string, steps: [number, string | null, string, boolean][]): BoardPlan => ({
+  id,
+  title,
+  goal: "",
+  kind: "feature",
+  status: "open",
+  closed_at_ms: null,
+  report_path: null,
+  steps: steps.map(([number, header, text, done]) => ({ number, header, text, done, workers: [] })),
+});
+const boardPlans = [
+  plan("plan-a", "Plan A", [
+    [1, "Engine", "Build the engine", true],
+    [2, null, "Wire the UI", false],
+    [3, "Polish", "Tidy", false],
+  ]),
+  plan("plan-b", "Plan B", [[1, "Only", "One", false]]),
+  { ...plan("plan-c", "Plan C", [[1, null, "Shipped", true]]), status: "closed" as const },
+];
+
 describe("Mission Control", () => {
   beforeEach(() => {
-    app.set(fixtureState());
+    const state = fixtureState();
+    state.board = boardPlans;
+    app.set(state);
     actions.openTeam();
+  });
+
+  it("lists open plans and their undone steps, defaulting to the first", async () => {
+    render(ControlRoom);
+    const planSelect = screen.getByLabelText("Plan") as HTMLSelectElement;
+    expect([...planSelect.options].map((o) => o.text)).toEqual(["Plan A", "Plan B"]);
+    expect(planSelect.value).toBe("plan-a");
+    const stepSelect = screen.getByLabelText("Plan step") as HTMLSelectElement;
+    expect([...stepSelect.options].map((o) => o.text)).toEqual(["2. Wire the UI", "3. Polish"]);
+    expect(stepSelect.value).toBe("2");
+    await fireEvent.change(planSelect, { target: { value: "plan-b" } });
+    expect([...(screen.getByLabelText("Plan step") as HTMLSelectElement).options].map((o) => o.text)).toEqual(["1. Only"]);
+  });
+
+  it("passes the plan and step to the transport action, keeps the brief on refusal", async () => {
+    const dispatch = vi.spyOn(actions, "dispatchWorker").mockResolvedValue(false);
+    render(ControlRoom);
+    const button = screen.getByRole("button", { name: "Dispatch" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    const brief = screen.getByLabelText("New worker brief") as HTMLInputElement;
+    await fireEvent.input(brief, { target: { value: "wire it" } });
+    expect(button.disabled).toBe(false);
+    await fireEvent.change(screen.getByLabelText("Plan step"), { target: { value: "3" } });
+    await fireEvent.click(button);
+    expect(dispatch).toHaveBeenCalledWith("wire it", "plan-a", 3, null, null);
+    expect(brief.value).toBe("wire it");
+  });
+
+  it("disables dispatch when the plan has no undone step", async () => {
+    app.update((state) => ({ ...state, board: [plan("plan-d", "Plan D", [[1, null, "Done", true]])] }));
+    render(ControlRoom);
+    await fireEvent.input(screen.getByLabelText("New worker brief"), { target: { value: "x" } });
+    expect((screen.getByRole("button", { name: "Dispatch" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("replaces the form with one line when no plan is open", () => {
+    app.update((state) => ({ ...state, board: [boardPlans[2]] }));
+    render(ControlRoom);
+    expect(screen.getByText("No open plan — ask the lead to plan the work first.")).toBeTruthy();
+    expect(screen.queryByLabelText("New worker brief")).toBeNull();
+  });
+
+  it("dispatches with an explicit model and reasoning effort", async () => {
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        models: [
+          {
+            endpoint: "test",
+            model: "scripted-a",
+            spec: "test/scripted-a",
+            is_default: true,
+            reasoning_efforts: ["max", "low", "off"],
+            default_effort: "max",
+          },
+          {
+            endpoint: "other",
+            model: "scripted-a",
+            spec: "other/scripted-a",
+            is_default: false,
+            reasoning_efforts: ["max", "low", "off"],
+            default_effort: "max",
+          },
+        ],
+      },
+    }));
+    const dispatch = vi.spyOn(actions, "dispatchWorker").mockResolvedValue(true);
+    render(ControlRoom);
+    const model = screen.getByLabelText("Worker model") as HTMLSelectElement;
+    expect(model.value).toBe("test/scripted-a");
+    await fireEvent.change(model, { target: { value: "other/scripted-a" } });
+    await fireEvent.change(screen.getByLabelText("Worker reasoning effort"), { target: { value: "low" } });
+    await fireEvent.input(screen.getByLabelText("New worker brief"), { target: { value: "write the parser" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+    expect(dispatch).toHaveBeenCalledWith("write the parser", "plan-a", 2, "other/scripted-a", "low");
   });
 
   it("renders ten workers and filters the larger team", async () => {

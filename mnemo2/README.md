@@ -346,6 +346,10 @@ all live. Setup and day-to-day use are in
   - TeamManager notices go to Claude Code instead of the built-in lead: they
     are appended to tool results, delivered by the PostToolUse hook, or wake
     an idle session through a background `mnemo2-mcp wait`.
+  - The lead pane replaces the built-in chat with a "Claude Code is leading
+    this project" panel that follows the team live; "Open the built-in lead
+    anyway" reveals the chat behind a slim bar. Detaching brings the plain
+    chat back.
   - Sending to the built-in lead asks for confirmation.
   - The lead detaches when the Claude session ends or after 10 minutes
     without a call or a waiter.

@@ -720,4 +720,109 @@ describe("LeadChat", () => {
     expect(observer.disconnect).toHaveBeenCalled();
     expect(cancelAnimationFrame).toHaveBeenCalled();
   });
+
+  describe("while Claude Code leads externally", () => {
+    const attach = () =>
+      app.update((state) => ({
+        ...state,
+        externalLead: { attached: true, root: "C:/Mnemo", sinceMs: 1_000 },
+      }));
+    const detach = () =>
+      app.update((state) => ({
+        ...state,
+        externalLead: { attached: false, root: null, sinceMs: null },
+      }));
+    const panelTitle = () => screen.queryByText("Claude Code is leading this project");
+    const leadingBar = () => screen.queryByText("Claude Code is leading this project.");
+    const revealButton = () => screen.getByRole("button", { name: "Open the built-in lead anyway" });
+
+    function seedTeam() {
+      const state = fixtureState();
+      app.update((current) => ({
+        ...current,
+        workers: state.workers,
+        leadEntries: state.leadEntries,
+      }));
+    }
+
+    it("replaces the built-in chat with the external-lead panel", async () => {
+      await act(); // drain the project open from beforeEach: it resets the team
+      seedTeam();
+      setRuntime({
+        pending: { kind: "question", question_id: "q-ext", question: "Which branch should I target?" },
+      });
+      attach();
+      const { container } = render(LeadChat);
+
+      expect(screen.getByText("Claude Code is leading this project")).toBeTruthy();
+      expect(revealButton()).toBeTruthy();
+      // The idle built-in chat stays hidden: transcript, pending prompt and composer.
+      expect(container.querySelector(".lead-scroll")).toBeNull();
+      expect(container.querySelector(".composer-dock")).toBeNull();
+      expect(screen.queryByText(/Ship a first-run experience/)).toBeNull();
+      expect(screen.queryByText("Which branch should I target?")).toBeNull();
+      expect(screen.queryByRole("textbox", { name: "Message the lead" })).toBeNull();
+      // The panel keeps following the live team lines instead.
+      expect(screen.getByText("Working:")).toBeTruthy();
+      expect(screen.getByText("Needs you:")).toBeTruthy();
+    });
+
+    it("reveals the built-in chat behind a leading bar and returns to the panel", async () => {
+      await act(); // drain the project open from beforeEach: it resets the team
+      seedTeam();
+      attach();
+      const { container } = render(LeadChat);
+
+      await fireEvent.click(revealButton());
+      expect(leadingBar()).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
+      expect(container.querySelector(".composer-dock")).not.toBeNull();
+      expect(screen.getByText(/Ship a first-run experience/)).toBeTruthy();
+      expect(screen.getByRole("textbox", { name: "Message the lead" })).toBeTruthy();
+      expect(panelTitle()).toBeNull();
+
+      await fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      expect(panelTitle()).toBeTruthy();
+      expect(leadingBar()).toBeNull();
+      expect(screen.queryByRole("textbox", { name: "Message the lead" })).toBeNull();
+    });
+
+    it("shows the plain chat with no bar once the external lead detaches", async () => {
+      await act(); // drain the project open from beforeEach: it resets the team
+      seedTeam();
+      attach();
+      const { container } = render(LeadChat);
+
+      await fireEvent.click(revealButton());
+      expect(leadingBar()).toBeTruthy();
+
+      detach();
+      await act();
+      expect(screen.getByText(/Ship a first-run experience/)).toBeTruthy();
+      expect(screen.getByRole("textbox", { name: "Message the lead" })).toBeTruthy();
+      expect(container.querySelector(".lead-scroll")).not.toBeNull();
+      expect(leadingBar()).toBeNull();
+      expect(screen.queryByText("Open the built-in lead anyway")).toBeNull();
+    });
+
+    it("resets to the panel when the external lead attaches again", async () => {
+      await act(); // drain the project open from beforeEach: it resets the team
+      seedTeam();
+      attach();
+      render(LeadChat);
+
+      await fireEvent.click(revealButton());
+      expect(leadingBar()).toBeTruthy();
+
+      detach();
+      await act();
+      attach();
+      await act();
+
+      expect(panelTitle()).toBeTruthy();
+      expect(leadingBar()).toBeNull();
+      expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+      expect(screen.queryByRole("textbox", { name: "Message the lead" })).toBeNull();
+    });
+  });
 });

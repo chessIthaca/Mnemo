@@ -41,3 +41,23 @@ Every accepted finding is fixed with a regression test where testable. Tests aft
 ## Follow-ups (outside this plan)
 
 - High-risk dispatch and audits read the active plan from `.coding/plans/stack.json`, which Mnemo2's plan board never writes. The board serializer also escapes a `## Acceptance scenarios` heading. This affects the built-in lead as well, and the `mnemo-lead` skill documents a workaround.
+
+## Step 9: end-to-end findings (real Claude Code 2.1.138 + plugin + hidden Mnemo2, scratch project)
+
+| Finding | Outcome |
+|---|---|
+| Hooks ran with no arguments (2.1.138 ignores `args`). The helper printed usage and exited 2: a hook error, usage text in Claude's context after every tool call, and the PreToolUse gate blocking for the wrong reason | fixed: a bare call dispatches on the stdin `hook_event_name`; a test covers every event and the explicit-args round trip |
+| A hidden instance that could not open the project only showed a toast in its invisible window; the helper timed out after 90 s | fixed: the UI reports the reason (`external_open_failed`); `/health` returns `open_error` for that root; the server's open wait and the helper's spawn wait fail at once with the reason; tests on both sides |
+| After a failed start, each later request spawned another hidden Mnemo2 | fixed: the helper checks running instances for a reported open failure before spawning; regression test |
+| `F7` (extensionless exec path on Windows) | verified working |
+| Handle inheritance fix | verified: `serve` exits and closes its pipes at once after EOF while the spawned Mnemo2 keeps running |
+
+**End-to-end result:**
+- Cold auto-start opens the project in under 1 s.
+- 30 tools are listed.
+- `team_status`, `plan_list`, `plan_create` and `team_dispatch` work from Claude Code.
+- A worker failing (dummy API key) produces the TeamManager notice, which the background waiter delivers.
+- The agent gate asks with the Mnemo reason.
+- The Stop hook stays silent with no active workers.
+
+Not covered by the scripted run (needs the Desktop UI): how the permission prompt looks, the tray menu, and the mission-control badge in a visible window.

@@ -49,3 +49,9 @@ Date: 2026-10-31. Terminal CLI: `claude` 2.1.138. A throwaway plugin was run wit
 - **MCP tools are deferred behind ToolSearch in this CLI.** The model loads them on demand, while the instructions are always in context. The lead brief must therefore name the tools so the model knows what to search for.
 
 All spike items are now verified.
+
+## Found in the step-9 end-to-end run (real CLI 2.1.138 with the real plugin)
+
+- **CLI 2.1.138 ignores `args` on exec-form hooks** and runs the bare `command`. The documented `args` field belongs to newer versions. The helper therefore dispatches a bare call from the hook's stdin `hook_event_name` (SessionStart, PostToolUse, Stop, PreToolUse). The plugin keeps `args` for versions that pass them; the same hook runs either way, and no shell is involved.
+- **An extensionless `${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp` resolves to `mnemo2-mcp.exe` on Windows**, for both the MCP server and hooks.
+- **CLI 2.1.138 on Windows offers a PowerShell tool**, and Haiku picked the `& "<path>" wait` form from the instructions unprompted.

@@ -26,6 +26,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tauri_plugin_notification::NotificationExt;
@@ -35,7 +36,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use mnemo::{Approval, UserAnswer};
 
-use crate::mnemo2::mcp_server::McpServer;
+use crate::mnemo2::mcp_server::{McpServer, OpenFailure};
 use crate::mnemo2::phase3::{Finding, ReviewEvidence};
 use crate::mnemo2::project::{self, ProjectPreferences, ProjectRecord};
 use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
@@ -68,18 +69,38 @@ pub struct Mnemo2State {
     /// The local endpoint for an external lead; dropping it stops listening.
     endpoint: std::sync::Mutex<Option<McpServer>>,
     /// Why the UI could not open a project Claude Code asked for: the
-    /// canonical root and the reason, until the next request or open.
-    open_failure: std::sync::Mutex<Option<(PathBuf, String)>>,
+    /// canonical root, the reason and when it was reported, until the next
+    /// request or open.
+    open_failure: std::sync::Mutex<Option<(PathBuf, String, Instant)>>,
 }
 
 impl Mnemo2State {
-    /// The reported reason the project at `root` could not be opened.
-    pub(crate) fn open_failure(&self, root: &std::path::Path) -> Option<String> {
+    /// The reported failure to open the project at `root`.
+    pub(crate) fn open_failure(&self, root: &std::path::Path) -> Option<OpenFailure> {
         let failure = self.open_failure.lock().unwrap_or_else(|e| e.into_inner());
         failure
             .as_ref()
-            .filter(|(failed, _)| failed.as_path() == root)
-            .map(|(_, reason)| reason.clone())
+            .filter(|(failed, _, _)| failed.as_path() == root)
+            .map(|(_, reason, reported)| OpenFailure {
+                reason: reason.clone(),
+                age: reported.elapsed(),
+            })
+    }
+
+    /// Remember that the UI could not open `root` (canonical). `open` is the
+    /// canonical root of the project open right now: a report that arrives
+    /// after that project opened is late and would only mislead the helper.
+    pub(crate) fn record_open_failure(
+        &self,
+        root: PathBuf,
+        reason: String,
+        open: Option<&std::path::Path>,
+    ) {
+        if open == Some(root.as_path()) {
+            return;
+        }
+        *self.open_failure.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((root, reason, Instant::now()));
     }
 
     /// Forget a reported open failure (a new request, or a project opened).
@@ -628,7 +649,11 @@ pub async fn external_open_failed(
     reason: String,
 ) -> Result<(), String> {
     let root = project::canonical_root(std::path::Path::new(&root))?;
-    *state.open_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some((root, reason));
+    let open = state.open_lead().await.map(|lead| {
+        let open = lead.workspace_root();
+        project::canonical_root(open).unwrap_or_else(|_| open.to_path_buf())
+    });
+    state.record_open_failure(root, reason, open.as_deref());
     Ok(())
 }
 
@@ -1258,6 +1283,37 @@ mod tests {
         assert!(crate::mnemo2::run_file::read(&path).expect("read").project.is_none());
         state.shutdown_endpoint();
         assert!(!path.exists(), "the file goes with the endpoint");
+    }
+
+    #[test]
+    fn a_reported_open_failure_carries_its_age_and_is_cleared_by_a_new_attempt() {
+        let state = Mnemo2State::default();
+        let root = std::path::PathBuf::from("/work/app");
+        assert_eq!(state.open_failure(&root), None);
+        state.record_open_failure(root.clone(), "no engine".into(), None);
+        let failure = state.open_failure(&root).expect("reported");
+        assert_eq!(failure.reason, "no engine");
+        assert!(failure.age < std::time::Duration::from_secs(5));
+        assert_eq!(state.open_failure(std::path::Path::new("/work/other")), None);
+        state.clear_open_failure();
+        assert_eq!(state.open_failure(&root), None);
+        // Opening a project forgets a failure too.
+        state.record_open_failure(root.clone(), "no engine".into(), None);
+        state.sync_run_file(Some(&root));
+        assert_eq!(state.open_failure(&root), None);
+    }
+
+    #[test]
+    fn a_late_failure_report_for_the_open_project_is_ignored() {
+        let state = Mnemo2State::default();
+        let root = std::path::PathBuf::from("/work/app");
+        // The project opened while the UI was still reporting its failure.
+        state.record_open_failure(root.clone(), "late".into(), Some(&root));
+        assert_eq!(state.open_failure(&root), None);
+        // Another open project does not excuse the report.
+        let other = std::path::PathBuf::from("/work/other");
+        state.record_open_failure(root.clone(), "busy".into(), Some(&other));
+        assert_eq!(state.open_failure(&root).map(|failure| failure.reason).as_deref(), Some("busy"));
     }
 
     #[test]

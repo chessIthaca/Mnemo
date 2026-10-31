@@ -3,6 +3,7 @@ import { get } from "svelte/store";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExternalLeadEvent, ExternalLeadStatus, ExternalOpenRequest } from "./externalLeadEngine";
 import type { ProjectRecord } from "./projectEngine";
+import type { LeadSnapshot } from "./types";
 
 /**
  * Claude Code leading a project from outside: the startup `--project`, open
@@ -23,12 +24,25 @@ const host = vi.hoisted(() => ({
   statusGate: null as Promise<void> | null,
   statusAsked: vi.fn(),
   reportOpenFailure: vi.fn(async (_root: string, _reason: string) => undefined),
+  /** Whether the native lead transport exists, and what opening the lead does. */
+  leadNative: true,
+  leadOpen: vi.fn(),
   openHandlers: [] as ((request: ExternalOpenRequest) => void)[],
   changeHandlers: [] as ((event: ExternalLeadEvent) => void)[],
   unlisten: vi.fn(),
 }));
 
-vi.mock("./leadEngine", () => ({ createLeadTransport: () => null }));
+vi.mock("./leadEngine", () => ({
+  createLeadTransport: () =>
+    host.leadNative
+      ? {
+          probe: async () => true,
+          open: host.leadOpen,
+          close: async () => undefined,
+          onEvent: async () => () => undefined,
+        }
+      : null,
+}));
 vi.mock("./teamEngine", () => ({ createTeamTransport: () => null }));
 vi.mock("./boardEngine", () => ({ createBoardTransport: () => null }));
 vi.mock("./indexingEngine", async (importOriginal) => ({
@@ -86,6 +100,19 @@ vi.mock("./externalLeadEngine", async (importOriginal) => ({
 import TopBar from "../components/TopBar.svelte";
 import { actions, app, createInitialState } from "./store";
 
+const leadSnapshot: LeadSnapshot = {
+  generation: 1,
+  model: "test/scripted-a",
+  model_id: "scripted-a",
+  models: [],
+  default_model: "test/scripted-a",
+  transcript: { messages: [] },
+  used_tokens: 0,
+  max_tokens: 1000,
+  pending: null,
+  busy: false,
+};
+
 const mnemo: ProjectRecord = { name: "mnemo", path: "C:\\Mnemo", branch: "main" };
 const garden: ProjectRecord = { name: "garden", path: "C:\\Garden", branch: "main" };
 
@@ -108,6 +135,9 @@ describe("Claude Code opening a project", () => {
     );
     host.attach.mockReset();
     host.attach.mockResolvedValue({ conflict_pid: null, conflict_started_at: null });
+    host.leadNative = true;
+    host.leadOpen.mockReset();
+    host.leadOpen.mockResolvedValue(leadSnapshot);
     host.startup = null;
     host.status = { attached: false, root: null, since_ms: null };
     host.statusError = false;
@@ -127,7 +157,9 @@ describe("Claude Code opening a project", () => {
     expect(host.attach).toHaveBeenCalledWith("C:\\Mnemo", false);
     expect(state().projectId).toBe("C:\\Mnemo");
     expect(state().route).toBe("lead");
+    expect(state().leadRuntime.status).toBe("ready");
     expect(toast()).toBeNull();
+    expect(host.reportOpenFailure).not.toHaveBeenCalled();
   });
 
   it("starts on the project list when the app was started without a project", async () => {
@@ -163,6 +195,8 @@ describe("Claude Code opening a project", () => {
     emitOpen("C:/Garden");
     await vi.waitFor(() => expect(state().projectId).toBe("C:\\Garden"));
     expect(host.attach).toHaveBeenCalledWith("C:\\Garden", false);
+    await vi.waitFor(() => expect(state().leadRuntime.status).toBe("ready"));
+    expect(host.reportOpenFailure).not.toHaveBeenCalled();
   });
 
   it("toasts for an open request naming an unregistered folder", async () => {
@@ -195,6 +229,73 @@ describe("Claude Code opening a project", () => {
     expect(host.attach).not.toHaveBeenCalled();
     expect(state().projectId).toBe("C:\\Mnemo");
     expect(toast()).toBeNull();
+    expect(host.reportOpenFailure).not.toHaveBeenCalled();
+  });
+
+  it("reports a lead that failed to open, with its error", async () => {
+    host.leadOpen.mockRejectedValue(new Error("could not start the headless engine: not_configured"));
+    host.startup = "C:\\Mnemo";
+    await actions.initExternalLead();
+
+    // The project stays selected, with the error on its lead.
+    expect(state().projectId).toBe("C:\\Mnemo");
+    expect(state().leadRuntime.status).toBe("error");
+    expect(host.reportOpenFailure).toHaveBeenCalledTimes(1);
+    expect(host.reportOpenFailure).toHaveBeenCalledWith(
+      "C:\\Mnemo",
+      "could not start the headless engine: not_configured",
+    );
+  });
+
+  it("reports a lead that never started", async () => {
+    host.leadNative = false;
+    host.startup = "C:\\Mnemo";
+    await actions.initExternalLead();
+
+    expect(state().projectId).toBe("C:\\Mnemo");
+    expect(host.reportOpenFailure).toHaveBeenCalledWith("C:\\Mnemo", "the native lead did not start");
+  });
+
+  it("reports a project another Mnemo2 process is using, with its pid", async () => {
+    await actions.initExternalLead();
+    host.attach.mockResolvedValue({ conflict_pid: 4242, conflict_started_at: 1_700_000_000_000 });
+
+    emitOpen("C:/Garden");
+    await vi.waitFor(() => expect(host.reportOpenFailure).toHaveBeenCalledTimes(1));
+    expect(host.reportOpenFailure).toHaveBeenCalledWith(
+      "C:/Garden",
+      "another Mnemo2 process (pid 4242) is using the project",
+    );
+    expect(state().projectId).toBeNull();
+  });
+
+  it("retries a project whose lead failed to open when asked again", async () => {
+    host.leadOpen.mockRejectedValueOnce(new Error("not_configured"));
+    host.startup = "C:\\Mnemo";
+    await actions.initExternalLead();
+    expect(state().leadRuntime.status).toBe("error");
+    expect(host.reportOpenFailure).toHaveBeenCalledTimes(1);
+    expect(host.attach).toHaveBeenCalledTimes(1);
+
+    // The user fixed the cause; the helper asks again.
+    emitOpen("C:/Mnemo");
+    await vi.waitFor(() => expect(state().leadRuntime.status).toBe("ready"));
+    expect(host.attach).toHaveBeenCalledTimes(2);
+    expect(host.leadOpen).toHaveBeenCalledTimes(2);
+    expect(state().projectId).toBe("C:\\Mnemo");
+    expect(host.reportOpenFailure).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports again when the retry fails too", async () => {
+    host.leadOpen.mockRejectedValueOnce(new Error("first failure"));
+    host.leadOpen.mockRejectedValueOnce(new Error("second failure"));
+    host.startup = "C:\\Mnemo";
+    await actions.initExternalLead();
+
+    emitOpen("C:/Mnemo");
+    await vi.waitFor(() => expect(host.reportOpenFailure).toHaveBeenCalledTimes(2));
+    expect(host.reportOpenFailure).toHaveBeenLastCalledWith("C:/Mnemo", "second failure");
+    expect(state().leadRuntime.status).toBe("error");
   });
 
   it("does not switch away from a different open project", async () => {
@@ -237,6 +338,9 @@ describe("external lead state", () => {
     host.list.mockImplementation(async () => host.records);
     host.attach.mockReset();
     host.attach.mockResolvedValue({ conflict_pid: null, conflict_started_at: null });
+    host.leadNative = true;
+    host.leadOpen.mockReset();
+    host.leadOpen.mockResolvedValue(leadSnapshot);
     host.startup = null;
     host.status = { attached: false, root: null, since_ms: null };
     host.statusError = false;

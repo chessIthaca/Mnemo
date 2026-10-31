@@ -558,10 +558,6 @@ function handleExternalLeadEvent(token: number, event: ExternalLeadEvent): void 
 }
 
 /**
- * Open the registered project at `root` for Claude Code. An unregistered root
- * is never added here: the user adds projects themselves.
- */
-/**
  * Tell the host why a project Claude Code asked for did not open, so the
  * waiting helper reports the reason instead of timing out. The window may be
  * hidden, so the toast alone would reach nobody.
@@ -571,6 +567,29 @@ function reportExternalOpenFailure(root: string, reason: string): void {
   void transport?.reportOpenFailure(root, reason).catch(() => undefined);
 }
 
+/**
+ * Why `project` is not open and leading after `openProject`, or null when it
+ * is. A failed lead open keeps the project selected and shows the error on
+ * the lead runtime, so the project id alone is not success.
+ */
+function externalOpenFailure(project: Project): string | null {
+  const after = get(app);
+  if (after.projectId !== project.id) {
+    const conflict = after.projectConflict;
+    return conflict
+      ? `another Mnemo2 process (pid ${conflict.pid}) is using the project`
+      : after.toast?.message ?? "the project did not open";
+  }
+  const lead = after.leadRuntime;
+  if (lead.status === "error") return lead.error ?? "the lead could not start";
+  // Idle or still opening once the open has returned: no lead came up.
+  return lead.status === "ready" ? null : "the native lead did not start";
+}
+
+/**
+ * Open the registered project at `root` for Claude Code. An unregistered root
+ * is never added here: the user adds projects themselves.
+ */
 async function openExternalRoot(root: string): Promise<void> {
   const find = () => get(app).projects.find((item) => sameProjectPath(item.path, root));
   let project = find();
@@ -586,9 +605,11 @@ async function openExternalRoot(root: string): Promise<void> {
     reportExternalOpenFailure(root, "it is not a registered Mnemo2 project");
     return;
   }
-  const open = get(app).projectId;
-  if (open === project.id) return;
-  if (open !== null) {
+  const { projectId: open, leadRuntime } = get(app);
+  // A failed earlier open leaves the project selected with the error on its
+  // lead: asking again is a retry (the cause may be fixed), not a no-op.
+  if (open === project.id && leadRuntime.status !== "error") return;
+  if (open !== null && open !== project.id) {
     // Switching would stop the open project's lead; the user decides that.
     const name = project.name;
     app.update((state) =>
@@ -598,18 +619,8 @@ async function openExternalRoot(root: string): Promise<void> {
     return;
   }
   await openProject(project.id);
-  const after = get(app);
-  // A failed lead open keeps the project selected and shows the error on the
-  // lead runtime, so the project id alone is not success.
-  const openError = after.leadRuntime.status === "error" ? after.leadRuntime.error : null;
-  if (after.projectId === project.id && !openError) return;
-  const conflict = after.projectConflict;
-  reportExternalOpenFailure(
-    root,
-    conflict
-      ? `another Mnemo2 process (pid ${conflict.pid}) is using the project`
-      : openError ?? after.toast?.message ?? "the project did not open",
-  );
+  const failure = externalOpenFailure(project);
+  if (failure) reportExternalOpenFailure(root, failure);
 }
 
 /**

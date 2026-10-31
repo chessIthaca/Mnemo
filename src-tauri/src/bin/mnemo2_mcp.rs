@@ -187,6 +187,10 @@ fn hook_args(hook: Hook) -> Vec<String> {
 }
 
 fn main() -> ExitCode {
+    // First, for every command: a copy that delegates hands its own stdio
+    // handles to the delegate, and anything either spawns later (the hidden
+    // Mnemo2) must not hold Claude Code's pipes.
+    instance::stop_inheriting_stdio();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or_default();

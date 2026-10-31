@@ -41,6 +41,9 @@ const CALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCK_STALE: Duration = Duration::from_secs(120);
 /// A takeover guard older than this belongs to a crashed helper.
 const GUARD_STALE: Duration = Duration::from_secs(10);
+/// An open failure reported more recently than this stands: the user has had
+/// no time to fix its cause. An older one is retried instead of refused.
+const OPEN_ERROR_FRESH: Duration = Duration::from_secs(30);
 
 /// Launches Mnemo2 for a project root. `Ok(None)` means "launched, no handle".
 pub type Spawner = Arc<dyn Fn(&Path) -> Result<Option<Child>, String> + Send + Sync>;
@@ -424,24 +427,35 @@ pub fn resolve(env: &Env, cwd: &Path) -> Resolution {
 }
 
 fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance, String> {
-    // An instance that already failed to open this project keeps running (in
-    // the tray, so the user can fix it); starting another would fail the same
-    // way and pile up hidden instances.
-    if let Some(reason) = open_error(env, root) {
-        return Err(format!("Mnemo2 could not open the project {root}: {reason}"));
-    }
     let mut busy = already_busy;
-    let mut child = None;
+    // Only a failure reported after this moment belongs to the wait below.
+    let began = Instant::now();
     // The guard lives until this function returns, so the lock outlasts the wait.
-    let _lock = if busy {
-        None
-    } else {
-        let lock = SpawnLock::acquire(&env.run_dir, root);
-        if !matches!(lock, SpawnLock::Busy) {
-            eprintln!("mnemo2-mcp: starting Mnemo2 for {root}");
-            child = (env.spawner)(Path::new(root))?;
+    let (_lock, mut child, retried) = match open_error(env, root) {
+        // An instance that failed to open this project keeps running (in the
+        // tray, so the user can fix it); starting another would fail the same
+        // way and pile up hidden instances.
+        Some(failure) if failure.age < OPEN_ERROR_FRESH => {
+            return Err(open_refused(root, &failure.reason));
         }
-        Some(lock)
+        // The user may have fixed the cause since: ask that instance to try
+        // again and wait for it, rather than starting another.
+        Some(failure) => {
+            if !ask_to_open(env, &failure.endpoint, root) {
+                return Err(open_refused(root, &failure.reason));
+            }
+            (None, None, true)
+        }
+        None if busy => (None, None, false),
+        None => {
+            let lock = SpawnLock::acquire(&env.run_dir, root);
+            let mut child = None;
+            if !matches!(lock, SpawnLock::Busy) {
+                eprintln!("mnemo2-mcp: starting Mnemo2 for {root}");
+                child = (env.spawner)(Path::new(root))?;
+            }
+            (Some(lock), child, false)
+        }
     };
     let deadline = Instant::now() + env.spawn_timeout;
     loop {
@@ -450,8 +464,12 @@ fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance,
             return Ok(instance);
         }
         busy |= found.busy;
-        if let Some(reason) = open_error(env, root) {
-            return Err(format!("Mnemo2 could not open the project {root}: {reason}"));
+        if let Some(failure) = open_error(env, root) {
+            // A failure from before this wait is history (the one a retry
+            // was asked to redo); a newer one is the answer.
+            if failure.age < began.elapsed() {
+                return Err(open_refused(root, &failure.reason));
+            }
         }
         if let Some(child) = child.as_mut() {
             if let Ok(Some(status)) = child.try_wait() {
@@ -461,7 +479,9 @@ fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance,
             }
         }
         if Instant::now() >= deadline {
-            let what = if busy {
+            let what = if retried {
+                "Mnemo2 was asked to try again but did not open the project"
+            } else if busy {
                 "Mnemo2 is running but did not answer"
             } else {
                 "Mnemo2 was started but did not open the project"
@@ -475,9 +495,19 @@ fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance,
     }
 }
 
-/// The reason a running instance reported for not opening `root`, if any
+/// An open failure a running instance reported on `/health`.
+struct OpenError {
+    /// The instance that reported it.
+    endpoint: Endpoint,
+    reason: String,
+    /// How long ago it was reported. An instance that does not say counts as
+    /// just now, so the failure is never retried blindly.
+    age: Duration,
+}
+
+/// The failure a running instance reported for not opening `root`, if any
 /// (its UI hit an error, e.g. a failed lead open, and said so on `/health`).
-fn open_error(env: &Env, root: &str) -> Option<String> {
+fn open_error(env: &Env, root: &str) -> Option<OpenError> {
     let body = serde_json::json!({ "root": root }).to_string();
     read_run_files(&env.run_dir).into_iter().find_map(|(_, run)| {
         let endpoint = Endpoint {
@@ -487,11 +517,39 @@ fn open_error(env: &Env, root: &str) -> Option<String> {
         let response =
             http::post(&endpoint, "/health", &[], &body, Some(env.health_timeout)).ok()?;
         let health: Value = serde_json::from_str(&response.body).ok()?;
-        health
-            .get("open_error")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        let reason = health.get("open_error").and_then(Value::as_str)?.to_string();
+        let age_ms = health
+            .get("open_error_age_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Some(OpenError {
+            endpoint,
+            reason,
+            age: Duration::from_millis(age_ms),
+        })
     })
+}
+
+/// The refusal for a project an instance could not open: only the user, from
+/// that instance's window, can fix what the reason names.
+fn open_refused(root: &str, reason: &str) -> String {
+    format!(
+        "Mnemo2 could not open the project {root}: {}. Open Mnemo2 from the tray to fix it, then retry.",
+        reason.trim_end_matches('.')
+    )
+}
+
+/// Ask the instance behind `endpoint` to try opening `root` again; true when
+/// it took the request (one without the route, or one that declines, is not
+/// waited for).
+fn ask_to_open(env: &Env, endpoint: &Endpoint, root: &str) -> bool {
+    let body = serde_json::json!({ "root": root }).to_string();
+    http::post(endpoint, "/lead/open", &[], &body, Some(env.health_timeout))
+        .ok()
+        .filter(|response| response.status == 200)
+        .and_then(|response| serde_json::from_str::<Value>(&response.body).ok())
+        .and_then(|reply| reply.get("requested").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// Keeps two helpers (two Claude sessions) from both launching Mnemo2 for the
@@ -693,19 +751,23 @@ fn detach(command: &mut Command) {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    stop_inheriting_stdio();
+    // The stdio handles stopped being inheritable when `main` started (see
+    // `stop_inheriting_stdio`), so the child cannot hold Claude's pipes.
 }
 
-/// Mark this process's own stdio handles non-inheritable.
+/// Mark this process's own stdio handles non-inheritable. `main` does this
+/// first thing, before anything is spawned.
 ///
 /// `CreateProcess` passes EVERY inheritable handle to the child, not just the
 /// ones named in STARTUPINFO. Claude Code hands `serve` inheritable pipe
 /// handles, so a long-lived Mnemo2 started from here would keep Claude's MCP
-/// pipe open after `serve` exits and hang the session's shutdown. Inherited
-/// stdio for our own children still works: std duplicates those handles as
-/// inheritable for each spawn.
+/// pipe open after `serve` exits and hang the session's shutdown. This also
+/// covers the plugin-cache copy that delegates `serve` to the `<config>/bin`
+/// copy: the delegate inherits the parent's ORIGINAL handles, which only the
+/// parent can fix. Inherited stdio for our own children still works: std
+/// duplicates those handles as inheritable for each spawn.
 #[cfg(windows)]
-fn stop_inheriting_stdio() {
+pub(crate) fn stop_inheriting_stdio() {
     use std::os::windows::io::AsRawHandle;
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
     #[link(name = "kernel32")]
@@ -727,6 +789,11 @@ fn stop_inheriting_stdio() {
         }
     }
 }
+
+/// Elsewhere std closes every descriptor but stdio on exec, and `spawn_app`
+/// replaces stdio: nothing to do.
+#[cfg(not(windows))]
+pub(crate) fn stop_inheriting_stdio() {}
 
 #[cfg(unix)]
 fn detach(command: &mut Command) {

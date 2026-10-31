@@ -119,9 +119,18 @@ pub trait LeadHost: Send + Sync + 'static {
     fn show_window(&self);
     /// Why the UI could not open the project at `root` after the last
     /// request, if it reported a failure.
-    fn open_failure(&self, _root: &Path) -> Option<String> {
+    fn open_failure(&self, _root: &Path) -> Option<OpenFailure> {
         None
     }
+}
+
+/// A failure the UI reported for opening a project Claude Code asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenFailure {
+    pub reason: String,
+    /// How long ago it was reported. A helper tells a fresh failure from one
+    /// the user may have fixed since.
+    pub age: Duration,
 }
 
 /// Server timing; the defaults are the documented 60 s and 10 minutes.
@@ -564,6 +573,7 @@ impl Shared {
             "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach" => {
                 self.lead_route(request).await
             }
+            "/lead/open" => self.lead_open(request).await,
             _ => Response::error(404, "unknown route"),
         }
     }
@@ -575,21 +585,56 @@ impl Shared {
             .await
             .map(|lead| lead.workspace_root().to_string_lossy().into_owned());
         // A helper waiting for a hidden start learns why the project did not
-        // open instead of timing out.
-        let open_error = serde_json::from_slice::<Value>(request_body)
+        // open instead of timing out, and how long ago that happened.
+        let failure = serde_json::from_slice::<Value>(request_body)
             .ok()
             .and_then(|body| body.get("root").and_then(Value::as_str).map(str::to_string))
             .and_then(|root| project::canonical_root(Path::new(&root)).ok())
             .and_then(|root| self.host.open_failure(&root));
+        let age_ms = failure
+            .as_ref()
+            .map(|failure| u64::try_from(failure.age.as_millis()).unwrap_or(u64::MAX));
         Response::json(
             200,
             &json!({
                 "pid": std::process::id(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "project": project,
-                "open_error": open_error,
+                "open_error": failure.map(|failure| failure.reason),
+                "open_error_age_ms": age_ms,
             }),
         )
+    }
+
+    /// Ask the UI to try opening the registered project at `root` again: the
+    /// helper's retry after an open failure it saw reported earlier (the user
+    /// may have fixed the cause). A project that is already open, or is not
+    /// registered, is not worth a request.
+    async fn lead_open(&self, request: &Request) -> Response {
+        let body: Value = match serde_json::from_slice(&request.body) {
+            Ok(body) => body,
+            Err(err) => return Response::error(400, &format!("invalid JSON body: {err}")),
+        };
+        let Some(root) = body.get("root").and_then(Value::as_str) else {
+            return Response::error(400, "missing \"root\"");
+        };
+        let declined = |reason: String| {
+            Response::json(200, &json!({ "requested": false, "reason": reason }))
+        };
+        let root = match project::canonical_root(Path::new(root)) {
+            Ok(root) => root,
+            Err(err) => return declined(err),
+        };
+        if !self.is_registered(&root) {
+            return declined(format!("{} is not a registered Mnemo2 project", root.display()));
+        }
+        if let Some(lead) = self.host.lead().await {
+            if canonical(lead.workspace_root()) == root {
+                return declined(format!("{} is already open", root.display()));
+            }
+        }
+        self.host.request_open(&root);
+        Response::json(200, &json!({ "requested": true }))
     }
 
     /// The open project when it is the one at `root` (never opens anything).
@@ -904,8 +949,12 @@ impl Shared {
             if let Some(target) = self.target_for(&root).await? {
                 return Ok(target);
             }
-            if let Some(reason) = self.host.open_failure(&root) {
-                return Err(format!("Mnemo2 could not open {}: {reason}", root.display()));
+            if let Some(failure) = self.host.open_failure(&root) {
+                return Err(format!(
+                    "Mnemo2 could not open {}: {}",
+                    root.display(),
+                    failure.reason
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
@@ -1048,7 +1097,7 @@ impl LeadHost for AppLeadHost {
         mnemo::config::resolve_config_dir(None)
     }
 
-    fn open_failure(&self, root: &Path) -> Option<String> {
+    fn open_failure(&self, root: &Path) -> Option<OpenFailure> {
         let state = self.app.try_state::<crate::mnemo2::ipc::Mnemo2State>()?;
         state.open_failure(root)
     }
@@ -1137,8 +1186,8 @@ mod tests {
         open_requests: Mutex<Vec<PathBuf>>,
         changes: Mutex<Vec<(bool, Option<PathBuf>)>>,
         shown: AtomicUsize,
-        /// A reported open failure: the canonical root and the reason.
-        failure: Mutex<Option<(PathBuf, String)>>,
+        /// A reported open failure: the canonical root and what was reported.
+        failure: Mutex<Option<(PathBuf, OpenFailure)>>,
     }
 
     #[async_trait]
@@ -1172,12 +1221,12 @@ mod tests {
             self.shown.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn open_failure(&self, root: &Path) -> Option<String> {
+        fn open_failure(&self, root: &Path) -> Option<OpenFailure> {
             let failure = self.failure.lock().expect("failure slot");
             failure
                 .as_ref()
                 .filter(|(failed, _)| failed.as_path() == root)
-                .map(|(_, reason)| reason.clone())
+                .map(|(_, failure)| failure.clone())
         }
     }
 
@@ -1525,6 +1574,7 @@ mod tests {
         assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(health["project"], fixture.root.to_string_lossy().as_ref());
         assert!(health["open_error"].is_null());
+        assert!(health["open_error_age_ms"].is_null());
         let (status, _) = fixture.post("/nope", Some("tok-123"), &[], "{}").await;
         assert_eq!(status, 404);
         fixture.shutdown().await;
@@ -1539,23 +1589,77 @@ mod tests {
         // The UI tries (and fails) instead of opening the pending lead.
         fixture.host.pending.lock().expect("pending slot").take();
         let root = project::canonical_root(&fixture.root).expect("root");
-        *fixture.host.failure.lock().expect("failure slot") =
-            Some((root.clone(), "could not start the headless engine: not_configured".into()));
+        *fixture.host.failure.lock().expect("failure slot") = Some((
+            root.clone(),
+            OpenFailure {
+                reason: "could not start the headless engine: not_configured".into(),
+                age: Duration::from_millis(2500),
+            },
+        ));
         let body = json!({ "root": root.to_string_lossy() }).to_string();
         let (status, reply) = fixture.post("/health", Some("tok-123"), &[], &body).await;
         assert_eq!(status, 200);
         let health: Value = serde_json::from_str(&reply).expect("health json");
         assert_eq!(health["open_error"], "could not start the headless engine: not_configured");
+        assert_eq!(health["open_error_age_ms"], 2500);
         // Another root learns nothing.
         let other = json!({ "root": std::env::temp_dir().to_string_lossy() }).to_string();
         let (_, reply) = fixture.post("/health", Some("tok-123"), &[], &other).await;
-        assert!(serde_json::from_str::<Value>(&reply).expect("json")["open_error"].is_null());
+        let health: Value = serde_json::from_str(&reply).expect("json");
+        assert!(health["open_error"].is_null());
+        assert!(health["open_error_age_ms"].is_null());
 
         let started = std::time::Instant::now();
         let reply = fixture.call("team_status", json!({})).await;
         let message = reply["error"]["message"].as_str().unwrap_or_default().to_string();
         assert!(message.contains("not_configured"), "{reply}");
         assert!(started.elapsed() < Duration::from_secs(5), "no open-wait timeout");
+        fixture.shutdown().await;
+    }
+
+    /// The helper's retry: a registered project that is not open is
+    /// requested again; an open or unregistered one is not.
+    #[tokio::test]
+    async fn lead_open_requests_a_registered_project_that_is_not_open() {
+        let fixture = Fixture::new(false, true, ServerOptions::default()).await;
+        let body = json!({ "root": fixture.root.to_string_lossy() });
+        let reply = fixture.lead_post("/lead/open", body.clone()).await;
+        assert_eq!(reply, json!({ "requested": true }));
+        let requests = fixture.host.open_requests.lock().expect("requests").clone();
+        assert_eq!(requests, vec![fixture.root.clone()]);
+
+        // Now the project is open: nothing to ask for.
+        let reply = fixture.lead_post("/lead/open", body).await;
+        assert_eq!(reply["requested"], false);
+        assert!(reply["reason"].as_str().unwrap_or_default().contains("already open"), "{reply}");
+        assert_eq!(fixture.host.open_requests.lock().expect("requests").len(), 1);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lead_open_declines_an_unregistered_or_unusable_root() {
+        let fixture = Fixture::new(false, false, ServerOptions::default()).await;
+        let reply = fixture
+            .lead_post("/lead/open", json!({ "root": fixture.root.to_string_lossy() }))
+            .await;
+        assert_eq!(reply["requested"], false);
+        assert!(reply["reason"].as_str().unwrap_or_default().contains("not a registered"), "{reply}");
+        let gone = fixture.root.join("missing");
+        let reply = fixture
+            .lead_post("/lead/open", json!({ "root": gone.to_string_lossy() }))
+            .await;
+        assert_eq!(reply["requested"], false);
+        assert!(fixture.host.open_requests.lock().expect("requests").is_empty());
+
+        // Like the other local routes: a token, a JSON body, a root.
+        let body = json!({ "root": fixture.root.to_string_lossy() }).to_string();
+        let (status, _) = fixture.post("/lead/open", None, &[], &body).await;
+        assert_eq!(status, 401);
+        let (status, _) = fixture.post("/lead/open", Some("tok-123"), &[], "{}").await;
+        assert_eq!(status, 400);
+        let (status, _) = fixture.post("/lead/open", Some("tok-123"), &[], "nope").await;
+        assert_eq!(status, 400);
+        assert!(fixture.host.open_requests.lock().expect("requests").is_empty());
         fixture.shutdown().await;
     }
 

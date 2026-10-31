@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::testutil::{closed_port, health, json_reply, write_run_file, FakeServer, Reply, Sandbox};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// A fake Mnemo2 that answers `/health` for `project`.
@@ -242,25 +242,49 @@ fn resolve_starts_mnemo2_and_waits_for_its_run_file() {
     assert!(lock_files(&sandbox).is_empty(), "the spawn lock must be released");
 }
 
-#[test]
-fn a_reported_open_failure_is_returned_without_starting_another_mnemo2() {
-    let sandbox = Sandbox::new();
-    sandbox.register(&[&sandbox.project]);
-    let project = sandbox.project_str();
-    // A hidden instance that failed to open the project: no project, and a
-    // reason on `/health` for this root.
-    let wanted = project.clone();
-    let server = FakeServer::start("tok", move |req| match req.path.as_str() {
-        "/health" if req.json()["root"] == wanted.as_str() => json_reply(serde_json::json!({
-            "pid": 802,
-            "version": "test",
-            "project": null,
-            "open_error": "could not start the headless engine: not_configured",
-        })),
-        "/health" => health(802, None),
+/// What a hidden instance that failed to open the project does when asked
+/// to try again.
+enum Retry {
+    /// The retry works: the project is open afterwards.
+    Opens,
+    /// The retry fails again, at once, with this reason.
+    FailsAgain(&'static str),
+    /// The retry is taken, but nothing new is ever reported.
+    Silent,
+    /// The retry is declined.
+    Declined,
+}
+
+/// A fake Mnemo2 whose UI failed to open `project`: no open project, and
+/// `reason` (reported `age_ms` ago) on `/health`, until `/lead/open` retries.
+fn failed_instance(pid: u32, project: &str, reason: &str, age_ms: u64, retry: Retry) -> FakeServer {
+    let (project, reason) = (project.to_string(), reason.to_string());
+    let retried = AtomicBool::new(false);
+    FakeServer::start("tok", move |req| match req.path.as_str() {
+        "/lead/open" => match retry {
+            Retry::Declined => json_reply(serde_json::json!({ "requested": false, "reason": "no" })),
+            _ => {
+                retried.store(true, Ordering::SeqCst);
+                json_reply(serde_json::json!({ "requested": true }))
+            }
+        },
+        "/health" => match (&retry, retried.load(Ordering::SeqCst)) {
+            (Retry::Opens, true) => health(pid, Some(&project)),
+            (Retry::FailsAgain(again), true) => json_reply(serde_json::json!({
+                "pid": pid, "version": "test", "project": null,
+                "open_error": again, "open_error_age_ms": 0,
+            })),
+            _ => json_reply(serde_json::json!({
+                "pid": pid, "version": "test", "project": null,
+                "open_error": reason, "open_error_age_ms": age_ms,
+            })),
+        },
         _ => json_reply(serde_json::json!({})),
-    });
-    sandbox.write_run(802, server.port, "tok", None);
+    })
+}
+
+/// An `Env` that counts how often it is asked to start Mnemo2.
+fn counting_env(sandbox: &Sandbox) -> (Env, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut env = sandbox.env();
     env.spawner = {
@@ -270,11 +294,118 @@ fn a_reported_open_failure_is_returned_without_starting_another_mnemo2() {
             Ok(None)
         })
     };
+    (env, calls)
+}
+
+#[test]
+fn a_fresh_open_failure_is_returned_without_starting_another_mnemo2() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let reason = "could not start the headless engine: not_configured";
+    let server = failed_instance(802, &project, reason, 5_000, Retry::Opens);
+    // The run file names the project, but `/health` says it is not open: only
+    // the failure counts.
+    sandbox.write_run(802, server.port, "tok", Some(&project));
+    let (env, calls) = counting_env(&sandbox);
     let Resolution::Failed(message) = resolve(&env, &sandbox.deep) else {
         panic!("expected the reported failure");
     };
     assert!(message.contains("not_configured"), "{message}");
+    assert!(
+        message.ends_with(" Open Mnemo2 from the tray to fix it, then retry."),
+        "{message}"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no second Mnemo2 may start");
+    assert!(server.requests_to("/lead/open").is_empty(), "a fresh failure is not retried");
+}
+
+#[test]
+fn an_instance_that_does_not_date_its_failure_is_never_retried() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let server = FakeServer::start("tok", |req| match req.path.as_str() {
+        "/health" => json_reply(serde_json::json!({
+            "pid": 803, "version": "test", "project": null, "open_error": "no engine",
+        })),
+        _ => json_reply(serde_json::json!({ "requested": true })),
+    });
+    sandbox.write_run(803, server.port, "tok", Some(&project));
+    let (env, calls) = counting_env(&sandbox);
+    assert!(matches!(resolve(&env, &sandbox.deep), Resolution::Failed(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(server.requests_to("/lead/open").is_empty());
+}
+
+#[test]
+fn an_old_open_failure_is_retried_on_the_same_instance() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let server = failed_instance(804, &project, "no engine", 60_000, Retry::Opens);
+    sandbox.write_run(804, server.port, "tok", Some(&project));
+    let (env, calls) = counting_env(&sandbox);
+    let Resolution::Live(instance) = resolve(&env, &sandbox.deep) else {
+        panic!("expected the retry to open the project");
+    };
+    assert_eq!(instance.pid, 804);
+    assert_eq!(instance.root, project);
+    let retries = server.requests_to("/lead/open");
+    assert_eq!(retries.len(), 1, "one retry request");
+    assert_eq!(retries[0].json()["root"], project.as_str());
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the instance is reused, not replaced");
+}
+
+#[test]
+fn a_retry_that_fails_again_reports_the_new_failure() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let server = failed_instance(805, &project, "old news", 60_000, Retry::FailsAgain("still no engine"));
+    sandbox.write_run(805, server.port, "tok", Some(&project));
+    let (env, calls) = counting_env(&sandbox);
+    let Resolution::Failed(message) = resolve(&env, &sandbox.deep) else {
+        panic!("expected the fresh failure");
+    };
+    assert!(message.contains("still no engine"), "{message}");
+    assert!(message.contains("Open Mnemo2 from the tray"), "{message}");
+    assert_eq!(server.requests_to("/lead/open").len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_retry_waits_through_the_old_failure_until_the_timeout() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let server = failed_instance(806, &project, "old news", 60_000, Retry::Silent);
+    sandbox.write_run(806, server.port, "tok", Some(&project));
+    let (mut env, calls) = counting_env(&sandbox);
+    env.spawn_timeout = Duration::from_millis(400);
+    let Resolution::Failed(message) = resolve(&env, &sandbox.deep) else {
+        panic!("expected the timeout");
+    };
+    // The failure that predates the retry is not the answer to it.
+    assert!(!message.contains("old news"), "{message}");
+    assert!(message.contains("asked to try again"), "{message}");
+    assert_eq!(server.requests_to("/lead/open").len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no second Mnemo2 may start");
+}
+
+#[test]
+fn a_declined_retry_leaves_the_old_failure_as_the_answer() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let server = failed_instance(807, &project, "old news", 60_000, Retry::Declined);
+    sandbox.write_run(807, server.port, "tok", Some(&project));
+    let (env, calls) = counting_env(&sandbox);
+    let Resolution::Failed(message) = resolve(&env, &sandbox.deep) else {
+        panic!("expected the old failure");
+    };
+    assert!(message.contains("old news"), "{message}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -612,4 +743,38 @@ fn call_returns_the_json_of_a_200_and_nothing_otherwise() {
     assert_eq!(call(&instance, "/ok", &body, timeout), Some(serde_json::json!({ "x": 1 })));
     assert_eq!(call(&instance, "/broken", &body, timeout), None);
     assert_eq!(call(&instance, "/garbled", &body, timeout), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn stop_inheriting_stdio_clears_the_inherit_flag_of_the_std_handles() {
+    use std::os::windows::io::AsRawHandle;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    // SAFETY: process-owned std handles; a call that fails (a harness with no
+    // stdio) just leaves that handle out.
+    let usable: Vec<_> = handles
+        .into_iter()
+        .filter(|handle| !handle.is_null())
+        // Start from what Claude Code hands over: an inheritable handle.
+        .filter(|handle| unsafe {
+            SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) != 0
+        })
+        .collect();
+    stop_inheriting_stdio();
+    for handle in usable {
+        let mut flags = 0;
+        // SAFETY: as above.
+        assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "{handle:?} is still inheritable");
+    }
 }

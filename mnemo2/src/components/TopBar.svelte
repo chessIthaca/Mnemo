@@ -3,6 +3,7 @@
   import { actions, app, currentProject, needsYouCount } from "../lib/store";
   import { formatTokenCount, formatUsageCost, usageIsPartial, usageTotalTokens } from "../lib/usage";
   import AvatarStack from "./AvatarStack.svelte";
+  import ContextRing from "./ContextRing.svelte";
   import LeadModelPicker from "./LeadModelPicker.svelte";
   import Sheet from "./Sheet.svelte";
   import SettingsDialog from "./SettingsDialog.svelte";
@@ -62,6 +63,7 @@
       ><PanelsTopLeft size={15} /></button>
     {/if}
     <button class="icon-button" aria-label="Settings" onclick={() => (appSettingsOpen = true)}><Settings size={15} /></button>
+    <ContextRing />
     <div class="usage-chip">
       <button
         class="budget-chip"

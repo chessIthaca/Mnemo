@@ -584,6 +584,22 @@ impl LeadRuntime {
             .map_err(|err| format!("could not interrupt the lead: {err}"))
     }
 
+    /// Compact the lead's context window; the session stays open. The kernel
+    /// summarizes the older history between turns and reports the outcome as
+    /// `compact_started` / `compacted` lead events (the compacted event
+    /// carries the token count before and after). A busy lead queues the
+    /// compaction behind the running turn.
+    pub async fn compact(&self) -> Result<(), String> {
+        let live = self.live.lock().await;
+        let live = live
+            .as_ref()
+            .ok_or_else(|| "the lead session is not open".to_string())?;
+        live.session
+            .send(SessionCommand::Compact)
+            .await
+            .map_err(|err| format!("could not compact the lead context: {err}"))
+    }
+
     /// Resolve a pending approval.
     pub async fn approve(&self, request_id: String, decision: Approval) -> Result<(), String> {
         let live = self.live.lock().await;
@@ -6456,6 +6472,94 @@ mod tests {
 
         team.shutdown().await;
         lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lead_compact_summarizes_history_and_reports_the_outcome() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        // The summarizer only runs once the conversation is longer than
+        // keep_recent (6) + 1 messages, so the lead drives four turns first,
+        // and the first prompt is large enough that the summary is a real
+        // reduction rather than a rewrite of the same history.
+        let big = "keep this lead history around ".repeat(2_000);
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["first turn"]),
+            text_turn(&["second turn"]),
+            text_turn(&["third turn"]),
+            text_turn(&["fourth turn"]),
+            text_turn(&["compact summary"]),
+        ]));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm))
+            .await
+            .expect("the lead opens");
+        let mut events = lead.subscribe();
+        for text in [big.as_str(), "second", "third", "fourth"] {
+            lead.send_prompt(text.to_string(), Vec::new())
+                .await
+                .expect("prompt");
+            drain_turn(&mut events).await;
+        }
+        wait_until_idle(&lead).await;
+        let before = lead.snapshot().await.expect("snapshot before compaction");
+        assert!(
+            before.used_tokens > 1_000,
+            "the history must be worth compacting: {before:?}"
+        );
+        lead.compact().await.expect("compaction accepted");
+        // The summarization runs between turns: poll the bus for the paired
+        // outcome, recording the position of both events to prove the order.
+        let mut sequence = 0usize;
+        let mut started_at = usize::MAX;
+        let mut compacted_at = usize::MAX;
+        let mut outcome = None;
+        for _ in 0..500 {
+            while let Ok(event) = events.try_recv() {
+                sequence += 1;
+                match &event.event.event {
+                    SerializableAgentEvent::CompactStarted => started_at = sequence,
+                    SerializableAgentEvent::Compacted {
+                        before: event_before,
+                        after: event_after,
+                    } => {
+                        compacted_at = sequence;
+                        outcome = Some((*event_before, *event_after));
+                    }
+                    _ => {}
+                }
+            }
+            if outcome.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (event_before, event_after) = outcome.expect("compaction reports its outcome");
+        assert!(
+            started_at < compacted_at,
+            "CompactStarted must precede Compacted"
+        );
+        assert_eq!(
+            event_before, before.used_tokens,
+            "the event reports the pre-compaction token count"
+        );
+        assert!(
+            event_after < event_before,
+            "compaction must reduce the used tokens: {event_before} -> {event_after}"
+        );
+        let after = lead.snapshot().await.expect("snapshot after compaction");
+        assert!(
+            after.used_tokens < before.used_tokens,
+            "the compacted snapshot re-reads the smaller conversation: {before:?} -> {after:?}"
+        );
+        lead.shutdown().await;
+        // Once the session is gone the same call is rejected, so the IPC
+        // surface reports the error instead of compacting nothing.
+        let error = lead
+            .compact()
+            .await
+            .expect_err("compaction needs an open session");
+        assert_eq!(error, "the lead session is not open");
     }
 
     #[test]

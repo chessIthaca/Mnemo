@@ -29,6 +29,8 @@ export function initialLeadRuntime(): LeadRuntimeInfo {
     pending: null,
     usedTokens: 0,
     maxTokens: 0,
+    contextBreakdown: null,
+    compacting: false,
     turnStartedAtMs: null,
     streamingEntryId: null,
   };
@@ -545,6 +547,21 @@ function appendLeadText(state: AppState, generation: number, text: string): AppS
   };
 }
 
+/** Narrow a `context_usage` event's per-role breakdown payload. */
+function roleBreakdown(value: unknown): LeadRuntimeInfo["contextBreakdown"] {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const counts = ["system", "user", "assistant", "tool"].map((role) => record[role]);
+  return counts.every((count) => typeof count === "number")
+    ? {
+        system: counts[0] as number,
+        user: counts[1] as number,
+        assistant: counts[2] as number,
+        tool: counts[3] as number,
+      }
+    : null;
+}
+
 /** Apply one live native event, ignoring stale generations. */
 export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
   if (state.leadRuntime.mode !== "native" || event.generation !== state.leadRuntime.generation) {
@@ -707,6 +724,27 @@ export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
       };
     }
 
+    case "context_usage": {
+      const breakdown = roleBreakdown(inner.breakdown);
+      return {
+        ...state,
+        leadRuntime: {
+          ...runtime,
+          usedTokens: typeof inner.used === "number" ? inner.used : runtime.usedTokens,
+          maxTokens: typeof inner.max === "number" ? inner.max : runtime.maxTokens,
+          contextBreakdown: breakdown,
+        },
+      };
+    }
+
+    case "compact_started":
+      return { ...state, leadRuntime: { ...runtime, compacting: true } };
+
+    case "compacted": {
+      const usedTokens = typeof inner.after === "number" ? inner.after : runtime.usedTokens;
+      return { ...state, leadRuntime: { ...runtime, compacting: false, usedTokens } };
+    }
+
     case "finished":
     case "exited":
     case "parked":
@@ -741,9 +779,10 @@ export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
   }
 }
 
-/** Whether this event means the turn is over and a snapshot refresh is due. */
+/** Whether this event means the turn is over (or a compaction rewrote the
+ * conversation) and a snapshot refresh is due. */
 export function leadEventNeedsSnapshot(event: LeadEvent): boolean {
-  return ["finished", "exited", "parked", "approval_request", "user_question"].includes(
+  return ["finished", "exited", "parked", "approval_request", "user_question", "compacted"].includes(
     event.event?.event?.kind ?? "",
   );
 }

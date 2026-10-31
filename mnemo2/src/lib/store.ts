@@ -1255,6 +1255,25 @@ async function interruptLead(): Promise<void> {
   }
 }
 
+/** Compact the lead's context window between turns; a failure is toasted. */
+async function compactLead(): Promise<void> {
+  const transport = leadTransport;
+  if (!transport) {
+    app.update((state) =>
+      withToast(state, "The native lead is not connected, so its context cannot be compacted."),
+    );
+    return;
+  }
+  const token = leadSessionToken;
+  try {
+    await transport.compact();
+  } catch (error) {
+    if (token === leadSessionToken) {
+      app.update((state) => withToast(state, leadError(error)));
+    }
+  }
+}
+
 function approveLead(requestId: string, decision: LeadApprovalDecision) {
   const transport = leadTransport;
   if (!transport) return;
@@ -2201,6 +2220,7 @@ export const actions = {
   clearLeadDraft,
   showToast,
   interruptLead,
+  compactLead,
   approveLead,
   answerLead,
   setLeadModel,

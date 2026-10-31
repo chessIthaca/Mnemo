@@ -45,6 +45,7 @@ describe("native lead transport", () => {
     await transport.snapshot();
     await transport.prompt("hello");
     await transport.interrupt();
+    await transport.compact();
     await transport.setModel("test/scripted-b");
     await transport.approve("req-1", "deny");
     await transport.answer("q-1", { kind: "choice", index: 1 });
@@ -59,19 +60,20 @@ describe("native lead transport", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(2, "lead_snapshot");
     expect(invokeMock).toHaveBeenNthCalledWith(3, "lead_prompt", { text: "hello" });
     expect(invokeMock).toHaveBeenNthCalledWith(4, "lead_interrupt");
-    expect(invokeMock).toHaveBeenNthCalledWith(5, "lead_set_model", {
+    expect(invokeMock).toHaveBeenNthCalledWith(5, "lead_compact");
+    expect(invokeMock).toHaveBeenNthCalledWith(6, "lead_set_model", {
       spec: "test/scripted-b",
       reasoningEffort: null,
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(6, "lead_approve", {
+    expect(invokeMock).toHaveBeenNthCalledWith(7, "lead_approve", {
       requestId: "req-1",
       decision: "deny",
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(7, "lead_answer", {
+    expect(invokeMock).toHaveBeenNthCalledWith(8, "lead_answer", {
       questionId: "q-1",
       answer: { kind: "choice", index: 1 },
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(9, "lead_close");
+    expect(invokeMock).toHaveBeenNthCalledWith(10, "lead_close");
     expect(invokeMock).toHaveBeenCalledWith("lead_prompt", {
       text: "with an image",
       images: ["data:image/png;base64,one"],

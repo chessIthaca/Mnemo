@@ -534,6 +534,14 @@ pub async fn lead_interrupt(state: State<'_, Mnemo2State>) -> Result<(), String>
     current(&state).await?.interrupt().await
 }
 
+/// Compact the lead's context window between turns without closing the
+/// session. The outcome arrives as `compact_started` / `compacted` events
+/// on the lead event channel.
+#[tauri::command]
+pub async fn lead_compact(state: State<'_, Mnemo2State>) -> Result<(), String> {
+    current(&state).await?.compact().await
+}
+
 /// Change the lead model while idle, resuming the transcript on the new model.
 #[tauri::command]
 pub async fn lead_set_model(

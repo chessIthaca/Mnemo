@@ -51,7 +51,7 @@ Check the plugin files with `claude plugin validate mnemo2/plugin` and `claude p
 - Start Claude Code in a Mnemo2 project directory (or any folder inside it). `mnemo2-mcp serve` finds the running Mnemo2 instance whose open project contains the directory. If there is none, it starts `mnemo2 --hidden --project <root>`, which opens the project in the system tray without a window, and waits for it.
 - Outside a registered Mnemo2 project the helper stays inert: it offers no tools, and the hooks print nothing. Claude Code works normally there. A folder is never registered silently; add it in Mnemo2 first.
 - Mnemo2 instances are per project. Several projects can be open at once, each in its own instance, and the helper picks the right one.
-- While Claude Code is attached, mission control shows "Lead: Claude Code (external)". Worker notices go to Claude Code instead of Mnemo2's own lead, and sending from the in-app lead composer asks for confirmation first.
+- While Claude Code is attached, mission control shows "Lead: Claude Code (external)" and the lead pane shows a "Claude Code is leading this project" panel instead of the built-in chat, with an "Open the built-in lead anyway" escape hatch. Worker notices go to Claude Code instead of Mnemo2's own lead, and sending from the in-app lead composer asks for confirmation first.
 - The lead detaches when the session closes, or after 10 minutes with no Mnemo call and no waiter. Mnemo2's own lead then takes over again.
 - All Claude sessions in the same project share one lead queue. Lead from one session at a time.
 

@@ -245,6 +245,7 @@ impl Sandbox {
             project_dir: None,
             spawner,
             spawn_timeout: Duration::from_secs(3),
+            list_wait: Duration::from_secs(3),
             poll_interval: Duration::from_millis(20),
             health_timeout: Duration::from_secs(3),
             wait_reach_timeout: Duration::from_millis(300),

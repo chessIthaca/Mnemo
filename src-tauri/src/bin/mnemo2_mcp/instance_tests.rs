@@ -435,6 +435,113 @@ fn a_second_helper_waits_instead_of_starting_a_second_mnemo2() {
     assert_eq!(calls.load(Ordering::SeqCst), 0, "the loser must not spawn");
 }
 
+/// The pid of a process that has already exited.
+fn dead_pid() -> u32 {
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd").args(["/c", "exit"]).spawn().unwrap();
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    child.id()
+}
+
+/// An `Env` whose spawner counts its calls and, like the real app, publishes a
+/// run file for `project` a moment later.
+fn publishing_env(sandbox: &Sandbox, pid: u32, port: u16) -> (Env, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut env = sandbox.env();
+    env.spawner = {
+        let calls = calls.clone();
+        let (run_dir, project) = (sandbox.run_dir.clone(), sandbox.project_str());
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let (run_dir, project) = (run_dir.clone(), project.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                write_run_file(&run_dir, pid, port, "tok", Some(&project), 1);
+            });
+            Ok(None)
+        })
+    };
+    (env, calls)
+}
+
+/// A session that ended while its helper was starting Mnemo2 leaves a young
+/// lock behind and takes that Mnemo2 along. The next helper must start one
+/// itself, not wait out the lock.
+#[test]
+fn a_young_lock_whose_helper_and_mnemo2_are_gone_does_not_block_the_next_start() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let path = lock_path(&sandbox.run_dir, &project);
+    std::fs::create_dir_all(&sandbox.run_dir).unwrap();
+    std::fs::write(&path, format!("{}-1-0\n{}", dead_pid(), dead_pid())).unwrap();
+    let server = live(812, Some(&project));
+    let (mut env, calls) = publishing_env(&sandbox, 812, server.port);
+    env.spawn_timeout = Duration::from_secs(5);
+    let started = Instant::now();
+    let Resolution::Live(instance) = resolve(&env, &sandbox.deep) else {
+        panic!("expected a live instance");
+    };
+    assert_eq!(instance.pid, 812);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(started.elapsed() < Duration::from_secs(3), "waited out a dead lock");
+    assert!(lock_files(&sandbox).is_empty(), "the taken-over lock is released");
+}
+
+/// A helper that found the lock taken starts Mnemo2 itself once the holder
+/// lets go without an instance having come up.
+#[test]
+fn a_waiting_helper_starts_mnemo2_when_the_holder_gives_up() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let held = SpawnLock::acquire(&sandbox.run_dir, &project);
+    assert!(matches!(held, SpawnLock::Owned { .. }));
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+    });
+    let server = live(813, Some(&project));
+    let (mut env, calls) = publishing_env(&sandbox, 813, server.port);
+    env.spawn_timeout = Duration::from_secs(5);
+    let Resolution::Live(instance) = resolve(&env, &sandbox.deep) else {
+        panic!("expected a live instance");
+    };
+    assert_eq!(instance.pid, 813);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_lock_names_its_helper_and_later_its_mnemo2() {
+    assert_eq!(lock_pids("4242-1700000000-3"), vec![4242]);
+    assert_eq!(lock_pids("4242-1700000000-3\n977"), vec![4242, 977]);
+    assert!(lock_pids("crashed").is_empty());
+    assert!(lock_pids("").is_empty());
+    let alive = |pid: u32| pid == 977;
+    // Mnemo2 still starting: the lock stands though its helper is gone.
+    assert!(!owners_gone("4242-1-0\n977", alive));
+    assert!(owners_gone("4242-1-0\n978", alive));
+    assert!(owners_gone("4242-1-0", alive));
+    // A lock that names nobody is judged by its age alone.
+    assert!(!owners_gone("crashed", alive));
+}
+
+#[test]
+fn the_owner_records_the_mnemo2_it_started_and_still_releases_its_lock() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_str();
+    let lock = SpawnLock::acquire(&sandbox.run_dir, &project);
+    let path = owned_path(&lock).to_path_buf();
+    lock.record_app(std::process::id());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(lock_pids(&text), vec![std::process::id(), std::process::id()]);
+    assert!(!lock_is_stale(&path, LOCK_STALE));
+    drop(lock);
+    assert!(!path.exists());
+}
+
 /// Every spawn lock or takeover guard left in the run dir.
 fn lock_files(sandbox: &Sandbox) -> Vec<PathBuf> {
     std::fs::read_dir(&sandbox.run_dir)
@@ -777,4 +884,104 @@ fn stop_inheriting_stdio_clears_the_inherit_flag_of_the_std_handles() {
         assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
         assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "{handle:?} is still inheritable");
     }
+}
+
+/// Claude Desktop terminates each Claude Code session's job object when it
+/// quits or restarts, so Mnemo2 breaks away from it; inside a job that forbids
+/// breakaway it still starts, inside that job.
+#[cfg(windows)]
+#[test]
+fn the_app_breaks_away_from_a_session_job_and_starts_inside_one_that_forbids_it() {
+    use std::os::windows::io::AsRawHandle;
+    type Handle = *mut std::ffi::c_void;
+    // BREAKAWAY_OK is an extended limit: the basic class rejects it.
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
+    /// JOBOBJECT_EXTENDED_LIMIT_INFORMATION, with its nested
+    /// JOBOBJECT_BASIC_LIMIT_INFORMATION and IO_COUNTERS spelled out.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimits {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+        io_counters: [u64; 6],
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attributes: *const std::ffi::c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(job: Handle, class: i32, info: *const std::ffi::c_void, len: u32) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
+        fn GetCurrentProcess() -> Handle;
+    }
+    // The test process joins a new job, nested in any job it is already in,
+    // for good: neither job here limits or kills anything.
+    let join_new_job = |limit_flags: u32| -> Handle {
+        let limits = ExtendedLimits {
+            limit_flags,
+            ..ExtendedLimits::default()
+        };
+        let os_error = std::io::Error::last_os_error;
+        // SAFETY: plain Win32 calls on a job this test owns; the limits struct
+        // outlives the call that reads it.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            assert!(!job.is_null(), "CreateJobObjectW: {}", os_error());
+            let set = SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                (&limits as *const ExtendedLimits).cast(),
+                std::mem::size_of::<ExtendedLimits>() as u32,
+            );
+            assert_ne!(set, 0, "SetInformationJobObject: {}", os_error());
+            let joined = AssignProcessToJobObject(job, GetCurrentProcess());
+            assert_ne!(joined, 0, "AssignProcessToJobObject: {}", os_error());
+            job
+        }
+    };
+    let sleeper = || {
+        let mut command = Command::new("ping");
+        command
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    };
+    // Whether `child` is in `job`; the child is killed either way.
+    let in_job_then_kill = |mut child: Child, job: Handle| -> bool {
+        let mut result = 0;
+        // SAFETY: a live child handle and a job handle this test keeps open.
+        let queried = unsafe { IsProcessInJob(child.as_raw_handle(), job, &mut result) };
+        let error = std::io::Error::last_os_error();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ne!(queried, 0, "IsProcessInJob: {error}");
+        result != 0
+    };
+
+    let session = join_new_job(JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+    let child = spawn_detached(sleeper).expect("a job that allows breakaway starts the app");
+    assert!(
+        !in_job_then_kill(child, session),
+        "the app stayed in the session job, so a Desktop restart would kill it"
+    );
+
+    let strict = join_new_job(0);
+    let child = spawn_detached(sleeper).expect("a job that forbids breakaway still starts the app");
+    assert!(
+        in_job_then_kill(child, strict),
+        "the app started outside a job it may not leave"
+    );
 }

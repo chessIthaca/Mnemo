@@ -37,7 +37,8 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_secs(4);
 /// ago: loopback connects to a live listener are instant.
 const CALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// A spawn lock older than this belongs to a crashed starter. It must outlast
-/// `Env::spawn_timeout`, or a slow but live starter would lose its lock.
+/// `Env::spawn_timeout`, or a slow but live starter would lose its lock. A
+/// younger one is stale too once the processes it names are all gone.
 const LOCK_STALE: Duration = Duration::from_secs(120);
 /// A takeover guard older than this belongs to a crashed helper.
 const GUARD_STALE: Duration = Duration::from_secs(10);
@@ -65,6 +66,10 @@ pub struct Env {
     pub spawner: Spawner,
     /// How long `serve` waits for a freshly started Mnemo2 to open the project.
     pub spawn_timeout: Duration,
+    /// How long `serve` holds a `tools/list` for a Mnemo2 that is still
+    /// starting before it answers with an empty list (and announces the real
+    /// one later). Claude Code gives up on `tools/list` after 30 s.
+    pub list_wait: Duration,
     /// Pause between run-file polls while waiting.
     pub poll_interval: Duration,
     /// How long a `/health` ping may take before the instance counts as busy.
@@ -72,7 +77,8 @@ pub struct Env {
     /// How long `wait` keeps looking for an instance that is gone or silent
     /// before it gives up (and tells the lead not to restart it).
     pub wait_reach_timeout: Duration,
-    /// Pause between those `wait` lookups.
+    /// Pause between those `wait` lookups, and between the lookups `serve`
+    /// makes after a failed start (the user may start Mnemo2 by hand).
     pub wait_poll: Duration,
 }
 
@@ -107,6 +113,7 @@ impl Env {
             // A cold start (window, webview, project open) can be slow, and
             // `serve` answers `initialize` before it is over.
             spawn_timeout: Duration::from_secs(90),
+            list_wait: Duration::from_secs(20),
             poll_interval: Duration::from_millis(250),
             health_timeout: HEALTH_TIMEOUT,
             wait_reach_timeout: Duration::from_secs(60),
@@ -431,7 +438,7 @@ fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance,
     // Only a failure reported after this moment belongs to the wait below.
     let began = Instant::now();
     // The guard lives until this function returns, so the lock outlasts the wait.
-    let (_lock, mut child, retried) = match open_error(env, root) {
+    let (mut lock, mut child, retried) = match open_error(env, root) {
         // An instance that failed to open this project keeps running (in the
         // tray, so the user can fix it); starting another would fail the same
         // way and pile up hidden instances.
@@ -449,21 +456,32 @@ fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance,
         None if busy => (None, None, false),
         None => {
             let lock = SpawnLock::acquire(&env.run_dir, root);
-            let mut child = None;
-            if !matches!(lock, SpawnLock::Busy) {
-                eprintln!("mnemo2-mcp: starting Mnemo2 for {root}");
-                child = (env.spawner)(Path::new(root))?;
-            }
+            let child = match lock {
+                SpawnLock::Busy => None,
+                _ => spawn_locked(env, root, &lock)?,
+            };
             (Some(lock), child, false)
         }
     };
-    let deadline = Instant::now() + env.spawn_timeout;
+    let mut deadline = Instant::now() + env.spawn_timeout;
     loop {
         let found = lookup(env, Path::new(root), Limits::normal(env));
         if let Some(instance) = found.instance {
             return Ok(instance);
         }
         busy |= found.busy;
+        // The helper that holds the spawn lock can go away before its Mnemo2
+        // is up (its session ended, taking that Mnemo2 along). Once its lock
+        // is free or stale, start Mnemo2 here instead of waiting it out, and
+        // give that start the full timeout.
+        if matches!(lock, Some(SpawnLock::Busy)) && !busy {
+            let next = SpawnLock::acquire(&env.run_dir, root);
+            if !matches!(next, SpawnLock::Busy) {
+                child = spawn_locked(env, root, &next)?;
+                lock = Some(next);
+                deadline = Instant::now() + env.spawn_timeout;
+            }
+        }
         if let Some(failure) = open_error(env, root) {
             // A failure from before this wait is history (the one a retry
             // was asked to redo); a newer one is the answer.
@@ -493,6 +511,18 @@ fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance,
         }
         std::thread::sleep(env.poll_interval);
     }
+}
+
+/// Start Mnemo2 under `lock` (owned, or `Unlocked` when the run dir has no
+/// room for one) and note its pid in the lock, so waiting helpers can tell a
+/// starting Mnemo2 from one that is gone.
+fn spawn_locked(env: &Env, root: &str, lock: &SpawnLock) -> Result<Option<Child>, String> {
+    eprintln!("mnemo2-mcp: starting Mnemo2 for {root}");
+    let child = (env.spawner)(Path::new(root))?;
+    if let Some(child) = &child {
+        lock.record_app(child.id());
+    }
+    Ok(child)
 }
 
 /// An open failure a running instance reported on `/health`.
@@ -614,15 +644,54 @@ fn is_stale_at(modified: Option<SystemTime>, now: SystemTime, stale_after: Durat
         .is_none_or(|age| age > stale_after)
 }
 
+/// The processes a lock speaks for: the helper that wrote it (the pid that
+/// leads its token) and, once started, the Mnemo2 it launched (second line).
+/// Text that names no pid (a foreign or truncated file) speaks for nobody.
+fn lock_pids(text: &str) -> Vec<u32> {
+    let mut lines = text.lines();
+    let helper = lines
+        .next()
+        .and_then(|token| token.split('-').next())
+        .and_then(|pid| pid.parse().ok());
+    let app = lines.next().and_then(|pid| pid.trim().parse().ok());
+    helper.into_iter().chain(app).collect()
+}
+
+/// True when the lock names processes and none of them is alive.
+fn owners_gone(text: &str, alive: impl Fn(u32) -> bool) -> bool {
+    let pids = lock_pids(text);
+    !pids.is_empty() && !pids.into_iter().any(alive)
+}
+
 fn lock_is_stale(path: &Path, stale_after: Duration) -> bool {
     let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok();
-    is_stale_at(modified, SystemTime::now(), stale_after)
+    if is_stale_at(modified, SystemTime::now(), stale_after) {
+        return true;
+    }
+    // However young, a lock whose helper and Mnemo2 are both gone protects
+    // nothing: the next helper need not wait out its age.
+    fs::read_to_string(path)
+        .is_ok_and(|text| owners_gone(&text, mnemo_app::instance_marker::pid_alive))
 }
 
 impl SpawnLock {
     fn acquire(run_dir: &Path, root: &str) -> SpawnLock {
         let _ = fs::create_dir_all(run_dir);
+        // The same user-only folder Mnemo2 keeps, inherited by the lock, which
+        // must stay readable for its release and for others' staleness checks.
+        let _ = mnemo::config::keys::restrict_dir_permissions(run_dir);
         SpawnLock::acquire_at(&lock_path(run_dir, root), LOCK_STALE)
+    }
+
+    /// Note the pid of the Mnemo2 this lock's owner started.
+    fn record_app(&self, pid: u32) {
+        if let SpawnLock::Owned { path, token } = self {
+            if fs::read_to_string(path)
+                .is_ok_and(|text| text.lines().next() == Some(token.as_str()))
+            {
+                let _ = fs::write(path, format!("{token}\n{pid}"));
+            }
+        }
     }
 
     fn acquire_at(path: &Path, stale_after: Duration) -> SpawnLock {
@@ -683,7 +752,9 @@ impl Drop for SpawnLock {
     fn drop(&mut self) {
         if let SpawnLock::Owned { path, token } = self {
             // Only remove our own lock: a takeover may have replaced it.
-            if fs::read_to_string(&*path).is_ok_and(|text| text == *token) {
+            if fs::read_to_string(&*path)
+                .is_ok_and(|text| text.lines().next() == Some(token.as_str()))
+            {
                 let _ = fs::remove_file(&*path);
             }
         }
@@ -745,14 +816,32 @@ pub fn resolve_app(search: &AppSearch) -> Result<PathBuf, String> {
     ))
 }
 
+/// Spawn the command `build` makes, detached from this console and process
+/// group and, where the job allows it, out of this process's job object.
+///
+/// Claude Desktop runs each Claude Code session, with everything it starts,
+/// in a job object of its own, and terminates that job when it quits or
+/// restarts: every process still in it dies, whatever its parent and however
+/// detached. Mnemo2 must outlive the session (its workers run inside it), so
+/// it breaks away. The session job permits that. A job that does not (such as
+/// Desktop's own outer job, which a restart leaves alone) makes `CreateProcess`
+/// fail with ERROR_ACCESS_DENIED, and Mnemo2 then starts inside it as before.
 #[cfg(windows)]
-fn detach(command: &mut Command) {
+fn spawn_detached(build: impl Fn() -> Command) -> std::io::Result<Child> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
     // The stdio handles stopped being inheritable when `main` started (see
     // `stop_inheriting_stdio`), so the child cannot hold Claude's pipes.
+    let spawn = |flags: u32| build().creation_flags(flags).spawn();
+    match spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB) {
+        Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        }
+        spawned => spawned,
+    }
 }
 
 /// Mark this process's own stdio handles non-inheritable. `main` does this
@@ -796,27 +885,28 @@ pub(crate) fn stop_inheriting_stdio() {
 pub(crate) fn stop_inheriting_stdio() {}
 
 #[cfg(unix)]
-fn detach(command: &mut Command) {
+fn spawn_detached(build: impl Fn() -> Command) -> std::io::Result<Child> {
     use std::os::unix::process::CommandExt;
-    command.process_group(0);
+    build().process_group(0).spawn()
 }
 
 /// Start `mnemo2 --hidden --project <root>` detached, with no stdio. It runs
 /// from the config dir so it never pins the project folder as its cwd.
 fn spawn_app(app: &Path, root: &Path, cwd: &Path) -> std::io::Result<Child> {
-    let mut command = Command::new(app);
-    command
-        .arg("--hidden")
-        .arg("--project")
-        .arg(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if cwd.is_dir() {
-        command.current_dir(cwd);
-    }
-    detach(&mut command);
-    command.spawn()
+    spawn_detached(|| {
+        let mut command = Command::new(app);
+        command
+            .arg("--hidden")
+            .arg("--project")
+            .arg(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if cwd.is_dir() {
+            command.current_dir(cwd);
+        }
+        command
+    })
 }
 
 #[cfg(test)]

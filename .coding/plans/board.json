@@ -66,10 +66,10 @@
     },
     {
       "id": "0f378abe",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793449591831,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793457381988,
+      "report_path": ".coding/reviews/claude-lead-0f378abe-round1.md",
       "abandon_reason": null
     }
   ]

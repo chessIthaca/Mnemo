@@ -1,6 +1,7 @@
 <script lang="ts">
   import { AlertCircle, ChevronRight } from "@lucide/svelte";
   import { workerPlanLabel } from "../lib/boardState";
+  import { briefSummary } from "../lib/brief";
   import { app } from "../lib/store";
   import { workerStatusText, type Worker } from "../lib/types";
   import ModelBadge from "./ModelBadge.svelte";
@@ -18,6 +19,8 @@
   } = $props();
 
   const planLabel = $derived(workerPlanLabel($app.board, worker));
+  /** One plain paragraph of the brief; the row clamps it to three lines. */
+  const taskSummary = $derived(briefSummary(worker.task));
 </script>
 
 <button
@@ -33,7 +36,7 @@
   <span class="worker-copy">
     <span class="worker-name"><strong>{worker.name}</strong>{#if worker.needsYou}<AlertCircle size={11} />{/if}{#if worker.kind === "audit"}<span class="row-badge" data-kind="audit">Audit</span>{/if}{#if worker.reviewRisk === "high"}<span class="row-badge" data-risk="high">High risk</span>{/if}<ModelBadge model={worker.model} /></span>
     {#if planLabel}<span class="worker-plan">{planLabel}</span>{/if}
-    <span class="worker-task">{worker.task}</span>
+    <span class="worker-task" title={taskSummary}>{taskSummary}</span>
     {#if !compact}<span class="worker-progress"><span style={`width: ${worker.progress}%`}></span></span>{/if}
   </span>
   <span class="worker-meta">
@@ -58,6 +61,7 @@
   .row-badge[data-kind="audit"] { background: var(--accent-soft); color: var(--accent-strong); }
   .row-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
   .worker-plan { display: block; margin-top: 2px; overflow: hidden; color: var(--accent-strong); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .worker-task { display: -webkit-box; line-clamp: 3; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
   .worker-meta small { display: block; margin-top: 4px; color: var(--muted); font-size: 7px; white-space: nowrap; }
   .status-label { display: inline-flex; padding: 3px 6px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: 7px; font-weight: 650; white-space: nowrap; }
   .status-label[data-status="in_review"], .status-label[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }

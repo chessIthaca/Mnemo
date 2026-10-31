@@ -44,7 +44,7 @@ Rules:
 
 ## Briefs
 
-The worker automatically receives the plan (title, goal, context, decisions, interfaces, step list) and the full text of its step. Your `brief` carries only what is specific to this task:
+The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. Your `brief` carries only what is specific to this task:
 
 - the goal of this task in one or two sentences;
 - the files it owns, and the files it must not touch because another step owns them;
@@ -99,7 +99,7 @@ Dispatch with `review_risk` "high" for shared contracts, persistence, concurrenc
 2. Its notice says "finished its read-only audit". Read its reports, then `team_review` the implementation worker with `evidence.independent_reviewer_id` and a written `evidence.audit_adjudication` that answers each audit finding.
 3. Any fix commit moves the tip and makes the audit stale. Dispatch a fresh audit with a new `reviewer_id`. Never merge the audit worker itself.
 
-Current mechanics to know: high-risk dispatch and audits read the active plan, which is the last id in `.coding/plans/stack.json` (a local, git-ignored file shaped `{"stack":["<plan_id>"]}`). High-risk dispatch also needs a `## Acceptance scenarios` heading with observable bullets in that plan's file. If a refusal says no active plan or no such section was found, write `stack.json` for the plan and add the section with Edit. The board tools rewrite a plan file from their own fields, so the added section is lost on the next `plan_update` or step tick. Add it immediately before dispatching.
+High-risk dispatch needs observable acceptance scenarios on the plan you dispatch under. Pass them as `acceptance_scenarios` to `plan_create`, or add them later with `plan_update` `add_acceptance_scenarios`. The board keeps them in the plan's `## Acceptance scenarios` section, through later updates and step ticks. The audit reads the implementation worker's own plan.
 
 ## Notices
 

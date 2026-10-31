@@ -81,6 +81,8 @@ struct CreateArgs {
     bug: Option<String>,
     #[serde(default)]
     interfaces: Vec<String>,
+    #[serde(default)]
+    acceptance_scenarios: Vec<String>,
 }
 
 /// `plan_create` — open a new plan on the board.
@@ -115,8 +117,11 @@ impl Tool for PlanCreateTool {
              review status, what is next belongs in plan_update `progress`). When two steps \
              touch the same file or module boundary, record the contract in `interfaces` \
              (or later with plan_update `interface`) before dispatching them. Every step must name the file path(s) it touches; a bug_fixing plan's context must name its regression test (which test, which file, how it fails without the fix). One step per independently deliverable unit; \
-             name the files each step touches. Delegate each step with team_dispatch(plan_id, \
-             step, ...). The plan stays on disk after it closes.",
+             name the files each step touches. List the observable outcomes in \
+             `acceptance_scenarios` (or add them later with plan_update \
+             `add_acceptance_scenarios`): workers receive them, and a review_risk='high' \
+             dispatch on this plan requires at least one. Delegate each step with \
+             team_dispatch(plan_id, step, ...). The plan stays on disk after it closes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -126,7 +131,8 @@ impl Tool for PlanCreateTool {
                     "steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered steps; optionally start each with a bold **header**."},
                     "kind": {"type": "string", "enum": ["implementation", "research", "bug_fixing"], "description": "Default implementation. bug_fixing needs `bug` and, to close, a recorded regression test."},
                     "bug": {"type": "string", "description": "The symptom (bug_fixing only)."},
-                    "interfaces": {"type": "array", "items": {"type": "string"}, "description": "Contracts between steps, one per entry: exports, signatures, data shapes, file ownership, e.g. \"`src/game.js` — exports `Game` as a named export; UI owns rendering and must not modify it\". Record one whenever two steps touch the same file or module boundary, before dispatching them."}
+                    "interfaces": {"type": "array", "items": {"type": "string"}, "description": "Contracts between steps, one per entry: exports, signatures, data shapes, file ownership, e.g. \"`src/game.js` — exports `Game` as a named export; UI owns rendering and must not modify it\". Record one whenever two steps touch the same file or module boundary, before dispatching them."},
+                    "acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes the finished work must show, one per entry: a command and its result, a persisted state, a concurrency or security property, a UI behavior. Kept in the plan's '## Acceptance scenarios' section and given to every worker; a review_risk='high' dispatch requires at least one."}
                 },
                 "required": ["title", "goal", "context", "steps"]
             }),
@@ -158,6 +164,7 @@ impl Tool for PlanCreateTool {
             bug: args.bug.clone(),
             steps: args.steps,
             interfaces: args.interfaces,
+            acceptance: args.acceptance_scenarios,
         };
         let plan = match self.board.create(draft) {
             Ok(plan) => plan,
@@ -208,6 +215,8 @@ struct UpdateArgs {
     #[serde(default)]
     add_steps: Vec<String>,
     #[serde(default)]
+    add_acceptance_scenarios: Vec<String>,
+    #[serde(default)]
     regression_test: Option<String>,
     #[serde(default)]
     landed_design: bool,
@@ -244,7 +253,8 @@ impl Tool for PlanUpdateTool {
              that touch the same file or module boundary), record execution state with \
              `progress` (commits, review status, what is next), append to the context (stable \
              why, constraints, intent only — never status, because every worker brief copies \
-             it), add steps, record a bug_fixing plan's regression test, or flag a feature-scale fix with \
+             it), add steps, add observable acceptance scenarios (required before a \
+             review_risk='high' dispatch), record a bug_fixing plan's regression test, or flag a feature-scale fix with \
              landed_design (closing then needs a \"Landed design\" context paragraph).",
             json!({
                 "type": "object",
@@ -255,6 +265,7 @@ impl Tool for PlanUpdateTool {
                     "progress": {"type": "string", "description": "Execution state, dated into Progress: commits, review status, what is next. Not shown to workers."},
                     "context_append": {"type": "string", "description": "A paragraph of stable intent appended to the context (why, constraints). Workers read the context, so never put execution state here; use `progress`."},
                     "add_steps": {"type": "array", "items": {"type": "string"}, "description": "Steps appended after the existing ones."},
+                    "add_acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes appended to the plan's '## Acceptance scenarios', one per entry; workers receive them, and a review_risk='high' dispatch requires at least one. A scenario already recorded is not repeated."},
                     "regression_test": {"type": "string", "description": "The regression test name (bug_fixing)."},
                     "landed_design": {"type": "boolean"}
                 },
@@ -278,6 +289,7 @@ impl Tool for PlanUpdateTool {
             interface: args.interface,
             progress_note: args.progress,
             add_steps: args.add_steps,
+            add_acceptance: args.add_acceptance_scenarios,
             regression_test: args.regression_test,
             landed_design: args.landed_design,
         };
@@ -328,7 +340,7 @@ impl Tool for PlanShowTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "plan_show",
-            "Show one plan in full: status, goal, context, decisions, interfaces, steps, progress.",
+            "Show one plan in full: status, goal, context, acceptance scenarios, steps, decisions, interfaces, progress.",
             json!({
                 "type": "object",
                 "properties": {"plan_id": {"type": "string"}},
@@ -687,6 +699,41 @@ mod tests {
                 .execute(json!({"plan_id": "nope"}))
                 .await
                 .success
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_scenarios_flow_through_plan_create_update_and_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let res = PlanCreateTool::new(board.clone())
+            .execute(json!({
+                "title": "Importer",
+                "goal": "Fix the importer",
+                "context": "Rows vanish on empty cells; keep the CLI flags.",
+                "steps": ["Fix src/import.rs"],
+                "acceptance_scenarios": ["Importing a file with empty cells keeps every row."]
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        let id = res.data.unwrap()["id"].as_str().unwrap().to_string();
+        let res = PlanUpdateTool::new(board.clone())
+            .execute(json!({
+                "plan_id": id,
+                "add_acceptance_scenarios": ["The CLI flags parse unchanged."],
+                "progress": "parser fixed"
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        let shown = PlanShowTool::new(board)
+            .execute(json!({"plan_id": id}))
+            .await;
+        assert!(
+            shown.output.contains(
+                "## Acceptance scenarios\n- Importing a file with empty cells keeps every row.\n- The CLI flags parse unchanged.\n"
+            ),
+            "{}",
+            shown.output
         );
     }
 

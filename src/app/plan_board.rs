@@ -104,6 +104,9 @@ pub struct PlanDraft {
     /// Interface contracts (exports, signatures, data shapes, file
     /// ownership) recorded as dated entries in `## Interfaces`.
     pub interfaces: Vec<String>,
+    /// Observable acceptance scenarios, one per entry, recorded as bullets
+    /// in `## Acceptance scenarios` (high-risk dispatch requires one).
+    pub acceptance: Vec<String>,
 }
 
 /// What `plan_update` takes. Nothing already recorded is rewritten.
@@ -121,6 +124,9 @@ pub struct PlanEdit {
     pub progress_note: Option<String>,
     /// New steps appended after the existing ones.
     pub add_steps: Vec<String>,
+    /// Acceptance scenarios appended to `## Acceptance scenarios`; one
+    /// already recorded is not repeated.
+    pub add_acceptance: Vec<String>,
     /// The regression test of a `bug_fixing` plan.
     pub regression_test: Option<String>,
     /// Declare the fix feature-scale (the close then needs a "Landed design"
@@ -249,12 +255,15 @@ impl PlanBoard {
             .map_err(|e| format!("could not read plan {id}: {e}"))
     }
 
-    /// Create an open plan and write its plan file.
+    /// Create an open plan and write its plan file. An `## Acceptance
+    /// scenarios` section written into the context joins the plan's
+    /// acceptance scenarios instead of being escaped into the context.
     pub fn create(&self, draft: PlanDraft) -> Result<BoardPlan, String> {
         let title = collapse_whitespace(&draft.title);
         let goal = draft.goal.trim();
         let steps = clean_steps(&draft.steps);
-        if title.is_empty() || goal.is_empty() || draft.context.trim().is_empty() {
+        let (context, lifted) = lift_acceptance(&draft.context);
+        if title.is_empty() || goal.is_empty() || context.is_empty() {
             return Err("a plan needs a title, a goal, and a context".to_string());
         }
         if steps.is_empty() {
@@ -271,7 +280,7 @@ impl PlanBoard {
         // The same resumability bar create_plan applies. A board plan's steps
         // are real work (no locked bug skeleton), so every kind gets the
         // step check.
-        let issues: Vec<String> = context_issue(&draft.context, draft.kind, None, true)
+        let issues: Vec<String> = context_issue(&context, draft.kind, None, true)
             .into_iter()
             .chain(step_issue(&steps, false))
             .collect();
@@ -287,7 +296,7 @@ impl PlanBoard {
         let mut plan = PlanFile::new(
             title,
             escape_section_markers(goal),
-            escape_section_markers(draft.context.trim()),
+            escape_section_markers(&context),
             steps,
         );
         plan.kind = draft.kind;
@@ -297,6 +306,7 @@ impl PlanBoard {
                 push_line(&mut plan.interfaces, format!("- {}: {interface}", today()));
             }
         }
+        add_scenarios(&mut plan, draft.acceptance.iter().chain(&lifted));
         plan.bug_symptom = bug.filter(|_| draft.kind == PlanKind::BugFixing);
         std::fs::create_dir_all(&self.plans_dir).map_err(|e| e.to_string())?;
         self.save_plan(&id, &plan)?;
@@ -314,17 +324,19 @@ impl PlanBoard {
         Ok(view)
     }
 
-    /// Edit an open plan: append context, record a decision, add steps, set
-    /// the regression test or the landed-design flag.
+    /// Edit an open plan: append context, record a decision, add steps or
+    /// acceptance scenarios, set the regression test or the landed-design
+    /// flag. As in [`create`](Self::create), an `## Acceptance scenarios`
+    /// section in the appended context joins the acceptance scenarios.
     pub fn update(&self, id: &str, edit: PlanEdit) -> Result<BoardPlan, String> {
         let _guard = self.guard();
         let (entry, mut plan) = self.load(id)?;
         require_open(&entry)?;
-        if let Some(extra) = edit.context_append.as_deref().map(str::trim) {
-            if !extra.is_empty() {
-                plan.context = format!("{}\n\n{}", plan.context, escape_section_markers(extra));
-            }
+        let (extra, lifted) = lift_acceptance(edit.context_append.as_deref().unwrap_or(""));
+        if !extra.is_empty() {
+            plan.context = format!("{}\n\n{}", plan.context, escape_section_markers(&extra));
         }
+        add_scenarios(&mut plan, edit.add_acceptance.iter().chain(&lifted));
         if let Some(decision) = edit.decision.as_deref().map(collapse_whitespace) {
             if !decision.is_empty() {
                 push_line(&mut plan.decisions, format!("- {}: {decision}", today()));
@@ -362,9 +374,10 @@ impl PlanBoard {
     }
 
     /// The worker brief header for `step` (1-based): the plan's title, goal,
-    /// kind, bug, context, decisions, a step list, and the assigned step's
-    /// full text. Refuses an unknown, closed, or abandoned plan, a missing
-    /// step, and a step that is already done.
+    /// kind, bug, context, decisions, interfaces, acceptance scenarios, a
+    /// step list, and the assigned step's full text. Refuses an unknown,
+    /// closed, or abandoned plan, a missing step, and a step that is already
+    /// done.
     pub fn brief_for(&self, id: &str, step: usize) -> Result<String, String> {
         let _guard = self.guard();
         let (entry, plan) = self.load(id)?;
@@ -394,6 +407,12 @@ impl PlanBoard {
             out.push_str(
                 "\nFollow these interface contracts exactly. If one is wrong or insufficient, \
                  message the lead instead of changing it.\n",
+            );
+        }
+        if let Some(acceptance) = &plan.acceptance {
+            out.push_str(&format!("\n## Acceptance scenarios\n{acceptance}\n"));
+            out.push_str(
+                "\nThe lead verifies these observable outcomes on the integrated result.\n",
             );
         }
         out.push_str("\n## Steps\n");
@@ -974,6 +993,68 @@ fn step_paths(text: &str) -> Vec<String> {
     out
 }
 
+/// Split `## Acceptance scenarios` sections out of free text (a lead's
+/// context): `(the rest, trimmed; the sections' scenarios)`. The context is
+/// escaped on write, so a heading left in it would read as prose rather
+/// than as the plan's acceptance scenarios. A section runs to the next line
+/// the plan parser treats as structure (`# ` or `## `); a line that is not
+/// a list item continues the scenario before it.
+fn lift_acceptance(text: &str) -> (String, Vec<String>) {
+    let mut rest = Vec::new();
+    let mut scenarios: Vec<String> = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            inside = heading.trim().eq_ignore_ascii_case("acceptance scenarios");
+            if inside {
+                continue;
+            }
+        } else if trimmed.starts_with("# ") {
+            inside = false;
+        }
+        if !inside {
+            rest.push(line);
+        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            scenarios.push(trimmed.to_string());
+        } else if !trimmed.is_empty() {
+            match scenarios.last_mut() {
+                Some(last) => {
+                    last.push(' ');
+                    last.push_str(trimmed);
+                }
+                None => scenarios.push(trimmed.to_string()),
+            }
+        }
+    }
+    (rest.join("\n").trim().to_string(), scenarios)
+}
+
+/// Record acceptance scenarios as `- ` bullets in `## Acceptance
+/// scenarios`: each collapsed to one line (so it cannot inject a section),
+/// a leading list marker dropped, blanks and already recorded ones skipped.
+fn add_scenarios<'a>(plan: &mut PlanFile, scenarios: impl IntoIterator<Item = &'a String>) {
+    for scenario in scenarios {
+        let text = collapse_whitespace(scenario);
+        let text = text
+            .strip_prefix("- ")
+            .or_else(|| text.strip_prefix("* "))
+            .unwrap_or(&text)
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let line = format!("- {text}");
+        let recorded = plan
+            .acceptance
+            .as_deref()
+            .is_some_and(|body| body.lines().any(|l| l.trim() == line));
+        if !recorded {
+            push_line(&mut plan.acceptance, line);
+        }
+    }
+}
+
 /// Append one line to an optional section body.
 fn push_line(body: &mut Option<String>, line: String) {
     match body {
@@ -1172,6 +1253,79 @@ mod tests {
         let bare = create(&board, "Bare");
         let brief = board.brief_for(&bare.id, 1).unwrap();
         assert!(!brief.contains("Interfaces") && !brief.contains("message the lead"));
+    }
+
+    #[test]
+    fn acceptance_scenarios_are_recorded_kept_and_carried_into_briefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                acceptance: vec!["A restart reloads\nevery saved row.".to_string(), " ".to_string()],
+                context: format!(
+                    "{CONTEXT}\n## Acceptance scenarios\n- Empty cells keep their row\n  in the export.\n## Notes\nSee the issue."
+                ),
+                ..draft("Importer")
+            })
+            .unwrap();
+        // The heading written into the context becomes the plan's real
+        // section; other headings there are still escaped context.
+        let text = board.read_markdown(&plan.id).unwrap();
+        assert!(
+            text.contains(
+                "\n## Acceptance scenarios\n- A restart reloads every saved row.\n- Empty cells keep their row in the export.\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("\\## Acceptance scenarios"), "{text}");
+        assert!(text.contains("\\## Notes\nSee the issue."), "{text}");
+
+        // Later updates and step ticks keep the section; plan_update adds to
+        // it (also from appended context) without repeating a scenario.
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    add_acceptance: vec![
+                        "- A restart reloads every saved row.".to_string(),
+                        "The CLI flags are unchanged.".to_string(),
+                    ],
+                    context_append: Some(
+                        "Also: windows paths.\n## Acceptance scenarios\n- Windows paths round-trip through the importer."
+                            .to_string(),
+                    ),
+                    decision: Some("use serde".to_string()),
+                    add_steps: vec!["Update docs/import.md".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        board.tick(&plan.id, 0, "merged abc123").unwrap();
+        board.untick(&plan.id, 0, "reverted").unwrap();
+        board.tick(&plan.id, 1, "merged def456").unwrap();
+        let parsed =
+            PlanFile::read_from_file(&dir.path().join("plans").join(format!("{}.md", plan.id)))
+                .unwrap();
+        assert_eq!(
+            parsed.acceptance.as_deref(),
+            Some(
+                "- A restart reloads every saved row.\n- Empty cells keep their row in the export.\n- The CLI flags are unchanged.\n- Windows paths round-trip through the importer."
+            )
+        );
+        assert!(parsed.context.ends_with("Also: windows paths."), "{}", parsed.context);
+        assert!(!parsed.context.contains("Empty cells"), "{}", parsed.context);
+
+        let brief = board.brief_for(&plan.id, 3).unwrap();
+        assert!(
+            brief.contains("\n## Acceptance scenarios\n- A restart reloads every saved row.\n"),
+            "{brief}"
+        );
+        assert!(brief.find("## Acceptance scenarios").unwrap() < brief.find("## Steps").unwrap());
+
+        // A plan without scenarios has no section, in its file or its brief.
+        let plain = create(&board, "Exporter");
+        assert!(!board.read_markdown(&plain.id).unwrap().contains("Acceptance scenarios"));
+        assert!(!board.brief_for(&plain.id, 1).unwrap().contains("Acceptance scenarios"));
     }
 
     #[test]

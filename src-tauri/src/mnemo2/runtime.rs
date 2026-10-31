@@ -2063,6 +2063,25 @@ mod tests {
             .id
     }
 
+    /// A one-step board plan with `goal` and one acceptance scenario, so it
+    /// takes high-risk dispatches and audits.
+    fn new_audited_plan(lead: &LeadRuntime, goal: &str, scenario: &str) -> String {
+        lead.board_handle()
+            .expect("the lead's plan board")
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Audited plan".into(),
+                goal: goal.into(),
+                context:
+                    "verified: the host owns dispatch; src/lib.rs is the anchor file for the change"
+                        .into(),
+                steps: vec!["**Change** - implement src/lib.rs".into()],
+                acceptance: vec![scenario.into()],
+                ..Default::default()
+            })
+            .expect("the plan is created")
+            .id
+    }
+
     /// Dispatch through the lead tool under `plan`/`step`, then make the
     /// worker mergeable: stopped, one committed file, reviewed, checked.
     async fn mergeable_worker(
@@ -5036,37 +5055,21 @@ mod tests {
             invalid.output
         );
 
-        // High-risk dispatch requires the active plan's acceptance scenarios:
-        // with no active plan the dispatch is refused before provisioning.
-        let no_plan = team
-            .handle_lead_host_tool(
-                "team_dispatch",
-                serde_json::json!({
-                    "worker_id": "hiresk0001",
-                    "plan_id": plan,
-                    "step": 1,
-                    "brief": "high-risk task",
-                    "review_risk": "high"
-                }),
+        // High-risk dispatch requires a board plan step: a plan-free
+        // high-risk dispatch is refused.
+        let plan_free = team
+            .dispatch_with_id(
+                "high-risk task".into(),
+                None,
+                Some("hiresk0001".into()),
+                Some("high".into()),
             )
-            .await;
-        assert!(!no_plan.success);
-        assert!(no_plan.output.contains("stack.json"), "{}", no_plan.output);
-        assert!(team.worker("hiresk0001").await.is_err());
-        assert!(team.snapshot().await.workers.is_empty());
+            .await
+            .expect_err("high-risk work needs a board plan");
+        assert!(plan_free.contains("board plan step"), "{plan_free}");
 
-        // A plan without the section still blocks…
-        let plans = root.path().join(".coding/plans");
-        std::fs::create_dir_all(&plans).expect("plans dir");
-        std::fs::write(
-            plans.join("stack.json"),
-            format!("{{\"stack\":[\"{plan}\"],\"reviewed\":false}}"),
-        )
-        .expect("stack");
-        // The board plan document already exists and has no acceptance
-        // scenarios; overwriting it would erase its steps.
-        run_git(root.path(), &["add", ".coding/plans"]);
-        run_git(root.path(), &["commit", "-m", "plan without scenarios"]);
+        // The dispatched plan must declare acceptance scenarios: one without
+        // them is refused before provisioning.
         let no_section = team
             .handle_lead_host_tool(
                 "team_dispatch",
@@ -5081,23 +5084,27 @@ mod tests {
             .await;
         assert!(!no_section.success);
         assert!(
-            no_section.output.contains("does not declare"),
+            no_section.output.contains(&format!("plan '{plan}' does not declare")),
             "{}",
             no_section.output
         );
+        assert!(team.worker("hiresk0001").await.is_err());
+        assert!(team.snapshot().await.workers.is_empty());
 
-        // …while observable bullets unblock it, and the risk is recorded.
-        let plan_doc = plans.join(format!("{plan}.md"));
-        let document = std::fs::read_to_string(&plan_doc).expect("board plan doc");
-        std::fs::write(
-            &plan_doc,
-            format!(
-                "{document}\n## Acceptance scenarios\n\n- A high-risk worker cannot merge without structured evidence.\n"
-            ),
-        )
-        .expect("plan doc");
-        run_git(root.path(), &["add", ".coding/plans"]);
-        run_git(root.path(), &["commit", "-m", "plan acceptance scenarios"]);
+        // …while observable scenarios added through the board unblock it,
+        // and the risk is recorded.
+        lead.board_handle()
+            .expect("the lead's plan board")
+            .update(
+                &plan,
+                mnemo::app::plan_board::PlanEdit {
+                    add_acceptance: vec![
+                        "A high-risk worker cannot merge without structured evidence.".into(),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .expect("the scenarios are recorded");
         let dispatched = team
             .handle_lead_host_tool(
                 "team_dispatch",
@@ -5344,6 +5351,99 @@ mod tests {
         lead.shutdown().await;
     }
 
+    /// Regression: high-risk dispatch and audits read the dispatched board
+    /// plan, not Mnemo1's `.coding/plans/stack.json`, which the board never
+    /// writes. A plan created through `plan_create` with acceptance
+    /// scenarios takes a high-risk dispatch and an audit with no stack file,
+    /// and its scenarios survive a later `plan_update`.
+    #[tokio::test]
+    async fn high_risk_dispatch_and_audit_use_the_board_plan_without_stack_json() {
+        use mnemo::app::tool::workflow::board::{PlanCreateTool, PlanUpdateTool};
+        use mnemo::tool::Tool;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team_spawns(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(vec![
+                text_turn(&["done"]),
+                text_turn(&["audit findings: none"]),
+            ])),
+            2,
+        )
+        .await;
+        let board = lead.board_handle().expect("the lead's plan board");
+        let created = PlanCreateTool::new(board.clone())
+            .execute(serde_json::json!({
+                "title": "Persist workers",
+                "goal": "Reload worker records after a restart",
+                "context": "verified: the host owns dispatch; src/lib.rs is the anchor file for the change",
+                "steps": ["**Persist** - implement src/lib.rs"],
+                "acceptance_scenarios": [
+                    "BOARD-SCENARIO-MARKER a restart reloads every saved worker record."
+                ]
+            }))
+            .await;
+        assert!(created.success, "{}", created.output);
+        let plan = created.data.expect("plan data")["id"]
+            .as_str()
+            .expect("plan id")
+            .to_string();
+        let updated = PlanUpdateTool::new(board.clone())
+            .execute(serde_json::json!({
+                "plan_id": plan,
+                "decision": "keep the team.json format",
+                "context_append": "Also: Windows paths."
+            }))
+            .await;
+        assert!(updated.success, "{}", updated.output);
+        assert!(
+            !root.path().join(".coding/plans/stack.json").exists(),
+            "the board never writes Mnemo1's plan stack"
+        );
+
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "boardrisk01",
+                    "plan_id": plan,
+                    "step": 1,
+                    "brief": "persist worker records",
+                    "review_risk": "high"
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        let worker = team.worker("boardrisk01").await.expect("high-risk worker");
+        assert_eq!(worker.review_risk, "high");
+        team.stop(&worker.id).await.expect("stop");
+        std::fs::write(worker.worktree.join("feature.rs"), "pub fn feature() {}\n")
+            .expect("worker source");
+        run_git(&worker.worktree, &["add", "feature.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "feature"]);
+
+        let audited = team
+            .handle_lead_host_tool(
+                "team_audit_dispatch",
+                serde_json::json!({"worker_id": worker.id, "reviewer_id": "boardaudit01"}),
+            )
+            .await;
+        assert!(audited.success, "{}", audited.output);
+        let audit = team.worker("boardaudit01").await.expect("audit record");
+        assert!(audit.brief.contains(&plan), "the audit names the worker's plan");
+        assert!(
+            audit.brief.contains("BOARD-SCENARIO-MARKER"),
+            "the audit brief carries the board plan's acceptance scenarios"
+        );
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
     #[tokio::test]
     async fn stale_audit_blocks_high_risk_merge_until_a_fresh_audit() {
         use crate::mnemo2::team::WorkerStatus;
@@ -5363,27 +5463,21 @@ mod tests {
             2,
         )
         .await;
-        let plans = root.path().join(".coding/plans");
-        std::fs::create_dir_all(&plans).expect("plans dir");
-        std::fs::write(
-            plans.join("stack.json"),
-            r#"{"stack":["planid02"],"reviewed":false}"#,
-        )
-        .expect("stack");
-        std::fs::write(
-            plans.join("planid02.md"),
-            "# Plan\n\n## Acceptance scenarios\n\n- A fix commit invalidates the prior audit.\n",
-        )
-        .expect("plan doc");
-        run_git(root.path(), &["add", ".coding/plans"]);
-        run_git(root.path(), &["commit", "-m", "plan acceptance scenarios"]);
+        let plan = new_audited_plan(
+            &lead,
+            "Ship the audited change",
+            "A fix commit invalidates the prior audit.",
+        );
 
-        let worker = team
-            .dispatch_with_id(
+        let (worker, _) = team
+            .dispatch_on_plan(
                 "high-risk feature".into(),
+                None,
                 None,
                 Some("stalesk01".into()),
                 Some("high".into()),
+                &plan,
+                1,
             )
             .await
             .expect("dispatch");
@@ -5475,28 +5569,22 @@ mod tests {
         ]));
         let (lead, team) =
             open_git_team_spawns(&root, &config, &state, llm.clone(), 2).await;
-        let plans = root.path().join(".coding/plans");
-        std::fs::create_dir_all(&plans).expect("plans dir");
-        std::fs::write(
-            plans.join("stack.json"),
-            r#"{"stack":["planid03"],"reviewed":false}"#,
-        )
-        .expect("stack");
-        std::fs::write(
-            plans.join("planid03.md"),
-            "# Plan\n\n## Goal\nShip PLANID03-GOAL-MARKER.\n\n## Acceptance scenarios\n\n- The audit receives the plan.\n",
-        )
-        .expect("plan doc");
-        run_git(root.path(), &["add", ".coding/plans"]);
-        run_git(root.path(), &["commit", "-m", "plan"]);
+        let plan = new_audited_plan(
+            &lead,
+            "Ship PLANID03-GOAL-MARKER.",
+            "The audit receives the plan.",
+        );
 
         // One implementation worker with a distinctive intent brief.
-        let worker = team
-            .dispatch_with_id(
+        let (worker, _) = team
+            .dispatch_on_plan(
                 "INTENT-MARKER-77 implement the flux capacitor".into(),
+                None,
                 None,
                 Some("auditsk01".into()),
                 None,
+                &plan,
+                1,
             )
             .await
             .expect("dispatch");
@@ -6915,17 +7003,6 @@ mod tests {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_config(config.path(), &["scripted-a"]);
-        let plans = root.path().join(".coding/plans");
-        std::fs::create_dir_all(&plans).expect("plans dir");
-        std::fs::write(
-            plans.join("stack.json"),
-            r#"{"stack":["planid04"],"reviewed":false}"#,
-        )
-        .expect("stack");
-        std::fs::write(plans.join("planid04.md"), "# Plan\n\n## Goal\nAudited change.\n")
-            .expect("plan doc");
-        run_git(root.path(), &["add", ".coding/plans"]);
-        run_git(root.path(), &["commit", "-m", "plan"]);
         let llm = Arc::new(ScriptedLlm::new(vec![
             text_turn(&["worker done"]),
             text_turn(&["audit complete"]),
@@ -6937,12 +7014,16 @@ mod tests {
             .await
             .expect("lead opens");
         let team = lead.team_handle().await.expect("lead's actual team");
-        let worker = team
-            .dispatch_with_id(
+        let plan = new_audited_plan(&lead, "Audited change.", "The lead adjudicates every audit.");
+        let (worker, _) = team
+            .dispatch_on_plan(
                 "implement the audited change".into(),
+                None,
                 None,
                 Some("notice0002".into()),
                 None,
+                &plan,
+                1,
             )
             .await
             .expect("worker dispatches");

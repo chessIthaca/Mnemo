@@ -160,6 +160,13 @@ pub struct PlanFile {
     /// `#[serde(skip)]` keeps it off the frontend wire shape.
     #[serde(skip)]
     pub interfaces: Option<String>,
+    /// The plan's acceptance scenarios: the raw `## Acceptance scenarios`
+    /// body, one observable bullet per scenario. Mnemo2's high-risk dispatch
+    /// and audits read them from the dispatched board plan. `None` when the
+    /// plan declares none. Persisted verbatim; `#[serde(skip)]` keeps it off
+    /// the frontend wire shape.
+    #[serde(skip)]
+    pub acceptance: Option<String>,
     /// The plan board's outcome log (Mnemo2 Phase 6): the raw `## Progress`
     /// body, one bullet per step outcome. `None` for Mnemo1 plans.
     /// Persisted verbatim; `#[serde(skip)]` keeps it off the frontend wire
@@ -219,6 +226,7 @@ pub struct Step {
         let mut reviews: Vec<ReviewRoundStamp> = Vec::new();
         let mut decisions = String::new();
         let mut interfaces = String::new();
+        let mut acceptance = String::new();
         let mut progress = String::new();
         let mut steps = Vec::new();
 
@@ -246,6 +254,7 @@ pub struct Step {
                     "reviews" => Section::Reviews,
                     "decisions" => Section::Decisions,
                     "interfaces" => Section::Interfaces,
+                    "acceptance scenarios" => Section::Acceptance,
                     "progress" => Section::Progress,
                     "steps" => Section::Steps,
                     "detailed steps" => Section::DetailedSteps,
@@ -342,6 +351,12 @@ pub struct Step {
                     }
                     interfaces.push_str(line);
                 }
+                Section::Acceptance => {
+                    if !acceptance.is_empty() {
+                        acceptance.push('\n');
+                    }
+                    acceptance.push_str(line);
+                }
                 Section::Progress => {
                     if !progress.is_empty() {
                         progress.push('\n');
@@ -386,6 +401,7 @@ pub struct Step {
             reviews,
             decisions: Some(decisions.trim().to_string()).filter(|d| !d.is_empty()),
             interfaces: Some(interfaces.trim().to_string()).filter(|d| !d.is_empty()),
+            acceptance: Some(acceptance.trim().to_string()).filter(|a| !a.is_empty()),
             progress: Some(progress.trim().to_string()).filter(|p| !p.is_empty()),
             steps,
         })
@@ -404,6 +420,7 @@ enum Section {
     Reviews,
     Decisions,
     Interfaces,
+    Acceptance,
     Progress,
     Other,
 }

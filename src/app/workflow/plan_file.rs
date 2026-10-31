@@ -67,6 +67,7 @@ impl PlanFile {
             reviews: Vec::new(),
             decisions: None,
             interfaces: None,
+            acceptance: None,
             progress: None,
             steps,
         }
@@ -75,12 +76,16 @@ impl PlanFile {
     /// Serialize the plan back to markdown.
     pub fn serialize(&self) -> String {
         let mut out = format!(
-            "# Plan: {}\n\n## Goal\n{}\n\n## Kind\n{}\n\n## Context\n{}\n\n## Steps\n",
+            "# Plan: {}\n\n## Goal\n{}\n\n## Kind\n{}\n\n## Context\n{}\n\n",
             self.title,
             self.goal,
             self.kind.as_str(),
             self.context
         );
+        if let Some(acceptance) = &self.acceptance {
+            out.push_str(&format!("## Acceptance scenarios\n{acceptance}\n\n"));
+        }
+        out.push_str("## Steps\n");
         for step in &self.steps {
             let mark = if step.done { 'x' } else { ' ' };
             out.push_str(&format!("- [{}] {}. {}\n", mark, step.index + 1, step.text));
@@ -1200,5 +1205,33 @@ C
         assert!(!old.serialize().contains("## Decisions"));
         assert!(!old.serialize().contains("## Interfaces"));
         assert!(!old.serialize().contains("## Progress"));
+    }
+
+    #[test]
+    fn acceptance_section_roundtrips_and_stays_optional() {
+        let mut plan = PlanFile::new("T", "G", "C", vec!["one".into()]);
+        plan.acceptance =
+            Some("- A restart reloads every record.\n- The export is byte-identical.".into());
+        let text = plan.serialize();
+        assert!(
+            text.contains(
+                "\n## Context\nC\n\n## Acceptance scenarios\n- A restart reloads every record.\n- The export is byte-identical.\n\n## Steps\n- [ ] 1. one\n"
+            ),
+            "{text}"
+        );
+        let parsed = PlanFile::parse(&text).unwrap();
+        assert_eq!(parsed.acceptance, plan.acceptance);
+        assert_eq!(parsed.context, "C");
+        assert_eq!(parsed.steps.len(), 1);
+        assert_eq!(parsed.serialize(), text);
+
+        // A plan without scenarios serializes exactly as before the section
+        // existed.
+        let old = PlanFile::new("T", "G", "C", vec!["one".into()]);
+        assert!(old.acceptance.is_none());
+        assert_eq!(
+            old.serialize(),
+            "# Plan: T\n\n## Goal\nG\n\n## Kind\nimplementation\n\n## Context\nC\n\n## Steps\n- [ ] 1. one\n"
+        );
     }
 }

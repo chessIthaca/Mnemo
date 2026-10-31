@@ -817,6 +817,14 @@ impl TeamRuntime {
         self.board.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The markdown of the board plan `plan_id`: what the high-risk gate
+    /// scans for acceptance scenarios and what an audit brief carries.
+    fn plan_document(&self, plan_id: &str) -> Result<String, String> {
+        self.board()
+            .ok_or_else(|| "the plan board is not available".to_string())?
+            .read_markdown(plan_id)
+    }
+
     /// Every board plan with the workers stamped on each step. Report paths
     /// are relative to the project root.
     pub async fn board_snapshot(&self) -> Result<BoardSnapshot, String> {
@@ -1299,14 +1307,14 @@ impl TeamRuntime {
         vec![
             HostToolSpec {
                 name: "team_dispatch".to_string(),
-                description: "Delegate one implementation task through TeamManager to a full executor worker, under a step of a plan on the plan board (plan first: plan_create, then dispatch with its plan_id and 1-based step). The worker receives the plan and its step automatically, so your brief is only the task-specific instructions. A step is checked off when one of its tasks merges and none is still open. Workers run in their own worktree and branch with file_edit, file_write, shell, git, and tests, and have no token or cost budget: give them whole, self-contained implementation tasks (code, tests, verification, commit), never read-only, content-only, or 'send me the file text' briefs. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. Mark shared contracts, persistence, concurrency, security, or large/cross-cutting work with review_risk='high'; high-risk dispatch requires the active plan's '## Acceptance scenarios' section with observable bullets. The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"review_risk":{"type":"string","enum":["standard","high"],"description":"Lead-assigned review risk; high risk requires observable acceptance scenarios and an independent audit before merge."}},"required":dispatch_required}),
+                description: "Delegate one implementation task through TeamManager to a full executor worker, under a step of a plan on the plan board (plan first: plan_create, then dispatch with its plan_id and 1-based step). The worker receives the plan and its step automatically, so your brief is only the task-specific instructions. A step is checked off when one of its tasks merges and none is still open. Workers run in their own worktree and branch with file_edit, file_write, shell, git, and tests, and have no token or cost budget: give them whole, self-contained implementation tasks (code, tests, verification, commit), never read-only, content-only, or 'send me the file text' briefs. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. Mark shared contracts, persistence, concurrency, security, or large/cross-cutting work with review_risk='high'; high-risk dispatch requires that plan to declare observable acceptance scenarios (plan_create acceptance_scenarios or plan_update add_acceptance_scenarios). The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"review_risk":{"type":"string","enum":["standard","high"],"description":"Lead-assigned review risk; high risk requires observable acceptance scenarios on this plan and an independent audit before merge."}},"required":dispatch_required}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
                 name: "team_audit_dispatch".to_string(),
-                description: "Dispatch a fresh read-only independent audit of one implementation worker's current branch/tip for a high-risk review. The reviewer_id is a stable unique 8-64 ASCII letters/digits ID of your choosing; retry a timed-out dispatch with that same identity for the same worker and tip, and choose a new reviewer_id after any fix commit moves the tip. The audit receives the active plan, the worker's intent brief, and the target diff — never the worker's own summary or findings — and cannot edit files, commit, merge, spawn, ask the user, or tick plan steps. When it completes, link it through team_review's evidence.independent_reviewer_id and write an audit_adjudication; never merge the audit worker itself.".to_string(),
+                description: "Dispatch a fresh read-only independent audit of one implementation worker's current branch/tip for a high-risk review. The reviewer_id is a stable unique 8-64 ASCII letters/digits ID of your choosing; retry a timed-out dispatch with that same identity for the same worker and tip, and choose a new reviewer_id after any fix commit moves the tip. The audit receives the worker's board plan, its intent brief, and the target diff — never the worker's own summary or findings — and cannot edit files, commit, merge, spawn, ask the user, or tick plan steps. When it completes, link it through team_review's evidence.independent_reviewer_id and write an audit_adjudication; never merge the audit worker itself.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"reviewer_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"model":{"type":"string"},"reasoning_effort":{"type":"string","enum":["max","high","medium","low","minimal","none"]},"brief":{"type":"string"}},"required":["worker_id","reviewer_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
@@ -1817,12 +1825,17 @@ impl TeamRuntime {
         if brief.trim().is_empty() {
             return Err("the worker brief is empty".to_string());
         }
-        // High-risk work needs observable acceptance scenarios the lead can
-        // verify at closing integration; standard dispatch needs none.
+        // High-risk work needs observable acceptance scenarios on the
+        // dispatched board plan, which the lead verifies at closing
+        // integration; standard dispatch needs none.
         let review_risk = match review_risk.as_deref() {
             None | Some("standard") => "standard".to_string(),
             Some("high") => {
-                require_acceptance_scenarios(&self.workspace_root)?;
+                let plan = plan.as_ref().ok_or_else(|| {
+                    "review_risk='high' requires a board plan step: dispatch with plan_id and step on a plan that declares acceptance scenarios".to_string()
+                })?;
+                let doc = self.plan_document(&plan.plan_id)?;
+                require_acceptance_scenarios(&plan.plan_id, &doc)?;
                 "high".to_string()
             }
             Some(other) => {
@@ -1948,11 +1961,11 @@ impl TeamRuntime {
     /// The audit reuses the tracked session/telemetry lifecycle: it gets its
     /// own worktree checked out at the audited branch, its own ledger record
     /// (`kind: "audit"`, no plan step), and the standard worker event pump.
-    /// Its opening brief carries the active plan, the lead's intent brief,
-    /// and the target diff — never the implementation worker's own summary,
-    /// findings, or review — and its tool selection is read-only by
-    /// construction: no file mutation, shell, git writes, spawning, user
-    /// questions, or plan-step ticks.
+    /// Its opening brief carries the implementation worker's board plan, the
+    /// lead's intent brief, and the target diff — never the implementation
+    /// worker's own summary, findings, or review — and its tool selection is
+    /// read-only by construction: no file mutation, shell, git writes,
+    /// spawning, user questions, or plan-step ticks.
     ///
     /// Idempotency: retrying the same `reviewer_id` for the same worker and
     /// the same tip reuses (and restarts, when needed) the existing audit;
@@ -2051,9 +2064,15 @@ impl TeamRuntime {
         {
             return Err(format!("reviewer ID prefix collides with an existing {branch}"));
         }
-        // The audit reviews a plan's change: the active plan document is its
-        // context, alongside the lead's intent and the target diff.
-        let (plan_id, plan_doc) = active_plan_document(&self.workspace_root)?;
+        // The audit reviews a plan step's change: the implementation
+        // worker's board plan is its context, alongside the lead's intent
+        // and the target diff.
+        let plan_id = target.plan_id.clone().ok_or_else(|| {
+            format!(
+                "worker '{worker_id}' was not dispatched on a board plan; audits review a plan step's change, so only workers dispatched with plan_id and step can be audited"
+            )
+        })?;
+        let plan_doc = self.plan_document(&plan_id)?;
         let audit_brief = audit_brief_text(
             &self.workspace_root,
             &target,
@@ -4612,16 +4631,6 @@ fn worker_result<T: Serialize>(result: Result<T, String>, action: &str) -> ToolR
     }
 }
 
-/// Enforce every source/evidence precondition while the merge lock is held.
-/// The active-plan stack (`.coding/plans/stack.json`), read for high-risk
-/// dispatch validation.
-#[derive(Deserialize)]
-struct PlanStack {
-    /// Plan ids, newest active plan last.
-    #[serde(default)]
-    stack: Vec<String>,
-}
-
 /// Scan a plan document for its `## Acceptance scenarios` section.
 ///
 /// Returns whether the section exists and how many observable bullets it
@@ -4661,43 +4670,28 @@ fn acceptance_scenarios(doc: &str) -> (bool, usize) {
     (found, bullets)
 }
 
-/// Require the lead's active plan document to declare observable
-/// `## Acceptance scenarios` before a high-risk dispatch.
+/// Require the dispatched board plan's document to declare observable
+/// `## Acceptance scenarios` before a high-risk dispatch on it.
 ///
-/// Returns actionable errors for every failure mode: no active plan, an
-/// unreadable plan document, a missing section, or a section without an
-/// observable bullet.
-fn require_acceptance_scenarios(root: &Path) -> Result<(), String> {
-    let plans_dir = root.join(".coding/plans");
-    let guidance = "dispatch with review_risk='standard', or give the active plan a '## Acceptance scenarios' section with observable bullets before dispatching high-risk work";
-    let stack = std::fs::read_to_string(plans_dir.join("stack.json")).map_err(|_| {
-        format!("review_risk='high' requires the active plan's acceptance scenarios, but no active plan was found in .coding/plans/stack.json; {guidance}")
-    })?;
-    let stack: PlanStack = serde_json::from_str(&stack).map_err(|_| {
-        format!("review_risk='high' requires the active plan's acceptance scenarios, but .coding/plans/stack.json is unreadable; {guidance}")
-    })?;
-    let Some(id) = stack.stack.last() else {
-        return Err(format!(
-            "review_risk='high' requires the active plan's acceptance scenarios, but the plan stack is empty; {guidance}"
-        ));
-    };
-    let doc = std::fs::read_to_string(plans_dir.join(format!("{id}.md"))).map_err(|_| {
-        format!("review_risk='high' requires the active plan's acceptance scenarios, but plan '{id}' has no readable document at .coding/plans/{id}.md; {guidance}")
-    })?;
-    let (found, bullets) = acceptance_scenarios(&doc);
+/// Returns an actionable error for a missing section and for a section
+/// without an observable bullet.
+fn require_acceptance_scenarios(plan_id: &str, doc: &str) -> Result<(), String> {
+    let guidance = "add observable scenarios with plan_update add_acceptance_scenarios, or dispatch with review_risk='standard'";
+    let (found, bullets) = acceptance_scenarios(doc);
     if !found {
         return Err(format!(
-            "the active plan '{id}' does not declare a '## Acceptance scenarios' section; add one with observable bullets describing verifiable outcomes before dispatching high-risk work"
+            "review_risk='high' requires acceptance scenarios, but plan '{plan_id}' does not declare any; {guidance}"
         ));
     }
     if bullets == 0 {
         return Err(format!(
-            "the active plan '{id}' declares '## Acceptance scenarios' but no observable bullet was found; write at least one concrete, verifiable outcome bullet before dispatching high-risk work"
+            "review_risk='high' requires acceptance scenarios, but plan '{plan_id}' has no observable bullet (a concrete, verifiable outcome of at least eight characters); {guidance}"
         ));
     }
     Ok(())
 }
 
+/// Enforce every source/evidence precondition while the merge lock is held.
 fn validate_merge(worker: &WorkerRecord, tip: &str, records: &[WorkerRecord]) -> Result<(), String> {
     if worker.status != WorkerStatus::InReview {
         return Err(format!("worker is {:?}, not in review", worker.status));
@@ -4876,25 +4870,6 @@ fn audit_guardrails() -> Guardrails {
     }
 }
 
-/// Load the lead's active plan document: `(plan id, markdown body)`.
-fn active_plan_document(root: &Path) -> Result<(String, String), String> {
-    let plans_dir = root.join(".coding/plans");
-    let stack = std::fs::read_to_string(plans_dir.join("stack.json")).map_err(|_| {
-        "no active plan was found in .coding/plans/stack.json; audits review a plan's change — activate the plan first".to_string()
-    })?;
-    let stack: PlanStack = serde_json::from_str(&stack).map_err(|_| {
-        ".coding/plans/stack.json is unreadable; fix the plan stack before dispatching an audit".to_string()
-    })?;
-    let id = stack
-        .stack
-        .last()
-        .ok_or_else(|| "the plan stack is empty; audits review a plan's change — activate the plan first".to_string())?
-        .clone();
-    let doc = std::fs::read_to_string(plans_dir.join(format!("{id}.md")))
-        .map_err(|_| format!("plan '{id}' has no readable document at .coding/plans/{id}.md"))?;
-    Ok((id, doc))
-}
-
 /// Cap one brief section, keeping the cut visible to the reviewer.
 fn truncate_for_brief(text: &str, limit: usize) -> String {
     if text.len() <= limit {
@@ -4962,7 +4937,7 @@ async fn audit_brief_text(
         text.push_str("\n\n");
     }
     text.push_str(&format!(
-        "## Plan context — active plan `{plan_id}`\n\n```markdown\n{plan_doc}\n```\n\n"
+        "## Plan context — board plan `{plan_id}`\n\n```markdown\n{plan_doc}\n```\n\n"
     ));
     text.push_str(&format!(
         "## Target diff `{merge_base}..{tip}`\n\n### Commits\n\n```\n{log}\n```\n\n### Stat\n\n```\n{stat}\n```\n\n### Full diff\n\n```diff\n{diff}\n```\n\n"
@@ -5839,49 +5814,32 @@ mod tests {
 
     #[test]
     fn high_risk_dispatch_requires_observable_acceptance_scenarios() {
-        let root = tempfile::tempdir().expect("plans root");
-        let plans = root.path().join(".coding/plans");
+        let no_section =
+            require_acceptance_scenarios("planid01", "# Plan\n\n## Goal\nShip it.\n")
+                .expect_err("a plan without the section must block high-risk dispatch");
+        assert!(no_section.contains("plan 'planid01' does not declare"), "{no_section}");
+        assert!(no_section.contains("add_acceptance_scenarios"), "{no_section}");
 
-        let missing = require_acceptance_scenarios(root.path())
-            .expect_err("no active plan must block high-risk dispatch");
-        assert!(missing.contains("stack.json"), "{missing}");
-
-        std::fs::create_dir_all(&plans).expect("plans dir");
-        std::fs::write(plans.join("stack.json"), r#"{"stack":[]}"#).expect("empty stack");
-        let empty = require_acceptance_scenarios(root.path())
-            .expect_err("an empty plan stack must block high-risk dispatch");
-        assert!(empty.contains("stack is empty"), "{empty}");
-
-        std::fs::write(
-            plans.join("stack.json"),
-            r#"{"stack":["planid01"],"reviewed":false}"#,
+        // A heading the board escaped into the context is prose, not the
+        // plan's section.
+        let escaped = require_acceptance_scenarios(
+            "planid01",
+            "# Plan\n\n## Context\n\\## Acceptance scenarios\n- A restart reloads every record.\n",
         )
-        .expect("stack");
-        let unreadable = require_acceptance_scenarios(root.path())
-            .expect_err("a missing plan document must block high-risk dispatch");
-        assert!(unreadable.contains("no readable document"), "{unreadable}");
+        .expect_err("an escaped heading must not count as the section");
+        assert!(escaped.contains("does not declare"), "{escaped}");
 
-        std::fs::write(plans.join("planid01.md"), "# Plan\n\n## Goal\nShip it.\n")
-            .expect("plan doc");
-        let no_section = require_acceptance_scenarios(root.path())
-            .expect_err("a plan without the section must block high-risk dispatch");
-        assert!(no_section.contains("does not declare"), "{no_section}");
-
-        std::fs::write(
-            plans.join("planid01.md"),
+        let no_bullet = require_acceptance_scenarios(
+            "planid01",
             "# Plan\n\n## Acceptance scenarios\n\n- x\n\nNone yet.\n",
         )
-        .expect("plan doc");
-        let no_bullet = require_acceptance_scenarios(root.path())
-            .expect_err("a section without observable bullets must block high-risk dispatch");
+        .expect_err("a section without observable bullets must block high-risk dispatch");
         assert!(no_bullet.contains("no observable bullet"), "{no_bullet}");
 
-        std::fs::write(
-            plans.join("planid01.md"),
+        require_acceptance_scenarios(
+            "planid01",
             "# Plan\n\n## Acceptance scenarios\n\n- A standard worker cannot merge with only a summary and passing checks.\n\n## Steps\n- done\n",
         )
-        .expect("plan doc");
-        require_acceptance_scenarios(root.path())
-            .expect("observable bullets validate high-risk dispatch");
+        .expect("observable bullets validate high-risk dispatch");
     }
 }

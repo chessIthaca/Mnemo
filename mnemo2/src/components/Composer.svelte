@@ -1,5 +1,6 @@
 <script lang="ts">
   import { ArrowUp, Square, X } from "@lucide/svelte";
+  import { parseNumericAnswer } from "../../../frontend/src/lib/answerSelect";
   import { fileToAttachedDataUrl } from "../../../frontend/src/lib/attachImages";
   import { actions, app } from "../lib/store";
   import LeadModelPicker from "./LeadModelPicker.svelte";
@@ -28,6 +29,20 @@
   const hasContent = $derived(
     draft.text.trim().length > 0 || draft.images.length > 0,
   );
+  // A pending question is answered from this same box: a numeric `N)` picks an
+  // option, anything else is a freeform answer. Approvals stay on their buttons.
+  const pendingQuestion = $derived(
+    $app.leadRuntime.pending?.kind === "question" &&
+      !!$app.leadRuntime.pending.question_id
+      ? $app.leadRuntime.pending
+      : null,
+  );
+  const canAnswerQuestion = $derived(
+    pendingQuestion !== null && $app.leadRuntime.status === "ready",
+  );
+  const canSubmit = $derived(
+    canAnswerQuestion ? draft.text.trim().length > 0 : hasContent,
+  );
 
   $effect(() => {
     if (!canInterrupt) stopping = false;
@@ -45,12 +60,30 @@
   }
 
   function send() {
+    if (canAnswerQuestion && pendingQuestion) {
+      submitAnswer(pendingQuestion);
+      return;
+    }
     if (!canSend) return;
     const message = draft.text.trim();
     const images = draft.images;
     // An image-only submission is a real message for a vision model.
     if (!message && images.length === 0) return;
     actions.sendLeadMessage(message, images);
+    actions.clearLeadDraft();
+  }
+
+  function submitAnswer(question: NonNullable<typeof pendingQuestion>) {
+    const questionId = question.question_id;
+    const answer = draft.text.trim();
+    if (!questionId || !answer) return;
+    const parsed = parseNumericAnswer(answer, question.options?.length ?? 0);
+    if (parsed?.kind === "choice") {
+      actions.answerLead(questionId, { kind: "choice", index: parsed.index });
+    } else {
+      // Any other text (including a bare number) is a freeform answer.
+      actions.answerLead(questionId, { kind: "freeform", text: answer });
+    }
     actions.clearLeadDraft();
   }
 
@@ -141,13 +174,21 @@
         <span>{stopping ? "Stopping…" : "Stop"}</span>
       </button>
     {/if}
-    {#if canSend}
+    {#if canAnswerQuestion || canSend}
       <button
         class="send-button"
         type="submit"
-        aria-label={busy ? "Steer the lead" : "Send message"}
-        title={busy ? "Steer the lead" : "Send message"}
-        disabled={!hasContent}
+        aria-label={canAnswerQuestion
+          ? "Answer question"
+          : busy
+            ? "Steer the lead"
+            : "Send message"}
+        title={canAnswerQuestion
+          ? "Answer question"
+          : busy
+            ? "Steer the lead"
+            : "Send message"}
+        disabled={!canSubmit}
       >
         <ArrowUp size={17} strokeWidth={2} />
       </button>

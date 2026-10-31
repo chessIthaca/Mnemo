@@ -88,6 +88,77 @@ describe("Composer", () => {
     expect(stop).toHaveBeenCalled();
   });
 
+  it("answers a pending question with a numeric choice", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockImplementation(() => {});
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-1",
+          question: "Which approach?",
+          options: [
+            { label: "Fast" },
+            { label: "Thorough" },
+            { label: "Ask again" },
+          ],
+        },
+      },
+    }));
+    actions.setLeadDraftText("2)");
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    expect(answer).toHaveBeenCalledWith("q-1", { kind: "choice", index: 1 });
+    expect(draft()).toEqual({ text: "", images: [] });
+  });
+
+  it("answers a pending question with freeform text", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockImplementation(() => {});
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-2",
+          question: "When should this land?",
+          options: [{ label: "Now" }, { label: "Later" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("Run it on Friday instead");
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    expect(answer).toHaveBeenCalledWith("q-2", {
+      kind: "freeform",
+      text: "Run it on Friday instead",
+    });
+    expect(draft()).toEqual({ text: "", images: [] });
+  });
+
+  it("keeps pending approvals on their own buttons, not the composer", () => {
+    setLead(false);
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: { kind: "approval", request_id: "req-1" },
+      },
+    }));
+    render(Composer);
+    expect(screen.queryByRole("button", { name: "Answer question" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Stop the lead" })).toBeTruthy();
+  });
+
   it("keeps Stopping visible until the engine confirms completion", async () => {
     setLead(true);
     let finish!: () => void;

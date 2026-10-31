@@ -163,6 +163,42 @@ describe("TopBar lead context ring", () => {
     expect(compactButton().textContent).toContain("Compact now");
   });
 
+  it("keeps the compact button unpressable while the session is opening", async () => {
+    openLeadSession({ usedTokens: 1_000, maxTokens: 2_000, status: "opening" });
+    render(ContextRing);
+
+    // The ring renders during opening (the transport exists), but a disabled
+    // button never dispatches click events, so compaction cannot start.
+    await fireEvent.click(ringButton());
+    expect(compactButton().disabled).toBe(true);
+  });
+
+  it("disables the compact button live when a ready session reopens", async () => {
+    openLeadSession({ usedTokens: 1_000, maxTokens: 2_000 });
+    render(ContextRing);
+    await fireEvent.click(ringButton());
+    expect(compactButton().disabled).toBe(false);
+
+    app.update((state) => ({
+      ...state,
+      leadRuntime: { ...state.leadRuntime, status: "opening" },
+    }));
+    await tick();
+    expect(compactButton().disabled).toBe(true);
+
+    // Status "error" is ambiguous: a failed open has no session, but a failed
+    // turn leaves a live session that may still compact. The UI cannot tell
+    // them apart, so it stays available and the host gate rejects a
+    // sessionless compact with "the lead session is not open" (pinned by the
+    // Rust test lead_compact_summarizes_history_and_reports_the_outcome).
+    app.update((state) => ({
+      ...state,
+      leadRuntime: { ...state.leadRuntime, status: "error" },
+    }));
+    await tick();
+    expect(compactButton().disabled).toBe(false);
+  });
+
   it("closes a pinned popup with Escape or an outside click", async () => {
     openLeadSession({ usedTokens: 1_000, maxTokens: 2_000 });
     render(ContextRing);

@@ -5,6 +5,14 @@ import { probeMnemo2Host } from "./runtime";
 import { createTeamTransport, type TeamTransport } from "./teamEngine";
 import { createBoardTransport, type BoardTransport } from "./boardEngine";
 import { createIndexingTransport, newerIndexing, type IndexingSnapshot, type IndexingTransport } from "./indexingEngine";
+import {
+  applyExternalLeadEvent,
+  createExternalLeadTransport,
+  externalLeadFromStatus,
+  noExternalLead,
+  sameProjectPath,
+  type ExternalLeadEvent,
+} from "./externalLeadEngine";
 import { boardFromSnapshot } from "./boardState";
 import { createWorkbenchTransport, type WorkbenchTransport } from "./workbenchEngine";
 import { createBrowserTransport, type BrowserTransport } from "./browserEngine";
@@ -75,6 +83,12 @@ let boardSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let indexingTransport: IndexingTransport | null = null;
 let indexingUnlisten: (() => void) | null = null;
 let indexingToken = 0;
+/** App-level listeners for Claude Code's open requests and attach/detach events. */
+let externalLeadUnlisten: (() => void)[] = [];
+let externalLeadStart: Promise<void> | null = null;
+let externalLeadToken = 0;
+/** Counts attach/detach events, so a slower status read never overwrites a newer event. */
+let externalLeadEvents = 0;
 let workbenchTransport: WorkbenchTransport | null = null;
 let diffRequest = 0;
 let diffSyncTimer: ReturnType<typeof setTimeout> | null = null;
@@ -244,6 +258,7 @@ export function createInitialState(): AppState {
     diffError: null,
     projectConflict: null,
     indexing: null,
+    externalLead: noExternalLead(),
     cleanupProjectId: null,
     cleanupBusy: false,
     workerDeletion: null,
@@ -453,6 +468,7 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
     projectId,
     projectConflict: null,
     indexing: null,
+    externalLead: noExternalLead(),
     cleanupProjectId: null,
     workerDeletion: null,
     closeProjectPending: false,
@@ -492,6 +508,7 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
   await Promise.all([connectTeam(), connectBoard(), connectIndexing()]);
   // The runtime (and its indexing status) exists once the lead has opened.
   await syncIndexing();
+  await syncExternalLead(project);
   await syncTeam();
   await restoreWorkbench(project);
 }
@@ -511,6 +528,107 @@ async function loadProjects(): Promise<void> {
   } catch (error) {
     app.update((state) => withToast(state, `Could not load projects: ${leadError(error)}`));
   }
+}
+
+/** The open project's external lead as the native host reports it now. */
+async function syncExternalLead(project: Project): Promise<void> {
+  const transport = createExternalLeadTransport();
+  if (!transport || !(await probeMnemo2Host())) return;
+  const events = externalLeadEvents;
+  try {
+    const status = await transport.status();
+    app.update((state) =>
+      state.projectId === project.id && events === externalLeadEvents
+        ? { ...state, externalLead: externalLeadFromStatus(status, project.path) }
+        : state,
+    );
+  } catch {
+    // A host without external-lead support: the built-in lead leads.
+  }
+}
+
+function handleExternalLeadEvent(token: number, event: ExternalLeadEvent): void {
+  if (token !== externalLeadToken) return;
+  const state = get(app);
+  const project = state.projects.find((item) => item.id === state.projectId);
+  const externalLead = applyExternalLeadEvent(state.externalLead, event, project?.path ?? null);
+  if (externalLead === state.externalLead) return;
+  externalLeadEvents += 1;
+  app.update((current) => ({ ...current, externalLead }));
+}
+
+/**
+ * Open the registered project at `root` for Claude Code. An unregistered root
+ * is never added here: the user adds projects themselves.
+ */
+async function openExternalRoot(root: string): Promise<void> {
+  const find = () => get(app).projects.find((item) => sameProjectPath(item.path, root));
+  let project = find();
+  if (!project) {
+    // The registry may have changed since the list was loaded.
+    await loadProjects();
+    project = find();
+  }
+  if (!project) {
+    app.update((state) =>
+      withToast(state, `Claude Code asked to open ${root}, which is not a Mnemo2 project. Add it first.`),
+    );
+    return;
+  }
+  const open = get(app).projectId;
+  if (open === project.id) return;
+  if (open !== null) {
+    // Switching would stop the open project's lead; the user decides that.
+    const name = project.name;
+    app.update((state) =>
+      withToast(state, `Claude Code asked to open ${name}, but another project is open. Close it first.`),
+    );
+    return;
+  }
+  await openProject(project.id);
+}
+
+/**
+ * Start listening for Claude Code's requests, then open the project the app
+ * was started with (`--project`). Safe to call again; browser-only sessions
+ * and hosts without the commands do nothing.
+ */
+function initExternalLead(): Promise<void> {
+  if (externalLeadStart) return externalLeadStart;
+  const transport = createExternalLeadTransport();
+  if (!transport) return Promise.resolve();
+  const token = ++externalLeadToken;
+  const start = (async () => {
+    try {
+      if (!(await probeMnemo2Host())) return;
+      // Listen before loading the registry so no early request is missed.
+      const unlisten = await Promise.all([
+        transport.onOpenRequest((request) => {
+          if (token === externalLeadToken) void openExternalRoot(request.root);
+        }),
+        transport.onChanged((event) => handleExternalLeadEvent(token, event)),
+      ]);
+      if (token !== externalLeadToken) {
+        for (const stop of unlisten) stop();
+        return;
+      }
+      externalLeadUnlisten = unlisten;
+      await loadProjects();
+      const root = await transport.startupProject();
+      if (root && token === externalLeadToken) await openExternalRoot(root);
+    } catch {
+      // A host without the external-lead commands has nothing to start.
+    }
+  })();
+  externalLeadStart = start;
+  return start;
+}
+
+function disconnectExternalLead(): void {
+  externalLeadToken += 1;
+  externalLeadStart = null;
+  for (const unlisten of externalLeadUnlisten) unlisten();
+  externalLeadUnlisten = [];
 }
 
 async function openFolder(): Promise<void> {
@@ -552,6 +670,7 @@ async function closeProjectNow(): Promise<void> {
     projectId: null,
     projectConflict: null,
     indexing: null,
+    externalLead: noExternalLead(),
     cleanupProjectId: null,
     cleanupBusy: false,
     workerDeletion: null,
@@ -2166,6 +2285,7 @@ function resetDemo() {
   void disconnectTeam();
   void disconnectBoard();
   disconnectIndexing();
+  disconnectExternalLead();
   void disconnectWorkbench();
   app.set(createInitialState());
 }
@@ -2173,6 +2293,7 @@ function resetDemo() {
 export const actions = {
   openProject,
   loadProjects,
+  initExternalLead,
   openFolder,
   closeProject,
   reviewProject,

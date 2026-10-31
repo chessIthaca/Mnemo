@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { app } from "./lib/store";
+  import { onMount } from "svelte";
+  import { actions, app } from "./lib/store";
   import ControlRoom from "./components/ControlRoom.svelte";
   import FirstIndexOverlay from "./components/FirstIndexOverlay.svelte";
   import LeadChat from "./components/LeadChat.svelte";
@@ -10,6 +11,11 @@
   import WorkerPanel from "./components/WorkerPanel.svelte";
   import Workbench from "./components/Workbench.svelte";
   import WorkerDeleteSheet from "./components/WorkerDeleteSheet.svelte";
+
+  // Claude Code can start Mnemo2 on a project (`--project`) or ask it to open one.
+  onMount(() => {
+    void actions.initExternalLead();
+  });
 </script>
 
 <svelte:head>

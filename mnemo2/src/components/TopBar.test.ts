@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import TopBar from "./TopBar.svelte";
@@ -105,5 +105,37 @@ describe("TopBar project usage", () => {
     expect(costButton().getAttribute("aria-label")).toMatch(/partial estimate/);
     expect(usageTip().textContent).toContain("No price for: mystery-model, kimi-k3.1-pro");
     expect(usageTip().textContent).toContain("The cost covers priced usage only.");
+  });
+});
+
+describe("TopBar external lead badge", () => {
+  const badge = () => screen.queryByText("Lead: Claude Code (external)");
+
+  beforeEach(() => {
+    app.set(fixtureState());
+  });
+
+  it("is hidden while the built-in lead leads", () => {
+    render(TopBar);
+    expect(badge()).toBeNull();
+  });
+
+  it("shows while Claude Code is attached, with an explaining tooltip, and hides on detach", async () => {
+    render(TopBar);
+
+    app.update((state) => ({
+      ...state,
+      externalLead: { attached: true, root: "C:/Mnemo", sinceMs: 1_000 },
+    }));
+    const shown = await screen.findByText("Lead: Claude Code (external)");
+    expect(shown.closest("[title]")?.getAttribute("title")).toBe(
+      "Claude Code is leading this project through the mnemo plugin. Mnemo2 sends worker notices to it instead of the built-in lead.",
+    );
+
+    app.update((state) => ({
+      ...state,
+      externalLead: { attached: false, root: null, sinceMs: null },
+    }));
+    await vi.waitFor(() => expect(badge()).toBeNull());
   });
 });

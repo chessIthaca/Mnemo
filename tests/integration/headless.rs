@@ -554,6 +554,42 @@ async fn run_to_completion_mock_provider() {
     assert!(saw_finished, "the stream shows Finished");
 }
 
+#[tokio::test]
+async fn model_pinned_resume_uses_the_injected_provider() {
+    let root = tempfile::tempdir().expect("workspace");
+    let cfg = tempfile::tempdir().expect("config");
+    write_ready_config(cfg.path());
+    let llm = std::sync::Arc::new(ScriptedLlm::new(vec![text_turn(&["resumed"])]));
+    let engine = Engine::builder(engine_opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm.clone())
+    .start()
+    .await
+    .expect("the scripted engine starts");
+    let session = engine
+        .spawn(SpawnOptions {
+            model: Some("test/test-model".to_string()),
+            resume: Some(Transcript {
+                messages: vec![Message::user_text("before")],
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("the model-pinned session spawns");
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        session.run_to_completion("after"),
+    )
+    .await
+    .expect("the injected provider answers instead of resolving another client")
+    .expect("the resumed turn completes");
+    assert_eq!(outcome.final_text, "resumed");
+    assert_eq!(llm.calls(), 1);
+    engine.shutdown().await.expect("shutdown");
+}
+
 /// §7 row 12: two events() subscribers both receive every event; dropping
 /// one never stalls the other.
 #[tokio::test]

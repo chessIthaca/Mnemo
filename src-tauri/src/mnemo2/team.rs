@@ -1477,7 +1477,10 @@ impl TeamRuntime {
                     images: Vec::new(),
                 }
             } else {
-                SessionCommand::Steer { text }
+                SessionCommand::Steer {
+                    text,
+                    images: Vec::new(),
+                }
             };
             let result = live.session.send(command).await;
             (busy, idle, result)

@@ -159,6 +159,12 @@ pub enum SessionCommand {
     Steer {
         /// The steer text.
         text: String,
+        /// Base64 data-URL image attachments riding the steer, queued
+        /// with the text and injected at the next safe boundary exactly
+        /// like a prompt's images. `#[serde(default)]` keeps legacy
+        /// steer JSON (no `images` key) decoding.
+        #[serde(default)]
+        images: Vec<String>,
     },
     /// Cancel a queued steer whose text matches.
     CancelSteer {

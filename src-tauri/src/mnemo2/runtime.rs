@@ -360,27 +360,38 @@ impl LeadRuntime {
         })
     }
 
-    /// Start a turn with a user prompt.
-    pub async fn send_prompt(&self, text: String) -> Result<(), String> {
-        if text.trim().is_empty() {
+    /// Start a turn with a user prompt — or, while the lead is busy,
+    /// queue the same text and images as a steer the kernel injects at
+    /// the next safe turn boundary. Image-only submissions are accepted;
+    /// only a wholly empty one (no text and no images) is rejected.
+    pub async fn send_prompt(&self, text: String, images: Vec<String>) -> Result<(), String> {
+        if text.trim().is_empty() && images.is_empty() {
             return Err("the prompt is empty".to_string());
         }
-        if let Some(team) = self.team.lock().await.clone() {
-            team.begin_lead_turn();
-        }
-        let live = self.live.lock().await;
-        let live = live
+        // Take the team handle first, then the live lock — the same
+        // team→live order `shutdown` uses, so the two never deadlock.
+        let team = self.team.lock().await.clone();
+        let live_guard = self.live.lock().await;
+        let live = live_guard
             .as_ref()
             .ok_or_else(|| "the lead session is not open".to_string())?;
         if live.busy.load(Ordering::SeqCst) {
-            return Err("the lead is still working on the previous turn".to_string());
+            // Busy: not an error and not a second prompt — a queued
+            // steer. `begin_lead_turn` is skipped (the lead is already
+            // busy, so the merge gate is already closed) and the busy
+            // flag stays with the running turn.
+            return live
+                .session
+                .send(SessionCommand::Steer { text, images })
+                .await
+                .map_err(|err| format!("could not steer the busy lead: {err}"));
+        }
+        if let Some(team) = team {
+            team.begin_lead_turn();
         }
         live.busy.store(true, Ordering::SeqCst);
         live.session
-            .send(SessionCommand::Prompt {
-                text,
-                images: Vec::new(),
-            })
+            .send(SessionCommand::Prompt { text, images })
             .await
             .map_err(|err| {
                 live.busy.store(false, Ordering::SeqCst);
@@ -733,7 +744,10 @@ async fn pump_team_notifications(
             continue;
         };
         let command = if team.lead_is_busy() {
-            SessionCommand::Steer { text }
+            SessionCommand::Steer {
+                text,
+                images: Vec::new(),
+            }
         } else {
             SessionCommand::Prompt {
                 text,
@@ -919,8 +933,8 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use mnemo::provider::{
-        Capabilities, FinishReason, LlmClient, LlmEvent, Message, ProviderKind, ToolChoice,
-        ToolSchema,
+        Capabilities, FinishReason, LlmClient, LlmEvent, Message, MessageContent, ProviderKind,
+        ToolChoice, ToolSchema,
     };
     use tempfile::TempDir;
 
@@ -935,6 +949,7 @@ mod tests {
         responses: std::sync::Mutex<VecDeque<ScriptedTurn>>,
         calls: std::sync::atomic::AtomicUsize,
         advertised_tools: std::sync::Mutex<Vec<Vec<String>>>,
+        recorded_messages: std::sync::Mutex<Vec<Vec<Message>>>,
         caps: Capabilities,
         models: Vec<std::sync::Arc<str>>,
         active_model: std::sync::atomic::AtomicUsize,
@@ -968,6 +983,7 @@ mod tests {
                 ),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 advertised_tools: std::sync::Mutex::new(Vec::new()),
+                recorded_messages: std::sync::Mutex::new(Vec::new()),
                 caps: Capabilities::openai(),
                 models: models.into_iter().map(std::sync::Arc::from).collect(),
                 active_model: std::sync::atomic::AtomicUsize::new(0),
@@ -983,6 +999,23 @@ mod tests {
 
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Report a multimodal capability set — the flag image tests
+        /// need so pasted images ride the request as image blocks
+        /// instead of the vision-model fallback.
+        fn multimodal(mut self) -> Self {
+            self.caps.multimodal = true;
+            self
+        }
+
+        /// The full conversation each `complete` call saw, oldest first —
+        /// how tests assert an image block reached the provider.
+        fn recorded_messages(&self) -> Vec<Vec<Message>> {
+            self.recorded_messages
+                .lock()
+                .expect("recorded message lock poisoned")
+                .clone()
         }
 
         fn advertised_tools(&self) -> Vec<Vec<String>> {
@@ -1017,6 +1050,10 @@ mod tests {
                 .lock()
                 .expect("advertised tool lock poisoned")
                 .push(_tools.iter().map(|tool| tool.name.clone()).collect());
+            self.recorded_messages
+                .lock()
+                .expect("recorded message lock poisoned")
+                .push(_messages.to_vec());
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let next = self
                 .responses
@@ -1429,6 +1466,18 @@ mod tests {
         }
     }
 
+    /// Poll until the lead reports idle again (a queued steer's follow-up
+    /// turn can outlive the interrupt that flushed it).
+    async fn wait_until_idle(runtime: &LeadRuntime) {
+        for _ in 0..500 {
+            if !runtime.snapshot().await.expect("snapshot").busy {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the lead never returned to idle");
+    }
+
     async fn wait_for_persisted(path: &Path) -> PersistedLead {
         for _ in 0..100 {
             if let Ok(bytes) = std::fs::read(path) {
@@ -1455,7 +1504,7 @@ mod tests {
             .expect("the lead opens");
         let mut rx = runtime.subscribe();
         runtime
-            .send_prompt("hi".to_string())
+            .send_prompt("hi".to_string(), Vec::new())
             .await
             .expect("the prompt is accepted");
         let events = drain_turn(&mut rx).await;
@@ -1495,7 +1544,7 @@ mod tests {
         .expect("the first lead opens");
         let mut rx = first.subscribe();
         first
-            .send_prompt("remember this".to_string())
+            .send_prompt("remember this".to_string(), Vec::new())
             .await
             .expect("prompt");
         drain_turn(&mut rx).await;
@@ -1531,7 +1580,7 @@ mod tests {
         .expect("the lead opens");
         let mut rx = runtime.subscribe();
         runtime
-            .send_prompt("first turn".to_string())
+            .send_prompt("first turn".to_string(), Vec::new())
             .await
             .expect("prompt");
         drain_turn(&mut rx).await;
@@ -1555,6 +1604,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_submission_becomes_a_queued_steer_with_images() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["scripted-a"],
+            vec![
+                (Some(gate_rx), text_turn(&["turn one"])),
+                (None, text_turn(&["turn two"])),
+            ],
+        ));
+        let runtime = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("the lead opens");
+        let mut rx = runtime.subscribe();
+        runtime
+            .send_prompt("first".to_string(), Vec::new())
+            .await
+            .expect("the first prompt is accepted");
+        assert!(
+            runtime.snapshot().await.expect("snapshot").busy,
+            "the gated turn is busy"
+        );
+
+        // The busy submission: not an error and not a second prompt — a
+        // queued steer carrying both the text and the images.
+        runtime
+            .send_prompt(
+                "a steer".to_string(),
+                vec!["data:image/png;base64,AAA".to_string()],
+            )
+            .await
+            .expect("a busy submission becomes a queued steer");
+        assert!(
+            runtime.snapshot().await.expect("snapshot").busy,
+            "a queued steer leaves the running turn's busy flag alone"
+        );
+        assert_eq!(llm.calls(), 1, "the steer waits at the turn boundary");
+
+        // Release the first turn: the steer is injected with its images
+        // and runs as the follow-up turn.
+        gate_tx.send(()).expect("the first turn is released");
+        let mut saw_injected = false;
+        let mut finished_turns = 0;
+        while finished_turns < 2 {
+            let event = next_event(&mut rx).await;
+            match event.event.event {
+                SerializableAgentEvent::SuggestionInjected { text, images } => {
+                    assert_eq!(text, "a steer");
+                    assert_eq!(
+                        images,
+                        vec!["data:image/png;base64,AAA".to_string()],
+                        "the injected steer keeps the busy submission's images"
+                    );
+                    saw_injected = true;
+                }
+                SerializableAgentEvent::Finished { .. } => finished_turns += 1,
+                _ => {}
+            }
+        }
+        assert!(saw_injected, "the queued steer was injected at the boundary");
+        wait_until_idle(&runtime).await;
+        assert_eq!(llm.calls(), 2, "the injected steer ran a follow-up turn");
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn image_only_prompt_is_accepted_and_rides_the_request() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![text_turn(&["saw it"])]).multimodal());
+        let runtime = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("the lead opens");
+        let mut rx = runtime.subscribe();
+        runtime
+            .send_prompt(
+                "   ".to_string(),
+                vec!["data:image/png;base64,AAA".to_string()],
+            )
+            .await
+            .expect("an image-only submission is accepted");
+        drain_turn(&mut rx).await;
+        let recorded = llm.recorded_messages();
+        assert_eq!(recorded.len(), 1, "the image-only prompt ran one turn");
+        assert!(
+            recorded[0].iter().any(|message| match &message.content {
+                MessageContent::Parts(parts) => parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        mnemo::provider::ContentPart::ImageUrl { image_url }
+                            if image_url.url == "data:image/png;base64,AAA"
+                    )
+                }),
+                _ => false,
+            }),
+            "the pasted image must ride the request as an image block: {:?}",
+            recorded[0]
+        );
+        assert!(!runtime.snapshot().await.expect("snapshot").busy);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_wholly_empty_submission_is_rejected_without_starting_a_turn() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(Vec::new()));
+        let runtime = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("the lead opens");
+        let err = runtime
+            .send_prompt("   ".to_string(), Vec::new())
+            .await
+            .expect_err("blank text with no images is rejected");
+        assert_eq!(err, "the prompt is empty");
+        assert!(!runtime.snapshot().await.expect("snapshot").busy);
+        assert_eq!(llm.calls(), 0, "the rejection never reaches the engine");
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_remains_independently_available_with_a_queued_steer() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["scripted-a"],
+            vec![
+                (Some(gate_rx), text_turn(&["turn one"])),
+                (None, text_turn(&["steer turn"])),
+                (None, text_turn(&["after the stop"])),
+            ],
+        ));
+        let runtime = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm))
+            .await
+            .expect("the lead opens");
+        let mut rx = runtime.subscribe();
+        runtime
+            .send_prompt("first".to_string(), Vec::new())
+            .await
+            .expect("the first prompt is accepted");
+        runtime
+            .send_prompt("a steer".to_string(), Vec::new())
+            .await
+            .expect("the busy submission queues as a steer");
+        // Stop stays independently available while a steer is queued —
+        // it interrupts the active turn without submitting the queued
+        // steer through the prompt path.
+        runtime
+            .interrupt()
+            .await
+            .expect("stop interrupts the running turn with a steer queued");
+        gate_tx.send(()).expect("the first turn is released");
+        // Whatever the kernel does with the flushed steer, the lead
+        // must return to idle and accept a fresh prompt.
+        wait_until_idle(&runtime).await;
+        runtime
+            .send_prompt("after the stop".to_string(), Vec::new())
+            .await
+            .expect("a fresh prompt is accepted after stop");
+        drain_turn(&mut rx).await;
+        wait_until_idle(&runtime).await;
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn approval_turn_surfaces_and_resolves_by_tool_call_id() {
         let root = tempfile::tempdir().expect("workspace");
         let config = tempfile::tempdir().expect("config");
@@ -1572,7 +1796,7 @@ mod tests {
         .expect("the lead opens");
         let mut rx = runtime.subscribe();
         runtime
-            .send_prompt("write the note".to_string())
+            .send_prompt("write the note".to_string(), Vec::new())
             .await
             .expect("prompt");
 
@@ -1633,7 +1857,7 @@ mod tests {
         .expect("the lead opens");
         let mut rx = runtime.subscribe();
         runtime
-            .send_prompt("ask me".to_string())
+            .send_prompt("ask me".to_string(), Vec::new())
             .await
             .expect("prompt");
 
@@ -1690,7 +1914,7 @@ mod tests {
         .expect("the lead opens");
         let mut rx = runtime.subscribe();
         runtime
-            .send_prompt("take your time".to_string())
+            .send_prompt("take your time".to_string(), Vec::new())
             .await
             .expect("prompt");
         let mut started = false;
@@ -1932,7 +2156,7 @@ mod tests {
 
         // The lead's own usage is recorded on the same accumulator.
         let mut events = lead.subscribe();
-        lead.send_prompt("lead usage turn".into())
+        lead.send_prompt("lead usage turn".into(), Vec::new())
             .await
             .expect("lead prompt");
         drain_turn(&mut events).await;

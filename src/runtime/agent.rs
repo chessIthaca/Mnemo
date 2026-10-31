@@ -1067,7 +1067,12 @@ impl AgentTask {
         // Cancel-path spawn), so working-tier events are compressed + pruned
         // whenever a session ends.
         self.spawn_consolidation();
-        let _ = fanin_tx.send((self.id, AgentEvent::Exited)).await;
+        let id = self.id;
+        // Release the loop (including a worktree's open codegraph SQLite
+        // connection) before announcing Exited. A closer waiting on that event
+        // may immediately remove the worktree folder.
+        drop(self);
+        let _ = fanin_tx.send((id, AgentEvent::Exited)).await;
     }
 
     /// Best-effort background consolidation of the current session's working

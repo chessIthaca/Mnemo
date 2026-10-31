@@ -671,6 +671,39 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Close the session and wait until the agent task has released its loop.
+    /// Worktree-bound callers use this before deleting the checkout: the loop
+    /// owns that checkout's code graph and its open SQLite connection.
+    pub async fn close_and_wait(&self) -> Result<(), EngineError> {
+        let mut events = self.events();
+        let sent = self.agent_command(AgentCommand::Cancel).await.is_ok();
+        self.inner.sessions.lock().await.remove(&self.id);
+        if !sent {
+            return Ok(());
+        }
+        let exited = async {
+            loop {
+                match events.recv().await {
+                    Ok(event)
+                        if event.agent == self.agent
+                            && matches!(event.event, SerializableAgentEvent::Exited) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) | Err(crate::headless::types::RecvError::Lagged(_)) => continue,
+                    Err(crate::headless::types::RecvError::Closed) => {
+                        return Err(EngineError::session_closed(
+                            "the event pump ended before the agent exited",
+                        ));
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), exited)
+            .await
+            .map_err(|_| EngineError::session_closed("timed out waiting for the agent to exit"))?
+    }
+
     async fn agent_command(&self, command: AgentCommand) -> Result<(), EngineError> {
         let mgr = self.inner.host.manager.lock().await;
         mgr.send(self.agent, command)

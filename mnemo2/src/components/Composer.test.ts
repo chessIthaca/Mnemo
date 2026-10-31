@@ -492,7 +492,7 @@ describe("Composer", () => {
     expect(draft().images).toEqual([expected]);
   });
 
-  it("an Explorer-copied PNG file renders its thumbnail before sending", async () => {
+  async function explorerCopiedPngRendersThumbnailBeforeSending() {
     setLead(false);
     // Real converter, same as the direct paste regression above: the paste
     // must run the true clipboard File -> FileReader -> data URL -> store
@@ -529,7 +529,12 @@ describe("Composer", () => {
     expect(
       (await screen.findByAltText("Attachment 1")).getAttribute("src"),
     ).toBe(expected);
-  });
+  }
+
+  it(
+    "an Explorer-copied PNG file renders its thumbnail before sending",
+    explorerCopiedPngRendersThumbnailBeforeSending,
+  );
 
   it("removes an attached image without touching the text", async () => {
     setLead(false);

@@ -6,7 +6,6 @@
     LoaderCircle,
     Pause,
     Play,
-    Send,
     Square,
     Trash2,
     XCircle,
@@ -16,18 +15,15 @@
   import { canMerge, isAuditWorker } from "../lib/review";
   import { workerStatusText, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
-  import Collapsible from "./Collapsible.svelte";
   import FindingsPanel from "./FindingsPanel.svelte";
-  import Markdown from "./Markdown.svelte";
   import ModelBadge from "./ModelBadge.svelte";
   import ModelEffortPicker from "./ModelEffortPicker.svelte";
   import ReviewEvidence from "./ReviewEvidence.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
-  import ToolActivity from "./ToolActivity.svelte";
+  import WorkerThread from "./WorkerThread.svelte";
 
   let { worker }: { worker: Worker } = $props();
   let tab = $state<"review" | "thread" | "timeline">("thread");
-  let reply = $state("");
   let lastWorkerId = "";
 
   const openFindings = $derived(worker.findings.filter((finding) => finding.status === "open").length);
@@ -53,21 +49,7 @@
     if (id === lastWorkerId) return;
     lastWorkerId = id;
     tab = "thread";
-    reply = "";
   });
-
-  function sendReply() {
-    if (!reply.trim()) return;
-    actions.replyWorker(worker.id, reply);
-    reply = "";
-  }
-
-  function replyKeydown(event: KeyboardEvent) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      sendReply();
-    }
-  }
 
 </script>
 
@@ -194,34 +176,7 @@
         </div>
       </section>
     {:else if tab === "thread"}
-      <section class="thread-panel" aria-label={`${worker.name} worker conversation`}>
-        <div class="thread-messages">
-          {#each worker.messages as entry (entry.id)}
-            {#if entry.kind === "tool"}
-              <div class="thread-tool"><ToolActivity {entry} /></div>
-            {:else}
-              <div class="thread-message" class:from-lead={entry.from === "lead"} class:from-harness={entry.from === "harness"}>
-                <span>{entry.from === "lead" ? "LEAD" : entry.from === "harness" ? "HARNESS NOTE" : worker.name.toUpperCase()} · {entry.time}</span>
-                <div class="thread-message-body"><Collapsible maxHeight={160} label="message"><Markdown source={entry.body} onOpenLink={actions.openBrowser} /></Collapsible></div>
-              </div>
-            {/if}
-          {/each}
-        </div>
-        {#if worker.screenshots.length > 0}
-          <div class="screenshot-links" aria-label="Worker screenshots">
-            <span>SCREENSHOTS</span>
-            <div>
-              {#each worker.screenshots as path (path)}
-                <button class="button button-quiet" title={`Open ${path}`} onclick={() => actions.openScreenshot(worker.id, path)}>{path.split("/").pop()}</button>
-              {/each}
-            </div>
-          </div>
-        {/if}
-        <div class="thread-composer">
-          <textarea bind:value={reply} onkeydown={replyKeydown} rows="2" aria-label={`Reply to ${worker.name}`} placeholder={`Message ${worker.name}`} disabled={worker.status === "cancelled"}></textarea>
-          <button class="icon-button" aria-label={`Send reply to ${worker.name}`} disabled={!reply.trim() || worker.status === "cancelled"} onclick={sendReply}><Send size={14} /></button>
-        </div>
-      </section>
+      <WorkerThread {worker} />
     {:else}
       <section class="timeline-panel" aria-label={`${worker.name} timeline`}>
         {#each worker.timeline as step (step.id)}
@@ -262,29 +217,12 @@
   .check-row div { flex: 1; }
   .check-row strong, .check-row small { display: block; }
   .check-row strong { font-size: 10px; font-weight: 600; }
-  .thread-message > span { color: var(--muted); font-size: 7px; letter-spacing: 0.07em; }
 
   .merge-decision { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
   .merge-decision p { margin: 0 0 4px; color: var(--muted); font-size: 7px; letter-spacing: 0.09em; }
   .merge-decision h3 { margin: 0 0 4px; font-size: 12px; font-weight: 650; }
   .merge-decision div > span { display: block; max-width: 360px; color: var(--muted); font-size: 8px; line-height: 1.45; }
   .merge-decision button { flex: 0 0 auto; }
-  .thread-message-body { margin: 5px 0 0; padding: 10px 12px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--ink-soft); }
-  .thread-message-body :global(.markdown) { font-size: 11px; line-height: 1.5; }
-  .thread-message-body :global(p) { margin-bottom: 8px; }
-  .thread-message-body :global(.markdown h1), .thread-message-body :global(.markdown h2), .thread-message-body :global(.markdown h3) { font-size: 12.5px; }
-  .thread-message-body :global(.markdown h4), .thread-message-body :global(.markdown h5), .thread-message-body :global(.markdown h6) { font-size: 11.5px; }
-  .thread-message.from-lead { margin-left: auto; }
-  .thread-message.from-lead > span { display: block; text-align: right; }
-  .thread-message.from-lead .thread-message-body { border-radius: 12px 12px 4px 12px; background: var(--accent-soft); }
-  .thread-message.from-harness .thread-message-body { border: 1px dashed var(--line-strong); background: transparent; color: var(--muted); }
-  .thread-message + .thread-message, .thread-tool + .thread-message { margin-top: 12px; }
-  .thread-tool { min-width: 0; margin: 4px 0; }
-  .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
-  .screenshot-links > span { color: var(--muted); font-size: 8px; letter-spacing: 0.08em; }
-  .screenshot-links > div { display: flex; flex-wrap: wrap; gap: 6px; }
-  .thread-composer { display: flex; align-items: flex-end; gap: 8px; margin-top: 16px; padding: 9px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); }
-  .thread-composer textarea { flex: 1; resize: none; border: 0; outline: 0; color: var(--ink); font-size: 10px; }
   .timeline-step { display: grid; grid-template-columns: 20px 1fr; gap: 8px; min-height: 76px; }
   .timeline-marker { display: flex; justify-content: center; border-left: 1px solid var(--line); margin-left: 6px; }
   .timeline-marker > span { width: 8px; height: 8px; margin: 5px 0 0 -4.5px; border-radius: 50%; background: var(--line-strong); }

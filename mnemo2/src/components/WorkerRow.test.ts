@@ -29,6 +29,29 @@ describe("WorkerRow", () => {
     expect(container.textContent).not.toContain("`");
   });
 
+  it("uses small muted task text and a visible progress track", () => {
+    render(WorkerRow, { worker: worker(), onSelect: vi.fn() });
+
+    const summary = document.querySelector<HTMLElement>(".worker-task");
+    const progress = document.querySelector<HTMLElement>(".worker-progress");
+    const bar = progress?.querySelector<HTMLElement>("span");
+    if (!summary || !progress || !bar) throw new Error("Worker summary or progress bar missing");
+
+    const summaryStyle = getComputedStyle(summary);
+    expect(summaryStyle.fontFamily).toBe("var(--font-ui)");
+    expect(summaryStyle.fontSize).toBe("var(--text-xs)");
+    expect(summaryStyle.color).toBe("var(--muted)");
+    expect(summaryStyle.webkitLineClamp).toBe("3");
+
+    const progressStyle = getComputedStyle(progress);
+    expect(progressStyle.display).toBe("block");
+    expect(progressStyle.height).toBe("2px");
+    expect(progressStyle.marginTop).toBe("7px");
+    expect(progressStyle.overflow).toBe("hidden");
+    expect(getComputedStyle(bar).display).toBe("block");
+    expect(getComputedStyle(bar).height).toBe("100%");
+  });
+
   it("still opens the worker when the row is clicked", async () => {
     const onSelect = vi.fn();
     render(WorkerRow, { worker: worker(), onSelect });

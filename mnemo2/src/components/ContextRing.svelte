@@ -150,7 +150,7 @@
 
 <style>
   .context-chip { position: relative; display: inline-flex; }
-  .ring-button { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; font-size: 9px; font-weight: 600; }
+  .ring-button { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; font-size: var(--text-xs); font-weight: 600; }
   .ring-button:hover, .ring-button:focus-visible { background: var(--surface-soft); }
   .ring-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .ring-track { fill: none; stroke: var(--line); stroke-width: 3; }
@@ -162,17 +162,17 @@
   .ring-pct { color: var(--ink-soft); font-variant-numeric: tabular-nums; }
   .context-tip { position: absolute; top: calc(100% + 7px); right: 0; z-index: 30; width: 228px; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 120ms ease; }
   .context-tip.open { opacity: 1; visibility: visible; pointer-events: auto; }
-  .context-tip strong { display: block; margin-bottom: 7px; font-size: 9px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
-  .context-total { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 0 0 8px; color: var(--ink); font-family: var(--font-mono); font-size: 9px; font-variant-numeric: tabular-nums; }
+  .context-tip strong { display: block; margin-bottom: 7px; font-size: var(--text-xs); font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+  .context-total { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 0 0 8px; color: var(--ink); font-family: var(--font-mono); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
   .context-pct { font-weight: 700; }
   .context-tip dl { display: grid; gap: 4px; margin: 0 0 10px; }
   .context-tip dl div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .context-tip dt { flex: 0 0 auto; color: var(--muted); font-size: 9px; }
+  .context-tip dt { flex: 0 0 auto; color: var(--muted); font-size: var(--text-xs); }
   .role-bar { flex: 1; position: relative; height: 3px; overflow: hidden; border-radius: 2px; background: var(--line); }
   .role-bar > span { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--accent); transition: width 240ms ease; }
-  .context-tip dd { flex: 0 0 auto; margin: 0; color: var(--ink); font-family: var(--font-mono); font-size: 9px; font-variant-numeric: tabular-nums; }
-  .context-note { margin: 0 0 10px; color: var(--warning); font-size: 8px; line-height: 1.45; }
-  .compact-button { width: 100%; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); cursor: pointer; font-size: 9px; font-weight: 600; }
+  .context-tip dd { flex: 0 0 auto; margin: 0; color: var(--ink); font-family: var(--font-mono); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+  .context-note { margin: 0 0 10px; color: var(--warning); font-size: var(--text-2xs); line-height: 1.45; }
+  .compact-button { width: 100%; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); cursor: pointer; font-size: var(--text-xs); font-weight: 600; }
   .compact-button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-strong); }
   .compact-button:disabled { opacity: 0.55; cursor: default; }
 </style>

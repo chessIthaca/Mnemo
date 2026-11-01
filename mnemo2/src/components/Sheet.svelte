@@ -106,8 +106,8 @@
   .sheet-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgb(35 38 30 / 18%); backdrop-filter: blur(2px); }
   .sheet { position: absolute; top: 50%; left: 50%; display: flex; width: min(480px, calc(100vw - 32px)); max-height: min(640px, calc(100vh - 48px)); flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); transform: translate(-50%, -50%); }
   header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 20px 20px 12px; }
-  header p { margin: 0 0 4px; color: var(--muted); font-size: 7px; letter-spacing: 0.11em; }
-  header h2 { margin: 0; font-family: var(--font-prose); font-size: 25px; font-weight: 550; }
+  header p { margin: 0 0 4px; color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.11em; }
+  header h2 { margin: 0; font-family: var(--font-prose); font-size: var(--text-xl); font-weight: 550; }
   .sheet-body { overflow-y: auto; padding: 4px 20px 20px; }
   .sheet.wide { width: min(960px, calc(100vw - 32px)); height: min(680px, calc(100vh - 48px)); max-height: none; }
   .sheet.wide header { padding-bottom: 14px; border-bottom: 1px solid var(--line); }

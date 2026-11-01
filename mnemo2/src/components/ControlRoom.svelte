@@ -178,34 +178,34 @@
 <style>
   .control-room { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
   .control-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 24px 12px; }
-  .control-header h1 { margin: 0; font-family: var(--font-prose); font-size: 28px; font-weight: 500; letter-spacing: -0.03em; }
+  .control-header h1 { margin: 0; font-family: var(--font-prose); font-size: var(--text-xl); font-weight: 500; letter-spacing: -0.03em; }
   .team-settings { display: flex; align-items: center; gap: 18px; }
-  .slot-pill { padding: 5px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font-size: 9px; font-weight: 600; }
+  .slot-pill { padding: 5px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font-size: var(--text-xs); font-weight: 600; }
   .dispatch-bar { display: flex; gap: 8px; padding: 0 24px 12px; }
-  .dispatch-bar input { flex: 1; min-width: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); font-size: 10px; }
-  .dispatch-bar select { flex: 0 1 180px; min-width: 0; padding: 9px 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); font-size: 10px; }
-  .dispatch-empty { margin: 0; padding: 0 24px 12px; color: var(--muted); font-size: 10px; }
+  .dispatch-bar input { flex: 1; min-width: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); font-size: var(--text-sm); }
+  .dispatch-bar select { flex: 0 1 180px; min-width: 0; padding: 9px 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); font-size: var(--text-sm); }
+  .dispatch-empty { margin: 0; padding: 0 24px 12px; color: var(--muted); font-size: var(--text-sm); }
   .dispatch-bar button { flex: 0 0 auto; }
   .dispatch-model { display: inline-flex; flex: 0 1 auto; align-items: center; min-width: 0; padding: 0 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
-  .control-summary { display: flex; align-items: center; gap: 8px; padding: 0 24px 12px; color: var(--muted); font-size: 8px; }
-  .control-summary strong { color: var(--ink-soft); font-size: 9px; font-weight: 600; }
+  .control-summary { display: flex; align-items: center; gap: 8px; padding: 0 24px 12px; color: var(--muted); font-size: var(--text-2xs); }
+  .control-summary strong { color: var(--ink-soft); font-size: var(--text-xs); font-weight: 600; }
   .control-layout { display: grid; flex: 1; min-height: 0; grid-template-columns: minmax(340px, 0.88fr) minmax(430px, 1.12fr); border-top: 1px solid var(--line); }
   .worker-board { min-height: 0; overflow-y: auto; border-right: 1px solid var(--line); background: var(--surface); }
-  .board-top { display: flex; justify-content: space-between; padding: 14px 18px 8px; color: var(--muted); font-size: 7px; letter-spacing: 0.08em; }
+  .board-top { display: flex; justify-content: space-between; padding: 14px 18px 8px; color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.08em; }
   .board-top > span:first-child { display: inline-flex; align-items: center; gap: 5px; }
   .board-filters { display: flex; gap: 5px; padding: 6px 14px 12px; border-bottom: 1px solid var(--line); }
-  .board-filters button { display: inline-flex; align-items: center; gap: 4px; padding: 5px 8px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: 8px; }
+  .board-filters button { display: inline-flex; align-items: center; gap: 4px; padding: 5px 8px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-2xs); }
   .board-filters button.active { border-color: var(--line); background: var(--surface-soft); color: var(--ink); }
-  .board-filters button span { display: grid; min-width: 13px; height: 13px; place-items: center; border-radius: 7px; background: var(--surface-soft); font-size: 7px; }
+  .board-filters button span { display: grid; min-width: 13px; height: 13px; place-items: center; border-radius: 7px; background: var(--surface-soft); font-size: var(--text-2xs); }
   .board-filters button.active span { background: var(--surface); }
   .worker-list { padding: 4px 8px 18px; }
   .worker-list section { margin-top: 10px; }
-  .worker-list h2 { display: flex; justify-content: space-between; margin: 0 10px 4px; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; }
+  .worker-list h2 { display: flex; justify-content: space-between; margin: 0 10px 4px; color: var(--muted); font-size: var(--text-2xs); font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; }
   .worker-list h2 span { font-weight: 500; }
   .worker-pane { min-width: 0; min-height: 0; background: var(--canvas); }
   .empty-board, .empty-detail { display: grid; place-items: center; padding: 50px 20px; color: var(--muted); text-align: center; }
   .empty-detail { height: 100%; align-content: center; }
-  .empty-detail h2 { margin: 12px 0 0; color: var(--ink-soft); font-family: var(--font-prose); font-size: 22px; font-weight: 500; }
+  .empty-detail h2 { margin: 12px 0 0; color: var(--ink-soft); font-family: var(--font-prose); font-size: var(--text-xl); font-weight: 500; }
   @media (max-width: 980px) {
     .control-layout { grid-template-columns: minmax(290px, 0.8fr) minmax(360px, 1.2fr); }
     .control-summary > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -213,7 +213,7 @@
 
   @media (max-width: 760px) {
     .control-header { padding: 16px; }
-    .control-header h1 { font-size: 26px; }
+    .control-header h1 { font-size: var(--text-xl); }
     .control-summary { flex-wrap: wrap; row-gap: 4px; padding: 0 16px 12px; }
     .control-summary > span:last-child { flex-basis: 100%; overflow: visible; text-overflow: clip; white-space: normal; }
     .control-layout { grid-template-columns: 1fr; grid-template-rows: minmax(220px, 42%) minmax(0, 58%); }

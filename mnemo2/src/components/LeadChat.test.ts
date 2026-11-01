@@ -610,24 +610,32 @@ describe("LeadChat", () => {
   });
 
   it("keeps human messages inline in exchange order and caps prose at 100 characters", () => {
-    setLeadEntries([
-      { id: "human", kind: "message", time: "now", author: "user", body: "Review this change" },
-      toolEntry(),
-      { id: "answer", kind: "message", time: "now", author: "lead", body: "I will inspect it." },
-    ]);
-    const { container } = render(LeadChat);
-    const user = container.querySelector(".user-entry")!;
-    const tool = container.querySelector(".tool-activity-row")!;
-    const assistant = container.querySelector(".chat-entry:not(.user-entry)")!;
+    const previousRootSize = document.documentElement.style.fontSize;
+    document.documentElement.style.fontSize = "13px";
+    try {
+      setLeadEntries([
+        { id: "human", kind: "message", time: "now", author: "user", body: "Review this change" },
+        toolEntry(),
+        { id: "answer", kind: "message", time: "now", author: "lead", body: "I will inspect it." },
+      ]);
+      const { container } = render(LeadChat);
+      const user = container.querySelector(".user-entry")!;
+      const tool = container.querySelector(".tool-activity-row")!;
+      const assistant = container.querySelector(".chat-entry:not(.user-entry)")!;
 
-    expect(user.compareDocumentPosition(tool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(tool.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(getComputedStyle(user).marginLeft).toBe("0px");
-    expect(getComputedStyle(user).maxWidth).toBe("800px");
-    const prose = assistant.querySelector(".markdown p")!;
-    const proseStyle = getComputedStyle(prose);
-    expect(proseStyle.fontSize).toBe("14px");
-    expect(proseStyle.maxWidth).toBe(`${parseFloat(proseStyle.fontSize) * 50}px`);
+      expect(user.compareDocumentPosition(tool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(tool.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(getComputedStyle(user).marginLeft).toBe("0px");
+      expect(getComputedStyle(user).maxWidth).toBe("650px");
+      const prose = assistant.querySelector<HTMLElement>(".markdown p")!;
+      const proseStyle = getComputedStyle(prose);
+      expect(proseStyle.fontSize).toBe("var(--text-md)");
+      // jsdom cannot resolve the token; apply its value to exercise the ch unit.
+      prose.style.fontSize = "13px";
+      expect(getComputedStyle(prose).maxWidth).toBe("650px");
+    } finally {
+      document.documentElement.style.fontSize = previousRootSize;
+    }
   });
 
   it("does not follow new activity after the user scrolls up", async () => {

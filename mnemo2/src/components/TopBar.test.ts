@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
+import { get } from "svelte/store";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
@@ -156,5 +157,43 @@ describe("TopBar external lead badge", () => {
     }));
     await screen.findByText("Lead: Claude Code (external)");
     expect(screen.queryByText("Lead: Claude Code (idle)")).toBeNull();
+  });
+});
+
+describe("TopBar workspace tabs", () => {
+  beforeEach(() => {
+    app.set(fixtureState());
+  });
+
+  it("switches between Lead, Team, Cost and Graph from the nav", async () => {
+    render(TopBar);
+
+    await fireEvent.click(screen.getByRole("button", { name: /^Team/ }));
+    expect(get(app).route).toBe("team");
+    await fireEvent.click(screen.getByRole("button", { name: /^Cost/ }));
+    expect(get(app).route).toBe("cost");
+    await fireEvent.click(screen.getByRole("button", { name: /^Graph/ }));
+    expect(get(app).route).toBe("graph");
+    await fireEvent.click(screen.getByRole("button", { name: /^Lead/ }));
+    expect(get(app).route).toBe("lead");
+  });
+
+  it("opens the Cost tab from the cost chip instead of the settings sheet", async () => {
+    render(TopBar);
+
+    await fireEvent.click(costButton());
+
+    expect(get(app).route).toBe("cost");
+    expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
+  });
+
+  it("keeps project settings on the Settings gear and install settings one step away", async () => {
+    render(TopBar);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Project settings" }));
+    expect(await screen.findByRole("dialog", { name: "Project settings" })).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(await screen.findByRole("dialog", { name: "Settings" })).toBeTruthy();
   });
 });

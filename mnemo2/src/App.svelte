@@ -2,6 +2,8 @@
   import { onMount } from "svelte";
   import { actions, app } from "./lib/store";
   import ControlRoom from "./components/ControlRoom.svelte";
+  import CostView from "./components/CostView.svelte";
+  import GraphView from "./components/GraphView.svelte";
   import FirstIndexOverlay from "./components/FirstIndexOverlay.svelte";
   import LeadChat from "./components/LeadChat.svelte";
   import StartScreen from "./components/StartScreen.svelte";
@@ -36,8 +38,12 @@
           <LeadChat />
           {#if $app.workbenchOpen}<Workbench />{:else if $app.workerPanelId}<WorkerPanel />{/if}
         </div>
-      {:else}
+      {:else if $app.route === "team"}
         <ControlRoom />
+      {:else if $app.route === "cost"}
+        <CostView />
+      {:else}
+        <GraphView />
       {/if}
     </div>
     {#if $app.teamPeekOpen && $app.route === "lead"}<TeamPeek />{/if}

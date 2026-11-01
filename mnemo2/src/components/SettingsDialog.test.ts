@@ -68,12 +68,16 @@ describe("SettingsDialog", () => {
     app.set(fixtureState());
   });
 
-  it("is opened by the gear button in the top bar", async () => {
+  it("is reached from the project settings sheet opened by the gear in the top bar", async () => {
     makeTransport();
     render(TopBar);
     expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
-    await fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Project settings" }));
+    expect(screen.getByRole("dialog", { name: "Project settings" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Open" }));
     expect(screen.getByRole("dialog", { name: "Settings" })).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
     await fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull());
   });

@@ -930,6 +930,26 @@ function openTeam() {
   }));
 }
 
+/** Show the project's spend and savings; needs an open project. */
+function openCost() {
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "cost" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: false,
+  }));
+}
+
+/** Show the project's code graph; needs an open project. */
+function openGraph() {
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "graph" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: false,
+  }));
+}
+
 function toggleTeamPeek() {
   app.update((state) => ({ ...state, teamPeekOpen: !state.teamPeekOpen }));
 }
@@ -2456,6 +2476,8 @@ export const actions = {
   cancelNewProject,
   openLead,
   openTeam,
+  openCost,
+  openGraph,
   toggleTeamPeek,
   selectWorker,
   setTeamFilter,

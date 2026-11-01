@@ -22,6 +22,9 @@ pub mod indexing;
 /// The real worker team runtime.
 pub mod team;
 
+/// Best-effort naming of the processes holding a worker checkout's files.
+pub mod lock_holders;
+
 /// Durable per-project usage and cost accounting.
 pub mod usage;
 

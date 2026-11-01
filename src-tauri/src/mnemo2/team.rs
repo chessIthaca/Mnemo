@@ -35,6 +35,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::mnemo2::ledger::{self, RecordsLedger};
+use crate::mnemo2::lock_holders;
 use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewEvidence, ReviewRecord};
 use crate::mnemo2::runtime::{LeadModel, LeadRuntime};
 use crate::mnemo2::usage::{event_session, usage_model_key, ProjectUsage, ProjectUsageView};
@@ -4228,9 +4229,16 @@ async fn remove_leftover_checkout(root: &Path, worker: &WorkerRecord) -> Result<
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     }
+    // Name what still holds the folder, so the user knows what to close. The
+    // probe is best effort and never closes anything itself.
+    let probe = canonical.clone();
+    let holders = tokio::task::spawn_blocking(move || lock_holders::holders(&[probe]))
+        .await
+        .unwrap_or_default();
     Err(format!(
-        "could not remove leftover checkout {}: {last_error}",
-        canonical.display()
+        "could not remove leftover checkout {}: {last_error}{}",
+        canonical.display(),
+        lock_holders::held_by_suffix(&holders)
     ))
 }
 

@@ -310,7 +310,8 @@ impl ShutdownProgress {
 }
 
 /// Run shutdown on the async runtime, leaving the event-loop thread free to
-/// service WebView2 work. The exit callback always runs, even on a stalled step.
+/// service WebView2 work. The exit callback always runs, even when a step
+/// stalls or panics.
 fn spawn_orderly_shutdown<F, E>(
     shutdown: F,
     exit: E,
@@ -321,11 +322,21 @@ fn spawn_orderly_shutdown<F, E>(
     E: FnOnce() + Send + 'static,
 {
     tauri::async_runtime::spawn(async move {
-        if tokio::time::timeout(deadline, shutdown).await.is_err() {
-            eprintln!(
-                "mnemo2: shutdown deadline exceeded while {}; exiting anyway",
-                progress.pending_step()
-            );
+        let shutdown = tauri::async_runtime::spawn(shutdown);
+        match tokio::time::timeout(deadline, shutdown).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!(
+                    "mnemo2: shutdown failed while {}: {error}; exiting anyway",
+                    progress.pending_step()
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "mnemo2: shutdown deadline exceeded while {}; exiting anyway",
+                    progress.pending_step()
+                );
+            }
         }
         exit();
     });
@@ -590,6 +601,27 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("a pending shutdown step cannot prevent exit");
         assert_eq!(progress.pending_step(), "stopping runtimes");
+    }
+
+    #[test]
+    fn panicking_shutdown_step_still_exits() {
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let progress = std::sync::Arc::new(ShutdownProgress::new());
+        let shutdown_progress = progress.clone();
+        spawn_orderly_shutdown(
+            async move {
+                shutdown_progress.set(ShutdownStep::ClosingBrowser);
+                panic!("simulated browser close panic");
+            },
+            move || exit_tx.send(()).expect("report exit"),
+            progress.clone(),
+            std::time::Duration::from_secs(2),
+        );
+
+        exit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a panicking shutdown step cannot prevent exit");
+        assert_eq!(progress.pending_step(), "closing the browser");
     }
 
     /// The native shell must compile with Mnemo2's own Tauri identity. Sharing

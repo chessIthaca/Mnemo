@@ -41,6 +41,10 @@ VERIFY:
 ## Steps
 - [ ] 1. **Record and deliver the sender** — `src-tauri/src/mnemo2/team.rs` (MessageSender, inbox log on WorkerRecord persisted on every message, sender header on delivered text, `message_parent` result and worker guidance wording, the route-fix/brief caller passes Mnemo), `src-tauri/src/mnemo2/mcp_server.rs` (external lead calls pass ExternalLead), `src-tauri/src/mnemo2/ipc.rs` (mission control passes User), `src-tauri/src/mnemo2/runtime.rs` (built-in lead path passes Lead; update test callers and the message_parent assertion). Tests: each sender is recorded and persisted immediately, the header reaches the worker's session, old ledgers without the field load, the cap holds, message_parent's new result text.
 - [ ] 2. **Show senders in mission control** — `mnemo2/src/lib/` team types plus the worker detail component (find it with graph_search, e.g. WorkerDetail.svelte): list the worker's inbox entries with a sender label and time, newest last, collapsed by default like the brief. Add or extend the frontend tests next to the touched components.
+- [ ] 3. **Integration check** — run the combined result (build, tests, or launching the entry point) and verify the parallel steps fit together; fix any seam breakage.
+
+## Decisions
+- 2026-11-01: added step 3 (Integration check) because steps 1 and 2 ran in parallel
 
 ## Interfaces
 - 2026-11-01: `src-tauri/src/mnemo2/team.rs` is also being changed by plan 763a911f step 1 (external-lead memory tracking, close-gate wiring, closed-notice reminder) and possibly by plan 53e56d1d (shutdown). This plan's step 1 touches only the worker-message path (`message`/`message_inner` and callers, `WorkerRecord` inbox field, `message_parent` handling, worker guidance strings). Do not refactor neighbouring code, so merges stay mechanical.

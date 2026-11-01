@@ -89,12 +89,13 @@ describe("worker thread", () => {
     ]);
   });
 
-  it("shows the brief and inbox reports before the first turn is saved", () => {
+  it("shows inbox reports before the first turn without a dispatched brief bubble", () => {
     const thread = workerThreadFromRecord(record([]), [
       { worker_id: "w1", text: "halfway there", at_ms: 1_700_000_000_000 },
       { worker_id: "other", text: "not mine", at_ms: 1_700_000_000_000 },
     ]);
-    expect(shape(thread)).toEqual(["lead:Build the parser", "worker:halfway there"]);
+    expect(shape(thread)).toEqual(["worker:halfway there"]);
+    expect(thread.some((entry) => entry.time === "dispatched")).toBe(false);
   });
 
   it("does not repeat an inbox report the transcript already holds", () => {

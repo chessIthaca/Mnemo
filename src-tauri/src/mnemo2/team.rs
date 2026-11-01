@@ -1435,6 +1435,13 @@ impl TeamRuntime {
         Ok(report)
     }
 
+    /// The raw durable per-model usage accumulator behind
+    /// [`TeamSnapshot::usage`] (read-only; the Cost tab prices its rows per
+    /// model).
+    pub async fn usage(&self) -> ProjectUsage {
+        self.usage.lock().await.clone()
+    }
+
     /// The current team state.
     pub async fn snapshot(&self) -> TeamSnapshot {
         let workers = self.records.lock().await.clone();

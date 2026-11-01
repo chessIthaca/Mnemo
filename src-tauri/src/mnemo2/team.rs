@@ -478,6 +478,16 @@ impl LiveWorker {
     fn abort(&self) {
         self.pump.abort();
     }
+
+    /// Admit a non-cleanup session command only when the event pump is live.
+    fn admit_session_command(&self, worker_id: &str) -> Result<(), String> {
+        if self.cleanup_retry_only {
+            return Err(format!(
+                "worker '{worker_id}' session cleanup must be retried before sending commands"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The state of an external lead (Claude Code leading over MCP) on one team.
@@ -2537,11 +2547,7 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running; resume it first"))?;
-            if live.cleanup_retry_only {
-                return Err(
-                    "worker session cleanup must be retried before messaging it".to_string()
-                );
-            }
+            live.admit_session_command(worker_id)?;
             let busy = live.busy.clone();
             let idle = !busy.load(Ordering::SeqCst);
             if idle {
@@ -2588,6 +2594,7 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+            live.admit_session_command(worker_id)?;
             live.session
                 .send(SessionCommand::Interrupt)
                 .await
@@ -2610,6 +2617,7 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+            live.admit_session_command(worker_id)?;
             live.session
                 .send(SessionCommand::Interrupt)
                 .await
@@ -2694,11 +2702,7 @@ impl TeamRuntime {
     async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let live = self.live.lock().await;
         if let Some(live) = live.get(worker_id) {
-            if live.cleanup_retry_only {
-                return Err(
-                    "worker session cleanup must be retried before resuming it".to_string()
-                );
-            }
+            live.admit_session_command(worker_id)?;
             return Err(format!("worker '{worker_id}' is already running"));
         }
         drop(live);
@@ -2852,6 +2856,7 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+            live.admit_session_command(worker_id)?;
             if live.busy.swap(true, Ordering::SeqCst) {
                 return Err(format!(
                     "worker '{worker_id}' is busy; compact it when it becomes idle"
@@ -5917,7 +5922,7 @@ models = [\"scripted-a\"]
             worker.id.clone(),
             LiveWorker {
                 session,
-                pump: tokio::spawn(async {}),
+                pump: tokio::spawn(std::future::pending::<()>()),
                 cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
             },
@@ -6083,6 +6088,14 @@ models = [\"scripted-a\"]
         .expect("provision worker");
         let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
         spawn_live_worker(&team, &worker).await;
+        assert!(!team
+            .live
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("pending live worker")
+            .pump
+            .is_finished());
         team.fail_next_close_for_test();
 
         let error = team.stop_inner(&worker.id).await.expect_err("injected close failure");
@@ -6136,6 +6149,29 @@ models = [\"scripted-a\"]
             .await
             .expect_err("a cleanup-retry-only worker rejects resume");
         assert!(resume.contains("cleanup"), "{resume}");
+        let before_commands = team.worker(&worker.id).await.expect("worker before commands");
+        let compact = team
+            .compact(&worker.id)
+            .await
+            .expect_err("a cleanup-retry-only worker rejects compact");
+        assert!(compact.contains("cleanup"), "{compact}");
+        let after_compact = team.worker(&worker.id).await.expect("worker after compact");
+        assert_eq!(after_compact.status, before_commands.status);
+        assert_eq!(after_compact.compacting, before_commands.compacting);
+        assert!(!busy.load(Ordering::SeqCst));
+        let pause = team
+            .pause(&worker.id)
+            .await
+            .expect_err("a cleanup-retry-only worker rejects pause");
+        assert!(pause.contains("cleanup"), "{pause}");
+        let interrupt = team
+            .interrupt(&worker.id)
+            .await
+            .expect_err("a cleanup-retry-only worker rejects interrupt");
+        assert!(interrupt.contains("cleanup"), "{interrupt}");
+        let after_commands = team.worker(&worker.id).await.expect("worker after commands");
+        assert_eq!(after_commands.status, before_commands.status);
+        assert_eq!(after_commands.compacting, before_commands.compacting);
         assert!(!busy.load(Ordering::SeqCst));
 
         let stopped = team.stop_inner(&worker.id).await.expect("stop retry");

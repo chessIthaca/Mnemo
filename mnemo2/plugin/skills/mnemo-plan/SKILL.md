@@ -10,6 +10,7 @@ In a Mnemo2 project all worker tasks belong to a step of a plan on the board. `t
 
 ## 1. Scope
 
+- Call `memory_search` with a query about the change and no `record_type` — mandatory before every `plan_create`, and enforced while you are the attached lead: `plan_create` is refused until a `memory_search` ran since your previous `plan_create` (or since you attached). Earlier decisions, known bugs and how-tos decide the design. For a defect, also `memory_search` with `record_type` "bug": a recorded root cause and regression test may already exist, and a `bug_fixing` `plan_create` is refused until one ran.
 - Call `plan_list` and `team_status`. If an open plan already covers the request, continue it with `plan_show` and `plan_update` instead of creating a second one.
 - Read the code the change touches. Find the exact files, symbols, existing tests and the commands that verify them.
 - Ask the user only for what changes the plan: unclear scope, a choice between designs, or something expensive or risky. Otherwise state your assumptions in the plan.
@@ -19,7 +20,7 @@ In a Mnemo2 project all worker tasks belong to a step of a plan on the board. `t
 Call `plan_create` with:
 
 - `title` and `goal`: the outcome in one or two sentences.
-- `kind`: `implementation` (the default), `research`, or `bug_fixing`. A bug_fixing plan needs `bug` (the symptom), and its context must name the regression test: which test, in which file, and how it fails without the fix. Record it later with `plan_update` `regression_test`.
+- `kind`: `implementation` (the default), `research`, or `bug_fixing`. A defect is ALWAYS a `bug_fixing` plan, never `implementation`. It needs `bug` (the symptom), its context must name the regression test — which test, in which file, and how it fails without the fix — and the bare test function name is recorded with `plan_update` `regression_test` once it exists. Exception: a bug-triggered change that adds capabilities, new dependencies or spans multiple modules is an `implementation` plan, with the bug documented as motivation in `goal` and `context`. If you file a defect fix as `implementation` or `research`, the `plan_create` result appends a reminder line that bugs use `bug_fixing`: re-plan with the right kind unless the exception applies.
 - `context`: at least 40 characters, in practice a page. Why the work exists, constraints, decisions already taken, exact file paths and symbols, and the verification commands. Workers read it, so write stable intent only. Never put status in it (commits, review state, what is next); that goes into `plan_update` `progress`.
 - `steps`: ordered, each starting with a bold **header**. The board refuses a step that names no file path (a research-only step may carry an explicit "no-code research" marker instead), so name the files each step touches.
 - `interfaces`: contracts between steps (exports, signatures, data shapes, file ownership).
@@ -57,4 +58,6 @@ Summarize the plan to the user in a few lines: the steps, the tier each will use
 - `plan_update` `progress`: execution state. Workers do not see it.
 - `plan_update` `add_steps`: new work discovered along the way.
 - A step ticks itself when a task on it merges and none is still open. Tick only your own steps with `plan_step_done`.
-- The plan closes after its last step when the team review passes. `plan_abandon` with a reason is the last resort.
+- Record durable knowledge with `memory_write` as it settles during the work — a `SPEC:`/`DECISION:`/`HOW:` title, no plan IDs, branch names or commit hashes. This is a habit, not a gate: writing as you go just means the close gate below is already satisfied when you reach it.
+- The plan closes after its last step when the team review passes. While you are the attached lead, an `implementation` or `research` plan additionally needs at least one durable knowledge record to close: a live `memory_write` with a `SPEC:`, `DECISION:` or `HOW:` (or `BUG:`) title, written, amended or superseded since the plan was created — plan-scoped notes do not count. A "cannot close yet" notice names `memory_write`: record what the plan established, then tick the last step again with `plan_step_done` to close. A `bug_fixing` plan is exempt — its `BUG:` record is captured automatically at close.
+- `plan_abandon` with a reason is the last resort.

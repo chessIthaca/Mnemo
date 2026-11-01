@@ -1,6 +1,6 @@
 ---
 name: mnemo-lead
-description: Lead a Mnemo2 team from Claude Code. Use only in a Mnemo2 project, when the Mnemo tools (team_dispatch, team_status, team_review, team_merge) are available in this session. Covers tiers, briefs, the review and merge cycle, worker notices and failures.
+description: Lead a Mnemo2 team from Claude Code. Use only in a Mnemo2 project, when the Mnemo tools (team_dispatch, team_status, team_review, team_merge) are available in this session. Covers tiers, briefs, the review and merge cycle, the enforced memory workflow, worker notices and failures.
 when_to_use: The user asks to build, fix or change something in a Mnemo2 project; a worker notice arrives (it starts with "[TeamManager notice"); you are about to dispatch, review or merge worker output; or you are about to use Agent, Task or Workflow in a Mnemo2 project.
 ---
 
@@ -24,7 +24,7 @@ The first Mnemo tool call on a machine can return a note that starts with "[Mnem
 ## Start of a task
 
 1. Call `team_status` (all workers) and `plan_list` (the board). Continue open plans instead of starting duplicates.
-2. Plan first with the `mnemo-plan` skill. Every dispatch belongs to a step of a board plan.
+2. Plan first with the `mnemo-plan` skill — its scope starts with `memory_search` (mandatory; see Project memory and code graph below). Every dispatch belongs to a step of a board plan.
 3. Dispatch, then run the review cycle below. The `mnemo-review` skill is the detailed checklist.
 
 Never infer worker lifecycle from Git, files, timestamps or team.json. `team_status` is the only authority. Reading a worker's branch or worktree to review its work is expected. Reading it to decide whether the worker is running or finished is not.
@@ -135,11 +135,17 @@ Do not poll with sleep loops or repeated `team_status` calls. If you end your tu
 
 ## Project memory and code graph
 
-Mnemo keeps the project's knowledge in `.coding/knowledge/` (specs, decisions, bugs, how-tos) and a code graph of the source. Use them before planning and when reviewing:
+Mnemo keeps the project's knowledge in `.coding/knowledge/` (specs, decisions, bugs, how-tos) and a code graph of the source. Mnemo2's own lead follows a memory workflow, and while you are the attached lead the MCP server enforces the same one on you — the gates below refuse the calls that skip it. These habits are mandatory, not suggestions:
 
-- `memory_search` finds earlier decisions, known bugs and how-tos; check it before you plan a change in an area.
-- `memory_write` records a durable decision or finding (a `SPEC:`/`DECISION:`/`BUG:`/`HOW:` title). `memory_amend`, `memory_update` and `memory_supersede` keep records current; supersede rather than delete.
+- `memory_search` before planning: query it about the change with no `record_type`. Earlier decisions, known bugs and how-tos decide the design. `plan_create` is refused until a `memory_search` ran since your previous `plan_create` (or since you attached); the refusal names the exact call.
+- `memory_search` with `record_type` "bug" before diagnosing any defect: a recorded root cause and regression test may already exist. A `bug_fixing` `plan_create` is refused until one ran in the same window.
 - `graph_search`, `graph_context`, `graph_impact` and `graph_path` answer "where is X defined, who calls it, what does a change touch". Use `graph_impact` to size a step and to choose which files a worker owns.
+
+`memory_write` the moment you learn something durable — deferred is lost. Give it a typed title: `SPEC:` how a feature works, `DECISION:` a choice and its rationale, `BUG:` symptom -> root cause -> fix and its regression test name, `HOW:` a recurring workflow. Keep records compact and pointer-first (the gist plus a file or path pointer; the file carries the detail) and leave out plan IDs, branch names and commit hashes — a record carrying them is a plan-scoped note, retired at plan close, so it does not count as durable knowledge. (`PLAN:` and `REVIEW:` records are digests Mnemo writes itself.)
+
+Keep records current: `memory_supersede` when a new fact makes a stored one obsolete (never leave both live), `memory_update` to refine a still-current record, `memory_amend` to append a dated amendment. Supersede rather than delete.
+
+Two gates ride the plan board while you lead. An `implementation` or `research` plan cannot close until a durable knowledge record exists that was written, amended or superseded since the plan was created — a live `SPEC:`, `DECISION:` or `HOW:` record (a `BUG:` record counts too), never a plan-scoped note; the "cannot close yet" notice names `memory_write`, so record what the plan established and tick the last step again with `plan_step_done` to close. A `bug_fixing` plan is exempt: its `BUG:` record is captured automatically at close. The `team_merge` result and the "Plan X is closed" notice end with a reminder line to record `SPEC:`/`DECISION:`/`HOW:` learnings and supersede stale records.
 
 Knowledge files live on the lead branch; a merge allows uncommitted changes there, but commit them with your other lead-branch edits.
 

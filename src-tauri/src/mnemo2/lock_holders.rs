@@ -51,11 +51,13 @@ pub fn holders(paths: &[PathBuf]) -> Vec<LockHolder> {
     }
 }
 
-/// The note a failed checkout removal appends to its error: the holders, or
-/// the fact that none were found.
+/// The note a failed checkout removal appends to its error: the holders, or —
+/// when the Restart Manager reports none — a hint that a terminal or program
+/// whose working folder is inside the checkout also blocks removal, because
+/// the manager only sees open files, never directory handles.
 pub fn held_by_suffix(holders: &[LockHolder]) -> String {
     if holders.is_empty() {
-        return " (no process found holding it)".to_string();
+        return " (no process found holding a file in it; a terminal or program whose working folder is inside it can also block removal)".to_string();
     }
     let named: Vec<String> = holders
         .iter()
@@ -305,7 +307,10 @@ mod tests {
 
     #[test]
     fn the_suffix_names_holders_or_says_none_were_found() {
-        assert_eq!(held_by_suffix(&[]), " (no process found holding it)");
+        assert_eq!(
+            held_by_suffix(&[]),
+            " (no process found holding a file in it; a terminal or program whose working folder is inside it can also block removal)"
+        );
         let found = [
             LockHolder {
                 name: "Code.exe".to_string(),

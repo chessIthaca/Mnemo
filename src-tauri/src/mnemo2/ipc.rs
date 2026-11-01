@@ -188,6 +188,12 @@ impl Mnemo2State {
 }
 
 impl Mnemo2State {
+    /// Install an open runtime for shutdown integration tests.
+    #[cfg(test)]
+    pub(crate) fn install_runtime_for_test(&mut self, runtime: Arc<LeadRuntime>) {
+        *self.runtime.get_mut() = Some(runtime);
+    }
+
     /// Stop the real runtimes and release only this process's project claim.
     pub async fn shutdown(&self) {
         if let Some(forwarder) = self.forwarder.lock().await.take() {

@@ -2282,6 +2282,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_completes_with_an_open_project_and_team() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let (lead, _team) = open_git_lead(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(Vec::new())),
+        )
+        .await;
+        let mut app_state = crate::mnemo2::ipc::Mnemo2State::default();
+        app_state.install_runtime_for_test(Arc::new(lead));
+
+        tokio::time::timeout(Duration::from_secs(5), app_state.shutdown())
+            .await
+            .expect("shutdown with an open project and team completes");
+    }
+
+    #[tokio::test]
     async fn streams_a_real_engine_turn_and_persists_the_transcript() {
         let root = tempfile::tempdir().expect("workspace");
         let config = tempfile::tempdir().expect("config");

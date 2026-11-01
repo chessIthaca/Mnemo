@@ -44,10 +44,12 @@
 //!   from it is budgeted and always carries the file path. `PLAN:` and
 //!   `REVIEW:` records have their own file homes (`.coding/plans/`,
 //!   `.coding/reviews/`) and are NOT knowledge files.
-//! - **Monotonic dates.** New records are stamped `max(wall clock, newest
-//!   on-disk artifact date)` (the knowledge dirs plus the sibling
-//!   `.coding/reviews/`), so a stale or rolled-back OS clock cannot
-//!   back-date exports (the 2026-09-01 incident, backlog d7b2e722).
+//! - **Wall-clock dates.** New records are stamped with the wall clock
+//!   date; files already on disk never move a new record's date. The
+//!   former `max(wall clock, newest on-disk date)` floor (added for the
+//!   2026-09-01 stale-clock incident, backlog d7b2e722) copied one
+//!   clock-ahead session's future dates (2027-01-11) onto every later
+//!   record and was removed (plan ecf59f53).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -420,48 +422,6 @@ fn classify_link(target: &str) -> KnowledgeLink {
     }
 }
 
-/// Scan one directory for the newest strict `YYYY-MM-DD-<slug>` stem and
-/// fold it into `best` when it passes [`valid_floor_date`]. Unreadable dirs
-/// and non-matching names contribute nothing.
-fn scan_dir_max_date(dir: &std::path::Path, ceiling: &str, best: &mut Option<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for stem in entries.flatten().filter_map(|e| {
-        e.path()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-    }) {
-        if let Some(date) = date_from_slug(&stem) {
-            if valid_floor_date(date, ceiling) && best.as_deref().is_none_or(|b| date > b) {
-                *best = Some(date.to_string());
-            }
-        }
-    }
-}
-
-/// A floor candidate is plausible when its calendar components are valid
-/// (month 1-12 and day within that month's length, leap-checked — rejects
-/// typo'd stems like `2026-13-99` and `2026-02-31`) and it does not exceed
-/// the slack ceiling (rejects far-future junk that would pin every export).
-fn valid_floor_date(date: &str, ceiling: &str) -> bool {
-    let year: u32 = date.get(0..4).and_then(|y| y.parse().ok()).unwrap_or(0);
-    let month: u32 = date.get(5..7).and_then(|m| m.parse().ok()).unwrap_or(0);
-    let day: u32 = date.get(8..10).and_then(|d| d.parse().ok()).unwrap_or(0);
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let max_day = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        // Month out of range (0 or 13+) — parse guaranteed the shape, the
-        // value can still be junk.
-        _ => 0,
-    };
-    (1..=max_day).contains(&day) && date <= ceiling
-}
-
 // ── File-backed writer ─────────────────────────────────────────────────────
 
 /// Apply a targeted, unambiguous repair to a record body (backlog 488248ce):
@@ -597,49 +557,18 @@ impl KnowledgeStore {
         }
     }
 
-    /// The date stamped on NEW records: `max(wall clock, artifact floor)`.
+    /// The date stamped on NEW records: the wall clock date.
     ///
-    /// The OS wall clock is not always right — on a stale/pinned clock every
-    /// export gets back-dated (the 2026-09-01 incident, backlog d7b2e722 /
-    /// review LOW 2). The artifact floor (newest on-disk date prefix across
-    /// the knowledge dirs and the sibling reviews dir) acts as a monotonic
-    /// high-water mark: a new record can never be dated BEFORE the newest
-    /// thing already on disk, so a frozen or rolled-back clock cannot
-    /// back-date exports. When the clock is ahead of every artifact (the
-    /// normal case) it wins and behavior is unchanged.
+    /// Files already on disk never move a new record's date. The former
+    /// `max(wall clock, newest on-disk artifact date)` floor (added for the
+    /// 2026-09-01 stale-clock exports, backlog d7b2e722) had the opposite
+    /// failure: one session running on a clock set ahead (2027-01-11)
+    /// wrote hundreds of future-dated files, and the floor then copied
+    /// that future date onto EVERY later record (plan ecf59f53). A stale
+    /// clock now back-dates at most one session's records; a
+    /// future-dated file pins nothing.
     fn stamped_date(&self) -> String {
-        let wall = fmt_date((self.now)());
-        match self.artifact_date_floor() {
-            Some(floor) if floor > wall => floor,
-            _ => wall,
-        }
-    }
-
-    /// Newest strict `YYYY-MM-DD` filename prefix across the knowledge type
-    /// dirs and the sibling `.coding/reviews/` dir (both sides of the
-    /// `.coding` side-car carry dated artifacts). Candidates beyond a slack
-    /// ceiling (~13 months past the wall clock) are ignored — a typo'd or
-    /// hostile far-future filename must not pin every future export.
-    fn artifact_date_floor(&self) -> Option<String> {
-        let ceiling = fmt_date((self.now)() + 400 * 86_400);
-        let mut best: Option<String> = None;
-        for t in [
-            MemoryRecordType::Spec,
-            MemoryRecordType::Decision,
-            MemoryRecordType::Bug,
-            MemoryRecordType::How,
-        ] {
-            if let Some(dir) = dir_for_record_type(t) {
-                scan_dir_max_date(&self.knowledge_dir.join(dir), &ceiling, &mut best);
-            }
-        }
-        // The reviews dir is the knowledge dir's sibling under `.coding/`
-        // (`.coding/knowledge` ↔ `.coding/reviews`); a missing dir simply
-        // contributes nothing.
-        if let Some(parent) = self.knowledge_dir.parent() {
-            scan_dir_max_date(&parent.join("reviews"), &ceiling, &mut best);
-        }
-        best
+        fmt_date((self.now)())
     }
 
     /// Write a new live knowledge record: `<type>/<date>-<slug>.md`.
@@ -1367,82 +1296,62 @@ mod tests {
     }
 
     #[test]
-    fn write_dates_from_artifact_floor_when_clock_stale() {
-        // Backlog d7b2e722 / review LOW 2: a stale OS wall clock (here
-        // pinned to 2026-02-01, mirroring the 2026-09-01 incident) back-dated
-        // every export. The stamped date must never fall below the newest
-        // on-disk artifact date — a 2026-12-19 review file floors new
-        // records at 2026-12-19 regardless of the clock.
+    fn write_uses_the_wall_clock_even_when_a_future_dated_file_exists() {
+        // Plan ecf59f53: a session with its clock set to January 2027
+        // wrote 336 knowledge files dated 2027-01-11, and the artifact
+        // floor then copied that future date onto EVERY later record. New
+        // records take the wall clock — a future-dated file on disk moves
+        // nothing.
         let dir = tempfile::tempdir().unwrap();
-        let reviews = dir.path().join(".coding/reviews");
-        std::fs::create_dir_all(&reviews).unwrap();
-        std::fs::write(reviews.join("2026-12-19-levers-review.md"), "x").unwrap();
-        let ks = KnowledgeStore::with_clock(dir.path().join(".coding/knowledge"), || CLOCK);
+        let spec = dir.path().join(".coding/knowledge/spec");
+        std::fs::create_dir_all(&spec).unwrap();
+        std::fs::write(spec.join("2027-01-11-old.md"), "future-dated body").unwrap();
+        // 1_793_491_200 = 2026-11-01 UTC — the real date, behind the file.
+        let ks = KnowledgeStore::with_clock(dir.path().join(".coding/knowledge"), || 1_793_491_200);
         let rel = ks
-            .write(MemoryRecordType::Decision, "Stale clock record", "body")
+            .write(MemoryRecordType::Decision, "Today record", "body")
             .unwrap();
-        assert_eq!(rel, "decision/2026-12-19-stale-clock-record.md");
+        assert_eq!(rel, "decision/2026-11-01-today-record.md");
         let text = read_file(&format!(".coding/knowledge/{rel}"), &dir);
         assert!(
-            text.contains("created = \"2026-12-19\""),
-            "created must match the artifact floor, not the stale clock: {text}"
+            text.starts_with("+++\ntitle = \"Today record\"\ncreated = \"2026-11-01\"\n+++\n"),
+            "created must take the wall clock, not the on-disk future date: {text}"
+        );
+        // Acceptance scenario: existing (misdated) files keep their names
+        // and bytes — history is never rewritten.
+        assert_eq!(
+            std::fs::read_to_string(spec.join("2027-01-11-old.md")).unwrap(),
+            "future-dated body"
         );
     }
 
     #[test]
-    fn clock_ahead_of_artifact_floor_wins() {
-        // Normal case: the wall clock is ahead of every on-disk artifact —
-        // the clock date wins and behavior is identical to the old
-        // clock-only stamping.
+    fn supersede_successor_carries_the_wall_clock_not_the_disk_date() {
+        // The supersede successor stamps through the same wall-clock rule:
+        // a future-dated file on disk (a clock-ahead session — the
+        // 2027-01-11 incident, plan ecf59f53) must not move the
+        // successor's date.
         let dir = tempfile::tempdir().unwrap();
-        let reviews = dir.path().join(".coding/reviews");
-        std::fs::create_dir_all(&reviews).unwrap();
-        std::fs::write(reviews.join("2026-12-19-levers-review.md"), "x").unwrap();
-        // 1_799_107_200 = 2027-01-05 UTC (338 days after CLOCK).
-        let ks = KnowledgeStore::with_clock(dir.path().join(".coding/knowledge"), || 1_799_107_200);
-        let rel = ks
-            .write(MemoryRecordType::Spec, "Clock ahead", "body")
-            .unwrap();
-        assert_eq!(rel, "spec/2027-01-05-clock-ahead.md");
-    }
-
-    #[test]
-    fn supersede_successor_never_backdates_below_floor() {
-        // The supersede successor is stamped through the same floored date:
-        // a stale clock must not date the successor BEFORE the floor.
-        let dir = tempfile::tempdir().unwrap();
-        let reviews = dir.path().join(".coding/reviews");
-        std::fs::create_dir_all(&reviews).unwrap();
-        std::fs::write(reviews.join("2026-12-19-levers-review.md"), "x").unwrap();
-        let ks = KnowledgeStore::with_clock(dir.path().join(".coding/knowledge"), || CLOCK);
+        let spec = dir.path().join(".coding/knowledge/spec");
+        std::fs::create_dir_all(&spec).unwrap();
+        std::fs::write(spec.join("2027-01-11-old.md"), "future-dated body").unwrap();
+        // 1_793_491_200 = 2026-11-01 UTC — the real date, behind the file.
+        let ks = KnowledgeStore::with_clock(dir.path().join(".coding/knowledge"), || 1_793_491_200);
         let old = ks
-            .write(MemoryRecordType::How, "Old record", "body")
+            .write(MemoryRecordType::How, "Old record", "old body")
             .unwrap();
-        let successor = ks.supersede(&old, "New record", "body").unwrap();
+        assert_eq!(old, "how/2026-11-01-old-record.md");
+        let successor = ks.supersede(&old, "New record", "new body").unwrap();
+        assert_eq!(successor, "how/2026-11-01-new-record.md");
+        let text = read_file(&format!(".coding/knowledge/{successor}"), &dir);
         assert!(
-            successor.starts_with("how/2026-12-19-"),
-            "successor must carry the artifact floor date, got {successor}"
+            text.contains("supersedes = \"2026-11-01-old-record\""),
+            "the successor must supersede the old slug: {text}"
         );
-    }
-
-    #[test]
-    fn malformed_floor_candidates_are_ignored() {
-        // Junk stems must not move the floor: impossible month, undated name,
-        // and far-future dates (beyond the slack ceiling) all contribute
-        // nothing — with no valid floor the stale clock date stands.
-        let dir = tempfile::tempdir().unwrap();
-        let reviews = dir.path().join(".coding/reviews");
-        std::fs::create_dir_all(&reviews).unwrap();
-        std::fs::write(reviews.join("2026-13-99-bad-month.md"), "x").unwrap();
-        std::fs::write(reviews.join("nodate.md"), "x").unwrap();
-        std::fs::write(reviews.join("2999-01-01-far-future.md"), "x").unwrap();
-        std::fs::write(reviews.join("2026-02-31-bad-day.md"), "x").unwrap();
-        std::fs::write(reviews.join("2026-04-31-bad-day.md"), "x").unwrap();
-        let ks = KnowledgeStore::with_clock(dir.path().join(".coding/knowledge"), || CLOCK);
-        let rel = ks
-            .write(MemoryRecordType::Bug, "Junk floor", "body")
-            .unwrap();
-        assert_eq!(rel, "bug/2026-02-01-junk-floor.md");
+        assert!(
+            text.contains("created = \"2026-11-01\""),
+            "created must take the wall clock, not the on-disk future date: {text}"
+        );
     }
 
     #[test]

@@ -767,6 +767,7 @@ impl Shared {
                     "status": worker.status,
                     "needs_you": waiting_on_user(worker.status),
                     "elapsed_ms": worker.elapsed_ms,
+                    "last_activity_ms": worker.created_at_ms + worker.elapsed_ms,
                 })
             })
             .collect();
@@ -1972,6 +1973,19 @@ mod tests {
         assert_eq!(entry["model_short"], "scripted");
         assert_eq!(entry["model"], "test/scripted-a");
         assert!(entry["elapsed_ms"].is_number());
+        // The absolute time of the last activity, so a client can tell how
+        // long ago a finished worker stopped being busy.
+        assert!(entry["last_activity_ms"].is_number());
+        let last_activity_ms = entry["last_activity_ms"].as_u64().expect("epoch ms");
+        let created_at_ms = team
+            .worker(&worker.id)
+            .await
+            .expect("worker record")
+            .created_at_ms;
+        assert!(
+            u128::from(last_activity_ms) >= created_at_ms,
+            "last activity {last_activity_ms} predates creation {created_at_ms}"
+        );
         assert!(entry["needs_you"].is_boolean());
         assert_eq!(summary["open_plans"], 0);
         assert!(summary["running"].is_number());

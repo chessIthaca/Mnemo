@@ -3852,6 +3852,12 @@ impl TeamRuntime {
                 && other.branch == record.branch
                 && !batch.iter().any(|id| id == &other.id)
         });
+        // Informative in every state, blocked included: another worker may
+        // have landed this record's plan step through its own commits.
+        let superseded_by = {
+            let records = self.records.lock().await;
+            landing_worker_name(&records, &record)
+        };
         let mut deletion = WorkerDeletion {
             worker_id: record.id.clone(),
             name: record.name.clone(),
@@ -3860,6 +3866,7 @@ impl TeamRuntime {
             checkout: false,
             uncommitted: false,
             unmerged_commits: 0,
+            superseded_by,
             shared_branch,
             blocked: None,
         };
@@ -3992,6 +3999,27 @@ fn owns_its_branch(record: &WorkerRecord) -> bool {
             .chars()
             .all(|character| character.is_ascii_alphanumeric())
         && record.branch == agent_branch(&record.id)
+}
+
+/// The merged worker that landed this record's plan step, when the ledger
+/// knows one: another implementation record on the same plan step was
+/// merged and never reverted, so the step's work reached the lead branch
+/// through that worker's commits — typically a replay worker that
+/// re-applied this record's conflicted step by hand. Git cannot prove the
+/// two commits are the same work; the ledger can. Purely informative: the
+/// caller keeps counting this record's own unmerged commits.
+fn landing_worker_name(records: &[WorkerRecord], record: &WorkerRecord) -> Option<String> {
+    let (plan_id, plan_step) = (record.plan_id.as_deref()?, record.plan_step?);
+    records
+        .iter()
+        .find(|other| {
+            other.id != record.id
+                && other.kind == "implementation"
+                && other.plan_id.as_deref() == Some(plan_id)
+                && other.plan_step == Some(plan_step)
+                && ledger::merged(other)
+        })
+        .map(|other| other.name.clone())
 }
 
 /// The worker's registered checkout path inside the project.
@@ -4867,6 +4895,14 @@ pub struct WorkerDeletion {
     pub uncommitted: bool,
     /// Commits on the branch that the lead branch does not contain.
     pub unmerged_commits: u32,
+    /// The merged worker that landed this record's plan step through its
+    /// own commits, when the ledger knows one (a replay worker, for
+    /// example): those commits re-apply work that already reached the lead
+    /// branch, so the preview says whose instead of presenting them as the
+    /// only copy. `None` — serialized as `null` — when no merged worker
+    /// shares the step. Purely informative: the commit count and the
+    /// discard check are unaffected.
+    pub superseded_by: Option<String>,
     /// Another worker record (outside this deletion) uses the same branch,
     /// so the branch and checkout are kept and only this record goes.
     pub shared_branch: bool,

@@ -82,6 +82,18 @@ fn from_subagent(input: &Value) -> bool {
         .is_some_and(|id| !id.trim().is_empty())
 }
 
+/// The Claude Code session the hook fired for, when its input names one
+/// (`session_id`). The server records it for the staking lead, so that
+/// session's own hooks — and no other session's — can re-attach it after an
+/// idle release.
+fn hook_session(input: &Value) -> Option<&str> {
+    input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+}
+
 /// The helper path for the waiter command lines. A path that could break out
 /// of the quotes falls back to the bare command name.
 fn quoted_helper(env: &Env) -> String {
@@ -125,12 +137,13 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
     } else {
         "drain"
     };
-    let reply = call(
-        &instance,
-        "/lead/notices",
-        &json!({ "root": instance.root, "mode": wire_mode }),
-        HOOK_TIMEOUT,
-    )?;
+    // Name the session when Claude Code does: the server re-attaches an
+    // idle-released lead only for the session that staked it.
+    let mut body = json!({ "root": instance.root, "mode": wire_mode });
+    if let Some(session) = hook_session(&input) {
+        body["session"] = json!(session);
+    }
+    let reply = call(&instance, "/lead/notices", &body, HOOK_TIMEOUT)?;
     let reply: NoticesReply = serde_json::from_value(reply).ok()?;
     match mode {
         NoticesMode::Drain => {
@@ -159,13 +172,19 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
                 return None;
             }
             let helper = quoted_helper(env);
+            // Name this session in the command (the Stop hook knows it; the
+            // session itself does not): staking the lead with its session is
+            // what lets its own hooks re-attach it after an idle release.
+            let session = hook_session(&input)
+                .map(|session| format!(" --session {session}"))
+                .unwrap_or_default();
             Some(
                 json!({
                     "decision": "block",
                     "reason": format!(
                         "{} Mnemo worker(s) are still running and no waiter is active. \
                          Start this as a background command so you are woken when one reports. \
-                         Bash: {helper} wait \u{2014} PowerShell: & {helper} wait",
+                         Bash: {helper} wait{session} \u{2014} PowerShell: & {helper} wait{session}",
                         reply.active_workers,
                     ),
                 })
@@ -254,19 +273,29 @@ fn describe_wait_reply(reply: &Value, timeout_s: u64) -> String {
     }
 }
 
-/// `wait [--timeout <s>]`: block until a notice is queued; the text to print.
+/// `wait [--timeout <s>] [--session <id>]`: block until a notice is queued;
+/// the text to print.
 ///
 /// When no instance is found, or it stops answering, this keeps looking every
 /// `wait_poll` for up to `wait_reach_timeout` (the instance may be restarting)
 /// and then says plainly that Mnemo2 is unreachable, instead of exiting at
 /// once and having the lead start another waiter, again and again.
-pub fn wait(env: &Env, timeout_s: u64) -> String {
+///
+/// `--session` names the Claude Code session the Stop hook suggested this
+/// command for (the session itself cannot know it): staking the lead with
+/// that name is what lets the session's own hooks re-attach it after an
+/// idle release.
+pub fn wait(env: &Env, timeout_s: u64, session: Option<&str>) -> String {
     let read_timeout = Duration::from_secs(timeout_s).saturating_add(WAIT_SLACK);
+    let session = session.map(str::trim).filter(|session| !session.is_empty());
     let mut unreachable_since: Option<Instant> = None;
     loop {
         let reply = wait_instance(env).and_then(|instance| {
             let mut body = root_body(&instance);
             body["timeout_s"] = json!(timeout_s);
+            if let Some(session) = session {
+                body["session"] = json!(session);
+            }
             call(&instance, "/lead/wait", &body, read_timeout)
         });
         if let Some(reply) = reply {
@@ -279,7 +308,6 @@ pub fn wait(env: &Env, timeout_s: u64) -> String {
         std::thread::sleep(env.wait_poll);
     }
 }
-
 #[cfg(test)]
 #[path = "hooks_tests.rs"]
 mod tests;

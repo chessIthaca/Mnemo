@@ -47,7 +47,7 @@ use instance::Env;
 
 const USAGE: &str = "usage: mnemo2-mcp serve\n       \
     mnemo2-mcp notices --drain | --session-start | --stop-check\n       \
-    mnemo2-mcp wait [--timeout <seconds>]\n       \
+    mnemo2-mcp wait [--timeout <seconds>] [--session <id>]\n       \
     mnemo2-mcp gate-agent\n       \
     mnemo2-mcp team-summary [--json] [--cwd <dir>]\n       \
     mnemo2-mcp show-worker <worker_id> [--cwd <dir>]";
@@ -214,10 +214,10 @@ fn main() -> ExitCode {
         }
         // `wait` always runs in place: a delegated waiter is a second process
         // that outlives a kill of the first and would drain notices nobody reads.
-        "wait" => match parse_wait_timeout(rest) {
-            Some(timeout_s) => {
+        "wait" => match parse_wait_args(rest) {
+            Some((timeout_s, session)) => {
                 let env = Env::from_process();
-                print_line(&hooks::wait(&env, timeout_s));
+                print_line(&hooks::wait(&env, timeout_s, session.as_deref()));
                 ExitCode::SUCCESS
             }
             None => usage(),
@@ -258,13 +258,31 @@ fn parse_notices_mode(args: &[String]) -> Option<NoticesMode> {
     }
 }
 
-fn parse_wait_timeout(args: &[String]) -> Option<u64> {
-    match args {
-        [] => Some(DEFAULT_WAIT_S),
-        [flag, value] if flag == "--timeout" => value.parse().ok(),
-        [flag] => flag.strip_prefix("--timeout=")?.parse().ok(),
-        _ => None,
+/// The `wait` command line: `--timeout <s>` or `--timeout=<s>` (the default
+/// otherwise), plus `--session <id>` or `--session=<id>` (the Claude Code
+/// session the Stop hook named), in any order.
+fn parse_wait_args(args: &[String]) -> Option<(u64, Option<String>)> {
+    let mut timeout_s = DEFAULT_WAIT_S;
+    let mut session = None;
+    let mut index = 0;
+    while index < args.len() {
+        let (flag, inline) = match args[index].split_once('=') {
+            Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+            None => (args[index].clone(), None),
+        };
+        let has_inline = inline.is_some();
+        let value = match inline {
+            Some(value) => value,
+            None => args.get(index + 1)?.clone(),
+        };
+        match flag.as_str() {
+            "--timeout" => timeout_s = value.parse().ok()?,
+            "--session" => session = Some(value),
+            _ => return None,
+        }
+        index += if has_inline { 1 } else { 2 };
     }
+    Some((timeout_s, session))
 }
 
 /// Run a hook: read its JSON from stdin, print what it answers. A hook never
@@ -502,12 +520,29 @@ mod tests {
     }
 
     #[test]
-    fn wait_timeout_parses_both_spellings() {
-        assert_eq!(parse_wait_timeout(&strings(&[])), Some(DEFAULT_WAIT_S));
-        assert_eq!(parse_wait_timeout(&strings(&["--timeout", "90"])), Some(90));
-        assert_eq!(parse_wait_timeout(&strings(&["--timeout=15"])), Some(15));
-        assert_eq!(parse_wait_timeout(&strings(&["--timeout", "soon"])), None);
-        assert_eq!(parse_wait_timeout(&strings(&["--timeout"])), None);
-        assert_eq!(parse_wait_timeout(&strings(&["90"])), None);
+    fn wait_args_parse_both_spellings_and_the_session() {
+        assert_eq!(parse_wait_args(&strings(&[])), Some((DEFAULT_WAIT_S, None)));
+        assert_eq!(parse_wait_args(&strings(&["--timeout", "90"])), Some((90, None)));
+        assert_eq!(parse_wait_args(&strings(&["--timeout=15"])), Some((15, None)));
+        assert_eq!(
+            parse_wait_args(&strings(&["--session", "sess-9"])),
+            Some((DEFAULT_WAIT_S, Some("sess-9".to_string())))
+        );
+        assert_eq!(
+            parse_wait_args(&strings(&["--session=sess-8"])),
+            Some((DEFAULT_WAIT_S, Some("sess-8".to_string())))
+        );
+        assert_eq!(
+            parse_wait_args(&strings(&["--timeout", "60", "--session", "sess-7"])),
+            Some((60, Some("sess-7".to_string())))
+        );
+        assert_eq!(
+            parse_wait_args(&strings(&["--session", "sess-7", "--timeout=60"])),
+            Some((60, Some("sess-7".to_string())))
+        );
+        assert_eq!(parse_wait_args(&strings(&["--timeout", "soon"])), None);
+        assert_eq!(parse_wait_args(&strings(&["--timeout"])), None);
+        assert_eq!(parse_wait_args(&strings(&["--session"])), None);
+        assert_eq!(parse_wait_args(&strings(&["90"])), None);
     }
 }

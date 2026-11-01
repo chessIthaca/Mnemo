@@ -78,7 +78,7 @@ fn drain_prints_the_queued_notices_as_post_tool_use_context() {
     );
     let sent = server.requests_to("/lead/notices");
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].json(), json!({ "root": sandbox.project_str(), "mode": "drain" }));
+    assert_eq!(sent[0].json(), json!({ "root": sandbox.project_str(), "mode": "drain", "session": "s-1" }));
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn stop_check_blocks_when_workers_run_and_nobody_waits() {
     assert_eq!(
         value["reason"],
         format!(
-            "2 Mnemo worker(s) are still running and no waiter is active. Start this as a background command so you are woken when one reports. Bash: \"{helper}\" wait \u{2014} PowerShell: & \"{helper}\" wait"
+            "2 Mnemo worker(s) are still running and no waiter is active. Start this as a background command so you are woken when one reports. Bash: \"{helper}\" wait --session s-1 \u{2014} PowerShell: & \"{helper}\" wait --session s-1"
         )
     );
     // The check must not consume notices.
@@ -379,7 +379,7 @@ fn wait_prints_each_notice_on_its_own_line() {
         "/lead/wait",
         json!({ "notices": ["worker a finished its turn", "worker b needs input"] }),
     );
-    let text = wait(&sandbox.env(), 90);
+    let text = wait(&sandbox.env(), 90, None);
     assert_eq!(text, "worker a finished its turn\nworker b needs input");
     let sent = server.requests_to("/lead/wait");
     assert_eq!(sent[0].json(), json!({ "root": sandbox.project_str(), "timeout_s": 90 }));
@@ -390,7 +390,7 @@ fn wait_says_no_events_on_an_empty_list() {
     let sandbox = Sandbox::new();
     let _server = server_with(&sandbox, "/lead/wait", json!({ "notices": [] }));
     // A reply without a status reads as it always did.
-    assert_eq!(wait(&sandbox.env(), 5), "no events");
+    assert_eq!(wait(&sandbox.env(), 5, None), "no events");
 }
 
 #[test]
@@ -398,7 +398,7 @@ fn wait_reports_each_server_status_distinctly() {
     let say = |reply: Value| {
         let sandbox = Sandbox::new();
         let _server = server_with(&sandbox, "/lead/wait", reply);
-        wait(&sandbox.env(), 90)
+        wait(&sandbox.env(), 90, None)
     };
     assert_eq!(say(json!({ "notices": [], "status": "timeout" })), "no events after 90 s");
     assert_eq!(say(json!({ "notices": [], "status": "detached" })), DETACHED);
@@ -426,7 +426,7 @@ fn wait_without_an_instance_polls_then_says_not_reachable() {
     let sandbox = Sandbox::new();
     let env = sandbox.env(); // 300 ms patience, polling every 20 ms
     let started = Instant::now();
-    assert_eq!(wait(&env, 5), NOT_REACHABLE);
+    assert_eq!(wait(&env, 5, None), NOT_REACHABLE);
     let took = started.elapsed();
     assert!(took >= env.wait_reach_timeout, "gave up after only {took:?}");
     assert!(took < env.wait_reach_timeout + Duration::from_secs(2), "{took:?}");
@@ -451,7 +451,7 @@ fn wait_finds_an_instance_that_comes_up_while_it_polls() {
         std::thread::sleep(Duration::from_millis(200));
         crate::testutil::write_run_file(&run_dir, 55, port, "tok", Some(&project), 1);
     });
-    assert_eq!(wait(&env, 5), "worker a finished its turn");
+    assert_eq!(wait(&env, 5, None), "worker a finished its turn");
 }
 
 #[test]
@@ -474,7 +474,7 @@ fn wait_rides_out_a_restart_of_mnemo2() {
     sandbox.write_run(55, server.port, "tok", Some(&project));
     let mut env = sandbox.env();
     env.wait_reach_timeout = Duration::from_secs(5);
-    assert_eq!(wait(&env, 7), "no events after 7 s");
+    assert_eq!(wait(&env, 7, None), "no events after 7 s");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -484,9 +484,9 @@ fn wait_falls_back_to_claude_project_dir() {
     let _server = server_with(&sandbox, "/lead/wait", json!({ "notices": ["x"] }));
     let mut env = sandbox.env();
     env.process_cwd = sandbox.elsewhere.clone();
-    assert_eq!(wait(&env, 5), NOT_REACHABLE);
+    assert_eq!(wait(&env, 5, None), NOT_REACHABLE);
     env.project_dir = Some(sandbox.project.clone());
-    assert_eq!(wait(&env, 5), "x");
+    assert_eq!(wait(&env, 5, None), "x");
 }
 
 #[test]
@@ -503,8 +503,51 @@ fn wait_gives_up_on_an_instance_that_keeps_failing() {
     sandbox.write_run(55, server.port, "tok", Some(&sandbox.project_str()));
     let env = sandbox.env();
     let started = Instant::now();
-    assert_eq!(wait(&env, 5), NOT_REACHABLE);
+    assert_eq!(wait(&env, 5, None), NOT_REACHABLE);
     assert!(started.elapsed() >= env.wait_reach_timeout);
     // It kept trying while it waited, rather than asking once and quitting.
     assert!(server.requests_to("/lead/wait").len() > 1);
+}
+
+#[test]
+fn wait_sends_the_session_it_was_named_with() {
+    let sandbox = Sandbox::new();
+    let server = server_with(&sandbox, "/lead/wait", json!({ "notices": ["x"] }));
+    assert_eq!(wait(&sandbox.env(), 5, Some("sess-9")), "x");
+    assert_eq!(
+        server.requests_to("/lead/wait")[0].json(),
+        json!({ "root": sandbox.project_str(), "timeout_s": 5, "session": "sess-9" })
+    );
+}
+
+#[test]
+fn a_hook_without_a_session_id_sends_none() {
+    let sandbox = Sandbox::new();
+    let server = server_with(&sandbox, "/lead/notices", notices_reply(true, &[], 0, false, ""));
+    let stdin = json!({ "cwd": sandbox.deep.to_string_lossy() }).to_string();
+    assert!(notices(&sandbox.env(), NoticesMode::Drain, &stdin).is_none());
+    assert_eq!(
+        server.requests_to("/lead/notices")[0].json(),
+        json!({ "root": sandbox.project_str(), "mode": "drain" })
+    );
+}
+
+#[test]
+fn stop_check_without_a_session_id_suggests_the_plain_wait() {
+    let sandbox = Sandbox::new();
+    let _server = server_with(&sandbox, "/lead/notices", notices_reply(true, &[], 2, false, ""));
+    let env = sandbox.env();
+    let stdin = json!({
+        "cwd": sandbox.deep.to_string_lossy(),
+        "stop_hook_active": false,
+    })
+    .to_string();
+    let value = parsed(notices(&env, NoticesMode::StopCheck, &stdin));
+    let helper = env.helper.display();
+    assert_eq!(
+        value["reason"],
+        format!(
+            "2 Mnemo worker(s) are still running and no waiter is active. Start this as a background command so you are woken when one reports. Bash: \"{helper}\" wait \u{2014} PowerShell: & \"{helper}\" wait"
+        )
+    );
 }

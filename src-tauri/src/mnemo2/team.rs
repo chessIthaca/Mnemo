@@ -470,6 +470,8 @@ struct LiveWorker {
     session: AgentSession,
     busy: Arc<AtomicBool>,
     pump: JoinHandle<()>,
+    /// A failed close aborted the pump; only cleanup retries may use this handle.
+    cleanup_retry_only: bool,
 }
 
 impl LiveWorker {
@@ -2453,6 +2455,7 @@ impl TeamRuntime {
                 session,
                 busy,
                 pump,
+                cleanup_retry_only: false,
             },
         );
         self.update_worker(&id, |worker| {
@@ -2534,6 +2537,11 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running; resume it first"))?;
+            if live.cleanup_retry_only {
+                return Err(
+                    "worker session cleanup must be retried before messaging it".to_string()
+                );
+            }
             let busy = live.busy.clone();
             let idle = !busy.load(Ordering::SeqCst);
             if idle {
@@ -2638,7 +2646,7 @@ impl TeamRuntime {
         })
         .await;
         let live = self.live.lock().await.remove(worker_id);
-        if let Some(live) = live {
+        if let Some(mut live) = live {
             let snapshot = live.session.snapshot().await.ok();
             live.abort();
             if let Some(snapshot) = snapshot {
@@ -2662,6 +2670,7 @@ impl TeamRuntime {
             }
             if let Err(error) = self.close_session_for_cleanup(&live.session).await {
                 let message = format!("could not close worker session: {error}");
+                live.cleanup_retry_only = true;
                 self.live.lock().await.insert(worker_id.to_string(), live);
                 self.update_worker(worker_id, |worker| {
                     worker.error = Some(message.clone());
@@ -2683,9 +2692,16 @@ impl TeamRuntime {
     }
 
     async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
-        if self.live.lock().await.contains_key(worker_id) {
+        let live = self.live.lock().await;
+        if let Some(live) = live.get(worker_id) {
+            if live.cleanup_retry_only {
+                return Err(
+                    "worker session cleanup must be retried before resuming it".to_string()
+                );
+            }
             return Err(format!("worker '{worker_id}' is already running"));
         }
+        drop(live);
         let active = self.live.lock().await.len();
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
@@ -2741,6 +2757,7 @@ impl TeamRuntime {
                 session,
                 busy,
                 pump,
+                cleanup_retry_only: false,
             },
         );
         self.update_worker(worker_id, |worker| {
@@ -3331,9 +3348,10 @@ impl TeamRuntime {
         .await;
         self.persist().await?;
         let live = self.live.lock().await.remove(worker_id);
-        if let Some(live) = live {
+        if let Some(mut live) = live {
             live.abort();
             if let Err(error) = self.close_session_for_cleanup(&live.session).await {
+                live.cleanup_retry_only = true;
                 self.live.lock().await.insert(worker_id.to_string(), live);
                 self.update_worker(worker_id, |worker| {
                     // The Git merge landed, but keep the worker retryable:
@@ -3704,10 +3722,11 @@ impl TeamRuntime {
     async fn delete_one(&self, deletion: &WorkerDeletion) -> Result<(), String> {
         let record = self.worker(&deletion.worker_id).await?;
         let live = self.live.lock().await.remove(&record.id);
-        if let Some(live) = live {
+        if let Some(mut live) = live {
             live.abort();
             if let Err(error) = self.close_session_for_cleanup(&live.session).await {
                 let message = format!("could not close {}'s session: {error}", record.name);
+                live.cleanup_retry_only = true;
                 self.live.lock().await.insert(record.id.clone(), live);
                 return Err(message);
             }
@@ -5899,6 +5918,7 @@ models = [\"scripted-a\"]
             LiveWorker {
                 session,
                 pump: tokio::spawn(async {}),
+                cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
             },
         );
@@ -5989,6 +6009,7 @@ models = [\"scripted-a\"]
                 LiveWorker {
                     session,
                     pump: tokio::spawn(async {}),
+                    cleanup_retry_only: false,
                     busy: Arc::new(AtomicBool::new(false)),
                 },
             );
@@ -6075,6 +6096,47 @@ models = [\"scripted-a\"]
             .error
             .as_deref()
             .is_some_and(|error| error.contains("injected close failure")));
+        let busy = team
+            .live
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("retained live worker")
+            .busy
+            .clone();
+        for _ in 0..10 {
+            if team
+                .live
+                .lock()
+                .await
+                .get(&worker.id)
+                .expect("retained live worker")
+                .pump
+                .is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(team
+            .live
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("retained live worker")
+            .pump
+            .is_finished());
+        let message = team
+            .message_inner(&worker.id, "must not run without a pump".into())
+            .await
+            .expect_err("a cleanup-retry-only worker rejects messages");
+        assert!(message.contains("cleanup"), "{message}");
+        let resume = team
+            .resume_inner(&worker.id)
+            .await
+            .expect_err("a cleanup-retry-only worker rejects resume");
+        assert!(resume.contains("cleanup"), "{resume}");
+        assert!(!busy.load(Ordering::SeqCst));
 
         let stopped = team.stop_inner(&worker.id).await.expect("stop retry");
         assert_eq!(stopped.status, WorkerStatus::Stopped);
@@ -6188,6 +6250,7 @@ models = [\"scripted-a\"]
             LiveWorker {
                 session,
                 pump: tokio::spawn(async {}),
+                cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
             },
         );

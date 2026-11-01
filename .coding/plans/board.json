@@ -122,8 +122,24 @@
     },
     {
       "id": "53e56d1d",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793519477729,
+      "closed_at_ms": 1793521084864,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-53e56d1d-20261101-081804.md",
+      "abandon_reason": null
+    },
+    {
+      "id": "763a911f",
+      "status": "open",
+      "created_at_ms": 1793519856043,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null
+    },
+    {
+      "id": "fceee53e",
+      "status": "open",
+      "created_at_ms": 1793520681429,
       "closed_at_ms": null,
       "report_path": null,
       "abandon_reason": null

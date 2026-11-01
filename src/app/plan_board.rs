@@ -16,6 +16,7 @@
 //! says which.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ use crate::app::tool::workflow::plan::{
 use crate::app::workflow::{PlanFile, PlanKind};
 use crate::codegraph::CodeGraph;
 use crate::memory::knowledge::KnowledgeStore;
-use crate::memory::MemoryStoreTrait;
+use crate::memory::{plan_scope, Memory, MemoryFilter, MemoryRecordType, MemoryStoreTrait};
 
 /// The board file name inside the plans dir.
 const BOARD_FILE: &str = "board.json";
@@ -177,6 +178,9 @@ pub struct PlanBoard {
     memory: Option<Arc<dyn MemoryStoreTrait>>,
     knowledge: Option<Arc<KnowledgeStore>>,
     codegraph: Option<Arc<CodeGraph>>,
+    /// The external-lead close gate is opt-in so the built-in lead keeps its
+    /// prompt-driven memory workflow.
+    external_lead_attached: AtomicBool,
     lock: Mutex<()>,
 }
 
@@ -190,6 +194,7 @@ impl PlanBoard {
             memory: None,
             knowledge: None,
             codegraph: None,
+            external_lead_attached: AtomicBool::new(false),
             lock: Mutex::new(()),
         }
     }
@@ -210,6 +215,12 @@ impl PlanBoard {
     pub fn with_codegraph(mut self, graph: Arc<CodeGraph>) -> Self {
         self.codegraph = Some(graph);
         self
+    }
+
+    /// Enable or disable the durable-knowledge close gate with the external
+    /// lead attachment. Every close path observes the same atomic setting.
+    pub fn set_external_lead_attached(&self, attached: bool) {
+        self.external_lead_attached.store(attached, Ordering::Release);
     }
 
     /// The memory store, for the `plan_create` recall rider.
@@ -656,6 +667,17 @@ impl PlanBoard {
                 reasons: vec![reason],
             };
         }
+        if self.external_lead_attached.load(Ordering::Acquire)
+            && matches!(plan.kind, PlanKind::Implementation | PlanKind::Research)
+            && !matches!(self.has_durable_knowledge_since(entry.created_at_ms).await, Ok(true))
+        {
+            return CloseOutcome::Blocked {
+                reasons: vec![
+                    "Record what this plan established with memory_write (a durable SPEC:/DECISION:/HOW: title; no plan IDs, branch names or commit hashes), then call plan_step_done on the last step to close."
+                        .to_string(),
+                ],
+            };
+        }
         if self.reviews_dir.as_os_str().is_empty() {
             return CloseOutcome::Blocked {
                 reasons: vec!["no reviews directory is configured".to_string()],
@@ -788,6 +810,64 @@ impl PlanBoard {
     }
 
     // ── internals ──────────────────────────────────────────────────────
+
+    /// Whether a live, non-plan-scoped learning was written or changed at or
+    /// after `since_ms`. Knowledge-backed rows use their file's modification
+    /// time, which also covers amendments of records created before the plan.
+    async fn has_durable_knowledge_since(&self, since_ms: u64) -> Result<bool, String> {
+        let Some(store) = self.memory.as_ref() else {
+            // Without a memory store there is nothing the lead can write to;
+            // the opt-in gate is not applicable.
+            return Ok(true);
+        };
+        let records = store
+            .list_filtered(&MemoryFilter::new())
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(records
+            .iter()
+            .any(|memory| self.is_durable_knowledge_since(memory, since_ms)))
+    }
+
+    fn is_durable_knowledge_since(&self, memory: &Memory, since_ms: u64) -> bool {
+        if !matches!(
+            MemoryRecordType::from_title(&memory.title),
+            MemoryRecordType::Spec
+                | MemoryRecordType::Decision
+                | MemoryRecordType::How
+                | MemoryRecordType::Bug
+        ) || memory
+            .data
+            .get("plan_scoped")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || plan_scope::scoped_tier(memory.tier, &memory.title, &memory.content).is_scoped()
+            || mentions_commit_hash(&memory.title)
+            || mentions_commit_hash(&memory.content)
+        {
+            return false;
+        }
+        if let Some(modified_ms) = self.knowledge_modified_ms(memory) {
+            return modified_ms >= since_ms;
+        }
+        // Authored DB rows have second precision. Comparing with the plan's
+        // containing second lets a write immediately after plan_create count.
+        memory.created_at >= (since_ms / 1000) as i64
+    }
+
+    fn knowledge_modified_ms(&self, memory: &Memory) -> Option<u64> {
+        let relative = memory.data.get("rel_path")?.as_str()?;
+        let modified = std::fs::metadata(self.knowledge.as_ref()?.dir().join(relative))
+            .ok()?
+            .modified()
+            .ok()?;
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .try_into()
+            .ok()
+    }
 
     fn guard(&self) -> MutexGuard<'_, ()> {
         self.lock
@@ -943,6 +1023,18 @@ fn require_open(entry: &BoardEntry) -> Result<(), String> {
         BoardStatus::Closed => Err(format!("plan {} is closed", entry.id)),
         BoardStatus::Abandoned => Err(format!("plan {} was abandoned", entry.id)),
     }
+}
+
+/// Whether text carries something shaped like a Git commit hash. Durable
+/// learnings must outlive the commit and plan that motivated them.
+fn mentions_commit_hash(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| (7..=40).contains(&word.len()))
+        .any(|word| {
+            word.bytes().all(|b| b.is_ascii_hexdigit())
+                && word.bytes().any(|b| b.is_ascii_digit())
+                && word.bytes().any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
+        })
 }
 
 /// Single-line, non-empty step texts.
@@ -1735,5 +1827,211 @@ mod tests {
         }
         let tail = board.tail_summary();
         assert!(tail.contains("... and 2 more (plan_list)"), "{tail}");
+    }
+
+    #[tokio::test]
+    async fn external_close_requires_a_new_durable_learning() {
+        use crate::memory::{HashEmbedder, Memory, MemoryStore, MemoryTier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let board = board(dir.path()).with_memory(store.clone());
+        board.set_external_lead_attached(true);
+
+        let mut old = Memory::new(
+            MemoryTier::Semantic,
+            "SPEC: Existing importer contract",
+            "Rows retain their source order.",
+            100,
+        );
+        old.created_at = 1;
+        store.write(old).await.unwrap();
+        let plan = create(&board, "Importer");
+        board.tick(&plan.id, 0, "ok").unwrap();
+        board.tick(&plan.id, 1, "ok").unwrap();
+        let ledger = FakeLedger::passing();
+
+        let CloseOutcome::Blocked { reasons } = board.try_close(&plan.id, &ledger).await else {
+            panic!("an old learning must not satisfy the external-lead gate");
+        };
+        assert!(reasons[0].contains("memory_write"), "{reasons:?}");
+        assert!(reasons[0].contains("plan_step_done"), "{reasons:?}");
+
+        let mut note = Memory::new(
+            MemoryTier::Episodic,
+            "SPEC: Importer decision",
+            "Use the parser selected for this plan.",
+            (now_ms() / 1000) as i64,
+        );
+        note.data = serde_json::json!({"plan_scoped": true, "plan_ids": [plan.id]});
+        store.write(note).await.unwrap();
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "PLAN: Importer",
+                "Automatic plan digest, not a durable learning.",
+                (now_ms() / 1000) as i64,
+            ))
+            .await
+            .unwrap();
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "REVIEW: Importer",
+                "Automatic review digest, not a durable learning.",
+                (now_ms() / 1000) as i64,
+            ))
+            .await
+            .unwrap();
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "SPEC: Commit-bound importer note",
+                "Recorded in commit 435c399e, so this is not durable.",
+                (now_ms() / 1000) as i64,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            board.try_close(&plan.id, &ledger).await,
+            CloseOutcome::Blocked { .. }
+        ));
+
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "DECISION: Keep importer rows ordered",
+                "Preserve source order because downstream imports depend on it.",
+                (now_ms() / 1000) as i64,
+            ))
+            .await
+            .unwrap();
+        let outcome = board.try_close(&plan.id, &ledger).await;
+        assert!(matches!(outcome, CloseOutcome::Closed { .. }), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn external_research_close_also_requires_a_learning() {
+        use crate::memory::{HashEmbedder, MemoryStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let board = board(dir.path()).with_memory(store);
+        board.set_external_lead_attached(true);
+        let plan = board
+            .create(PlanDraft {
+                kind: PlanKind::Research,
+                steps: vec!["Investigate the importer (no-code research)".to_string()],
+                ..draft("Research importer")
+            })
+            .unwrap();
+        board.tick(&plan.id, 0, "ok").unwrap();
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Blocked { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn amended_knowledge_satisfies_the_external_close_gate() {
+        use crate::memory::{HashEmbedder, Memory, MemoryStore, MemoryTier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let knowledge = Arc::new(KnowledgeStore::new(dir.path().join("knowledge")));
+        std::fs::create_dir_all(knowledge.dir().join("spec")).unwrap();
+        let path = knowledge.dir().join("spec/importer.md");
+        std::fs::write(&path, "# SPEC: Importer\n\nOriginal contract.\n").unwrap();
+        let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let mut record = Memory::new(
+            MemoryTier::Semantic,
+            "SPEC: Importer",
+            "Original contract.",
+            100,
+        );
+        record.created_at = 1;
+        record.data = serde_json::json!({"rel_path": "spec/importer.md"});
+        store.write(record).await.unwrap();
+        let board = board(dir.path())
+            .with_memory(store)
+            .with_knowledge(knowledge);
+        board.set_external_lead_attached(true);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let plan = create(&board, "Importer");
+        board.tick(&plan.id, 0, "ok").unwrap();
+        board.tick(&plan.id, 1, "ok").unwrap();
+        let ledger = FakeLedger::passing();
+        assert!(matches!(
+            board.try_close(&plan.id, &ledger).await,
+            CloseOutcome::Blocked { .. }
+        ));
+
+        std::fs::write(&path, "# SPEC: Importer\n\nAmended durable contract.\n").unwrap();
+        assert!(matches!(
+            board.try_close(&plan.id, &ledger).await,
+            CloseOutcome::Closed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_bug_fixing_close_is_exempt_from_the_learning_gate() {
+        use crate::memory::{HashEmbedder, MemoryStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let board = board(dir.path()).with_memory(store);
+        board.set_external_lead_attached(true);
+        let plan = board
+            .create(PlanDraft {
+                kind: PlanKind::BugFixing,
+                bug: Some("rows vanish".to_string()),
+                context: format!(
+                    "{CONTEXT} Regression test: importer_keeps_rows in tests/import.rs fails without the fix."
+                ),
+                steps: vec!["Fix src/import.rs".to_string()],
+                ..draft("Bug")
+            })
+            .unwrap();
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    regression_test: Some("importer_keeps_rows".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        board.tick(&plan.id, 0, "merged").unwrap();
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn built_in_and_store_less_external_close_skip_the_learning_gate() {
+        use crate::memory::{HashEmbedder, MemoryStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let external = board(dir.path());
+        external.set_external_lead_attached(true);
+        let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let board = board(dir.path()).with_memory(store);
+        let plan = create(&board, "Importer");
+        board.tick(&plan.id, 0, "ok").unwrap();
+        board.tick(&plan.id, 1, "ok").unwrap();
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+
+        let plan = create(&external, "Store-less external");
+        external.tick(&plan.id, 0, "ok").unwrap();
+        external.tick(&plan.id, 1, "ok").unwrap();
+        assert!(matches!(
+            external
+                .try_close(&plan.id, &FakeLedger::passing())
+                .await,
+            CloseOutcome::Closed { .. }
+        ));
     }
 }

@@ -1295,7 +1295,7 @@ impl Tool for MemorySupersedeTool {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "The id of the memory being superseded (from recall/list output)."},
-                    "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "The successor's tier (same tiers as memory_write)."},
+                    "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "The successor's tier (same tiers as memory_write). A file-backed knowledge record's successor is always stored as semantic — a working/episodic/procedural request is stored as semantic instead of refused."},
                     "title": {"type": "string", "description": "The successor's title — keep the same typed prefix when the topic is unchanged."},
                     "content": {"type": "string", "description": "The successor's content."}
                 },
@@ -1315,26 +1315,35 @@ impl Tool for MemorySupersedeTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
-        let tier = match MemoryTier::from_str_opt(&args.tier) {
+        let mut tier = match MemoryTier::from_str_opt(&args.tier) {
             Some(t) => t,
             None => return ToolResult::error(format!("unknown tier '{}'", args.tier)),
         };
+        let requested_tier = tier;
         let old_id = args.id;
         let title = args.title;
-        // Knowledge-backed supersede: the record's FILE is the truth. The
-        // successor's tier must be a distilled tier (knowledge records are
-        // semantic rows — an episodic/working successor has no file home).
+        // Knowledge-backed supersede: the record's FILE is the truth, and a
+        // file-backed record's successor is ALWAYS a distilled (semantic)
+        // row — working/episodic/procedural rows have no file home. A
+        // requested non-semantic tier is therefore COERCED, never refused
+        // (2026-11-01 lead friction: `memory_supersede` with tier
+        // "procedural" on a file-backed record errored instead of doing the
+        // obvious thing, and the agent had to retry); the result says so.
         let knowledge_rel = match &self.knowledge {
             Some(support) => support.knowledge_for_id(&old_id).await.map(|kr| kr.rel),
             None => None,
         };
+        let tier_note = if knowledge_rel.is_some() && tier != MemoryTier::Semantic {
+            tier = MemoryTier::Semantic;
+            format!(
+                ". The successor is stored as semantic (file-backed records are always \
+                 semantic), not {}",
+                requested_tier.as_str()
+            )
+        } else {
+            String::new()
+        };
         if let Some(old_rel) = knowledge_rel {
-            if tier != MemoryTier::Semantic {
-                return ToolResult::error(format!(
-                    "knowledge record {old_id} lives in a file — the successor must be \
-                     semantic (the record file carries the truth)"
-                ));
-            }
             let Some(support) = &self.knowledge else {
                 return ToolResult::error(format!(
                     "knowledge record {old_id} exists but the file backing is not wired"
@@ -1372,7 +1381,8 @@ impl Tool for MemorySupersedeTool {
                     let msg = format!(
                         "Superseded knowledge record {old_id} with \"{title}\" — old file \
                          .coding/knowledge/{old_rel} marked superseded (history), successor \
-                         at .coding/knowledge/{new_rel}{pointer_note}; memory rows re-indexed"
+                         at .coding/knowledge/{new_rel}{pointer_note}; memory rows re-indexed\
+                         {tier_note}"
                     );
                     ToolResult::success(msg).with_data(json!({
                         "id": new_id,
@@ -3187,6 +3197,126 @@ mod tests {
         assert!(result.success, "{}", result.output);
         assert!(result.output.contains("postgres"), "{}", result.output);
         assert!(result.output.contains("[superseded]"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn supersede_file_backed_record_stores_semantic_instead_of_refusing() {
+        // 2026-11-01 lead friction: `memory_supersede` with tier "procedural"
+        // on a file-backed record was REFUSED ("the successor must be
+        // semantic") instead of doing the obvious thing — the caller had to
+        // retry. A file-backed predecessor's successor is always semantic
+        // (working/episodic/procedural rows have no file home), so the tool
+        // coerces the tier and says so in the result.
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, write, _update, supersede, _delete) =
+            make_knowledge_tools(&dir, store.clone());
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "HOW: release checklist",
+                "content": "Run the checklist. Body one.",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let write_data = result.data.expect("structured data");
+        let old_id = write_data["id"].as_str().unwrap().to_string();
+        let old_rel = write_data["knowledge"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches(".coding/knowledge/")
+            .to_string();
+        assert!(dir
+            .path()
+            .join(".coding/knowledge")
+            .join(&old_rel)
+            .exists());
+
+        let result = supersede
+            .execute(json!({
+                "id": old_id,
+                "tier": "procedural",
+                "title": "HOW: release checklist",
+                "content": "Run the checklist. Body two.",
+            }))
+            .await;
+        assert!(
+            result.success,
+            "a non-semantic tier is coerced, never refused: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("stored as semantic (file-backed records are always semantic)"),
+            "the result says which tier was stored: {}",
+            result.output
+        );
+        assert!(result.output.contains("not procedural"), "{}", result.output);
+        let data = result.data.expect("structured data");
+        assert_eq!(
+            data["tier"], "semantic",
+            "the reported tier is what was stored"
+        );
+        let new_id = data["id"].as_str().unwrap().to_string();
+        let new_rel = data["knowledge"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches(".coding/knowledge/")
+            .to_string();
+        let new_file = dir.path().join(".coding/knowledge").join(&new_rel);
+        let text = std::fs::read_to_string(&new_file).unwrap();
+        assert!(text.contains("Run the checklist. Body two."), "{text}");
+        // The predecessor FILE stays as history, flipped to superseded.
+        let old_text = std::fs::read_to_string(
+            dir.path().join(".coding/knowledge").join(&old_rel),
+        )
+        .unwrap();
+        assert!(old_text.contains("status = \"superseded\""), "{old_text}");
+        assert!(old_text.contains("Body one."), "{old_text}");
+        let m = store.get_memory(&old_id).await.unwrap().unwrap();
+        assert_eq!(m.superseded_by.as_deref(), Some(new_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn supersede_db_native_record_keeps_the_requested_tier() {
+        // Non-file-backed rows behave exactly as before: the requested tier
+        // is stored as asked and no coercion note appears.
+        let store = make_store();
+        let write = MemoryWriteTool::new(store.clone());
+        let supersede = MemorySupersedeTool::new(store.clone());
+        let result = write
+            .execute(json!({
+                "tier": "procedural",
+                "title": "a reusable workflow",
+                "content": "step one",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let old_id = result.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        let result = supersede
+            .execute(json!({
+                "id": old_id,
+                "tier": "procedural",
+                "title": "a reusable workflow",
+                "content": "step two",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            !result.output.contains("stored as semantic"),
+            "no tier coercion for a DB-native row: {}",
+            result.output
+        );
+        let data = result.data.expect("structured data");
+        assert_eq!(
+            data["tier"], "procedural",
+            "the requested tier is stored as asked"
+        );
+        let new_id = data["id"].as_str().unwrap().to_string();
+        let m = store.get_memory(&new_id).await.unwrap().unwrap();
+        assert_eq!(m.tier, MemoryTier::Procedural);
     }
 
     #[tokio::test]

@@ -80,11 +80,14 @@ mnemo = { path = "..", features = ["test-support"] }
 # platforms. Win32_System_Diagnostics_Debug + Win32_System_Kernel provide
 # StackWalk64/SymInitialize/SymFromAddr/GetThreadContext + the x64 CONTEXT;
 # Win32_System_SystemInformation provides IMAGE_FILE_MACHINE_AMD64.
+# Win32_System_RestartManager backs the best-effort lock-holder diagnostics
+# (mnemo2/lock_holders.rs).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
+    "Win32_System_RestartManager",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

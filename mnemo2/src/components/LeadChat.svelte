@@ -11,7 +11,7 @@
   import MergeCard from "./MergeCard.svelte";
   import PendingPrompt from "./PendingPrompt.svelte";
   import ToolActivity from "./ToolActivity.svelte";
-  import ElapsedTime from "./ElapsedTime.svelte";
+  import ActivityStatus from "./ActivityStatus.svelte";
 
   const STICK_TO_BOTTOM_PX = 48;
   const runningTool = $derived.by(() => {
@@ -201,12 +201,10 @@
           {/if}
         {/each}
         {#if showThinking}
-          <div class="thinking-status" role="status" aria-live="off">
-            <span class="thinking-dot" aria-hidden="true"></span>
-            <span>Thinking…</span>
-            {#if $app.leadRuntime.turnStartedAtMs !== null}
-              <ElapsedTime startedAtMs={$app.leadRuntime.turnStartedAtMs} />
-            {/if}
+          <!-- The wrapper carries the chat's indent (`.thinking-status` margin); the shared
+               component inside renders the same dot, label, and timer the waiting rows use. -->
+          <div class="thinking-status">
+            <ActivityStatus label="Thinking…" startedAtMs={$app.leadRuntime.turnStartedAtMs} />
           </div>
         {/if}
         {#if showWaiting}
@@ -275,6 +273,9 @@
   .waiting-worker:hover { text-decoration: underline; }
   .needs-you-status .thinking-dot { animation-duration: 0.9s; background: var(--danger); }
   @keyframes thinking-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    .thinking-dot { animation: none; opacity: 1; }
+  }
   .user-entry { max-width: 100ch; margin: 20px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--line-strong); }
   .user-entry p { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.6; white-space: pre-wrap; }
   .user-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }

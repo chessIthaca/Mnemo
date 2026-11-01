@@ -2,7 +2,9 @@
   import { Send } from "@lucide/svelte";
   import { onMount } from "svelte";
   import { actions } from "../lib/store";
+  import { workerPhaseLabel } from "../lib/workerActivity";
   import type { Worker } from "../lib/types";
+  import ActivityStatus from "./ActivityStatus.svelte";
   import Collapsible from "./Collapsible.svelte";
   import Markdown from "./Markdown.svelte";
   import ToolActivity from "./ToolActivity.svelte";
@@ -51,10 +53,12 @@
     };
   });
 
-  // Follow the stream while the reader is near the bottom.
+  // Follow the stream while the reader is near the bottom; the live status
+  // row ends the stream, so its changes count as stream growth too.
   $effect(() => {
     if (!compact) return;
     worker.messages.length;
+    worker.activity?.phase;
     scheduleScroll();
   });
 
@@ -98,6 +102,15 @@
       </div>
     {/if}
   {/each}
+  {#if worker.activity}
+    <div class="thread-activity">
+      <ActivityStatus
+        label={workerPhaseLabel(worker.activity)}
+        startedAtMs={worker.activity.turnStartedAtMs}
+        pulse={worker.activity.phase !== "waiting"}
+      />
+    </div>
+  {/if}
 {/snippet}
 
 <section class="thread-panel" class:compact aria-label={`${worker.name} worker conversation`}>
@@ -137,6 +150,7 @@
   .thread-message.from-harness .thread-message-body { border: 1px dashed var(--line-strong); background: transparent; color: var(--muted); }
   .thread-message + .thread-message, .thread-tool + .thread-message { margin-top: 12px; }
   .thread-tool { min-width: 0; margin: 4px 0; }
+  .thread-activity { margin-top: 12px; }
   .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
   .screenshot-links > span { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .screenshot-links > div { display: flex; flex-wrap: wrap; gap: 6px; }

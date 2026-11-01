@@ -5203,6 +5203,10 @@ mod tests {
             Some(worker_id)
         );
         assert!(receipt.pointer("/result/worker/status").is_some());
+        assert!(
+            receipt.pointer("/result/worker/brief").is_none(),
+            "the dispatch answer stays compact: {receipt}"
+        );
         assert_eq!(
             receipt
                 .pointer("/result/reused")
@@ -5562,16 +5566,27 @@ mod tests {
         assert!(reviewed.success, "{}", reviewed.output);
         let review_receipt: serde_json::Value =
             serde_json::from_str(&reviewed.output).expect("JSON receipt");
+        // The answer stays compact — the review's identity, not its evidence,
+        // which the record keeps for `team_status` detail and the merge gate.
         assert_eq!(
             review_receipt
-                .pointer("/result/review/evidence/unanchored_pass")
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            review_receipt
-                .pointer("/result/review/evidence/independent_reviewer_id")
+                .pointer("/result/review/summary")
                 .and_then(|value| value.as_str()),
+            Some("reviewed")
+        );
+        assert!(
+            review_receipt.pointer("/result/review/evidence").is_none(),
+            "the review answer carries its evidence: {review_receipt}"
+        );
+        let reviewed_record = team.worker(&worker.id).await.expect("reviewed record");
+        let evidence = reviewed_record
+            .review
+            .as_ref()
+            .and_then(|review| review.evidence.as_ref())
+            .expect("the record keeps the review evidence");
+        assert!(evidence.unanchored_pass);
+        assert_eq!(
+            evidence.independent_reviewer_id.as_deref(),
             Some("auditor01")
         );
         team.record_check(

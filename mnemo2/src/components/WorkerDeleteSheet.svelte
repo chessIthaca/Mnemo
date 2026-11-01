@@ -48,7 +48,7 @@
   {/if}
   <ul class="deletion-list">
     {#each deletable as preview (preview.worker_id)}
-      <li data-loss={deletionDiscardsWork(preview)}>
+      <li data-loss={deletionDiscardsWork(preview) && preview.superseded_by === null}>
         <strong>{preview.name}</strong>
         <span>{removes(preview)}</span>
         {#if deletionDiscardsWork(preview)}

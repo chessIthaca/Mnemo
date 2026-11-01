@@ -38,3 +38,33 @@ describe("WorkerDetail brief", () => {
     expect(container.querySelector("h3")?.textContent ?? "").not.toBe(longBrief);
   });
 });
+
+describe("WorkerDetail received messages", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  it("shows the inbox ledger above the thread when the worker received messages", () => {
+    const { container } = render(WorkerDetail, {
+      worker: {
+        ...createWorkers()[0],
+        inbox: [
+          { sender: "user", kind: "steer", text: "Keep going.", atMs: 1_787_400_000_000 },
+        ],
+      },
+    });
+
+    const inbox = container.querySelector(".inbox-panel");
+    expect(inbox).toBeTruthy();
+    expect(inbox?.textContent).toContain("You");
+    // The ledger sits above the conversation it fed.
+    const body = [...(container.querySelector(".detail-body")?.children ?? [])];
+    expect(
+      body.findIndex((node) => node.classList.contains("inbox-panel")),
+    ).toBeLessThan(body.findIndex((node) => node.classList.contains("thread-panel")));
+  });
+
+  it("keeps the section out of the thread tab when nothing was received", () => {
+    const { container } = render(WorkerDetail, { worker: createWorkers()[0] });
+
+    expect(container.querySelector(".inbox-panel")).toBeNull();
+  });
+});

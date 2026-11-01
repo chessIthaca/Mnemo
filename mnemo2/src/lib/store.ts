@@ -35,6 +35,7 @@ import {
   emptyProjectUsage,
   findingFromWire,
   findingToWire,
+  inboxFromWire,
   projectUsageFrom,
   reviewEvidenceFrom,
   reviewEvidenceToWire,
@@ -2000,6 +2001,7 @@ function workerFromRecord(
         }
       : undefined,
     messages: workerThreadFromRecord(record, messages),
+    inbox: (record.inbox ?? []).map(inboxFromWire),
     screenshots: workerScreenshotPaths(record.transcript),
     timeline: workerTimeline(record),
     diff: record.merge

@@ -1,12 +1,14 @@
 <script lang="ts">
-  import type { TaskWorkflow } from "../lib/types";
+  import type { TaskWorkflow, TaskWorkflowStepId } from "../lib/types";
 
   let {
     workflow,
     compact = false,
+    onselect,
   }: {
     workflow: TaskWorkflow;
     compact?: boolean;
+    onselect?: (stepId: TaskWorkflowStepId) => void;
   } = $props();
 
   const current = $derived(workflow.steps.find((step) => step.id === workflow.current) ?? workflow.steps[0]);
@@ -27,7 +29,13 @@
   <ol class="task-workflow" data-state={workflow.state} aria-label={`Task workflow: ${summary}`}>
     {#each workflow.steps as step (step.id)}
       <li data-status={step.status} aria-current={step.id === workflow.current ? "step" : undefined} title={step.detail}>
-        <span class="dot" aria-hidden="true"></span><span>{step.label}</span>
+        {#if onselect}
+          <button type="button" aria-label={`Workflow: ${step.label}`} onclick={() => onselect(step.id)}>
+            <span class="dot" data-status={step.status} aria-hidden="true"></span><span>{step.label}</span>
+          </button>
+        {:else}
+          <span class="dot" data-status={step.status} aria-hidden="true"></span><span>{step.label}</span>
+        {/if}
       </li>
     {/each}
   </ol>
@@ -43,6 +51,8 @@
   .task-workflow li[data-status="active"] { color: var(--ink); font-weight: 650; }
   .task-workflow li[data-status="done"] { color: var(--ink-soft); }
   .task-workflow li[data-status="blocked"] { color: var(--danger, #a34a3a); }
+  .task-workflow li button { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font: inherit; letter-spacing: inherit; }
+  .task-workflow li button:hover { background: var(--surface-soft); }
   .dot { width: 4px; height: 4px; flex: 0 0 auto; border-radius: 50%; background: currentColor; opacity: 0.35; }
   .dot[data-status="active"] { background: var(--accent); opacity: 1; }
   .dot[data-status="done"] { opacity: 0.7; }

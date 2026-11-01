@@ -105,10 +105,6 @@ export function workerThreadFromRecord(
       };
     }
   });
-  if (!entries.some((entry) => entry.kind !== "tool" && entry.from === "lead") && record.brief.trim()) {
-    // The brief reaches the transcript only when the first turn is saved.
-    entries.unshift({ id: `worker-${record.id}-brief`, from: "lead", body: record.brief, time: "dispatched" });
-  }
   // Reports kept only in the live inbox (the transcript is saved per turn).
   const shown = new Set(entries.flatMap((entry) => (entry.kind === "tool" ? [] : [entry.body.trim()])));
   for (const message of inbox) {

@@ -6,6 +6,7 @@ import {
   findingFromWire,
   type TeamEvent,
   type TeamFinding,
+  type TeamInboxEntry,
   type TeamMergeRecord,
   type TeamWorkerRecord,
 } from "./teamState";
@@ -228,6 +229,27 @@ describe("native Phase 3 store integration", () => {
 
     await actions.stopAll();
     expect(transport.stopAll).toHaveBeenCalled();
+  });
+
+  it("maps a worker's received-message inbox from the snapshot", async () => {
+    const inbox: TeamInboxEntry[] = [
+      { sender: "external_lead", kind: "prompt", text: "[From the lead (Claude Code)] Ship the ledger UI.", at_ms: 1_787_400_000_000 },
+      { sender: "user", kind: "steer", text: "[From the user in mission control] Keep it collapsed by default.", at_ms: 1_787_400_060_000 },
+    ];
+    const transport = makeTransport(nativeWorker({ inbox }));
+    await openNativeTeam(transport);
+
+    expect(get(app).workers[0].inbox).toEqual([
+      { sender: "external_lead", kind: "prompt", text: "[From the lead (Claude Code)] Ship the ledger UI.", atMs: 1_787_400_000_000 },
+      { sender: "user", kind: "steer", text: "[From the user in mission control] Keep it collapsed by default.", atMs: 1_787_400_060_000 },
+    ]);
+  });
+
+  it("keeps the inbox empty for a ledger saved before senders were recorded", async () => {
+    const transport = makeTransport(nativeWorker());
+    await openNativeTeam(transport);
+
+    expect(get(app).workers[0].inbox).toEqual([]);
   });
 
   it("streams a working worker's Markdown and tools live, then shows the saved turn", async () => {

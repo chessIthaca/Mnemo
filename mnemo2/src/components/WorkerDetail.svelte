@@ -22,6 +22,7 @@
   import ModelEffortPicker from "./ModelEffortPicker.svelte";
   import ReviewEvidence from "./ReviewEvidence.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
+  import WorkerInbox from "./WorkerInbox.svelte";
   import WorkerThread from "./WorkerThread.svelte";
 
   let { worker }: { worker: Worker } = $props();
@@ -183,6 +184,7 @@
         </div>
       </section>
     {:else if tab === "thread"}
+      <WorkerInbox {worker} />
       <WorkerThread {worker} />
     {:else}
       <section class="timeline-panel" aria-label={`${worker.name} timeline`}>

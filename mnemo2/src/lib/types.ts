@@ -178,6 +178,21 @@ export interface MergeRecord {
   revertCommit?: string;
 }
 
+/** Who sent a message to a worker: Claude Code through MCP, the built-in lead, the user in mission control, or Mnemo2 itself. */
+export type InboxSender = "external_lead" | "lead" | "user" | "mnemo";
+
+/** The form a message to a worker was delivered in: a fresh prompt, a mid-turn steer, a route-fix brief, or a fix request. */
+export type InboxKind = "prompt" | "steer" | "brief" | "fix";
+
+/** One message a worker received, from the durable inbox ledger. */
+export interface InboxEntry {
+  sender: InboxSender;
+  kind: InboxKind;
+  text: string;
+  /** Epoch milliseconds — when the message was recorded. */
+  atMs: number;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -221,6 +236,12 @@ export interface Worker {
   findings: Finding[];
   review?: ReviewRecord;
   messages: WorkerThreadEntry[];
+  /**
+   * Every message this worker received, oldest first, from the durable
+   * inbox ledger — who sent it, in what form, and when. Empty when the
+   * ledger predates sender recording.
+   */
+  inbox: InboxEntry[];
   screenshots: string[];
   timeline: TimelineStep[];
   diff: DiffStats;

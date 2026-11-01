@@ -271,6 +271,77 @@ fn install_shell(app: &tauri::AppHandle, hidden: bool) -> tauri::Result<()> {
     Ok(())
 }
 
+const EXIT_RUNNING: u8 = 0;
+const EXIT_SHUTTING_DOWN: u8 = 1;
+const EXIT_READY: u8 = 2;
+const SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum ShutdownStep {
+    Starting,
+    SavingPreferences,
+    StoppingRuntimes,
+    ClosingBrowser,
+}
+
+struct ShutdownProgress(std::sync::atomic::AtomicUsize);
+
+impl ShutdownProgress {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(
+            ShutdownStep::Starting as usize,
+        ))
+    }
+
+    fn set(&self, step: ShutdownStep) {
+        self.0
+            .store(step as usize, std::sync::atomic::Ordering::Release);
+    }
+
+    fn pending_step(&self) -> &'static str {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            step if step == ShutdownStep::SavingPreferences as usize => "saving preferences",
+            step if step == ShutdownStep::StoppingRuntimes as usize => "stopping runtimes",
+            step if step == ShutdownStep::ClosingBrowser as usize => "closing the browser",
+            _ => "starting shutdown",
+        }
+    }
+}
+
+/// Run shutdown on the async runtime, leaving the event-loop thread free to
+/// service WebView2 work. The exit callback always runs, even when a step
+/// stalls or panics.
+fn spawn_orderly_shutdown<F, E>(
+    shutdown: F,
+    exit: E,
+    progress: std::sync::Arc<ShutdownProgress>,
+    deadline: std::time::Duration,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+    E: FnOnce() + Send + 'static,
+{
+    tauri::async_runtime::spawn(async move {
+        let shutdown = tauri::async_runtime::spawn(shutdown);
+        match tokio::time::timeout(deadline, shutdown).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!(
+                    "mnemo2: shutdown failed while {}: {error}; exiting anyway",
+                    progress.pending_step()
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "mnemo2: shutdown deadline exceeded while {}; exiting anyway",
+                    progress.pending_step()
+                );
+            }
+        }
+        exit();
+    });
+}
+
 /// Build and run the Mnemo2 desktop host.
 ///
 /// The bare window and its shell child are created explicitly so per-instance
@@ -290,6 +361,7 @@ pub fn run() {
         }
     }));
     let hidden = args.hidden;
+    let exit_phase = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EXIT_RUNNING));
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -380,20 +452,56 @@ pub fn run() {
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to build the Mnemo2 desktop host")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                use tauri::Manager as _;
-                let state = app.state::<ipc::Mnemo2State>();
-                let browser = app.state::<browser::BrowserController>();
-                // Stop advertising this instance before tearing the project down.
-                state.shutdown_endpoint();
-                let _ = tauri::async_runtime::block_on(async {
-                    if let Ok(owner) = ipc::state_owner(app) {
+        .run(move |app, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                use std::sync::atomic::Ordering;
+
+                if exit_phase.load(Ordering::Acquire) == EXIT_READY {
+                    return;
+                }
+                api.prevent_exit();
+                if exit_phase
+                    .compare_exchange(
+                        EXIT_RUNNING,
+                        EXIT_SHUTTING_DOWN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+
+                let shutdown_app = app.clone();
+                let progress = std::sync::Arc::new(ShutdownProgress::new());
+                let shutdown_progress = progress.clone();
+                let shutdown = async move {
+                    use tauri::Manager as _;
+
+                    let state = shutdown_app.state::<ipc::Mnemo2State>();
+                    let browser = shutdown_app.state::<browser::BrowserController>();
+                    // Stop advertising this instance before tearing the project down.
+                    state.shutdown_endpoint();
+                    shutdown_progress.set(ShutdownStep::SavingPreferences);
+                    if let Ok(owner) = ipc::state_owner(&shutdown_app) {
                         let _ = state.save_cached_preferences(&owner).await;
                     }
+                    shutdown_progress.set(ShutdownStep::StoppingRuntimes);
                     state.shutdown().await;
+                    shutdown_progress.set(ShutdownStep::ClosingBrowser);
                     let _ = browser.close().await;
-                });
+                };
+                let exit_app = app.clone();
+                let exit_phase = exit_phase.clone();
+                spawn_orderly_shutdown(
+                    shutdown,
+                    move || {
+                        exit_phase.store(EXIT_READY, Ordering::Release);
+                        exit_app.exit(code.unwrap_or(0));
+                    },
+                    progress,
+                    SHUTDOWN_DEADLINE,
+                );
             }
         });
 }
@@ -446,6 +554,74 @@ mod tests {
     fn the_tray_worker_line_counts_running_workers() {
         assert_eq!(workers_label(0), "Workers: 0 running");
         assert_eq!(workers_label(3), "Workers: 3 running");
+    }
+
+    #[test]
+    fn orderly_shutdown_leaves_the_event_loop_thread_free() {
+        let (main_tx, main_rx) = std::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let progress = std::sync::Arc::new(ShutdownProgress::new());
+        let shutdown_progress = progress.clone();
+        spawn_orderly_shutdown(
+            async move {
+                shutdown_progress.set(ShutdownStep::ClosingBrowser);
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                main_tx.send(done_tx).expect("request main-thread work");
+                done_rx.await.expect("main-thread work completes");
+            },
+            move || exit_tx.send(()).expect("report exit"),
+            progress,
+            std::time::Duration::from_secs(2),
+        );
+
+        // This models WebView2 close: it can finish only while the thread that
+        // requested shutdown is still servicing event-loop work.
+        let done = main_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("shutdown runs without blocking the event-loop thread");
+        done.send(()).expect("finish main-thread work");
+        exit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("shutdown proceeds to exit");
+    }
+
+    #[test]
+    fn stalled_shutdown_exits_after_the_deadline() {
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let progress = std::sync::Arc::new(ShutdownProgress::new());
+        progress.set(ShutdownStep::StoppingRuntimes);
+        spawn_orderly_shutdown(
+            std::future::pending(),
+            move || exit_tx.send(()).expect("report exit"),
+            progress.clone(),
+            std::time::Duration::from_millis(20),
+        );
+
+        exit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a pending shutdown step cannot prevent exit");
+        assert_eq!(progress.pending_step(), "stopping runtimes");
+    }
+
+    #[test]
+    fn panicking_shutdown_step_still_exits() {
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let progress = std::sync::Arc::new(ShutdownProgress::new());
+        let shutdown_progress = progress.clone();
+        spawn_orderly_shutdown(
+            async move {
+                shutdown_progress.set(ShutdownStep::ClosingBrowser);
+                panic!("simulated browser close panic");
+            },
+            move || exit_tx.send(()).expect("report exit"),
+            progress.clone(),
+            std::time::Duration::from_secs(2),
+        );
+
+        exit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a panicking shutdown step cannot prevent exit");
+        assert_eq!(progress.pending_step(), "closing the browser");
     }
 
     /// The native shell must compile with Mnemo2's own Tauri identity. Sharing

@@ -43,7 +43,7 @@ use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
 use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
-    BoardSignal, BoardSnapshot, TeamMessage, TeamRuntime, TeamSnapshot, WorkerDeletion, WorkerRecord, TEAM_EVENT_CHANNEL,
+    BoardSignal, BoardSnapshot, MessageSender, TeamMessage, TeamRuntime, TeamSnapshot, WorkerDeletion, WorkerRecord, TEAM_EVENT_CHANNEL,
 };
 use crate::mnemo2::workbench::{self, DiffSnapshot};
 
@@ -188,6 +188,12 @@ impl Mnemo2State {
 }
 
 impl Mnemo2State {
+    /// Install an open runtime for shutdown integration tests.
+    #[cfg(test)]
+    pub(crate) fn install_runtime_for_test(&mut self, runtime: Arc<LeadRuntime>) {
+        *self.runtime.get_mut() = Some(runtime);
+    }
+
     /// Stop the real runtimes and release only this process's project claim.
     pub async fn shutdown(&self) {
         if let Some(forwarder) = self.forwarder.lock().await.take() {
@@ -816,14 +822,17 @@ pub async fn team_audit_dispatch(
         .map(|(worker, _reused)| worker)
 }
 
-/// Send a lead message to a worker.
+/// Send a mission-control user message to a worker.
 #[tauri::command]
 pub async fn team_message(
     state: State<'_, Mnemo2State>,
     worker_id: String,
     text: String,
 ) -> Result<WorkerRecord, String> {
-    current_team(&state).await?.message(&worker_id, text).await
+    current_team(&state)
+        .await?
+        .message(&worker_id, text, MessageSender::User)
+        .await
 }
 
 /// Pause a worker's current turn.

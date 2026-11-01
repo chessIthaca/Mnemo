@@ -26,7 +26,7 @@ Look for:
 - Intent: does the diff do what the step and the plan say, and nothing more? Flag changes outside the step's files.
 - Execution path: trace the new code from its entry point to its effect. Look for unreachable code, wrong defaults, missing error handling, and edge cases the brief mentioned.
 - Integration: callers, exports, signatures and data shapes against the plan's interfaces and the neighbouring code. Compare what other merged workers changed.
-- Test quality: do the tests exercise the new behaviour, would they fail without the change, and do they cover the failure paths? A passing test count alone is not a review.
+- Test quality: do the tests exercise the new behaviour, would they fail without the change, and do they cover the failure paths? A passing test count alone is not a review. For a `bug_fixing` plan, check the regression test recorded on the plan by name: it must reproduce the defect without the fix and pass with it.
 - Hygiene: leftover debug code, stray files, secrets, formatting churn, commented-out code, dependency changes nobody asked for.
 
 ## 3. Run the checks
@@ -61,10 +61,18 @@ Do this when the step was dispatched with `review_risk` "high", or when the chan
 
 When the review is current, no finding is open and all checks passed on the current tip, call `team_merge`. The lead checkout must be clean and on a non-main branch. Afterwards:
 
-- Read the board notice about the step (done, plan closed, or cannot close yet) and `plan_show` if it needs attention.
+- Read the board notice about the step (done, plan closed, or cannot close yet) and `plan_show` if it needs attention. A "cannot close yet" can be the knowledge gate: record the durable learning (next section), then tick the last step again with `plan_step_done`.
 - After a merge that other open work depends on, run the project's tests on the lead branch before dispatching dependents.
 - After parallel steps, do the plan's "Integration check" step yourself (run the combined result), then `plan_step_done`.
 - If the merge makes things worse and has not reached `main`, `team_revert_merge`.
 - A conflict is not auto-resolved. See the Review and merge cycle in the `mnemo-lead` skill.
 
 Finish with a short report to the user: what merged, what the checks showed, what you decided about findings, and what is still running. If more workers are active, make sure one background waiter is running.
+
+## 8. Record what the work established
+
+After each merge, write what the work taught the project to Mnemo's memory, not only to the user — the `team_merge` result ends with a reminder line:
+
+- `memory_write` the durable facts with a typed title: `SPEC:` how the feature now works, `DECISION:` a choice and its rationale, `HOW:` a recurring workflow. Keep each record compact and pointer-first, and leave out plan IDs, branch names and commit hashes — a record carrying them is a plan-scoped note, retired at plan close, and does not satisfy the close gate.
+- While you are the attached lead, an `implementation` or `research` plan cannot close until such a record was written, amended or superseded after the plan was created, so record with the merge instead of waiting for the "cannot close yet" notice. A `bug_fixing` plan captures its `BUG:` record automatically at close; check that the captured record tells the truth (symptom, root cause, fix, regression test) and `memory_update` it if it does not.
+- A merge that makes a stored fact wrong calls for `memory_supersede`, never a second live record. `memory_update` refines a still-current record; `memory_amend` appends a dated amendment.

@@ -15,11 +15,14 @@
   import { canMerge, isAuditWorker } from "../lib/review";
   import { workerStatusText, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
+  import Collapsible from "./Collapsible.svelte";
   import FindingsPanel from "./FindingsPanel.svelte";
+  import Markdown from "./Markdown.svelte";
   import ModelBadge from "./ModelBadge.svelte";
   import ModelEffortPicker from "./ModelEffortPicker.svelte";
   import ReviewEvidence from "./ReviewEvidence.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
+  import WorkerInbox from "./WorkerInbox.svelte";
   import WorkerThread from "./WorkerThread.svelte";
 
   let { worker }: { worker: Worker } = $props();
@@ -82,7 +85,12 @@
           {#if worker.tier}<span class="effort-pill" title="Model tier">tier: {worker.tier}</span>{/if}
         </div>
         {#if planLabel}<p class="worker-plan">{planLabel}</p>{/if}
-        <h3>{worker.task}</h3>
+        <!-- Three lines of Markdown prose: 3 × (14px font × 1.62 line-height) ≈ 68px. -->
+        <div class="worker-brief">
+          <Collapsible maxHeight={68} label="worker brief">
+            <Markdown source={worker.task} onOpenLink={actions.openBrowser} />
+          </Collapsible>
+        </div>
         {#if audit}
           <p class="audit-scope">
             Read-only audit{#if worker.auditTarget} of <code>{worker.auditTarget}</code>{/if}{#if worker.auditTip} at <code>{worker.auditTip}</code>{/if} · no plan step, no merge
@@ -176,6 +184,7 @@
         </div>
       </section>
     {:else if tab === "thread"}
+      <WorkerInbox {worker} />
       <WorkerThread {worker} />
     {:else}
       <section class="timeline-panel" aria-label={`${worker.name} timeline`}>
@@ -197,6 +206,7 @@
   .avatar { display: grid; flex: 0 0 auto; width: 44px; height: 44px; place-items: center; border-radius: 13px; background: hsl(var(--hue) 32% 87%); color: hsl(var(--hue) 30% 32%); font-size: 12px; font-weight: 750; }
   .worker-heading { min-width: 0; }
   .worker-plan { margin: 2px 0 0; color: var(--accent-strong); font-size: 9px; }
+  .worker-brief { margin: 10px 0 0; }
   .worker-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .worker-identity h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--font-prose); font-size: 26px; font-weight: 550; }
   .worker-identity h2 span { padding: 4px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-ui); font-size: 7px; font-weight: 650; }

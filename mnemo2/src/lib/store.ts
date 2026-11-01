@@ -25,10 +25,17 @@ import {
   type WorkerLive,
 } from "./workerThread";
 import {
+  createOpenWorkerTransport,
+  openWorkerNotice,
+  openWorkerOutcome,
+  type OpenWorkerRequest,
+} from "./workerSelection";
+import {
   deletionDiscardsWork,
   emptyProjectUsage,
   findingFromWire,
   findingToWire,
+  inboxFromWire,
   projectUsageFrom,
   reviewEvidenceFrom,
   reviewEvidenceToWire,
@@ -89,6 +96,10 @@ let externalLeadStart: Promise<void> | null = null;
 let externalLeadToken = 0;
 /** Counts attach/detach events, so a slower status read never overwrites a newer event. */
 let externalLeadEvents = 0;
+/** The listener for Claude Code asking to show a worker in mission control. */
+let openWorkerUnlisten: (() => void) | null = null;
+let openWorkerStart: Promise<void> | null = null;
+let openWorkerToken = 0;
 let workbenchTransport: WorkbenchTransport | null = null;
 let diffRequest = 0;
 let diffSyncTimer: ReturnType<typeof setTimeout> | null = null;
@@ -664,6 +675,60 @@ function disconnectExternalLead(): void {
   externalLeadStart = null;
   for (const unlisten of externalLeadUnlisten) unlisten();
   externalLeadUnlisten = [];
+}
+
+/**
+ * Start listening for Claude Code asking to show a worker (the helper's
+ * `show-worker`). Safe to call again; browser-only sessions and hosts without
+ * the event have nothing to listen to.
+ */
+async function initOpenWorker(): Promise<void> {
+  if (openWorkerStart) return openWorkerStart;
+  const transport = createOpenWorkerTransport();
+  if (!transport) return Promise.resolve();
+  const token = ++openWorkerToken;
+  const start = (async () => {
+    try {
+      // Like the external-lead listeners: Mnemo1's Browser tab is a Tauri
+      // WebView too, and only the real Mnemo2 host emits this event.
+      if (!(await probeMnemo2Host())) return;
+      const unlisten = await transport.onOpenWorker((request) => {
+        if (token === openWorkerToken) handleOpenWorkerRequest(request);
+      });
+      if (token !== openWorkerToken) {
+        unlisten();
+        return;
+      }
+      openWorkerUnlisten = unlisten;
+    } catch {
+      // A host without the open-worker event has nothing to show.
+    }
+  })();
+  openWorkerStart = start;
+  return start;
+}
+
+function disconnectOpenWorker(): void {
+  openWorkerToken += 1;
+  openWorkerStart = null;
+  openWorkerUnlisten?.();
+  openWorkerUnlisten = null;
+}
+
+/**
+ * Show the worker Claude Code names: mission control opens on it, exactly like
+ * a row click. A request that cannot be honored — another project's root, an
+ * unknown worker, no project open — keeps the view and says so in a notice.
+ */
+function handleOpenWorkerRequest(request: OpenWorkerRequest): void {
+  const state = get(app);
+  const project = state.projects.find((item) => item.id === state.projectId) ?? null;
+  const outcome = openWorkerOutcome(request, state.workers, project);
+  if (outcome.kind === "select") {
+    selectWorker(outcome.workerId);
+    return;
+  }
+  app.update((current) => withToast(current, openWorkerNotice(outcome)));
 }
 
 async function openFolder(): Promise<void> {
@@ -1936,6 +2001,7 @@ function workerFromRecord(
         }
       : undefined,
     messages: workerThreadFromRecord(record, messages),
+    inbox: (record.inbox ?? []).map(inboxFromWire),
     screenshots: workerScreenshotPaths(record.transcript),
     timeline: workerTimeline(record),
     diff: record.merge
@@ -2321,6 +2387,7 @@ function resetDemo() {
   void disconnectBoard();
   disconnectIndexing();
   disconnectExternalLead();
+  disconnectOpenWorker();
   void disconnectWorkbench();
   app.set(createInitialState());
 }
@@ -2329,6 +2396,7 @@ export const actions = {
   openProject,
   loadProjects,
   initExternalLead,
+  initOpenWorker,
   openFolder,
   closeProject,
   reviewProject,

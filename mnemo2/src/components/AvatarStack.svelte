@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { briefSummary } from "../lib/brief";
   import type { Worker } from "../lib/types";
 
   let { workers, max = 4 }: { workers: Worker[]; max?: number } = $props();
@@ -6,7 +7,7 @@
 
 <span class="avatar-stack" aria-label={`${workers.length} workers`}>
   {#each workers.slice(0, max) as worker (worker.id)}
-    <span class="avatar" style="--hue: {worker.hue}" title={`${worker.name} · ${worker.task}`}>{worker.initials}</span>
+    <span class="avatar" style="--hue: {worker.hue}" title={`${worker.name} · ${briefSummary(worker.task)}`}>{worker.initials}</span>
   {/each}
   {#if workers.length > max}<span class="overflow">+{workers.length - max}</span>{/if}
 </span>

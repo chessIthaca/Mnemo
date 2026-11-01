@@ -30,6 +30,8 @@ mod instance;
 mod permissions;
 #[path = "mnemo2_mcp/serve.rs"]
 mod serve;
+#[path = "mnemo2_mcp/summary.rs"]
+mod summary;
 #[cfg(test)]
 #[path = "mnemo2_mcp/testutil.rs"]
 mod testutil;
@@ -46,7 +48,9 @@ use instance::Env;
 const USAGE: &str = "usage: mnemo2-mcp serve\n       \
     mnemo2-mcp notices --drain | --session-start | --stop-check\n       \
     mnemo2-mcp wait [--timeout <seconds>]\n       \
-    mnemo2-mcp gate-agent";
+    mnemo2-mcp gate-agent\n       \
+    mnemo2-mcp team-summary [--json] [--cwd <dir>]\n       \
+    mnemo2-mcp show-worker <worker_id> [--cwd <dir>]";
 
 /// Default `wait` timeout, in seconds.
 const DEFAULT_WAIT_S: u64 = 1800;
@@ -218,6 +222,21 @@ fn main() -> ExitCode {
             }
             None => usage(),
         },
+        "team-summary" => {
+            let env = Env::from_process();
+            print_line(&summary::team_summary(&env, rest));
+            ExitCode::SUCCESS
+        }
+        "show-worker" => {
+            let env = Env::from_process();
+            match summary::show_worker(&env, rest) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(reason) => {
+                    eprintln!("{reason}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => usage(),
     }
 }

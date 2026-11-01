@@ -1,0 +1,6 @@
++++
+title = "Mnemo2 enforces its memory workflow on an external lead"
+created = "2027-01-11"
++++
+
+While an external lead (Claude Code over MCP) is attached, Mnemo2 enforces the memory workflow the built-in lead follows by prompt. (1) Recall gate in src-tauri/src/mnemo2/mcp_server.rs Shared::call_tool: plan_create is refused until a successful memory_search ran since the last plan_create or attach; a bug_fixing plan_create also needs a memory_search with record_type "bug". State lives on TeamRuntime's ExternalLead (memory_search_since_plan_create, bug_search_since_plan_create), reset on attach, detach and each plan_create. (2) A plan_create of kind implementation/research whose title or goal says fix/bug/crash/hang/broken/regression gets a reminder to use bug_fixing. (3) Close gate in src/app/plan_board.rs PlanBoard::try_close, switched by set_external_lead_attached: implementation and research plans stay Blocked until a live SPEC/DECISION/HOW/BUG record exists that was written or amended after the plan was created and is not plan-scoped and carries no commit hash; bug_fixing plans are exempt (BUG captured at close). Retry with plan_step_done on the last step. (4) team_merge results and closed notices carry EXTERNAL_LEAD_MEMORY_REMINDER. The built-in lead is never gated. The plugin skills (mnemo-lead, mnemo-plan, mnemo-review) document the same rules.

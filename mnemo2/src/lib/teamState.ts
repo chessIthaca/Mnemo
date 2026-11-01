@@ -1,5 +1,6 @@
 import type {
   Finding,
+  InboxEntry,
   LeadAgentEvent,
   LeadPendingInteraction,
   LeadTranscript,
@@ -84,6 +85,20 @@ export interface TeamFinding {
   justification?: string | null;
 }
 
+/** Who sent a message to a worker, as the host serializes it. */
+export type TeamInboxSender = "external_lead" | "lead" | "user" | "mnemo";
+
+/** The form a message to a worker was delivered in, as the host serializes it. */
+export type TeamInboxKind = "prompt" | "steer" | "brief" | "fix";
+
+/** One durable message delivered to a worker, as the host serializes it. */
+export interface TeamInboxEntry {
+  sender: TeamInboxSender;
+  kind: TeamInboxKind;
+  text: string;
+  at_ms: number;
+}
+
 export interface TeamWorkerRecord {
   id: string;
   name: string;
@@ -130,6 +145,11 @@ export interface TeamWorkerRecord {
   audit_target?: string | null;
   /** Set on audit workers: the exact implementation tip the audit inspected. */
   audit_tip?: string | null;
+  /**
+   * Every message this worker received, oldest first: sender, delivery form,
+   * text, time. Absent in ledgers saved before senders were recorded.
+   */
+  inbox?: TeamInboxEntry[];
 }
 
 /**
@@ -313,6 +333,24 @@ export function findingFromWire(finding: TeamFinding): Finding {
     fixCommit: finding.fix_commit ?? undefined,
     evidence: finding.evidence ?? undefined,
     justification: finding.justification ?? undefined,
+  };
+}
+
+/**
+ * Map one durable inbox entry from the host's wire shape to the UI shape.
+ *
+ * The sender and kind are written by the host, but a record saved by an older
+ * host — or read by a newer frontend — could carry a value this build does not
+ * know; those degrade to Mnemo2/prompt rather than crashing the ledger.
+ */
+export function inboxFromWire(entry: TeamInboxEntry): InboxEntry {
+  const senders: readonly TeamInboxSender[] = ["external_lead", "lead", "user", "mnemo"];
+  const kinds: readonly TeamInboxKind[] = ["prompt", "steer", "brief", "fix"];
+  return {
+    sender: senders.includes(entry.sender) ? entry.sender : "mnemo",
+    kind: kinds.includes(entry.kind) ? entry.kind : "prompt",
+    text: typeof entry.text === "string" ? entry.text : "",
+    atMs: entry.at_ms,
   };
 }
 

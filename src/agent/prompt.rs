@@ -442,7 +442,7 @@ pub fn strip_request_scaffolding(
         .enumerate()
         .filter(|(index, _)| {
             // Index 0 is the stable head, never a tail.
-            !footer[*index] && !(*index > 0 && footer.get(index + 1).copied().unwrap_or(false))
+            !(footer[*index] || *index > 0 && footer.get(index + 1).copied().unwrap_or(false))
         })
         .map(|(_, message)| message)
         .collect()

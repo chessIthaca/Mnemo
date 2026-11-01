@@ -78,6 +78,10 @@ pub struct Engine {
     configured_embedding_model: Option<String>,
     /// The event pump task — `shutdown` aborts it.
     pump: tokio::task::JoinHandle<()>,
+    /// Whether the builder supplied the model transport. An injected
+    /// provider remains the transport for model-pinned sessions instead of
+    /// being replaced by a config-resolved client.
+    has_injected_provider: bool,
     /// The runtime this engine owns when started via
     /// [`start_blocking`](Engine::start_blocking) — `None` when the
     /// caller's runtime hosts it. Held purely for its lifetime.
@@ -111,7 +115,8 @@ impl EngineBuilder {
 
     /// Replace the factory's base provider — the scripted-mock seam for
     /// the engine fixtures (and custom endpoints before job 4's register
-    /// surface).
+    /// surface). The injected client also serves model-pinned sessions;
+    /// per-turn config resolution never replaces it.
     pub fn provider(mut self, provider: Arc<dyn LlmClient>) -> Self {
         self.provider = Some(provider);
         self
@@ -336,6 +341,11 @@ impl Engine {
         let name = opts.name.unwrap_or_else(|| "session".to_string());
         let model = forced_model_ref(opts.model.as_deref(), opts.reasoning_effort)
             .map_err(EngineError::spawn_failed)?;
+        let model = if self.has_injected_provider {
+            None
+        } else {
+            model
+        };
         let permission = opts
             .permissions
             .unwrap_or_else(|| self.default_permissions.clone());
@@ -459,9 +469,19 @@ impl Engine {
         }
         let id = SessionId::new(agent);
         self.inner.sessions.lock().await.insert(id, agent);
+        let agent_loop = self
+            .inner
+            .host
+            .agent_loops
+            .lock()
+            .await
+            .get(&agent)
+            .map(std::sync::Arc::downgrade)
+            .unwrap_or_default();
         Ok(AgentSession {
             id,
             agent,
+            agent_loop,
             inner: self.inner.clone(),
             bus,
         })
@@ -475,9 +495,19 @@ impl Engine {
     pub async fn session(&self, id: &SessionId) -> Option<AgentSession> {
         let agent = *self.inner.sessions.lock().await.get(id)?;
         let bus = self.session_bus()?;
+        let agent_loop = self
+            .inner
+            .host
+            .agent_loops
+            .lock()
+            .await
+            .get(&agent)
+            .map(std::sync::Arc::downgrade)
+            .unwrap_or_default();
         Some(AgentSession {
             id: *id,
             agent,
+            agent_loop,
             inner: self.inner.clone(),
             bus,
         })
@@ -772,6 +802,7 @@ async fn start_inner(
     // sessions inherit the host app's semantics, so the built path's
     // provider override + FreePolicyFactory assignment are skipped.
     let brain_is_injected = injected_brain.is_some();
+    let has_injected_provider = provider.is_some();
     let brain: Arc<Brain> = match injected_brain {
         Some(brain) => brain,
         None => {
@@ -890,6 +921,7 @@ async fn start_inner(
         default_permissions: opts.permissions,
         configured_embedding_model,
         pump,
+        has_injected_provider,
         _owned_runtime: None,
     })
 }

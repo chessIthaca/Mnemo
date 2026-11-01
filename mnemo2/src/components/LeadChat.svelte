@@ -3,7 +3,9 @@
   import { ArrowUpRight, ClipboardCheck, MessageSquareText } from "@lucide/svelte";
   import { actions, app } from "../lib/store";
   import { workerStatusText } from "../lib/types";
+  import { selectNeedsYouWorkers, selectRunningWorkers } from "../lib/workerSelection";
   import Composer from "./Composer.svelte";
+  import ExternalLeadPanel from "./ExternalLeadPanel.svelte";
   import Markdown from "./Markdown.svelte";
   import EventRow from "./EventRow.svelte";
   import MergeCard from "./MergeCard.svelte";
@@ -34,17 +36,27 @@
 
   // The lead ends its turn while workers run; TeamManager wakes it when one
   // finishes. Say so, so an idle lead does not read as a stalled one.
-  const runningWorkers = $derived(
-    $app.workers.filter((worker) => ["dispatching", "working", "fixing"].includes(worker.status)),
-  );
+  const runningWorkers = $derived(selectRunningWorkers($app.workers));
   // Same predicate as needsYouCount: any worker waiting on a human, busy lead or not.
-  const needsYouWorkers = $derived($app.workers.filter((worker) => worker.needsYou));
+  const needsYouWorkers = $derived(selectNeedsYouWorkers($app.workers));
   const showWaiting = $derived(
     !$app.leadRuntime.busy && !$app.leadRuntime.pending && !$app.leadRuntime.error && runningWorkers.length > 0,
   );
 
-  let scroller: HTMLDivElement;
-  let content: HTMLDivElement;
+  // While Claude Code leads externally, a pointer panel replaces the idle
+  // built-in chat; "Open the built-in lead anyway" reveals it behind a slim
+  // bar. Any attach or detach returns the view to that default.
+  let externalRevealed = $state(false);
+  const showExternalPanel = $derived($app.externalLead.attached && !externalRevealed);
+  const showExternalBar = $derived($app.externalLead.attached && externalRevealed);
+
+  $effect(() => {
+    void $app.externalLead.attached;
+    externalRevealed = false;
+  });
+
+  let scroller = $state<HTMLDivElement>();
+  let content = $state<HTMLDivElement>();
   let nearBottom = true;
   let scrollFrame: number | null = null;
   let resizeObserver: ResizeObserver | null = null;
@@ -71,6 +83,19 @@
     scheduleScroll();
   });
 
+  // The external-lead panel unmounts the transcript, so re-observe the
+  // live content and settle at the bottom whenever the chat is shown.
+  $effect(() => {
+    if (showExternalPanel) return;
+    const stream = content;
+    if (!stream) return;
+    resizeObserver?.observe(stream);
+    scheduleScroll();
+    return () => {
+      resizeObserver?.unobserve(stream);
+    };
+  });
+
   function handleScroll() {
     if (!scroller) return;
     const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
@@ -88,6 +113,15 @@
 </script>
 
 <section class="lead-workspace" aria-label="Lead conversation">
+  {#if showExternalPanel}
+    <ExternalLeadPanel onReveal={() => (externalRevealed = true)} />
+  {:else}
+    {#if showExternalBar}
+      <div class="external-lead-bar">
+        <span>Claude Code is leading this project.</span>
+        <button type="button" onclick={() => (externalRevealed = false)}>Back</button>
+      </div>
+    {/if}
   <div class="lead-scroll" bind:this={scroller} onscroll={handleScroll}>
     <div class="lead-content">
       <div class="lead-stream" bind:this={content}>
@@ -219,6 +253,7 @@
     </div>
   </div>
   <footer class="composer-dock"><PendingPrompt /><Composer /></footer>
+  {/if}
 </section>
 
 <style>
@@ -264,10 +299,14 @@
   .lead-pending { border-color: #ddd2bd; background: #f8f4ea; }
   .notice-label { margin-bottom: 5px; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: 0.08em; }
   .notice-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .external-lead-bar { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 32px; border-bottom: 1px solid var(--line); background: var(--surface); color: var(--ink-soft); font-size: 10px; }
+  .external-lead-bar button { padding: 3px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font: inherit; font-size: 9px; }
+  .external-lead-bar button:hover { border-color: var(--line-strong); color: var(--ink); }
   .composer-dock { flex: 0 0 auto; padding: 10px 32px 12px; background: linear-gradient(transparent, var(--canvas) 18%); }
   @media (max-width: 760px) {
     .lead-content { padding: 16px; }
     .composer-dock { padding: 10px 16px 72px; }
+    .external-lead-bar { padding: 7px 16px; }
   }
   @media (max-width: 560px) {
     .chat-entry:not(.user-entry), .tool-activity-row { margin-left: 0; }

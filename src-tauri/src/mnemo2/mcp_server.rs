@@ -43,13 +43,20 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use mnemo::app::plan_board::BoardStatus;
+
+use crate::mnemo2::model_label::short_model_name;
 use crate::mnemo2::project;
 use crate::mnemo2::runtime::LeadRuntime;
 use crate::mnemo2::run_file;
-use crate::mnemo2::team::{TeamRuntime, EXTERNAL_LEAD_IDLE_MS};
+use crate::mnemo2::team::{
+    MessageSender, TeamRuntime, WorkerStatus, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
+};
 
 /// Asks the frontend to open a registered project (`{"root": String}`).
 pub const EXTERNAL_OPEN_REQUEST_CHANNEL: &str = "mnemo2://external-open-request";
+/// The backend asks the frontend to open this worker in mission control.
+pub const OPEN_WORKER_CHANNEL: &str = "mnemo2://open-worker";
 
 /// Reports an external lead attaching or detaching
 /// (`{"attached": bool, "root": String|null}`).
@@ -58,6 +65,7 @@ pub const EXTERNAL_LEAD_CHANNEL: &str = "mnemo2://external-lead";
 /// The short lead brief MCP `initialize` returns. `{helper}` becomes the
 /// helper executable's path, so the lead can start the waiter without PATH.
 pub const LEAD_INSTRUCTIONS: &str = "You are leading a Mnemo2 team for this project. Mnemo2 workers run on the user's own model endpoints, grouped in tiers (difficult/average/simple). You plan, dispatch, review and merge with the team_* tools.\n\
+- Mandatory memory workflow: memory_search before planning and before diagnosing a bug; use plan_create kind bug_fixing for bugs; memory_write durable SPEC:/DECISION:/HOW: learnings before close (details in the mnemo-lead skill).\n\
 - Plan first on the board: plan_create (then plan_show, plan_update, plan_step_done). Every team_dispatch needs a plan_id and step; dispatch one worker per step with a precise brief and a `tier` (prefer tier over model).\n\
 - When a worker finishes you get a notice: team_check, then team_review; close findings with team_resolve_finding; team_merge only when the review passes.\n\
 - If a worker fails, move it with team_resume (worker_id + tier) and team_message it to continue.\n\
@@ -117,6 +125,8 @@ pub trait LeadHost: Send + Sync + 'static {
     fn lead_changed(&self, attached: bool, root: Option<&Path>);
     /// Bring the Mnemo2 window to the front.
     fn show_window(&self);
+    /// Ask the frontend to open a worker in mission control.
+    fn open_worker(&self, root: &Path, worker_id: &str);
     /// Why the UI could not open the project at `root` after the last
     /// request, if it reported a failure.
     fn open_failure(&self, _root: &Path) -> Option<OpenFailure> {
@@ -166,6 +176,16 @@ pub struct McpServer {
     shared: Arc<Shared>,
     port: u16,
     tasks: Vec<JoinHandle<()>>,
+}
+
+/// Whether plan wording contains a whole-word defect-fix trigger.
+fn reads_like_defect_fix(text: &str) -> bool {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| {
+            ["fix", "bug", "crash", "hang", "broken", "regression"]
+                .iter()
+                .any(|trigger| word.eq_ignore_ascii_case(trigger))
+        })
 }
 
 impl McpServer {
@@ -547,6 +567,30 @@ fn canonical(path: &Path) -> PathBuf {
     project::canonical_root(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Whether this worker has active work in progress.
+fn is_running(status: WorkerStatus) -> bool {
+    matches!(
+        status,
+        WorkerStatus::Dispatching
+            | WorkerStatus::Working
+            | WorkerStatus::Fixing
+            | WorkerStatus::Merging
+    )
+}
+
+/// Whether this worker is blocked on the person's review or intervention.
+fn waiting_on_user(status: WorkerStatus) -> bool {
+    matches!(
+        status,
+        WorkerStatus::Completed
+            | WorkerStatus::InReview
+            | WorkerStatus::NeedsYou
+            | WorkerStatus::Failed
+            | WorkerStatus::Conflict
+            | WorkerStatus::Interrupted
+    )
+}
+
 impl Shared {
     /// The bearer-token check, run on the request head before the body is
     /// read.
@@ -573,6 +617,7 @@ impl Shared {
             "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach" => {
                 self.lead_route(request).await
             }
+            "/lead/summary" | "/lead/show-worker" => self.lead_route(request).await,
             "/lead/open" => self.lead_open(request).await,
             _ => Response::error(404, "unknown route"),
         }
@@ -668,8 +713,93 @@ impl Shared {
             "/lead/notices" => self.notices(target, body).await,
             "/lead/wait" => self.wait(target, body).await,
             "/lead/gate-agent" => Response::json(200, &self.gate_agent(target, body).await),
+            "/lead/summary" => self.summary(target).await,
+            "/lead/show-worker" => self.show_worker(target, body).await,
             _ => Response::json(200, &self.detach(target).await),
         }
+    }
+
+    /// A read-only worker summary for external surfaces. This neither attaches
+    /// the external lead nor reads (and therefore never drains) its notices.
+    async fn summary(&self, target: Option<Target>) -> Response {
+        let Some(target) = target else {
+            return Response::json(200, &json!({}));
+        };
+        let team = target.team;
+        let snapshot = team.snapshot().await;
+        let open_plans = team
+            .board_snapshot()
+            .await
+            .map(|board| {
+                board
+                    .plans
+                    .iter()
+                    .filter(|plan| plan.status == BoardStatus::Open)
+                    .count()
+            })
+            .unwrap_or(0);
+        let running = snapshot
+            .workers
+            .iter()
+            .filter(|worker| is_running(worker.status))
+            .count();
+        let waiting = snapshot
+            .workers
+            .iter()
+            .filter(|worker| waiting_on_user(worker.status))
+            .count();
+        let workers: Vec<Value> = snapshot
+            .workers
+            .iter()
+            .map(|worker| {
+                let model = worker
+                    .model
+                    .clone()
+                    .or_else(|| worker.model_id.clone())
+                    .unwrap_or_default();
+                let model_short = short_model_name(&model);
+                json!({
+                    "id": worker.id,
+                    "name": worker.name,
+                    "model": model,
+                    "model_short": model_short,
+                    "tier": worker.tier,
+                    "status": worker.status,
+                    "needs_you": waiting_on_user(worker.status),
+                    "elapsed_ms": worker.elapsed_ms,
+                })
+            })
+            .collect();
+        Response::json(
+            200,
+            &json!({
+                "workers": workers,
+                "open_plans": open_plans,
+                "running": running,
+                "waiting": waiting,
+            }),
+        )
+    }
+
+    /// Show a known worker without changing leadership or consuming notices.
+    async fn show_worker(&self, target: Option<Target>, body: Value) -> Response {
+        let Some(target) = target else {
+            return Response::error(404, "the project is not open in Mnemo2");
+        };
+        let worker_id = body
+            .get("worker_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if worker_id.is_empty() {
+            return Response::error(400, "missing \"worker_id\"");
+        }
+        if let Err(error) = target.team.worker(worker_id).await {
+            return Response::error(404, &error);
+        }
+        self.host.show_window();
+        self.host.open_worker(&target.root, worker_id);
+        Response::json(200, &json!({ "shown": true }))
     }
 
     /// The hooks' view of the board. Never attaches an external lead: reading
@@ -884,9 +1014,30 @@ impl Shared {
             Some(args) if !args.is_null() => args.clone(),
             _ => json!({}),
         };
+        let bug_fixing_plan = name == "plan_create"
+            && args.get("kind").and_then(Value::as_str) == Some("bug_fixing");
+        let defect_kind_reminder = name == "plan_create"
+            && matches!(
+                args.get("kind").and_then(Value::as_str),
+                None | Some("implementation" | "research")
+            )
+            && ["title", "goal"].iter().any(|field| {
+                args.get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(reads_like_defect_fix)
+            });
+        let bug_search = name == "memory_search"
+            && args.get("record_type").and_then(Value::as_str) == Some("bug");
+        let plan_create_refusal = if name == "plan_create" {
+            target.team.external_plan_create_refusal(bug_fixing_plan)
+        } else {
+            None
+        };
         let board_tools = target.lead.board_tools();
         let knowledge_tools = target.lead.knowledge_tools();
-        let result = if name == OPEN_MISSION_CONTROL {
+        let mut result = if let Some(reason) = plan_create_refusal {
+            mnemo::tool::ToolResult::error(reason)
+        } else if name == OPEN_MISSION_CONTROL {
             self.host.show_window();
             mnemo::tool::ToolResult::success("Mnemo2 is open on this project.")
         } else if let Some(tool) = board_tools.iter().find(|tool| tool.name() == name) {
@@ -901,10 +1052,28 @@ impl Shared {
             .iter()
             .any(|spec| spec.name == name)
         {
-            target.team.handle_lead_host_tool(name, args).await
+            target
+                .team
+                .handle_lead_host_tool_from(name, args, MessageSender::ExternalLead)
+                .await
         } else {
             return Err((CODE_INVALID_PARAMS, format!("unknown tool '{name}'")));
         };
+        if result.success {
+            if name == "memory_search" {
+                target.team.record_external_memory_search(bug_search);
+            } else if name == "plan_create" {
+                target.team.record_external_plan_create();
+                if defect_kind_reminder {
+                    result.output.push_str(
+                        "\nBug reminder: use plan_create with kind bug_fixing for bugs unless the fix adds capabilities or spans modules.",
+                    );
+                }
+            } else if name == "team_merge" {
+                result.output.push('\n');
+                result.output.push_str(EXTERNAL_LEAD_MEMORY_REMINDER);
+            }
+        }
         let mut text = result.output;
         // Drain last, so the notices are as fresh as the answer; if the
         // response cannot be written they are put back (see `Reply`).
@@ -1123,6 +1292,13 @@ impl LeadHost for AppLeadHost {
     fn show_window(&self) {
         show_main_window(&self.app);
     }
+
+    fn open_worker(&self, root: &Path, worker_id: &str) {
+        let _ = self.app.emit(
+            OPEN_WORKER_CHANNEL,
+            json!({ "root": root.to_string_lossy(), "worker_id": worker_id }),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1184,6 +1360,7 @@ mod tests {
         lead: Mutex<Option<Arc<LeadRuntime>>>,
         pending: Mutex<Option<Arc<LeadRuntime>>>,
         open_requests: Mutex<Vec<PathBuf>>,
+        opened_workers: Mutex<Vec<(PathBuf, String)>>,
         changes: Mutex<Vec<(bool, Option<PathBuf>)>>,
         shown: AtomicUsize,
         /// A reported open failure: the canonical root and what was reported.
@@ -1219,6 +1396,13 @@ mod tests {
 
         fn show_window(&self) {
             self.shown.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn open_worker(&self, root: &Path, worker_id: &str) {
+            self.opened_workers
+                .lock()
+                .expect("opened workers")
+                .push((root.to_path_buf(), worker_id.to_string()));
         }
 
         fn open_failure(&self, root: &Path) -> Option<OpenFailure> {
@@ -1738,6 +1922,121 @@ mod tests {
         fixture.shutdown().await;
     }
 
+    #[test]
+    fn worker_activity_classification_covers_every_status() {
+        for (status, running, waiting) in [
+            (WorkerStatus::Dispatching, true, false),
+            (WorkerStatus::Working, true, false),
+            (WorkerStatus::NeedsYou, false, true),
+            (WorkerStatus::Idle, false, false),
+            (WorkerStatus::Paused, false, false),
+            (WorkerStatus::Interrupted, false, true),
+            (WorkerStatus::Completed, false, true),
+            (WorkerStatus::Stopped, false, false),
+            (WorkerStatus::Failed, false, true),
+            (WorkerStatus::InReview, false, true),
+            (WorkerStatus::Fixing, true, false),
+            (WorkerStatus::Merging, true, false),
+            (WorkerStatus::Merged, false, false),
+            (WorkerStatus::Conflict, false, true),
+            (WorkerStatus::Cancelled, false, false),
+        ] {
+            assert_eq!(is_running(status), running, "running: {status:?}");
+            assert_eq!(waiting_on_user(status), waiting, "waiting: {status:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_and_show_worker_are_read_only_and_open_the_worker() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let worker = team
+            .dispatch_with_id(
+                "Exercise the external worker summary".into(),
+                Some("test/scripted-a".into()),
+                Some("summary001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch");
+        let root = fixture.root.to_string_lossy().into_owned();
+        let request = || json!({ "root": root, "worker_id": worker.id });
+
+        let summary = fixture.lead_post("/lead/summary", request()).await;
+        let entry = summary["workers"]
+            .as_array()
+            .expect("workers")
+            .iter()
+            .find(|entry| entry["id"] == worker.id)
+            .expect("dispatched worker");
+        assert_eq!(entry["model_short"], "scripted");
+        assert_eq!(entry["model"], "test/scripted-a");
+        assert!(entry["elapsed_ms"].is_number());
+        assert!(entry["needs_you"].is_boolean());
+        assert_eq!(summary["open_plans"], 0);
+        assert!(summary["running"].is_number());
+        assert!(summary["waiting"].is_number());
+        assert!(!team.external_lead_attached(), "summary must not attach");
+
+        let shown = fixture.lead_post("/lead/show-worker", request()).await;
+        assert_eq!(shown, json!({ "shown": true }));
+        assert!(
+            !team.external_lead_attached(),
+            "show-worker must not attach"
+        );
+        assert_eq!(OPEN_WORKER_CHANNEL, "mnemo2://open-worker");
+        assert_eq!(fixture.host.shown.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .host
+                .opened_workers
+                .lock()
+                .expect("opened workers")
+                .as_slice(),
+            [(fixture.root.clone(), worker.id.clone())]
+        );
+
+        fixture.attach().await;
+        assert!(team.push_external_notice("keep this notice".into()));
+        fixture.lead_post("/lead/summary", request()).await;
+        fixture.lead_post("/lead/show-worker", request()).await;
+        assert_eq!(fixture.host.changes(), vec![true], "no new attachment");
+        let notices = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "peek" }))
+            .await;
+        assert!(
+            notices["notices"]
+                .as_array()
+                .expect("notices")
+                .contains(&json!("keep this notice")),
+            "neither read-only route may drain the queue: {notices}"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn show_worker_rejects_an_unknown_worker_without_showing_the_window() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let body = json!({
+            "root": fixture.root.to_string_lossy(),
+            "worker_id": "missing001"
+        });
+        let (status, reply) = fixture
+            .post("/lead/show-worker", Some("tok-123"), &[], &body.to_string())
+            .await;
+        assert_eq!(status, 404, "{reply}");
+        assert!(reply.contains("unknown worker"), "{reply}");
+        assert_eq!(fixture.host.shown.load(Ordering::SeqCst), 0);
+        assert!(fixture
+            .host
+            .opened_workers
+            .lock()
+            .expect("opened workers")
+            .is_empty());
+        assert!(!fixture.team().await.external_lead_attached());
+        fixture.shutdown().await;
+    }
+
     #[tokio::test]
     async fn tools_list_has_the_team_tools_the_plan_board_knowledge_tools_and_mission_control() {
         let fixture = Fixture::new(true, true, ServerOptions::default()).await;
@@ -1818,6 +2117,15 @@ mod tests {
             .as_str()
             .expect("text")
             .to_string()
+    }
+
+    fn plan_args(title: &str) -> Value {
+        json!({
+            "title": title,
+            "goal": "Prove the external lead follows the server workflow",
+            "context": "The server enforces memory recall for this plan; src/lib.rs is the concrete implementation anchor and cargo test is the verification.",
+            "steps": ["Edit src/lib.rs"]
+        })
     }
 
     /// Every `.md` file under `dir`.
@@ -2077,6 +2385,108 @@ Since your last call:
     }
 
 
+    #[tokio::test]
+    async fn external_plan_create_requires_a_successful_search_per_plan() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+
+        let refused = fixture
+            .call("plan_create", plan_args("External memory gate"))
+            .await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert!(refused["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("memory_search")));
+
+        let failed_search = fixture
+            .call("memory_search", json!({"limit": "not-a-number"}))
+            .await;
+        assert_eq!(failed_search["result"]["isError"], true, "{failed_search}");
+        let still_refused = fixture
+            .call("plan_create", plan_args("External memory gate"))
+            .await;
+        assert_eq!(still_refused["result"]["isError"], true, "{still_refused}");
+
+        let searched = fixture
+            .call("memory_search", json!({"query": "external memory gate"}))
+            .await;
+        ok_text(&searched);
+        let created = fixture
+            .call("plan_create", plan_args("External memory gate"))
+            .await;
+        assert!(ok_text(&created).contains("Created plan"));
+
+        let next_refused = fixture
+            .call("plan_create", plan_args("Fix external importer"))
+            .await;
+        assert_eq!(next_refused["result"]["isError"], true, "{next_refused}");
+        let searched = fixture
+            .call("memory_search", json!({"query": "external importer"}))
+            .await;
+        ok_text(&searched);
+        let defect = fixture
+            .call("plan_create", plan_args("Fix external importer"))
+            .await;
+        let text = ok_text(&defect);
+        assert!(text.contains("Bug reminder"), "{text}");
+        assert!(text.contains("kind bug_fixing"), "{text}");
+        assert!(text.contains("adds capabilities or spans modules"), "{text}");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn external_bug_plan_needs_bug_search_and_a_new_attachment_resets_recall() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let mut bug_args = plan_args("Repair importer crash");
+        bug_args["kind"] = json!("bug_fixing");
+        bug_args["bug"] = json!("The importer crashes on an empty file");
+        bug_args["context"] = json!(
+            "Repair the empty-input crash in src/lib.rs. Regression test: empty_importer_input in src/lib.rs tests panics before the fix and passes after it."
+        );
+
+        let searched = fixture
+            .call("memory_search", json!({"query": "importer crash"}))
+            .await;
+        ok_text(&searched);
+        let refused = fixture.call("plan_create", bug_args.clone()).await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert!(refused["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("record_type \"bug\"")));
+
+        let wrong_type = fixture
+            .call(
+                "memory_search",
+                json!({"query": "importer", "record_type": "spec"}),
+            )
+            .await;
+        ok_text(&wrong_type);
+        let still_refused = fixture.call("plan_create", bug_args.clone()).await;
+        assert_eq!(still_refused["result"]["isError"], true, "{still_refused}");
+
+        let bug_search = fixture
+            .call(
+                "memory_search",
+                json!({"query": "importer crash", "record_type": "bug"}),
+            )
+            .await;
+        ok_text(&bug_search);
+        let created = fixture.call("plan_create", bug_args).await;
+        assert!(ok_text(&created).contains("Created plan"));
+
+        let team = fixture.team().await;
+        let searched = fixture
+            .call("memory_search", json!({"query": "new attachment"}))
+            .await;
+        ok_text(&searched);
+        assert!(team.detach_external_lead());
+        assert!(team.attach_external_lead());
+        let refused = fixture
+            .call("plan_create", plan_args("New attachment"))
+            .await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        fixture.shutdown().await;
+    }
+
     /// The whole external-lead loop: plan on the board over MCP, dispatch a
     /// worker, and the worker's "finished" notice reaches the external lead
     /// (not the in-app one) through the waiter and the next tool result.
@@ -2090,6 +2500,10 @@ Since your last call:
         fixture.rpc(initialize()).await;
         let mut board = team.subscribe_board();
 
+        let searched = fixture
+            .call("memory_search", json!({"query": "external lead planning"}))
+            .await;
+        ok_text(&searched);
         let (_, reply) = fixture
             .rpc(json!({
                 "jsonrpc": "2.0", "id": 10, "method": "tools/call",
@@ -2173,6 +2587,114 @@ Since your last call:
                 .as_str()
                 .is_some_and(|text| text.contains("extlead001")),
             "{status}"
+        );
+
+        let (_, message) = fixture
+            .rpc(json!({
+                "jsonrpc": "2.0", "id": 14, "method": "tools/call",
+                "params": { "name": "team_message", "arguments": {
+                    "worker_id": "extlead001", "text": "continue from Claude Code"
+                } }
+            }))
+            .await;
+        assert_eq!(message["result"]["isError"], false, "{message}");
+        let worker = fixture
+            .team()
+            .await
+            .worker("extlead001")
+            .await
+            .expect("messaged worker");
+        let entry = worker.inbox.last().expect("external lead inbox entry");
+        assert_eq!(entry.sender, MessageSender::ExternalLead);
+        assert_eq!(entry.kind, crate::mnemo2::team::InboxKind::Prompt);
+        assert_eq!(entry.text, "continue from Claude Code");
+        let delivered = "[From the lead (Claude Code)]\ncontinue from Claude Code";
+        for _ in 0..100 {
+            let worker = fixture
+                .team()
+                .await
+                .worker("extlead001")
+                .await
+                .expect("worker transcript");
+            if worker
+                .transcript
+                .messages
+                .iter()
+                .any(|message| message.content.as_text() == delivered)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let worker = fixture
+            .team()
+            .await
+            .worker("extlead001")
+            .await
+            .expect("final worker transcript");
+        assert!(worker
+            .transcript
+            .messages
+            .iter()
+            .any(|message| message.content.as_text() == delivered));
+
+        let worker = team.worker("extlead001").await.expect("dispatched worker");
+        std::fs::create_dir_all(worker.worktree.join("src")).expect("worker src");
+        std::fs::write(worker.worktree.join("src/lib.rs"), "pub fn external() {}\n")
+            .expect("worker change");
+        git(&worker.worktree, &["add", "src/lib.rs"]);
+        git(&worker.worktree, &["commit", "-m", "worker change"]);
+
+        let learning = fixture
+            .call(
+                "memory_write",
+                json!({
+                    "tier": "semantic",
+                    "title": "DECISION: External leads preserve memory workflow",
+                    "content": "The MCP server enforces recall before planning and durable learnings before close."
+                }),
+            )
+            .await;
+        ok_text(&learning);
+        let checked = fixture
+            .call(
+                "team_check",
+                json!({"worker_id": "extlead001", "name": "cargo test", "status": "passed"}),
+            )
+            .await;
+        ok_text(&checked);
+        let reviewed = fixture
+            .call(
+                "team_review",
+                json!({
+                    "worker_id": "extlead001",
+                    "summary": "Reviewed the complete worker diff and found no findings.",
+                    "findings": [],
+                    "evidence": {
+                        "unanchored_pass": true,
+                        "intent": "The worker diff matches the plan step.",
+                        "execution": "The implementation follows the requested path.",
+                        "integration": "No surrounding contracts changed.",
+                        "test_quality": "The recorded check covers the worker change.",
+                        "residual_risk": "No residual risk beyond this small fixture."
+                    }
+                }),
+            )
+            .await;
+        ok_text(&reviewed);
+        let merged = fixture
+            .call("team_merge", json!({"worker_id": "extlead001"}))
+            .await;
+        let merged_text = ok_text(&merged);
+        assert!(merged_text.contains(EXTERNAL_LEAD_MEMORY_REMINDER), "{merged_text}");
+        let notices = fixture
+            .lead_post("/lead/notices", json!({"root": root, "mode": "drain"}))
+            .await;
+        let combined = format!("{merged_text}\n{notices}");
+        assert!(combined.contains("is closed"), "{combined}");
+        assert!(
+            combined.matches(EXTERNAL_LEAD_MEMORY_REMINDER).count() >= 2,
+            "merge result and closed notice both need the reminder: {combined}"
         );
         fixture.shutdown().await;
     }

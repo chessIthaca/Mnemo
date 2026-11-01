@@ -57,6 +57,17 @@ describe("WorkerDetail brief", () => {
     expect(screen.getByRole("button", { name: "Show less brief" })).toBeTruthy();
   });
 
+  it("keeps the expanded brief bounded and scrollable", async () => {
+    render(WorkerDetail, { worker: worker(), measureBriefOverflow: () => true });
+    const toggle = await screen.findByRole("button", { name: "Show more brief" });
+    const brief = document.getElementById(toggle.getAttribute("aria-controls")!) as HTMLElement;
+
+    await fireEvent.click(toggle);
+
+    expect(brief.style.maxHeight).toBe("40vh");
+    expect(brief.style.overflowY).toBe("auto");
+  });
+
   it("offers no toggle when the brief fits", async () => {
     const measure = vi.fn(() => false);
     render(WorkerDetail, {

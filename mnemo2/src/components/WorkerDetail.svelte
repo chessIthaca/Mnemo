@@ -164,7 +164,8 @@
         id={`worker-${worker.id}-brief`}
         class="brief-content"
         class:clamped={!briefExpanded && briefOverflowing}
-        style:max-height={briefExpanded ? "none" : `${BRIEF_MAX_HEIGHT}px`}
+        style:max-height={briefExpanded ? "40vh" : `${BRIEF_MAX_HEIGHT}px`}
+        style:overflow-y={briefExpanded ? "auto" : "hidden"}
         bind:this={briefContent}
       >
         <Markdown source={worker.task} onOpenLink={actions.openBrowser} />

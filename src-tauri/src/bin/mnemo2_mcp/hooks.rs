@@ -102,6 +102,19 @@ fn quoted_helper(env: &Env) -> String {
     format!("\"{}\"", if usable { helper.as_ref() } else { "mnemo2-mcp" })
 }
 
+/// The exact waiter command lines for the Claude Code session this hook fired
+/// for — Bash and PowerShell, named with `--session <id>`, so staking the
+/// lead lets that session's own hooks (and no other session's) re-attach it
+/// after an idle release. `None` when the input names no session: then a
+/// started waiter stays anonymous, as before.
+fn waiter_commands(env: &Env, input: &Value) -> Option<String> {
+    let session = hook_session(input)?;
+    let helper = quoted_helper(env);
+    Some(format!(
+        "Bash: {helper} wait --session {session} \u{2014} PowerShell: & {helper} wait --session {session}"
+    ))
+}
+
 fn notice_lines(notices: &[String]) -> String {
     let lines: Vec<String> = notices.iter().map(|notice| format!("- {notice}")).collect();
     format!("Mnemo notices:\n{}", lines.join("\n"))
@@ -150,7 +163,20 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
             if reply.notices.is_empty() {
                 return None;
             }
-            Some(hook_output("PostToolUse", &notice_lines(&reply.notices)))
+            let mut context = notice_lines(&reply.notices);
+            // Workers are running and no waiter: the session may have
+            // compacted away the waiter command it was taught — repeat it, so
+            // a waiter named for this session keeps the claim re-attachable.
+            if reply.attached && reply.active_workers > 0 && !reply.waiter_alive {
+                if let Some(commands) = waiter_commands(env, &input) {
+                    context.push_str(&format!(
+                        "\n\n{} Mnemo worker(s) are still running and no waiter is active. \
+                         Start this as a background command so you are woken when one reports. {commands}",
+                        reply.active_workers,
+                    ));
+                }
+            }
+            Some(hook_output("PostToolUse", &context))
         }
         // The server fills the summary whenever the root is its open project:
         // SessionStart can run before MCP `initialize` attaches the lead.
@@ -162,6 +188,19 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
                 }
                 context.push_str(&notice_lines(&reply.notices));
             }
+            // Teach the session its own waiter command up front: the MCP
+            // instructions and the skill cannot name the session, and an
+            // unnamed claim cannot come back through its hooks after an
+            // idle release.
+            if let Some(commands) = waiter_commands(env, &input) {
+                if !context.is_empty() {
+                    context.push_str("\n\n");
+                }
+                context.push_str(
+                    "Whenever you start a Mnemo waiter, use this command (it names your Claude Code session, so your own hooks can re-attach you after an idle release). ",
+                );
+                context.push_str(&commands);
+            }
             if context.is_empty() {
                 return None;
             }
@@ -171,20 +210,19 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
             if !reply.attached || reply.active_workers == 0 || reply.waiter_alive {
                 return None;
             }
-            let helper = quoted_helper(env);
             // Name this session in the command (the Stop hook knows it; the
             // session itself does not): staking the lead with its session is
             // what lets its own hooks re-attach it after an idle release.
-            let session = hook_session(&input)
-                .map(|session| format!(" --session {session}"))
-                .unwrap_or_default();
+            let commands = waiter_commands(env, &input).unwrap_or_else(|| {
+                let helper = quoted_helper(env);
+                format!("Bash: {helper} wait \u{2014} PowerShell: & {helper} wait")
+            });
             Some(
                 json!({
                     "decision": "block",
                     "reason": format!(
                         "{} Mnemo worker(s) are still running and no waiter is active. \
-                         Start this as a background command so you are woken when one reports. \
-                         Bash: {helper} wait{session} \u{2014} PowerShell: & {helper} wait{session}",
+                         Start this as a background command so you are woken when one reports. {commands}",
                         reply.active_workers,
                     ),
                 })

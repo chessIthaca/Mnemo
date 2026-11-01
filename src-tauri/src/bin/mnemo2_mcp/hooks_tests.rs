@@ -62,17 +62,26 @@ fn drain_prints_the_queued_notices_as_post_tool_use_context() {
         "/lead/notices",
         notices_reply(true, &["worker a finished its turn", "worker b failed"], 1, false, "board"),
     );
+    let env = sandbox.env();
     let output = notices(
-        &sandbox.env(),
+        &env,
         NoticesMode::Drain,
         &hook_stdin(&sandbox.deep, json!({ "hook_event_name": "PostToolUse", "tool_name": "Bash" })),
     );
+    let helper = env.helper.display();
+    // Workers are running and no waiter: the context repeats the waiter
+    // command named for this session, so a compacted session still finds it.
     assert_eq!(
         parsed(output),
         json!({
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": "Mnemo notices:\n- worker a finished its turn\n- worker b failed",
+                "additionalContext": format!(
+                    "Mnemo notices:\n- worker a finished its turn\n- worker b failed\n\n\
+                     1 Mnemo worker(s) are still running and no waiter is active. \
+                     Start this as a background command so you are woken when one reports. \
+                     Bash: \"{helper}\" wait --session s-1 \u{2014} PowerShell: & \"{helper}\" wait --session s-1"
+                ),
             }
         })
     );
@@ -155,25 +164,33 @@ fn the_root_comes_from_stdin_cwd_then_claude_project_dir_then_the_process_cwd() 
 // ---- notices --session-start ----------------------------------------------
 
 #[test]
-fn session_start_adds_the_summary_and_any_queued_notices() {
+fn session_start_adds_the_summary_any_queued_notices_and_the_waiter_command() {
     let sandbox = Sandbox::new();
     let server = server_with(
         &sandbox,
         "/lead/notices",
         notices_reply(true, &["worker c merged"], 1, false, "Mnemo: board 3 open, 1 worker, lead model X."),
     );
+    let env = sandbox.env();
     let output = notices(
-        &sandbox.env(),
+        &env,
         NoticesMode::SessionStart,
         &hook_stdin(&sandbox.deep, json!({ "hook_event_name": "SessionStart", "source": "startup" })),
     );
+    let helper = env.helper.display();
+    // The session is taught its own waiter command right away: it names the
+    // session, so only its own hooks can re-attach it after an idle release.
     assert_eq!(
         parsed(output),
         json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext":
-                    "Mnemo: board 3 open, 1 worker, lead model X.\n\nMnemo notices:\n- worker c merged",
+                "additionalContext": format!(
+                    "Mnemo: board 3 open, 1 worker, lead model X.\n\nMnemo notices:\n- worker c merged\n\n\
+                     Whenever you start a Mnemo waiter, use this command (it names your Claude Code \
+                     session, so your own hooks can re-attach you after an idle release). \
+                     Bash: \"{helper}\" wait --session s-1 \u{2014} PowerShell: & \"{helper}\" wait --session s-1"
+                ),
             }
         })
     );
@@ -184,10 +201,17 @@ fn session_start_adds_the_summary_and_any_queued_notices() {
 fn session_start_with_only_a_summary_and_not_attached() {
     let sandbox = Sandbox::new();
     let _server = server_with(&sandbox, "/lead/notices", notices_reply(true, &[], 0, false, "Mnemo: idle."));
-    let output = notices(&sandbox.env(), NoticesMode::SessionStart, &hook_stdin(&sandbox.deep, json!({})));
+    let env = sandbox.env();
+    let output = notices(&env, NoticesMode::SessionStart, &hook_stdin(&sandbox.deep, json!({})));
+    let helper = env.helper.display();
     assert_eq!(
         parsed(output)["hookSpecificOutput"]["additionalContext"],
-        "Mnemo: idle."
+        format!(
+            "Mnemo: idle.\n\n\
+             Whenever you start a Mnemo waiter, use this command (it names your Claude Code \
+             session, so your own hooks can re-attach you after an idle release). \
+             Bash: \"{helper}\" wait --session s-1 \u{2014} PowerShell: & \"{helper}\" wait --session s-1"
+        )
     );
 
     // SessionStart can run before MCP `initialize` attaches the lead, so an
@@ -202,10 +226,17 @@ fn session_start_with_only_a_summary_and_not_attached() {
     assert!(context.starts_with("Mnemo: idle."), "{context}");
     assert!(context.contains("- x"), "{context}");
 
+    // With nothing else to say, the waiter command alone still reaches the
+    // session: it is the one line the session cannot reconstruct itself.
     let empty = Sandbox::new();
     let _server = server_with(&empty, "/lead/notices", notices_reply(false, &[], 0, false, ""));
     let output = notices(&empty.env(), NoticesMode::SessionStart, &hook_stdin(&empty.deep, json!({})));
-    assert!(output.is_none(), "nothing to say prints nothing");
+    let value = parsed(output);
+    let context = value["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("context");
+    assert!(context.contains("wait --session s-1"), "{context}");
+    assert!(!context.contains("Mnemo notices"), "{context}");
 }
 
 // ---- notices --stop-check --------------------------------------------------
@@ -294,7 +325,14 @@ fn session_start_is_not_affected_by_an_agent_id() {
         NoticesMode::SessionStart,
         &hook_stdin(&sandbox.deep, json!({ "agent_id": "agent-1" })),
     );
-    assert_eq!(parsed(output)["hookSpecificOutput"]["additionalContext"], "Mnemo: idle.");
+    // The subagent gate must not suppress the session-start context (here:
+    // the summary plus the waiter command named for this session).
+    let value = parsed(output);
+    let context = value["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("context");
+    assert!(context.starts_with("Mnemo: idle."), "{context}");
+    assert!(context.contains("wait --session s-1"), "{context}");
     assert_eq!(server.requests_to("/lead/notices").len(), 1);
 }
 
@@ -550,4 +588,34 @@ fn stop_check_without_a_session_id_suggests_the_plain_wait() {
             "2 Mnemo worker(s) are still running and no waiter is active. Start this as a background command so you are woken when one reports. Bash: \"{helper}\" wait \u{2014} PowerShell: & \"{helper}\" wait"
         )
     );
+}
+
+#[test]
+fn drain_leaves_the_waiter_line_out_when_a_waiter_runs_or_none_works() {
+    // A waiter is alive: nothing to teach.
+    let sandbox = Sandbox::new();
+    let _server = server_with(&sandbox, "/lead/notices", notices_reply(true, &["n1"], 2, true, ""));
+    let output = notices(&sandbox.env(), NoticesMode::Drain, &hook_stdin(&sandbox.deep, json!({})));
+    assert_eq!(
+        parsed(output)["hookSpecificOutput"]["additionalContext"],
+        "Mnemo notices:\n- n1"
+    );
+
+    // No workers are running: nothing to be woken for.
+    let idle = Sandbox::new();
+    let _server = server_with(&idle, "/lead/notices", notices_reply(true, &["n1"], 0, false, ""));
+    let output = notices(&idle.env(), NoticesMode::Drain, &hook_stdin(&idle.deep, json!({})));
+    assert_eq!(
+        parsed(output)["hookSpecificOutput"]["additionalContext"],
+        "Mnemo notices:\n- n1"
+    );
+}
+
+#[test]
+fn session_start_without_a_session_id_teaches_no_waiter() {
+    let sandbox = Sandbox::new();
+    let _server = server_with(&sandbox, "/lead/notices", notices_reply(true, &[], 0, false, "Mnemo: idle."));
+    let stdin = json!({ "cwd": sandbox.deep.to_string_lossy() }).to_string();
+    let output = notices(&sandbox.env(), NoticesMode::SessionStart, &stdin);
+    assert_eq!(parsed(output)["hookSpecificOutput"]["additionalContext"], "Mnemo: idle.");
 }

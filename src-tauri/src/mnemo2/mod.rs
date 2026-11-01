@@ -46,6 +46,9 @@ pub mod run_file;
 /// The local endpoint for an external lead (Claude Code over MCP).
 pub mod mcp_server;
 
+/// Compact model names for external worker displays.
+pub mod model_label;
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
 /// also exposes `__TAURI_INTERNALS__`.

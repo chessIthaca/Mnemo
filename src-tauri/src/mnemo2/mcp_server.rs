@@ -43,15 +43,20 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use mnemo::app::plan_board::BoardStatus;
+
+use crate::mnemo2::model_label::short_model_name;
 use crate::mnemo2::project;
 use crate::mnemo2::runtime::LeadRuntime;
 use crate::mnemo2::run_file;
 use crate::mnemo2::team::{
-    MessageSender, TeamRuntime, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
+    MessageSender, TeamRuntime, WorkerStatus, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
 };
 
 /// Asks the frontend to open a registered project (`{"root": String}`).
 pub const EXTERNAL_OPEN_REQUEST_CHANNEL: &str = "mnemo2://external-open-request";
+/// The backend asks the frontend to open this worker in mission control.
+pub const OPEN_WORKER_CHANNEL: &str = "mnemo2://open-worker";
 
 /// Reports an external lead attaching or detaching
 /// (`{"attached": bool, "root": String|null}`).
@@ -120,6 +125,8 @@ pub trait LeadHost: Send + Sync + 'static {
     fn lead_changed(&self, attached: bool, root: Option<&Path>);
     /// Bring the Mnemo2 window to the front.
     fn show_window(&self);
+    /// Ask the frontend to open a worker in mission control.
+    fn open_worker(&self, root: &Path, worker_id: &str);
     /// Why the UI could not open the project at `root` after the last
     /// request, if it reported a failure.
     fn open_failure(&self, _root: &Path) -> Option<OpenFailure> {
@@ -560,6 +567,30 @@ fn canonical(path: &Path) -> PathBuf {
     project::canonical_root(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Whether this worker has active work in progress.
+fn is_running(status: WorkerStatus) -> bool {
+    matches!(
+        status,
+        WorkerStatus::Dispatching
+            | WorkerStatus::Working
+            | WorkerStatus::Fixing
+            | WorkerStatus::Merging
+    )
+}
+
+/// Whether this worker is blocked on the person's review or intervention.
+fn waiting_on_user(status: WorkerStatus) -> bool {
+    matches!(
+        status,
+        WorkerStatus::Completed
+            | WorkerStatus::InReview
+            | WorkerStatus::NeedsYou
+            | WorkerStatus::Failed
+            | WorkerStatus::Conflict
+            | WorkerStatus::Interrupted
+    )
+}
+
 impl Shared {
     /// The bearer-token check, run on the request head before the body is
     /// read.
@@ -586,6 +617,7 @@ impl Shared {
             "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach" => {
                 self.lead_route(request).await
             }
+            "/lead/summary" | "/lead/show-worker" => self.lead_route(request).await,
             "/lead/open" => self.lead_open(request).await,
             _ => Response::error(404, "unknown route"),
         }
@@ -681,8 +713,93 @@ impl Shared {
             "/lead/notices" => self.notices(target, body).await,
             "/lead/wait" => self.wait(target, body).await,
             "/lead/gate-agent" => Response::json(200, &self.gate_agent(target, body).await),
+            "/lead/summary" => self.summary(target).await,
+            "/lead/show-worker" => self.show_worker(target, body).await,
             _ => Response::json(200, &self.detach(target).await),
         }
+    }
+
+    /// A read-only worker summary for external surfaces. This neither attaches
+    /// the external lead nor reads (and therefore never drains) its notices.
+    async fn summary(&self, target: Option<Target>) -> Response {
+        let Some(target) = target else {
+            return Response::json(200, &json!({}));
+        };
+        let team = target.team;
+        let snapshot = team.snapshot().await;
+        let open_plans = team
+            .board_snapshot()
+            .await
+            .map(|board| {
+                board
+                    .plans
+                    .iter()
+                    .filter(|plan| plan.status == BoardStatus::Open)
+                    .count()
+            })
+            .unwrap_or(0);
+        let running = snapshot
+            .workers
+            .iter()
+            .filter(|worker| is_running(worker.status))
+            .count();
+        let waiting = snapshot
+            .workers
+            .iter()
+            .filter(|worker| waiting_on_user(worker.status))
+            .count();
+        let workers: Vec<Value> = snapshot
+            .workers
+            .iter()
+            .map(|worker| {
+                let model = worker
+                    .model
+                    .clone()
+                    .or_else(|| worker.model_id.clone())
+                    .unwrap_or_default();
+                let model_short = short_model_name(&model);
+                json!({
+                    "id": worker.id,
+                    "name": worker.name,
+                    "model": model,
+                    "model_short": model_short,
+                    "tier": worker.tier,
+                    "status": worker.status,
+                    "needs_you": waiting_on_user(worker.status),
+                    "elapsed_ms": worker.elapsed_ms,
+                })
+            })
+            .collect();
+        Response::json(
+            200,
+            &json!({
+                "workers": workers,
+                "open_plans": open_plans,
+                "running": running,
+                "waiting": waiting,
+            }),
+        )
+    }
+
+    /// Show a known worker without changing leadership or consuming notices.
+    async fn show_worker(&self, target: Option<Target>, body: Value) -> Response {
+        let Some(target) = target else {
+            return Response::error(404, "the project is not open in Mnemo2");
+        };
+        let worker_id = body
+            .get("worker_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if worker_id.is_empty() {
+            return Response::error(400, "missing \"worker_id\"");
+        }
+        if let Err(error) = target.team.worker(worker_id).await {
+            return Response::error(404, &error);
+        }
+        self.host.show_window();
+        self.host.open_worker(&target.root, worker_id);
+        Response::json(200, &json!({ "shown": true }))
     }
 
     /// The hooks' view of the board. Never attaches an external lead: reading
@@ -1175,6 +1292,13 @@ impl LeadHost for AppLeadHost {
     fn show_window(&self) {
         show_main_window(&self.app);
     }
+
+    fn open_worker(&self, root: &Path, worker_id: &str) {
+        let _ = self.app.emit(
+            OPEN_WORKER_CHANNEL,
+            json!({ "root": root.to_string_lossy(), "worker_id": worker_id }),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1236,6 +1360,7 @@ mod tests {
         lead: Mutex<Option<Arc<LeadRuntime>>>,
         pending: Mutex<Option<Arc<LeadRuntime>>>,
         open_requests: Mutex<Vec<PathBuf>>,
+        opened_workers: Mutex<Vec<(PathBuf, String)>>,
         changes: Mutex<Vec<(bool, Option<PathBuf>)>>,
         shown: AtomicUsize,
         /// A reported open failure: the canonical root and what was reported.
@@ -1271,6 +1396,13 @@ mod tests {
 
         fn show_window(&self) {
             self.shown.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn open_worker(&self, root: &Path, worker_id: &str) {
+            self.opened_workers
+                .lock()
+                .expect("opened workers")
+                .push((root.to_path_buf(), worker_id.to_string()));
         }
 
         fn open_failure(&self, root: &Path) -> Option<OpenFailure> {
@@ -1787,6 +1919,121 @@ mod tests {
             .await;
         assert_eq!(waited["status"], "timeout");
         assert!(team.external_lead_attached());
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn worker_activity_classification_covers_every_status() {
+        for (status, running, waiting) in [
+            (WorkerStatus::Dispatching, true, false),
+            (WorkerStatus::Working, true, false),
+            (WorkerStatus::NeedsYou, false, true),
+            (WorkerStatus::Idle, false, false),
+            (WorkerStatus::Paused, false, false),
+            (WorkerStatus::Interrupted, false, true),
+            (WorkerStatus::Completed, false, true),
+            (WorkerStatus::Stopped, false, false),
+            (WorkerStatus::Failed, false, true),
+            (WorkerStatus::InReview, false, true),
+            (WorkerStatus::Fixing, true, false),
+            (WorkerStatus::Merging, true, false),
+            (WorkerStatus::Merged, false, false),
+            (WorkerStatus::Conflict, false, true),
+            (WorkerStatus::Cancelled, false, false),
+        ] {
+            assert_eq!(is_running(status), running, "running: {status:?}");
+            assert_eq!(waiting_on_user(status), waiting, "waiting: {status:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_and_show_worker_are_read_only_and_open_the_worker() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let worker = team
+            .dispatch_with_id(
+                "Exercise the external worker summary".into(),
+                Some("test/scripted-a".into()),
+                Some("summary001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch");
+        let root = fixture.root.to_string_lossy().into_owned();
+        let request = || json!({ "root": root, "worker_id": worker.id });
+
+        let summary = fixture.lead_post("/lead/summary", request()).await;
+        let entry = summary["workers"]
+            .as_array()
+            .expect("workers")
+            .iter()
+            .find(|entry| entry["id"] == worker.id)
+            .expect("dispatched worker");
+        assert_eq!(entry["model_short"], "scripted");
+        assert_eq!(entry["model"], "test/scripted-a");
+        assert!(entry["elapsed_ms"].is_number());
+        assert!(entry["needs_you"].is_boolean());
+        assert_eq!(summary["open_plans"], 0);
+        assert!(summary["running"].is_number());
+        assert!(summary["waiting"].is_number());
+        assert!(!team.external_lead_attached(), "summary must not attach");
+
+        let shown = fixture.lead_post("/lead/show-worker", request()).await;
+        assert_eq!(shown, json!({ "shown": true }));
+        assert!(
+            !team.external_lead_attached(),
+            "show-worker must not attach"
+        );
+        assert_eq!(OPEN_WORKER_CHANNEL, "mnemo2://open-worker");
+        assert_eq!(fixture.host.shown.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .host
+                .opened_workers
+                .lock()
+                .expect("opened workers")
+                .as_slice(),
+            [(fixture.root.clone(), worker.id.clone())]
+        );
+
+        fixture.attach().await;
+        assert!(team.push_external_notice("keep this notice".into()));
+        fixture.lead_post("/lead/summary", request()).await;
+        fixture.lead_post("/lead/show-worker", request()).await;
+        assert_eq!(fixture.host.changes(), vec![true], "no new attachment");
+        let notices = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "peek" }))
+            .await;
+        assert!(
+            notices["notices"]
+                .as_array()
+                .expect("notices")
+                .contains(&json!("keep this notice")),
+            "neither read-only route may drain the queue: {notices}"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn show_worker_rejects_an_unknown_worker_without_showing_the_window() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let body = json!({
+            "root": fixture.root.to_string_lossy(),
+            "worker_id": "missing001"
+        });
+        let (status, reply) = fixture
+            .post("/lead/show-worker", Some("tok-123"), &[], &body.to_string())
+            .await;
+        assert_eq!(status, 404, "{reply}");
+        assert!(reply.contains("unknown worker"), "{reply}");
+        assert_eq!(fixture.host.shown.load(Ordering::SeqCst), 0);
+        assert!(fixture
+            .host
+            .opened_workers
+            .lock()
+            .expect("opened workers")
+            .is_empty());
+        assert!(!fixture.team().await.external_lead_attached());
         fixture.shutdown().await;
     }
 

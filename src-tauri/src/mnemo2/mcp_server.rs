@@ -47,7 +47,7 @@ use crate::mnemo2::project;
 use crate::mnemo2::runtime::LeadRuntime;
 use crate::mnemo2::run_file;
 use crate::mnemo2::team::{
-    TeamRuntime, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
+    MessageSender, TeamRuntime, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
 };
 
 /// Asks the frontend to open a registered project (`{"root": String}`).
@@ -935,7 +935,10 @@ impl Shared {
             .iter()
             .any(|spec| spec.name == name)
         {
-            target.team.handle_lead_host_tool(name, args).await
+            target
+                .team
+                .handle_lead_host_tool_from(name, args, MessageSender::ExternalLead)
+                .await
         } else {
             return Err((CODE_INVALID_PARAMS, format!("unknown tool '{name}'")));
         };
@@ -2338,6 +2341,55 @@ Since your last call:
                 .is_some_and(|text| text.contains("extlead001")),
             "{status}"
         );
+
+        let (_, message) = fixture
+            .rpc(json!({
+                "jsonrpc": "2.0", "id": 14, "method": "tools/call",
+                "params": { "name": "team_message", "arguments": {
+                    "worker_id": "extlead001", "text": "continue from Claude Code"
+                } }
+            }))
+            .await;
+        assert_eq!(message["result"]["isError"], false, "{message}");
+        let worker = fixture
+            .team()
+            .await
+            .worker("extlead001")
+            .await
+            .expect("messaged worker");
+        let entry = worker.inbox.last().expect("external lead inbox entry");
+        assert_eq!(entry.sender, MessageSender::ExternalLead);
+        assert_eq!(entry.kind, crate::mnemo2::team::InboxKind::Prompt);
+        assert_eq!(entry.text, "continue from Claude Code");
+        let delivered = "[From the lead (Claude Code)]\ncontinue from Claude Code";
+        for _ in 0..100 {
+            let worker = fixture
+                .team()
+                .await
+                .worker("extlead001")
+                .await
+                .expect("worker transcript");
+            if worker
+                .transcript
+                .messages
+                .iter()
+                .any(|message| message.content.as_text() == delivered)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let worker = fixture
+            .team()
+            .await
+            .worker("extlead001")
+            .await
+            .expect("final worker transcript");
+        assert!(worker
+            .transcript
+            .messages
+            .iter()
+            .any(|message| message.content.as_text() == delivered));
 
         let worker = team.worker("extlead001").await.expect("dispatched worker");
         std::fs::create_dir_all(worker.worktree.join("src")).expect("worker src");

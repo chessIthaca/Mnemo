@@ -31,7 +31,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::mnemo2::ledger::LeadTeamLedger;
-use crate::mnemo2::team::{BoardSignal, TeamRuntime, TeamRuntimeOptions};
+use crate::mnemo2::team::{BoardSignal, MessageSender, TeamRuntime, TeamRuntimeOptions};
 use crate::mnemo2::usage::event_session;
 
 /// The Tauri event channel name used by the IPC layer.
@@ -1413,7 +1413,10 @@ async fn pump_events(
         } = &event.event
         {
             let result = match &team {
-                Some(team) => team.handle_lead_host_tool(name, args.clone()).await,
+                Some(team) => {
+                    team.handle_lead_host_tool_from(name, args.clone(), MessageSender::Lead)
+                        .await
+                }
                 None => ToolResult::error("the team runtime is not available"),
             };
             send_lead_host_result(&engine, session_id, call_id.clone(), result).await;
@@ -3350,7 +3353,11 @@ mod tests {
         );
 
         // A second worker turn accumulates on the same model row.
-        team.message(&worker.id, "second usage turn".into())
+        team.message(
+        &worker.id,
+        "second usage turn".into(),
+        MessageSender::User,
+    )
             .await
             .expect("second turn");
         let worker = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
@@ -3403,7 +3410,7 @@ mod tests {
         // recovered session or the reloaded ledger.
         reopened_team.resume(&worker.id).await.expect("resume worker");
         reopened_team
-            .message(&worker.id, "resume usage turn".into())
+            .message(&worker.id, "resume usage turn".into(), MessageSender::User)
             .await
             .expect("post-restart worker turn");
         wait_for_worker_status(&reopened_team, &worker.id, WorkerStatus::Completed).await;
@@ -4014,7 +4021,9 @@ mod tests {
     #[tokio::test]
     async fn larger_findings_route_to_the_tracked_worker_for_delta_review() {
         use crate::mnemo2::phase3::Finding;
-        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+        use crate::mnemo2::team::{
+            InboxKind, MessageSender, TeamRuntime, TeamRuntimeOptions, WorkerStatus,
+        };
 
         let root = tempfile::tempdir().expect("workspace");
         let config = tempfile::tempdir().expect("config");
@@ -4078,6 +4087,11 @@ mod tests {
         assert_eq!(routed.fixer_finding_id.as_deref(), Some("F-large"));
         assert!(routed.review.is_none());
         assert!(routed.checks.is_empty());
+        assert_eq!(routed.inbox.len(), 1);
+        assert_eq!(routed.inbox[0].sender, MessageSender::Mnemo);
+        assert_eq!(routed.inbox[0].kind, InboxKind::Fix);
+        assert!(routed.inbox[0].text.starts_with("Fix review finding F-large:"));
+        assert!(routed.inbox[0].at_ms > 0);
         for _ in 0..100 {
             if llm.calls() >= 2
                 && team.worker(&worker.id).await.expect("worker").status == WorkerStatus::Completed
@@ -4087,6 +4101,21 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(llm.calls(), 2, "the tracked worker received the fix brief");
+        let mut header_in_transcript = false;
+        for _ in 0..100 {
+            let fixed = team.worker(&worker.id).await.expect("fixed worker");
+            header_in_transcript = fixed.transcript.messages.iter().any(|message| {
+                message
+                    .content
+                    .as_text()
+                    .starts_with("[From Mnemo2]\nFix review finding F-large:")
+            });
+            if header_in_transcript {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(header_in_transcript, "the Mnemo2 header reaches the transcript");
         std::fs::write(worker.worktree.join("src/lib.rs"), "pub fn new() {}\n")
             .expect("fixed source");
         run_git(&worker.worktree, &["add", "src/lib.rs"]);
@@ -4133,6 +4162,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_inbox_persists_senders_before_a_busy_turn_ends() {
+        use crate::mnemo2::team::{InboxKind, MessageSender, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["scripted-a"],
+            vec![
+                (Some(gate_rx), text_turn(&["initial"])),
+                (None, text_turn(&["after all three steers"])),
+            ],
+        ));
+        let (lead, team) = open_git_team(&root, &config, &state, llm.clone()).await;
+        let worker = team
+            .dispatch("wait for the sender test".into(), None)
+            .await
+            .expect("dispatch worker");
+        wait_for_calls(&llm, 1).await;
+
+        let built_in = team
+            .handle_lead_host_tool_from(
+                "team_message",
+                serde_json::json!({"worker_id": worker.id, "text": "lead guidance"}),
+                MessageSender::Lead,
+            )
+            .await;
+        assert!(built_in.success, "{}", built_in.output);
+        team.message(&worker.id, "user guidance".into(), MessageSender::User)
+            .await
+            .expect("user message");
+        team.message(
+            &worker.id,
+            "external guidance".into(),
+            MessageSender::ExternalLead,
+        )
+        .await
+        .expect("external lead message");
+
+        let expected = [
+            (
+                MessageSender::Lead,
+                "lead",
+                "lead guidance",
+                "[From the built-in lead]",
+            ),
+            (
+                MessageSender::User,
+                "user",
+                "user guidance",
+                "[From the user in mission control]",
+            ),
+            (
+                MessageSender::ExternalLead,
+                "external_lead",
+                "external guidance",
+                "[From the lead (Claude Code)]",
+            ),
+        ];
+        let working = team.worker(&worker.id).await.expect("working worker");
+        assert_eq!(working.status, WorkerStatus::Working);
+        assert_eq!(working.inbox.len(), expected.len());
+        for (index, (sender, _label, text, _header)) in expected.iter().enumerate() {
+            assert_eq!(working.inbox[index].sender, *sender);
+            assert_eq!(working.inbox[index].kind, InboxKind::Steer);
+            assert_eq!(working.inbox[index].text, *text);
+            assert!(working.inbox[index].at_ms > 0);
+        }
+
+        // The first provider call is still gated, so this is the durable ledger
+        // before the worker's turn ended or its transcript snapshot was copied.
+        let ledger: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state.path().join("team.json")).expect("team ledger"),
+        )
+        .expect("ledger JSON");
+        let saved = ledger["workers"][0]["inbox"]
+            .as_array()
+            .expect("persisted inbox");
+        assert_eq!(saved.len(), expected.len());
+        for (index, (_sender, label, text, _header)) in expected.iter().enumerate() {
+            assert_eq!(saved[index]["sender"], *label);
+            assert_eq!(saved[index]["kind"], "steer");
+            assert_eq!(saved[index]["text"], *text);
+        }
+        assert_eq!(llm.calls(), 1, "the initial turn remains gated");
+
+        gate_tx.send(()).expect("release the initial turn");
+        wait_for_calls(&llm, 2).await;
+        // The first turn can publish Completed before its accumulated steers
+        // finish their follow-up turn, so wait for the actual transcript.
+        for _ in 0..100 {
+            let record = team.worker(&worker.id).await.expect("worker transcript");
+            let all_delivered = expected.iter().all(|(_sender, _label, text, header)| {
+                let delivered = format!("{header}\n{text}");
+                record
+                    .transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content.as_text() == delivered)
+            });
+            if all_delivered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let completed = team.worker(&worker.id).await.expect("completed transcript");
+        for (_sender, _label, text, header) in expected {
+            let delivered = format!("{header}\n{text}");
+            assert!(
+                completed
+                    .transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content.as_text() == delivered),
+                "the worker transcript contains {delivered:?}"
+            );
+        }
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn merge_requires_an_idle_worker() {
         let root = tempfile::tempdir().expect("workspace");
         let config = tempfile::tempdir().expect("config");
@@ -4151,7 +4304,7 @@ mod tests {
             .await
             .expect("check");
         team.resume(&worker.id).await.expect("resume");
-        team.message(&worker.id, "continue working".into())
+        team.message(&worker.id, "continue working".into(), MessageSender::User)
             .await
             .expect("new turn");
 
@@ -4761,7 +4914,11 @@ mod tests {
         let first = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
         assert_eq!(first.total_tokens, 200_000);
         assert_eq!(first.cost_micros, Some(440_000));
-        team.message(&worker.id, "second usage turn".into())
+        team.message(
+        &worker.id,
+        "second usage turn".into(),
+        MessageSender::User,
+    )
             .await
             .expect("second turn");
         let continued = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
@@ -4773,7 +4930,11 @@ mod tests {
         assert_eq!(continued.cost_micros, Some(750_000));
         assert!(continued.error.is_none());
 
-        team.message(&worker.id, "continue without a budget".into())
+        team.message(
+            &worker.id,
+            "continue without a budget".into(),
+            MessageSender::User,
+        )
             .await
             .expect("usage never blocks continuation");
         wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
@@ -5898,13 +6059,9 @@ mod tests {
             "the worker's own handler answers message_parent: {:?}",
             result.content.as_text()
         );
-        assert!(
-            result
-                .content
-                .as_text()
-                .contains("message sent to the lead"),
-            "{:?}",
-            result.content.as_text()
+        assert_eq!(
+            result.content.as_text(),
+            "message sent to the lead. A reply, if any, arrives later as a new message that starts with a [From …] header; do not assume or invent a reply — continue your task or end your turn."
         );
         let mut forwarded = Vec::new();
         while let Ok(event) = lead_events.try_recv() {

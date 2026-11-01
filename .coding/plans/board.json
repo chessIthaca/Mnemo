@@ -138,10 +138,10 @@
     },
     {
       "id": "fceee53e",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793520681429,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793525950493,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-fceee53e-20261101-093910.md",
       "abandon_reason": null
     },
     {

@@ -160,6 +160,18 @@
     </div>
 
     <section class="worker-brief" aria-label="Worker brief">
+      {#if briefOverflowing}
+        <div class="brief-controls">
+          <button
+            class="brief-toggle"
+            type="button"
+            aria-controls={`worker-${worker.id}-brief`}
+            aria-expanded={briefExpanded}
+            aria-label={briefExpanded ? "Show less brief" : "Show more brief"}
+            onclick={() => { briefExpanded = !briefExpanded; }}
+          >{briefExpanded ? "Show less" : "Show more"}<span class="sr-only"> brief</span></button>
+        </div>
+      {/if}
       <div
         id={`worker-${worker.id}-brief`}
         class="brief-content"
@@ -170,16 +182,6 @@
       >
         <Markdown source={worker.task} onOpenLink={actions.openBrowser} />
       </div>
-      {#if briefOverflowing}
-        <button
-          class="brief-toggle"
-          type="button"
-          aria-controls={`worker-${worker.id}-brief`}
-          aria-expanded={briefExpanded}
-          aria-label={briefExpanded ? "Show less brief" : "Show more brief"}
-          onclick={() => { briefExpanded = !briefExpanded; }}
-        >{briefExpanded ? "Show less" : "Show more"}<span class="sr-only"> brief</span></button>
-      {/if}
     </section>
 
     <div class="worker-meta">
@@ -300,6 +302,7 @@
   .toolbar-button:disabled { opacity: 0.4; cursor: not-allowed; }
   .toolbar-button.danger { color: var(--danger); }
   .worker-brief { min-width: 0; margin-top: 6px; }
+  .brief-controls { display: flex; min-height: 12px; justify-content: flex-end; margin-bottom: 2px; }
   .brief-content { position: relative; overflow: hidden; }
   .brief-content.clamped::after { position: absolute; right: 0; bottom: 0; left: 0; height: 18px; background: linear-gradient(transparent, var(--canvas)); content: ""; pointer-events: none; }
   .worker-brief :global(.markdown) { font-size: 11px; line-height: 1.4; }
@@ -309,7 +312,7 @@
   .worker-brief .brief-content :global(.markdown) :global(h3) { margin: 0 0 5px; font-size: 11px; line-height: 1.4; }
   .worker-brief .brief-content :global(.markdown) :global(ul),
   .worker-brief .brief-content :global(.markdown) :global(ol) { margin-bottom: 5px; }
-  .brief-toggle { margin-top: 2px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 9px; font-weight: 650; line-height: 12px; }
+  .brief-toggle { padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 9px; font-weight: 650; line-height: 12px; }
   .brief-toggle:hover { text-decoration: underline; text-underline-offset: 2px; }
   .worker-meta { display: flex; min-height: 20px; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; }
   .audit-scope { margin: 0; overflow: hidden; color: var(--muted); font-size: 8px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }

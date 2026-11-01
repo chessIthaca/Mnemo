@@ -68,6 +68,22 @@ describe("WorkerDetail brief", () => {
     expect(brief.style.overflowY).toBe("auto");
   });
 
+  it("keeps the toggle in the same control row while the brief expands", async () => {
+    render(WorkerDetail, { worker: worker(), measureBriefOverflow: () => true });
+    const toggle = await screen.findByRole("button", { name: "Show more brief" });
+    const brief = document.getElementById(toggle.getAttribute("aria-controls")!);
+    const controlRow = toggle.parentElement;
+
+    expect(controlRow?.classList.contains("brief-controls")).toBe(true);
+    expect(controlRow?.nextElementSibling).toBe(brief);
+    await fireEvent.click(toggle);
+
+    const collapse = screen.getByRole("button", { name: "Show less brief" });
+    expect(collapse).toBe(toggle);
+    expect(collapse.parentElement).toBe(controlRow);
+    expect(controlRow?.nextElementSibling).toBe(brief);
+  });
+
   it("offers no toggle when the brief fits", async () => {
     const measure = vi.fn(() => false);
     render(WorkerDetail, {

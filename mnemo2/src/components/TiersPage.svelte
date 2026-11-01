@@ -118,23 +118,23 @@
 <style>
   .tiers-page { display: flex; min-height: 0; flex: 1; flex-direction: column; }
   .tiers-scroll { display: grid; flex: 1; align-content: start; gap: 18px; padding: 18px 24px; overflow-y: auto; }
-  .tiers-help { margin: 0; color: var(--muted); font-family: var(--font-prose); font-size: 13px; line-height: 1.55; }
+  .tiers-help { margin: 0; color: var(--muted); font-family: var(--font-prose); font-size: var(--text-md); line-height: 1.55; }
   .tier header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
-  .tier h3 { margin: 0; font-size: 11px; font-weight: 650; }
-  .tier header p { margin: 2px 0 0; color: var(--muted); font-size: 9px; }
-  .tier select { width: 260px; max-width: 100%; padding: 5px 7px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font-size: 10px; }
+  .tier h3 { margin: 0; font-size: var(--text-sm); font-weight: 650; }
+  .tier header p { margin: 2px 0 0; color: var(--muted); font-size: var(--text-xs); }
+  .tier select { width: 260px; max-width: 100%; padding: 5px 7px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font-size: var(--text-sm); }
   .tier ol { margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; list-style: none; }
   .tier li { display: grid; align-items: center; grid-template-columns: minmax(0, 1fr) 54px 110px auto; gap: 8px; padding: 6px 8px 6px 12px; }
   .tier li + li { border-top: 1px solid var(--line); }
-  .spec { overflow: hidden; font-family: var(--font-mono); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-  .default em { padding: 2px 6px; border-radius: 6px; background: var(--accent-soft); color: var(--accent-strong); font-size: 8px; font-style: normal; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
-  .price { color: var(--ink-soft); font-size: 10px; font-variant-numeric: tabular-nums; text-align: right; }
+  .spec { overflow: hidden; font-family: var(--font-mono); font-size: var(--text-sm); text-overflow: ellipsis; white-space: nowrap; }
+  .default em { padding: 2px 6px; border-radius: 6px; background: var(--accent-soft); color: var(--accent-strong); font-size: var(--text-2xs); font-style: normal; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
+  .price { color: var(--ink-soft); font-size: var(--text-sm); font-variant-numeric: tabular-nums; text-align: right; }
   .row-actions { display: flex; gap: 3px; }
   .row-actions .icon-button { width: 24px; height: 24px; border-radius: 7px; }
   .row-actions .icon-button:disabled { opacity: 0.35; cursor: default; }
-  .tier-empty { margin: 0; padding: 12px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--muted); font-size: 10px; }
+  .tier-empty { margin: 0; padding: 12px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--muted); font-size: var(--text-sm); }
   .settings-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 24px; border-top: 1px solid var(--line); background: var(--surface); }
   .settings-footer div { display: flex; gap: 8px; }
-  .footer-note { color: var(--muted); font-size: 10px; }
-  .footer-error { margin: 0; color: var(--danger); font-size: 10px; overflow-wrap: anywhere; }
+  .footer-note { color: var(--muted); font-size: var(--text-sm); }
+  .footer-error { margin: 0; color: var(--danger); font-size: var(--text-sm); overflow-wrap: anywhere; }
 </style>

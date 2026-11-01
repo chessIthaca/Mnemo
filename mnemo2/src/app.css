@@ -1,5 +1,6 @@
 :root {
   font-family: var(--font-ui);
+  font-size: var(--text-sm);
   color: var(--ink);
   background: var(--canvas);
   font-synthesis: none;
@@ -8,6 +9,12 @@
   --font-ui: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
   --font-prose: "Source Serif 4 Variable", "Source Serif 4", Georgia, serif;
   --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --text-2xs: 8px;
+  --text-xs: 9px;
+  --text-sm: 11px;
+  --text-md: 13px;
+  --text-lg: 16px;
+  --text-xl: 26px;
   --canvas: #f7f7f4;
   --surface: #ffffff;
   --surface-soft: #f0f1eb;
@@ -54,7 +61,7 @@ select:focus-visible {
   border: 1px solid transparent;
   border-radius: 9px;
   cursor: pointer;
-  font-size: 10px;
+  font-size: var(--text-sm);
   font-weight: 620;
   text-decoration: none;
 }

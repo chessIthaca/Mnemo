@@ -125,12 +125,12 @@
 </section>
 
 <style>
-  .thread-message > span { color: var(--muted); font-size: 7px; letter-spacing: 0.07em; }
+  .thread-message > span { color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.07em; }
   .thread-message-body { margin: 5px 0 0; padding: 10px 12px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--ink-soft); }
-  .thread-message-body :global(.markdown) { font-size: 11px; line-height: 1.5; }
+  .thread-message-body :global(.markdown) { font-size: var(--text-sm); line-height: 1.5; }
   .thread-message-body :global(p) { margin-bottom: 8px; }
-  .thread-message-body :global(.markdown h1), .thread-message-body :global(.markdown h2), .thread-message-body :global(.markdown h3) { font-size: 12.5px; }
-  .thread-message-body :global(.markdown h4), .thread-message-body :global(.markdown h5), .thread-message-body :global(.markdown h6) { font-size: 11.5px; }
+  .thread-message-body :global(.markdown h1), .thread-message-body :global(.markdown h2), .thread-message-body :global(.markdown h3) { font-size: var(--text-md); }
+  .thread-message-body :global(.markdown h4), .thread-message-body :global(.markdown h5), .thread-message-body :global(.markdown h6) { font-size: var(--text-sm); }
   .thread-message.from-lead { margin-left: auto; }
   .thread-message.from-lead > span { display: block; text-align: right; }
   .thread-message.from-lead .thread-message-body { border-radius: 12px 12px 4px 12px; background: var(--accent-soft); }
@@ -138,10 +138,10 @@
   .thread-message + .thread-message, .thread-tool + .thread-message { margin-top: 12px; }
   .thread-tool { min-width: 0; margin: 4px 0; }
   .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
-  .screenshot-links > span { color: var(--muted); font-size: 8px; letter-spacing: 0.08em; }
+  .screenshot-links > span { color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.08em; }
   .screenshot-links > div { display: flex; flex-wrap: wrap; gap: 6px; }
   .thread-composer { display: flex; align-items: flex-end; gap: 8px; margin-top: 16px; padding: 9px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); }
-  .thread-composer textarea { flex: 1; resize: none; border: 0; outline: 0; color: var(--ink); font-size: 10px; }
+  .thread-composer textarea { flex: 1; resize: none; border: 0; outline: 0; color: var(--ink); font-size: var(--text-sm); }
 
   /* Compact: the panel body scrolls the messages alone so the reply box stays put. */
   .compact { display: flex; flex-direction: column; height: 100%; min-height: 0; }

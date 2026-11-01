@@ -60,7 +60,7 @@
     -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent);
     mask-image: linear-gradient(to bottom, #000 60%, transparent);
   }
-  .collapsible-toggle { display: inline-flex; align-items: center; gap: 3px; margin-top: 3px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); font-size: 9px; font-weight: 600; cursor: pointer; }
+  .collapsible-toggle { display: inline-flex; align-items: center; gap: 3px; margin-top: 3px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-xs); font-weight: 600; cursor: pointer; }
   .collapsible-toggle :global(svg) { transition: transform 120ms ease; }
   .collapsible-toggle.expanded :global(svg) { transform: rotate(180deg); }
 </style>

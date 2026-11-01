@@ -42,16 +42,16 @@
   .peek-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgb(38 40 34 / 5%); pointer-events: auto; }
   .team-peek { position: absolute; top: 10px; right: 12px; bottom: 12px; display: flex; width: min(380px, calc(100vw - 24px)); flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); pointer-events: auto; }
   header { display: flex; align-items: center; justify-content: space-between; padding: 18px; }
-  header p { margin: 0 0 3px; color: var(--muted); font-size: 7px; letter-spacing: 0.12em; }
-  header h2 { margin: 0; font-family: var(--font-prose); font-size: 27px; font-weight: 500; }
-  .peek-budget { margin: 0 18px 12px; padding: 12px; border-radius: 10px; background: var(--surface-soft); color: var(--muted); font-size: 9px; }
+  header p { margin: 0 0 3px; color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.12em; }
+  header h2 { margin: 0; font-family: var(--font-prose); font-size: var(--text-xl); font-weight: 500; }
+  .peek-budget { margin: 0 18px 12px; padding: 12px; border-radius: 10px; background: var(--surface-soft); color: var(--muted); font-size: var(--text-xs); }
   .peek-budget > strong { float: right; color: var(--ink-soft); font-weight: 550; }
   .peek-budget small { color: var(--muted); font-weight: 400; }
   .peek-scroll { flex: 1; overflow-y: auto; padding: 0 10px 10px; }
   section { margin-top: 12px; }
-  section h3 { display: flex; justify-content: space-between; margin: 0 8px 5px; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; }
+  section h3 { display: flex; justify-content: space-between; margin: 0 8px 5px; color: var(--muted); font-size: var(--text-2xs); font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; }
   section h3 span { font-weight: 500; }
-  footer { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 9px; }
-  footer button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 10px; font-weight: 650; }
+  footer { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: var(--text-xs); }
+  footer button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: var(--text-sm); font-weight: 650; }
   @media (max-width: 720px) { .peek-layer { inset: 64px 0 0; } .team-peek { inset: 0; width: 100%; border-radius: 0; } footer { margin-bottom: 58px; } }
 </style>

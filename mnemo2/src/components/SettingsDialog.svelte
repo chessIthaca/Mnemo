@@ -78,11 +78,11 @@
 <style>
   .settings-shell { display: grid; min-height: 0; flex: 1; grid-template-columns: 140px minmax(0, 1fr); }
   .settings-rail { display: flex; flex-direction: column; gap: 2px; padding: 12px 10px; border-right: 1px solid var(--line); background: var(--canvas); }
-  .settings-rail button { padding: 7px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 600; text-align: left; }
+  .settings-rail button { padding: 7px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-sm); font-weight: 600; text-align: left; }
   .settings-rail button:hover { color: var(--ink); }
   .settings-rail button.active { background: var(--surface); box-shadow: 0 1px 3px rgb(35 38 30 / 8%); color: var(--ink); }
   .settings-page { display: flex; min-width: 0; min-height: 0; flex-direction: column; }
-  .settings-empty { margin: 0; padding: 28px 24px; color: var(--muted); font-family: var(--font-prose); font-size: 14px; }
-  .settings-error { margin: 0; padding: 20px 24px; color: var(--danger); font-size: 11px; }
+  .settings-empty { margin: 0; padding: 28px 24px; color: var(--muted); font-family: var(--font-prose); font-size: var(--text-md); }
+  .settings-error { margin: 0; padding: 20px 24px; color: var(--danger); font-size: var(--text-sm); }
   @media (max-width: 640px) { .settings-shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } .settings-rail { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--line); } }
 </style>

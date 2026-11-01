@@ -7726,6 +7726,121 @@ mod tests {
         lead.shutdown().await;
     }
 
+    /// The deletion preview names the merged worker that landed a stopped
+    /// record's plan step. Git cannot prove that the record's commit and a
+    /// replay worker's merged commit carry the same work, but the ledger
+    /// knows another implementation worker on the same plan step was merged.
+    /// The commit count stays honest — the commit really is missing from the
+    /// lead branch — and a record on a different step is never superseded.
+    #[tokio::test]
+    async fn deletion_preview_names_the_worker_that_landed_the_step() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        // One branch per stopped record, each with one commit the lead
+        // branch does not have — a step another worker re-applied by hand.
+        let branch_with_commit = |id: &str, file: &str| {
+            let branch = mnemo::app::worktrees::agent_branch(id);
+            run_git(root.path(), &["checkout", "-b", &branch]);
+            std::fs::write(root.path().join(file), "worker work\n").expect("worker file");
+            run_git(root.path(), &["add", "--", file]);
+            run_git(root.path(), &["commit", "-m", "worker work"]);
+            run_git(root.path(), &["checkout", "wt/lead"]);
+            branch
+        };
+        let superseded_branch = branch_with_commit("ledgerab0001", "ledger.txt");
+        let other_branch = branch_with_commit("summaryab001", "summary.txt");
+        // The merged replay worker's retained branch sits at the lead tip:
+        // its step landed through the merge, so nothing of its own is missing.
+        let replay_branch = mnemo::app::worktrees::agent_branch("replayab0001");
+        run_git(root.path(), &["branch", &replay_branch]);
+        let record = |id: &str, name: &str, status: &str, step: usize, branch: &str| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "brief": "step task",
+                "model": null,
+                "model_id": null,
+                "branch": branch,
+                "worktree": root
+                    .path()
+                    .join(".worktrees")
+                    .join(format!("agent-{}", mnemo::app::worktrees::agent_short_id(id))),
+                "status": status,
+                "generation": 1,
+                "transcript": { "messages": [] },
+                "pending": null,
+                "used_tokens": 0,
+                "max_tokens": 0,
+                "checks": [],
+                "error": null,
+                "kind": "implementation",
+                "plan_id": "01762f92",
+                "plan_step": step,
+            })
+        };
+        let mut landed = record("replayab0001", "senderReplay36", "merged", 0, &replay_branch);
+        landed["merge"] = serde_json::json!({
+            "commit": "replaymerge000",
+            "worker_tip": "replaytip00000",
+            "branch": replay_branch,
+            "target": "wt/lead",
+            "checks": [],
+            "review_summary": "the replay landed the step",
+            "merged_at_ms": 1790000000000u64,
+        });
+        std::fs::write(
+            state.path().join("team.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "workers": [
+                    landed,
+                    record("ledgerab0001", "senderLedger34", "stopped", 0, &superseded_branch),
+                    record("summaryab001", "teamSummary35", "stopped", 1, &other_branch),
+                ],
+                "slots": 1,
+            }))
+            .expect("ledger JSON"),
+        )
+        .expect("ledger");
+        let lead = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+        )
+        .await
+        .expect("lead opens");
+        let team = lead.team_handle().await.expect("team");
+
+        let ids = vec![
+            "ledgerab0001".to_string(),
+            "summaryab001".to_string(),
+            "replayab0001".to_string(),
+        ];
+        let preview = team.deletion_preview(&ids).await.expect("preview");
+        // The stopped record names the worker that landed its step...
+        assert_eq!(
+            preview[0].superseded_by.as_deref(),
+            Some("senderReplay36"),
+            "{preview:?}"
+        );
+        // ...while the count stays honest: the commit really is missing.
+        assert_eq!(preview[0].unmerged_commits, 1, "{preview:?}");
+        assert!(preview[0].blocked.is_none(), "{preview:?}");
+        // A different step is never superseded, even with its own missing work.
+        assert_eq!(preview[1].superseded_by, None, "{preview:?}");
+        assert_eq!(preview[1].unmerged_commits, 1, "{preview:?}");
+        // The merged worker itself is not superseded; it landed the step.
+        assert_eq!(preview[2].superseded_by, None, "{preview:?}");
+        // The frontend reads the name and the null exactly as serialized.
+        let value = serde_json::to_value(&preview).expect("serialized preview");
+        assert_eq!(value[0]["superseded_by"], serde_json::json!("senderReplay36"));
+        assert_eq!(value[1]["superseded_by"], serde_json::Value::Null);
+
+        lead.shutdown().await;
+    }
+
     /// Legacy ledgers hold records whose ids share an 8-character prefix and
     /// therefore one branch and checkout (`wt/agent-00000003`). Deleting one
     /// such record must never destroy the other's work.

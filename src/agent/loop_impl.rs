@@ -323,6 +323,9 @@ pub struct AgentLoop {
     /// be set through a `&AgentLoop` reference (mirroring
     /// `plan_mutations_allowed`).
     pub(crate) is_subagent: std::sync::Mutex<bool>,
+    /// Stable root of this agent family, inherited at spawn and unaffected by
+    /// intermediate agents exiting or being removed from the manager.
+    pub(crate) family_root: std::sync::Mutex<Option<crate::runtime::AgentId>>,
     /// Failed-reviewer protocol latch: set by the event forwarder when a
     /// `role: "reviewer"` child of this agent finishes with a final error and
     /// NO report (the review did not happen). While set, `spawn_agent` calls
@@ -1076,6 +1079,7 @@ impl AgentLoop {
             plan_mutations_allowed: std::sync::Mutex::new(true),
             model_resolver: None,
             is_subagent: std::sync::Mutex::new(false),
+            family_root: std::sync::Mutex::new(None),
             reviewer_failure_pending: std::sync::Mutex::new(false),
             reviewer_retry_sanctioned: std::sync::Mutex::new(false),
             fill_rate: 0.5,
@@ -1422,6 +1426,16 @@ impl AgentLoop {
     ) -> Self {
         self.model_resolver = Some(resolver);
         self
+    }
+
+    /// Set the stable family root during shared host spawn.
+    pub fn set_family_root(&self, root: crate::runtime::AgentId) {
+        *self.family_root.lock().expect("family_root lock poisoned") = Some(root);
+    }
+
+    /// The stable family root, if this loop was built through the shared host.
+    pub fn family_root(&self) -> Option<crate::runtime::AgentId> {
+        *self.family_root.lock().expect("family_root lock poisoned")
     }
 
     /// Set whether this agent is a subagent. Used by the IPC spawner

@@ -1361,3 +1361,183 @@ async fn spawn_with_worktree_binds_tools_to_the_worktree_root() {
         "the lead root stays untouched"
     );
 }
+
+struct PendingLlm {
+    caps: Capabilities,
+    started: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl LlmClient for PendingLlm {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+
+    fn model(&self) -> &str {
+        "pending"
+    }
+
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<ToolChoice>,
+    ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+        self.started.notify_one();
+        Ok(Box::pin(futures::stream::pending()))
+    }
+}
+
+#[tokio::test]
+async fn close_and_wait_rejects_a_full_command_queue() {
+    let root = tempfile::tempdir().expect("workspace");
+    let cfg = tempfile::tempdir().expect("config");
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let llm = std::sync::Arc::new(PendingLlm {
+        caps: Capabilities::openai(),
+        started: tokio::sync::Notify::new(),
+    });
+    let engine = Engine::builder(opts)
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("start the pending-provider engine");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    session
+        .send(SessionCommand::Prompt {
+            text: "hold the turn open".into(),
+            images: vec![],
+        })
+        .await
+        .expect("queue the prompt");
+    llm.started.notified().await;
+
+    let mut queue_filled = false;
+    for _ in 0..1024 {
+        if session.send(SessionCommand::Compact).await.is_err() {
+            queue_filled = true;
+            break;
+        }
+    }
+    assert!(queue_filled, "the pending turn leaves its command queue full");
+
+    let error = session
+        .close_and_wait()
+        .await
+        .expect_err("a full queue must not be mistaken for an exited agent");
+    assert!(error.to_string().contains("still live"), "{error}");
+}
+
+#[tokio::test]
+async fn close_and_wait_accepts_an_already_exited_agent() {
+    let (_engine, session, _root, _cfg) = scripted_engine(vec![]).await;
+    session.close().await.expect("queue the first close");
+    for _ in 0..100 {
+        if session.send(SessionCommand::Compact).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    session
+        .close_and_wait()
+        .await
+        .expect("an already-exited agent has released its loop");
+}
+
+struct ConsolidationBlockingLlm {
+    caps: Capabilities,
+    calls: AtomicUsize,
+    consolidation_started: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl LlmClient for ConsolidationBlockingLlm {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+
+    fn model(&self) -> &str {
+        "consolidation-blocking"
+    }
+
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<ToolChoice>,
+    ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(Box::pin(futures::stream::iter([
+                LlmEvent::TextDelta {
+                    text: "served".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ])))
+        } else {
+            self.consolidation_started.notify_one();
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+}
+
+#[tokio::test]
+async fn consolidation_does_not_hold_a_worktree_codegraph_open() {
+    let project = tempfile::tempdir().expect("project");
+    let worktree = tempfile::tempdir().expect("worktree");
+    let cfg = tempfile::tempdir().expect("config");
+    std::fs::create_dir_all(project.path().join(".coding")).expect("project state directory");
+    let mut opts = engine_opts(
+        Workspace::new(project.path()),
+        Some(cfg.path().to_path_buf()),
+    );
+    opts.memory = MemoryBackend::Sqlite { path: None };
+    let llm = std::sync::Arc::new(ConsolidationBlockingLlm {
+        caps: Capabilities::openai(),
+        calls: AtomicUsize::new(0),
+        consolidation_started: tokio::sync::Notify::new(),
+    });
+    let engine = Engine::builder(opts)
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("start the memory-enabled engine");
+    let session = engine
+        .spawn(SpawnOptions {
+            worktree: Some(worktree.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("spawn the worktree session");
+    session
+        .run_to_completion("your summary is too long — keep it to 3 lines")
+        .await
+        .expect("serve the prompt");
+    assert!(worktree.path().join(".coding/codegraph.db").is_file());
+
+    session
+        .close_and_wait()
+        .await
+        .expect("close releases the loop and codegraph");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        llm.consolidation_started.notified(),
+    )
+    .await
+    .expect("consolidation is still running in the background");
+    assert!(llm.calls.load(Ordering::SeqCst) >= 2);
+
+    std::fs::remove_dir_all(worktree.path())
+        .expect("the released codegraph does not pin the worktree on Windows");
+    assert!(!worktree.path().exists());
+}

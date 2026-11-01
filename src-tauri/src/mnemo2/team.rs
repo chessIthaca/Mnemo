@@ -470,11 +470,23 @@ struct LiveWorker {
     session: AgentSession,
     busy: Arc<AtomicBool>,
     pump: JoinHandle<()>,
+    /// A failed close aborted the pump; only cleanup retries may use this handle.
+    cleanup_retry_only: bool,
 }
 
 impl LiveWorker {
     fn abort(&self) {
         self.pump.abort();
+    }
+
+    /// Admit a non-cleanup session command only when the event pump is live.
+    fn admit_session_command(&self, worker_id: &str) -> Result<(), String> {
+        if self.cleanup_retry_only {
+            return Err(format!(
+                "worker '{worker_id}' session cleanup must be retried before sending commands"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -566,6 +578,8 @@ pub struct TeamRuntime {
     generation: Arc<AtomicU64>,
     next_worker: AtomicU64,
     lead_busy: AtomicBool,
+    #[cfg(test)]
+    fail_next_close: AtomicBool,
     lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
@@ -603,6 +617,23 @@ const TIER_PURPOSES: [(&str, &str); 3] = [
 pub const MAX_WORKER_SLOTS: usize = 32;
 
 impl TeamRuntime {
+    async fn close_session_for_cleanup(&self, session: &AgentSession) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_next_close.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected close failure for transition tests".to_string());
+        }
+        session
+            .close_and_wait()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    fn fail_next_close_for_test(&self) {
+        self.fail_next_close
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Open the team ledger, recover interrupted workers, and prepare to spawn.
     pub async fn open(options: TeamRuntimeOptions) -> Result<Self, String> {
         let persistence = TeamPersistence::new(&options.state_dir);
@@ -633,6 +664,8 @@ impl TeamRuntime {
             generation: Arc::new(AtomicU64::new(0)),
             next_worker: AtomicU64::new(1),
             lead_busy: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_close: AtomicBool::new(false),
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
@@ -2432,6 +2465,7 @@ impl TeamRuntime {
                 session,
                 busy,
                 pump,
+                cleanup_retry_only: false,
             },
         );
         self.update_worker(&id, |worker| {
@@ -2513,6 +2547,7 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running; resume it first"))?;
+            live.admit_session_command(worker_id)?;
             let busy = live.busy.clone();
             let idle = !busy.load(Ordering::SeqCst);
             if idle {
@@ -2559,6 +2594,7 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+            live.admit_session_command(worker_id)?;
             live.session
                 .send(SessionCommand::Interrupt)
                 .await
@@ -2581,6 +2617,7 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+            live.admit_session_command(worker_id)?;
             live.session
                 .send(SessionCommand::Interrupt)
                 .await
@@ -2617,7 +2654,7 @@ impl TeamRuntime {
         })
         .await;
         let live = self.live.lock().await.remove(worker_id);
-        if let Some(live) = live {
+        if let Some(mut live) = live {
             let snapshot = live.session.snapshot().await.ok();
             live.abort();
             if let Some(snapshot) = snapshot {
@@ -2639,7 +2676,17 @@ impl TeamRuntime {
                 })
                 .await;
             }
-            let _ = live.session.close().await;
+            if let Err(error) = self.close_session_for_cleanup(&live.session).await {
+                let message = format!("could not close worker session: {error}");
+                live.cleanup_retry_only = true;
+                self.live.lock().await.insert(worker_id.to_string(), live);
+                self.update_worker(worker_id, |worker| {
+                    worker.error = Some(message.clone());
+                })
+                .await;
+                self.persist().await?;
+                return Err(message);
+            }
         }
         self.persist().await?;
         self.worker(worker_id).await
@@ -2653,9 +2700,12 @@ impl TeamRuntime {
     }
 
     async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
-        if self.live.lock().await.contains_key(worker_id) {
+        let live = self.live.lock().await;
+        if let Some(live) = live.get(worker_id) {
+            live.admit_session_command(worker_id)?;
             return Err(format!("worker '{worker_id}' is already running"));
         }
+        drop(live);
         let active = self.live.lock().await.len();
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
@@ -2711,6 +2761,7 @@ impl TeamRuntime {
                 session,
                 busy,
                 pump,
+                cleanup_retry_only: false,
             },
         );
         self.update_worker(worker_id, |worker| {
@@ -2805,6 +2856,7 @@ impl TeamRuntime {
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+            live.admit_session_command(worker_id)?;
             if live.busy.swap(true, Ordering::SeqCst) {
                 return Err(format!(
                     "worker '{worker_id}' is busy; compact it when it becomes idle"
@@ -3301,11 +3353,27 @@ impl TeamRuntime {
         .await;
         self.persist().await?;
         let live = self.live.lock().await.remove(worker_id);
-        if let Some(live) = live {
+        if let Some(mut live) = live {
             live.abort();
-            let _ = live.session.close().await;
+            if let Err(error) = self.close_session_for_cleanup(&live.session).await {
+                live.cleanup_retry_only = true;
+                self.live.lock().await.insert(worker_id.to_string(), live);
+                self.update_worker(worker_id, |worker| {
+                    // The Git merge landed, but keep the worker retryable:
+                    // `team.merge` skips Merged records and would otherwise
+                    // never retry session shutdown or checkout cleanup.
+                    worker.status = WorkerStatus::InReview;
+                    worker.merge = None;
+                    worker.error = Some(format!(
+                        "merge was committed, but cleanup needs attention; retry merge after closing the worker session: {error}"
+                    ));
+                })
+                .await;
+                self.persist().await?;
+                return self.worker(worker_id).await;
+            }
         }
-        if let Err(err) = cleanup_agent_worktree(&self.workspace_root, &worker.id).await {
+        if let Err(err) = cleanup_agent_worktree(&self.workspace_root, &worker).await {
             self.update_worker(worker_id, |worker| {
                 worker.error = Some(format!(
                     "merged, but worktree cleanup needs attention: {err}"
@@ -3622,24 +3690,28 @@ impl TeamRuntime {
             return Ok(deletion);
         }
         let checkout = worker_checkout(&self.workspace_root, &record.id);
-        if checkout.exists() {
+        if std::fs::symlink_metadata(&checkout).is_ok() {
             deletion.checkout = true;
-            match current_branch(&checkout) {
-                Ok(branch) if branch == record.branch => {}
-                Ok(branch) => {
-                    deletion.blocked = Some(format!(
-                        "its checkout is on '{branch}', not {}",
-                        record.branch
-                    ));
-                    return Ok(deletion);
+            if checkout_is_registered(&self.workspace_root, &checkout).await? {
+                match current_branch(&checkout) {
+                    Ok(branch) if branch == record.branch => {}
+                    Ok(branch) => {
+                        deletion.blocked = Some(format!(
+                            "its checkout is on '{branch}', not {}",
+                            record.branch
+                        ));
+                        return Ok(deletion);
+                    }
+                    Err(error) => {
+                        deletion.blocked =
+                            Some(format!("its checkout could not be read: {error}"));
+                        return Ok(deletion);
+                    }
                 }
-                Err(error) => {
-                    deletion.blocked = Some(format!("its checkout could not be read: {error}"));
-                    return Ok(deletion);
-                }
+                let status =
+                    phase3::git_value(&checkout, &["status", "--porcelain", "-uall"]).await?;
+                deletion.uncommitted = !status.is_empty();
             }
-            let status = phase3::git_value(&checkout, &["status", "--porcelain", "-uall"]).await?;
-            deletion.uncommitted = !status.is_empty();
         }
         if branch_exists(&self.workspace_root, &record.branch).await {
             let range = format!("HEAD..refs/heads/{}", record.branch);
@@ -3654,16 +3726,34 @@ impl TeamRuntime {
     /// so a failure leaves a record that a retry can finish deleting.
     async fn delete_one(&self, deletion: &WorkerDeletion) -> Result<(), String> {
         let record = self.worker(&deletion.worker_id).await?;
+        let live = self.live.lock().await.remove(&record.id);
+        if let Some(mut live) = live {
+            live.abort();
+            if let Err(error) = self.close_session_for_cleanup(&live.session).await {
+                let message = format!("could not close {}'s session: {error}", record.name);
+                live.cleanup_retry_only = true;
+                self.live.lock().await.insert(record.id.clone(), live);
+                return Err(message);
+            }
+        }
         if !deletion.shared_branch && owns_its_branch(&record) {
             let checkout = worker_checkout(&self.workspace_root, &record.id);
             let mut last_error = String::new();
             for _ in 0..12 {
-                if !checkout.exists() {
+                if std::fs::symlink_metadata(&checkout).is_err() {
+                    break;
+                }
+                if !checkout_is_registered(&self.workspace_root, &checkout).await? {
+                    remove_leftover_checkout(&self.workspace_root, &record).await?;
                     break;
                 }
                 // `worktree remove --force`: discarding was confirmed above.
                 match remove_agent_worktree(self.workspace_root.clone(), record.id.clone()).await {
-                    Ok(()) => break,
+                    Ok(()) if !checkout.exists() => break,
+                    Ok(()) => {
+                        last_error =
+                            "Git deregistered the checkout but left its folder".to_string()
+                    }
                     Err(error) => last_error = error,
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3733,24 +3823,203 @@ async fn branch_exists(root: &Path, branch: &str) -> bool {
         .is_ok()
 }
 
-async fn cleanup_agent_worktree(root: &std::path::Path, worker_id: &str) -> Result<(), String> {
-    validate_worker_id(worker_id)?;
-    let worktree = root
-        .join(".worktrees")
-        .join(format!("agent-{}", agent_short_id(worker_id)));
-    if !worktree.exists() {
-        return Ok(());
+/// Whether Git's main-checkout worktree registry still lists this exact path.
+/// Never probe an unregistered folder with Git: without its own `.git`, Git
+/// walks up and answers for the main checkout instead.
+async fn checkout_is_registered(root: &Path, checkout: &Path) -> Result<bool, String> {
+    let arguments = ["worktree", "list", "--porcelain", "-z"];
+    let output = phase3::git(root, &arguments).await?;
+    if !output.status.success() {
+        return Err(phase3::git_error(&arguments, &output));
     }
-    if current_branch(&worktree)? != agent_branch(worker_id) {
+    let expected = normalized_checkout_path(checkout);
+    Ok(worktree_list_paths(&output.stdout)?
+        .iter()
+        .any(|listed| same_checkout_path(listed, &expected)))
+}
+
+/// Decode NUL-delimited porcelain worktree paths without replacement
+/// characters. Unix paths remain arbitrary bytes; platforms whose paths are
+/// Unicode reject invalid UTF-8 instead of failing open as an unregistered
+/// checkout.
+fn worktree_list_paths(stdout: &[u8]) -> Result<Vec<PathBuf>, String> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(b"worktree "))
+        .map(|path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+
+                Ok(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+            }
+            #[cfg(not(unix))]
+            {
+                std::str::from_utf8(path)
+                    .map(PathBuf::from)
+                    .map_err(|error| format!("undecodable worktree path: {error}"))
+            }
+        })
+        .collect()
+}
+
+/// Normalize a checkout without following a symlink or junction at its final
+/// component. Git prints absolute paths; canonicalizing the parent also
+/// reconciles Windows short names and verbatim prefixes.
+fn normalized_checkout_path(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => dunce::canonicalize(parent)
+            .unwrap_or_else(|_| dunce::simplified(parent).to_path_buf())
+            .join(name),
+        _ => dunce::simplified(path).to_path_buf(),
+    }
+}
+
+fn same_checkout_path(left: &Path, right: &Path) -> bool {
+    let left = normalized_checkout_path(left);
+    let right = normalized_checkout_path(right);
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+            == right
+                .to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+#[cfg(windows)]
+fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+/// Remove an unregistered checkout with filesystem operations only. The
+/// canonical path must remain the expected direct child of this repository's
+/// `.worktrees`; links and junctions are refused rather than traversed.
+async fn remove_leftover_checkout(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
+    if !owns_its_branch(worker) {
+        return Err("refusing to remove a checkout for an invalid worker identity".to_string());
+    }
+    let checkout = worker_checkout(root, &worker.id);
+    let metadata = match std::fs::symlink_metadata(&checkout) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_link_or_junction(&metadata) {
+        return Err(format!(
+            "refusing to remove a symlink or junction at {}",
+            checkout.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "refusing to remove a non-directory at {}",
+            checkout.display()
+        ));
+    }
+    let canonical_root = dunce::canonicalize(root).map_err(|error| error.to_string())?;
+    let worktrees = root.join(".worktrees");
+    let canonical_worktrees =
+        dunce::canonicalize(&worktrees).map_err(|error| error.to_string())?;
+    if !same_checkout_path(&canonical_worktrees, &canonical_root.join(".worktrees")) {
+        return Err(format!(
+            "refusing to remove {}: .worktrees is not a direct child of the workspace",
+            checkout.display()
+        ));
+    }
+    let canonical = dunce::canonicalize(&checkout).map_err(|error| error.to_string())?;
+    let expected = canonical_worktrees.join(format!("agent-{}", agent_short_id(&worker.id)));
+    if !same_checkout_path(&canonical, &expected)
+        || canonical.parent() != Some(canonical_worktrees.as_path())
+        || canonical.file_name() != expected.file_name()
+    {
+        return Err(format!(
+            "refusing to remove {}: it is not the worker's own checkout",
+            checkout.display()
+        ));
+    }
+
+    let mut last_error = String::new();
+    for attempt in 0..12 {
+        // Revalidate immediately before every destructive call, then delete
+        // only the canonical path that passed the direct-child guard above.
+        let current = match dunce::canonicalize(&canonical) {
+            Ok(current) => current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let metadata = match std::fs::symlink_metadata(&canonical) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        if current != canonical || is_link_or_junction(&metadata) || !metadata.is_dir() {
+            return Err(format!(
+                "refusing to remove {}: the validated checkout changed",
+                canonical.display()
+            ));
+        }
+        let path = canonical.clone();
+        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(path)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(Err(error)) => last_error = error.to_string(),
+            Err(error) => last_error = error.to_string(),
+        }
+        if !canonical.exists() {
+            return Ok(());
+        }
+        if attempt < 11 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    Err(format!(
+        "could not remove leftover checkout {}: {last_error}",
+        canonical.display()
+    ))
+}
+
+async fn cleanup_agent_worktree(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
+    validate_worker_id(&worker.id)?;
+    let worktree = worker_checkout(root, &worker.id);
+    match std::fs::symlink_metadata(&worktree) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    }
+    if !checkout_is_registered(root, &worktree).await? {
+        return remove_leftover_checkout(root, worker).await;
+    }
+    if current_branch(&worktree)? != agent_branch(&worker.id) {
         return Err("worker checkout is on an unexpected branch; checkout retained".to_string());
     }
     let mut last_error = String::new();
     for _ in 0..12 {
         phase3::require_clean(&worktree, "worker before worktree cleanup").await?;
-        match remove_agent_worktree(root.to_path_buf(), worker_id.to_string()).await {
-            Ok(()) => return Ok(()),
+        match remove_agent_worktree(root.to_path_buf(), worker.id.clone()).await {
+            Ok(()) if !worktree.exists() => return Ok(()),
+            Ok(()) => last_error = "Git deregistered the checkout but left its folder".to_string(),
             Err(_) if !worktree.exists() => return Ok(()),
             Err(err) => last_error = err,
+        }
+        if !checkout_is_registered(root, &worktree).await? {
+            return remove_leftover_checkout(root, worker).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -3855,7 +4124,7 @@ async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Re
             worker.status = WorkerStatus::Merged;
             worker.merge = Some(record);
             worker.error = None;
-            if let Err(err) = cleanup_agent_worktree(root, &worker.id).await {
+            if let Err(err) = cleanup_agent_worktree(root, worker).await {
                 worker.error = Some(format!(
                     "merge recovered, but worktree cleanup needs attention: {err}"
                 ));
@@ -4481,7 +4750,7 @@ pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupR
                 continue;
             }
         };
-        let expected = if checkout.exists() {
+        let expected = if std::fs::symlink_metadata(&checkout).is_ok() {
             dunce::canonicalize(&checkout).map_err(|err| err.to_string())?
         } else {
             checkout.clone()
@@ -4499,27 +4768,45 @@ pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupR
             ));
             continue;
         }
-        if checkout.exists() {
-            match phase3::git_value(&checkout, &["status", "--porcelain", "-uall"]).await {
-                Ok(status) if status.trim().is_empty() => {}
-                Ok(_) => {
-                    report
-                        .skipped
-                        .push(format!("{branch}: uncommitted work is retained for review"));
-                    continue;
+        if std::fs::symlink_metadata(&checkout).is_ok() {
+            let registered = checkout_is_registered(root, &checkout).await?;
+            let mut removal_error = None;
+            if registered {
+                match phase3::git_value(&checkout, &["status", "--porcelain", "-uall"]).await {
+                    Ok(status) if status.trim().is_empty() => {}
+                    Ok(_) => {
+                        report
+                            .skipped
+                            .push(format!("{branch}: uncommitted work is retained for review"));
+                        continue;
+                    }
+                    Err(error) => {
+                        report.skipped.push(format!(
+                            "{branch}: cleanliness could not be verified: {error}"
+                        ));
+                        continue;
+                    }
                 }
-                Err(error) => {
+                if let Err(error) = remove_agent_worktree(root.to_path_buf(), id.clone()).await {
+                    removal_error = Some(error);
+                }
+            }
+            if std::fs::symlink_metadata(&checkout).is_ok() {
+                if checkout_is_registered(root, &checkout).await? {
                     report.skipped.push(format!(
-                        "{branch}: cleanliness could not be verified: {error}"
+                        "{branch}: cleanup failed: {}",
+                        removal_error.unwrap_or_else(|| {
+                            "the registered checkout folder remains".to_string()
+                        })
                     ));
                     continue;
                 }
-            }
-            if let Err(error) = remove_agent_worktree(root.to_path_buf(), id).await {
-                report
-                    .skipped
-                    .push(format!("{branch}: cleanup failed: {error}"));
-                continue;
+                if let Err(error) = remove_leftover_checkout(root, worker).await {
+                    report
+                        .skipped
+                        .push(format!("{branch}: cleanup failed: {error}"));
+                    continue;
+                }
             }
             report.removed.push(branch.clone());
         } else {
@@ -5487,6 +5774,563 @@ mod tests {
         phase3::require_clean_lead(root, "lead")
             .await
             .expect_err("rename out of plans");
+    }
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git(root: &std::path::Path) {
+        run_git(root, &["init", "-b", "main"]);
+        run_git(root, &["config", "user.name", "Mnemo2 Test"]);
+        run_git(root, &["config", "user.email", "mnemo2@example.invalid"]);
+        std::fs::write(root.join("README.md"), "seed\n").expect("seed file");
+        std::fs::write(root.join(".gitignore"), ".worktrees/\n.coding/\n")
+            .expect("ignore worktrees and state");
+        run_git(root, &["add", "README.md", ".gitignore"]);
+        run_git(root, &["commit", "-m", "seed"]);
+    }
+
+    fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
+        let branch = agent_branch(id);
+        WorkerRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            brief: "test worker".to_string(),
+            opening_prompt: None,
+            model: None,
+            model_id: None,
+            reasoning_effort: None,
+            branch,
+            worktree: worker_checkout(root, id),
+            status: WorkerStatus::Completed,
+            generation: 0,
+            transcript: Transcript::default(),
+            pending: None,
+            used_tokens: 0,
+            max_tokens: 0,
+            brief_sent: true,
+            compacting: false,
+            total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            requests: 0,
+            cost_micros: None,
+            created_at_ms: 0,
+            elapsed_ms: 0,
+            turns: 0,
+            last_activity_ms: 0,
+            checks: Vec::new(),
+            review_risk: "standard".to_string(),
+            kind: "implementation".to_string(),
+            audit_target: None,
+            audit_tip: None,
+            findings: Vec::new(),
+            review: None,
+            fixer_finding_id: None,
+            merge: None,
+            error: None,
+            plan_id: None,
+            plan_step: None,
+            tier: None,
+        }
+    }
+
+    fn deregister_worktree(root: &std::path::Path, worker_id: &str) {
+        let admin = root
+            .join(".git")
+            .join("worktrees")
+            .join(format!("agent-{}", agent_short_id(worker_id)));
+        std::fs::remove_dir_all(&admin).expect("remove the worktree admin data");
+        run_git(root, &["worktree", "prune"]);
+    }
+
+    async fn open_test_team(
+        root: &std::path::Path,
+        state: &std::path::Path,
+        workers: Vec<WorkerRecord>,
+    ) -> TeamRuntime {
+        let config = tempfile::tempdir().expect("config");
+        std::fs::write(
+            config.path().join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            config.path().join("endpoints.toml"),
+            "[[endpoint]]
+name = \"test\"
+kind = \"local\"
+base_url = \"http://127.0.0.1:9/v1/\"
+models = [\"scripted-a\"]
+",
+        )
+        .expect("endpoints.toml");
+        TeamPersistence::new(state)
+            .save(&PersistedTeam {
+                workers,
+                slots: Some(2),
+                usage: ProjectUsage::default(),
+            })
+            .expect("save the team ledger");
+        let engine = mnemo::headless::Engine::start(mnemo::headless::EngineOptions {
+            workspace: mnemo::workspace::Workspace::new(root),
+            config_dir: Some(config.path().to_path_buf()),
+            permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+            memory: mnemo::headless::MemoryBackend::Disabled,
+            index_codegraph: false,
+            require_git: true,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("start the test engine");
+        TeamRuntime::open(TeamRuntimeOptions {
+            engine: Arc::new(engine),
+            workspace_root: root.to_path_buf(),
+            state_dir: state.to_path_buf(),
+            slots: Some(2),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("open the test team")
+    }
+
+    async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
+        let session = team
+            .spawn_worker_session(
+                worker.name.clone(),
+                None,
+                None,
+                worker.worktree.clone(),
+                None,
+                "implementation",
+            )
+            .await
+            .expect("spawn worker session");
+        team.live.lock().await.insert(
+            worker.id.clone(),
+            LiveWorker {
+                session,
+                pump: tokio::spawn(std::future::pending::<()>()),
+                cleanup_retry_only: false,
+                busy: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(link: &std::path::Path, target: &std::path::Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("create a junction");
+        assert!(
+            output.status.success(),
+            "mklink failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(link: &std::path::Path, target: &std::path::Path) {
+        std::os::unix::fs::symlink(target, link).expect("create a directory symlink");
+    }
+
+    #[tokio::test]
+    async fn a_half_removed_checkout_is_finished_after_merge() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        let worker = worker(root.path(), "00000001000000000001");
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        deregister_worktree(root.path(), &worker.id);
+        assert!(worker.worktree.join(".git").is_file());
+
+        cleanup_agent_worktree(root.path(), &worker)
+            .await
+            .expect("finish removing the half-removed checkout");
+
+        assert!(!worker.worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn a_leftover_checkout_does_not_block_deleting_its_worker() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let dangling = worker(root.path(), "00000001000000000001");
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            dangling.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        deregister_worktree(root.path(), &dangling.id);
+        let fragment = worker(root.path(), "00000002000000000002");
+        run_git(root.path(), &["branch", &fragment.branch, "main"]);
+        std::fs::create_dir_all(&fragment.worktree).expect("fragment checkout");
+        std::fs::write(fragment.worktree.join("fragment.txt"), "leftover\n")
+            .expect("fragment file");
+        let team = open_test_team(
+            root.path(),
+            state.path(),
+            vec![dangling.clone(), fragment.clone()],
+        )
+        .await;
+        for worker in [&dangling, &fragment] {
+            let session = team
+                .spawn_worker_session(
+                    worker.name.clone(),
+                    None,
+                    None,
+                    worker.worktree.clone(),
+                    None,
+                    "implementation",
+                )
+                .await
+                .expect("open a worktree-bound session and its code graph");
+            assert!(worker.worktree.join(".coding/codegraph.db").is_file());
+            team.live.lock().await.insert(
+                worker.id.clone(),
+                LiveWorker {
+                    session,
+                    pump: tokio::spawn(async {}),
+                    cleanup_retry_only: false,
+                    busy: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        let ids = vec![dangling.id.clone(), fragment.id.clone()];
+
+        let previews = team.deletion_preview(&ids).await.expect("preview leftovers");
+        assert!(previews.iter().all(|preview| preview.blocked.is_none()));
+        let snapshot = team
+            .delete_workers(&ids, false)
+            .await
+            .expect("delete workers with leftover checkouts");
+
+        assert!(snapshot.workers.is_empty());
+        assert!(team.live.lock().await.is_empty());
+        assert!(!dangling.worktree.exists());
+        assert!(!fragment.worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn leftover_removal_never_leaves_the_worker_folder() {
+        let root = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        init_git(root.path());
+        let leftover = worker(root.path(), "00000001000000000001");
+        std::fs::create_dir_all(&leftover.worktree).expect("leftover checkout");
+        std::fs::write(leftover.worktree.join("fragment.txt"), "leftover\n")
+            .expect("leftover file");
+        let sibling = root.path().join(".worktrees").join("keep.txt");
+        std::fs::write(&sibling, "keep\n").expect("sibling file");
+        let main_marker = root.path().join("README.md");
+        let original_main = std::fs::read(&main_marker).expect("main checkout marker");
+
+        cleanup_agent_worktree(root.path(), &leftover)
+            .await
+            .expect("remove only the leftover checkout");
+        assert!(!leftover.worktree.exists());
+        assert_eq!(std::fs::read_to_string(&sibling).expect("sibling"), "keep\n");
+        assert_eq!(
+            std::fs::read(&main_marker).expect("main checkout survives"),
+            original_main
+        );
+
+        let linked = worker(root.path(), "00000002000000000002");
+        let outside_marker = outside.path().join("keep.txt");
+        std::fs::write(&outside_marker, "outside\n").expect("outside marker");
+        create_directory_link(&linked.worktree, outside.path());
+        let error = cleanup_agent_worktree(root.path(), &linked)
+            .await
+            .expect_err("a junction or symlink at the checkout path is refused");
+        assert!(error.contains("refus"), "unexpected error: {error}");
+        assert!(linked.worktree.exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside_marker).expect("outside marker survives"),
+            "outside\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_close_error_is_persisted_and_retryable() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let worker = worker(root.path(), "00000001000000000001");
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision worker");
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        spawn_live_worker(&team, &worker).await;
+        assert!(!team
+            .live
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("pending live worker")
+            .pump
+            .is_finished());
+        team.fail_next_close_for_test();
+
+        let error = team.stop_inner(&worker.id).await.expect_err("injected close failure");
+        assert!(error.contains("injected close failure"), "{error}");
+        assert!(team.live.lock().await.contains_key(&worker.id));
+        let persisted = TeamPersistence::new(state.path())
+            .load()
+            .expect("load team")
+            .expect("saved team");
+        assert!(persisted.workers[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected close failure")));
+        let busy = team
+            .live
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("retained live worker")
+            .busy
+            .clone();
+        for _ in 0..10 {
+            if team
+                .live
+                .lock()
+                .await
+                .get(&worker.id)
+                .expect("retained live worker")
+                .pump
+                .is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(team
+            .live
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("retained live worker")
+            .pump
+            .is_finished());
+        let message = team
+            .message_inner(&worker.id, "must not run without a pump".into())
+            .await
+            .expect_err("a cleanup-retry-only worker rejects messages");
+        assert!(message.contains("cleanup"), "{message}");
+        let resume = team
+            .resume_inner(&worker.id)
+            .await
+            .expect_err("a cleanup-retry-only worker rejects resume");
+        assert!(resume.contains("cleanup"), "{resume}");
+        let before_commands = team.worker(&worker.id).await.expect("worker before commands");
+        let compact = team
+            .compact(&worker.id)
+            .await
+            .expect_err("a cleanup-retry-only worker rejects compact");
+        assert!(compact.contains("cleanup"), "{compact}");
+        let after_compact = team.worker(&worker.id).await.expect("worker after compact");
+        assert_eq!(after_compact.status, before_commands.status);
+        assert_eq!(after_compact.compacting, before_commands.compacting);
+        assert!(!busy.load(Ordering::SeqCst));
+        let pause = team
+            .pause(&worker.id)
+            .await
+            .expect_err("a cleanup-retry-only worker rejects pause");
+        assert!(pause.contains("cleanup"), "{pause}");
+        let interrupt = team
+            .interrupt(&worker.id)
+            .await
+            .expect_err("a cleanup-retry-only worker rejects interrupt");
+        assert!(interrupt.contains("cleanup"), "{interrupt}");
+        let after_commands = team.worker(&worker.id).await.expect("worker after commands");
+        assert_eq!(after_commands.status, before_commands.status);
+        assert_eq!(after_commands.compacting, before_commands.compacting);
+        assert!(!busy.load(Ordering::SeqCst));
+
+        let stopped = team.stop_inner(&worker.id).await.expect("stop retry");
+        assert_eq!(stopped.status, WorkerStatus::Stopped);
+        assert!(!team.live.lock().await.contains_key(&worker.id));
+    }
+
+    #[tokio::test]
+    async fn merge_close_error_returns_to_review_and_retries_cleanup() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000001000000000001");
+        worker.status = WorkerStatus::InReview;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision worker");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        spawn_live_worker(&team, &worker).await;
+        team.fail_next_close_for_test();
+
+        let failed = team.merge(&worker.id).await.expect("merge close diagnostic");
+        assert_eq!(failed.status, WorkerStatus::InReview);
+        assert_eq!(failed.merge, None);
+        assert!(failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("retry merge")));
+        assert!(team.live.lock().await.contains_key(&worker.id));
+        assert!(worker.worktree.exists());
+        let persisted = TeamPersistence::new(state.path())
+            .load()
+            .expect("load team")
+            .expect("saved team");
+        assert_eq!(persisted.workers[0].status, WorkerStatus::InReview);
+        assert!(persisted.workers[0].error.is_some());
+
+        let merged = team.merge(&worker.id).await.expect("merge retry");
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert_eq!(merged.error, None);
+        assert!(!worker.worktree.exists());
+        assert!(!team.live.lock().await.contains_key(&worker.id));
+    }
+
+    #[tokio::test]
+    async fn merge_closes_a_live_session_before_finishing_its_checkout() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000001000000000001");
+        worker.status = WorkerStatus::InReview;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        let session = team
+            .spawn_worker_session(
+                worker.name.clone(),
+                None,
+                None,
+                worker.worktree.clone(),
+                None,
+                "implementation",
+            )
+            .await
+            .expect("open a worktree-bound session and its code graph");
+        assert!(worker.worktree.join(".coding/codegraph.db").is_file());
+        team.live.lock().await.insert(
+            worker.id.clone(),
+            LiveWorker {
+                session,
+                pump: tokio::spawn(async {}),
+                cleanup_retry_only: false,
+                busy: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+        let merged = team.merge(&worker.id).await.expect("merge the worker");
+
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert_eq!(merged.error, None);
+        assert!(!worker.worktree.exists());
+        assert!(!team.live.lock().await.contains_key(&worker.id));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("merged.txt"))
+                .expect("merged file")
+                .trim_end(),
+            "merged"
+        );
+        let persisted = TeamPersistence::new(state.path())
+            .load()
+            .expect("load persisted team")
+            .expect("saved team");
+        assert_eq!(persisted.workers[0].error, None);
+    }
+
+    #[test]
+    fn porcelain_worktree_paths_are_nul_delimited_and_fail_closed() {
+        let paths = worktree_list_paths(b"worktree /tmp/main\0worktree /tmp/agent\0\0")
+            .expect("decode porcelain paths");
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/tmp/main"), PathBuf::from("/tmp/agent")]
+        );
+
+        #[cfg(not(unix))]
+        assert!(worktree_list_paths(b"worktree \xff\0").is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            assert_eq!(
+                worktree_list_paths(b"worktree \xff\0").expect("Unix paths are bytes"),
+                vec![PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]))]
+            );
+        }
     }
 
     /// Mnemo1 owns `runall-*` worktrees and `wt/runall-*` branches in the same

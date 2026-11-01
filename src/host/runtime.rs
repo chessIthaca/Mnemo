@@ -241,6 +241,12 @@ async fn spawn_agent_shared_inner(
     } else {
         factory.build_with_id(agent_id)
     };
+    let family_root = parent
+        .as_ref()
+        .and_then(|parent| parent.family_root())
+        .or(parent_id)
+        .unwrap_or(agent_id);
+    agent_loop.set_family_root(family_root);
 
     // 3c/G2 (§5.9.2): register the session's host tools into the registry
     // via the shared dynamic slot — the late-registration path the MCP

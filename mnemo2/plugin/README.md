@@ -14,6 +14,10 @@ Only the lead runs on your Claude subscription. If you want a Claude model as a 
 | `hooks/hooks.json` | SessionStart adds the team summary. PostToolUse delivers worker notices. Stop reminds the lead to keep the background waiter running. PreToolUse asks before Claude Code's own agents run. |
 | `bin/mnemo2-mcp` | The helper itself. It is built from this repository and is not checked in. |
 
+## Mnemo2's memory workflow is enforced
+
+While Claude Code is the attached lead, the MCP server enforces the same memory workflow Mnemo2's own lead follows, so the external lead cannot skip it: a `plan_create` is refused until a `memory_search` has run since the previous one (or since the lead attached), and a `bug_fixing` plan additionally needs a `memory_search` with `record_type` "bug"; defect fixes are planned as `bug_fixing` plans, and their `BUG:` knowledge record is captured automatically at close (a fix that adds capabilities or spans modules is an implementation plan with the bug as motivation). An `implementation` or `research` plan cannot close until a durable knowledge record was written or amended since it opened — `memory_write` with a `SPEC:`, `DECISION:` or `HOW:` title, without plan IDs, branches or commit hashes — after which the last `plan_step_done` closes it. The skills describe the workflow in detail.
+
 ## Requirements
 
 - Mnemo2 built from this repository: `npm run build:mnemo2:native` at the repository root. It builds `mnemo2` and `mnemo2-mcp`, then copies `mnemo2-mcp` into `mnemo2/plugin/bin/` and records where `mnemo2` lives (`bin/mnemo2-path.txt`) so the helper can start it.

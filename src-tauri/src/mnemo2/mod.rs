@@ -28,6 +28,9 @@ pub mod lock_holders;
 /// Durable per-project usage and cost accounting.
 pub mod usage;
 
+/// The Cost tab's spend and savings insight commands.
+pub mod insights;
+
 /// The lead's team ledger for the TeamLead workflow.
 pub(crate) mod ledger;
 
@@ -455,6 +458,8 @@ pub fn run() {
             browser::browser_overlay,
             browser::browser_close,
             browser::browser_open_external,
+            insights::insights_cost,
+            insights::insights_savings,
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to build the Mnemo2 desktop host")

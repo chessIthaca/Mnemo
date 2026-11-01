@@ -162,10 +162,10 @@
     },
     {
       "id": "e6c49e39",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793537729274,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793540758260,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e6c49e39-20261101-134558.md",
       "abandon_reason": null
     },
     {

@@ -24,6 +24,20 @@ export type WorkerStatus =
   | "failed"
   | "cancelled";
 
+/** What a running worker is doing right now, derived from its streamed events. */
+export type WorkerPhase = "starting" | "thinking" | "writing" | "tool" | "waiting";
+
+/** The live activity of one running worker: its phase, and how long it has been going on. */
+export interface WorkerActivity {
+  phase: WorkerPhase;
+  /** The tool the worker is running, when `phase === "tool"`. */
+  toolName: string | null;
+  /** When the current turn began (ms epoch); null until the turn's `started` event arrives. */
+  turnStartedAtMs: number | null;
+  /** When the current phase began (ms epoch). */
+  phaseSinceMs: number;
+}
+
 export const workerStatusLabel: Record<WorkerStatus, string> = {
   dispatching: "Dispatching",
   working: "Working",
@@ -218,6 +232,10 @@ export interface Worker {
   compacting?: boolean;
   progress: number;
   lastActivity: string;
+  /** When the worker was created (ms epoch); live rows tick their timer from this. */
+  createdAtMs: number;
+  /** What the worker is doing right now, while it runs; null when it is not running. */
+  activity: WorkerActivity | null;
   needsYou: boolean;
   /** Implementation workers own the brief; audit workers only review one tip. */
   kind: WorkerKind;

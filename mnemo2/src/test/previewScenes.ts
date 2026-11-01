@@ -9,7 +9,7 @@
 
 import type { BoardPlan } from "../lib/boardState";
 import type { WorkerDeletionPreview } from "../lib/teamState";
-import type { AppState, LeadEntry, Worker, WorkerThreadEntry } from "../lib/types";
+import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 
 /** The fixture worker whose thread the preview shows in full. */
@@ -20,6 +20,20 @@ type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
 
 /** The clock the scene is built against, so relative stamps read "just now". */
 const NOW_MS = Date.now();
+
+/**
+ * One worker's live activity at the scene's clock: `agoMs` is how long the
+ * phase (and its turn) has been running. A dispatching worker has no turn
+ * anchor yet — its turn timer starts when the turn's first event streams.
+ */
+function liveActivity(phase: WorkerActivity["phase"], agoMs: number, toolName: string | null = null): WorkerActivity {
+  return {
+    phase,
+    toolName,
+    turnStartedAtMs: phase === "starting" ? null : NOW_MS - agoMs,
+    phaseSinceMs: NOW_MS - agoMs,
+  };
+}
 
 /** The open plan the dispatch bar shows above the worker list. */
 const PREVIEW_PLAN: BoardPlan = {
@@ -231,10 +245,26 @@ function baseState(workerOverrides: Partial<Worker> = {}): AppState {
   };
 }
 
-/** Mission control, with the rich-thread worker selected. */
+/** Mission control: the rich-thread worker selected, one running worker per live phase. */
 function missionControl(): AppState {
+  const state = baseState();
+  const minutes = (value: number) => value * 60_000;
+  // The rows' live statuses: June is dispatching, Sol thinks, Milo writes,
+  // Kai runs its re-check shell (the thread's last tool row), Noa waits on you.
+  const live: Record<string, Partial<Worker> & Pick<Worker, "activity" | "createdAtMs">> = {
+    june: { createdAtMs: NOW_MS - minutes(2), activity: liveActivity("starting", minutes(2)) },
+    sol: { createdAtMs: NOW_MS - minutes(21), activity: liveActivity("thinking", minutes(1.5)) },
+    milo: { createdAtMs: NOW_MS - minutes(24), activity: liveActivity("writing", 45_000) },
+    kai: { createdAtMs: NOW_MS - minutes(18), activity: liveActivity("tool", 72_000, "shell") },
+    noa: {
+      status: "needs_you",
+      needsYou: true,
+      createdAtMs: NOW_MS - minutes(14),
+      activity: liveActivity("waiting", minutes(5)),
+    },
+  };
   return {
-    ...baseState(),
+    ...state,
     route: "team",
     selectedWorkerId: RICH_WORKER_ID,
     teamFilter: "all",
@@ -242,6 +272,9 @@ function missionControl(): AppState {
     teamSlots: 8,
     workerPanelId: null,
     workerDeletion: null,
+    workers: state.workers.map((worker) =>
+      worker.id in live ? { ...worker, ...live[worker.id] } : worker,
+    ),
   };
 }
 
@@ -253,6 +286,8 @@ function workerThread(): AppState {
       needsYou: true,
       summary: "The thread renders as Markdown — the component test still fails on the tool rows. Which way do you want them?",
       lastActivity: "just now",
+      createdAtMs: NOW_MS - 18 * 60_000,
+      activity: liveActivity("waiting", 75_000),
     }),
     route: "lead",
     selectedWorkerId: RICH_WORKER_ID,
@@ -333,7 +368,7 @@ export const previewScenes: PreviewScene[] = [
   {
     name: "mission-control",
     title: "Mission control",
-    description: "The team list with a selected worker whose thread has Markdown and tool rows.",
+    description: "The team list with a live status row per running worker, and a selected worker whose thread has Markdown and tool rows.",
     build: missionControl,
   },
   {

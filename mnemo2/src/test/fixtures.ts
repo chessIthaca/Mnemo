@@ -64,6 +64,8 @@ function makeWorker(input: WorkerInput): Worker {
     turns: 3,
     progress: 40,
     lastActivity: "just now",
+    createdAtMs: 0,
+    activity: null,
     needsYou: false,
     kind: "implementation",
     reviewRisk: "standard",

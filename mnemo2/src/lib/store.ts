@@ -24,6 +24,7 @@ import {
   workerThreadFromRecord,
   type WorkerLive,
 } from "./workerThread";
+import { applyWorkerEvent, applyWorkerStatus } from "./workerActivity";
 import {
   createOpenWorkerTransport,
   openWorkerNotice,
@@ -69,6 +70,7 @@ import type {
   ReviewEvidence,
   TeamFilter,
   Worker,
+  WorkerActivity,
   WorkerStatus,
   WorkbenchTab,
 } from "./types";
@@ -1944,6 +1946,11 @@ function workerFromRecord(
   messages: TeamMessage[],
 ): Worker {
   const status = record.status as WorkerStatus;
+  // Fold the status snapshot into the live activity: needs_you waits on the
+  // human, dispatching has not streamed yet, and non-running statuses clear.
+  const activity = applyWorkerStatus(workerActivity.get(record.id) ?? null, status, Date.now());
+  if (activity) workerActivity.set(record.id, activity);
+  else workerActivity.delete(record.id);
   const progress: Record<WorkerStatus, number> = {
     dispatching: 10,
     working: 45,
@@ -1983,6 +1990,8 @@ function workerFromRecord(
     compacting: record.compacting === true,
     progress: progress[status],
     lastActivity: timeFromMs(record.last_activity_ms),
+    createdAtMs: record.created_at_ms,
+    activity,
     needsYou:
       waitsOnUser(record.pending) || ["needs_you", "conflict", "failed"].includes(record.status),
     fixerFindingId: record.fixer_finding_id ?? undefined,
@@ -2120,8 +2129,28 @@ function composeThread(workerId: string): Worker["messages"] | null {
   return [...saved.thread, ...live.entries];
 }
 
-/** Stream one worker event into that worker's open thread. */
+/** Each worker's live activity: what its model is doing right now, for every running worker — not just open threads. */
+const workerActivity = new Map<string, WorkerActivity>();
+
+/** Fold one streamed worker event into its worker's live activity, for every worker in state. */
+function streamWorkerActivity(event: TeamEvent): void {
+  const workerId = event.worker_id;
+  const current = workerActivity.get(workerId) ?? null;
+  const next = applyWorkerEvent(current, event, Date.now());
+  if (next === current) return;
+  if (next) workerActivity.set(workerId, next);
+  else workerActivity.delete(workerId);
+  app.update((state) => ({
+    ...state,
+    workers: state.workers.map((worker) =>
+      worker.id === workerId ? { ...worker, activity: next } : worker,
+    ),
+  }));
+}
+
+/** Stream one worker event into that worker's live activity and open thread. */
 function streamWorkerEvent(event: TeamEvent): void {
+  streamWorkerActivity(event);
   const saved = workerSaved.get(event.worker_id);
   if (!saved || event.generation < saved.generation) return;
   let live = workerLive.get(event.worker_id);
@@ -2270,6 +2299,10 @@ async function syncTeam(): Promise<void> {
       // must never repaint (or reprice) a project the human has since opened.
       if (state.projectId !== projectId) return state;
       const diffWorkerId = state.diffWorkerId ?? state.selectedWorkerId;
+      // A worker that left the snapshot must not keep a live activity record.
+      for (const id of workerActivity.keys()) {
+        if (!snapshot.workers.some((record) => record.id === id)) workerActivity.delete(id);
+      }
       return {
         ...state,
         workers: snapshot.workers.map((record, index) => {
@@ -2320,6 +2353,7 @@ async function disconnectTeam(): Promise<void> {
   teamToken += 1;
   workerLive.clear();
   workerSaved.clear();
+  workerActivity.clear();
   if (teamSyncTimer) {
     clearTimeout(teamSyncTimer);
     teamSyncTimer = null;

@@ -126,4 +126,27 @@ describe("preview scenes", () => {
     expect(request?.previews[0].superseded_by).toBeTruthy();
     expect(request?.previews[0].unmerged_commits).toBeGreaterThan(0);
   });
+
+  it("mission-control shows one running worker in every live phase", () => {
+    const state = build("mission-control");
+    const live = new Map(
+      state.workers
+        .filter((worker) => worker.activity)
+        .map((worker) => [worker.activity!.phase, worker.id] as const),
+    );
+    expect([...live.keys()].sort()).toEqual(["starting", "thinking", "tool", "waiting", "writing"]);
+    // The selected worker runs the shell its thread's last tool row streams.
+    expect(live.get("tool")).toBe("kai");
+    // Every live row ticks its timer from when the worker was created.
+    for (const worker of state.workers.filter((candidate) => candidate.activity)) {
+      expect(worker.createdAtMs).toBeGreaterThan(0);
+    }
+  });
+
+  it("worker-thread waits on the human with the turn timer still anchored", () => {
+    const worker = selectedWorker(build("worker-thread"));
+    expect(worker.activity?.phase).toBe("waiting");
+    expect(worker.activity?.turnStartedAtMs).not.toBeNull();
+    expect(worker.createdAtMs).toBeGreaterThan(0);
+  });
 });

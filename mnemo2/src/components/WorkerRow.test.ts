@@ -51,11 +51,62 @@ describe("WorkerRow", () => {
     expect(getComputedStyle(bar).display).toBe("block");
     expect(getComputedStyle(bar).height).toBe("100%");
   });
-
   it("still opens the worker when the row is clicked", async () => {
     const onSelect = vi.fn();
     render(WorkerRow, { worker: worker(), onSelect });
     await fireEvent.click(screen.getByRole("button", { name: "Open Ana worker thread" }));
     expect(onSelect).toHaveBeenCalledWith("ana");
+  });
+
+  it("shows the live phase and a ticking timer while the worker runs", () => {
+    const running = {
+      ...worker(),
+      status: "working",
+      createdAtMs: Date.now() - 18 * 60_000,
+      activity: {
+        phase: "tool",
+        toolName: "shell",
+        turnStartedAtMs: Date.now() - 72_000,
+        phaseSinceMs: Date.now() - 5_000,
+      },
+    } as Worker;
+    const { container } = render(WorkerRow, { worker: running, onSelect: vi.fn() });
+
+    const live = container.querySelector<HTMLElement>(".worker-live .thinking-status");
+    expect(live?.textContent).toContain("Running shell…");
+    // The timer ticks since the worker was created, not the static elapsed text.
+    expect(live?.textContent).toContain("18:");
+    expect(live?.classList.contains("meta")).toBe(true);
+    expect(getComputedStyle(live!).fontSize).toBe("var(--text-meta)");
+    // The static cost-and-elapsed line is gone while the worker runs.
+    expect(container.querySelector(".worker-meta small")).toBeNull();
+  });
+
+  it("keeps the dot solid when the worker waits on the human", () => {
+    const waiting = {
+      ...worker(),
+      status: "needs_you",
+      needsYou: true,
+      createdAtMs: Date.now() - 5 * 60_000,
+      activity: {
+        phase: "waiting",
+        toolName: null,
+        turnStartedAtMs: Date.now() - 30_000,
+        phaseSinceMs: Date.now() - 1_000,
+      },
+    } as Worker;
+    const { container } = render(WorkerRow, { worker: waiting, onSelect: vi.fn() });
+
+    const live = container.querySelector<HTMLElement>(".worker-live .thinking-status");
+    expect(live?.textContent).toContain("Waiting on you");
+    expect(live?.classList.contains("still")).toBe(true);
+  });
+
+  it("keeps the finished worker's static cost and elapsed line", () => {
+    const { container } = render(WorkerRow, { worker: worker(), onSelect: vi.fn() });
+
+    const line = container.querySelector<HTMLElement>(".worker-meta small");
+    expect(line?.textContent).toContain("$1.84 · 26m");
+    expect(container.querySelector(".worker-live")).toBeNull();
   });
 });

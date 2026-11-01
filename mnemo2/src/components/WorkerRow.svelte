@@ -3,7 +3,9 @@
   import { workerPlanLabel } from "../lib/boardState";
   import { briefSummary } from "../lib/brief";
   import { app } from "../lib/store";
+  import { workerPhaseLabel } from "../lib/workerActivity";
   import { workerStatusText, type Worker } from "../lib/types";
+  import ActivityStatus from "./ActivityStatus.svelte";
   import ModelBadge from "./ModelBadge.svelte";
 
   let {
@@ -41,7 +43,18 @@
   </span>
   <span class="worker-meta">
     <span class="status-label" data-status={worker.status}>{workerStatusText(worker)}</span>
-    <small>{#if worker.cost != null}${worker.cost.toFixed(2)}{:else}{worker.tokens} tokens{/if} · {worker.elapsed || "—"}</small>
+    {#if worker.activity}
+      <span class="worker-live">
+        <ActivityStatus
+          label={workerPhaseLabel(worker.activity)}
+          startedAtMs={worker.createdAtMs}
+          pulse={worker.activity.phase !== "waiting"}
+          size="meta"
+        />
+      </span>
+    {:else}
+      <small>{#if worker.cost != null}${worker.cost.toFixed(2)}{:else}{worker.tokens} tokens{/if} · {worker.elapsed || "—"}</small>
+    {/if}
   </span>
   <ChevronRight class="row-chevron" size={13} />
 </button>
@@ -65,12 +78,13 @@
   .worker-progress { display: block; height: 2px; margin-top: 7px; overflow: hidden; border-radius: 2px; background: var(--line); }
   .worker-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width 240ms ease; }
   .worker-meta small { display: block; margin-top: 4px; color: var(--muted); font-size: var(--text-meta); white-space: nowrap; }
+  .worker-live { display: block; margin-top: 4px; white-space: nowrap; }
   .status-label { display: inline-flex; padding: 3px 6px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; white-space: nowrap; }
   .status-label[data-status="in_review"], .status-label[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }
   .status-label[data-status="failed"] { background: #f4e4e1; color: var(--danger); }
   .status-label[data-status="merged"] { background: var(--accent-soft); color: var(--accent-strong); }
   .status-label[data-status="working"], .status-label[data-status="fixing"] { background: #e9edf3; color: #536c89; }
   .worker-row :global(.row-chevron) { flex: 0 0 auto; color: var(--line-strong); }
-  .worker-row.compact .worker-meta small { display: none; }
-  @media (max-width: 1100px) { .worker-meta small { display: none; } }
+  .worker-row.compact .worker-meta small, .worker-row.compact .worker-live { display: none; }
+  @media (max-width: 1100px) { .worker-meta small, .worker-live { display: none; } }
 </style>

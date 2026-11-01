@@ -175,6 +175,14 @@
       "closed_at_ms": 1793541428300,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f7ae722b-20261101-135708.md",
       "abandon_reason": null
+    },
+    {
+      "id": "955f6b4c",
+      "status": "open",
+      "created_at_ms": 1793542183464,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null
     }
   ]
 }

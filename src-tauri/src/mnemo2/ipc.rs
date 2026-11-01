@@ -780,6 +780,8 @@ pub async fn board_snapshot(state: State<'_, Mnemo2State>) -> Result<BoardSnapsh
 
 /// Delegate a real task to a worker on a board plan step (1-based).
 #[tauri::command]
+// Each parameter is one wire field of the JS invoke — the command mirrors the IPC payload.
+#[allow(clippy::too_many_arguments)]
 pub async fn team_dispatch(
     state: State<'_, Mnemo2State>,
     brief: String,

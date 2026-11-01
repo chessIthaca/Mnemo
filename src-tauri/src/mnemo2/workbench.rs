@@ -267,8 +267,8 @@ fn parse_unified_diff(patch: &str) -> ParsedDiff {
             file.binary = true;
             continue;
         }
-        let (kind, text) = if raw.starts_with("@@") {
-            if let Some((old, new)) = hunk_start(&raw[2..]) {
+        let (kind, text) = if let Some(hunk) = raw.strip_prefix("@@") {
+            if let Some((old, new)) = hunk_start(hunk) {
                 old_line = old;
                 new_line = new;
             }

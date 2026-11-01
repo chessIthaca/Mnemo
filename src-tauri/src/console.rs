@@ -1071,38 +1071,30 @@ async fn handle_event(
                 runtime.cleanup_inactive_subagents(id).await;
             }
         }
-        SerializableAgentEvent::Started => {
+        SerializableAgentEvent::Started if id == runtime.main_id() => {
             // The pump does the lifecycle bookkeeping (running flags,
             // parent notifications, dead-agent cleanup) — the console
             // keeps only its own REPL state machine.
-            if id == runtime.main_id() {
-                state.running = true;
-            }
+            state.running = true;
         }
-        SerializableAgentEvent::Finished { .. } => {
-            if id == runtime.main_id() && state.running {
-                // Guarded: a final Error already ended the turn (the agent
-                // then also emits a bookkeeping Finished) — one prompt only.
-                state.running = false;
-                if !state.exiting {
-                    print_prompt();
-                }
+        SerializableAgentEvent::Finished { .. } if id == runtime.main_id() && state.running => {
+            // Guarded: a final Error already ended the turn (the agent
+            // then also emits a bookkeeping Finished) — one prompt only.
+            state.running = false;
+            if !state.exiting {
+                print_prompt();
             }
         }
         SerializableAgentEvent::Error {
             retrying: false, ..
-        } => {
-            if id == runtime.main_id() && state.running {
-                state.running = false;
-                if !state.exiting {
-                    print_prompt();
-                }
+        } if id == runtime.main_id() && state.running => {
+            state.running = false;
+            if !state.exiting {
+                print_prompt();
             }
         }
-        SerializableAgentEvent::Exited => {
-            if id == runtime.main_id() {
-                state.main_exited = true;
-            }
+        SerializableAgentEvent::Exited if id == runtime.main_id() => {
+            state.main_exited = true;
         }
         // Retrying errors keep the agent running; delta events need no
         // REPL state at all.
@@ -1338,7 +1330,7 @@ pub(crate) async fn run_console() -> i32 {
     let session_permission = {
         let config = brain.config.lock().await;
         mnemo::PermissionPolicy::ApproveViaApi {
-            safety_mode: config.general.general.safety.clone(),
+            safety_mode: config.general.general.safety,
         }
     };
     // Job 6 (§5.9.10 :747-753): the console's own Engine over the SAME

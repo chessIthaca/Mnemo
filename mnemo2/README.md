@@ -45,6 +45,34 @@ The native host is the `mnemo2` Cargo feature. The default `cargo test
 --workspace` compiles Mnemo1 alone; `npm run test:mnemo2:native` runs the
 feature-enabled Mnemo2 lib tests.
 
+## Preview scenes (dev only)
+
+`preview.html` renders the real app shell against sample data, so a UI change
+can be reviewed in a browser without the native host:
+
+```bash
+cd mnemo2
+npx vite                   # http://127.0.0.1:5180/preview.html
+```
+
+Pick a screen with `?scene=<name>`; a missing parameter renders
+`mission-control`, an unknown one shows an index of the links:
+
+- `mission-control` — the team list with a worker selected whose thread has
+  Markdown headings, inline and fenced code, a list, and tool rows in the
+  done/running/failed states.
+- `worker-thread` — the same thread beside the lead chat, for a needs-you
+  worker.
+- `lead-chat` — the lead conversation: plan, dispatch, review, merge, tool row.
+- `lead-idle` — the top bar with an idle Claude Code lead badge.
+- `delete-sheet` — the delete-old sheet with one superseded worker.
+
+The sample data lives in `src/test/previewScenes.ts` (test-side code built on
+`src/test/fixtures.ts`). Nothing of it reaches the production bundle:
+`preview.html` is not a Vite build input and no production file imports the
+preview module, so `npm run check:no-mock` still passes and `vite build` writes
+only the app.
+
 ## Native lead
 
 - **Runtime.** `LeadRuntime` starts the existing `mnemo::headless::Engine`,

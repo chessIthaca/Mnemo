@@ -43,7 +43,7 @@ use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
 use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
-    BoardSignal, BoardSnapshot, TeamMessage, TeamRuntime, TeamSnapshot, WorkerDeletion, WorkerRecord, TEAM_EVENT_CHANNEL,
+    BoardSignal, BoardSnapshot, MessageSender, TeamMessage, TeamRuntime, TeamSnapshot, WorkerDeletion, WorkerRecord, TEAM_EVENT_CHANNEL,
 };
 use crate::mnemo2::workbench::{self, DiffSnapshot};
 
@@ -822,14 +822,17 @@ pub async fn team_audit_dispatch(
         .map(|(worker, _reused)| worker)
 }
 
-/// Send a lead message to a worker.
+/// Send a mission-control user message to a worker.
 #[tauri::command]
 pub async fn team_message(
     state: State<'_, Mnemo2State>,
     worker_id: String,
     text: String,
 ) -> Result<WorkerRecord, String> {
-    current_team(&state).await?.message(&worker_id, text).await
+    current_team(&state)
+        .await?
+        .message(&worker_id, text, MessageSender::User)
+        .await
 }
 
 /// Pause a worker's current turn.

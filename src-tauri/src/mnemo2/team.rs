@@ -111,11 +111,66 @@ pub struct WorkerCheck {
     pub tip: String,
 }
 
+/// Who sent a message to a worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSender {
+    /// Claude Code leading through Mnemo2's MCP endpoint.
+    ExternalLead,
+    /// Mnemo2's built-in lead session.
+    Lead,
+    /// The user replying in mission control.
+    User,
+    /// Mnemo2 itself, for a generated repair or route-fix brief.
+    Mnemo,
+}
+
+impl MessageSender {
+    fn header(self) -> &'static str {
+        match self {
+            Self::ExternalLead => "[From the lead (Claude Code)]",
+            Self::Lead => "[From the built-in lead]",
+            Self::User => "[From the user in mission control]",
+            Self::Mnemo => "[From Mnemo2]",
+        }
+    }
+}
+
+/// The purpose or delivery form of a message sent to a worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxKind {
+    /// A prompt sent to an idle worker.
+    Prompt,
+    /// Guidance queued while the worker is busy.
+    Steer,
+    /// A worker brief.
+    Brief,
+    /// A generated review-fix brief.
+    Fix,
+}
+
+/// One durable lead-to-worker or system-to-worker message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxEntry {
+    /// Who sent the message.
+    pub sender: MessageSender,
+    /// The message's purpose or delivery form.
+    pub kind: InboxKind,
+    /// The original text, without the delivery header.
+    pub text: String,
+    /// Unix epoch milliseconds when Mnemo2 accepted the message.
+    pub at_ms: u128,
+}
+
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRecord {
     /// Stable worker id (the first 8 chars name the branch and worktree).
     pub id: String,
+    /// Messages sent to this worker, oldest first and capped at the latest 200.
+    #[serde(default)]
+    pub inbox: Vec<InboxEntry>,
     /// The worker's display name.
     pub name: String,
     /// The lead's brief: the task-specific instructions. Idempotent re-dispatch
@@ -1535,8 +1590,19 @@ impl TeamRuntime {
         }]
     }
 
-    /// Execute a lead host-tool call.
+    /// Execute a built-in lead host-tool call.
     pub async fn handle_lead_host_tool(&self, name: &str, args: Value) -> ToolResult {
+        self.handle_lead_host_tool_from(name, args, MessageSender::Lead)
+            .await
+    }
+
+    /// Execute a lead host-tool call with its caller's identity attached.
+    pub async fn handle_lead_host_tool_from(
+        &self,
+        name: &str,
+        args: Value,
+        sender: MessageSender,
+    ) -> ToolResult {
         if name == "team_dispatch" {
             let (Some(brief), Some(worker_id)) = (
                 args.get("brief").and_then(Value::as_str),
@@ -1661,7 +1727,7 @@ impl TeamRuntime {
         };
         let result = match name {
             "team_message" => match args.get("text").and_then(Value::as_str) {
-                Some(text) => self.message(worker_id, text.to_string()).await,
+                Some(text) => self.message(worker_id, text.to_string(), sender).await,
                 None => Err("team_message requires a 'text' string".to_string()),
             },
             "team_stop" => self.stop(worker_id).await,
@@ -2188,6 +2254,7 @@ impl TeamRuntime {
         let millis = phase3::now_ms();
         let record = WorkerRecord {
             id: reviewer_id.to_string(),
+            inbox: Vec::new(),
             name: format!("Audit {}", agent_short_id(reviewer_id)),
             brief: audit_brief,
             model,
@@ -2376,6 +2443,7 @@ impl TeamRuntime {
         let base_tip = phase3::tip(&worktree).await?;
         let record = WorkerRecord {
             id: id.clone(),
+            inbox: Vec::new(),
             name,
             brief,
             opening_prompt,
@@ -2577,14 +2645,35 @@ impl TeamRuntime {
         let _ = self.persist().await;
     }
 
-    /// Send the lead's message to a worker. A busy worker gets it as a steer;
-    /// an idle worker starts a new turn with it.
-    pub async fn message(&self, worker_id: &str, text: String) -> Result<WorkerRecord, String> {
+    /// Send a message to a worker with its sender attached. A busy worker gets
+    /// it as a steer; an idle worker starts a new turn with it.
+    pub async fn message(
+        &self,
+        worker_id: &str,
+        text: String,
+        sender: MessageSender,
+    ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
-        self.message_inner(worker_id, text).await
+        self.message_inner(worker_id, text, sender).await
     }
 
-    async fn message_inner(&self, worker_id: &str, text: String) -> Result<WorkerRecord, String> {
+    async fn message_inner(
+        &self,
+        worker_id: &str,
+        text: String,
+        sender: MessageSender,
+    ) -> Result<WorkerRecord, String> {
+        self.message_inner_with_kind(worker_id, text, sender, None)
+            .await
+    }
+
+    async fn message_inner_with_kind(
+        &self,
+        worker_id: &str,
+        text: String,
+        sender: MessageSender,
+        kind: Option<InboxKind>,
+    ) -> Result<WorkerRecord, String> {
         if text.trim().is_empty() {
             return Err("the worker message is empty".to_string());
         }
@@ -2599,6 +2688,8 @@ impl TeamRuntime {
                 "wait for the worker's compaction to finish before messaging it".to_string(),
             );
         }
+        let previous_inbox = record.inbox.clone();
+        let delivered_text = format!("{}\n{text}", sender.header());
         let (busy, idle, sent) = {
             let live = self.live.lock().await;
             let live = live
@@ -2607,17 +2698,43 @@ impl TeamRuntime {
             live.admit_session_command(worker_id)?;
             let busy = live.busy.clone();
             let idle = !busy.load(Ordering::SeqCst);
+            let kind = kind.unwrap_or(if idle {
+                InboxKind::Prompt
+            } else {
+                InboxKind::Steer
+            });
+            self.update_worker(worker_id, |worker| {
+                append_inbox(
+                    worker,
+                    InboxEntry {
+                        sender,
+                        kind,
+                        text: text.clone(),
+                        at_ms: now_key(),
+                    },
+                );
+            })
+            .await;
+            // Persist the receipt before the command can end another turn.
+            if let Err(err) = self.persist().await {
+                self.update_worker(worker_id, |worker| {
+                    worker.inbox = previous_inbox.clone();
+                })
+                .await;
+                let _ = self.persist().await;
+                return Err(err);
+            }
             if idle {
                 busy.store(true, Ordering::SeqCst);
             }
             let command = if idle {
                 SessionCommand::Prompt {
-                    text,
+                    text: delivered_text,
                     images: Vec::new(),
                 }
             } else {
                 SessionCommand::Steer {
-                    text,
+                    text: delivered_text,
                     images: Vec::new(),
                 }
             };
@@ -2628,6 +2745,9 @@ impl TeamRuntime {
             if idle {
                 busy.store(false, Ordering::SeqCst);
             }
+            self.update_worker(worker_id, |worker| worker.inbox = previous_inbox)
+                .await;
+            let _ = self.persist().await;
             return Err(format!("could not message the worker: {err}"));
         }
         self.update_worker(worker_id, |worker| {
@@ -2642,6 +2762,7 @@ impl TeamRuntime {
         self.persist().await?;
         self.worker(worker_id).await
     }
+
 
     /// Pause the worker's current turn without ending its session.
     pub async fn pause(&self, worker_id: &str) -> Result<WorkerRecord, String> {
@@ -3268,7 +3389,10 @@ impl TeamRuntime {
             "Fix review finding {}: {}\n{}\nFile: {}:{}\nCommit the fix, rerun the affected checks, and report evidence for delta review.",
             finding.id, finding.title, finding.detail, finding.file, finding.line
         );
-        if let Err(err) = self.message_inner(worker_id, brief).await {
+        if let Err(err) = self
+            .message_inner_with_kind(worker_id, brief, MessageSender::Mnemo, Some(InboxKind::Fix))
+            .await
+        {
             self.update_worker(worker_id, |worker| *worker = previous)
                 .await;
             self.persist().await?;
@@ -4261,7 +4385,9 @@ async fn worker_host_tool_result(
         text: text.to_string(),
         at_ms,
     });
-    ToolResult::success("message sent to the lead")
+    ToolResult::success(
+        "message sent to the lead. A reply, if any, arrives later as a new message that starts with a [From …] header; do not assume or invent a reply — continue your task or end your turn.",
+    )
 }
 
 /// Send a host-tool result back to the worker session.
@@ -4915,6 +5041,20 @@ fn without_transcripts(value: &mut Value) {
     }
 }
 
+const WORKER_INBOX_LIMIT: usize = 200;
+
+fn append_inbox(worker: &mut WorkerRecord, entry: InboxEntry) {
+    let overflow = worker
+        .inbox
+        .len()
+        .saturating_add(1)
+        .saturating_sub(WORKER_INBOX_LIMIT);
+    if overflow > 0 {
+        worker.inbox.drain(..overflow);
+    }
+    worker.inbox.push(entry);
+}
+
 fn now_key() -> u128 {
     phase3::now_ms() as u128
 }
@@ -5110,7 +5250,9 @@ pub(crate) fn executor_prompt() -> PromptSpec {
             "you do not act as a reviewer. File editing, shell commands, tests, and Git ",
             "commits are available and expected when needed. ",
             "Do not create or modify plans, spawn agents, or ask the user. When blocked, ",
-            "use message_parent with the precise issue and wait for the lead; never modify ",
+            "use message_parent with the precise issue and wait for the lead. A reply, if any, ",
+            "arrives later as a new message that starts with a [From …] header; do not assume ",
+            "or invent a reply — continue your task or end your turn. Never modify ",
             "TeamManager state or use Git/files as worker lifecycle status. Run relevant ",
             "checks, commit on the assigned worker branch, and report the actual commit and checks."
         )
@@ -5481,6 +5623,7 @@ mod tests {
         assert!(worker.fixer_finding_id.is_none());
         assert!(worker.merge.is_none());
         assert_eq!(worker.checks[0].tip, "");
+        assert!(worker.inbox.is_empty());
         // Legacy ledgers predate review risk: they decode as standard.
         assert_eq!(worker.review_risk, "standard");
         recover_worker(std::path::Path::new("unused"), &mut persisted.workers[0])
@@ -5489,6 +5632,47 @@ mod tests {
         assert!(persisted.workers[0].error.is_none());
         assert_eq!(persisted.workers[0].total_tokens, 120);
         assert_eq!(persisted.workers[0].prompt_tokens, 120);
+    }
+
+    #[test]
+    fn inbox_entries_use_the_stable_snapshot_shape() {
+        let entry = InboxEntry {
+            sender: MessageSender::ExternalLead,
+            kind: InboxKind::Fix,
+            text: "repair this".to_string(),
+            at_ms: 7,
+        };
+        assert_eq!(
+            serde_json::to_value(entry).expect("inbox JSON"),
+            json!({
+                "sender": "external_lead",
+                "kind": "fix",
+                "text": "repair this",
+                "at_ms": 7,
+            })
+        );
+    }
+
+    #[test]
+    fn inbox_keeps_only_the_latest_200_entries() {
+        let mut record = worker(std::path::Path::new("unused"), "inboxcap");
+        for index in 0..(WORKER_INBOX_LIMIT + 5) {
+            append_inbox(
+                &mut record,
+                InboxEntry {
+                    sender: MessageSender::User,
+                    kind: InboxKind::Prompt,
+                    text: format!("message {index}"),
+                    at_ms: index as u128,
+                },
+            );
+        }
+        assert_eq!(record.inbox.len(), WORKER_INBOX_LIMIT);
+        assert_eq!(record.inbox.first().expect("oldest retained").text, "message 5");
+        assert_eq!(
+            record.inbox.last().expect("newest retained").text,
+            "message 204"
+        );
     }
 
     /// Workers do the bulk of the work and run without any session limit.
@@ -5864,6 +6048,7 @@ mod tests {
         let branch = agent_branch(id);
         WorkerRecord {
             id: id.to_string(),
+            inbox: Vec::new(),
             name: id.to_string(),
             brief: "test worker".to_string(),
             opening_prompt: None,
@@ -6200,7 +6385,11 @@ models = [\"scripted-a\"]
             .pump
             .is_finished());
         let message = team
-            .message_inner(&worker.id, "must not run without a pump".into())
+            .message_inner(
+                &worker.id,
+                "must not run without a pump".into(),
+                MessageSender::Lead,
+            )
             .await
             .expect_err("a cleanup-retry-only worker rejects messages");
         assert!(message.contains("cleanup"), "{message}");

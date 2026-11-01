@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ListFilter, Square, Trash2, UsersRound } from "@lucide/svelte";
-  import { actions, app, OLD_WORKER_STATUSES, selectedWorker } from "../lib/store";
+  import { actions, app, isOldWorker, selectedWorker } from "../lib/store";
   import { openPlans } from "../lib/boardState";
   import type { Worker, WorkerStatus } from "../lib/types";
   import AvatarStack from "./AvatarStack.svelte";
@@ -23,7 +23,7 @@
   const needsCount = $derived($app.workers.filter((worker) => worker.needsYou).length);
   const activeCount = $derived($app.workers.filter((worker) => activeStatuses.includes(worker.status)).length);
   const doneCount = $derived($app.workers.filter((worker) => doneStatuses.includes(worker.status)).length);
-  const oldCount = $derived($app.workers.filter((worker) => OLD_WORKER_STATUSES.includes(worker.status)).length);
+  const oldCount = $derived($app.workers.filter(isOldWorker).length);
 
   let brief = $state("");
   let dispatching = $state(false);
@@ -112,7 +112,7 @@
     <div class="team-settings">
       <span class="slot-pill">{$app.teamActive} live / {$app.teamSlots} slots</span>
       <button class="button button-quiet" disabled={$app.teamActive === 0} onclick={() => actions.stopAll()}><Square size={11} /> Stop all</button>
-      <button class="button button-quiet" title="Delete merged, cancelled, stopped, interrupted, and failed workers with their history" disabled={oldCount === 0} onclick={() => actions.requestDeleteOldWorkers()}><Trash2 size={11} /> Delete old ({oldCount})</button>
+      <button class="button button-quiet" title="Delete merged, cancelled, stopped, interrupted, and failed workers, plus finished audits, with their history" disabled={oldCount === 0} onclick={() => actions.requestDeleteOldWorkers()}><Trash2 size={11} /> Delete old ({oldCount})</button>
     </div>
   </header>
 

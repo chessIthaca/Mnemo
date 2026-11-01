@@ -9,6 +9,7 @@ import {
   type TeamInboxEntry,
   type TeamMergeRecord,
   type TeamWorkerRecord,
+  type WorkerDeletionPreview,
 } from "./teamState";
 import type { ReviewEvidence } from "./types";
 
@@ -157,6 +158,7 @@ function makeTransport(initial: TeamWorkerRecord) {
       unmerged_commits: 2,
       shared_branch: false,
       blocked: null,
+      superseded_by: null,
     }))),
     deleteWorkers: vi.fn(async () => {
       deleted = true;
@@ -334,6 +336,50 @@ describe("native Phase 3 store integration", () => {
     actions.cancelDeleteWorkers();
     expect(get(app).workerDeletion).toBeNull();
     expect(stopped.deleteWorkers).not.toHaveBeenCalled();
+  });
+
+  it("delete old workers offers finished audit workers", async () => {
+    const merged = nativeWorker({ id: "mia", name: "Mia", status: "merged" });
+    const audit = nativeWorker({
+      id: "rex",
+      name: "Rex",
+      status: "completed",
+      kind: "audit",
+      audit_target: "mia",
+      audit_tip: "tip-1",
+    });
+    const implementation = nativeWorker({ id: "ivo", name: "Ivo", status: "completed" });
+    // A host older than `superseded_by` sends previews without the field.
+    const transport: TeamTransport = {
+      ...makeTransport(merged),
+      snapshot: vi.fn(async () => ({
+        workers: [merged, audit, implementation],
+        slots: 3,
+        active: 0,
+        usage: emptyProjectUsageView(),
+      })),
+      deletePreview: vi.fn(async (ids: string[]) => ids.map((id) => ({
+        worker_id: id,
+        name: "Rex",
+        branch: "wt/agent-rex",
+        live: false,
+        checkout: true,
+        uncommitted: false,
+        unmerged_commits: 1,
+        shared_branch: false,
+        blocked: null,
+      }) as WorkerDeletionPreview)),
+    };
+    team.transport = transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).workers).toHaveLength(3));
+
+    await actions.requestDeleteOldWorkers();
+    // Offered: the merged worker and the finished audit; the completed
+    // implementation worker still awaits review and is never offered.
+    expect(transport.deletePreview).toHaveBeenCalledWith(["mia", "rex"]);
+    // An older host's previews read superseded_by as null, never undefined.
+    expect(get(app).workerDeletion?.previews.every((preview) => preview.superseded_by === null)).toBe(true);
   });
 
   it("routes every finding and check operation through the real transport", async () => {

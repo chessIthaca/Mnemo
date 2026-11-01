@@ -16,6 +16,7 @@ function preview(overrides: Partial<WorkerDeletionPreview> = {}): WorkerDeletion
     unmerged_commits: 0,
     shared_branch: false,
     blocked: null,
+    superseded_by: null,
     ...overrides,
   };
 }
@@ -48,6 +49,29 @@ describe("WorkerDeleteSheet", () => {
     render(WorkerDeleteSheet);
     expect(screen.getByText("Discards 3 unmerged commits and uncommitted changes.")).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toContain("not on the lead branch");
+    expect(screen.getByRole("button", { name: "Delete and discard work" })).toBeTruthy();
+  });
+
+  it("names the worker that landed a superseded step instead of warning", async () => {
+    const confirm = vi.spyOn(actions, "confirmDeleteWorkers").mockResolvedValue(undefined);
+    open([preview({ unmerged_commits: 1, superseded_by: "senderReplay36" })]);
+    render(WorkerDeleteSheet);
+    expect(screen.getByText(/Its step landed through senderReplay36/)).toBeTruthy();
+    expect(screen.getByText(/its own 1 unmerged commit not on the lead branch will be discarded/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(confirm).toHaveBeenCalled();
+  });
+
+  it("counts only work no other worker landed in the warning", () => {
+    open([
+      preview({ worker_id: "w1", unmerged_commits: 1, superseded_by: "senderReplay36" }),
+      preview({ worker_id: "w2", name: "Worker w2", unmerged_commits: 2 }),
+    ]);
+    render(WorkerDeleteSheet);
+    expect(screen.getByText(/Its step landed through senderReplay36/)).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("1 worker has work that is not on the lead branch");
     expect(screen.getByRole("button", { name: "Delete and discard work" })).toBeTruthy();
   });
 

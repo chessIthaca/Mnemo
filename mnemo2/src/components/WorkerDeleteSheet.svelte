@@ -7,7 +7,8 @@
   const previews = $derived(request?.previews ?? []);
   const deletable = $derived(previews.filter((preview) => preview.blocked === null));
   const kept = $derived(previews.filter((preview) => preview.blocked !== null));
-  const discarding = $derived(deletable.filter(deletionDiscardsWork));
+  /** Deletable previews whose discarded work no other worker already landed. */
+  const losing = $derived(deletable.filter((preview) => deletionDiscardsWork(preview) && preview.superseded_by === null));
   const busy = $derived(request?.busy === true);
   const title = $derived(
     deletable.length === 1 ? `Delete ${deletable[0].name}?` : `Delete ${deletable.length} workers?`,
@@ -47,10 +48,14 @@
   {/if}
   <ul class="deletion-list">
     {#each deletable as preview (preview.worker_id)}
-      <li data-loss={deletionDiscardsWork(preview)}>
+      <li data-loss={deletionDiscardsWork(preview) && preview.superseded_by === null}>
         <strong>{preview.name}</strong>
         <span>{removes(preview)}</span>
-        {#if deletionDiscardsWork(preview)}<em>Discards {loss(preview)}.</em>{/if}
+        {#if deletionDiscardsWork(preview)}
+          {#if preview.superseded_by}
+            <em>Its step landed through {preview.superseded_by}; its own {loss(preview)} not on the lead branch will be discarded.</em>
+          {:else}<em>Discards {loss(preview)}.</em>{/if}
+        {/if}
       </li>
     {/each}
     {#each kept as preview (preview.worker_id)}
@@ -60,15 +65,15 @@
       </li>
     {/each}
   </ul>
-  {#if discarding.length > 0}
+  {#if losing.length > 0}
     <p class="loss-warning" role="alert">
-      {discarding.length === 1 ? "1 worker has" : `${discarding.length} workers have`} work that is not on the lead branch. Merge it first if you need it.
+      {losing.length === 1 ? "1 worker has" : `${losing.length} workers have`} work that is not on the lead branch. Merge it first if you need it.
     </p>
   {/if}
   <div class="dialog-actions">
     <button class="button button-quiet" disabled={busy} onclick={actions.cancelDeleteWorkers}>Cancel</button>
     <button class="button button-danger" disabled={busy || deletable.length === 0} onclick={actions.confirmDeleteWorkers}>
-      {busy ? "Deleting…" : discarding.length > 0 ? "Delete and discard work" : "Delete"}
+      {busy ? "Deleting…" : losing.length > 0 ? "Delete and discard work" : "Delete"}
     </button>
   </div>
 </Sheet>

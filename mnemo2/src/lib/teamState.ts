@@ -185,11 +185,34 @@ export interface WorkerDeletionPreview {
   shared_branch: boolean;
   /** Why this worker cannot be deleted now. */
   blocked: string | null;
+  /**
+   * The merged worker that landed this same plan step through its own
+   * branch, when one exists: the unmerged commits counted above are this
+   * worker's own superseded copy, not work lost forever. Null when no other
+   * worker landed the step, or when the host predates the field.
+   */
+  superseded_by: string | null;
 }
 
 /** Whether deleting this worker discards work the lead branch lacks. */
 export function deletionDiscardsWork(preview: WorkerDeletionPreview): boolean {
   return preview.uncommitted || preview.unmerged_commits > 0;
+}
+
+/**
+ * Map one deletion preview from the host's wire shape to the UI shape.
+ *
+ * `superseded_by` is newer than the preview itself: a host that predates the
+ * field sends no such key, which reads here as null — no other worker landed
+ * this preview's step, so the work its delete discards is genuinely lost.
+ */
+export function deletionPreviewFromWire(raw: WorkerDeletionPreview): WorkerDeletionPreview {
+  return {
+    ...raw,
+    superseded_by: typeof raw.superseded_by === "string" && raw.superseded_by.length > 0
+      ? raw.superseded_by
+      : null,
+  };
 }
 
 export interface TeamSnapshot {

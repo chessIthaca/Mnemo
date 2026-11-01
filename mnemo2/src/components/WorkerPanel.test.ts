@@ -141,6 +141,7 @@ function makeTeamTransport(records: TeamWorkerRecord[]): TeamTransport & { emit:
         unmerged_commits: 0,
         shared_branch: false,
         blocked: null,
+        superseded_by: null,
       })),
     ),
     deleteWorkers: vi.fn(async () => ({

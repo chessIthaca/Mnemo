@@ -32,6 +32,7 @@ import {
 } from "./workerSelection";
 import {
   deletionDiscardsWork,
+  deletionPreviewFromWire,
   emptyProjectUsage,
   findingFromWire,
   findingToWire,
@@ -1632,12 +1633,23 @@ function stopWorker(workerId: string) {
 /** Statuses of workers whose task is over — what "Delete old workers" offers. */
 export const OLD_WORKER_STATUSES: WorkerStatus[] = ["merged", "cancelled", "stopped", "interrupted", "failed"];
 
+/**
+ * Whether "Delete old workers" offers this worker: its task is over. That
+ * is any terminal status, plus finished audit workers — read-only reviewers
+ * are never merged, so they end in `completed`. A `completed` implementation
+ * worker still awaits review and is never offered here.
+ */
+export function isOldWorker(worker: Pick<Worker, "status" | "kind">): boolean {
+  return OLD_WORKER_STATUSES.includes(worker.status) ||
+    (worker.kind === "audit" && worker.status === "completed");
+}
+
 /** Ask what deleting these workers removes, then open the confirmation. */
 async function requestDeleteWorkers(workerIds: string[]): Promise<void> {
   const transport = requireTeam();
   if (!transport || workerIds.length === 0) return;
   try {
-    const previews = await transport.deletePreview(workerIds);
+    const previews = (await transport.deletePreview(workerIds)).map(deletionPreviewFromWire);
     app.update((state) => ({ ...state, workerDeletion: { previews, busy: false } }));
   } catch (error) {
     noteTeamError(error);
@@ -1646,9 +1658,7 @@ async function requestDeleteWorkers(workerIds: string[]): Promise<void> {
 
 /** Offer to delete every worker whose task is over. */
 async function requestDeleteOldWorkers(): Promise<void> {
-  const ids = get(app).workers
-    .filter((worker) => OLD_WORKER_STATUSES.includes(worker.status))
-    .map((worker) => worker.id);
+  const ids = get(app).workers.filter(isOldWorker).map((worker) => worker.id);
   if (ids.length === 0) {
     app.update((state) => withToast(state, "There are no old workers to delete."));
     return;

@@ -114,10 +114,10 @@
     },
     {
       "id": "5ce39273",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793483015207,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793505340199,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5ce39273-20261101-035540.md",
       "abandon_reason": null
     }
   ]

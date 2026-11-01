@@ -87,6 +87,38 @@
       "closed_at_ms": 1793457381988,
       "report_path": ".coding/reviews/claude-lead-0f378abe-round1.md",
       "abandon_reason": null
+    },
+    {
+      "id": "df0dd2d0",
+      "status": "open",
+      "created_at_ms": 1793481515446,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null
+    },
+    {
+      "id": "e061970d",
+      "status": "closed",
+      "created_at_ms": 1793481845500,
+      "closed_at_ms": 1793482597353,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e061970d-20261031-213637.md",
+      "abandon_reason": null
+    },
+    {
+      "id": "435c399e",
+      "status": "closed",
+      "created_at_ms": 1793482674809,
+      "closed_at_ms": 1793483644896,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-435c399e-20261031-215404.md",
+      "abandon_reason": null
+    },
+    {
+      "id": "5ce39273",
+      "status": "open",
+      "created_at_ms": 1793483015207,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null
     }
   ]
 }

@@ -7,6 +7,10 @@ const summary = atom({ plugin: 'mnemo-workers', key: 'summary' } as const, null)
 
 /** Statuses in which a worker is doing work right now. */
 const ACTIVE = new Set(['dispatching', 'working', 'fixing', 'merging'])
+/** Blocked on the person's approval or answer: shown until answered. */
+const BLOCKED = 'needs_you'
+/** How long a finished worker stays in the band after its last activity. */
+export const RECENT_MS = 2 * 60 * 1000
 /** How many worker rows the band shows before "+N more". */
 const MAX_ROWS = 6
 const POLL_MS = 4000
@@ -28,17 +32,42 @@ export function isActive(worker: SummaryWorker): boolean {
   return ACTIVE.has(worker.status)
 }
 
-/** The workers worth showing: active ones first, then the ones waiting on you. */
-export function shownWorkers(value: Summary | null): SummaryWorker[] {
-  if (!value) return []
-  const active = value.workers.filter(isActive)
-  const waiting = value.workers.filter(worker => !isActive(worker) && worker.needs_you)
-  return [...active, ...waiting]
+/** When a worker was last active: the host's time, else when this session first saw it idle. */
+const firstSeenIdle = new Map<string, number>()
+
+function lastActivity(worker: SummaryWorker, now: number): number {
+  if (typeof worker.last_activity_ms === 'number') return worker.last_activity_ms
+  const key = `${worker.id}:${worker.status}`
+  if (!firstSeenIdle.has(key)) firstSeenIdle.set(key, now)
+  return firstSeenIdle.get(key)!
 }
 
-/** The status entry: "Mnemo ▶2 ◆1", or nothing when no worker needs a look. */
+/**
+ * The workers worth showing: active ones first, then the ones blocked on you,
+ * then the ones that finished in the last two minutes.
+ */
+export function shownWorkers(value: Summary | null, now: number): SummaryWorker[] {
+  if (!value) return []
+  const active = value.workers.filter(isActive)
+  const blocked = value.workers.filter(worker => worker.status === BLOCKED)
+  const recent = value.workers.filter(worker =>
+    !isActive(worker)
+    && worker.status !== BLOCKED
+    && worker.needs_you
+    && now - lastActivity(worker, now) <= RECENT_MS,
+  )
+  return [...active, ...blocked, ...recent]
+}
+
+/** The summary cut down to the workers the band shows, or null when none. */
+export function bandSummary(value: Summary | null, now: number): Summary | null {
+  const workers = shownWorkers(value, now)
+  return value && workers.length > 0 ? { ...value, workers } : null
+}
+
+/** The status entry for the shown workers: "Mnemo ▶2 ◆1", or nothing. */
 export function statusText(value: Summary | null): string | undefined {
-  const workers = shownWorkers(value)
+  const workers = value?.workers ?? []
   if (workers.length === 0) return undefined
   const active = workers.filter(isActive).length
   return `Mnemo ▶${active} ◆${workers.length - active}`
@@ -76,7 +105,7 @@ async function helperPath($: EngineInterface): Promise<string> {
   return home ? `${home}/.mnemo/bin/mnemo2-mcp` : 'mnemo2-mcp'
 }
 
-/** The last summary drawn, so an unchanged answer does not redraw. */
+/** The last band drawn, so an unchanged answer does not redraw. */
 let last = ''
 
 async function refresh($: EngineInterface): Promise<void> {
@@ -91,6 +120,7 @@ async function refresh($: EngineInterface): Promise<void> {
   } catch {
     next = null
   }
+  next = bandSummary(next, await $.clock.now())
   const key = JSON.stringify(next)
   if (key === last) return
   last = key
@@ -131,7 +161,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const workers = shownWorkers(await read($, summary))
+    const workers = (await read($, summary))?.workers ?? []
     if (e.props.hasSurvey || workers.length === 0) return next(e)
 
     const { Box, Markdown, Text } = $.ui.resolve(e)

@@ -3,7 +3,9 @@
 A band above the prompt in Claude Desktop's Code tab that lists the running Mnemo2
 workers of the session's project with their short model name (`kimi`, `glm`,
 `deepseek-f`; `-f` marks a flash model), plus a status entry `Mnemo ▶N ◆M`
-(running / waiting on you). Clicking a worker's name opens that worker in Mnemo2's
+(running / other shown). Workers blocked on your approval or answer stay listed;
+finished ones (completed, in review, failed) show for two minutes after their last
+activity, then leave the band. Clicking a worker's name opens that worker in Mnemo2's
 mission control.
 
 It reads `mnemo2-mcp team-summary --json` every 4 s (and after each Mnemo tool call)

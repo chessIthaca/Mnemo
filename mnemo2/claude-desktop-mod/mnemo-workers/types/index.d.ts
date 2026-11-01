@@ -8,6 +8,8 @@ export type SummaryWorker = {
   status: string
   needs_you: boolean
   elapsed_ms: number
+  /** Epoch ms of the worker's last activity (newer hosts only). */
+  last_activity_ms?: number
 }
 
 /** The whole `team-summary` answer for the session's project. */

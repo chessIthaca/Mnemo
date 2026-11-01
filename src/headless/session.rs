@@ -673,31 +673,64 @@ impl AgentSession {
         Ok(())
     }
 
-    /// Close the session and wait until the agent task has released its loop.
-    /// Worktree-bound callers use this before deleting the checkout: the loop
-    /// owns that checkout's code graph and its open SQLite connection.
+    /// Close the session and wait until the agent and all of its descendants
+    /// have released their loops. Worktree-bound callers use this before
+    /// deleting the checkout: descendants inherit the same code graph and its
+    /// open SQLite connection.
     pub async fn close_and_wait(&self) -> Result<(), EngineError> {
-        let (manager_present, sent) = {
-            let manager = self.inner.host.manager.lock().await;
-            let present = manager.get(self.agent).is_some();
-            let sent = manager.send(self.agent, AgentCommand::Cancel).is_ok();
-            (present, sent)
-        };
         self.inner.sessions.lock().await.remove(&self.id);
-
-        // A missing manager entry is not sufficient proof: the event pump
-        // removes it before dropping the engine's AgentLoop reference. A full
-        // or closed queue with a manager entry is a failed close, unless the
-        // loop has already gone independently.
-        if manager_present && !sent && self.agent_loop.upgrade().is_some() {
-            return Err(EngineError::session_closed(
-                "could not queue cancellation; the agent is still live",
-            ));
-        }
+        let mut family_loops = vec![(self.agent, self.agent_loop.clone())];
         let released = async {
             loop {
-                if self.agent_loop.upgrade().is_none() {
-                    return;
+                let mut cancel_failed = None;
+                {
+                    let manager = self.inner.host.manager.lock().await;
+                    let mut family = vec![self.agent];
+                    family.extend(manager.descendant_ids(self.agent));
+                    let loops = self.inner.host.agent_loops.lock().await;
+                    for id in &family {
+                        let live = loops.get(id).cloned();
+                        if let Some(loop_ref) = live.as_ref() {
+                            let weak = std::sync::Arc::downgrade(loop_ref);
+                            if !family_loops
+                                .iter()
+                                .any(|(known, existing)| known == id && existing.ptr_eq(&weak))
+                            {
+                                family_loops.push((*id, weak));
+                            }
+                        }
+                        let loop_alive = live.is_some()
+                            || family_loops
+                                .iter()
+                                .any(|(known, weak)| known == id && weak.upgrade().is_some());
+                        if manager.get(*id).is_some()
+                            && manager.send(*id, AgentCommand::Cancel).is_err()
+                            && loop_alive
+                        {
+                            cancel_failed = Some(*id);
+                        }
+                    }
+                }
+                if let Some(id) = cancel_failed {
+                    return Err(EngineError::session_closed(format!(
+                        "could not queue cancellation for agent {id}; its loop is still live"
+                    )));
+                }
+                if family_loops
+                    .iter()
+                    .all(|(_, weak)| weak.upgrade().is_none())
+                {
+                    // Once the parent is dead no new child can be spawned. A
+                    // final registry scan closes the small window where a
+                    // child spawned just as the parent exited was not in the
+                    // preceding snapshot.
+                    let manager = self.inner.host.manager.lock().await;
+                    let mut final_family = vec![self.agent];
+                    final_family.extend(manager.descendant_ids(self.agent));
+                    let loops = self.inner.host.agent_loops.lock().await;
+                    if final_family.iter().all(|id| !loops.contains_key(id)) {
+                        return Ok(());
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -705,8 +738,10 @@ impl AgentSession {
         tokio::time::timeout(std::time::Duration::from_secs(10), released)
             .await
             .map_err(|_| {
-                EngineError::session_closed("timed out waiting for the agent loop to be released")
-            })?;
+                EngineError::session_closed(
+                    "timed out waiting for the agent family to release its loops",
+                )
+            })??;
         Ok(())
     }
 
@@ -888,5 +923,211 @@ mod lifecycle_tests {
             .expect("join close")
             .expect("close after the final loop reference is released");
         assert!(weak_loop.upgrade().is_none());
+    }
+
+    fn write_test_config(config: &std::path::Path) {
+        std::fs::write(
+            config.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"local\"\n",
+        )
+        .expect("config");
+        std::fs::write(
+            config.join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"local\"]\n",
+        )
+        .expect("endpoints");
+    }
+
+    fn test_engine_options(
+        root: &std::path::Path,
+        config: &std::path::Path,
+    ) -> crate::headless::EngineOptions {
+        crate::headless::EngineOptions {
+            workspace: crate::workspace::Workspace::new(root),
+            config_dir: Some(config.to_path_buf()),
+            permissions: crate::agent::policy::PermissionPolicy::OverridePermissions,
+            memory: crate::headless::MemoryBackend::Disabled,
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_a_descendant_holding_the_inherited_graph() {
+        let project = tempfile::tempdir().expect("project");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let config = tempfile::tempdir().expect("config");
+        write_test_config(config.path());
+        let engine = Engine::start(test_engine_options(project.path(), config.path()))
+            .await
+            .expect("start engine");
+        let session = engine
+            .spawn(SpawnOptions {
+                worktree: Some(worktree.path().to_path_buf()),
+                ..Default::default()
+            })
+            .await
+            .expect("spawn worktree parent");
+        let inner = session.inner.clone();
+        let parent = session.agent;
+        let (child, _) = crate::host::runtime::spawn_agent_shared(
+            crate::host::runtime::SpawnHost {
+                factory: inner.host.factory.clone(),
+                manager: inner.host.manager.clone(),
+                agent_loops: inner.host.agent_loops.clone(),
+            },
+            "child".to_string(),
+            None,
+            Some(parent),
+            crate::host::runtime::SessionOptions {
+                model: None,
+                role: None,
+                own_plans_dir: false,
+                worktree: None,
+                permission: Some(crate::agent::policy::PermissionPolicy::OverridePermissions),
+                initial_messages: None,
+                limits: None,
+                host_tools: Vec::new(),
+            },
+        )
+        .await
+        .expect("spawn a real descendant");
+        let (parent_loop, child_loop) = {
+            let loops = inner.host.agent_loops.lock().await;
+            (
+                loops.get(&parent).cloned().expect("parent loop"),
+                loops.get(&child).cloned().expect("child loop"),
+            )
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            parent_loop.graph.as_ref().expect("parent graph"),
+            child_loop.graph.as_ref().expect("inherited child graph")
+        ));
+        drop(parent_loop);
+        let weak_child = std::sync::Arc::downgrade(&child_loop);
+        let mut closing = tokio::spawn(async move { session.close_and_wait().await });
+
+        for _ in 0..100 {
+            let manager_gone = inner.host.manager.lock().await.get(child).is_none();
+            let registry_gone = !inner.host.agent_loops.lock().await.contains_key(&child);
+            if manager_gone && registry_gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(inner.host.manager.lock().await.get(child).is_none());
+        assert!(!inner.host.agent_loops.lock().await.contains_key(&child));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut closing)
+                .await
+                .is_err(),
+            "close returned while a descendant still owned the checkout graph"
+        );
+
+        drop(child_loop);
+        closing
+            .await
+            .expect("join close")
+            .expect("close after the descendant releases its loop");
+        assert!(weak_child.upgrade().is_none());
+        std::fs::remove_dir_all(worktree.path()).expect("remove the released worktree");
+    }
+
+    struct DigestLlm {
+        caps: crate::provider::Capabilities,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::LlmClient for DigestLlm {
+        fn capabilities(&self) -> &crate::provider::Capabilities {
+            &self.caps
+        }
+
+        fn kind(&self) -> crate::provider::ProviderKind {
+            crate::provider::ProviderKind::OpenAI
+        }
+
+        fn model(&self) -> &str {
+            "digest-test"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[crate::provider::Message],
+            _tools: &[crate::provider::ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+        ) -> crate::error::Result<futures::stream::BoxStream<'_, crate::provider::LlmEvent>> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(Box::pin(futures::stream::iter([
+                    crate::provider::LlmEvent::TextDelta { text: "served".into() },
+                    crate::provider::LlmEvent::Finish {
+                        reason: crate::provider::FinishReason::Stop,
+                    },
+                ])))
+            } else {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_the_worktree_corpus_digest() {
+        let project = tempfile::tempdir().expect("project");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let config = tempfile::tempdir().expect("config");
+        write_test_config(config.path());
+        std::fs::create_dir_all(project.path().join(".coding")).expect("memory state");
+        let llm = std::sync::Arc::new(DigestLlm {
+            caps: crate::provider::Capabilities::openai(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut options = test_engine_options(project.path(), config.path());
+        options.memory = crate::headless::MemoryBackend::Sqlite { path: None };
+        let engine = Engine::builder(options)
+            .provider(llm)
+            .start()
+            .await
+            .expect("start memory engine");
+        let session = engine
+            .spawn(SpawnOptions {
+                worktree: Some(worktree.path().to_path_buf()),
+                ..Default::default()
+            })
+            .await
+            .expect("spawn worktree session");
+        let plans_dir = session
+            .agent_loop
+            .upgrade()
+            .expect("parent loop")
+            .plans_dir()
+            .to_path_buf();
+        std::fs::create_dir_all(&plans_dir).expect("plans dir");
+        std::fs::write(plans_dir.join("digest.md"), "plan corpus").expect("plan corpus");
+        session
+            .run_to_completion("your summary is too long — keep it to 3 lines")
+            .await
+            .expect("establish working memory");
+        let gate = crate::runtime::agent::digest_test_gate::install(plans_dir.clone());
+        let mut closing = tokio::spawn(async move { session.close_and_wait().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("digest reached its blocking phase");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut closing)
+                .await
+                .is_err(),
+            "close returned before the worktree digest finished"
+        );
+        assert!(plans_dir.join("digest.md").is_file());
+
+        gate.release.notify_one();
+        closing
+            .await
+            .expect("join close")
+            .expect("close after the digest completes");
+        std::fs::remove_dir_all(worktree.path()).expect("remove the digested worktree");
     }
 }

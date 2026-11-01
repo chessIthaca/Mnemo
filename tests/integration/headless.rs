@@ -1493,10 +1493,6 @@ async fn consolidation_does_not_hold_a_worktree_codegraph_open() {
         .close_and_wait()
         .await
         .expect("close releases the loop and codegraph");
-    assert!(
-        llm.calls.load(Ordering::SeqCst) >= 2,
-        "session close did not start consolidation"
-    );
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         llm.consolidation_started.notified(),

@@ -153,6 +153,15 @@ impl AgentManager {
             .any(|h| h.is_running() && self.is_descendant_of(h.id, id))
     }
 
+    /// List every registered descendant of `id`, including grandchildren.
+    pub fn descendant_ids(&self, id: AgentId) -> Vec<AgentId> {
+        self.agents
+            .values()
+            .filter(|handle| self.is_descendant_of(handle.id, id))
+            .map(|handle| handle.id)
+            .collect()
+    }
+
     /// Whether `candidate` is a descendant of `ancestor` via the `parent_id`
     /// chain (child → parent → grandparent …). Bounded by the number of
     /// registered agents so a cyclic chain (shouldn't happen) can't loop.

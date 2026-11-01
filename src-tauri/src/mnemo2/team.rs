@@ -566,6 +566,8 @@ pub struct TeamRuntime {
     generation: Arc<AtomicU64>,
     next_worker: AtomicU64,
     lead_busy: AtomicBool,
+    #[cfg(test)]
+    fail_next_close: AtomicBool,
     lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
@@ -603,6 +605,23 @@ const TIER_PURPOSES: [(&str, &str); 3] = [
 pub const MAX_WORKER_SLOTS: usize = 32;
 
 impl TeamRuntime {
+    async fn close_session_for_cleanup(&self, session: &AgentSession) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_next_close.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected close failure for transition tests".to_string());
+        }
+        session
+            .close_and_wait()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    fn fail_next_close_for_test(&self) {
+        self.fail_next_close
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Open the team ledger, recover interrupted workers, and prepare to spawn.
     pub async fn open(options: TeamRuntimeOptions) -> Result<Self, String> {
         let persistence = TeamPersistence::new(&options.state_dir);
@@ -633,6 +652,8 @@ impl TeamRuntime {
             generation: Arc::new(AtomicU64::new(0)),
             next_worker: AtomicU64::new(1),
             lead_busy: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_close: AtomicBool::new(false),
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
@@ -2639,7 +2660,7 @@ impl TeamRuntime {
                 })
                 .await;
             }
-            if let Err(error) = live.session.close_and_wait().await {
+            if let Err(error) = self.close_session_for_cleanup(&live.session).await {
                 let message = format!("could not close worker session: {error}");
                 self.live.lock().await.insert(worker_id.to_string(), live);
                 self.update_worker(worker_id, |worker| {
@@ -3312,7 +3333,7 @@ impl TeamRuntime {
         let live = self.live.lock().await.remove(worker_id);
         if let Some(live) = live {
             live.abort();
-            if let Err(error) = live.session.close_and_wait().await {
+            if let Err(error) = self.close_session_for_cleanup(&live.session).await {
                 self.live.lock().await.insert(worker_id.to_string(), live);
                 self.update_worker(worker_id, |worker| {
                     // The Git merge landed, but keep the worker retryable:
@@ -3685,7 +3706,7 @@ impl TeamRuntime {
         let live = self.live.lock().await.remove(&record.id);
         if let Some(live) = live {
             live.abort();
-            if let Err(error) = live.session.close_and_wait().await {
+            if let Err(error) = self.close_session_for_cleanup(&live.session).await {
                 let message = format!("could not close {}'s session: {error}", record.name);
                 self.live.lock().await.insert(record.id.clone(), live);
                 return Err(message);
@@ -5861,6 +5882,28 @@ models = [\"scripted-a\"]
         .expect("open the test team")
     }
 
+    async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
+        let session = team
+            .spawn_worker_session(
+                worker.name.clone(),
+                None,
+                None,
+                worker.worktree.clone(),
+                None,
+                "implementation",
+            )
+            .await
+            .expect("spawn worker session");
+        team.live.lock().await.insert(
+            worker.id.clone(),
+            LiveWorker {
+                session,
+                pump: tokio::spawn(async {}),
+                busy: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
     #[cfg(windows)]
     fn create_directory_link(link: &std::path::Path, target: &std::path::Path) {
         let output = std::process::Command::new("cmd")
@@ -6002,6 +6045,98 @@ models = [\"scripted-a\"]
             std::fs::read_to_string(&outside_marker).expect("outside marker survives"),
             "outside\n"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_close_error_is_persisted_and_retryable() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let worker = worker(root.path(), "00000001000000000001");
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision worker");
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        spawn_live_worker(&team, &worker).await;
+        team.fail_next_close_for_test();
+
+        let error = team.stop_inner(&worker.id).await.expect_err("injected close failure");
+        assert!(error.contains("injected close failure"), "{error}");
+        assert!(team.live.lock().await.contains_key(&worker.id));
+        let persisted = TeamPersistence::new(state.path())
+            .load()
+            .expect("load team")
+            .expect("saved team");
+        assert!(persisted.workers[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected close failure")));
+
+        let stopped = team.stop_inner(&worker.id).await.expect("stop retry");
+        assert_eq!(stopped.status, WorkerStatus::Stopped);
+        assert!(!team.live.lock().await.contains_key(&worker.id));
+    }
+
+    #[tokio::test]
+    async fn merge_close_error_returns_to_review_and_retries_cleanup() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000001000000000001");
+        worker.status = WorkerStatus::InReview;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision worker");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        spawn_live_worker(&team, &worker).await;
+        team.fail_next_close_for_test();
+
+        let failed = team.merge(&worker.id).await.expect("merge close diagnostic");
+        assert_eq!(failed.status, WorkerStatus::InReview);
+        assert_eq!(failed.merge, None);
+        assert!(failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("retry merge")));
+        assert!(team.live.lock().await.contains_key(&worker.id));
+        assert!(worker.worktree.exists());
+        let persisted = TeamPersistence::new(state.path())
+            .load()
+            .expect("load team")
+            .expect("saved team");
+        assert_eq!(persisted.workers[0].status, WorkerStatus::InReview);
+        assert!(persisted.workers[0].error.is_some());
+
+        let merged = team.merge(&worker.id).await.expect("merge retry");
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert_eq!(merged.error, None);
+        assert!(!worker.worktree.exists());
+        assert!(!team.live.lock().await.contains_key(&worker.id));
     }
 
     #[tokio::test]

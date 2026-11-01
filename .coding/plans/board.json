@@ -223,6 +223,14 @@
       "closed_at_ms": 1793573038005,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-988fe146-20261101-224358.md",
       "abandon_reason": null
+    },
+    {
+      "id": "d23736c6",
+      "status": "closed",
+      "created_at_ms": 1793573978792,
+      "closed_at_ms": 1793574943622,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d23736c6-20261101-231543.md",
+      "abandon_reason": null
     }
   ]
 }

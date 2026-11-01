@@ -88,7 +88,7 @@
   .bench-header { display: flex; align-items: center; gap: 10px; min-height: 50px; padding: 0 12px; border-bottom: 1px solid var(--line); }
   .back-button { display: none; }
   .bench-tabs { display: flex; flex: 1; gap: 4px; }
-  .bench-tabs button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-sm); font-weight: 600; }
+  .bench-tabs button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-body); font-weight: 600; }
   .bench-tabs button.active { border-color: var(--line); background: var(--surface-soft); color: var(--ink); }
   .close-button { display: grid; width: 28px; height: 28px; place-items: center; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }
   .close-button:hover { background: var(--surface-soft); color: var(--ink); }

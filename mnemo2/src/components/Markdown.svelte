@@ -47,12 +47,11 @@
     max-width: 100%;
     overflow-x: auto;
     color: var(--ink);
-    font-family: var(--font-prose);
-    font-size: var(--text-md);
-    line-height: 1.62;
+    font-size: var(--text-body);
+    line-height: 1.5;
     overflow-wrap: anywhere;
   }
-  .markdown :global(p) { margin: 0 0 16px; }
+  .markdown :global(p) { margin: 0 0 10px; }
   .markdown :global(p:last-child) { margin-bottom: 0; }
   .markdown :global(h1), .markdown :global(h2), .markdown :global(h3),
   .markdown :global(h4), .markdown :global(h5), .markdown :global(h6) {
@@ -62,15 +61,15 @@
     letter-spacing: -0.01em;
     line-height: 1.35;
   }
-  .markdown :global(h1) { font-size: var(--text-xl); }
-  .markdown :global(h2) { font-size: var(--text-lg); }
-  .markdown :global(h3) { font-size: var(--text-lg); }
-  .markdown :global(h4) { font-size: var(--text-lg); }
-  .markdown :global(h5) { font-size: var(--text-md); }
-  .markdown :global(h6) { font-size: var(--text-md); color: var(--ink-soft); }
+  .markdown :global(h1) { font-size: var(--text-title); }
+  .markdown :global(h2) { font-size: var(--text-title); }
+  .markdown :global(h3) { font-size: var(--text-body); }
+  .markdown :global(h4) { font-size: var(--text-body); }
+  .markdown :global(h5) { font-size: var(--text-body); }
+  .markdown :global(h6) { font-size: var(--text-body); color: var(--ink-soft); }
   .markdown :global(h1:first-child), .markdown :global(h2:first-child), .markdown :global(h3:first-child),
   .markdown :global(h4:first-child), .markdown :global(h5:first-child), .markdown :global(h6:first-child) { margin-top: 0; }
-  .markdown :global(ul), .markdown :global(ol) { margin: 0 0 18px; padding-left: 22px; }
+  .markdown :global(ul), .markdown :global(ol) { margin: 0 0 12px; padding-left: 22px; }
   .markdown :global(li) { margin: 5px 0; padding-left: 3px; }
   .markdown :global(li > ul), .markdown :global(li > ol) { margin: 5px 0; }
   .markdown :global(li.task-list-item) { list-style: none; }
@@ -85,16 +84,16 @@
     background: var(--surface-soft);
     padding: 2px 5px;
     font-family: var(--font-mono);
-    font-size: var(--text-sm);
+    font-size: 0.92em;
   }
-  .markdown :global(table) { width: 100%; margin: 18px 0 22px; border-collapse: collapse; font-family: var(--font-ui); font-size: var(--text-md); line-height: 1.5; }
+  .markdown :global(table) { width: 100%; margin: 18px 0 22px; border-collapse: collapse; font-family: var(--font-ui); font-size: var(--text-body); line-height: 1.5; }
   .markdown :global(th), .markdown :global(td) { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; }
-  .markdown :global(th) { color: var(--muted); background: var(--surface-soft); font-size: var(--text-sm); letter-spacing: 0.06em; text-transform: uppercase; }
+  .markdown :global(th) { color: var(--muted); background: var(--surface-soft); font-size: var(--text-body); letter-spacing: 0.06em; text-transform: uppercase; }
   .markdown :global(.code-block) { margin: 20px 0; overflow: hidden; border: 1px solid #2f332e; border-radius: 12px; background: #20231f; }
-  .markdown :global(.code-toolbar) { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid #343832; color: #aeb6a7; font-family: var(--font-ui); font-size: var(--text-sm); letter-spacing: 0.06em; text-transform: uppercase; }
-  .markdown :global(.code-toolbar button) { border: 0; background: transparent; color: #c4ccbd; cursor: pointer; font-size: var(--text-sm); text-transform: none; }
+  .markdown :global(.code-toolbar) { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid #343832; color: #aeb6a7; font-family: var(--font-ui); font-size: var(--text-body); letter-spacing: 0.06em; text-transform: uppercase; }
+  .markdown :global(.code-toolbar button) { border: 0; background: transparent; color: #c4ccbd; cursor: pointer; font-size: var(--text-body); text-transform: none; }
   .markdown :global(pre) { margin: 0; padding: 16px; overflow-x: auto; }
-  .markdown :global(pre code) { padding: 0; background: transparent; color: #e5e9df; font-size: var(--text-md); line-height: 1.65; }
+  .markdown :global(pre code) { padding: 0; background: transparent; color: #e5e9df; font-size: 0.92em; line-height: 1.65; }
   .markdown :global(.hljs-keyword), .markdown :global(.hljs-built_in) { color: #c3b5f2; }
   .markdown :global(.hljs-string), .markdown :global(.hljs-title) { color: #b8d59f; }
   .markdown :global(.hljs-number), .markdown :global(.hljs-literal) { color: #e3bc8d; }

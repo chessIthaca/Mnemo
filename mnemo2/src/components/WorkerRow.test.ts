@@ -39,7 +39,7 @@ describe("WorkerRow", () => {
 
     const summaryStyle = getComputedStyle(summary);
     expect(summaryStyle.fontFamily).toBe("var(--font-ui)");
-    expect(summaryStyle.fontSize).toBe("var(--text-xs)");
+    expect(summaryStyle.fontSize).toBe("var(--text-meta)");
     expect(summaryStyle.color).toBe("var(--muted)");
     expect(summaryStyle.webkitLineClamp).toBe("3");
 

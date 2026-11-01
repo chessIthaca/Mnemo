@@ -85,24 +85,24 @@
 
 <style>
   .review-evidence { display: grid; gap: 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); }
-  .evidence-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.08em; }
+  .evidence-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .evidence-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-  .risk-badge, .pass-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-2xs); font-weight: 650; letter-spacing: 0; }
+  .risk-badge, .pass-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0; }
   .risk-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
   .pass-badge[data-recorded="true"] { background: var(--accent-soft); color: var(--accent-strong); }
   .pass-badge[data-recorded="false"] { background: var(--warning-soft); color: var(--warning); }
-  .evidence-summary { margin: 0; color: var(--ink-soft); font-size: var(--text-sm); line-height: 1.5; }
-  .evidence-note { margin: 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.5; }
+  .evidence-summary { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.5; }
+  .evidence-note { margin: 0; color: var(--muted); font-size: var(--text-meta); line-height: 1.5; }
   .evidence-note.legacy { color: var(--warning); }
-  .evidence-note code { font-family: var(--font-mono); font-size: var(--text-2xs); }
+  .evidence-note code { font-family: var(--font-mono); font-size: var(--text-meta); }
   .evidence-list { display: grid; gap: 8px; margin: 0; }
   .evidence-row { display: grid; grid-template-columns: 96px 1fr; gap: 10px; }
-  .evidence-row dt { color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.04em; text-transform: uppercase; }
-  .evidence-row dd { margin: 0; color: var(--ink-soft); font-size: var(--text-xs); line-height: 1.5; }
+  .evidence-row dt { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.04em; text-transform: uppercase; }
+  .evidence-row dd { margin: 0; color: var(--ink-soft); font-size: var(--text-meta); line-height: 1.5; }
   .evidence-audit { display: grid; gap: 6px; margin-top: 2px; padding-top: 9px; border-top: 1px solid var(--line); }
-  .audit-heading { color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.08em; }
-  .audit-line { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin: 0; color: var(--ink-soft); font-size: var(--text-xs); }
-  .audit-line code { padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); font-family: var(--font-mono); font-size: var(--text-2xs); }
-  .audit-adjudication { margin: 0; color: var(--ink-soft); font-size: var(--text-xs); line-height: 1.5; }
+  .audit-heading { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
+  .audit-line { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin: 0; color: var(--ink-soft); font-size: var(--text-meta); }
+  .audit-line code { padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .audit-adjudication { margin: 0; color: var(--ink-soft); font-size: var(--text-meta); line-height: 1.5; }
   .audit-adjudication[data-state="missing"] { color: var(--warning); }
 </style>

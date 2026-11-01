@@ -74,12 +74,12 @@
 <style>
   .external-lead-panel { display: flex; flex: 1; min-height: 0; flex-direction: column; justify-content: center; overflow-y: auto; padding: 22px 32px; }
   .external-notice { max-width: 62ch; margin: 0; padding: 20px 22px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
-  .notice-label { margin-bottom: 6px; color: var(--muted); font-size: var(--text-2xs); font-weight: 650; letter-spacing: 0.08em; }
-  h2 { margin: 0 0 8px; font-family: var(--font-prose); font-size: var(--text-xl); font-weight: 550; }
-  .notice-body { margin: 0; color: var(--ink-soft); font-size: var(--text-md); line-height: 1.55; }
-  .notice-meta { margin: 7px 0 0; color: var(--muted); font-size: var(--text-sm); }
+  .notice-label { margin-bottom: 6px; color: var(--muted); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0.08em; }
+  h2 { margin: 0 0 8px; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 550; }
+  .notice-body { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.55; }
+  .notice-meta { margin: 7px 0 0; color: var(--muted); font-size: var(--text-body); }
   .external-team { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
-  .external-team p { display: flex; flex-wrap: wrap; align-items: baseline; margin: 0 0 5px; color: var(--muted); font-size: var(--text-sm); }
+  .external-team p { display: flex; flex-wrap: wrap; align-items: baseline; margin: 0 0 5px; color: var(--muted); font-size: var(--text-body); }
   .external-team p:last-child { margin-bottom: 0; }
   .team-label { margin-right: 4px; font-weight: 650; }
   .team-sep { color: var(--muted); }

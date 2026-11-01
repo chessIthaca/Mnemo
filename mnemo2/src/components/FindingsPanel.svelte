@@ -118,30 +118,30 @@
 <style>
   .findings-panel { padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
   .section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
-  .section-heading p { margin: 0 0 3px; color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.12em; }
-  .section-heading h3 { margin: 0; font-size: var(--text-md); font-weight: 650; }
-  .section-heading > span { padding: 4px 7px; border-radius: 6px; background: var(--warning-soft); color: var(--warning); font-size: var(--text-2xs); }
+  .section-heading p { margin: 0 0 3px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.12em; }
+  .section-heading h3 { margin: 0; font-size: var(--text-body); font-weight: 650; }
+  .section-heading > span { padding: 4px 7px; border-radius: 6px; background: var(--warning-soft); color: var(--warning); font-size: var(--text-meta); }
   .finding { padding: 14px 0; border-top: 1px solid var(--line); }
   .finding-topline { display: flex; align-items: center; gap: 8px; }
-  .finding-topline > code { flex: 1; overflow: hidden; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-2xs); text-overflow: ellipsis; white-space: nowrap; }
-  .severity { padding: 3px 5px; border-radius: 5px; font-size: var(--text-2xs); font-weight: 700; text-transform: uppercase; }
+  .finding-topline > code { flex: 1; overflow: hidden; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
+  .severity { padding: 3px 5px; border-radius: 5px; font-size: var(--text-meta); font-weight: 700; text-transform: uppercase; }
   .severity[data-severity="high"] { background: #f4e4e1; color: var(--danger); }
   .severity[data-severity="low"] { background: var(--surface-soft); color: var(--muted); }
-  .finding-status { color: var(--muted); font-size: var(--text-2xs); }
-  .finding h4 { margin: 10px 0 5px; font-size: var(--text-sm); font-weight: 650; }
-  .finding > p { margin: 0; color: var(--muted); font-family: var(--font-prose); font-size: var(--text-md); line-height: 1.5; }
+  .finding-status { color: var(--muted); font-size: var(--text-meta); }
+  .finding h4 { margin: 10px 0 5px; font-size: var(--text-body); font-weight: 650; }
+  .finding > p { margin: 0; color: var(--muted); font-size: var(--text-body); line-height: 1.5; }
   .finding-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 12px; }
-  .finding-actions > span { flex-basis: 100%; color: var(--muted); font-size: var(--text-2xs); }
-  .text-action { padding: 6px; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-xs); }
+  .finding-actions > span { flex-basis: 100%; color: var(--muted); font-size: var(--text-meta); }
+  .text-action { padding: 6px; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-meta); }
   .text-action:hover { color: var(--danger); }
-  .resolution { display: flex; align-items: flex-start; gap: 6px; margin-top: 10px; color: var(--accent-strong); font-size: var(--text-2xs); line-height: 1.5; }
+  .resolution { display: flex; align-items: flex-start; gap: 6px; margin-top: 10px; color: var(--accent-strong); font-size: var(--text-meta); line-height: 1.5; }
   .resolution :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .resolution code { font-family: var(--font-mono); }
   .finding-form { margin-top: 12px; padding: 12px; border-radius: 10px; background: var(--surface-soft); }
-  .finding-form > code { display: block; margin-bottom: 8px; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-2xs); }
-  .finding-form label { display: block; margin: 8px 0 6px; color: var(--ink-soft); font-size: var(--text-xs); font-weight: 600; }
-  .finding-form textarea { width: 100%; resize: vertical; padding: 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font-family: var(--font-mono); font-size: var(--text-sm); }
+  .finding-form > code { display: block; margin-bottom: 8px; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .finding-form label { display: block; margin: 8px 0 6px; color: var(--ink-soft); font-size: var(--text-meta); font-weight: 600; }
+  .finding-form textarea { width: 100%; resize: vertical; padding: 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font-family: var(--font-mono); font-size: var(--text-body); }
   .finding-form > div { display: flex; justify-content: flex-end; gap: 7px; margin-top: 8px; }
-  .empty-findings { display: flex; align-items: center; gap: 8px; padding: 18px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: var(--text-sm); }
-  .review-closed { display: flex; align-items: center; gap: 6px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--accent-strong); font-size: var(--text-xs); }
+  .empty-findings { display: flex; align-items: center; gap: 8px; padding: 18px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: var(--text-body); }
+  .review-closed { display: flex; align-items: center; gap: 6px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--accent-strong); font-size: var(--text-meta); }
 </style>

@@ -629,7 +629,7 @@ describe("LeadChat", () => {
       expect(getComputedStyle(user).maxWidth).toBe("650px");
       const prose = assistant.querySelector<HTMLElement>(".markdown p")!;
       const proseStyle = getComputedStyle(prose);
-      expect(proseStyle.fontSize).toBe("var(--text-md)");
+      expect(proseStyle.fontSize).toBe("var(--text-body)");
       // jsdom cannot resolve the token; apply its value to exercise the ch unit.
       prose.style.fontSize = "13px";
       expect(getComputedStyle(prose).maxWidth).toBe("650px");

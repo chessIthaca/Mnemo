@@ -54,14 +54,14 @@
 
 <style>
   .inbox-panel { margin: 0 0 18px; }
-  .inbox-heading { margin-bottom: 8px; color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.08em; }
+  .inbox-heading { margin-bottom: 8px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .inbox-entry { min-width: 0; }
   .inbox-entry + .inbox-entry { margin-top: 10px; }
   .inbox-meta { display: flex; align-items: center; gap: 6px; }
-  .inbox-meta strong { font-size: var(--text-xs); font-weight: 650; }
-  .kind-tag { padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-2xs); font-weight: 650; text-transform: uppercase; }
-  .inbox-meta time { margin-left: auto; color: var(--muted); font-size: var(--text-2xs); }
+  .inbox-meta strong { font-size: var(--text-meta); font-weight: 650; }
+  .kind-tag { padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; text-transform: uppercase; }
+  .inbox-meta time { margin-left: auto; color: var(--muted); font-size: var(--text-meta); }
   .inbox-body { margin: 4px 0 0; padding: 9px 11px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); }
-  .inbox-body :global(.markdown) { font-size: var(--text-sm); line-height: 1.5; }
+  .inbox-body :global(.markdown) { font-size: var(--text-body); line-height: 1.5; }
   .inbox-body :global(p) { margin-bottom: 8px; }
 </style>

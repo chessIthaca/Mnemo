@@ -62,12 +62,12 @@
   .first-index { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; padding: 16px; background: rgb(247 247 244 / 82%); backdrop-filter: blur(3px); }
   .card { width: min(420px, 100%); padding: 22px 24px 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow); }
   .icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 10px; background: var(--accent-soft); color: var(--accent-strong); }
-  h2 { margin: 14px 0 6px; font-size: var(--text-lg); font-weight: 650; }
-  p { margin: 0 0 18px; color: var(--ink-soft); font-size: var(--text-md); line-height: 1.55; }
+  h2 { margin: 14px 0 6px; font-size: var(--text-title); font-weight: 650; }
+  p { margin: 0 0 18px; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.55; }
   .bar { position: relative; height: 4px; overflow: hidden; border-radius: 2px; background: var(--line); }
   .bar > span { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--accent); transition: width 240ms ease; }
   .bar.counting > span { width: 30%; animation: sweep 1.3s ease-in-out infinite; }
-  .counter { margin-top: 8px; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+  .counter { margin-top: 8px; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-body); font-variant-numeric: tabular-nums; }
   @keyframes sweep { from { left: -30%; } to { left: 100%; } }
   @media (prefers-reduced-motion: reduce) { .bar.counting > span { animation: none; left: 35%; } }
 </style>

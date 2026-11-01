@@ -12,6 +12,6 @@
 {/if}
 
 <style>
-  .external-lead-badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--accent-soft); color: var(--accent-strong); font-size: var(--text-xs); font-weight: 600; line-height: 1.2; white-space: nowrap; }
+  .external-lead-badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--accent-soft); color: var(--accent-strong); font-size: var(--text-meta); font-weight: 600; line-height: 1.2; white-space: nowrap; }
   .dot { width: 4px; height: 4px; flex: 0 0 auto; border-radius: 50%; background: var(--accent); }
 </style>

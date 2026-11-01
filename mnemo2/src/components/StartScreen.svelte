@@ -103,48 +103,48 @@
 <style>
   .start-screen { min-height: 100vh; min-height: 100dvh; overflow-y: auto; background: var(--canvas); }
   .start-nav { display: flex; align-items: center; justify-content: space-between; width: min(100%, 860px); margin: 0 auto; padding: 24px 32px; }
-  .brand { display: inline-flex; align-items: center; gap: 9px; color: var(--ink); font-size: var(--text-md); font-weight: 680; text-decoration: none; }
+  .brand { display: inline-flex; align-items: center; gap: 9px; color: var(--ink); font-size: var(--text-body); font-weight: 680; text-decoration: none; }
   .brand-mark, .project-monogram { display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--accent-strong); font-family: var(--font-prose); }
-  .brand-mark { width: 28px; height: 28px; font-size: var(--text-lg); }
+  .brand-mark { width: 28px; height: 28px; font-size: var(--text-title); }
   .start-nav-end { display: flex; align-items: center; gap: 14px; }
-  .phase-label { color: var(--muted); font-size: var(--text-2xs); font-weight: 650; letter-spacing: 0.13em; }
+  .phase-label { color: var(--muted); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0.13em; }
   .start-main { width: min(100%, 860px); margin: 0 auto; padding: 48px 32px 80px; }
   .picker-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
-  .picker-heading h1 { margin: 0; font-family: var(--font-prose); font-size: var(--text-xl); font-weight: 500; letter-spacing: -0.03em; }
-  .picker-heading span { color: var(--muted); font-size: var(--text-2xs); letter-spacing: 0.12em; }
+  .picker-heading h1 { margin: 0; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; letter-spacing: -0.03em; }
+  .picker-heading span { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.12em; }
   .project-list { display: grid; gap: 8px; }
   .project-card { overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
   .project-open { display: flex; align-items: center; gap: 12px; width: 100%; min-width: 0; padding: 13px 14px; border: 0; background: transparent; color: var(--ink); cursor: pointer; text-align: left; }
   .project-open:hover:not(:disabled) { background: var(--surface-soft); }
   .project-open:disabled { opacity: 0.55; cursor: not-allowed; }
-  .project-monogram { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 9px; font-size: var(--text-lg); }
+  .project-monogram { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 9px; font-size: var(--text-title); }
   .project-info { min-width: 0; flex: 1; }
   .project-info strong, .project-info small, .project-path { display: block; }
-  .project-info strong { font-size: var(--text-md); }
-  .project-info small { margin-top: 2px; color: var(--muted); font-size: var(--text-sm); }
-  .project-path { margin-top: 4px; overflow: hidden; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+  .project-info strong { font-size: var(--text-body); }
+  .project-info small { margin-top: 2px; color: var(--muted); font-size: var(--text-body); }
+  .project-path { margin-top: 4px; overflow: hidden; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
   .project-meta { display: flex; flex: 0 0 auto; flex-direction: column; align-items: flex-end; gap: 3px; text-align: right; }
-  .project-meta > span { display: flex; align-items: center; gap: 4px; color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-xs); }
-  .project-meta small { color: var(--muted); font-size: var(--text-xs); }
+  .project-meta > span { display: flex; align-items: center; gap: 4px; color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .project-meta small { color: var(--muted); font-size: var(--text-meta); }
   .project-meta :global(.model-badge) { max-width: 145px; overflow: hidden; text-overflow: ellipsis; }
   .project-card :global(.project-arrow) { color: var(--muted); }
   .recovery-actions { display: flex; align-items: center; gap: 6px; padding: 0 12px 10px 60px; }
-  .recovery-actions > span { margin-right: auto; color: var(--muted); font-size: var(--text-sm); }
+  .recovery-actions > span { margin-right: auto; color: var(--muted); font-size: var(--text-body); }
   .start-actions { display: flex; gap: 8px; margin-top: 14px; }
-  .empty-projects { color: var(--muted); font-size: var(--text-md); line-height: 1.6; }
-  .dialog-copy { margin: 0 0 16px; color: var(--muted); font-family: var(--font-prose); font-size: var(--text-md); line-height: 1.65; }
-  .dialog-copy code { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--text-sm); }
+  .empty-projects { color: var(--muted); font-size: var(--text-body); line-height: 1.6; }
+  .dialog-copy { margin: 0 0 16px; color: var(--muted); font-size: var(--text-body); line-height: 1.65; }
+  .dialog-copy code { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--text-body); }
   .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
   .new-project { display: grid; gap: 10px; }
-  .new-project label { color: var(--ink-soft); font-size: var(--text-sm); font-weight: 600; }
-  .new-project input { padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: var(--text-md); }
+  .new-project label { color: var(--ink-soft); font-size: var(--text-body); font-weight: 600; }
+  .new-project input { padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: var(--text-body); }
   @media (max-width: 560px) {
     .start-nav { padding: 20px; }
     .start-main { padding: 32px 20px 60px; }
     .phase-label { display: none; }
     .project-meta small { display: none; }
     .project-open { gap: 10px; padding: 12px; }
-    .project-monogram { width: 30px; height: 30px; font-size: var(--text-lg); }
+    .project-monogram { width: 30px; height: 30px; font-size: var(--text-title); }
     .recovery-actions { flex-wrap: wrap; padding-left: 54px; }
     .recovery-actions > span { flex-basis: 100%; }
   }

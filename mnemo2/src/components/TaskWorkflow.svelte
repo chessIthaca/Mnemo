@@ -42,12 +42,12 @@
 {/if}
 
 <style>
-  .workflow-compact { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-soft); font-size: var(--text-2xs); font-weight: 600; letter-spacing: 0.02em; white-space: nowrap; }
-  .workflow-compact small { color: var(--muted); font-size: var(--text-2xs); font-weight: 400; }
+  .workflow-compact { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-soft); font-size: var(--text-meta); font-weight: 600; letter-spacing: 0.02em; white-space: nowrap; }
+  .workflow-compact small { color: var(--muted); font-size: var(--text-meta); font-weight: 400; }
   .workflow-compact[data-state="blocked"] { color: var(--danger, #a34a3a); }
   .workflow-compact[data-state="done"] { color: var(--muted); }
   .task-workflow { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 10px; margin: 0; padding: 0; list-style: none; }
-  .task-workflow li { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: var(--text-2xs); font-weight: 500; letter-spacing: 0.02em; white-space: nowrap; }
+  .task-workflow li { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: var(--text-meta); font-weight: 500; letter-spacing: 0.02em; white-space: nowrap; }
   .task-workflow li[data-status="active"] { color: var(--ink); font-weight: 650; }
   .task-workflow li[data-status="done"] { color: var(--ink-soft); }
   .task-workflow li[data-status="blocked"] { color: var(--danger, #a34a3a); }

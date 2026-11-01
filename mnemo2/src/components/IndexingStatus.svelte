@@ -87,7 +87,7 @@
 {/each}
 
 <style>
-  .indexing { display: inline-flex; align-items: center; gap: 7px; font-size: var(--text-sm); font-weight: 500; letter-spacing: 0; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .indexing { display: inline-flex; align-items: center; gap: 7px; font-size: var(--text-body); font-weight: 500; letter-spacing: 0; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .failed { color: var(--danger); cursor: help; }
   .finished { gap: 4px; color: var(--accent-strong); animation: fade-out 600ms ease 3400ms forwards; }
   @keyframes fade-out { to { opacity: 0; } }

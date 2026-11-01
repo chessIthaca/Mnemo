@@ -132,21 +132,21 @@
   .resizer:hover::after, .resizer.resizing::after, .resizer:focus-visible::after { background: var(--accent); }
   .panel-header { display: grid; flex: 0 0 auto; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
   .panel-heading { display: flex; align-items: center; gap: 10px; min-width: 0; }
-  .panel-heading select { max-width: 60%; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); color: var(--ink); font-size: var(--text-sm); font-weight: 600; }
-  .panel-status { color: var(--muted); font-size: var(--text-xs); letter-spacing: 0.07em; text-transform: uppercase; }
+  .panel-heading select { max-width: 60%; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); color: var(--ink); font-size: var(--text-body); font-weight: 600; }
+  .panel-status { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.07em; text-transform: uppercase; }
   .panel-meta { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
-  .pill { padding: 3px 7px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface-soft); color: var(--muted); font-size: var(--text-xs); }
+  .pill { padding: 3px 7px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface-soft); color: var(--muted); font-size: var(--text-meta); }
   .pill.plan { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .panel-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
-  .handoff-button { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-sm); font-weight: 600; }
+  .handoff-button { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-body); font-weight: 600; }
   .handoff-button:hover { border-color: var(--line-strong); background: var(--surface-soft); color: var(--ink); }
   .close-button { display: grid; width: 28px; height: 28px; place-items: center; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }
   .close-button:hover { background: var(--surface-soft); color: var(--ink); }
   .panel-body { flex: 1; min-height: 0; display: flex; }
   .panel-banner { display: grid; flex: 0 0 auto; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--warning-soft); }
-  .banner-error { margin: 0; color: var(--danger); font-size: var(--text-sm); line-height: 1.45; }
+  .banner-error { margin: 0; color: var(--danger); font-size: var(--text-body); line-height: 1.45; }
   .banner-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  .banner-button { display: inline-flex; align-items: center; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-sm); font-weight: 600; }
+  .banner-button { display: inline-flex; align-items: center; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-body); font-weight: 600; }
   .banner-button:hover { background: var(--surface-soft); color: var(--ink); }
   .banner-button.continue { border-color: var(--danger); background: var(--danger); color: white; }
   .banner-button.continue:hover { background: #8a423b; }

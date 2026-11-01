@@ -79,15 +79,15 @@
 </Sheet>
 
 <style>
-  .dialog-copy { margin: 0 0 12px; color: var(--muted); font-family: var(--font-prose); font-size: var(--text-md); line-height: 1.65; }
+  .dialog-copy { margin: 0 0 12px; color: var(--muted); font-size: var(--text-body); line-height: 1.65; }
   .deletion-list { display: grid; gap: 6px; max-height: 280px; margin: 0 0 12px; padding: 0; overflow-y: auto; list-style: none; }
   .deletion-list li { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
   .deletion-list li[data-loss="true"] { border-color: #e3c7c2; background: #fbf3f1; }
   .deletion-list li.kept { opacity: 0.75; }
-  .deletion-list strong { color: var(--ink); font-size: var(--text-sm); font-weight: 650; }
-  .deletion-list span { color: var(--muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
-  .deletion-list em { color: var(--danger); font-size: var(--text-sm); font-style: normal; font-weight: 600; }
-  .loss-warning { margin: 0 0 12px; color: var(--danger); font-size: var(--text-sm); line-height: 1.5; }
+  .deletion-list strong { color: var(--ink); font-size: var(--text-body); font-weight: 650; }
+  .deletion-list span { color: var(--muted); font-size: var(--text-body); overflow-wrap: anywhere; }
+  .deletion-list em { color: var(--danger); font-size: var(--text-body); font-style: normal; font-weight: 600; }
+  .loss-warning { margin: 0 0 12px; color: var(--danger); font-size: var(--text-body); line-height: 1.5; }
   .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
   .button-danger { background: var(--danger); color: white; }
   .button-danger:hover:not(:disabled) { background: #8a4039; }

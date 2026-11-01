@@ -144,22 +144,22 @@
   .chrome-button:hover:not(:disabled) { background: var(--surface); color: var(--ink); }
   .chrome-button:disabled { opacity: 0.4; cursor: default; }
   .address-form { display: flex; flex: 1; min-width: 0; align-items: center; gap: 6px; padding: 3px 3px 3px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); }
-  .address-form input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-sm); }
-  .go-button { padding: 5px 8px; border: 0; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); cursor: pointer; font-size: var(--text-sm); }
-  .page-title { display: flex; justify-content: space-between; gap: 12px; padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--ink-soft); font-size: var(--text-sm); }
-  .page-title span { color: var(--muted); font-size: var(--text-sm); }
-  .browser-error { padding: 8px 12px; border-bottom: 1px solid #e3c7c0; background: #fbf0ee; color: #8d4d46; font-size: var(--text-sm); line-height: 1.5; }
+  .address-form input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-body); }
+  .go-button { padding: 5px 8px; border: 0; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); cursor: pointer; font-size: var(--text-body); }
+  .page-title { display: flex; justify-content: space-between; gap: 12px; padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--ink-soft); font-size: var(--text-body); }
+  .page-title span { color: var(--muted); font-size: var(--text-body); }
+  .browser-error { padding: 8px 12px; border-bottom: 1px solid #e3c7c0; background: #fbf0ee; color: #8d4d46; font-size: var(--text-body); line-height: 1.5; }
   .browser-content { position: relative; flex: 1; min-height: 0; overflow: hidden; background: white; }
   .native-page { position: absolute; inset: 0; }
   .page-hidden { visibility: hidden; pointer-events: none; }
   .browser-empty { display: grid; height: 100%; align-content: center; justify-items: center; padding: 28px; color: var(--muted); text-align: center; }
-  .browser-empty h2 { margin: 16px 0 8px; color: var(--ink); font-family: var(--font-prose); font-size: var(--text-xl); font-weight: 550; }
-  .browser-empty p { max-width: 340px; margin: 0 0 20px; font-size: var(--text-md); line-height: 1.65; }
-  .browser-status { padding: 24px; color: var(--muted); font-size: var(--text-md); }
+  .browser-empty h2 { margin: 16px 0 8px; color: var(--ink); font-family: var(--font-prose); font-size: var(--text-page); font-weight: 550; }
+  .browser-empty p { max-width: 340px; margin: 0 0 20px; font-size: var(--text-body); line-height: 1.65; }
+  .browser-status { padding: 24px; color: var(--muted); font-size: var(--text-body); }
   .screenshot-page { display: flex; height: 100%; min-height: 0; flex-direction: column; background: var(--surface-soft); }
-  .screenshot-page header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: var(--text-sm); }
+  .screenshot-page header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: var(--text-body); }
   .screenshot-page header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .screenshot-page img { flex: 1; min-height: 0; object-fit: contain; }
-  .screenshot-page p { padding: 20px; color: var(--muted); font-size: var(--text-md); }
-  @media (max-width: 480px) { .browser-chrome { gap: 4px; padding: 7px; } .chrome-button { width: 25px; } .address-form input { font-size: var(--text-sm); } }
+  .screenshot-page p { padding: 20px; color: var(--muted); font-size: var(--text-body); }
+  @media (max-width: 480px) { .browser-chrome { gap: 4px; padding: 7px; } .chrome-button { width: 25px; } .address-form input { font-size: var(--text-body); } }
 </style>

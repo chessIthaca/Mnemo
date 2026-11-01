@@ -86,7 +86,7 @@
     background: transparent;
     color: var(--accent-strong);
     cursor: pointer;
-    font-size: var(--text-xs);
+    font-size: var(--text-meta);
     font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;

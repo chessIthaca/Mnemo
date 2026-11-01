@@ -103,28 +103,25 @@
   .tool-icon[data-status="running"], .tool-icon[data-status="completed"] { color: var(--accent-strong); }
   .tool-icon[data-status="failed"] { color: var(--danger); }
   .tool-copy { flex: 0 1 auto; min-width: 0; }
-  .tool-copy strong { display: block; overflow: hidden; color: var(--ink-soft); font-size: var(--text-md); font-weight: 560; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+  .tool-copy strong { display: block; overflow: hidden; color: var(--muted); font-size: var(--text-body); font-weight: 500; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
   .tool-heading:hover .tool-copy strong { color: var(--accent-strong); }
-  .tool-status { flex: 0 0 auto; color: var(--muted); font-size: var(--text-xs); }
+  .tool-status { flex: 0 0 auto; color: var(--muted); font-size: var(--text-meta); }
   .tool-status[data-status="running"] { color: var(--accent-strong); }
   .tool-status[data-status="failed"] { color: var(--danger); }
   .tool-status :global(.elapsed-time) { color: var(--muted); }
   .tool-heading :global(.tool-chevron) { flex: 0 0 auto; margin-left: auto; color: var(--muted); transition: transform 120ms ease; }
   .tool-disclosure[open] .tool-heading :global(.tool-chevron) { transform: rotate(90deg); }
   .tool-details { margin: 6px 0 2px 26px; padding-top: 6px; border-top: 1px solid var(--line); }
-  .tool-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); font-size: var(--text-xs); }
-  .tool-identity code { color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-sm); }
+  .tool-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); font-size: var(--text-meta); }
+  .tool-identity code { color: var(--ink-soft); font-family: var(--font-mono); font-size: 0.92em; }
   .tool-detail-section { margin-top: 8px; }
-  .tool-detail-section h4 { margin: 0 0 5px; color: var(--muted); font-size: var(--text-xs); font-weight: 600; }
-  .tool-detail-section pre, .tool-live { max-height: 240px; margin: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-sm); line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+  .tool-detail-section h4 { margin: 0 0 5px; color: var(--muted); font-size: var(--text-meta); font-weight: 600; }
+  .tool-detail-section pre, .tool-live { max-height: 240px; margin: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-body); line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
   .tool-detail-section pre { padding: 10px 12px; }
   /* A fixed-height window on the newest lines: it grows to LIVE_ROWS as output
      arrives and never shrinks, so the conversation below does not jump. */
   .tool-live { box-sizing: content-box; height: calc(var(--live-rows, 1) * 1lh); margin: 4px 0 2px 26px; padding: 6px 10px; overflow: hidden; }
-  .tool-error { margin: 4px 0 4px 26px; color: var(--danger); font-size: var(--text-sm); line-height: 1.5; }
+  .tool-error { margin: 4px 0 4px 26px; color: var(--danger); font-size: var(--text-body); line-height: 1.5; }
   .tool-spinner { display: grid; place-items: center; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  @media (max-width: 560px) {
-    .tool-copy strong { font-size: var(--text-sm); }
-  }
 </style>

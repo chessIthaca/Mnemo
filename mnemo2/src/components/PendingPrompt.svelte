@@ -79,10 +79,10 @@
   }
   header { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; }
   .prompt-icon { display: grid; color: var(--accent-strong); }
-  .prompt-label { color: var(--muted); font-size: var(--text-2xs); font-weight: 650; letter-spacing: 0.08em; }
+  .prompt-label { color: var(--muted); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0.08em; }
   .prompt-scroll { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-  .prompt-question :global(.markdown) { color: var(--ink); font-size: var(--text-md); line-height: 1.55; }
-  .prompt-text { margin: 0; color: var(--ink-soft); font-family: var(--font-prose); font-size: var(--text-md); line-height: 1.5; }
+  .prompt-question :global(.markdown) { color: var(--ink); font-size: var(--text-body); line-height: 1.55; }
+  .prompt-text { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.5; }
   .prompt-options { display: grid; gap: 6px; margin-top: 10px; }
   .prompt-option {
     display: flex;
@@ -100,10 +100,10 @@
   .prompt-option:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
   .prompt-option:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .prompt-option:disabled { cursor: default; opacity: 0.6; }
-  .option-index { display: grid; width: 18px; height: 18px; flex: 0 0 auto; place-items: center; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-sm); }
+  .option-index { display: grid; width: 18px; height: 18px; flex: 0 0 auto; place-items: center; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-body); }
   .option-copy { display: grid; gap: 2px; min-width: 0; }
-  .option-copy strong { font-size: var(--text-md); font-weight: 600; line-height: 1.45; }
-  .option-copy span { color: var(--muted); font-size: var(--text-sm); line-height: 1.45; }
+  .option-copy strong { font-size: var(--text-body); font-weight: 600; line-height: 1.45; }
+  .option-copy span { color: var(--muted); font-size: var(--text-body); line-height: 1.45; }
   .prompt-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-  .prompt-hint { margin: 8px 0 0; color: var(--muted); font-size: var(--text-sm); }
+  .prompt-hint { margin: 8px 0 0; color: var(--muted); font-size: var(--text-body); }
 </style>

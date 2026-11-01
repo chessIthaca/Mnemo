@@ -42,10 +42,10 @@
   .event-icon { display: grid; width: 22px; height: 22px; flex: 0 0 auto; place-items: center; border-radius: 7px; background: var(--surface-soft); color: var(--ink-soft); }
   [data-tone="merge"] .event-icon { background: #e2ebdc; color: var(--accent-strong); }
   [data-tone="review"] .event-icon { background: #ece8de; color: #6f6046; }
-  .event-heading { min-width: 0; overflow: hidden; color: var(--ink); font-size: var(--text-md); font-weight: 600; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+  .event-heading { min-width: 0; overflow: hidden; color: var(--ink); font-size: var(--text-body); font-weight: 600; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
   summary:hover .event-heading { color: var(--accent-strong); }
   summary :global(.event-chevron) { flex: 0 0 auto; margin-left: auto; color: var(--muted); transition: transform 120ms ease; }
   .event-row[open] summary :global(.event-chevron) { transform: rotate(90deg); }
-  .event-body { margin: 6px 0 4px 30px; color: var(--ink-soft); font-size: var(--text-sm); }
+  .event-body { margin: 6px 0 4px 30px; color: var(--ink-soft); font-size: var(--text-body); }
   @media (max-width: 560px) { .event-row { margin-left: 0; } }
 </style>

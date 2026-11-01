@@ -394,7 +394,7 @@
     outline: 0;
     background: transparent;
     color: var(--ink);
-    font-size: var(--text-md);
+    font-size: var(--text-body);
     line-height: 1.55;
   }
   textarea::placeholder { color: #999c91; }
@@ -411,12 +411,12 @@
     cursor: pointer;
   }
   .send-button:disabled { background: var(--surface-soft); color: #adb0a6; cursor: default; }
-  .stop-button { display: inline-flex; width: auto; min-width: 64px; gap: 6px; padding: 0 10px; border: 1px solid var(--line); background: var(--surface-soft); color: var(--ink); font-size: var(--text-sm); font-weight: 600; }
+  .stop-button { display: inline-flex; width: auto; min-width: 64px; gap: 6px; padding: 0 10px; border: 1px solid var(--line); background: var(--surface-soft); color: var(--ink); font-size: var(--text-body); font-weight: 600; }
   .stop-button:hover { border-color: var(--line-strong); background: var(--line); }
   .stop-button:disabled { cursor: wait; }
   .composer-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 14px; padding: 8px 4px 0; }
-  .composer-status { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: var(--text-2xs); font-weight: 600; letter-spacing: 0.04em; }
-  .confirm-copy { margin: 0 0 16px; color: var(--muted); font-family: var(--font-prose); font-size: var(--text-md); line-height: 1.55; }
+  .composer-status { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: var(--text-meta); font-weight: 600; letter-spacing: 0.04em; }
+  .confirm-copy { margin: 0 0 16px; color: var(--muted); font-size: var(--text-body); line-height: 1.55; }
   .confirm-actions { display: flex; justify-content: space-between; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
   @media (max-width: 560px) { .composer { width: 100%; } }
 </style>

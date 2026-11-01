@@ -172,9 +172,9 @@ impl EngineBuilder {
                 || self.memory_store.is_some()
                 || self.shared.is_some())
         {
-            return Err(EngineError::start_failed(format!(
+            return Err(EngineError::start_failed(
                 "brain injection is exclusive with provider/memory_store/shared_resources — the injected brain carries its own transport, store, and resources"
-            )));
+            ));
         }
         start_inner(
             self.opts,
@@ -212,7 +212,7 @@ impl Engine {
     /// accessors read the same brain. Job 6: the field is the shared
     /// `Arc<Brain>` — the same Arc an injected host app holds.
     pub(crate) fn brain(&self) -> &Brain {
-        &*self.brain
+        &self.brain
     }
     /// Start an engine on an EXPLICIT workspace + config (§5.3 :297).
     /// Never blocks and never shows a picker (§7 row 9): an unusable

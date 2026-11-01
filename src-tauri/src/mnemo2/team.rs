@@ -755,10 +755,7 @@ impl TeamRuntime {
             pricing: lead.pricing()?,
         })
         .await
-        .map(|team| {
-            team.set_tiers(lead.tiers());
-            team
-        })
+        .inspect(|team| team.set_tiers(lead.tiers()))
     }
 
     /// Replace the model tiers new dispatches resolve against.
@@ -1861,6 +1858,8 @@ impl TeamRuntime {
     /// The one production dispatch path: a task on a plan step (1-based),
     /// checked against the board before anything is provisioned. The lead's
     /// `team_dispatch` tool and the Control Room form both land here.
+    // One parameter per dispatch knob — the tool and the Control Room form pass them explicitly.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_on_plan(
         &self,
         brief: String,
@@ -2410,6 +2409,8 @@ impl TeamRuntime {
         Ok(())
     }
 
+    // One parameter per provisioning input the dispatch sites pass explicitly.
+    #[allow(clippy::too_many_arguments)]
     async fn provision_worker(
         &self,
         brief: String,
@@ -4472,6 +4473,8 @@ fn usage_cost_micros(
 
 /// Forward one worker session's events, update its durable record, and refresh
 /// the transcript when the turn ends.
+// Each parameter is one shared worker handle — the pump's wiring stays flat.
+#[allow(clippy::too_many_arguments)]
 async fn pump_worker(
     worker_id: String,
     generation: u64,
@@ -4538,7 +4541,7 @@ async fn pump_worker(
                     worker.elapsed_ms = activity_ms.saturating_sub(worker.created_at_ms);
                 }
                 match &event.event {
-                    SerializableAgentEvent::Started => {
+                    SerializableAgentEvent::Started
                         if !matches!(
                             worker.status,
                             WorkerStatus::Paused
@@ -4547,27 +4550,27 @@ async fn pump_worker(
                                 | WorkerStatus::Failed
                                 | WorkerStatus::Merged
                                 | WorkerStatus::Cancelled
-                        ) {
-                            turn_active = true;
-                            busy.store(true, Ordering::SeqCst);
-                            worker.status = if worker.fixer_finding_id.is_some() {
-                                WorkerStatus::Fixing
-                            } else {
-                                WorkerStatus::Working
-                            };
-                            changed = true;
-                        }
+                        ) =>
+                    {
+                        turn_active = true;
+                        busy.store(true, Ordering::SeqCst);
+                        worker.status = if worker.fixer_finding_id.is_some() {
+                            WorkerStatus::Fixing
+                        } else {
+                            WorkerStatus::Working
+                        };
+                        changed = true;
                     }
-                    SerializableAgentEvent::ModelChanged { model, .. } => {
+                    SerializableAgentEvent::ModelChanged { model, .. }
+                        if event_session(&event) == Some(session_id) =>
+                    {
                         // The engine's bus is engine-wide: only OUR
                         // session's model change may re-point this
                         // worker's observed model (and its next usage
                         // row) — a concurrent worker's ModelChanged must
                         // not cross into it.
-                        if event_session(&event) == Some(session_id) {
-                            worker.model_id = Some(model.clone());
-                            changed = true;
-                        }
+                        worker.model_id = Some(model.clone());
+                        changed = true;
                     }
                     SerializableAgentEvent::Usage {
                         prompt_tokens,
@@ -5092,7 +5095,7 @@ fn append_inbox(worker: &mut WorkerRecord, entry: InboxEntry) {
 }
 
 fn now_key() -> u128 {
-    phase3::now_ms() as u128
+    phase3::now_ms()
 }
 
 /// `path` relative to the project root with forward slashes; the path as-is
@@ -5577,13 +5580,12 @@ fn deny_rule(tool: &str, pattern: String) -> GateRule {
 /// so these hold under `OverridePermissions`. Patterns match the call's
 /// JSON-serialized args (see `DeclarativePolicy::gate_call`).
 fn executor_gate_rules() -> Vec<GateRule> {
-    let mut rules = Vec::new();
     // The structured `git` tool. `checkout` takes a branch, never paths
     // (paths go through `restore`), so every checkout is a branch switch.
-    rules.push(deny_rule(
+    let mut rules = vec![deny_rule(
         "git",
         r#"(?i)"subcommand":"(?:push|merge|checkout|delete)""#.to_string(),
-    ));
+    )];
     rules.push(deny_rule("git", r#"(?i)"action":"delete""#.to_string()));
     // `action` alone can carry the subcommand, except for `stash` + `push`.
     rules.push(GateRule {

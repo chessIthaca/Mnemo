@@ -162,9 +162,7 @@ pub fn run_with<R: BufRead>(
 
 /// The JSON-RPC id of a request; None for notifications and client responses.
 fn request_id(msg: &Value) -> Option<Value> {
-    if msg.get("method").is_none() {
-        return None;
-    }
+    msg.get("method")?;
     msg.get("id").filter(|id| !id.is_null()).cloned()
 }
 

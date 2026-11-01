@@ -582,7 +582,7 @@ impl LeadRuntime {
             .lock()
             .await
             .clone()
-            .or_else(|| snapshot.model);
+            .or(snapshot.model);
         let model_id = observed.or_else(|| {
             selected
                 .as_deref()
@@ -792,8 +792,7 @@ impl LeadRuntime {
             if live.busy.load(Ordering::SeqCst) {
                 return Err("stop the current turn before changing models".to_string());
             }
-            let old = guard.take().expect("live session checked above");
-            old
+            guard.take().expect("live session checked above")
         };
         let snapshot = match old.session.snapshot().await {
             Ok(snapshot) => snapshot,
@@ -1331,6 +1330,8 @@ async fn send_to_in_app_lead(
     }
 }
 
+// Each parameter is one shared lead handle the pump observes — the wiring stays flat.
+#[allow(clippy::too_many_arguments)]
 async fn pump_events(
     generation: u64,
     engine: Arc<Mutex<Option<Arc<Engine>>>>,

@@ -453,6 +453,23 @@ fn actual_word(actual: &str) -> String {
     }
 }
 
+/// The retired tool names a model may still emit from priors. The
+/// unknown-tool error carries a one-shot redirect naming the live tool
+/// and its argument shape instead of leaving the model to guess
+/// (backlog 6954f3e9). This is error-text recovery only: the names stay
+/// undispatchable, and no silent alias is registered for them.
+pub(crate) fn legacy_tool_redirect(name: &str) -> Option<&'static str> {
+    match name {
+        "file_read" => Some(
+            "file_read was folded into read_files — call read_files with {\"files\": [{\"path\": …, \"start_line\"?: …, \"max_lines\"?: …}]}",
+        ),
+        "file_append" => Some(
+            "file_append was folded into file_write — call file_write with {\"path\": …, \"content\": …, \"mode\": \"append\"}",
+        ),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,22 +799,5 @@ mod tests {
         let msg = sanitize_arguments_error_with("file_edit", &err, &received);
         assert!(msg.contains("bytes of arguments"), "{msg}");
         assert!(!msg.contains("dropped in emission"), "{msg}");
-    }
-}
-
-/// The retired tool names a model may still emit from priors. The
-/// unknown-tool error carries a one-shot redirect naming the live tool
-/// and its argument shape instead of leaving the model to guess
-/// (backlog 6954f3e9). This is error-text recovery only: the names stay
-/// undispatchable, and no silent alias is registered for them.
-pub(crate) fn legacy_tool_redirect(name: &str) -> Option<&'static str> {
-    match name {
-        "file_read" => Some(
-            "file_read was folded into read_files — call read_files with {\"files\": [{\"path\": …, \"start_line\"?: …, \"max_lines\"?: …}]}",
-        ),
-        "file_append" => Some(
-            "file_append was folded into file_write — call file_write with {\"path\": …, \"content\": …, \"mode\": \"append\"}",
-        ),
-        _ => None,
     }
 }

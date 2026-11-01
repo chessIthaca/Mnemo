@@ -370,11 +370,12 @@ fn prepare_edit_lines(
     // historical line-range semantics).
     if let Some(id) = &args.from_read {
         if !args.old_string.is_empty() {
-            return Err(crate::error::Error::InvalidInput(format!(
+            return Err(crate::error::Error::InvalidInput(
                 "from_read and old_string are BOTH set — exactly one anchor form: \
-                 {{old_string, new_string}} (verbatim) or {{from_read, lines, \
-                 new_string}} (read-receipt cite)"
-            )));
+                 {old_string, new_string} (verbatim) or {from_read, lines, \
+                 new_string} (read-receipt cite)"
+                    .to_string(),
+            ));
         }
         crate::tool::agent::read_registry::resolve(id, validated_path, start, end, content)?;
     }

@@ -55,6 +55,9 @@ pub const DEFAULT_SLOTS: usize = 3;
 /// detached and the in-app lead takes over again.
 pub const EXTERNAL_LEAD_IDLE_MS: u64 = 10 * 60 * 1000;
 
+/// The durable-learning nudge appended to external-lead merge and close results.
+pub const EXTERNAL_LEAD_MEMORY_REMINDER: &str = "Record durable SPEC:/DECISION:/HOW: learnings with memory_write and supersede stale records with memory_supersede.";
+
 /// The most notices an unread external queue keeps; the oldest are dropped.
 const EXTERNAL_QUEUE_CAP: usize = 256;
 
@@ -504,6 +507,9 @@ struct ExternalLead {
     undelivered: VecDeque<String>,
     /// Its last call (MCP, notices or wait), in Unix epoch milliseconds.
     last_activity_ms: u64,
+    /// Successful memory searches in the current plan-creation window.
+    memory_search_since_plan_create: bool,
+    bug_search_since_plan_create: bool,
     /// Waiters currently blocked in [`TeamRuntime::wait_external_notices`].
     waiters: usize,
 }
@@ -843,6 +849,7 @@ impl TeamRuntime {
 
     /// Share the lead's one plan board with the team.
     pub(crate) fn attach_board(&self, board: Arc<PlanBoard>) {
+        board.set_external_lead_attached(self.external_lead_attached());
         *self.board.lock().unwrap_or_else(|e| e.into_inner()) = Some(board);
     }
 
@@ -946,6 +953,12 @@ impl TeamRuntime {
         }
         state.since_ms = Some(state.last_activity_ms);
         state.queue = std::mem::take(&mut state.undelivered);
+        state.memory_search_since_plan_create = false;
+        state.bug_search_since_plan_create = false;
+        drop(state);
+        if let Some(board) = self.board() {
+            board.set_external_lead_attached(true);
+        }
         true
     }
 
@@ -966,8 +979,13 @@ impl TeamRuntime {
             while state.undelivered.len() > EXTERNAL_QUEUE_CAP {
                 state.undelivered.pop_front();
             }
+            state.memory_search_since_plan_create = false;
+            state.bug_search_since_plan_create = false;
             was_attached
         };
+        if let Some(board) = self.board() {
+            board.set_external_lead_attached(false);
+        }
         self.external_wake.notify_waiters();
         was_attached
     }
@@ -975,6 +993,45 @@ impl TeamRuntime {
     /// Whether an external lead currently leads this team.
     pub fn external_lead_attached(&self) -> bool {
         self.external_state().since_ms.is_some()
+    }
+
+    /// Refuse an external-lead plan until its attachment searched memory.
+    /// Bug-fixing plans additionally require a search narrowed to bug records.
+    pub fn external_plan_create_refusal(&self, bug_fixing: bool) -> Option<String> {
+        let state = self.external_state();
+        state.since_ms?;
+        if !state.memory_search_since_plan_create {
+            return Some(
+                "plan_create refused: call memory_search first, then retry plan_create."
+                    .to_string(),
+            );
+        }
+        if bug_fixing && !state.bug_search_since_plan_create {
+            return Some(
+                "plan_create refused for kind bug_fixing: call memory_search with record_type \"bug\", then retry plan_create."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Record a successful external-lead memory search for the current
+    /// attachment and current plan-creation window.
+    pub fn record_external_memory_search(&self, bug_search: bool) {
+        let mut state = self.external_state();
+        if state.since_ms.is_some() {
+            state.memory_search_since_plan_create = true;
+            state.bug_search_since_plan_create |= bug_search;
+        }
+    }
+
+    /// Start a fresh required-search window after a successful plan_create.
+    pub fn record_external_plan_create(&self) {
+        let mut state = self.external_state();
+        if state.since_ms.is_some() {
+            state.memory_search_since_plan_create = false;
+            state.bug_search_since_plan_create = false;
+        }
     }
 
     /// When the external lead attached (Unix epoch milliseconds), if it is.
@@ -3523,6 +3580,9 @@ impl TeamRuntime {
                     lines.push(format!(
                         "{retired_notes} plan-scoped memory note(s) were retired into that report. Read them and re-store any durable fact without plan or branch references."
                     ));
+                }
+                if self.external_lead_attached() {
+                    lines.push(EXTERNAL_LEAD_MEMORY_REMINDER.to_string());
                 }
                 notice = Some(format!("closed:{plan_id}:{relative}"));
             }

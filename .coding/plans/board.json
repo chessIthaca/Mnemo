@@ -90,10 +90,10 @@
     },
     {
       "id": "df0dd2d0",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793481515446,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793492100215,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-df0dd2d0-20261101-001500.md",
       "abandon_reason": null
     },
     {

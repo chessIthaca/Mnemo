@@ -28,6 +28,29 @@ describe("Mnemo2 navigation and draft preservation", () => {
     ).toBeTruthy();
   });
 
+  it("opens the Cost and Graph tabs from the top bar", async () => {
+    render(App);
+
+    await fireEvent.click(screen.getByRole("button", { name: /^Cost/ }));
+    expect(state().route).toBe("cost");
+    expect(await screen.findByRole("region", { name: "Cost" })).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "Message the lead" })).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: /^Graph/ }));
+    expect(state().route).toBe("graph");
+    expect(await screen.findByRole("region", { name: "Code graph" })).toBeTruthy();
+  });
+
+  it("opens the Cost tab from the cost chip", async () => {
+    render(App);
+
+    await fireEvent.click(screen.getByRole("button", { name: /Project cost/ }));
+
+    expect(state().route).toBe("cost");
+    expect(await screen.findByRole("region", { name: "Cost" })).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
+  });
+
   it("restores an unsent text and image draft across Lead → Team → Lead", async () => {
     render(App);
     const input = await textbox();

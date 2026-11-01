@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ChevronDown, MessageSquare, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
+  import { ChartColumn, ChevronDown, MessageSquare, Network, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
   import { actions, app, currentProject, needsYouCount } from "../lib/store";
   import { formatTokenCount, formatUsageCost, usageIsPartial, usageTotalTokens } from "../lib/usage";
   import AvatarStack from "./AvatarStack.svelte";
@@ -16,7 +16,7 @@
   const usagePartial = $derived(usageIsPartial(usage));
   const totalTokens = $derived(usageTotalTokens(usage));
   const usageLabel = $derived(
-    `Project cost ${costLabel}${usagePartial ? ", partial estimate: some usage has no price" : ""}. Open project settings.`,
+    `Project cost ${costLabel}${usagePartial ? ", partial estimate: some usage has no price" : ""}. Open the Cost tab.`,
   );
   let settingsOpen = $state(false);
   let usageTipOpen = $state(false);
@@ -25,6 +25,12 @@
   function handleTeam() {
     // Team always opens Mission Control directly — never the right-side peek.
     actions.openTeam();
+  }
+
+  /** Leave the project sheet for the install-wide endpoints and tiers dialog. */
+  function openAppSettings() {
+    settingsOpen = false;
+    appSettingsOpen = true;
   }
 
   function setSlots(event: Event) {
@@ -48,6 +54,8 @@
     <button class:active={$app.route === "team"} aria-pressed={$app.route === "team"} onclick={handleTeam}><UsersRound size={14} /> Team
       {#if $needsYouCount > 0}<span class="nav-badge">{$needsYouCount}</span>{/if}
     </button>
+    <button class:active={$app.route === "cost"} aria-pressed={$app.route === "cost"} onclick={actions.openCost}><ChartColumn size={14} /> Cost</button>
+    <button class:active={$app.route === "graph"} aria-pressed={$app.route === "graph"} onclick={actions.openGraph}><Network size={14} /> Graph</button>
   </nav>
 
   <div class="topbar-right">
@@ -63,7 +71,7 @@
         onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench("browser"))}
       ><PanelsTopLeft size={15} /></button>
     {/if}
-    <button class="icon-button" aria-label="Settings" onclick={() => (appSettingsOpen = true)}><Settings size={15} /></button>
+    <button class="icon-button" aria-label="Project settings" onclick={() => (settingsOpen = true)}><Settings size={15} /></button>
     <ExternalLeadBadge />
     <ContextRing />
     <div class="usage-chip">
@@ -75,7 +83,7 @@
         onmouseleave={() => (usageTipOpen = false)}
         onfocus={() => (usageTipOpen = true)}
         onblur={() => (usageTipOpen = false)}
-        onclick={() => (settingsOpen = true)}
+        onclick={actions.openCost}
       >
         <Wallet size={13} />
         <span class="usage-cost">{costLabel}{#if usagePartial}<span class="usage-partial" aria-hidden="true">+</span>{/if}</span>
@@ -106,6 +114,7 @@
   </div>
   <div class="settings-row"><div><strong>Lead model</strong><small>Planning and review</small></div><LeadModelPicker compact /></div>
   <div class="settings-row"><div><strong>Merge policy</strong><small>Checks and review must close on the merge-time tip; merges are serialized into this project’s working branch.</small></div><span class="settings-value settings-ok">Guarded</span></div>
+  <div class="settings-row"><div><strong>Endpoints &amp; pricing</strong><small>Configure model endpoints, prices and tier routing for this install.</small></div><button class="button button-quiet" onclick={openAppSettings}>Open</button></div>
   <div class="settings-actions">
     <button class="button button-primary" onclick={() => (settingsOpen = false)}>Done</button>
   </div>

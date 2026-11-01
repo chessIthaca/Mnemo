@@ -12,9 +12,16 @@
 //! The marker is best-effort — `write` failures (read-only project, disk
 //! trouble) must never block startup. Stale markers from dead instances are
 //! ignored: `conflict_for` consults a caller-supplied aliveness predicate
-//! (`startup::instance_pid_alive` in the app — Windows `OpenProcess` probe,
-//! elsewhere a `ps` check) instead of enumerating processes here, which
-//! keeps this module platform-neutral and unit-testable.
+//! (`startup::instance_pid_alive` in the app — Windows `OpenProcess` +
+//! exit-code probe, elsewhere a `ps` check) instead of enumerating
+//! processes here, which keeps this module platform-neutral and
+//! unit-testable. On Windows the probe must go deeper than OpenProcess: an
+//! exited process keeps its kernel object while any process still holds a
+//! handle to it (d23736c6 — a hard-stopped instance's leftover marker
+//! thereby blocked the project as "in use"), so only a `STILL_ACTIVE` exit
+//! code proves the pid is live. A pid recycled to an unrelated live
+//! process still reads as its writer — the same accepted residual class
+//! as the exit-time window below.
 //!
 //! The write has a removal counterpart: on clean exit and when an instance
 //! switches away from a project, `remove_marker_if_self` deletes the marker
@@ -67,23 +74,36 @@ impl InstanceMarker {
     }
 }
 
-/// Whether a marker's process still exists, without a platform-specific libc dependency.
+/// Whether a marker's process still exists, without a platform-specific
+/// libc dependency. On Windows this is more than an `OpenProcess` probe:
+/// an exited process keeps its kernel object while ANY process still
+/// holds a handle to it (the launcher's `Child` — bug d23736c6, where a
+/// hard-stopped instance's leftover marker read as alive and blocked the
+/// project as "in use"), so the pid is live only when `GetExitCodeProcess`
+/// yields `STILL_ACTIVE`. A process that really exits with code 259 is
+/// indistinguishable from a live one — accepted: the marker warns, it
+/// never locks.
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
 
-        // SAFETY: fixed flags, no handle inheritance; the handle is closed immediately.
+        // SAFETY: fixed flags, no handle inheritance; the handle is
+        // closed on every path below.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             return false;
         }
-        // SAFETY: the handle was returned by OpenProcess and is no longer used.
+        // SAFETY: the handle comes from OpenProcess above and outlives
+        // this call; query access suffices for GetExitCodeProcess.
+        let mut exit_code: u32 = 0;
+        let probed = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: the handle is no longer used.
         unsafe { CloseHandle(handle) };
-        true
+        probed != 0 && exit_code == STILL_ACTIVE as u32
     }
     #[cfg(not(windows))]
     {
@@ -268,5 +288,42 @@ mod tests {
         assert!(!remove_marker_if_self(&dir, 42).unwrap());
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test (2026-11-01 bug, plan d23736c6): a hard-stopped
+    /// Mnemo2 left `.coding/instance.json` naming its pid, and the next
+    /// launch refused the project as "in use" — `pid_alive` read that pid
+    /// as alive because the launcher still held the exited process object.
+    /// This test reproduces the shape: a process that HAS exited but whose
+    /// handle is still held (the `Child`) must read as dead.
+    #[cfg(windows)]
+    #[test]
+    fn an_exited_process_held_open_is_not_alive() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .spawn()
+            .expect("spawning cmd /c exit 0 must succeed");
+        let pid = child.id();
+        assert!(
+            child.wait().expect("child must be waitable").success(),
+            "cmd /c exit 0 must exit with code 0"
+        );
+        // The Child still owns the OS handle, so the exited process
+        // object stays referenceable: OpenProcess succeeds on the pid
+        // and only the exit code can tell it is gone.
+        assert!(
+            !pid_alive(pid),
+            "an exited process whose handle is still held must read as dead"
+        );
+    }
+
+    /// The probe must stay honest after the exit-code fix: the running
+    /// test process itself reads as alive.
+    #[test]
+    fn the_current_process_is_alive() {
+        assert!(
+            pid_alive(std::process::id()),
+            "the running test process must read as alive"
+        );
     }
 }

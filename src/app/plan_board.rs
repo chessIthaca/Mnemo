@@ -235,7 +235,7 @@ impl PlanBoard {
                 done.push(view);
             }
         }
-        done.sort_by(|a, b| b.closed_at_ms.cmp(&a.closed_at_ms));
+        done.sort_by_key(|b| std::cmp::Reverse(b.closed_at_ms));
         open.extend(done);
         Ok(open)
     }

@@ -2351,7 +2351,15 @@ mod tests {
         let result = &reply["result"];
         assert_eq!(result["isError"], false);
         assert_eq!(result["content"][0]["type"], "text");
-        assert_eq!(result["content"][0]["text"], r#"{"action":"team_status","result":[]}"#);
+        // A tools/call attaches this session, so the answer names it as lead.
+        let text = result["content"][0]["text"].as_str().expect("text");
+        let answer: Value = serde_json::from_str(text).expect("team_status JSON");
+        assert_eq!(answer["action"], "team_status");
+        assert_eq!(answer["result"], json!([]));
+        assert_eq!(answer["lead"]["kind"], "external", "{answer}");
+        assert_eq!(answer["lead"]["attached"], true, "{answer}");
+        assert!(answer["lead"]["since_ms"].as_u64().is_some(), "{answer}");
+        assert!(answer["lead"]["idle_since_ms"].is_null(), "{answer}");
 
         team.push_external_notice("worker alpha finished its turn".into());
         team.push_external_notice("worker beta failed".into());
@@ -2362,13 +2370,16 @@ mod tests {
             }))
             .await;
         let text = reply["result"]["content"][0]["text"].as_str().expect("text");
+        let (answer, notices) = text
+            .split_once("\n\nSince your last call:\n")
+            .expect("the drained notices follow the answer");
+        let answer: Value = serde_json::from_str(answer).expect("team_status JSON");
+        assert_eq!(answer["action"], "team_status");
+        assert_eq!(answer["result"], json!([]));
+        assert_eq!(answer["lead"]["attached"], true, "{answer}");
         assert_eq!(
-            text,
-            r#"{"action":"team_status","result":[]}
-
-Since your last call:
-- worker alpha finished its turn
-- worker beta failed"#
+            notices, "- worker alpha finished its turn\n- worker beta failed",
+            "{text}"
         );
         // They were handed over once.
         assert!(team.drain_external_notices().is_empty());

@@ -12,9 +12,12 @@
   import Workbench from "./components/Workbench.svelte";
   import WorkerDeleteSheet from "./components/WorkerDeleteSheet.svelte";
 
-  // Claude Code can start Mnemo2 on a project (`--project`) or ask it to open one.
+  // Claude Code drives Mnemo2 from outside: it can start the app on a project
+  // (`--project`), ask it to open one, or ask for one of the project's workers
+  // to be shown.
   onMount(() => {
     void actions.initExternalLead();
+    void actions.initOpenWorker();
   });
 </script>
 

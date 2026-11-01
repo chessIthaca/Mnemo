@@ -572,6 +572,12 @@ struct ExternalLead {
     bug_search_since_plan_create: bool,
     /// Waiters currently blocked in [`TeamRuntime::wait_external_notices`].
     waiters: usize,
+    /// The Claude Code session that staked this lead, when it named itself
+    /// (the Stop hook suggests `wait --session <id>`; Claude Code tells its
+    /// MCP servers no session id, so a bare tool call cannot). Kept through
+    /// the idle release, so that session's own hooks can re-attach it; a
+    /// fresh anonymous claim or a forgotten idle lead clears it.
+    session_id: Option<String>,
 }
 
 /// How a [`TeamRuntime::wait_external`] ended.
@@ -1001,12 +1007,32 @@ impl TeamRuntime {
     /// now on lead notices queue for it instead of reaching the in-app lead.
     /// Notices a previous external lead never read (and the in-app lead could
     /// not take) are handed to this one. Returns `true` when it was not
-    /// attached before. Counts as activity.
+    /// attached before. Counts as activity. The claim stays anonymous: a bare
+    /// MCP tool call cannot know Claude Code's session id.
     pub fn attach_external_lead(&self) -> bool {
+        self.attach_external_lead_as(None)
+    }
+
+    /// [`TeamRuntime::attach_external_lead`] naming the Claude Code session
+    /// that staked the claim, when the caller knows it: the waiter runs with
+    /// `--session <id>` (the Stop hook names it — only a hook knows a session
+    /// id). A named claim also names an already-attached lead, so that
+    /// session's own hooks can re-attach it after an idle release
+    /// ([`TeamRuntime::reattach_idle_external_lead`]); a fresh anonymous
+    /// claim clears the name instead, so no session can reach through a hook
+    /// for a lead it never staked.
+    pub fn attach_external_lead_as(&self, session: Option<&str>) -> bool {
+        let named = session.map(str::trim).filter(|session| !session.is_empty());
         let mut state = self.external_state();
         state.last_activity_ms = unix_ms();
+        if let Some(named) = named {
+            state.session_id = Some(named.to_string());
+        }
         if state.since_ms.is_some() {
             return false;
+        }
+        if named.is_none() {
+            state.session_id = None;
         }
         state.since_ms = Some(state.last_activity_ms);
         state.idle_since_ms = None;
@@ -1020,6 +1046,27 @@ impl TeamRuntime {
         true
     }
 
+    /// Bring an idle-released lead back through its own hook. Only when the
+    /// lead was released for silence (it has not really detached) and
+    /// `session` names the Claude Code session that staked the claim: a hook
+    /// from another session must never take the lead, and an anonymous lead
+    /// has no hooks to come back with. Returns `true` when the lead attached
+    /// again — which also clears the idle mark and keeps the claim staked,
+    /// so it can come back the same way the next time it idles out.
+    pub fn reattach_idle_external_lead(&self, session: Option<&str>) -> bool {
+        let Some(session) = session.map(str::trim).filter(|session| !session.is_empty()) else {
+            return false;
+        };
+        let staked = {
+            let state = self.external_state();
+            state.idle_since_ms.is_some() && state.session_id.as_deref() == Some(session)
+        };
+        if !staked {
+            return false;
+        }
+        self.attach_external_lead_as(Some(session))
+    }
+
     /// Hand the team back to the in-app lead and wake blocked waiters.
     /// Returns `true` when an external lead was attached.
     ///
@@ -1027,6 +1074,11 @@ impl TeamRuntime {
     /// list, which [`TeamRuntime::take_undelivered_notices`] hands over (the
     /// caller gives them to the in-app lead, see
     /// `LeadRuntime::release_external_lead`).
+    ///
+    /// The staking session is kept: the idle release runs through here too,
+    /// and that session's own hooks must still be able to re-attach it
+    /// ([`TeamRuntime::reattach_idle_external_lead`]); a fresh claim or a
+    /// forgotten idle lead clears it.
     pub fn detach_external_lead(&self) -> bool {
         let was_attached = {
             let mut state = self.external_state();
@@ -1132,9 +1184,14 @@ impl TeamRuntime {
         }
     }
 
-    /// Forget an idle external lead. Returns `true` when one was idle.
+    /// Forget an idle external lead, together with the Claude Code session
+    /// that staked it (after a real detach even that session's hooks must not
+    /// bring it back). Returns `true` when one was idle.
     pub fn clear_external_lead_idle(&self) -> bool {
-        self.external_state().idle_since_ms.take().is_some()
+        let mut state = self.external_state();
+        let was_idle = state.idle_since_ms.take().is_some();
+        state.session_id = None;
+        was_idle
     }
 
     /// Record a call from the external lead (keeps it from idling out).

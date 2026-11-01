@@ -82,12 +82,37 @@ fn from_subagent(input: &Value) -> bool {
         .is_some_and(|id| !id.trim().is_empty())
 }
 
+/// The Claude Code session the hook fired for, when its input names one
+/// (`session_id`). The server records it for the staking lead, so that
+/// session's own hooks — and no other session's — can re-attach it after an
+/// idle release.
+fn hook_session(input: &Value) -> Option<&str> {
+    input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+}
+
 /// The helper path for the waiter command lines. A path that could break out
 /// of the quotes falls back to the bare command name.
 fn quoted_helper(env: &Env) -> String {
     let helper = env.helper.to_string_lossy();
     let usable = !helper.is_empty() && !helper.chars().any(|c| c == '"' || c.is_control());
     format!("\"{}\"", if usable { helper.as_ref() } else { "mnemo2-mcp" })
+}
+
+/// The exact waiter command lines for the Claude Code session this hook fired
+/// for — Bash and PowerShell, named with `--session <id>`, so staking the
+/// lead lets that session's own hooks (and no other session's) re-attach it
+/// after an idle release. `None` when the input names no session: then a
+/// started waiter stays anonymous, as before.
+fn waiter_commands(env: &Env, input: &Value) -> Option<String> {
+    let session = hook_session(input)?;
+    let helper = quoted_helper(env);
+    Some(format!(
+        "Bash: {helper} wait --session {session} \u{2014} PowerShell: & {helper} wait --session {session}"
+    ))
 }
 
 fn notice_lines(notices: &[String]) -> String {
@@ -125,19 +150,33 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
     } else {
         "drain"
     };
-    let reply = call(
-        &instance,
-        "/lead/notices",
-        &json!({ "root": instance.root, "mode": wire_mode }),
-        HOOK_TIMEOUT,
-    )?;
+    // Name the session when Claude Code does: the server re-attaches an
+    // idle-released lead only for the session that staked it.
+    let mut body = json!({ "root": instance.root, "mode": wire_mode });
+    if let Some(session) = hook_session(&input) {
+        body["session"] = json!(session);
+    }
+    let reply = call(&instance, "/lead/notices", &body, HOOK_TIMEOUT)?;
     let reply: NoticesReply = serde_json::from_value(reply).ok()?;
     match mode {
         NoticesMode::Drain => {
             if reply.notices.is_empty() {
                 return None;
             }
-            Some(hook_output("PostToolUse", &notice_lines(&reply.notices)))
+            let mut context = notice_lines(&reply.notices);
+            // Workers are running and no waiter: the session may have
+            // compacted away the waiter command it was taught — repeat it, so
+            // a waiter named for this session keeps the claim re-attachable.
+            if reply.attached && reply.active_workers > 0 && !reply.waiter_alive {
+                if let Some(commands) = waiter_commands(env, &input) {
+                    context.push_str(&format!(
+                        "\n\n{} Mnemo worker(s) are still running and no waiter is active. \
+                         Start this as a background command so you are woken when one reports. {commands}",
+                        reply.active_workers,
+                    ));
+                }
+            }
+            Some(hook_output("PostToolUse", &context))
         }
         // The server fills the summary whenever the root is its open project:
         // SessionStart can run before MCP `initialize` attaches the lead.
@@ -149,6 +188,19 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
                 }
                 context.push_str(&notice_lines(&reply.notices));
             }
+            // Teach the session its own waiter command up front: the MCP
+            // instructions and the skill cannot name the session, and an
+            // unnamed claim cannot come back through its hooks after an
+            // idle release.
+            if let Some(commands) = waiter_commands(env, &input) {
+                if !context.is_empty() {
+                    context.push_str("\n\n");
+                }
+                context.push_str(
+                    "Whenever you start a Mnemo waiter, use this command (it names your Claude Code session, so your own hooks can re-attach you after an idle release). ",
+                );
+                context.push_str(&commands);
+            }
             if context.is_empty() {
                 return None;
             }
@@ -158,14 +210,19 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
             if !reply.attached || reply.active_workers == 0 || reply.waiter_alive {
                 return None;
             }
-            let helper = quoted_helper(env);
+            // Name this session in the command (the Stop hook knows it; the
+            // session itself does not): staking the lead with its session is
+            // what lets its own hooks re-attach it after an idle release.
+            let commands = waiter_commands(env, &input).unwrap_or_else(|| {
+                let helper = quoted_helper(env);
+                format!("Bash: {helper} wait \u{2014} PowerShell: & {helper} wait")
+            });
             Some(
                 json!({
                     "decision": "block",
                     "reason": format!(
                         "{} Mnemo worker(s) are still running and no waiter is active. \
-                         Start this as a background command so you are woken when one reports. \
-                         Bash: {helper} wait \u{2014} PowerShell: & {helper} wait",
+                         Start this as a background command so you are woken when one reports. {commands}",
                         reply.active_workers,
                     ),
                 })
@@ -254,19 +311,29 @@ fn describe_wait_reply(reply: &Value, timeout_s: u64) -> String {
     }
 }
 
-/// `wait [--timeout <s>]`: block until a notice is queued; the text to print.
+/// `wait [--timeout <s>] [--session <id>]`: block until a notice is queued;
+/// the text to print.
 ///
 /// When no instance is found, or it stops answering, this keeps looking every
 /// `wait_poll` for up to `wait_reach_timeout` (the instance may be restarting)
 /// and then says plainly that Mnemo2 is unreachable, instead of exiting at
 /// once and having the lead start another waiter, again and again.
-pub fn wait(env: &Env, timeout_s: u64) -> String {
+///
+/// `--session` names the Claude Code session the Stop hook suggested this
+/// command for (the session itself cannot know it): staking the lead with
+/// that name is what lets the session's own hooks re-attach it after an
+/// idle release.
+pub fn wait(env: &Env, timeout_s: u64, session: Option<&str>) -> String {
     let read_timeout = Duration::from_secs(timeout_s).saturating_add(WAIT_SLACK);
+    let session = session.map(str::trim).filter(|session| !session.is_empty());
     let mut unreachable_since: Option<Instant> = None;
     loop {
         let reply = wait_instance(env).and_then(|instance| {
             let mut body = root_body(&instance);
             body["timeout_s"] = json!(timeout_s);
+            if let Some(session) = session {
+                body["session"] = json!(session);
+            }
             call(&instance, "/lead/wait", &body, read_timeout)
         });
         if let Some(reply) = reply {
@@ -279,7 +346,6 @@ pub fn wait(env: &Env, timeout_s: u64) -> String {
         std::thread::sleep(env.wait_poll);
     }
 }
-
 #[cfg(test)]
 #[path = "hooks_tests.rs"]
 mod tests;

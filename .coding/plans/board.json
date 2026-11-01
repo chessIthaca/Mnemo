@@ -183,6 +183,46 @@
       "closed_at_ms": 1793543612664,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-955f6b4c-20261101-143332.md",
       "abandon_reason": null
+    },
+    {
+      "id": "111244fb",
+      "status": "closed",
+      "created_at_ms": 1793569429348,
+      "closed_at_ms": 1793573725067,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-111244fb-20261101-225525.md",
+      "abandon_reason": null
+    },
+    {
+      "id": "07ee02fd",
+      "status": "closed",
+      "created_at_ms": 1793569448957,
+      "closed_at_ms": 1793570582770,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-07ee02fd-20261101-220302.md",
+      "abandon_reason": null
+    },
+    {
+      "id": "5115cef1",
+      "status": "closed",
+      "created_at_ms": 1793569467297,
+      "closed_at_ms": 1793570994036,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5115cef1-20261101-220954.md",
+      "abandon_reason": null
+    },
+    {
+      "id": "ecf59f53",
+      "status": "closed",
+      "created_at_ms": 1793570747694,
+      "closed_at_ms": 1793571321246,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-ecf59f53-20261101-221521.md",
+      "abandon_reason": null
+    },
+    {
+      "id": "988fe146",
+      "status": "closed",
+      "created_at_ms": 1793571027262,
+      "closed_at_ms": 1793573038005,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-988fe146-20261101-224358.md",
+      "abandon_reason": null
     }
   ]
 }

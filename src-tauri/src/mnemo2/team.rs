@@ -1756,17 +1756,16 @@ impl TeamRuntime {
                     plan_id,
                     step,
                 )
-                .await
-                .map(|(worker, reused)| json!({"worker": worker, "reused": reused}));
+                .await;
             let result = match (result, tier) {
-                (Ok(mut value), Some(tier)) => {
+                (Ok((mut worker, reused)), Some(tier)) => {
                     self.record_tier(worker_id, &tier).await;
-                    value["worker"]["tier"] = json!(tier);
-                    Ok(value)
+                    worker.tier = Some(tier);
+                    Ok((worker, reused))
                 }
                 (result, _) => result,
             };
-            return worker_result(result, "team_dispatch");
+            return dispatch_result(result, "team_dispatch");
         }
         if name == "team_audit_dispatch" {
             let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
@@ -1798,9 +1797,8 @@ impl TeamRuntime {
                     reasoning_effort,
                     brief,
                 )
-                .await
-                .map(|(worker, reused)| json!({"worker": worker, "reused": reused}));
-            return worker_result(result, "team_audit_dispatch");
+                .await;
+            return dispatch_result(result, "team_audit_dispatch");
         }
         if name == "team_status" {
             let plan_id = args
@@ -5353,7 +5351,7 @@ fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
 fn team_status_result(result: Result<Vec<Value>, String>, lead: TeamLeadStatus) -> ToolResult {
     let entries = match result {
         Ok(entries) => entries,
-        Err(err) => return worker_result::<Vec<Value>>(Err(err), "team_status"),
+        Err(err) => return team_tool_error(err),
     };
     let data = Value::Array(entries);
     let mut reported = data.clone();
@@ -5367,20 +5365,50 @@ fn team_status_result(result: Result<Vec<Value>, String>, lead: TeamLeadStatus) 
     ToolResult::success(output).with_data(data)
 }
 
-fn worker_result<T: Serialize>(result: Result<T, String>, action: &str) -> ToolResult {
+/// The one failure every team tool answers with: the lead reads the message,
+/// while `data` keeps the machine-readable kind.
+fn team_tool_error(err: String) -> ToolResult {
+    ToolResult::error(err.clone()).with_data(json!({
+        "error_kind": "domain",
+        "message": err,
+    }))
+}
+
+/// One worker as a team tool answers it: the text carries the compact entry
+/// (the answer lands in the lead's own context), while `data` keeps the whole
+/// record for internal callers. `team_status` with `detail: true` serves the
+/// whole record in the text when the lead asks for it.
+fn worker_answer(worker: &WorkerRecord, action: &str) -> ToolResult {
+    let mut reported = worker_status_view(worker, false);
+    without_transcripts(&mut reported);
+    let output = serde_json::to_string(&json!({"action": action, "result": reported}))
+        .unwrap_or_else(|_| action.to_string());
+    let data = serde_json::to_value(worker).unwrap_or(Value::Null);
+    ToolResult::success(output).with_data(data)
+}
+
+/// A team tool answer for one worker.
+fn worker_result(result: Result<WorkerRecord, String>, action: &str) -> ToolResult {
     match result {
-        Ok(value) => {
-            let data = serde_json::to_value(value).unwrap_or(Value::Null);
-            let mut output = data.clone();
-            without_transcripts(&mut output);
-            let output = serde_json::to_string(&json!({"action": action, "result": output}))
-                .unwrap_or_else(|_| action.to_string());
-            ToolResult::success(output).with_data(data)
+        Ok(worker) => worker_answer(&worker, action),
+        Err(err) => team_tool_error(err),
+    }
+}
+
+/// A dispatch answer: the compact worker entry next to the idempotent-reuse
+/// flag. `data` keeps the whole record, as the single-worker answers do.
+fn dispatch_result(result: Result<(WorkerRecord, bool), String>, action: &str) -> ToolResult {
+    match result {
+        Ok((worker, reused)) => {
+            let output = serde_json::to_string(&json!({
+                "action": action,
+                "result": {"worker": worker_status_view(&worker, false), "reused": reused},
+            }))
+            .unwrap_or_else(|_| action.to_string());
+            let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
+            ToolResult::success(output).with_data(json!({"worker": data, "reused": reused}))
         }
-        Err(err) => ToolResult::error(err.clone()).with_data(json!({
-            "error_kind": "domain",
-            "message": err,
-        })),
+        Err(err) => team_tool_error(err),
     }
 }
 
@@ -7400,6 +7428,68 @@ models = [\"scripted-a\"]
             .handle_lead_host_tool("team_status", json!({"worker_id": "nope"}))
             .await;
         assert!(!missing.success, "an unknown worker id fails: {}", missing.output);
+        team.shutdown().await;
+    }
+
+    /// Every team tool answers with the same compact worker entry the lead
+    /// already reads from `team_status`; the whole record stays in `data`.
+    #[tokio::test]
+    async fn team_tools_answer_with_the_compact_worker_entry() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        // A cleaned-up worker keeps its branch, so a check resolves the tip
+        // without a live checkout.
+        let id = "00000001000000000001";
+        let mut worker = reviewed_worker(root.path(), id);
+        worker.status = WorkerStatus::Cancelled;
+        worker.worktree = std::path::PathBuf::new();
+        worker.checks.clear();
+        run_git(root.path(), &["branch", &agent_branch(id)]);
+        let team = open_test_team(root.path(), state.path(), vec![worker]).await;
+
+        let answer = team
+            .handle_lead_host_tool(
+                "team_check",
+                json!({
+                    "worker_id": id,
+                    "name": "cargo test --workspace",
+                    "status": "passed",
+                    "detail": "the whole check output again",
+                }),
+            )
+            .await;
+        assert!(answer.success, "{}", answer.output);
+        let receipt: Value = serde_json::from_str(&answer.output).expect("JSON receipt");
+        assert_eq!(receipt["action"], "team_check");
+        let entry = &receipt["result"];
+        assert_eq!(entry["id"], id);
+        assert_eq!(entry["status"], "cancelled");
+        // Status, checks and findings stay; the oversized fields do not.
+        let checks = entry["checks"].as_array().expect("checks");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["name"], "cargo test --workspace");
+        assert_eq!(checks[0]["status"], "passed");
+        assert_eq!(checks[0]["tip"].as_str().map(str::len), Some(8), "{entry}");
+        assert!(
+            checks[0].get("detail").is_none(),
+            "the compact check carries its output: {}",
+            checks[0]
+        );
+        let findings = entry["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["id"], "finding1");
+        for oversized in ["brief", "opening_prompt", "inbox", "transcript"] {
+            assert!(
+                entry.get(oversized).is_none(),
+                "the team tool answer carries {oversized}: {entry}"
+            );
+        }
+        // The whole record stays in `data` for callers that need it.
+        let data = answer.data.as_ref().expect("structured data");
+        assert_eq!(data["brief"], "the whole brief");
+        assert_eq!(data["opening_prompt"], "the whole opening prompt");
+
         team.shutdown().await;
     }
 

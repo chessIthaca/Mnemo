@@ -702,11 +702,16 @@ impl AgentSession {
                         {
                             family_loops.push((id, weak));
                         }
-                        if manager.get(id).is_some()
-                            && cancelled.insert(id)
-                            && manager.send(id, AgentCommand::Cancel).is_err()
-                        {
-                            cancel_failed = Some(id);
+                        if manager.get(id).is_some() && cancelled.insert(id) {
+                            match manager.send(id, AgentCommand::Cancel) {
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    cancel_failed = Some(id);
+                                }
+                                // A stale manager entry whose receiver has
+                                // closed is already exiting. Keep polling the
+                                // loop weak rather than reporting a failure.
+                                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                            }
                         }
                     }
                 }
@@ -1343,5 +1348,47 @@ mod lifecycle_tests {
         }
         assert_eq!(cancellations, 1, "Cancel must be sent only once");
         std::fs::remove_dir_all(worktree.path()).expect("remove the released worktree");
+    }
+
+    #[tokio::test]
+    async fn close_treats_a_closed_stale_command_channel_as_exit_in_progress() {
+        let project = tempfile::tempdir().expect("project");
+        let config = tempfile::tempdir().expect("config");
+        write_test_config(config.path());
+        let engine = Engine::start(test_engine_options(project.path(), config.path()))
+            .await
+            .expect("start engine");
+        let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+        let inner = session.inner.clone();
+        let parent = session.agent;
+        let held_loop = session.agent_loop.upgrade().expect("parent loop");
+        let weak_loop = session.agent_loop.clone();
+        let (stale_tx, stale_rx) = tokio::sync::mpsc::channel(1);
+        let original_tx = {
+            let mut manager = inner.host.manager.lock().await;
+            manager
+                .replace_command_sender(parent, stale_tx)
+                .expect("parent handle")
+        };
+        drop(stale_rx);
+
+        let mut closing = tokio::spawn(async move { session.close_and_wait().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut closing)
+                .await
+                .is_err(),
+            "a closed stale channel must not fail close while the weak is alive"
+        );
+
+        original_tx
+            .send(crate::runtime::AgentCommand::Cancel)
+            .await
+            .expect("finish the real agent exit");
+        drop(held_loop);
+        closing
+            .await
+            .expect("join close")
+            .expect("closed channel is exit-in-progress, not a close failure");
+        assert!(weak_loop.upgrade().is_none());
     }
 }

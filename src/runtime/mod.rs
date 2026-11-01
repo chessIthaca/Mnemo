@@ -59,14 +59,15 @@ impl AgentManager {
         self.agents.insert(handle.id, handle);
     }
 
-    /// Send a command to an agent by id.
-    pub fn send(&self, id: AgentId, cmd: AgentCommand) -> Result<(), AgentCommand> {
+    /// Send a command to an agent by id, preserving a full versus closed queue.
+    pub fn send(
+        &self,
+        id: AgentId,
+        cmd: AgentCommand,
+    ) -> Result<(), mpsc::error::TrySendError<AgentCommand>> {
         match self.agents.get(&id) {
-            Some(handle) => handle.command_tx.try_send(cmd).map_err(|e| match e {
-                mpsc::error::TrySendError::Full(cmd) => cmd,
-                mpsc::error::TrySendError::Closed(cmd) => cmd,
-            }),
-            None => Err(cmd),
+            Some(handle) => handle.command_tx.try_send(cmd),
+            None => Err(mpsc::error::TrySendError::Closed(cmd)),
         }
     }
 

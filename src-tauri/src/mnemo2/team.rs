@@ -1112,6 +1112,25 @@ impl TeamRuntime {
         self.external_state().idle_since_ms
     }
 
+    /// The lead state a `team_status` answer reports, read under one lock so
+    /// an attach or idle release cannot land between the two timestamps.
+    fn lead_status(&self) -> TeamLeadStatus {
+        let (since_ms, idle_since_ms) = {
+            let state = self.external_state();
+            (state.since_ms, state.idle_since_ms)
+        };
+        TeamLeadStatus {
+            kind: if since_ms.is_some() || idle_since_ms.is_some() {
+                "external"
+            } else {
+                "in_app"
+            },
+            attached: since_ms.is_some(),
+            since_ms,
+            idle_since_ms,
+        }
+    }
+
     /// Forget an idle external lead. Returns `true` when one was idle.
     pub fn clear_external_lead_idle(&self) -> bool {
         self.external_state().idle_since_ms.take().is_some()
@@ -1496,8 +1515,12 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_status".to_string(),
-                description: "Read authoritative TeamManager state for every worker or one exact returned worker_id. This is the only worker lifecycle/ID authority; never infer status from Git, worktrees, timestamps, or files. Pass plan_id to see one plan's workers (their step, status, findings). Ask when you need it; status is not pushed.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"plan_id":{"type":"string","description":"Only the workers dispatched on this board plan."}}}),
+                description: "Read authoritative TeamManager state for every worker or one exact returned worker_id. This is the only worker lifecycle/ID authority; never infer status from Git, worktrees, timestamps, or files. Pass plan_id to see one plan's workers. Each worker is a compact entry by default (id, name, status, kind, tier, model, plan, branch, worktree, error, pending, open findings, checks, review summary, merge commit, cost, last activity); pass detail true for the full record with all review evidence. The answer also carries `lead`: whether Claude Code leads the team (kind external, attached true), idled out after a silent spell (attached false, idle_since_ms set), or the in-app lead leads (kind in_app). Ask when you need it; status is not pushed.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string"},
+                    "plan_id":{"type":"string","description":"Only the workers dispatched on this board plan."},
+                    "detail":{"type":"boolean","description":"Return each worker's full record instead of the compact entry."}
+                }}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -1743,7 +1766,16 @@ impl TeamRuntime {
                     .filter(|w| in_plan(w))
                     .collect::<Vec<_>>()),
             };
-            return worker_result(result, "team_status");
+            // The compact entry is the default because the answer lands in the
+            // lead's own context; `detail` asks for the whole record.
+            let detail = args.get("detail").and_then(Value::as_bool).unwrap_or(false);
+            let result = result.map(|workers| {
+                workers
+                    .iter()
+                    .map(|worker| worker_status_view(worker, detail))
+                    .collect::<Vec<_>>()
+            });
+            return team_status_result(result, self.lead_status());
         }
         let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
             return ToolResult::error(format!("{name} requires a 'worker_id' string"));
@@ -5166,6 +5198,110 @@ fn merge_outcome_line(number: usize, worker: &WorkerRecord) -> String {
     line
 }
 
+/// Who leads the team in a `team_status` answer: an external Claude Code
+/// session that leads or idled out, or the in-app lead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct TeamLeadStatus {
+    /// `external` while a Claude Code session leads or has idled out;
+    /// `in_app` when no external session has taken the team.
+    kind: &'static str,
+    /// Whether an external lead is attached right now.
+    attached: bool,
+    /// Unix epoch milliseconds it attached, while attached.
+    since_ms: Option<u64>,
+    /// Unix epoch milliseconds it was released for silence, while idle.
+    idle_since_ms: Option<u64>,
+}
+
+/// The first eight characters of a commit id: enough to tell tips apart
+/// without repeating a full hash in every answer.
+fn tip_prefix(tip: &str) -> String {
+    tip.chars().take(8).collect()
+}
+
+/// One worker as `team_status` reports it: the compact entry the lead reads
+/// by default, or the whole record on `detail`. Transcripts are dropped from
+/// the text of both forms by [`without_transcripts`].
+fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
+    if detail {
+        return serde_json::to_value(worker).unwrap_or(Value::Null);
+    }
+    let findings = worker
+        .findings
+        .iter()
+        .filter(|finding| finding.status == "open")
+        .map(|finding| {
+            json!({
+                "id": finding.id,
+                "title": finding.title,
+                "severity": finding.severity,
+                "file": finding.file,
+                "line": finding.line,
+            })
+        })
+        .collect::<Vec<_>>();
+    let checks = worker
+        .checks
+        .iter()
+        .map(|check| {
+            json!({
+                "name": check.name,
+                "status": check.status,
+                "tip": tip_prefix(&check.tip),
+            })
+        })
+        .collect::<Vec<_>>();
+    // The observed model id beats the selected spec: it is what actually ran.
+    let model = worker.model_id.as_ref().or(worker.model.as_ref());
+    let mut view = json!({
+        "id": worker.id,
+        "name": worker.name,
+        "status": worker.status,
+        "kind": worker.kind,
+        "tier": worker.tier,
+        "model": model,
+        "plan_id": worker.plan_id,
+        "plan_step": worker.plan_step,
+        "branch": worker.branch,
+        "worktree": worker.worktree,
+        "error": worker.error,
+        "pending": worker.pending,
+        "findings": findings,
+        "checks": checks,
+        "cost_micros": worker.cost_micros,
+        "last_activity_ms": worker.last_activity_ms,
+    });
+    if let Some(review) = &worker.review {
+        view["review"] = json!({
+            "summary": review.summary,
+            "tip": tip_prefix(&review.tip),
+        });
+    }
+    if let Some(merge) = &worker.merge {
+        view["merge"] = json!({ "commit": merge.commit });
+    }
+    view
+}
+
+/// The `team_status` answer: the worker entries under `result` (an array, as
+/// existing readers expect) with the lead's own state next to it.
+fn team_status_result(result: Result<Vec<Value>, String>, lead: TeamLeadStatus) -> ToolResult {
+    let entries = match result {
+        Ok(entries) => entries,
+        Err(err) => return worker_result::<Vec<Value>>(Err(err), "team_status"),
+    };
+    let data = Value::Array(entries);
+    let mut reported = data.clone();
+    without_transcripts(&mut reported);
+    let output = serde_json::to_string(&json!({
+        "action": "team_status",
+        "result": reported,
+        "lead": lead,
+    }))
+    .unwrap_or_else(|_| "team_status".to_string());
+    ToolResult::success(output).with_data(data)
+}
+
 fn worker_result<T: Serialize>(result: Result<T, String>, action: &str) -> ToolResult {
     match result {
         Ok(value) => {
@@ -6998,5 +7134,243 @@ models = [\"scripted-a\"]
             "# Plan\n\n## Acceptance scenarios\n\n- A standard worker cannot merge with only a summary and passing checks.\n\n## Steps\n- done\n",
         )
         .expect("observable bullets validate high-risk dispatch");
+    }
+
+    /// The parsed answer of one in-app lead `team_status` call.
+    async fn team_status_answer(team: &TeamRuntime, args: Value) -> Value {
+        let result = team.handle_lead_host_tool("team_status", args).await;
+        assert!(result.success, "{}", result.output);
+        serde_json::from_str(&result.output).expect("team_status answers with JSON")
+    }
+
+    fn reviewed_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
+        let mut worker = worker(root, id);
+        worker.brief = "the whole brief".to_string();
+        worker.opening_prompt = Some("the whole opening prompt".to_string());
+        worker.model = Some("test/scripted-a".to_string());
+        worker.model_id = Some("scripted-a".to_string());
+        worker.plan_id = Some("plan0001".to_string());
+        worker.plan_step = Some(2);
+        worker.tier = Some("average".to_string());
+        worker.status = WorkerStatus::InReview;
+        worker.error = Some("a recorded error".to_string());
+        worker.cost_micros = Some(1234);
+        worker.last_activity_ms = 42;
+        worker.findings = vec![
+            Finding {
+                id: "finding1".to_string(),
+                severity: "high".to_string(),
+                title: "the open one".to_string(),
+                detail: "the whole finding detail".to_string(),
+                file: "src/a.rs".to_string(),
+                line: 7,
+                status: "open".to_string(),
+                fix_commit: None,
+                evidence: None,
+                justification: None,
+            },
+            Finding {
+                id: "finding2".to_string(),
+                severity: "low".to_string(),
+                title: "the fixed one".to_string(),
+                detail: "the closed finding detail".to_string(),
+                file: "src/b.rs".to_string(),
+                line: 9,
+                status: "fixed".to_string(),
+                fix_commit: Some("1234567890abcdef".to_string()),
+                evidence: None,
+                justification: None,
+            },
+        ];
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test".to_string(),
+            status: "passed".to_string(),
+            detail: Some("the whole check output".to_string()),
+            tip: "0123456789abcdef".to_string(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "looks right".to_string(),
+            tip: "0123456789abcdef".to_string(),
+            reviewed_at_ms: 5,
+            evidence: Some(ReviewEvidence {
+                unanchored_pass: true,
+                intent: "the whole intent".to_string(),
+                execution: "the whole execution".to_string(),
+                integration: "the whole integration".to_string(),
+                test_quality: "the whole test quality".to_string(),
+                residual_risk: "the whole residual risk".to_string(),
+                independent_reviewer_id: None,
+                audit_adjudication: None,
+            }),
+        });
+        worker
+    }
+
+    fn merged_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
+        let mut worker = worker(root, id);
+        worker.status = WorkerStatus::Merged;
+        worker.merge = Some(MergeRecord {
+            commit: "abcdef0123456789".to_string(),
+            worker_tip: "0123456789abcdef".to_string(),
+            branch: agent_branch(id),
+            target: "wt/agent-lead".to_string(),
+            checks: vec!["cargo test".to_string()],
+            review_summary: "looks right".to_string(),
+            review_risk: Some("standard".to_string()),
+            review_evidence: None,
+            files: 1,
+            additions: 2,
+            deletions: 3,
+            worker_model: Some("scripted-a".to_string()),
+            worker_tokens: 10,
+            cost_micros: Some(5),
+            merged_at_ms: 7,
+            revert_commit: None,
+        });
+        worker
+    }
+
+    /// `team_status` answers compactly by default — the answer lands in the
+    /// lead's own context — and with the whole record on `detail`.
+    #[tokio::test]
+    async fn team_status_is_compact_by_default_and_full_on_detail() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let reviewed = reviewed_worker(root.path(), "00000001000000000001");
+        let merged = merged_worker(root.path(), "00000001000000000002");
+        let team = open_test_team(root.path(), state.path(), vec![reviewed, merged]).await;
+
+        let answer = team_status_answer(&team, json!({})).await;
+        assert_eq!(answer["action"], "team_status");
+        let entries = answer["result"].as_array().expect("a worker array");
+        assert_eq!(entries.len(), 2);
+        let entry = &entries[0];
+        assert_eq!(entry["id"], "00000001000000000001");
+        assert_eq!(entry["status"], "in_review");
+        assert_eq!(entry["kind"], "implementation");
+        assert_eq!(entry["tier"], "average");
+        assert_eq!(entry["model"], "scripted-a");
+        assert_eq!(entry["plan_id"], "plan0001");
+        assert_eq!(entry["plan_step"], 2);
+        assert_eq!(entry["branch"], agent_branch("00000001000000000001"));
+        assert_eq!(entry["error"], "a recorded error");
+        assert_eq!(entry["cost_micros"], 1234);
+        assert_eq!(entry["last_activity_ms"], 42);
+        assert!(entry["pending"].is_null(), "{entry}");
+        for oversized in ["brief", "opening_prompt", "inbox", "transcript"] {
+            assert!(
+                entry.get(oversized).is_none(),
+                "the compact entry carries {oversized}: {entry}"
+            );
+        }
+        // Only the open finding, and only its identity.
+        let findings = entry["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["id"], "finding1");
+        assert_eq!(findings[0]["severity"], "high");
+        assert_eq!(findings[0]["title"], "the open one");
+        assert_eq!(findings[0]["file"], "src/a.rs");
+        assert_eq!(findings[0]["line"], 7);
+        assert!(
+            findings[0].get("detail").is_none(),
+            "the compact finding carries its detail: {}",
+            findings[0]
+        );
+        // Checks keep their verdict and tip prefix, not the output.
+        let checks = entry["checks"].as_array().expect("checks");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["name"], "cargo test");
+        assert_eq!(checks[0]["status"], "passed");
+        assert_eq!(checks[0]["tip"], "01234567");
+        assert!(
+            checks[0].get("detail").is_none(),
+            "the compact check carries its output: {}",
+            checks[0]
+        );
+        // The review keeps its summary and tip, not the evidence.
+        assert_eq!(entry["review"]["summary"], "looks right");
+        assert_eq!(entry["review"]["tip"], "01234567");
+        assert!(
+            entry["review"].get("evidence").is_none(),
+            "the compact review carries its evidence: {}",
+            entry["review"]
+        );
+        // A merged worker names its merge commit and carries no review block.
+        let merged_entry = &entries[1];
+        assert_eq!(merged_entry["status"], "merged");
+        assert_eq!(merged_entry["merge"]["commit"], "abcdef0123456789");
+        assert!(merged_entry.get("review").is_none(), "{merged_entry}");
+
+        // `detail` returns the record as before, transcripts aside.
+        let full = team_status_answer(&team, json!({"detail": true})).await;
+        let entries = full["result"].as_array().expect("a worker array");
+        assert_eq!(entries.len(), 2);
+        let entry = &entries[0];
+        assert_eq!(entry["brief"], "the whole brief");
+        assert_eq!(entry["opening_prompt"], "the whole opening prompt");
+        assert_eq!(entry["checks"][0]["detail"], "the whole check output");
+        assert_eq!(entry["findings"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            entry["review"]["evidence"]["residual_risk"],
+            "the whole residual risk"
+        );
+        assert!(
+            entry.get("transcript").is_none(),
+            "transcripts stay out: {entry}"
+        );
+
+        // The worker_id filter works in both forms; an unknown id still fails.
+        for detail in [false, true] {
+            let answer = team_status_answer(
+                &team,
+                json!({"worker_id": "00000001000000000002", "detail": detail}),
+            )
+            .await;
+            let entries = answer["result"].as_array().expect("a worker array");
+            assert_eq!(entries.len(), 1, "detail {detail}: {answer}");
+            assert_eq!(entries[0]["id"], "00000001000000000002");
+        }
+        let missing = team
+            .handle_lead_host_tool("team_status", json!({"worker_id": "nope"}))
+            .await;
+        assert!(!missing.success, "an unknown worker id fails: {}", missing.output);
+        team.shutdown().await;
+    }
+
+    /// `team_status` says who leads: the in-app lead, an attached Claude Code
+    /// session, or one that was released for silence.
+    #[tokio::test]
+    async fn team_status_names_the_lead_and_whether_it_is_attached() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+        // No external lead: Mnemo2's own lead leads.
+        let answer = team_status_answer(&team, json!({})).await;
+        assert_eq!(
+            answer["lead"],
+            json!({"kind": "in_app", "attached": false, "since_ms": null, "idle_since_ms": null}),
+            "{answer}"
+        );
+
+        // An attached Claude Code session leads.
+        assert!(team.attach_external_lead(), "the first attach takes the team");
+        let answer = team_status_answer(&team, json!({})).await;
+        assert_eq!(answer["lead"]["kind"], "external", "{answer}");
+        assert_eq!(answer["lead"]["attached"], true, "{answer}");
+        assert!(answer["lead"]["since_ms"].as_u64().is_some(), "{answer}");
+        assert!(answer["lead"]["idle_since_ms"].is_null(), "{answer}");
+
+        // Released for silence: still the external session, no longer attached.
+        assert!(team.detach_external_lead());
+        team.mark_external_lead_idle(4242);
+        let answer = team_status_answer(&team, json!({})).await;
+        assert_eq!(answer["lead"]["kind"], "external", "{answer}");
+        assert_eq!(answer["lead"]["attached"], false, "{answer}");
+        assert!(answer["lead"]["since_ms"].is_null(), "{answer}");
+        assert_eq!(answer["lead"]["idle_since_ms"], 4242, "{answer}");
+        team.shutdown().await;
     }
 }

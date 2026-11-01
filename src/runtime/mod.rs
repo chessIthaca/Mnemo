@@ -125,6 +125,18 @@ impl AgentManager {
         self.agents.remove(&id);
     }
 
+    /// Replace one command sender to observe close behavior in unit tests.
+    #[cfg(test)]
+    pub(crate) fn replace_command_sender(
+        &mut self,
+        id: AgentId,
+        sender: mpsc::Sender<AgentCommand>,
+    ) -> Option<mpsc::Sender<AgentCommand>> {
+        self.agents
+            .get_mut(&id)
+            .map(|handle| std::mem::replace(&mut handle.command_tx, sender))
+    }
+
     /// The id of the "main" agent — the primary interactive agent that backlog
     /// prompts are dispatched to. The main agent is the one with no parent
     /// (`parent_id == None`) and the smallest id (it's built first in

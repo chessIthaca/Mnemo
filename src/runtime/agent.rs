@@ -97,35 +97,37 @@ pub(crate) mod digest_test_gate {
     }
 
     struct Gate {
-        plans_dir: std::path::PathBuf,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
 
-    static GATE: OnceLock<Mutex<Option<Gate>>> = OnceLock::new();
+    static GATE: OnceLock<
+        Mutex<std::collections::HashMap<std::path::PathBuf, Gate>>,
+    > = OnceLock::new();
 
     pub(crate) fn install(plans_dir: std::path::PathBuf) -> DigestTestControl {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        *GATE.get_or_init(|| Mutex::new(None)).lock().expect("digest gate") = Some(Gate {
-            plans_dir,
-            entered: entered.clone(),
-            release: release.clone(),
-        });
+        GATE
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .expect("digest gate")
+            .insert(
+                plans_dir,
+                Gate {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                },
+            );
         DigestTestControl { entered, release }
     }
 
     pub(crate) async fn wait(plans_dir: &std::path::Path) {
-        let gate = {
-            let mut slot = GATE
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .expect("digest gate");
-            match slot.as_ref() {
-                Some(gate) if gate.plans_dir == plans_dir => slot.take(),
-                _ => None,
-            }
-        };
+        let gate = GATE
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .expect("digest gate")
+            .remove(plans_dir);
         if let Some(gate) = gate {
             gate.entered.notify_one();
             gate.release.notified().await;

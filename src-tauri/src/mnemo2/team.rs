@@ -553,6 +553,10 @@ impl LiveWorker {
 struct ExternalLead {
     /// When it attached (Unix epoch milliseconds); `None` while detached.
     since_ms: Option<u64>,
+    /// When it was released for silence (Unix epoch milliseconds). It has
+    /// not left, so the UI still names it; cleared when it attaches again or
+    /// really detaches.
+    idle_since_ms: Option<u64>,
     /// Notices queued for it, oldest first. The text is exactly what the
     /// in-app lead would have been sent.
     queue: VecDeque<String>,
@@ -1004,6 +1008,7 @@ impl TeamRuntime {
             return false;
         }
         state.since_ms = Some(state.last_activity_ms);
+        state.idle_since_ms = None;
         state.queue = std::mem::take(&mut state.undelivered);
         state.memory_search_since_plan_create = false;
         state.bug_search_since_plan_create = false;
@@ -1025,6 +1030,7 @@ impl TeamRuntime {
         let was_attached = {
             let mut state = self.external_state();
             let was_attached = state.since_ms.take().is_some();
+            state.idle_since_ms = None;
             // They are newer than anything already held back.
             let unread = std::mem::take(&mut state.queue);
             state.undelivered.extend(unread);
@@ -1089,6 +1095,26 @@ impl TeamRuntime {
     /// When the external lead attached (Unix epoch milliseconds), if it is.
     pub fn external_lead_since_ms(&self) -> Option<u64> {
         self.external_state().since_ms
+    }
+
+    /// Remember that the external lead was released for silence at `at_ms`
+    /// rather than leaving. No-op while it is attached.
+    pub fn mark_external_lead_idle(&self, at_ms: u64) {
+        let mut state = self.external_state();
+        if state.since_ms.is_none() {
+            state.idle_since_ms = Some(at_ms);
+        }
+    }
+
+    /// When the external lead was released for silence, if it has not
+    /// attached again or detached since.
+    pub fn external_lead_idle_since_ms(&self) -> Option<u64> {
+        self.external_state().idle_since_ms
+    }
+
+    /// Forget an idle external lead. Returns `true` when one was idle.
+    pub fn clear_external_lead_idle(&self) -> bool {
+        self.external_state().idle_since_ms.take().is_some()
     }
 
     /// Record a call from the external lead (keeps it from idling out).

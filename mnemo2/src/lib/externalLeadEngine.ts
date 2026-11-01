@@ -13,10 +13,14 @@ export interface ExternalOpenRequest {
   root: string;
 }
 
-/** An external lead attached to or detached from the project at `root`. */
+/**
+ * An external lead attached to or detached from the project at `root`.
+ * `idle` marks a detach for silence: it gets no notices but has not left.
+ */
 export interface ExternalLeadEvent {
   attached: boolean;
   root: string | null;
+  idle?: boolean;
 }
 
 /** The native host's current external-lead state. */
@@ -24,6 +28,7 @@ export interface ExternalLeadStatus {
   attached: boolean;
   root: string | null;
   since_ms: number | null;
+  idle_since_ms?: number | null;
 }
 
 /** What the UI knows about the open project's external lead. */
@@ -31,6 +36,8 @@ export interface ExternalLeadState {
   attached: boolean;
   root: string | null;
   sinceMs: number | null;
+  /** Set while the external lead is idle: released for silence, not gone. */
+  idleSinceMs?: number | null;
 }
 
 export interface ExternalLeadTransportBindings {
@@ -98,10 +105,12 @@ export function externalLeadFromStatus(
   status: ExternalLeadStatus,
   projectPath: string,
 ): ExternalLeadState {
-  if (!status.attached || !status.root || !sameProjectPath(status.root, projectPath)) {
-    return noExternalLead();
+  if (!status.root || !sameProjectPath(status.root, projectPath)) return noExternalLead();
+  if (status.attached) return { attached: true, root: status.root, sinceMs: status.since_ms };
+  if (typeof status.idle_since_ms === "number") {
+    return { attached: false, root: status.root, sinceMs: null, idleSinceMs: status.idle_since_ms };
   }
-  return { attached: true, root: status.root, sinceMs: status.since_ms };
+  return noExternalLead();
 }
 
 /**
@@ -118,7 +127,9 @@ export function applyExternalLeadEvent(
   if (projectPath === null) return current;
   if (event.root === null) return event.attached ? current : noExternalLead();
   if (!sameProjectPath(event.root, projectPath)) return current;
-  if (!event.attached) return noExternalLead();
+  if (!event.attached) {
+    return event.idle ? { attached: false, root: event.root, sinceMs: null, idleSinceMs: nowMs } : noExternalLead();
+  }
   if (current.attached && current.root !== null && sameProjectPath(current.root, event.root)) {
     return current;
   }

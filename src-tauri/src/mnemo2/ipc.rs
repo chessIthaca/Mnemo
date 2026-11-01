@@ -114,10 +114,13 @@ impl Mnemo2State {
 pub struct ExternalLeadStatus {
     /// Whether an external lead (Claude Code over MCP) leads the open project.
     pub attached: bool,
-    /// The open project's root while attached.
+    /// The open project's root while attached or idle.
     pub root: Option<String>,
     /// When it attached, in Unix epoch milliseconds.
     pub since_ms: Option<u64>,
+    /// When it was released for silence (it has not left), in Unix epoch
+    /// milliseconds; `None` while attached or gone.
+    pub idle_since_ms: Option<u64>,
 }
 
 impl Mnemo2State {
@@ -674,14 +677,18 @@ pub async fn external_lead_status(
             attached: false,
             root: None,
             since_ms: None,
+            idle_since_ms: None,
         });
     };
     let team = lead.team_handle().await?;
     let since_ms = team.external_lead_since_ms();
+    let idle_since_ms = team.external_lead_idle_since_ms();
+    let named = since_ms.is_some() || idle_since_ms.is_some();
     Ok(ExternalLeadStatus {
         attached: since_ms.is_some(),
-        root: since_ms.map(|_| lead.workspace_root().to_string_lossy().into_owned()),
+        root: named.then(|| lead.workspace_root().to_string_lossy().into_owned()),
         since_ms,
+        idle_since_ms,
     })
 }
 
@@ -1333,19 +1340,31 @@ mod tests {
             attached: true,
             root: Some("/p".into()),
             since_ms: Some(5),
+            idle_since_ms: None,
         };
         assert_eq!(
             serde_json::to_value(status).expect("encode"),
-            serde_json::json!({ "attached": true, "root": "/p", "since_ms": 5 })
+            serde_json::json!({ "attached": true, "root": "/p", "since_ms": 5, "idle_since_ms": null })
         );
         let idle = ExternalLeadStatus {
             attached: false,
-            root: None,
+            root: Some("/p".into()),
             since_ms: None,
+            idle_since_ms: Some(9),
         };
         assert_eq!(
             serde_json::to_value(idle).expect("encode"),
-            serde_json::json!({ "attached": false, "root": null, "since_ms": null })
+            serde_json::json!({ "attached": false, "root": "/p", "since_ms": null, "idle_since_ms": 9 })
+        );
+        let gone = ExternalLeadStatus {
+            attached: false,
+            root: None,
+            since_ms: None,
+            idle_since_ms: None,
+        };
+        assert_eq!(
+            serde_json::to_value(gone).expect("encode"),
+            serde_json::json!({ "attached": false, "root": null, "since_ms": null, "idle_since_ms": null })
         );
     }
 

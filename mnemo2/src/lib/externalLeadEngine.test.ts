@@ -54,6 +54,20 @@ describe("external lead state", () => {
     );
   });
 
+  it("keeps an idled-out lead named until it attaches again or detaches", () => {
+    const idle = applyExternalLeadEvent(attached, { attached: false, idle: true, root: "C:/Mnemo" }, "C:/Mnemo", 88);
+    expect(idle).toEqual({ attached: false, root: "C:/Mnemo", sinceMs: null, idleSinceMs: 88 });
+    expect(applyExternalLeadEvent(idle, { attached: true, root: "C:/Mnemo" }, "C:/Mnemo", 90)).toEqual({
+      attached: true,
+      root: "C:/Mnemo",
+      sinceMs: 90,
+    });
+    expect(applyExternalLeadEvent(idle, { attached: false, root: "C:/Mnemo" }, "C:/Mnemo")).toEqual(noExternalLead());
+    expect(
+      externalLeadFromStatus({ attached: false, root: "C:\\Mnemo", since_ms: null, idle_since_ms: 7 }, "c:/mnemo"),
+    ).toEqual({ attached: false, root: "C:\\Mnemo", sinceMs: null, idleSinceMs: 7 });
+  });
+
   it("keeps the original attach time on a repeated attach", () => {
     expect(applyExternalLeadEvent(attached, { attached: true, root: "C:/Mnemo" }, "C:/Mnemo", 99)).toBe(attached);
   });

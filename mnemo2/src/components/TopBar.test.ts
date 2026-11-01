@@ -138,4 +138,23 @@ describe("TopBar external lead badge", () => {
     }));
     await vi.waitFor(() => expect(badge()).toBeNull());
   });
+
+  it("names an idle Claude Code lead instead of hiding it", async () => {
+    render(TopBar);
+
+    app.update((state) => ({
+      ...state,
+      externalLead: { attached: false, root: "C:/Mnemo", sinceMs: null, idleSinceMs: 2_000 },
+    }));
+    const shown = await screen.findByText("Lead: Claude Code (idle)");
+    expect(shown.closest("[title]")?.getAttribute("title")).toContain("worker notices go to the built-in lead");
+    expect(screen.queryByText("Lead: Claude Code (external)")).toBeNull();
+
+    app.update((state) => ({
+      ...state,
+      externalLead: { attached: true, root: "C:/Mnemo", sinceMs: 3_000 },
+    }));
+    await screen.findByText("Lead: Claude Code (external)");
+    expect(screen.queryByText("Lead: Claude Code (idle)")).toBeNull();
+  });
 });

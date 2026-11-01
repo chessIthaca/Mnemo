@@ -123,6 +123,11 @@ pub trait LeadHost: Send + Sync + 'static {
     fn request_open(&self, root: &Path);
     /// An external lead attached to or detached from the project at `root`.
     fn lead_changed(&self, attached: bool, root: Option<&Path>);
+    /// Tell the UI the external lead of `root` was released for silence:
+    /// it no longer gets notices but has not left.
+    fn lead_idle(&self, root: &Path) {
+        self.lead_changed(false, Some(root));
+    }
     /// Bring the Mnemo2 window to the front.
     fn show_window(&self);
     /// Ask the frontend to open a worker in mission control.
@@ -904,7 +909,8 @@ impl Shared {
     /// external lead never read) and wake any waiter.
     async fn detach(&self, target: Option<Target>) -> Value {
         if let Some(target) = target {
-            if target.lead.release_external_lead().await {
+            let was_idle = target.team.clear_external_lead_idle();
+            if target.lead.release_external_lead().await || was_idle {
                 self.host.lead_changed(false, Some(&target.root));
             }
         }
@@ -928,7 +934,8 @@ impl Shared {
         if team.external_idle_expired(now_ms, self.options.idle_detach_ms)
             && lead.release_external_lead().await
         {
-            self.host.lead_changed(false, Some(lead.workspace_root()));
+            team.mark_external_lead_idle(now_ms);
+            self.host.lead_idle(lead.workspace_root());
             return true;
         }
         false
@@ -1287,6 +1294,13 @@ impl LeadHost for AppLeadHost {
         let _ = self.app.emit(
             EXTERNAL_LEAD_CHANNEL,
             json!({ "attached": attached, "root": root.map(|root| root.to_string_lossy()) }),
+        );
+    }
+
+    fn lead_idle(&self, root: &Path) {
+        let _ = self.app.emit(
+            EXTERNAL_LEAD_CHANNEL,
+            json!({ "attached": false, "idle": true, "root": root.to_string_lossy() }),
         );
     }
 
@@ -2963,7 +2977,31 @@ Since your last call:
         assert!(fixture.server.sweep_idle(now + 11 * 60 * 1000).await);
         assert!(!team.external_lead_attached());
         assert_eq!(fixture.host.changes(), vec![true, false]);
+        assert_eq!(
+            team.external_lead_idle_since_ms(),
+            Some(now + 11 * 60 * 1000),
+            "an idled-out lead has not left"
+        );
         assert!(!fixture.server.sweep_idle(now + 12 * 60 * 1000).await, "nothing left to detach");
+        // The next call attaches it again and ends the idle state.
+        fixture.attach().await;
+        assert!(team.external_lead_attached());
+        assert_eq!(team.external_lead_idle_since_ms(), None);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn detaching_an_idle_lead_forgets_it() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        fixture.attach().await;
+        let now = run_file::now_ms();
+        assert!(fixture.server.sweep_idle(now + 11 * 60 * 1000).await);
+        assert!(team.external_lead_idle_since_ms().is_some());
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.lead_post("/lead/detach", json!({ "root": root })).await;
+        assert_eq!(team.external_lead_idle_since_ms(), None);
+        assert_eq!(fixture.host.changes(), vec![true, false, false], "the UI drops the idle lead");
         fixture.shutdown().await;
     }
 

@@ -410,13 +410,33 @@ impl LlmClient for OpenAiClient {
         tools: &[ToolSchema],
         tool_choice: Option<ToolChoice>,
     ) -> Result<BoxStream<'_, LlmEvent>> {
+        // The legacy empty-context path — records stay unattributed.
+        self.complete_with_context(
+            messages,
+            tools,
+            tool_choice,
+            &crate::provider::trace::LlmRequestContext::unattributed(),
+        )
+        .await
+    }
+
+    async fn complete_with_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        tool_choice: Option<ToolChoice>,
+        context: &crate::provider::trace::LlmRequestContext,
+    ) -> Result<BoxStream<'_, LlmEvent>> {
         // The pipeline, one stage per concern (backlog 76efacba):
         // 1. `prepare_request` — validate the shape + build the request body
-        //    (params + provider special-casing) + open the trace record.
+        //    (params + provider special-casing) + open the trace record
+        //    (stamped with `context`).
         // 2. `open_stream` — POST + status check + reasoning_effort retry.
         // 3. `spawn_stream` — channel + spawn the parse loop
         //    (`pump_sse_stream`) and return the event stream.
-        let mut prepared = self.prepare_request(messages, tools, tool_choice.clone()).await?;
+        let mut prepared =
+            self.prepare_request_with_context(messages, tools, tool_choice.clone(), context)
+                .await?;
         let response = self
             .open_stream(&mut prepared, messages, tools, tool_choice)
             .await?;
@@ -426,7 +446,7 @@ impl LlmClient for OpenAiClient {
 
 /// The request phase's output: everything the stream phases need.
 ///
-/// Built by [`OpenAiClient::prepare_request`], consumed by
+/// Built by [`OpenAiClient::prepare_request_with_context`], consumed by
 /// [`OpenAiClient::open_stream`] (which may rebuild `body` without the
 /// `reasoning_effort` field for the fallback retry) and
 /// [`OpenAiClient::spawn_stream`].
@@ -448,7 +468,7 @@ struct PreparedRequest {
     /// so headers arrive with the first chunk and a headers-arrived anchor
     /// measures ~0). Stamped by [`OpenAiClient::open_stream`] immediately
     /// before the first send; initialized to `record_created` by
-    /// [`OpenAiClient::prepare_request`] as a placeholder that is never
+    /// [`OpenAiClient::prepare_request_with_context`] as a placeholder that is never
     /// read before the stamp (open_stream always runs before any send).
     post_sent: std::time::Instant,
 }
@@ -462,11 +482,12 @@ impl OpenAiClient {
     /// Responses API format), starts the trace record, and stamps the parked
     /// timings onto it. Returns everything the later stages need — see
     /// [`PreparedRequest`].
-    async fn prepare_request(
+    async fn prepare_request_with_context(
         &self,
         messages: &[Message],
         tools: &[ToolSchema],
         tool_choice: Option<ToolChoice>,
+        context: &crate::provider::trace::LlmRequestContext,
     ) -> Result<PreparedRequest> {
         // Entry anchor for the prep sliver: everything from here until the
         // record is created (request-body build + trace-log start) is local
@@ -538,9 +559,18 @@ impl OpenAiClient {
             let base_url = self.config.base_url.clone();
             let provider = self.config.provider.clone();
             let body_for_trace = body.clone();
+            let context_for_trace = context.clone();
             tokio::task::spawn_blocking(move || {
                 serde_json::from_str::<serde_json::Value>(&body_for_trace)
-                    .map(|body_value| log.start(&model, &base_url, &provider, body_value))
+                    .map(|body_value| {
+                        log.start_with_context(
+                            &model,
+                            &base_url,
+                            &provider,
+                            body_value,
+                            &context_for_trace,
+                        )
+                    })
                     .ok()
             })
             .await

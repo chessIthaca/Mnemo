@@ -1173,6 +1173,14 @@ impl AgentTask {
                         String::new()
                     }
                 };
+                // Plan c3ba2b58 step A: stamp this session's identity + the
+                // consolidation purpose onto the pipeline's LLM calls. Snapshotted
+                // BEFORE the spawn so the closure owns it (identity reads stay
+                // off the spawned task's path).
+                let llm_context = self.agent_loop.llm_request_context(
+                    None,
+                    crate::provider::trace::TracePurpose::MemoryConsolidation,
+                );
                 tokio::spawn(async move {
                     let _guard = guard;
                     // The policy hook still precedes memory session teardown.
@@ -1180,9 +1188,14 @@ impl AgentTask {
                     if let Err(e) = store.end_session(&sid).await {
                         eprintln!("memory: end_session({sid}) failed during consolidation: {e}");
                     }
-                    if let Err(e) =
-                        consolidate_session(store.as_ref(), &sid, Some(provider.as_ref()), &corpus)
-                            .await
+                    if let Err(e) = consolidate_session(
+                        store.as_ref(),
+                        &sid,
+                        Some(provider.as_ref()),
+                        &corpus,
+                        &llm_context,
+                    )
+                    .await
                     {
                         eprintln!("memory: consolidate_session({sid}) failed: {e}");
                     }
@@ -1259,16 +1272,26 @@ impl AgentTask {
         } else {
             None
         };
+        // Plan c3ba2b58 step A: manual compaction carries the loop's
+        // identity + the compaction purpose. No turn id — the command
+        // runs between turns.
+        let compaction_context = self.agent_loop.llm_request_context(
+            None,
+            crate::provider::trace::TracePurpose::Compaction,
+        );
         let (summarized, mut buffered, stop, summarize_usage) = match context_manager
             .summarize_with_interrupt_opts(
                 &self.messages,
-                6,
                 // The TURN provider is what sends the compacted history next, so
                 // the result is bounded by its window, not the summarizer's.
-                crate::agent::context::sendable_budget(turn_provider.capabilities()),
                 provider.as_ref(),
-                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
+                crate::agent::context::SummarizeRequest::new(
+                    6,
+                    crate::agent::context::sendable_budget(turn_provider.capabilities()),
+                    &compaction_context,
+                ),
+                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
             )
             .await
         {
@@ -1927,6 +1950,89 @@ mod tests {
         }
     }
 
+    /// The traced variant of [`FallbackTestProvider`] for the attribution
+    /// test (plan c3ba2b58 step A review: fallbackAttributionTest): every
+    /// `complete_with_context` call ALSO opens a record in the SHARED
+    /// [`LlmRequestLog`](crate::provider::trace::LlmRequestLog) stamped
+    /// with the received context — what a real client does at
+    /// request-preparation time — then stamps the outcome (the 429 error,
+    /// or status/response/finish on success). Overrides
+    /// `complete_with_context` directly: the trait's default implementation
+    /// would drop the context on its way to `complete`.
+    struct TracedFallbackProvider {
+        model: &'static str,
+        provider: &'static str,
+        rate_limited: bool,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+        log: Arc<crate::provider::trace::LlmRequestLog>,
+        caps: Capabilities,
+    }
+
+    #[async_trait]
+    impl LlmClient for TracedFallbackProvider {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            self.model
+        }
+        fn provider_name(&self) -> &str {
+            self.provider
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            panic!("the turn path must call complete_with_context");
+        }
+        async fn complete_with_context(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+            context: &crate::provider::trace::LlmRequestContext,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let rec_id = self.log.start_with_context(
+                self.model,
+                "http://mock/v1/",
+                self.provider,
+                serde_json::json!({"rate_limited": self.rate_limited}),
+                context,
+            );
+            if self.rate_limited {
+                self.log.fail(
+                    rec_id,
+                    429,
+                    "stream request: HTTP 429 from https://primary.example.com/v1/ — \
+                     Too Many Requests",
+                );
+                return Err(crate::error::Error::Provider(
+                    "stream request: HTTP 429 from https://primary.example.com/v1/ — \
+                     Too Many Requests"
+                        .into(),
+                ));
+            }
+            self.log.set_status(rec_id, 200);
+            self.log.append_response(rec_id, "recovered");
+            self.log.finish(rec_id, "stop");
+            Ok(Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta {
+                    text: "recovered".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ])))
+        }
+    }
+
     /// A test [`ModelResolver`] double for the 429-fallback tests. Resolves
     /// every context to the "primary" endpoint; builds the primary or fallback
     /// provider based on the endpoint name; reports an alternate endpoint
@@ -2117,6 +2223,187 @@ mod tests {
             !saw_terminal_error,
             "no terminal error — the fallback recovered the turn"
         );
+    }
+
+    #[tokio::test]
+    async fn four29_endpoint_fallback_keeps_attribution_on_both_records() {
+        // Review finding fallbackAttributionTest (plan c3ba2b58 step A):
+        // the turn-level endpoint fallback ladder — a 429 on the primary
+        // switches to the alternate endpoint and re-runs the request. BOTH
+        // records (the failed primary attempt AND the successful fallback
+        // call) must carry the calling loop's attribution: the same
+        // identity, the same turn purpose — the fallback call is never
+        // anonymous and never cross-labelled with another agent's
+        // identity. Turn ids stay millisecond-scoped (`new_turn_id` =
+        // `<unix-millis>-<agent_id>`) — the identity, not turn-id
+        // distinctness, is what must survive the switch.
+        use crate::model_resolver::ModelResolver;
+
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let mut registry = ToolRegistry::new();
+        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
+
+        let log = Arc::new(crate::provider::trace::LlmRequestLog::new());
+        let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let primary: Arc<dyn LlmClient> = Arc::new(TracedFallbackProvider {
+            model: "test-model",
+            provider: "primary",
+            rate_limited: true,
+            calls: Arc::clone(&primary_calls),
+            log: Arc::clone(&log),
+            caps: fallback_test_caps(128_000),
+        });
+        let fallback: Arc<dyn LlmClient> = Arc::new(TracedFallbackProvider {
+            model: "test-model",
+            provider: "fallback",
+            rate_limited: false,
+            calls: Arc::clone(&fallback_calls),
+            log: Arc::clone(&log),
+            caps: fallback_test_caps(128_000),
+        });
+        let resolver: Arc<dyn ModelResolver> = Arc::new(FallbackResolver {
+            primary: Arc::clone(&primary),
+            fallback: Arc::clone(&fallback),
+            has_alternate: true,
+        });
+
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                AgentLoopConfig {
+                    provider: fallback.clone(),
+                    tools: Arc::new(registry),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
+                    sandbox,
+                    safety_mode: SafetyMode::Autonomous,
+                    context_manager: ContextManager::new(128_000, 0.5),
+                    memory: None,
+                    vision: None,
+                },
+                crate::project::Constitution::default(),
+            )
+            .with_model_resolver(resolver),
+        );
+        // Plan c3ba2b58 step A: the worker identity the loop's requests
+        // are stamped from.
+        agent_loop.set_trace_identity(crate::provider::trace::TraceIdentity {
+            actor_kind: crate::provider::trace::TraceActorKind::Worker,
+            agent_id: "1".into(),
+            session_id: "1".into(),
+            agent_name: "wt-fallback".into(),
+            worker_id: Some("wt-fallback".into()),
+            plan_id: Some("plan-9".into()),
+            plan_step: Some(2),
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = AgentTask::new(1, "test".into(), agent_loop);
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        cmd_tx
+            .send(AgentCommand::Prompt {
+                text: "hello".into(),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Drain the event fan-in until the turn finishes on the fallback
+        // (the 5s deadline bounds the wait). A recv TIMEOUT must NOT break
+        // the loop — under a fully loaded parallel test suite a 500ms
+        // scheduling gap is possible mid-turn, and bailing early would
+        // drop cmd_tx before the fallback request ever runs (a flake the
+        // first full-suite run caught). Keep waiting until the Finished /
+        // Exited event, the channel closes, or the deadline passes.
+        let mut saw_finished = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                fanin_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some((_id, event))) => match event {
+                    AgentEvent::Finished { .. } => {
+                        saw_finished = true;
+                        break;
+                    }
+                    AgentEvent::Exited => break,
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        drop(cmd_tx);
+        let _ = handle.await;
+
+        assert!(saw_finished, "the turn must finish on the fallback provider");
+        assert_eq!(
+            primary_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the primary 429s exactly once"
+        );
+        assert_eq!(
+            fallback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the fallback provider serves the retried request"
+        );
+
+        // Plan c3ba2b58 step A: BOTH records carry the loop's attribution.
+        let rows = log.list();
+        assert_eq!(
+            rows.len(),
+            2,
+            "one record per attempt: the 429 + the fallback retry"
+        );
+        for row in &rows {
+            let a = row
+                .attribution
+                .as_ref()
+                .expect("attribution survives on both records");
+            assert_eq!(
+                a.actor_kind,
+                crate::provider::trace::TraceActorKind::Worker
+            );
+            assert_eq!(a.agent_id, "1");
+            assert_eq!(a.agent_name, "wt-fallback");
+            assert_eq!(a.worker_id.as_deref(), Some("wt-fallback"));
+            assert_eq!(a.plan_id.as_deref(), Some("plan-9"));
+            assert_eq!(a.plan_step, Some(2));
+            assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
+            assert!(
+                a.turn_id.is_some(),
+                "each request cycle minted a turn id"
+            );
+        }
+        // The failed attempt and the recovered one are distinguishable —
+        // same identity, different providers/outcomes.
+        let (failed, succeeded) = if rows[0].error.is_some() {
+            (&rows[0], &rows[1])
+        } else {
+            (&rows[1], &rows[0])
+        };
+        assert_eq!(failed.provider, "primary");
+        assert_eq!(failed.http_status, Some(429));
+        assert!(failed.error.as_deref().unwrap_or("").contains("429"));
+        assert_eq!(succeeded.provider, "fallback");
+        assert_eq!(succeeded.http_status, Some(200));
+        assert!(succeeded.is_complete);
+        assert_eq!(succeeded.finish_reason.as_deref(), Some("stop"));
+        // The identity is identical across the switch (asserted above) —
+        // that is the fallback invariant. NO distinctness claim on the
+        // turn IDS: `new_turn_id` is `<unix-millis>-<agent_id>`,
+        // millisecond-scoped, so the two request cycles minted within the
+        // same millisecond legitimately share one id (observed under
+        // full-suite load — the second run of this test flaked exactly
+        // here before this claim was dropped).
     }
 
     #[tokio::test]

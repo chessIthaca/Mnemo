@@ -2761,6 +2761,9 @@ impl TeamRuntime {
                 host_tools: self.worker_host_tools(),
                 external_policy: None,
                 guardrails: Some(guardrails_for(kind)),
+                // Plan c3ba2b58 step B wires the worker's trace identity
+                // (worker id + plan step) here; `None` until then.
+                trace_identity: None,
             })
             .await
             .map_err(|err| format!("could not spawn the worker session: {err}"))

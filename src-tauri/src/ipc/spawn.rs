@@ -74,6 +74,9 @@ pub async fn spawn_agent(
             limits: None,
             // 3c (G2): the IPC path registers no host tools
             host_tools: vec![],
+            // Plan c3ba2b58 step A: Mnemo1 spawns pass no trace identity —
+            // records stay unattributed, exactly today's behavior.
+            trace_identity: None,
         },
     )
     .await?;
@@ -217,6 +220,9 @@ pub(crate) async fn spawn_run_all_agent(
             limits: None,
             // 3c (G2): the IPC path registers no host tools
             host_tools: vec![],
+            // Plan c3ba2b58 step A: Mnemo1 spawns pass no trace identity —
+            // records stay unattributed, exactly today's behavior.
+            trace_identity: None,
         },
     )
     .await
@@ -324,6 +330,10 @@ impl ParentAwareSpawner for IpcSpawner {
                 limits: None,
                 // 3c (G2): subagents register no host tools
                 host_tools: vec![],
+                // Plan c3ba2b58 step A: no explicit identity — the shared
+                // spawn path inherits the parent's, and an unattributed
+                // Mnemo1 parent stays unattributed (today's behavior).
+                trace_identity: None,
             },
         )
     .await?;

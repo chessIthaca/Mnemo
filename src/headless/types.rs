@@ -152,6 +152,15 @@ pub struct SpawnOptions {
     /// with `external_policy`; exclusive with `policy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardrails: Option<crate::agent::policy::Guardrails>,
+
+    /// Trace attribution (plan c3ba2b58 step A): the identity stamped on
+    /// this session's model-call records — who the session is in the
+    /// trace (lead/worker/subagent/system) plus its worker/plan labels.
+    /// `None` (every pre-c3ba2b58 caller) keeps the records
+    /// unattributed. The engine passes it to the host spawn path, which
+    /// fills the allocated agent/session ids and stamps it on the loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_identity: Option<crate::provider::trace::TraceIdentity>,
 }
 
 /// A command to a live session (§5.3 :327-338) — the public mirror of the

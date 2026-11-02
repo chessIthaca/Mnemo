@@ -285,6 +285,16 @@ pub struct AgentLoop {
     /// without wiring keeps an empty set, so recall is unfiltered.
     pub(crate) dismissed_recall:
         Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// This loop's trace identity (plan c3ba2b58 step A): who makes the
+    /// loop's model calls, so each trace record can be attributed to the
+    /// lead/worker/subagent it belongs to. The factory mints ONE handle per
+    /// built loop and hands clones to both the loop and the memory tools
+    /// (the `dismissed_recall` pattern) — the spawn path stamps it
+    /// post-build (pre-registration, before any turn can run), and a loop
+    /// built without a host identity keeps it empty forever (Mnemo1:
+    /// records stay unattributed).
+    pub(crate) trace_identity:
+        Arc<crate::provider::trace::TraceIdentityHandle>,
     /// This agent's id in the runtime (`AgentManager`), used so the agent's
     /// `spawn_agent` tool can record itself as the parent of any background
     /// agent it spawns (for the completion-notification feedback loop).
@@ -1074,6 +1084,7 @@ impl AgentLoop {
             dismissed_recall: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            trace_identity: Arc::new(crate::provider::trace::TraceIdentityHandle::new()),
             agent_id: std::sync::Mutex::new(None),
             event_fanin: std::sync::Mutex::new(None),
             plan_mutations_allowed: std::sync::Mutex::new(true),
@@ -1132,6 +1143,47 @@ impl AgentLoop {
     ) -> Self {
         self.dismissed_recall = dismissed;
         self
+    }
+
+    /// Wire the per-loop trace identity handle (plan c3ba2b58 step A): the
+    /// factory mints ONE handle per built loop and shares it with the
+    /// memory tools registered for the same loop, so a tool can stamp its
+    /// own LLM calls with the calling agent's identity. Directly-built
+    /// loops keep the fresh empty handle from `from_config` (unattributed).
+    pub fn with_trace_identity(
+        mut self,
+        identity: Arc<crate::provider::trace::TraceIdentityHandle>,
+    ) -> Self {
+        self.trace_identity = identity;
+        self
+    }
+
+    /// Stamp the loop's trace identity — called ONCE by the spawn path
+    /// post-build (pre-registration, before any turn can run, so no
+    /// request can race the stamp) with the spawn options' identity (or
+    /// the parent's, for a subagent) and the runtime-allocated agent and
+    /// session ids filled in. The identity is snapshotted per request
+    /// from the handle, never read back from live state.
+    pub fn set_trace_identity(&self, identity: crate::provider::trace::TraceIdentity) {
+        self.trace_identity.set(identity);
+    }
+
+    /// Snapshot the loop's trace identity (`None` = unattributed loop —
+    /// Mnemo1 paths, or a spawn without host identity).
+    pub fn trace_identity(&self) -> Option<crate::provider::trace::TraceIdentity> {
+        self.trace_identity.get()
+    }
+
+    /// Build the request-scoped trace context for a model call made by
+    /// this loop's agent: identity + turn id + purpose, stamped at the
+    /// call site (the turn request, compaction, consolidation...).
+    /// Unattributed when no identity was stamped.
+    pub fn llm_request_context(
+        &self,
+        turn_id: Option<&str>,
+        purpose: crate::provider::trace::TracePurpose,
+    ) -> crate::provider::trace::LlmRequestContext {
+        self.trace_identity.context(turn_id, purpose)
     }
 
     /// Attach the project's plans dir so consolidation can digest the

@@ -1269,6 +1269,23 @@ impl LlmClient for AnthropicClient {
         tools: &[ToolSchema],
         tool_choice: Option<ToolChoice>,
     ) -> Result<BoxStream<'_, LlmEvent>> {
+        // The legacy empty-context path — records stay unattributed.
+        self.complete_with_context(
+            messages,
+            tools,
+            tool_choice,
+            &crate::provider::trace::LlmRequestContext::unattributed(),
+        )
+        .await
+    }
+
+    async fn complete_with_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        tool_choice: Option<ToolChoice>,
+        context: &crate::provider::trace::LlmRequestContext,
+    ) -> Result<BoxStream<'_, LlmEvent>> {
         // Entry anchor for the prep sliver: everything from here until the
         // record is created (request-body build + trace-log start) is local
         // work that belongs in `prep_ms`, not in the connect window.
@@ -1317,8 +1334,15 @@ impl LlmClient for AnthropicClient {
             let base_url = self.config.base_url.clone();
             let provider = self.config.provider.clone();
             let body_for_trace = body.clone();
+            let context_for_trace = context.clone();
             tokio::task::spawn_blocking(move || {
-                log.start(&model, &base_url, &provider, body_for_trace)
+                log.start_with_context(
+                    &model,
+                    &base_url,
+                    &provider,
+                    body_for_trace,
+                    &context_for_trace,
+                )
             })
             .await
             .ok()

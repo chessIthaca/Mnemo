@@ -595,6 +595,10 @@ fn main() {
                                 limits: None,
                                 // 3c (G2): the main agent registers no host tools
                                 host_tools: vec![],
+                                // Plan c3ba2b58 step A: Mnemo1's main agent
+                                // passes no trace identity — records stay
+                                // unattributed, exactly today's behavior.
+                                trace_identity: None,
                             },
                         )
                         .await

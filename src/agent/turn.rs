@@ -423,9 +423,17 @@ impl AgentLoop {
         // ends the turn here.
         // The pre-swap summary's rewrite marker needs no handling here: this
         // call runs before `TurnState::fresh()`, so the accounting starts
-        // empty anyway.
+        // empty anyway. `turn_id` is `None` here too — this call runs before
+        // the turn id is minted.
         let swap = self
-            .handle_pending_swap(messages, fanin_tx, agent_id, session_id, cmd_rx)
+            .handle_pending_swap(
+                messages,
+                fanin_tx,
+                agent_id,
+                session_id,
+                cmd_rx,
+                None,
+            )
             .await;
         if let Some(outcome) = swap.early {
             return Ok(outcome);
@@ -474,7 +482,14 @@ impl AgentLoop {
             // run, not the next turn. The turn-top call above covers swaps
             // deferred between turns. Cheap no-op when nothing is pending.
             let swap = self
-                .handle_pending_swap(messages, fanin_tx, agent_id, session_id, cmd_rx)
+                .handle_pending_swap(
+                    messages,
+                    fanin_tx,
+                    agent_id,
+                    session_id,
+                    cmd_rx,
+                    state.spend_turn_id.as_deref(),
+                )
                 .await;
             if let Some(outcome) = swap.early {
                 return Ok(outcome);
@@ -1645,6 +1660,7 @@ impl AgentLoop {
         agent_id: AgentId,
         session_id: Option<&str>,
         cmd_rx: &mut mpsc::Receiver<AgentCommand>,
+        turn_id: Option<&str>,
     ) -> PendingSwapOutcome {
         // Set when the pre-swap summary replaced `messages` — reported to the
         // caller so it can reset its incremental token accounting.
@@ -1681,15 +1697,25 @@ impl AgentLoop {
                 // [models.summarize] routes the summary to the dedicated slot
                 // when set; unset rides the old provider (today's behavior).
                 let summary_provider = self.summarize_provider(&old_provider);
+                // Plan c3ba2b58 step A: the pre-swap summary is compaction —
+                // same turn id as the turn it serves when that turn is
+                // already running.
+                let compaction_context = self.llm_request_context(
+                    turn_id,
+                    crate::provider::trace::TracePurpose::Compaction,
+                );
                 let summarize_result = old_context_manager
                     .summarize_with_interrupt(
                         messages,
-                        KEEP_RECENT_ON_SWAP,
-                        // The result must fit the window it is being swapped
-                        // TO — the new model is what will receive it.
-                        context::sendable_budget(pending.provider.capabilities()),
                         summary_provider.as_ref(),
                         cmd_rx,
+                        // The result must fit the window it is being swapped
+                        // TO — the new model is what will receive it.
+                        context::SummarizeRequest::new(
+                            KEEP_RECENT_ON_SWAP,
+                            context::sendable_budget(pending.provider.capabilities()),
+                            &compaction_context,
+                        ),
                     )
                     .await;
                 // The summary path (Ok) rewrote `messages`; the failure path
@@ -3027,16 +3053,25 @@ impl AgentLoop {
         } else {
             None
         };
+        // Plan c3ba2b58 step A: auto-compaction carries the loop's identity
+        // + the compaction purpose, grouped under the current turn id.
+        let compaction_context = self.llm_request_context(
+            state.spend_turn_id.as_deref(),
+            crate::provider::trace::TracePurpose::Compaction,
+        );
         let summarize_result = context_manager
             .summarize_with_interrupt_opts(
                 messages,
-                keep_recent,
                 // The compacted result is what the TURN provider sends next, so
                 // its window is the one that has to fit — not the summarizer's.
-                context::sendable_budget(provider.capabilities()),
                 summary_provider.as_ref(),
-                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
+                context::SummarizeRequest::new(
+                    keep_recent,
+                    context::sendable_budget(provider.capabilities()),
+                    &compaction_context,
+                ),
+                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
             )
             .await;
         // Park the compaction time on the provider — the request's
@@ -4319,6 +4354,15 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // record gets stamped with it as `prep_ms`. Deliberately excludes
         // the POST + retries (that's `connect_ms`).
         provider.record_prep_ms(prep_started.elapsed().as_millis() as u32);
+        // Plan c3ba2b58 step A: the turn request's trace context — the
+        // loop's identity + the current turn id + the turn purpose, so
+        // every attempt of this request (inner retries, the turn-level
+        // endpoint-fallback ladder) carries the same attribution on its
+        // own record.
+        let llm_context = self.llm_request_context(
+            state.spend_turn_id.as_deref(),
+            crate::provider::trace::TracePurpose::Turn,
+        );
         // We have handed off to the network — TCP/TLS connect, POST upload,
         // time-to-first-token, AND any retry backoff sleeps are all
         // "waiting" (the user sees "waiting for response…"), not "sending"
@@ -4361,9 +4405,12 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 provider,
                 messages,
                 tool_schemas,
-                fanin_tx,
-                agent_id,
-                session_id,
+                super::dispatch::TurnRequest {
+                    fanin_tx,
+                    agent_id,
+                    session_id,
+                    llm_context: &llm_context,
+                },
             );
             // G5 (3a.6): the pre-request history snapshot — a mid-request
             // ExportHistory answers from this (the pinned future holds the

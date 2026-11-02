@@ -10574,9 +10574,11 @@ async fn set_explicit_provider_immediate_when_context_same_or_larger() {
 }
 
 #[tokio::test]
-async fn set_explicit_provider_deferred_when_context_smaller() {
-    // When the new provider's max_context < the current one, the swap is
-    // deferred. has_pending_swap() is true, provider unchanged, take clears it.
+async fn set_explicit_provider_smaller_window_swaps_at_once_when_it_fits() {
+    // A merely SMALLER window is NOT a reason to summarize (bug 2027-11-02,
+    // plan 1238e0de). With no live count recorded the conversation is empty
+    // (it trivially fits), so the swap lands at once: no pending swap, no
+    // summarization, the new provider active immediately.
     struct CtxProvider {
         model: &'static str,
         max_ctx: usize,
@@ -10639,15 +10641,79 @@ async fn set_explicit_provider_deferred_when_context_smaller() {
         max_ctx: 64_000,
     });
     agent.set_explicit_provider(small_provider, context::ContextManager::new(64_000, 0.5));
-    assert!(agent.has_pending_swap(), "smaller context → deferred swap");
+    assert!(
+        !agent.has_pending_swap(),
+        "a conversation that fits the new window swaps at once — no deferral"
+    );
     assert_eq!(
         agent.provider().model(),
-        "big-model",
-        "provider unchanged after deferral"
+        "small-model",
+        "the new provider is active immediately"
     );
-    let pending = agent.take_pending_swap();
-    assert!(pending.is_some(), "take returns the pending swap");
-    assert_eq!(pending.unwrap().model, "small-model");
+    assert!(
+        agent.take_pending_swap().is_none(),
+        "nothing was deferred, so there is nothing to take"
+    );
+}
+
+#[tokio::test]
+async fn set_explicit_provider_defers_when_the_conversation_exceeds_the_new_window() {
+    // The compact-then-switch path is still there for a conversation that does
+    // NOT fit: the live count (100K) exceeds the new model's own compaction
+    // trigger (64_000 × 0.5 = 32K), so the pin defers for the OLD model to
+    // summarize first. Provider unchanged; take returns the pending swap.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let big: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 200_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: big,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(200_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    // The live conversation the turn loop last counted: over the new window's
+    // trigger, under the old one's.
+    agent
+        .live_token_count
+        .store(100_000, std::sync::atomic::Ordering::Relaxed);
+    let small: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 64_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    agent.set_explicit_provider(small, context::ContextManager::new(64_000, 0.5));
+    assert!(
+        agent.has_pending_swap(),
+        "a conversation over the new window's trigger defers the swap"
+    );
+    assert_eq!(
+        agent.provider().capabilities().max_context,
+        200_000,
+        "the OLD provider stays active until the turn loop summarizes"
+    );
+    let pending = agent.take_pending_swap().expect("the pending swap");
+    assert_eq!(
+        pending.context_manager.max_tokens(),
+        64_000,
+        "the pending swap carries the new window"
+    );
     assert!(!agent.has_pending_swap(), "take clears the pending swap");
 }
 
@@ -10715,6 +10781,13 @@ async fn set_explicit_provider_clears_stale_deferred_swap_on_immediate() {
         crate::project::Constitution::default(),
     );
 
+    // A live conversation over the SMALLER model's trigger (64_000 × 0.5 =
+    // 32K) but under the larger model's (400_000 × 0.5 = 200K): B defers, C
+    // lands at once — so the stale-deferral clear is genuinely exercised.
+    agent
+        .live_token_count
+        .store(100_000, std::sync::atomic::Ordering::Relaxed);
+
     // Step 1: defer a swap to a smaller-context model B.
     let small_b: Arc<dyn crate::provider::LlmClient> = Arc::new(CtxProvider {
         model: "small-B",
@@ -10726,9 +10799,9 @@ async fn set_explicit_provider_clears_stale_deferred_swap_on_immediate() {
     // Step 2: supersede with an immediate swap to a larger-context model C.
     let large_c: Arc<dyn crate::provider::LlmClient> = Arc::new(CtxProvider {
         model: "large-C",
-        max_ctx: 200_000,
+        max_ctx: 400_000,
     });
-    agent.set_explicit_provider(large_c, context::ContextManager::new(200_000, 0.5));
+    agent.set_explicit_provider(large_c, context::ContextManager::new(400_000, 0.5));
 
     // The stale deferred swap must be cleared — C is the active provider.
     assert!(
@@ -10754,8 +10827,9 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
     // (3) complete the swap, (4) run the turn with the NEW provider.
     //
     // Sizing: new context = 2_000 (summarize_at = 1_000). The conversation
-    // must be > 80% of 2_000 = 1_600 tokens to trigger model-switch
-    // summarization, but after summarization (keep 6) it must be < 1_000 to
+    // must exceed the new manager's own trigger (2_000 × 0.5 = 1_000 tokens)
+    // to trigger model-switch summarization, but after summarization (keep 6)
+    // it must be < 1_000 to
     // avoid the regular summarization triggering again on the new provider.
     // Using diverse English text (~4 chars/token for tiktoken): 20 messages
     // × ~400 chars = ~8_000 chars = ~2_000 tokens > 1_600. After keep-6:
@@ -10855,7 +10929,14 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
         messages.push(Message::text(role, msg_text.clone()));
     }
 
-    // Defer the swap: new provider has smaller context (2_000 < 200_000).
+    // Defer the swap: the live conversation exceeds the new model's own
+    // compaction trigger (2_000 × 0.5 = 1_000), so the pin defers for the OLD
+    // provider to summarize first. `live_token_count` is what the turn loop
+    // records at the top of every iteration; this loop has not run a turn yet,
+    // so seed the count the pin reads.
+    agent
+        .live_token_count
+        .store(2_000, std::sync::atomic::Ordering::Relaxed);
     agent.set_explicit_provider(
         new_provider.clone(),
         context::ContextManager::new(2_000, 0.5),
@@ -10868,7 +10949,7 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
     );
 
     // Run the turn — should summarize with old provider, then complete swap.
-    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let outcome = agent
         .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
@@ -10889,6 +10970,24 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
             .iter()
             .any(|m| { m.content.as_text().contains("## Conversation summary") }),
         "messages should contain the conversation summary after model-switch summarization"
+    );
+    // The completion is INFORMATIONAL (bug 2027-11-02, plan 1238e0de): the
+    // summarized swap reports a model_swap_summarized note and never an Error
+    // — a final error made consumers that treat it as terminal (Mnemo2's
+    // worker pump) mark a healthy worker failed.
+    let mut events = Vec::new();
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ModelSwapSummarized { model } if model == "mock")),
+        "the completed deferred swap must report a model_swap_summarized event"
+    );
+    assert!(
+        !events.iter().any(|ev| matches!(ev, AgentEvent::Error { .. })),
+        "a completed deferred swap must not emit an Error"
     );
     // No pending swap after the turn.
     assert!(
@@ -11013,7 +11112,11 @@ async fn run_turn_model_switch_interrupt_emits_paired_compact_event() {
         messages.push(Message::text(role, msg_text.clone()));
     }
 
-    // Defer the swap (smaller context).
+    // Defer the swap: the live conversation exceeds the new model's trigger
+    // (2_000 × 0.5 = 1_000), so the pin defers before the turn runs.
+    agent
+        .live_token_count
+        .store(2_000, std::sync::atomic::Ordering::Relaxed);
     agent.set_explicit_provider(
         new_provider.clone(),
         context::ContextManager::new(2_000, 0.5),
@@ -15062,10 +15165,10 @@ async fn mid_run_model_swap_lands_on_the_next_request() {
 
 #[tokio::test]
 async fn mid_run_deferred_pick_lands_on_the_next_request() {
-    // The per-agent picker path with a SMALLER context window: the swap is
-    // deferred so the old provider could summarize an oversized conversation
-    // first — but a mid-run pick may not wait for the next turn, so the turn
-    // loop must complete it at the next iteration boundary.
+    // The per-agent picker path with a SMALLER context window and a live
+    // conversation over its trigger: the swap is deferred so the old provider
+    // could summarize first — but a mid-run pick may not wait for the next
+    // turn, so the turn loop must complete it at the next iteration boundary.
     let dir = tempdir().unwrap();
     let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
     let small_caps = Capabilities {
@@ -15081,6 +15184,12 @@ async fn mid_run_deferred_pick_lands_on_the_next_request() {
         &dir,
         workflow,
         Box::new(move |agent: &AgentLoop| {
+            // The pin defers on the LIVE count against the new model's own
+            // trigger (2_000 × 0.5 = 1_000), not on a window comparison: seed
+            // the count a session that had already served would carry.
+            agent
+                .live_token_count
+                .store(1_500, std::sync::atomic::Ordering::Relaxed);
             agent.set_explicit_provider(
                 swap_target.clone(),
                 context::ContextManager::new(2_000, 0.5),

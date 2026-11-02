@@ -291,4 +291,35 @@ describe("live model switch", () => {
     const next = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
     expect(next).toBe(live);
   });
+
+  it("notes a summarized deferred switch as a muted note, never an error", () => {
+    // The deferred compact-then-switch completed: the OLD model summarized the
+    // conversation to fit the new, smaller window. Informational (bug
+    // 2026-11-02, plan 1238e0de) — a muted note beside the switch note, never
+    // an `error` entry, and the pending switch keeps waiting for its serve.
+    let live = applyModelSwitch(emptyWorkerLive(1, 0), "test/deep");
+    live = applyWorkerLiveEvent(live, event("model_swap_summarized", { model: "deep" }));
+
+    expect(shape(live.entries)).toEqual([
+      "model-switch-pending:Model changed to deep by you; it takes effect on the next call",
+      "model-switch-applied:Summarized the conversation to fit deep",
+    ]);
+    expect(live.entries.some((entry) => entry.kind === "error")).toBe(false);
+
+    live = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
+    expect(shape(live.entries)).toEqual([
+      "model-switch-applied:Now running on deep",
+      "model-switch-applied:Summarized the conversation to fit deep",
+    ]);
+  });
+
+  it("names the summarization note by the badge's short model", () => {
+    const live = applyWorkerLiveEvent(
+      emptyWorkerLive(1, 0),
+      event("model_swap_summarized", { model: "openrouter/anthropic/claude-opus-5-5" }),
+    );
+    expect(shape(live.entries)).toEqual([
+      "model-switch-applied:Summarized the conversation to fit claude-opus-5-5",
+    ]);
+  });
 });

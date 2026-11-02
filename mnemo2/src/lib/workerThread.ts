@@ -182,6 +182,16 @@ export function modelSwitchedBody(model: string): string {
 }
 
 /**
+ * The muted note a completed deferred switch leaves in the worker's thread: the
+ * OLD model summarized the conversation so it fits the new, smaller window.
+ * Informational — the switch succeeded and the turn continues (bug 2026-11-02,
+ * plan 1238e0de).
+ */
+export function modelSwapSummarizedBody(model: string): string {
+  return `Summarized the conversation to fit ${shortModelLabel(model)}`;
+}
+
+/**
  * Record a live model switch as a muted note at the end of the worker's
  * thread. The request in flight still serves on the old model, so the note
  * stays pending until the kernel's model_changed event reports the new one
@@ -361,6 +371,31 @@ export function applyWorkerLiveEvent(live: WorkerLive, event: TeamEvent): Worker
         ),
       };
     }
+    case "model_swap_summarized": {
+      // The deferred compact-then-switch completed: the conversation was
+      // summarized to fit the new, smaller window and the swap landed. A muted
+      // note beside the model-switch note — never an error entry (bug
+      // 2026-11-02, plan 1238e0de). `applied: true` keeps it out of the
+      // pending-switch matcher above: it reports a completed summarization, not
+      // a switch still waiting to serve.
+      const model = typeof payload.model === "string" ? payload.model : "";
+      if (!model) return live;
+      return {
+        ...live,
+        sequence: live.sequence + 1,
+        entries: [
+          ...live.entries,
+          {
+            id: `model-swap-summarized-${event.worker_id}-${event.generation}-${live.sequence}`,
+            kind: "model_switch",
+            time: "now",
+            model,
+            body: modelSwapSummarizedBody(model),
+            applied: true,
+          },
+        ],
+      };
+    }
     default:
       return live;
   }
@@ -374,4 +409,5 @@ export const STREAM_ONLY_EVENTS = new Set([
   "tool_execution_start",
   "tool_output_delta",
   "model_changed",
+  "model_swap_summarized",
 ]);

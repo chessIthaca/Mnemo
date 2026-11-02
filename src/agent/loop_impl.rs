@@ -90,10 +90,12 @@ impl SessionState {
 }
 
 /// The agent loop. Drives a conversation turn.
-/// A deferred provider swap: stored when the user switches to a model with a
-/// smaller context window than the current one. The turn loop completes the
-/// swap after summarizing (if needed) using the OLD provider, so the
-/// conversation fits the new (smaller) window.
+/// A deferred provider swap: stored when the user switches to a model whose
+/// context manager cannot hold the LIVE conversation (see
+/// [`AgentLoop::swap_needs_compaction`]). The turn loop completes the swap
+/// after summarizing with the OLD provider, so the conversation fits the new
+/// window. A switch whose conversation already fits swaps at once — no
+/// `PendingSwap`, no summarization.
 pub struct PendingSwap {
     /// The new provider to swap to.
     pub provider: Arc<dyn LlmClient>,
@@ -2368,6 +2370,35 @@ impl AgentLoop {
         self.compaction_raise.reset();
     }
 
+    /// Whether the LIVE conversation is too large for `context_manager`'s
+    /// window — the shared "compact before switching" rule used by
+    /// [`set_explicit_provider`](Self::set_explicit_provider) and
+    /// [`AgentSession::set_model`](crate::headless::AgentSession::set_model).
+    ///
+    /// The measure is the turn loop's own compaction trigger (see the
+    /// `token_count >= context_manager.effective_limit()` gate in `run_turn`)
+    /// applied to the live token count recorded at the top of the last request
+    /// iteration — messages plus tools-schema overhead, the same value the
+    /// summarize trigger compares. A count of `0` means no request has been
+    /// built yet (a fresh session, or a `/new` reset): an empty conversation
+    /// trivially fits, so this reports `false`.
+    ///
+    /// A model switch compacts first ONLY when this is `true`. A new window
+    /// that is merely smaller than the old one is not, by itself, a reason to
+    /// summarize a conversation that already fits: the 2027-11-02 bug
+    /// (plan 1238e0de) summarized — and reported — a switch that needed no
+    /// summarization, which made Mnemo2 mark a healthy worker failed.
+    pub fn swap_needs_compaction(&self, context_manager: &super::context::ContextManager) -> bool {
+        // `effective_limit` carries the raise ladder; the incoming manager is
+        // freshly built (no raise installed) and `set_provider` resets the
+        // ladder on every swap anyway, so this reads exactly the trigger the
+        // new model applies to its first request.
+        let live = self
+            .live_token_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        live > 0 && live >= context_manager.effective_limit()
+    }
+
     /// Pin an explicit provider + context manager for THIS agent — the
     /// per-agent model picker's live switch (`set_model` with an
     /// `agent_id`). Also swaps the default slot (like [`set_provider`]) so
@@ -2386,11 +2417,16 @@ impl AgentLoop {
     /// [`set_provider`]) — an explicit per-agent choice is not silently
     /// undone.
     ///
-    /// **Deferral:** when the new provider's `max_context` is SMALLER than the
-    /// current one, the swap is deferred — stored in [`pending_swap`](Self::pending_swap)
-    /// — so the turn loop can summarize the conversation using the OLD provider
-    /// before completing the swap. This prevents a too-large conversation from
-    /// being sent to a smaller-context model (which would fail with a 400/502).
+    /// **Deferral:** when the LIVE conversation exceeds what the new
+    /// context manager allows ([`swap_needs_compaction`](Self::swap_needs_compaction)
+    /// — the turn loop's own compaction trigger measured on the new model),
+    /// the swap is deferred — stored in [`pending_swap`](Self::pending_swap)
+    /// — so the turn loop can summarize the conversation using the OLD
+    /// provider before completing the swap. This prevents a too-large
+    /// conversation from being sent to a smaller-context model (which would
+    /// fail with a 400/502). A new window that is merely smaller is NOT
+    /// enough: when the conversation fits, the swap lands immediately and
+    /// nothing is summarized (2027-11-02 bug, plan 1238e0de).
     /// The turn loop completes it via [`take_pending_swap`](Self::take_pending_swap)
     /// both at the top of `run_turn` and at the top of every loop iteration —
     /// a deferred pick made mid-run therefore lands before the next request of
@@ -2409,15 +2445,13 @@ impl AgentLoop {
             .pinned_state
             .lock()
             .expect("pinned_state lock poisoned") = None;
-        let current_max = self
-            .context_manager
-            .read()
-            .expect("context_manager lock poisoned")
-            .max_tokens();
-        let new_max = provider.capabilities().max_context;
-        if new_max < current_max {
-            // Smaller context — defer the swap so the turn loop can summarize
-            // using the OLD provider first.
+        if self.swap_needs_compaction(&context_manager) {
+            // The live conversation exceeds what the NEW model's context
+            // manager allows — defer the swap so the turn loop can summarize
+            // using the OLD provider first. A merely smaller window is NOT
+            // enough (2027-11-02 bug, plan 1238e0de): a conversation that
+            // already fits the new model swaps at once, with no
+            // summarization and no informational event.
             *self
                 .pending_swap
                 .lock()
@@ -2442,9 +2476,11 @@ impl AgentLoop {
     }
 
     /// Whether a deferred provider swap is pending (set by
-    /// [`set_explicit_provider`](Self::set_explicit_provider) when the new
-    /// model has a smaller context window). Checked by the IPC layer so it can
-    /// emit a user-facing note instead of `ModelChanged`.
+    /// [`set_explicit_provider`](Self::set_explicit_provider) when the live
+    /// conversation exceeds what the new model's context manager allows —
+    /// [`swap_needs_compaction`](Self::swap_needs_compaction); a smaller window
+    /// alone no longer defers). Checked by the IPC layer so it can
+    /// report the switch as pending instead of immediately serving.
     pub fn has_pending_swap(&self) -> bool {
         self.pending_swap
             .lock()

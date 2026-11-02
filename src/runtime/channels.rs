@@ -428,6 +428,18 @@ pub enum AgentEvent {
         /// value).
         reasoning_effort: Option<String>,
     },
+    /// A DEFERRED model switch completed after the OLD model summarized the
+    /// conversation so it fits the new, smaller window (the model picker's
+    /// compact-then-switch path — see
+    /// [`AgentLoop::set_explicit_provider`](crate::agent::AgentLoop::set_explicit_provider)).
+    /// Informational, NOT an error: the swap succeeded and the turn continues
+    /// on the new model. Emitting [`AgentEvent::Error`] for it made consumers
+    /// that treat a final error as a terminal failure (Mnemo2's worker pump)
+    /// mark a perfectly healthy worker failed (bug report 2026-11-02, plan
+    /// 1238e0de). `model` is the model now serving.
+    ModelSwapSummarized {
+        model: String,
+    },
     /// The per-turn AUTO-RECALL just injected memories into the agent's
     /// prompt — emitted once per FRESH recall that returned hits (not on
     /// cache reuse or empty results), so the frontend can show that the
@@ -838,6 +850,14 @@ pub enum SerializableAgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
     },
+    /// The active model changed for this agent — see
+    /// [`AgentEvent::ModelSwapSummarized`]. The deferred compact-then-switch
+    /// completed: the old model summarized the conversation so it fits the
+    /// new, smaller window. Informational — consumers must NOT treat it as a
+    /// failure (the swap succeeded and the turn continues on the new model).
+    ModelSwapSummarized {
+        model: String,
+    },
     /// The per-turn auto-recall injected memories into the prompt. See
     /// [`AgentEvent::MemoryRecalled`]. Display-only.
     MemoryRecalled {
@@ -1188,6 +1208,13 @@ impl AgentEvent {
                     provider,
                     reasoning_effort,
                 },
+                approval_sender: None,
+                question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
+            },
+            AgentEvent::ModelSwapSummarized { model } => SerializedEvent {
+                event: SerializableAgentEvent::ModelSwapSummarized { model },
                 approval_sender: None,
                 question_sender: None,
                 host_tool_sender: None,

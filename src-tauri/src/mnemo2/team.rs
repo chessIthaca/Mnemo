@@ -5413,6 +5413,17 @@ async fn pump_worker(
                         }
                         terminal = true;
                     }
+                    // The deferred compact-then-switch COMPLETED: the worker
+                    // summarized and now runs on the new model. Informational
+                    // — the turn continues, so status stays Working, busy
+                    // stays set, and no error is recorded (bug 2026-11-02:
+                    // this used to arrive as an `Error`, which failed a
+                    // perfectly healthy worker). This path emits
+                    // CompactStarted but no Compacted, so the badge ends here.
+                    SerializableAgentEvent::ModelSwapSummarized { .. } => {
+                        changed |= worker.compacting;
+                        worker.compacting = false;
+                    }
                     SerializableAgentEvent::Error { error, retrying } => {
                         if !retrying {
                             turn_active = false;

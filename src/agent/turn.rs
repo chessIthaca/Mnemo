@@ -75,14 +75,6 @@ pub(crate) struct StatsRow {
     pub purpose: Option<String>,
 }
 
-/// Fill-rate threshold for the pre-swap summarization: summarize with the
-/// OLD provider when the conversation exceeds this fraction of the NEW
-/// (smaller) context window. Tied to the ContextManager fill-rate policy
-/// (the same concept `effective_summarize_at` applies), but tighter — a
-/// provider swap is a one-shot window shrink, and the regular trigger only
-/// re-fires on the next turn, too late for the smaller window.
-const SWAP_SUMMARIZE_FILL: f64 = 0.8;
-
 /// Keep-recent message count for the pre-swap summarization — the same
 /// keep-recent count as the regular auto-compaction path's normal tier (the
 /// preflight hard-ceiling tier uses 3).
@@ -1680,11 +1672,13 @@ impl AgentLoop {
                 .read()
                 .expect("context_manager lock poisoned")
                 .clone();
-            let new_max = pending.provider.capabilities().max_context;
-            let token_count = context::ContextManager::count_tokens(messages);
-            if token_count > (new_max as f64 * SWAP_SUMMARIZE_FILL) as usize {
-                // Conversation is too large for the new (smaller) window —
-                // summarize using the OLD provider before completing the swap.
+            if pending.context_manager.should_summarize(messages) {
+                // The conversation does not fit the new model's own compaction
+                // trigger — summarize using the OLD provider before completing
+                // the swap. Same measure as the pin's deferral
+                // (`AgentLoop::swap_needs_compaction`) and the turn loop's
+                // regular trigger; a switch whose conversation fits swaps
+                // silently (2027-11-02 bug, plan 1238e0de).
                 let _ = fanin_tx
                     .send((
                         agent_id,
@@ -1901,18 +1895,22 @@ impl AgentLoop {
                 .write()
                 .expect("explicit_provider lock poisoned") =
                 Some((pending.provider, pending.context_manager));
-            let _ = fanin_tx
-                .send((
-                    agent_id,
-                    AgentEvent::Error {
-                        error: format!(
-                            "Switched to '{}' (summarized for smaller context)",
-                            pending.model
-                        ),
-                        retrying: false,
-                    },
-                ))
-                .await;
+            // Informational, never `AgentEvent::Error` (bug 2026-11-02, plan
+            // 1238e0de): the swap SUCCEEDED and the turn continues on the new
+            // model, so a consumer that treats a final error as a terminal
+            // failure (Mnemo2's worker pump) must not see one. Emitted only
+            // when the conversation was actually rewritten — a deferred swap
+            // whose conversation turned out to fit swaps silently.
+            if rewrote {
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::ModelSwapSummarized {
+                            model: pending.model,
+                        },
+                    ))
+                    .await;
+            }
         }
         PendingSwapOutcome {
             rewrote,

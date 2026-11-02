@@ -42,12 +42,21 @@
 //! [`HELD_SETUP_MANAGER`], the same role Mnemo1's `IpcState` manager
 //! plays — and every path that must touch a running sidecar reuses the
 //! held instances. Nothing here ever builds a second manager.
+//!
+//! The hold never outlives its consumer either (review finding
+//! heldManagerOrphan): when the pipeline task ends, the settlement
+//! ([`settle_held_manager_core`]) hands a serving manager to the open
+//! lead's runtime — [`LeadRuntime::set_laya_manager`], whose `shutdown`
+//! stops it like the attach-time one — or stops it directly when no
+//! lead is open, and the app-exit hook ([`stop_held_manager`]) clears
+//! whatever a closed race left behind. A static is never dropped; an
+//! unheld orphan never is either.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use mnemo::config::general::LayaConfig;
 use mnemo::config::settings_dto::{RoutingConfigDto, SettingsSaveDto};
@@ -57,6 +66,7 @@ use mnemo::laya::{LayaManager, english_checkpoint};
 use mnemo::memory::classifier::ClassifierStatus;
 
 use crate::mnemo2::ipc::{settings_refresh, settings_setup, Mnemo2State};
+use crate::mnemo2::runtime::LeadRuntime;
 
 /// The Tauri event channel `laya_setup` streams its install progress on:
 /// a [`SetupEvent`] payload — `Progress` events (fractions) while the
@@ -69,19 +79,26 @@ pub const LAYA_EVENT_CHANNEL: &str = "mnemo2://laya-event";
 /// manager). The completing pipeline autostarts the sidecar THROUGH this
 /// manager, and a child lives inside the manager that spawned it:
 /// without this hold the pipeline task's own `Arc` would be the last
-/// one, and its end would kill the sidecar it just started. `laya_disable`
-/// and a fresh `laya_setup` take or replace it, stopping any child it
-/// holds — never two settings-side children.
+/// one, and its end would kill the sidecar it just started. A static is
+/// never dropped, so the hold also never OUTLIVES its consumer (review
+/// finding heldManagerOrphan): the pipeline-end settlement
+/// ([`settle_held_manager_core`]) hands a serving manager to the open
+/// lead's runtime — whose `shutdown` stops it like the attach-time
+/// manager — or stops it when no lead is open; the app-exit hook
+/// ([`stop_held_manager`]) clears what a closed race left. `laya_disable`
+/// and a fresh `laya_setup` also take or replace it, stopping any child
+/// it holds — never two settings-side children.
 static HELD_SETUP_MANAGER: Mutex<Option<Arc<LayaManager>>> = Mutex::new(None);
 
 /// True while a settings-side setup pipeline is in flight. The kernel's
 /// own `begin_setup` guard is per-manager — useless across the per-call
 /// `Setup`s, which each build a fresh manager — so this flag is what
 /// makes a second Install click fail fast. Claimed by `laya_setup`,
-/// released at the pipeline's terminal `Done`/`Failed` event (or the
-/// stream's close) and on an early kernel-leg error; `laya_disable`
-/// releases it too — the escape hatch for a pipeline that never reached
-/// its terminal event.
+/// released when the pipeline TASK's event stream closes (the terminal
+/// `Done`/`Failed` AND the autostart that follows it have both ended)
+/// or on an early kernel-leg error; `laya_disable` releases it too —
+/// the escape hatch for a pipeline that never reached its terminal
+/// event.
 static SETUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 // ── Wire shapes ─────────────────────────────────────────────────────────────
@@ -347,13 +364,20 @@ pub(crate) async fn save_laya_settings_core(
     setup.patch_settings(patch).await.map_err(|err| err.to_string())
 }
 
-/// Forward the setup pipeline's events to [`LAYA_EVENT_CHANNEL`] and
-/// release the in-flight guard at the pipeline's end — eagerly at the
-/// terminal `Done`/`Failed`, and at the stream's close as the belt (a
-/// lagged terminal, a crashed pipeline).
+/// Forward the setup pipeline's events to [`LAYA_EVENT_CHANNEL`] until
+/// the stream closes, then release the in-flight guard and settle the
+/// settings-side hold ([`settle_held_manager_core`]). The close is the
+/// pipeline TASK's end: the terminal `Done`/`Failed` rode the stream,
+/// and the autostart the task starts AFTER `Done` (sidecar spawn +
+/// readiness probe + the live-slot swap) has landed or failed by then,
+/// so the manager's child state is final. Forwarding until that close —
+/// not stopping at the terminal event — is what lets the settlement see
+/// the outcome, and it keeps a second Install click failing fast while
+/// the sidecar itself is still coming up.
 fn spawn_laya_forwarder(
     app: AppHandle,
     mut events: EventReceiver<SetupEvent>,
+    manager: Arc<LayaManager>,
     in_flight: &'static AtomicBool,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -361,17 +385,103 @@ fn spawn_laya_forwarder(
             match events.recv().await {
                 Ok(event) => {
                     let _ = app.emit(LAYA_EVENT_CHANNEL, &event);
-                    if matches!(event, SetupEvent::Done { .. } | SetupEvent::Failed { .. }) {
-                        in_flight.store(false, Ordering::SeqCst);
-                        break;
-                    }
                 }
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             }
         }
         in_flight.store(false, Ordering::SeqCst);
+        settle_held_manager(&app, manager).await;
     });
+}
+
+/// The async shell of [`settle_held_manager_core`]: resolve the open
+/// lead through the sanctioned `settings_setup` accessor
+/// (`Mnemo2State`'s runtime field is private), then settle. A
+/// `settings_setup` failure falls back to the no-lead arm: right after
+/// the pipeline's own successful config save an unreadable config is a
+/// torn state, and stopping a sidecar nobody can name a consumer for is
+/// the safe side of the orphan trade-off (the app-exit hook still runs
+/// later).
+async fn settle_held_manager(app: &AppHandle, manager: Arc<LayaManager>) {
+    let runtime = match settings_setup(&app.state::<Mnemo2State>()).await {
+        Ok((_, runtime)) => runtime,
+        Err(_) => None,
+    };
+    settle_held_manager_core(&HELD_SETUP_MANAGER, runtime.as_deref(), manager);
+}
+
+/// Settle the settings-side hold at the pipeline task's end (review
+/// finding heldManagerOrphan): a live sidecar must never outlive its
+/// consumer or the app, and the static hold is never dropped.
+///
+/// - live sidecar (the manager's status reads `Starting`/`Ready`/
+///   `FineTuning` — the autostart's outcome) + an open lead → hand the
+///   manager to that session ([`LeadRuntime::set_laya_manager`], which
+///   stops the manager it replaces — its child was superseded by the
+///   live-slot swap that landed with this pipeline's sidecar), so
+///   `LeadRuntime::shutdown` stops it like the attach-time manager;
+/// - live sidecar + no lead → stop it now: a sidecar serving a closed
+///   project's slot is an orphan (the next lead open attaches through
+///   its own manager);
+/// - no live sidecar (a failed or disabled pipeline — the child was
+///   scoped-torn-down or never spawned) → just clear the hold: the
+///   session's own manager, if any, keeps serving the untouched slot.
+///
+/// The hold is only touched while it still points at THIS manager — a
+/// mid-flight `laya_disable` takes it, a newer `laya_setup` replaces it.
+fn settle_held_manager_core(
+    hold: &Mutex<Option<Arc<LayaManager>>>,
+    runtime: Option<&LeadRuntime>,
+    manager: Arc<LayaManager>,
+) {
+    let live = {
+        let status = manager
+            .status_arc()
+            .read()
+            .expect("classifier status lock poisoned");
+        matches!(
+            *status,
+            ClassifierStatus::Starting
+                | ClassifierStatus::Ready
+                | ClassifierStatus::FineTuning { .. }
+        )
+    };
+    let mut held = hold.lock().expect("laya hold lock poisoned");
+    if !held.as_ref().is_some_and(|current| Arc::ptr_eq(current, &manager)) {
+        return;
+    }
+    match (live, runtime) {
+        (true, Some(runtime)) => {
+            *held = None;
+            runtime.set_laya_manager(manager);
+        }
+        (true, None) => {
+            // The same Arc as `manager` (the ptr-check above matched it):
+            // dropping the hold's clone and stopping ours is one stop.
+            held.take();
+            manager.stop();
+        }
+        (false, _) => {
+            held.take();
+        }
+    }
+}
+
+/// Stop the settings-side hold's sidecar and clear it — the app-exit
+/// hook's call (mod.rs's `RunEvent::ExitRequested` handler, right after
+/// `state.shutdown()`): a static is never dropped, so without this a
+/// settings-installed `laya-serve` that no lead adopted would outlive
+/// the app (orphan process, port held). Stopping a childless manager is
+/// a `false` no-op, so the call is always safe.
+pub(crate) fn stop_held_manager() {
+    if let Some(manager) = HELD_SETUP_MANAGER
+        .lock()
+        .expect("laya hold lock poisoned")
+        .take()
+    {
+        manager.stop();
+    }
 }
 
 /// Compact `"endpoint/model"` form of a routing slot for the wire
@@ -406,7 +516,12 @@ pub async fn laya_status(state: State<'_, Mnemo2State>) -> Result<LayaStatusWire
 pub async fn laya_setup(state: State<'_, Mnemo2State>, app: AppHandle) -> Result<(), String> {
     let (setup, _) = settings_setup(&state).await?;
     let events = laya_setup_core(&setup, &HELD_SETUP_MANAGER, &SETUP_IN_FLIGHT).await?;
-    spawn_laya_forwarder(app, events, &SETUP_IN_FLIGHT);
+    spawn_laya_forwarder(
+        app,
+        events,
+        Arc::clone(setup.laya_manager()),
+        &SETUP_IN_FLIGHT,
+    );
     Ok(())
 }
 
@@ -464,6 +579,7 @@ mod tests {
     use super::*;
     use mnemo::config::general::SafetyMode;
     use mnemo::config::settings_dto::ModelRefDto;
+    use crate::mnemo2::runtime::LeadRuntimeOptions;
 
     /// A temp config dir with a rich fixture: a `config.toml` whose
     /// Laya-owned sections (`[general.laya]`, `[general.routing]`) sit
@@ -802,5 +918,134 @@ simple = ["ep1/exec-model"]
         assert!(!in_flight.load(Ordering::SeqCst));
         let held = hold.lock().expect("hold lock").as_ref().expect("hold set").clone();
         assert!(Arc::ptr_eq(&held, setup.laya_manager()));
+    }
+
+    /// The lead-open fixture the runtime's tests use (its private
+    /// `write_config`): a default model resolvable from a keyless local
+    /// endpoint — `Engine::start`'s only gate for a caller without an
+    /// injected provider — with `[general.laya]` deliberately absent so
+    /// nothing attaches at engine start. The only manager in play is the
+    /// settings-side one.
+    fn write_lead_config(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"scripted-a\"]\n",
+        )
+        .expect("endpoints.toml");
+    }
+
+    #[tokio::test]
+    async fn a_settled_manager_handed_to_the_runtime_is_stopped_by_shutdown() {
+        // Review finding heldManagerOrphan: the settings-side hold is a
+        // static (never dropped), so the sidecar a `laya_setup` pipeline
+        // spawned would outlive the session AND the app. The pipeline-end
+        // settlement hands a SERVING manager to the open lead's runtime —
+        // here simulated the way the real autostart drives it (the
+        // manager's status Arc reads Ready at the pipeline task's end).
+        // No real sidecar ever runs: the observable is the one the
+        // runtime's own attach test uses — the session holds the very
+        // Arc (ptr_eq) after the hand-off, and `shutdown` leaves it
+        // holding nothing (its explicit `stop` is the primary path; the
+        // manager's `Drop` is only the safety net).
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_lead_config(config.path());
+        let runtime = LeadRuntime::open(LeadRuntimeOptions {
+            workspace_root: root.path().to_path_buf(),
+            config_dir: Some(config.path().to_path_buf()),
+            state_dir: state.path().to_path_buf(),
+            model: None,
+        })
+        .await
+        .expect("the lead opens without Laya — no manager of its own");
+        assert!(
+            runtime.laya_manager().is_none(),
+            "nothing attached at engine start"
+        );
+
+        // The settings-side hold: the per-call Setup's own manager, its
+        // status reading Ready the way the autostart's spawn + readiness
+        // probe + live-slot swap leaves it.
+        let setup = Setup::open(Some(config.path().to_path_buf())).expect("setup");
+        let manager = Arc::clone(setup.laya_manager());
+        *manager
+            .status_arc()
+            .write()
+            .expect("classifier status lock poisoned") = ClassifierStatus::Ready;
+        let hold: Mutex<Option<Arc<LayaManager>>> = Mutex::new(Some(Arc::clone(&manager)));
+
+        settle_held_manager_core(&hold, Some(&runtime), Arc::clone(&manager));
+        let adopted = runtime
+            .laya_manager()
+            .expect("the session adopted the settings-side manager");
+        assert!(Arc::ptr_eq(&adopted, &manager));
+        assert!(
+            hold.lock().expect("hold lock").is_none(),
+            "the hold is cleared by the hand-off"
+        );
+
+        runtime.shutdown().await;
+        assert!(
+            runtime.laya_manager().is_none(),
+            "shutdown stopped the settings-installed manager like the attach-time one"
+        );
+    }
+
+    #[test]
+    fn settling_a_live_orphan_without_a_lead_stops_and_clears_the_hold() {
+        // No lead open at the pipeline's end: the sidecar's slot went
+        // with the closed project — stopping it beats leaking it to app
+        // exit. (Childless here — the fixture never runs one; the
+        // observable is the cleared hold, the real child dies in the
+        // same stop call.)
+        let (_dir, setup) = fixture();
+        let manager = Arc::clone(setup.laya_manager());
+        *manager
+            .status_arc()
+            .write()
+            .expect("classifier status lock poisoned") = ClassifierStatus::Ready;
+        let hold: Mutex<Option<Arc<LayaManager>>> = Mutex::new(Some(Arc::clone(&manager)));
+        settle_held_manager_core(&hold, None, Arc::clone(&manager));
+        assert!(
+            hold.lock().expect("hold lock").is_none(),
+            "an orphan sidecar never outlives its consumer"
+        );
+    }
+
+    #[test]
+    fn settling_a_failed_pipeline_only_clears_the_hold() {
+        // A failed or disabled pipeline leaves the manager childless
+        // (the child was scoped-torn-down or never spawned): the
+        // session's own manager, if any, keeps serving the untouched
+        // slot — nothing is stopped, the hold just clears.
+        let (_dir, setup) = fixture();
+        let manager = Arc::clone(setup.laya_manager());
+        let hold: Mutex<Option<Arc<LayaManager>>> = Mutex::new(Some(Arc::clone(&manager)));
+        settle_held_manager_core(&hold, None, Arc::clone(&manager));
+        assert!(hold.lock().expect("hold lock").is_none());
+    }
+
+    #[test]
+    fn settling_never_clobbers_a_hold_that_moved_on() {
+        // A mid-flight `laya_disable` takes the hold, a newer
+        // `laya_setup` replaces it: the old pipeline's settlement must
+        // leave it alone.
+        let (_dir_a, setup_a) = fixture();
+        let old_manager = Arc::clone(setup_a.laya_manager());
+        let (_dir_b, setup_b) = fixture();
+        let replacement = Arc::clone(setup_b.laya_manager());
+        let hold: Mutex<Option<Arc<LayaManager>>> = Mutex::new(Some(Arc::clone(&replacement)));
+        settle_held_manager_core(&hold, None, Arc::clone(&old_manager));
+        let still = hold.lock().expect("hold lock").clone();
+        assert!(
+            Arc::ptr_eq(still.as_ref().expect("hold kept"), &replacement),
+            "the newer hold survives the old pipeline's settlement"
+        );
     }
 }

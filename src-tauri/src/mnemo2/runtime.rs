@@ -1055,6 +1055,27 @@ impl LeadRuntime {
             .clone()
     }
 
+    /// Hand a settings-installed Laya manager (the manager a
+    /// `laya_settings::laya_setup` pipeline ran on) to this session, so
+    /// [`LeadRuntime::shutdown`] stops its sidecar exactly like the
+    /// attach-time one — a static hold is never dropped, and without
+    /// this hand-off a settings-installed `laya-serve` would outlive the
+    /// session and the app (review finding heldManagerOrphan). Any
+    /// manager the session already holds is stopped first: its child is
+    /// superseded by the live-slot swap that landed with the new
+    /// sidecar. Only `laya_settings`' pipeline-end settlement calls
+    /// this, and only when the manager it hands over actually serves.
+    pub fn set_laya_manager(&self, manager: Arc<LayaManager>) {
+        let previous = self
+            .laya
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(manager);
+        if let Some(previous) = previous {
+            previous.stop();
+        }
+    }
+
     async fn spawn_live(
         &self,
         generation: u64,

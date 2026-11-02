@@ -527,6 +527,11 @@ pub fn run() {
                     }
                     shutdown_progress.set(ShutdownStep::StoppingRuntimes);
                     state.shutdown().await;
+                    // A settings-installed sidecar that no lead adopted at
+                    // its pipeline's end lives only in laya_settings'
+                    // static hold — a static is never dropped, so stop it
+                    // explicitly here (review finding heldManagerOrphan).
+                    laya_settings::stop_held_manager();
                     shutdown_progress.set(ShutdownStep::ClosingBrowser);
                     let _ = browser.close().await;
                 };

@@ -58,6 +58,11 @@ pub mod run_file;
 /// e02de747).
 pub mod laya_settings;
 
+/// The Safety settings commands (approval mode + the project's safety
+/// rules) — the backend of the Settings dialog's Safety page (plan
+/// f1bd54e5).
+pub mod safety_settings;
+
 /// The local endpoint for an external lead (Claude Code over MCP).
 pub mod mcp_server;
 
@@ -421,6 +426,9 @@ pub fn run() {
             laya_settings::laya_setup,
             laya_settings::laya_disable,
             laya_settings::save_laya_settings,
+            safety_settings::safety_settings_get,
+            safety_settings::save_safety_mode,
+            safety_settings::save_safety_rules,
             ipc::lead_snapshot,
             ipc::indexing_snapshot,
             ipc::lead_prompt,

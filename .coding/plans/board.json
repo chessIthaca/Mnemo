@@ -362,18 +362,18 @@
     },
     {
       "id": "f1bd54e5",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793615681601,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793623910245,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f1bd54e5-20261102-125150.md",
       "abandon_reason": null
     },
     {
       "id": "9cd9d1fc",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793616557321,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793622294003,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-9cd9d1fc-20261102-122454.md",
       "abandon_reason": null
     }
   ]

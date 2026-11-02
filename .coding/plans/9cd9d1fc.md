@@ -32,7 +32,13 @@ Verification: `cargo test --manifest-path src-tauri/Cargo.toml --features mnemo2
 - If one worker cannot be deleted, all others are deleted, and the dialog shows which one failed and why, with a Retry.
 
 ## Steps
-- [ ] 1. **Instant sheet with progress, faster preview and deletion, per-worker results** — `src-tauri/src/mnemo2/team.rs` (deletion_preview, inspect_deletion, delete_workers, delete_one, trash sweep; regression test `delete_workers_continues_past_a_failed_worker`), `src-tauri/src/mnemo2/ipc.rs` (team_delete_preview / team_delete return shapes, progress event), `mnemo2/src/lib/store.ts` (requestDeleteWorkers / confirmDeleteWorkers region only), `mnemo2/src/components/WorkerDeleteSheet.svelte`, `mnemo2/src/components/ControlRoom.svelte` (button disabled state), tests.
+- [x] 1. **Instant sheet with progress, faster preview and deletion, per-worker results** — `src-tauri/src/mnemo2/team.rs` (deletion_preview, inspect_deletion, delete_workers, delete_one, trash sweep; regression test `delete_workers_continues_past_a_failed_worker`), `src-tauri/src/mnemo2/ipc.rs` (team_delete_preview / team_delete return shapes, progress event), `mnemo2/src/lib/store.ts` (requestDeleteWorkers / confirmDeleteWorkers region only), `mnemo2/src/components/WorkerDeleteSheet.svelte`, `mnemo2/src/components/ControlRoom.svelte` (button disabled state), tests.
 
 ## Bug
 In mission control, "Delete old" takes a long time before its dialog appears, so the button can be pressed twice and open the dialog twice; the deletion itself is slow; and when one worker's deletion fails, the remaining workers are not deleted.
+
+## Regression test
+delete_workers_continues_past_a_failed_worker
+
+## Progress
+- 2026-11-02 step 1 done: step 1 merged: deleteFlow89 (deleteFlow89) on glm-5.3, merge commit d97dea78; review: Delete old: the sheet opens at once and streams per-worker preview rows, the button can't double-open, previews batch git facts with bounded concurrency and no merge lock, checkouts are renamed into .worktrees/.trash and swept in the background (also at startup), and deletion returns per-worker results so one failure no longer stops the rest.

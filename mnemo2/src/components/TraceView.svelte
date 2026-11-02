@@ -506,7 +506,7 @@
   /** Which keys an export scope would write — empty means the button is inert. */
   function exportKeys(scope: ExportScope): string[] {
     if (scope === "call") return selectedKey === null ? [] : [selectedKey];
-    if (scope === "selected") return checked;
+    if (scope === "selected") return pickedKeys;
     return [];
   }
 

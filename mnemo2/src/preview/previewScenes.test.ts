@@ -48,9 +48,9 @@ describe("preview scenes", () => {
       "mission-control",
       "worker-thread",
       "lead-chat",
+      "settings-models",
       "lead-idle",
       "delete-sheet",
-      "settings-models",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
     expect(previewScene("")?.name).toBe(defaultPreviewScene);

@@ -395,18 +395,6 @@ export const previewScenes: PreviewScene[] = [
     build: leadChat,
   },
   {
-    name: "lead-idle",
-    title: "Lead idle",
-    description: "The top bar with an idle Claude Code lead badge.",
-    build: leadIdle,
-  },
-  {
-    name: "delete-sheet",
-    title: "Delete-old sheet",
-    description: "The delete sheet with one superseded worker.",
-    build: deleteSheet,
-  },
-  {
     name: "settings-models",
     title: "Settings: Models and Savings",
     description:
@@ -423,6 +411,18 @@ export const previewScenes: PreviewScene[] = [
         restore();
       };
     },
+  },
+  {
+    name: "lead-idle",
+    title: "Lead idle",
+    description: "The top bar with an idle Claude Code lead badge.",
+    build: leadIdle,
+  },
+  {
+    name: "delete-sheet",
+    title: "Delete-old sheet",
+    description: "The delete sheet with one superseded worker.",
+    build: deleteSheet,
   },
 ];
 

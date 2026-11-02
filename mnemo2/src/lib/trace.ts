@@ -78,13 +78,6 @@ export interface TraceRow {
   retained: boolean;
 }
 
-/** One poll of the log: the rows plus the ring's size. */
-export interface TracePage {
-  requests: TraceRow[];
-  /** How many records the ring keeps before evicting the oldest. */
-  capacity: number;
-}
-
 /** One tool call as the model delivered it, before harness normalization. */
 export interface TraceToolCall {
   id: string;
@@ -99,38 +92,6 @@ export interface TraceDetail extends TraceRow {
   response_raw: string | null;
   request_truncated: boolean;
   raw_tool_calls: TraceToolCall[] | null;
-}
-
-/** The IPC surface the Trace tab needs. */
-export interface TraceTransport {
-  /** The recorded requests, oldest first. */
-  list(): Promise<TracePage>;
-  /** One request in full, or `null` once it has been evicted. */
-  detail(id: number): Promise<TraceDetail | null>;
-  /** Drop every recorded request. */
-  clear(): Promise<void>;
-}
-
-/** The dev-only preview's stand-in transport; never set in production. */
-let previewSeed: TraceTransport | null = null;
-
-/**
- * Point the Trace tab at fixture data for the dev-only preview page
- * (`npm run check:no-mock` keeps this out of the production entry).
- */
-export function seedTracePreview(transport: TraceTransport | null): void {
-  previewSeed = transport;
-}
-
-/** Build the Trace tab's transport, or `null` outside the desktop app. */
-export function createTraceTransport(): TraceTransport | null {
-  if (previewSeed) return previewSeed;
-  if (!isTauriRuntime()) return null;
-  return {
-    list: () => invoke<TracePage>("trace_list"),
-    detail: (id: number) => invoke<TraceDetail | null>("trace_detail", { id }),
-    clear: () => invoke<void>("trace_clear"),
-  };
 }
 
 /** A request's start time as a local wall-clock time (`09:05:07`). */
@@ -335,20 +296,15 @@ export function responseText(detail: TraceDetail): string {
   return detail.response_raw ?? "";
 }
 
-/** How many rows a fresh poll adds, for the list's "new" hint. */
-export function newestId(page: TracePage): number | null {
-  return page.requests.length === 0
-    ? null
-    : page.requests[page.requests.length - 1].id;
-}
 // ---------------------------------------------------------------------------
 // The Trace route's contract — the full-page view of every model call.
 //
 // The wire shape is frozen in the plan's Interfaces section: Rust keeps
-// snake_case serde, this file mirrors it exactly, and the commands above
-// (`trace_list` without a query, `trace_detail` by id) belong to the compact
-// Workbench tab until step E switches it over. The page uses the commands
-// below; they arrive with the backend step in parallel.
+// snake_case serde, this file mirrors it exactly, and the commands below are
+// what the route and the compact Workbench tab both use since step E switched
+// the tab over (`trace_list` takes the query, `trace_detail` a durable key,
+// and `trace_settings`/`trace_export`/`trace_clear_live`/
+// `trace_delete_history` back the data controls).
 // ---------------------------------------------------------------------------
 
 /** The purpose a call was made for, as the kernel stamps it. */
@@ -448,6 +404,12 @@ export interface TracePageTransport {
   /** Drop the retained metadata journal. */
   deleteHistory(): Promise<TraceHistoryDeletion>;
   exportCalls(request: TraceExportRequest): Promise<TraceExportResult>;
+  /**
+   * Show one exported bundle in the OS file manager. The backend accepts only
+   * paths inside `.coding/logs/trace-exports/`, so a stale result can never
+   * point the app at an arbitrary file.
+   */
+  revealExport(path: string): Promise<void>;
 }
 
 /** The dev-only preview's stand-in page transport; never set in production. */
@@ -473,6 +435,7 @@ export function createTracePageTransport(): TracePageTransport | null {
     clearLive: () => invoke<void>("trace_clear_live"),
     deleteHistory: () => invoke<TraceHistoryDeletion>("trace_delete_history"),
     exportCalls: (request) => invoke<TraceExportResult>("trace_export", { request }),
+    revealExport: (path) => invoke<void>("trace_reveal_export", { path }),
   };
 }
 
@@ -1427,6 +1390,8 @@ export interface TraceEntry {
   turn_id?: string;
   search?: string;
   search_scope?: TraceSearchScope;
+  /** The call to open on arrival ("run_id:id"), for the compact tab's hand-over. */
+  selected?: string;
 }
 
 /**
@@ -1446,6 +1411,7 @@ export function traceEntryFilters(entry: TraceEntry | null): Partial<TraceFilter
     patch.scope = entry.search_scope ?? "all";
   }
   if (entry.turn_id !== undefined) patch.turn_id = entry.turn_id;
+  if (entry.selected !== undefined) patch.selected = entry.selected;
   if (entry.from_ms !== undefined || entry.to_ms !== undefined) {
     patch.time = "custom";
     patch.from_ms = entry.from_ms ?? null;

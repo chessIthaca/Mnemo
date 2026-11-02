@@ -23,9 +23,8 @@
     type CostGrouping,
     type TimingColumn,
     type TokenColumn,
-    type TraceRow,
   } from "../lib/traceCharts";
-  import { formatDuration, formatTokens } from "../lib/trace";
+  import { formatDuration, formatTokens, type TraceRow } from "../lib/trace";
   import { formatTokenCount } from "../lib/usage";
 
   let {

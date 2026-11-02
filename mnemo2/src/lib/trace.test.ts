@@ -7,7 +7,6 @@ import {
   capText,
   cacheReuseLabel,
   createTracePageTransport,
-  createTraceTransport,
   DEFAULT_TRACE_FILTERS,
   finishLabel,
   formatDuration,
@@ -16,7 +15,6 @@ import {
   loadTracePrefs,
   messageBlocks,
   messageText,
-  newestId,
   phaseTotalMs,
   prefixReuse,
   previousComparableRow,
@@ -27,7 +25,6 @@ import {
   responseView,
   saveTracePrefs,
   seedTracePagePreview,
-  seedTracePreview,
   shortTurnId,
   traceAgentOptions,
   traceAge,
@@ -242,41 +239,10 @@ describe("prettyJson", () => {
   });
 });
 
-describe("newestId", () => {
-  it("is the last row's id, or null for an empty log", () => {
-    expect(newestId({ requests: [], capacity: 32 })).toBeNull();
-    expect(
-      newestId({ requests: [row({ id: 3 }), row({ id: 4 })], capacity: 32 }),
-    ).toBe(4);
-  });
-});
-
-describe("createTraceTransport", () => {
-  afterEach(() => {
-    seedTracePreview(null);
-  });
-
-  it("is null outside the desktop app, so the tab can say so", () => {
-    expect(createTraceTransport()).toBeNull();
-  });
-
-  it("uses the preview seed when one is installed", async () => {
-    const detailRow = detail({ id: 7, request_json: { model: "m" }, response_raw: "ok" });
-    seedTracePreview({
-      list: async () => ({ requests: [row({ id: 7 })], capacity: 32 }),
-      detail: async () => detailRow,
-      clear: async () => undefined,
-    });
-    const transport = createTraceTransport();
-    expect(transport).not.toBeNull();
-    expect(await transport?.list()).toEqual({ requests: [row({ id: 7 })], capacity: 32 });
-    expect((await transport?.detail(7))?.response_raw).toBe("ok");
-    await expect(transport?.clear()).resolves.toBeUndefined();
-  });
-});
 // ---------------------------------------------------------------------------
 // The Trace route's contract mirror and helpers.
 // ---------------------------------------------------------------------------
+
 
 describe("trace page contract helpers", () => {
   const attr = (overrides: Partial<TraceAttribution> = {}): TraceAttribution => ({
@@ -596,6 +562,8 @@ describe("trace page contract helpers", () => {
       const patch = traceEntryFilters({ agent: "design-trace", turn_id: "t-9", from_ms: 5 });
       expect(patch).toEqual({ agent: "design-trace", turn_id: "t-9", time: "custom", from_ms: 5, to_ms: null });
       expect(traceEntryFilters({ search: "read_file", search_scope: "response" })).toEqual({ search: "read_file", scope: "response" });
+      // The compact tab hands its open call over so the route opens the same one.
+      expect(traceEntryFilters({ selected: "run-1:7" })).toEqual({ selected: "run-1:7" });
     });
   });
 

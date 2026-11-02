@@ -4,7 +4,8 @@
   // See LICENSE in the repository root.
 
   import { onMount } from "svelte";
-  import { Search, X } from "@lucide/svelte";
+  import { Copy, Download, FolderOpen, History, Search, Trash2, X } from "@lucide/svelte";
+  import { formatBytes } from "../lib/files";
   import { actions, app, SESSION_START_MS } from "../lib/store";
   import TraceCharts from "./TraceCharts.svelte";
   import TraceDetailPane from "./TraceDetail.svelte";
@@ -29,11 +30,14 @@
     TRACE_STATUS_OPTIONS,
     TRACE_TIME_OPTIONS,
     type TraceDetail,
+    type TraceExportRequest,
+    type TraceExportResult,
     type TraceFilters,
     type TraceListPage,
     type TraceListStatus,
     type TraceRow,
     type TraceSearchScope,
+    type TraceSettings,
     type TraceGrouping,
   } from "../lib/trace";
 
@@ -86,6 +90,43 @@
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
   let reloadToken = 0;
   let detailToken = 0;
+
+  // --- Data controls: export, on-disk bodies, clear and delete --------------
+  /** Which export scope is running, or `null` when idle. */
+  type ExportScope = TraceExportRequest["scope"];
+  let settings = $state<TraceSettings | null>(null);
+  let settingsError = $state("");
+  let settingsBusy = $state(false);
+  /** The durable keys ticked for a "selected calls" export. */
+  let checked = $state<string[]>([]);
+  let exporting = $state<ExportScope | null>(null);
+  let exportResult = $state<TraceExportResult | null>(null);
+  let exportError = $state("");
+  let exportNote = $state("");
+  let copiedPath = $state(false);
+  let confirmClear = $state(false);
+  let confirmDelete = $state(false);
+  let maintenanceBusy = $state(false);
+  let maintenanceNote = $state("");
+  let maintenanceError = $state("");
+
+  const liveSummary = $derived.by(() => {
+    if (settings === null) return "";
+    const parts = [`${settings.ring_capacity} calls kept in memory`];
+    parts.push(settings.log_bodies ? "bodies kept for the live log" : "bodies not kept for the live log");
+    return parts.join(" · ");
+  });
+
+  const journalSummary = $derived.by(() => {
+    if (settings === null) return "";
+    return `Retained metadata ${formatBytes(settings.history_bytes)} · journal ${formatBytes(settings.journal_bytes)}`;
+  });
+
+  /** Only the ticks that are still listed — a filter change silently drops the rest. */
+  const pickedKeys = $derived(checked.filter((key) => rows.some((row) => traceKey(row) === key)));
+
+  /** How many listed calls are metadata-only, for the delete confirmation. */
+  const retainedInView = $derived(rows.filter((row) => row.retained).length);
 
   const chips = $derived(activeTraceChips(filters));
   const groups = $derived(groupTraceRows(rows, filters.grouping, nowMs));
@@ -396,6 +437,16 @@
     void loadDetail(key);
   }
 
+  /**
+   * Open a call another surface handed over. The row may sit outside the
+   * current filters, so the detail loads by key instead of waiting for a row.
+   */
+  function openEntrySelection(key: string | null): void {
+    if (key === null) return;
+    selectedKey = key;
+    void loadDetail(key);
+  }
+
   function closeDetail(): void {
     selectedKey = null;
     detail = null;
@@ -414,6 +465,149 @@
 
   function revealNewCalls(): void {
     toggleFollow(true);
+  }
+
+  // -------------------------------------------------------------------------
+  // Data controls — every call goes through the frozen `trace_*` commands.
+  // -------------------------------------------------------------------------
+
+  async function loadSettings(): Promise<void> {
+    if (transport === null) return;
+    settingsBusy = true;
+    try {
+      settings = await transport.settings();
+      settingsError = "";
+    } catch (failure) {
+      settingsError = errorMessage(failure);
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
+  /** Flip the sensitive "save bodies to disk" switch and report what landed. */
+  async function toggleLogBodies(): Promise<void> {
+    if (transport === null || settings === null) return;
+    settingsBusy = true;
+    try {
+      settings = await transport.setLogBodies(!settings.log_bodies);
+      settingsError = "";
+    } catch (failure) {
+      settingsError = errorMessage(failure);
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
+  function toggleCheck(row: TraceRow): void {
+    const key = traceKey(row);
+    checked = checked.includes(key) ? checked.filter((entry) => entry !== key) : [...checked, key];
+  }
+
+  /** Which keys an export scope would write — empty means the button is inert. */
+  function exportKeys(scope: ExportScope): string[] {
+    if (scope === "call") return selectedKey === null ? [] : [selectedKey];
+    if (scope === "selected") return checked;
+    return [];
+  }
+
+  async function exportCalls(scope: ExportScope): Promise<void> {
+    if (transport === null || exporting !== null) return;
+    const keys = exportKeys(scope);
+    if (scope !== "filtered" && keys.length === 0) return;
+    exporting = scope;
+    exportError = "";
+    exportNote = "";
+    copiedPath = false;
+    try {
+      const request: TraceExportRequest = { scope };
+      if (scope !== "filtered") request.keys = [...keys];
+      else
+        request.query = traceListQuery(filters, {
+          sessionStartMs: SESSION_START_MS,
+          nowMs: Date.now(),
+          limit: TRACE_PAGE_SIZE,
+        });
+      exportResult = await transport.exportCalls(request);
+    } catch (failure) {
+      exportError = errorMessage(failure);
+    } finally {
+      exporting = null;
+    }
+  }
+
+  async function copyExportPath(): Promise<void> {
+    if (exportResult === null) return;
+    const ok = await copyText(exportResult.path);
+    copiedPath = ok;
+    exportNote = ok ? "Path copied." : "";
+    if (!ok) exportError = "The clipboard is not available — select the path and copy it manually.";
+  }
+
+  /** Best-effort clipboard write; the page never depends on it. */
+  async function copyText(text: string): Promise<boolean> {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function revealExport(): Promise<void> {
+    if (transport === null || exportResult === null) return;
+    try {
+      await transport.revealExport(exportResult.path);
+      exportError = "";
+      exportNote = "Opened the export folder.";
+    } catch (failure) {
+      exportError = `Could not open the export folder: ${errorMessage(failure)}`;
+    }
+  }
+
+  async function clearLive(): Promise<void> {
+    if (transport === null || maintenanceBusy) return;
+    maintenanceBusy = true;
+    maintenanceError = "";
+    maintenanceNote = "";
+    try {
+      await transport.clearLive();
+      checked = [];
+      maintenanceNote = "Cleared the live call log.";
+      await refreshAfterMaintenance();
+    } catch (failure) {
+      maintenanceError = `Could not clear the live call log: ${errorMessage(failure)}`;
+    } finally {
+      confirmClear = false;
+      maintenanceBusy = false;
+    }
+  }
+
+  async function deleteHistory(): Promise<void> {
+    if (transport === null || maintenanceBusy) return;
+    maintenanceBusy = true;
+    maintenanceError = "";
+    maintenanceNote = "";
+    try {
+      const outcome = await transport.deleteHistory();
+      maintenanceNote =
+        outcome.deleted_files === 0
+          ? "There was no retained history to delete."
+          : `Deleted ${outcome.deleted_files} retained file${outcome.deleted_files === 1 ? "" : "s"} (${formatBytes(outcome.bytes)}).`;
+      checked = [];
+      await refreshAfterMaintenance();
+    } catch (failure) {
+      maintenanceError = `Could not delete the retained history: ${errorMessage(failure)}`;
+    } finally {
+      confirmDelete = false;
+      maintenanceBusy = false;
+    }
+  }
+
+  /** Re-read everything a clear or delete changed: list, counts, settings, detail. */
+  async function refreshAfterMaintenance(): Promise<void> {
+    closeDetail();
+    loadedOnce = false;
+    await Promise.all([reload(), loadSettings()]);
   }
 
   function toggleInsights(): void {
@@ -493,6 +687,8 @@
     }
     // An entry hand-over wins over the saved filters when one is waiting.
     const entry = traceEntryFilters($app.traceEntry);
+    // The compact tab can hand over the call it has open; the route opens it too.
+    const wanted = entry?.selected ?? null;
     if (entry !== null) {
       filters = { ...filters, ...entry, selected: null };
       actions.clearTraceEntry();
@@ -502,7 +698,8 @@
       .list({ limit: TRACE_PAGE_SIZE })
       .then((page) => rememberRows(page.rows))
       .catch(() => undefined);
-    void reload();
+    void loadSettings();
+    void reload().then(() => openEntrySelection(wanted));
     const pollTimer = setInterval(() => void poll(), POLL_MS);
     const detailTimer = setInterval(() => void pollDetail(), DETAIL_POLL_MS);
     const media = window.matchMedia("(max-width: 900px)");
@@ -524,11 +721,12 @@
     actions.clearTraceEntry();
     const patch = traceEntryFilters(entry);
     if (patch === null) return;
+    const wanted = patch.selected ?? null;
     filters = { ...filters, ...patch, selected: null };
     selectedKey = null;
     detail = null;
     savePrefs();
-    void reload();
+    void reload().then(() => openEntrySelection(wanted));
   });
 </script><section class="trace-view" aria-label="Trace">
   <header class="trace-head">
@@ -613,6 +811,130 @@
       </label>
     </div>
 
+    <div class="data-bar" aria-label="Trace data controls">
+      <div class="data-group" role="group" aria-label="Export model calls">
+        <span class="data-label"><Download size={12} aria-hidden="true" /> Export</span>
+        <button
+          type="button"
+          class="data-button"
+          disabled={exporting !== null || selectedKey === null}
+          title={selectedKey === null ? "Open a call first" : "Write this call to a JSONL bundle"}
+          onclick={() => void exportCalls("call")}
+        >{exporting === "call" ? "Exporting…" : "Current call"}</button>
+        <button
+          type="button"
+          class="data-button"
+          disabled={exporting !== null || pickedKeys.length === 0}
+          title="Write the ticked calls to a JSONL bundle"
+          onclick={() => void exportCalls("selected")}
+        >Selected calls ({pickedKeys.length})</button>
+        <button
+          type="button"
+          class="data-button"
+          disabled={exporting !== null || rows.length === 0}
+          title="Write every call matching the current filters"
+          onclick={() => void exportCalls("filtered")}
+        >{exporting === "filtered" ? "Exporting…" : `All filtered (${total})`}</button>
+      </div>
+      <label class="bodies-toggle" title="Off by default: prompts and responses can contain secrets and personal data.">
+        <input
+          type="checkbox"
+          checked={settings?.log_bodies ?? false}
+          disabled={settings === null || settingsBusy}
+          onchange={() => void toggleLogBodies()}
+        />
+        Save full prompts and responses to disk (sensitive)
+      </label>
+      <div class="data-group maintenance" role="group" aria-label="Clear the trace logs">
+        <button type="button" class="data-button danger" disabled={maintenanceBusy} onclick={() => (confirmClear = true)}>
+          <Trash2 size={12} aria-hidden="true" /> Clear live calls
+        </button>
+        <button type="button" class="data-button danger" disabled={maintenanceBusy} onclick={() => (confirmDelete = true)}>
+          <History size={12} aria-hidden="true" /> Delete retained history
+        </button>
+      </div>
+    </div>
+
+    {#if settings !== null}
+      <p class="data-note">{liveSummary} · {journalSummary}</p>
+    {/if}
+    {#if settingsError !== ""}
+      <p class="data-note error" role="alert">Could not read the trace settings: {settingsError}</p>
+    {/if}
+
+    {#if confirmClear}
+      <div class="confirm-card" role="alertdialog" aria-label="Confirm clearing the live calls">
+        <p>
+          Clear the live call log? This drops the {settings?.ring_capacity ?? "live"} calls held in memory,
+          including any prompt and response bodies they still hold. Retained history is not touched.
+        </p>
+        <div class="confirm-actions">
+          <button type="button" class="data-button danger" disabled={maintenanceBusy} onclick={() => void clearLive()}>
+            {maintenanceBusy ? "Clearing…" : "Yes, clear live calls"}
+          </button>
+          <button type="button" class="data-button quiet" onclick={() => (confirmClear = false)}>Cancel</button>
+        </div>
+      </div>
+    {/if}
+
+    {#if confirmDelete}
+      <div class="confirm-card" role="alertdialog" aria-label="Confirm deleting retained history">
+        <p>
+          Delete the retained history? This removes {settings === null ? "the retained metadata" : formatBytes(settings.history_bytes)} of retained
+          metadata from <code>.coding/logs</code>
+          {#if retainedInView > 0}({retainedInView} retained call{retainedInView === 1 ? "" : "s"} in this view){/if}.
+          Live calls and this session's log stay as they are. This cannot be undone.
+        </p>
+        <div class="confirm-actions">
+          <button type="button" class="data-button danger" disabled={maintenanceBusy} onclick={() => void deleteHistory()}>
+            {maintenanceBusy ? "Deleting…" : "Yes, delete retained history"}
+          </button>
+          <button type="button" class="data-button quiet" onclick={() => (confirmDelete = false)}>Cancel</button>
+        </div>
+      </div>
+    {/if}
+
+    {#if maintenanceNote !== ""}
+      <p class="data-note" role="status">{maintenanceNote}</p>
+    {/if}
+    {#if maintenanceError !== ""}
+      <p class="data-note error" role="alert">{maintenanceError}</p>
+    {/if}
+
+    {#if exportResult !== null}
+      <div class="export-result" role="status">
+        <p>
+          Exported {exportResult.count} call{exportResult.count === 1 ? "" : "s"} to
+          <code>{exportResult.path}</code>
+          {#if !exportResult.includes_bodies}<span class="muted"> — metadata only, no prompt or response text</span>{/if}
+        </p>
+        <div class="export-actions">
+          <button type="button" class="data-button" onclick={() => void copyExportPath()}>
+            <Copy size={12} aria-hidden="true" /> {copiedPath ? "Path copied" : "Copy path"}
+          </button>
+          <button type="button" class="data-button" title="Open the export folder with the file selected" onclick={() => void revealExport()}>
+            <FolderOpen size={12} aria-hidden="true" /> Reveal
+          </button>
+          <button
+            type="button"
+            class="data-button quiet"
+            aria-label="Dismiss the export result"
+            onclick={() => {
+              exportResult = null;
+              exportNote = "";
+              exportError = "";
+            }}
+          ><X size={12} aria-hidden="true" /></button>
+        </div>
+      </div>
+    {/if}
+    {#if exportNote !== ""}
+      <p class="data-note" role="status">{exportNote}</p>
+    {/if}
+    {#if exportError !== ""}
+      <p class="data-note error" role="alert">{exportError}</p>
+    {/if}
+
     {#snippet listColumn()}
       <div class="list-column">
         {#if chips.length > 0}
@@ -664,11 +986,13 @@
           <TraceList
             {groups}
             selected={selectedKey}
+            {checked}
             {newCount}
             {hasMore}
             {loadingMore}
             {nowMs}
             onselect={selectRow}
+            oncheck={toggleCheck}
             onloadmore={() => void loadMore()}
             onfollow={revealNewCalls}
           />
@@ -787,4 +1111,27 @@
   .insights-toggle { padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-meta); font-weight: 650; }
   .insights-toggle:hover { border-color: var(--accent); color: var(--accent-strong); }
   .insights-body { margin-top: 10px; }
+  .data-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 8px 26px 4px; border-top: 1px solid var(--line); }
+  .data-group { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .data-group.maintenance { margin-left: auto; }
+  .data-label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: var(--text-meta); font-weight: 650; text-transform: uppercase; letter-spacing: 0.04em; }
+  .data-button { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-meta); font-weight: 650; }
+  .data-button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-strong); }
+  .data-button:disabled { color: var(--disabled-ink); border-color: var(--line); cursor: default; }
+  .data-button.danger { color: var(--danger); border-color: var(--line-strong); }
+  .data-button.danger:hover:not(:disabled) { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+  .data-button.quiet { border-color: transparent; background: transparent; }
+  .data-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .bodies-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-soft); font-size: var(--text-meta); font-weight: 600; cursor: pointer; }
+  .data-note { margin: 2px 26px; color: var(--muted); font-size: var(--text-meta); line-height: 1.5; }
+  .data-note.error { color: var(--danger); }
+  .confirm-card { display: grid; gap: 8px; margin: 6px 26px; padding: 12px 14px; border: 1px solid var(--danger); border-radius: 12px; background: var(--danger-soft); }
+  .confirm-card p { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.5; }
+  .confirm-card code { font-family: var(--font-mono); font-size: var(--text-meta); }
+  .confirm-actions { display: flex; gap: 6px; }
+  .export-result { display: grid; gap: 7px; margin: 6px 26px; padding: 11px 14px; border: 1px solid var(--accent-line); border-radius: 12px; background: var(--accent-soft); }
+  .export-result p { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.5; }
+  .export-result code { display: inline-block; max-width: 100%; overflow-wrap: anywhere; color: var(--ink); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .export-result .muted { color: var(--muted); }
+  .export-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 </style>

@@ -147,6 +147,13 @@
 
       <div class="worker-actions" role="toolbar" aria-label="Worker actions">
         <button class="toolbar-button" type="button" aria-label="Diff" title="Open worker diff" onclick={() => actions.openWorkerDiff(worker.id)}>Diff</button>
+        <button
+          class="toolbar-button"
+          type="button"
+          aria-label={`Model calls ${worker.name}`}
+          title="Every model call this worker made, in the Trace page"
+          onclick={() => actions.openTrace({ agent: worker.id })}
+        >Model calls</button>
         <button class="toolbar-button" type="button" aria-label="Steer" title="Steer worker" disabled={worker.status === "cancelled"} onclick={() => actions.steerWorker(worker.id)}>Steer</button>
         <button class="toolbar-button" type="button" aria-label="Compact" title="Compact worker context" disabled={worker.compacting || !["completed", "idle", "needs_you", "paused", "stopped", "interrupted", "failed"].includes(worker.status)} onclick={() => actions.compactWorker(worker.id)}>Compact</button>
         {#if worker.status === "working" || worker.status === "dispatching"}

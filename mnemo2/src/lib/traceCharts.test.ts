@@ -13,10 +13,8 @@ import {
   tokenChart,
   tokenValues,
   TIMING_SEGMENTS,
-  type TraceAttribution,
-  type TraceRow,
 } from "./traceCharts";
-
+import type { TraceAttribution, TraceRow } from "./trace";
 const MINUTE = 60_000;
 /** 2026-11-02T14:00:00Z — a whole minute, hour, and UTC day. */
 const BASE = Date.UTC(2026, 10, 2, 14, 0, 0);
@@ -382,6 +380,7 @@ describe("attributionLabel", () => {
       "researcher",
     );
     expect(attributionLabel(attribution({ actor_kind: "system" }))).toBe("System");
-    expect(attributionLabel(attribution({ actor_kind: "future-kind" }))).toBe("Unattributed");
+    // A kind the frozen union does not know yet must not break the label.
+    expect(attributionLabel(attribution({ actor_kind: "future-kind" } as unknown as Partial<TraceAttribution>))).toBe("Unattributed");
   });
 });

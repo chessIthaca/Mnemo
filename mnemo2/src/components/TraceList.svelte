@@ -30,28 +30,32 @@
   let {
     groups,
     selected,
+    checked,
     newCount,
     hasMore,
     loadingMore,
     nowMs,
     onselect,
+    oncheck,
     onloadmore,
     onfollow,
   }: {
     groups: TraceRowGroup[];
     /** The durable key of the open call. */
     selected: string | null;
+    /** The durable keys ticked for export. */
+    checked: string[];
     /** Calls that arrived while following was off. */
     newCount: number;
     hasMore: boolean;
     loadingMore: boolean;
     nowMs: number;
     onselect: (row: TraceRow) => void;
+    oncheck: (row: TraceRow) => void;
     onloadmore: () => void;
     onfollow: () => void;
   } = $props();
 
-  const rows = $derived(groups.flatMap((group) => group.rows));
 </script>
 
 <div class="trace-list">
@@ -74,7 +78,14 @@
           {@const status = callStatus(row)}
           {@const tokens = rowTokenSummary(row)}
           {@const subLabel = actorSubLabel(row.attribution)}
-          <li>
+          <li class="item">
+            <input
+              type="checkbox"
+              class="pick"
+              aria-label={`Select call ${row.id} for export`}
+              checked={checked.includes(traceKey(row))}
+              onchange={() => oncheck(row)}
+            />
             <button
               type="button"
               class="row"
@@ -137,6 +148,9 @@
   .group-head h4 { margin: 0; color: var(--ink-soft); font-size: var(--text-body); font-weight: 650; }
   .group-head p { margin: 0; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-meta); font-variant-numeric: tabular-nums; }
   .rows { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+  .item { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 2px; }
+  .pick { margin: 13px 0 0 4px; accent-color: var(--accent); cursor: pointer; }
+  .pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .row { display: grid; width: 100%; gap: 3px; padding: 9px 12px; border: 0; border-radius: 10px; background: transparent; cursor: pointer; text-align: left; }
   .row:hover { background: var(--surface-soft); }
   .row.open { background: var(--surface); box-shadow: inset 0 0 0 1px var(--accent); }

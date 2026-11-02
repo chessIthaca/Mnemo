@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ArrowLeft, ArrowUpRight, X } from "@lucide/svelte";
+  import { Activity, ArrowLeft, ArrowUpRight, X } from "@lucide/svelte";
   import { workerPlanLabel } from "../lib/boardState";
   import { actions, app } from "../lib/store";
   import { workerStatusText, type Worker, type WorkerStatus } from "../lib/types";
@@ -105,6 +105,15 @@
         {#if planLabel}<span class="pill plan">{planLabel}</span>{/if}
       </div>
       <div class="panel-actions">
+        <button
+          class="handoff-button"
+          type="button"
+          aria-label={`Model calls ${worker.name}`}
+          title="Every model call this worker made, in the Trace page"
+          onclick={() => actions.openTrace({ agent: worker.id })}
+        >
+          <Activity size={13} /> Model calls
+        </button>
         <button class="handoff-button" type="button" aria-label="Open in Mission Control" onclick={() => actions.selectWorker(worker.id)}>
           <ArrowUpRight size={13} /> Mission Control
         </button>

@@ -26,7 +26,16 @@ import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } f
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedFilesPreview, type FileEntry } from "../lib/files";
-import { seedTracePreview, type TraceDetail, type TraceRow } from "../lib/trace";
+import {
+  seedTracePagePreview,
+  type TraceAttribution,
+  type TraceDetail,
+  type TraceListPage,
+  type TraceListQuery,
+  type TracePageTransport,
+  type TraceRow,
+  type TraceSettings,
+} from "../lib/trace";
 import { seedGitPreview, type GitOverview } from "../lib/git";
 import { seedCostPreview, type CostInsights } from "../lib/cost";
 import {
@@ -788,6 +797,34 @@ function previewTraceRow(
   };
 }
 
+/** A trace attribution with the preview session's defaults. */
+function previewTraceAttribution(
+  fields: Pick<TraceAttribution, "actor_kind" | "agent_id" | "agent_name"> & Partial<TraceAttribution>,
+): TraceAttribution {
+  return {
+    session_id: "session-preview",
+    worker_id: null,
+    plan_id: null,
+    plan_step: null,
+    turn_id: null,
+    purpose: "turn",
+    ...fields,
+  };
+}
+
+/** The implementation worker the preview's running calls belong to. */
+function previewTraceWorkerAttribution(): TraceAttribution {
+  return previewTraceAttribution({
+    actor_kind: "worker",
+    agent_id: "agent-kai",
+    agent_name: "Kai",
+    worker_id: RICH_WORKER_ID,
+    plan_id: "c3ba2b58",
+    plan_step: 5,
+    purpose: "turn",
+  });
+}
+
 /** The tool declarations every preview request carries. */
 const PREVIEW_TRACE_TOOLS = [
   {
@@ -877,6 +914,14 @@ const PREVIEW_TRACE_ROWS: TraceRow[] = [
     finish_reason: "tool_calls",
     ttft_ms: 640,
     generation_ms: 3_400,
+    attribution: previewTraceAttribution({
+      actor_kind: "lead",
+      agent_id: "agent-lead",
+      agent_name: "Lead",
+      turn_id: "turn-4f2a",
+    }),
+    cost_micros: 84_000,
+    priced: true,
   }),
   previewTraceRow({
     id: 102,
@@ -889,6 +934,9 @@ const PREVIEW_TRACE_ROWS: TraceRow[] = [
     finish_reason: "stop",
     ttft_ms: 410,
     generation_ms: 1_800,
+    attribution: previewTraceWorkerAttribution(),
+    cost_micros: 11_200,
+    priced: true,
   }),
   previewTraceRow({
     id: 103,
@@ -903,6 +951,9 @@ const PREVIEW_TRACE_ROWS: TraceRow[] = [
     generation_ms: 120,
     error:
       "Invalid schema for response_format 'turn': In context=(), 'additionalProperties' is required to be supplied and to be false.",
+    attribution: previewTraceWorkerAttribution(),
+    cost_micros: null,
+    priced: true,
   }),
   previewTraceRow({
     id: 104,
@@ -915,6 +966,41 @@ const PREVIEW_TRACE_ROWS: TraceRow[] = [
     version: 3,
     ttft_ms: 520,
     generation_ms: 1_200,
+    attribution: previewTraceAttribution({
+      actor_kind: "lead",
+      agent_id: "agent-lead",
+      agent_name: "Lead",
+      purpose: "turn",
+      turn_id: "turn-91bc",
+    }),
+    cost_micros: 52_000,
+    priced: true,
+  }),
+  // Retained metadata from an earlier session: the model has no configured
+  // price and the bodies are gone, so the row shows a dash and the archive mark.
+  previewTraceRow({
+    id: 105,
+    ts_ms: NOW_MS - 26 * 60_000,
+    model: "legacy-model",
+    provider: "secondary",
+    base_url: "https://secondary.example.invalid/v1",
+    http_status: 200,
+    usage: { prompt: 4_200, completion: 180, reasoning: 0, cached: 0 },
+    finish_reason: "stop",
+    ttft_ms: 300,
+    generation_ms: 900,
+    attribution: previewTraceAttribution({
+      actor_kind: "worker",
+      agent_id: "agent-noa",
+      agent_name: "Noa",
+      worker_id: "noa",
+      plan_id: "c3ba2b58",
+      plan_step: 2,
+      purpose: "turn",
+    }),
+    cost_micros: null,
+    priced: false,
+    retained: true,
   }),
 ];
 
@@ -959,15 +1045,101 @@ const PREVIEW_TRACE_DETAILS: Record<number, TraceDetail> = Object.fromEntries(
   }),
 );
 
-/** The Trace tab: the shared request log, with the strict-mode refusal in it. */
-function traceTab(): AppState {
-  seedTracePreview({
-    list: async () => ({ requests: PREVIEW_TRACE_ROWS, capacity: 32 }),
-    detail: async (id) => PREVIEW_TRACE_DETAILS[id] ?? null,
-    clear: async () => undefined,
-  });
-  return { ...baseState(), workbenchOpen: true, workbenchTab: "trace", workbenchWidth: 460 };
+/** The page the preview's trace transport answers with, newest first. */
+function previewTraceListPage(query: TraceListQuery, rows: TraceRow[]): TraceListPage {
+  const matching = rows
+    .filter((row) => {
+      if (query.agent === undefined) return true;
+      if (query.agent === "unattributed") return row.attribution === null;
+      if (query.agent === "lead") return row.attribution?.actor_kind === "lead";
+      return row.attribution?.worker_id === query.agent || row.attribution?.agent_id === query.agent;
+    })
+    .sort((left, right) => right.ts_ms - left.ts_ms);
+  const limit = Math.min(query.limit ?? matching.length, matching.length);
+  return {
+    rows: matching.slice(0, limit),
+    total: matching.length,
+    unpriced: matching.filter((row) => !row.priced).length,
+    has_more: matching.length > limit,
+    next_cursor: null,
+    capped: false,
+  };
 }
+
+/**
+ * The Trace view model's transport over the preview rows. Every data control
+ * answers, so the export, settings and clear/delete states are previewable.
+ */
+function previewTraceTransport(rows: TraceRow[]): TracePageTransport {
+  const settings = (logBodies: boolean): TraceSettings => ({
+    log_bodies: logBodies,
+    ring_capacity: 128,
+    journal_bytes: 18_432,
+    history_bytes: 96_256,
+  });
+  let logBodies = false;
+  return {
+    list: async (query) => previewTraceListPage(query, rows),
+    detail: async (_runId, id) => {
+      const row = rows.find((entry) => entry.id === id);
+      // A retained row kept its metadata only; its bodies are gone.
+      if (row === undefined || row.retained) return null;
+      return PREVIEW_TRACE_DETAILS[id] ?? null;
+    },
+    settings: async () => settings(logBodies),
+    setLogBodies: async (on) => {
+      logBodies = on;
+      return settings(logBodies);
+    },
+    clearLive: async () => undefined,
+    deleteHistory: async () => ({ deleted_files: 2, bytes: 96_256 }),
+    exportCalls: async (request) => ({
+      path: ".coding/logs/trace-exports/trace-20261102-140000.jsonl",
+      count: request.keys?.length ?? rows.length,
+      includes_bodies: logBodies,
+    }),
+    revealExport: async () => undefined,
+  };
+}
+
+/** The full Trace route: streaming, failed, unpriced and retained calls in one list. */
+function traceScene(): AppState {
+  seedTracePagePreview(previewTraceTransport(PREVIEW_TRACE_ROWS));
+  return { ...baseState(), route: "trace", selectedWorkerId: RICH_WORKER_ID, workerPanelId: null };
+}
+
+/** The Trace route before any model call was recorded. */
+function traceEmpty(): AppState {
+  seedTracePagePreview(previewTraceTransport([]));
+  return { ...baseState(), route: "trace", selectedWorkerId: RICH_WORKER_ID, workerPanelId: null };
+}
+
+/** The compact side tab: the newest calls and the actor filters. */
+function traceTab(): AppState {
+  seedTracePagePreview(previewTraceTransport(PREVIEW_TRACE_ROWS));
+  return {
+    ...baseState(),
+    workbenchOpen: true,
+    workbenchTab: "trace",
+    workbenchWidth: 460,
+    selectedWorkerId: RICH_WORKER_ID,
+    workerPanelId: null,
+  };
+}
+
+/** The compact side tab before any model call was recorded. */
+function traceTabEmpty(): AppState {
+  seedTracePagePreview(previewTraceTransport([]));
+  return {
+    ...baseState(),
+    workbenchOpen: true,
+    workbenchTab: "trace",
+    workbenchWidth: 460,
+    selectedWorkerId: RICH_WORKER_ID,
+    workerPanelId: null,
+  };
+}
+
 
 /** The Git tab: branches at different distances from main, and the newest commits on one lane. */
 function gitTab(): AppState {
@@ -1901,13 +2073,6 @@ export const previewScenes: PreviewScene[] = [
     build: filesTab,
   },
   {
-    name: "trace",
-    title: "Trace",
-    description:
-      "The Trace tab: the shared request log — lead and worker rows, tokens and durations, and one refused strict-mode request.",
-    build: traceTab,
-  },
-  {
     name: "git",
     title: "Git",
     description:
@@ -2136,7 +2301,34 @@ export const previewScenes: PreviewScene[] = [
       return () => unmount(shell);
     },
   },
+  {
+    name: "trace",
+    title: "Trace",
+    description:
+      "The full Trace route: the filter bar, the export/retention controls, and a list with a streaming lead call, a failed worker call, an unpriced call and retained metadata, plus the charts and the call detail.",
+    build: traceScene,
+  },
+  {
+    name: "trace-empty",
+    title: "Trace (empty)",
+    description: "The Trace route before any model call was recorded: the empty state, the filters and the data controls.",
+    build: traceEmpty,
+  },
+  {
+    name: "trace-tab",
+    title: "Trace tab",
+    description:
+      "The compact side Trace tab: the newest calls with All agents / This lead / worker filters, tokens, cache reuse, cost and status.",
+    build: traceTab,
+  },
+  {
+    name: "trace-tab-empty",
+    title: "Trace tab (empty)",
+    description: "The compact side Trace tab before any model call was recorded.",
+    build: traceTabEmpty,
+  },
 ];
+
 
 /** The scene an empty `?scene=` parameter falls back to. */
 export const defaultPreviewScene = "mission-control";

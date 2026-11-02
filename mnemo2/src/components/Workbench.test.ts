@@ -3,7 +3,7 @@ import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { seedFilesPreview } from "../lib/files";
 import { seedGitPreview } from "../lib/git";
-import { seedTracePreview, type TraceRow } from "../lib/trace";
+import { seedTracePagePreview, type TraceRow } from "../lib/trace";
 import { actions, app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import Workbench from "./Workbench.svelte";
@@ -185,10 +185,15 @@ describe("Workbench", () => {
       priced: false,
       retained: false,
     };
-    seedTracePreview({
-      list: async () => ({ requests: [row], capacity: 32 }),
+    seedTracePagePreview({
+      list: async () => ({ rows: [row], total: 1, unpriced: 1, has_more: false, next_cursor: null, capped: false }),
       detail: async () => null,
-      clear: async () => undefined,
+      settings: async () => ({ log_bodies: false, ring_capacity: 128, journal_bytes: 0, history_bytes: 0 }),
+      setLogBodies: async () => ({ log_bodies: false, ring_capacity: 128, journal_bytes: 0, history_bytes: 0 }),
+      clearLive: async () => undefined,
+      deleteHistory: async () => ({ deleted_files: 0, bytes: 0 }),
+      exportCalls: async () => ({ path: "", count: 0, includes_bodies: false }),
+      revealExport: async () => undefined,
     });
     actions.openWorkbench("trace");
     render(Workbench);
@@ -199,11 +204,11 @@ describe("Workbench", () => {
     expect(within(strip).getByRole("button", { name: "Trace" }).getAttribute("aria-pressed")).toBe("true");
 
     // The body switch renders the log: one row for the refused worker request.
-    // Workers share the lead's engine, so the tab says whose requests these are.
+    // Workers share the lead's engine, so the tab names the actor per call.
     expect(screen.getByRole("heading", { name: "Trace" })).toBeTruthy();
-    expect(screen.getByText(/the lead's turns and every worker's/)).toBeTruthy();
-    const request = await screen.findByRole("button", { name: "Request 7: worker-model" });
-    expect(request.textContent).toContain("400");
+    expect(screen.getByText(/The latest 20 model calls from the lead and every worker/)).toBeTruthy();
+    const request = await screen.findByRole("button", { name: "Open call 7: Unattributed, Failed" });
+    expect(request.textContent).toContain("worker-model");
   });
   it("appends the Git tab to the strip and fast-forwards main after confirmation", async () => {
     const moved: string[] = [];
@@ -260,6 +265,6 @@ describe("Workbench", () => {
 afterEach(() => {
   seedFilesPreview(null);
   seedGitPreview(null);
-  seedTracePreview(null);
+  seedTracePagePreview(null);
   vi.unstubAllGlobals();
 });

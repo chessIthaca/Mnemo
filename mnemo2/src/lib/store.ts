@@ -401,10 +401,10 @@ function schedulePreferenceSave(): void {
     preferences: {
       workbench_open: state.workbenchOpen,
       workbench_tab: state.workbenchTab,
-      workbench_width: state.workbenchWidth,
+      workbench_width: Math.round(state.workbenchWidth),
       browser_url: state.browserUrl,
       diff_worker_id: state.diffWorkerId,
-      board_width: state.boardWidth,
+      board_width: state.boardWidth === null ? null : Math.round(state.boardWidth),
     },
   };
   if (preferenceTimer) clearTimeout(preferenceTimer);
@@ -1189,9 +1189,13 @@ export function maxWorkbenchWidth(windowWidth: number): number {
   return Math.max(MIN_WORKBENCH_WIDTH, windowWidth - MIN_LEAD_WIDTH);
 }
 
-/** Keep a side-panel width between its floor and the window-relative ceiling. */
+/**
+ * Keep a side-panel width between its floor and the window-relative ceiling.
+ * Always a whole pixel: a scaled display hands the drag handlers fractional
+ * coordinates, and the saved preference field is a `u32`.
+ */
 export function clampWorkbenchWidth(workbenchWidth: number, windowWidth: number): number {
-  return Math.min(maxWorkbenchWidth(windowWidth), Math.max(MIN_WORKBENCH_WIDTH, workbenchWidth));
+  return Math.round(Math.min(maxWorkbenchWidth(windowWidth), Math.max(MIN_WORKBENCH_WIDTH, workbenchWidth)));
 }
 
 function setWorkbenchWidth(workbenchWidth: number) {
@@ -1234,9 +1238,12 @@ export function maxBoardWidth(windowWidth: number): number {
   return Math.max(MIN_BOARD_WIDTH, windowWidth - MIN_BOARD_OUTPUT_WIDTH - BOARD_DIVIDER_WIDTH);
 }
 
-/** Keep a worker-list width between its floor and the window-relative ceiling. */
+/**
+ * Keep a worker-list width between its floor and the window-relative ceiling,
+ * in whole pixels so the saved `u32` preference can never see a float.
+ */
 export function clampBoardWidth(boardWidth: number, windowWidth: number): number {
-  return Math.min(maxBoardWidth(windowWidth), Math.max(MIN_BOARD_WIDTH, boardWidth));
+  return Math.round(Math.min(maxBoardWidth(windowWidth), Math.max(MIN_BOARD_WIDTH, boardWidth)));
 }
 
 /** The width a window this wide opens mission control with when nothing is saved. */

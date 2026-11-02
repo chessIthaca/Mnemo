@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createGraphTransport } from "../lib/graph";
 import type { AppState, LeadEntry, Worker, WorkerThreadEntry } from "../lib/types";
 import { costPreviewInsights } from "../lib/cost";
+import { createMemoryTransport } from "../lib/memoryView";
 import {
   defaultPreviewScene,
   previewScene,
@@ -68,12 +69,49 @@ describe("preview scenes", () => {
       "delete-sheet",
       "cost",
       "plans",
+      "memory",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
     expect(previewScene("")?.name).toBe(defaultPreviewScene);
     expect(previewScene("  ")?.name).toBe(defaultPreviewScene);
     expect(previewScene("worker-thread")?.name).toBe("worker-thread");
     expect(previewScene("no-such-scene")).toBeNull();
+  });
+
+  it("memory seeds the store with 20 records and opens the newest one", async () => {
+    const state = build("memory");
+    expect(state.route).toBe("memory");
+    expect(state.projectId).not.toBeNull();
+
+    const transport = createMemoryTransport();
+    expect(transport).not.toBeNull();
+
+    const page = await transport!.list({});
+    expect(page.rows.length).toBeGreaterThan(0);
+    expect(page.has_more).toBe(false);
+    expect(new Set(page.rows.map((row) => row.kind))).toEqual(
+      new Set(["spec", "decision", "bug", "how"]),
+    );
+
+    const newest = page.rows[0];
+    const detail = await transport!.read(newest.id);
+    expect(detail.markdown).toContain("## Why the store and not the files");
+    expect(detail.path).toContain(".coding/knowledge/spec/");
+    expect(detail.links.length).toBeGreaterThan(0);
+    expect(detail.backlinks.length).toBeGreaterThan(0);
+
+    const specs = await transport!.list({ kind: "spec" });
+    expect(specs.rows.every((row) => row.kind === "spec")).toBe(true);
+    const search = await transport!.search("graph");
+    expect(search.length).toBeGreaterThan(0);
+
+    const overview = await transport!.overview();
+    expect(overview.available).toBe(true);
+    expect(overview.counts.semantic).toBeGreaterThan(0);
+
+    const recall = await transport!.recallTest("memory store", 4);
+    expect(recall.length).toBe(4);
+    expect(recall[0].score).toBeGreaterThanOrEqual(recall[3].score);
   });
 
   it("mission-control selects a worker whose thread shows Markdown prose and every tool row state", () => {

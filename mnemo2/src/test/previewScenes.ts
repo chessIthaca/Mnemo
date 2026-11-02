@@ -23,6 +23,13 @@ import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } f
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedCostPreview, type CostInsights } from "../lib/cost";
+import {
+  LIST_PAGE_SIZE,
+  seedMemoryPreview,
+  type MemoryHit,
+  type MemoryRow,
+  type MemoryTransport,
+} from "../lib/memoryView";
 
 /** The fixture worker whose thread the preview shows in full. */
 const RICH_WORKER_ID = "kai";
@@ -854,6 +861,445 @@ function plansTab(): AppState {
   return { ...baseState(), board: PREVIEW_PLANS, route: "plans" };
 }
 
+/**
+ * One preview record: the list row plus everything the reading pane renders for
+ * it. The `path` mirrors what the indexer stores in `data.rel_path`
+ * (`<kind>/<created>-<slug>.md`).
+ */
+interface SampleMemoryRecord {
+  row: MemoryRow;
+  /** The knowledge file's body, front matter stripped. */
+  markdown: string;
+  /** The repo path of the knowledge file the row derives from. */
+  path: string;
+  /** The front matter's created date. */
+  created: string;
+  /** The records whose links point here. */
+  backlinks: string[];
+  /** The wiki-link targets the body carries. */
+  links: string[];
+}
+
+/** Unix seconds for a `YYYY-MM-DD` knowledge-file date (09:00 UTC). */
+const recordClock = (day: string): number => Math.floor(Date.parse(`${day}T09:00:00Z`) / 1000);
+
+/** Join knowledge-file lines into the Markdown the preview's reader shows. */
+const memoryBody = (...lines: string[]) => lines.join("\n");
+
+/** One sample record, its row derived exactly like `MemoryRow::from_memory`. */
+function sampleRecord(spec: {
+  id: string;
+  title: string;
+  kind: string;
+  slug: string;
+  created: string;
+  markdown: string;
+  tier?: string;
+  links?: string[];
+  backlinks?: string[];
+  accessCount?: number;
+}): SampleMemoryRecord {
+  const relPath = `${spec.kind}/${spec.created}-${spec.slug}.md`;
+  return {
+    row: {
+      id: spec.id,
+      title: spec.title,
+      kind: spec.kind,
+      tier: spec.tier ?? "semantic",
+      preview: spec.markdown.replace(/\s+/g, " ").trim().slice(0, 180),
+      path: `.coding/knowledge/${relPath}`,
+      created_at: recordClock(spec.created),
+      last_accessed_at: recordClock(spec.created) + 5_400,
+      access_count: spec.accessCount ?? 4,
+      strength: 0.87,
+      superseded: false,
+      quarantined: null,
+    },
+    markdown: spec.markdown,
+    path: `.coding/knowledge/${relPath}`,
+    created: spec.created,
+    backlinks: spec.backlinks ?? [],
+    links: spec.links ?? [],
+  };
+}
+
+/** The Memory tab's records: 20 knowledge files across the four types. */
+const SAMPLE_MEMORY_RECORDS: SampleMemoryRecord[] = [
+  sampleRecord({
+    id: "spec-memory-tab-reads-the-store",
+    title: "SPEC: the Memory tab reads the store, not a copy",
+    kind: "spec",
+    slug: "memory-tab-reads-the-store",
+    created: "2027-02-14",
+    accessCount: 9,
+    links: ["spec/2027-02-09-knowledge-as-files", "decision/2027-02-13-memory-tab-is-read-only"],
+    backlinks: ["spec-knowledge-as-files", "decision-memory-tab-read-only"],
+    markdown: memoryBody(
+      "The Memory tab is a read-only window onto the project's memory store. It renders what the agent's own memory tools read, so the user never sees a second, drifting truth.",
+      "",
+      "## What the tab shows",
+      "",
+      "- One newest-first list of every knowledge record and memory, filtered by `SPEC` / `DECISION` / `BUG` / `HOW`.",
+      "- The selected record as Markdown, with its file path, its date and its backlinks.",
+      "- A collapsed Diagnostics card: embedder status, per-tier counts and the store's own recall ranking.",
+      "",
+      "## Why the store and not the files",
+      "",
+      "The files under `.coding/knowledge/` are the authored truth, but a record is only *reachable* once the indexer has derived its row — recall, backlinks and supersession all live in the store. Reading the files directly would show records the agent cannot recall yet, which is worse than a slightly staler view.",
+      "",
+      "```rust",
+      "let store = engine.memory_store_handle()?;",
+      "let page = store.list_filtered(&MemoryFilter::new().limit(40)).await?;",
+      "```",
+      "",
+      "## Limits",
+      "",
+      "The tab never writes: superseding a record stays a knowledge-file edit the indexer picks up, so history and provenance cannot fork.",
+    ),
+  }),
+  sampleRecord({
+    id: "decision-memory-tab-read-only",
+    title: "DECISION: the Memory tab is read-only",
+    kind: "decision",
+    slug: "memory-tab-is-read-only",
+    created: "2027-02-13",
+    accessCount: 6,
+    links: ["spec/2027-02-14-memory-tab-reads-the-store"],
+    markdown: memoryBody(
+      "Browsing knowledge and editing memory are different jobs with different failure modes. A read surface cannot corrupt a corpus, so the tab ships without a write path and the agent keeps the pen.",
+      "",
+      "Editing stays in the knowledge files, where a diff review can catch a wrong supersession before it reaches a merge.",
+    ),
+  }),
+  sampleRecord({
+    id: "bug-indexer-skipped-predecessor",
+    title: "BUG: the memory indexer skipped an unchanged predecessor",
+    kind: "bug",
+    slug: "indexer-skipped-unchanged-predecessor",
+    created: "2027-02-11",
+    accessCount: 12,
+    markdown: memoryBody(
+      "Symptom: a record superseded a file whose content had not changed, and the predecessor kept its old `superseded_by` — recall still served the dead record.",
+      "",
+      "Cause: the content-hash skip short-circuited the row rewrite, so the successor resolution never ran for the unchanged file.",
+      "",
+      "Fix: an unchanged file still gets its derived metadata rewritten, which is idempotent. Regression test: `superseded_predecessor_is_rewritten_without_a_content_change`.",
+    ),
+  }),
+  sampleRecord({
+    id: "spec-knowledge-as-files",
+    title: "SPEC: knowledge as files",
+    kind: "spec",
+    slug: "knowledge-as-files",
+    created: "2027-02-09",
+    accessCount: 21,
+    links: ["decision/2027-02-13-memory-tab-is-read-only"],
+    markdown: memoryBody(
+      "Knowledge lives as Markdown files under `.coding/knowledge/{spec,decision,bug,how}/<date>-<slug>.md`: front matter (title, status, supersedes, created) plus an unbounded body with `[[links]]`.",
+      "",
+      "The indexer derives budgeted digests with a UUIDv5 key, a pointer line and the front matter's supersession, so a git merge converges instances instead of forking a database.",
+    ),
+  }),
+  sampleRecord({
+    id: "how-rebuild-the-memory-index",
+    title: "HOW: rebuild the memory index from Settings",
+    kind: "how",
+    slug: "rebuild-the-memory-index",
+    created: "2027-02-07",
+    tier: "procedural",
+    accessCount: 7,
+    markdown: memoryBody(
+      "1. Open Settings → Memory.",
+      "2. Press **Rebuild index from files**. The dialog reports the reconciliation while it runs.",
+      "3. Re-open the Memory tab; the list re-reads on mount.",
+      "",
+      "The databases (`memory.db`, `codegraph.db`) are rebuildable caches and gitignored — deleting one is always safe, and this is the control that repopulates it.",
+    ),
+  }),
+  sampleRecord({
+    id: "decision-branch-topology",
+    title: "DECISION: branch topology collapsed to wt/* → main",
+    kind: "decision",
+    slug: "branch-topology-collapsed-to-wt-main",
+    created: "2027-02-05",
+    accessCount: 15,
+    markdown: memoryBody(
+      "The `develop` integration tier is gone: one `wt/*` working branch per agent directory, merged into `main` through the protected-PR path. The two-tier topology cost a merge step on every landing and bought nothing the review gate did not already enforce.",
+    ),
+  }),
+  sampleRecord({
+    id: "bug-worker-row-kept-its-timer",
+    title: "BUG: the worker row kept its turn timer after the turn ended",
+    kind: "bug",
+    slug: "worker-row-kept-the-turn-timer",
+    created: "2027-02-04",
+    accessCount: 5,
+    markdown: memoryBody(
+      "Symptom: a finished worker still showed a running timer, and the team header counted it as active.",
+      "",
+      "Cause: the row read `turnStartedAtMs` from the activity snapshot instead of the phase — a `waiting` worker has an anchored turn but must not tick.",
+      "",
+      "Fix: the tick is keyed on the phase list, and a `done` event clears the anchor.",
+    ),
+  }),
+  sampleRecord({
+    id: "spec-code-graph-is-a-query-surface",
+    title: "SPEC: the code graph is a query surface",
+    kind: "spec",
+    slug: "code-graph-is-a-query-surface",
+    created: "2027-02-02",
+    accessCount: 11,
+    markdown: memoryBody(
+      "The graph exists to answer four questions fast — where is a symbol, who calls it, what breaks if it changes, what does its neighbourhood look like — never to draw a picture of the repository.",
+      "",
+      "Every answer comes from one in-memory snapshot, so the status line, the search and the impact query cannot disagree.",
+    ),
+  }),
+  sampleRecord({
+    id: "how-run-the-workspace-tests",
+    title: "HOW: run the workspace tests",
+    kind: "how",
+    slug: "run-the-workspace-tests",
+    created: "2027-01-31",
+    tier: "procedural",
+    accessCount: 33,
+    markdown: memoryBody(
+      "`cargo test --workspace` covers the engine, the app and both feature trees.",
+      "",
+      "A feature-gated dependency bump additionally needs `cargo test --features embeddings` (fastembed/ONNX) or `--features browser` (chromiumoxide): plain `cargo test` never compiles those paths.",
+    ),
+  }),
+  sampleRecord({
+    id: "decision-prompts-live-in-rust",
+    title: "DECISION: prompts live in Rust, not the frontend",
+    kind: "decision",
+    slug: "prompts-live-in-rust",
+    created: "2027-01-29",
+    accessCount: 8,
+    markdown: memoryBody(
+      "The system prompts are compiled constants on the Rust side, so the headless engine and the desktop app send byte-identical instructions and a prompt change is reviewable in a diff.",
+    ),
+  }),
+  sampleRecord({
+    id: "spec-plan-files-are-the-board",
+    title: "SPEC: plan files are the single source of board state",
+    kind: "spec",
+    slug: "plan-files-are-the-single-source-of-board-state",
+    created: "2027-01-27",
+    accessCount: 9,
+    markdown: memoryBody(
+      "`.coding/plans/<id>.md` is the plan; the board is a parsed view of those files. A step's checkbox, its worker assignment and its report path all round-trip through the file, so a hand edit and a tool edit produce the same board.",
+    ),
+  }),
+  sampleRecord({
+    id: "bug-plan-card-lost-its-scroll",
+    title: "BUG: the plan card lost its scroll position on rebuild",
+    kind: "bug",
+    slug: "plan-card-lost-its-scroll",
+    created: "2027-01-25",
+    accessCount: 4,
+    markdown: memoryBody(
+      "Symptom: an expanded plan card jumped back to its first line whenever the board refreshed.",
+      "",
+      "Cause: the card was re-keyed on the document string, so every poll replaced the scrolling node.",
+      "",
+      "Fix: the card is keyed on the plan id and the document is re-read into the same node.",
+    ),
+  }),
+  sampleRecord({
+    id: "how-rebase-a-worker-branch",
+    title: "HOW: rebase a worker branch onto the lead tip",
+    kind: "how",
+    slug: "rebase-a-worker-branch-onto-the-lead-tip",
+    created: "2027-01-23",
+    tier: "procedural",
+    accessCount: 6,
+    markdown: memoryBody(
+      "Fetch, rebase onto the lead's branch tip, then re-run the check scope before the merge is offered again. A conflict halts the merge and routes the branch back to its worker; a stale base is never auto-rebased.",
+    ),
+  }),
+  sampleRecord({
+    id: "decision-one-engine-per-project",
+    title: "DECISION: one engine per open project",
+    kind: "decision",
+    slug: "one-engine-per-open-project",
+    created: "2027-01-21",
+    accessCount: 10,
+    markdown: memoryBody(
+      "Mnemo2 opens exactly one engine for the project it has open. A second engine would mean two memory stores, two code-graph indexes and two cost ledgers racing on the same files — every one of them a silent corruption.",
+    ),
+  }),
+  sampleRecord({
+    id: "spec-cost-ledger-append-only",
+    title: "SPEC: the cost ledger is append-only",
+    kind: "spec",
+    slug: "the-cost-ledger-is-append-only",
+    created: "2027-01-19",
+    accessCount: 7,
+    markdown: memoryBody(
+      "Every turn appends one row per request with its tokens and model; nothing rewrites an existing row. Prices change, so pricing is resolved at read time and an unpriced model is reported as *partial*, never as zero.",
+    ),
+  }),
+  sampleRecord({
+    id: "bug-backlog-id-was-integer",
+    title: "BUG: backlog_status took an integer id, the ids are UUIDs",
+    kind: "bug",
+    slug: "backlog-status-took-an-integer-id",
+    created: "2027-01-17",
+    accessCount: 3,
+    markdown: memoryBody(
+      "Symptom: `backlog_status` rejected every id the list returned.",
+      "",
+      "Cause: the schema declared `id: integer` while the backlog writes UUID strings.",
+      "",
+      "Fix: the parameter is a `String` end to end, with a regression test that round-trips a UUID.",
+    ),
+  }),
+  sampleRecord({
+    id: "how-preview-a-scene",
+    title: "HOW: preview a scene in the browser",
+    kind: "how",
+    slug: "preview-a-scene-in-the-browser",
+    created: "2027-01-15",
+    tier: "procedural",
+    accessCount: 12,
+    markdown: memoryBody(
+      "Run the dev server on the `mnemo2` folder, open `preview.html?scene=<name>`, and pick a scene from the index. The scene builds an `AppState` and plants its transport through the dev-only seed seam, so a reviewer sees the real layout with sample data.",
+    ),
+  }),
+  sampleRecord({
+    id: "decision-settings-are-per-project",
+    title: "DECISION: settings are per project, endpoints are install-wide",
+    kind: "decision",
+    slug: "settings-are-per-project-endpoints-are-install-wide",
+    created: "2027-01-13",
+    accessCount: 9,
+    markdown: memoryBody(
+      "A project owns its models, budget, embedding choice and team slots; the endpoints they point at belong to the install. One endpoint list edited once cannot silently fork per checkout.",
+    ),
+  }),
+  sampleRecord({
+    id: "spec-mcp-is-the-only-external-surface",
+    title: "SPEC: MCP is the only external surface",
+    kind: "spec",
+    slug: "mcp-is-the-only-external-surface",
+    created: "2027-01-11",
+    accessCount: 14,
+    markdown: memoryBody(
+      "An external lead drives Mnemo2 over MCP and nothing else: plan, dispatch, review, merge. Every tool the UI can trigger is a tool the external lead can trigger, so the two paths cannot drift into different behaviour.",
+    ),
+  }),
+  sampleRecord({
+    id: "bug-primer-counted-superseded-rows",
+    title: "BUG: the memory primer counted superseded rows",
+    kind: "bug",
+    slug: "the-memory-primer-counted-superseded-rows",
+    created: "2027-01-09",
+    accessCount: 2,
+    markdown: memoryBody(
+      "Symptom: the primer's per-tier counts included records that recall excludes, so the user's \"what the agent knows\" number was too high.",
+      "",
+      "Fix: the counts apply the same filter defaults recall uses, and a test pins the two together.",
+    ),
+  }),
+];
+
+/** A tiny in-memory answer service over the sample records, so the preview's chips, search, reads and recall test all work. */
+function sampleMemoryTransport(): MemoryTransport {
+  const byId = new Map(SAMPLE_MEMORY_RECORDS.map((record) => [record.row.id, record]));
+  const rows = (): MemoryRow[] =>
+    SAMPLE_MEMORY_RECORDS.map((record) => record.row).sort((a, b) => b.created_at - a.created_at);
+  const inGroup = (row: MemoryRow, kind: string): boolean => {
+    if (kind === "" || kind === "all") return true;
+    if (kind === "other") return !["spec", "decision", "bug", "how"].includes(row.kind);
+    return row.kind === kind;
+  };
+  const hitRow = (row: MemoryRow, score: number): MemoryHit => ({ ...row, score });
+  const rowsFor = (ids: string[]): MemoryRow[] =>
+    ids.flatMap((id) => {
+      const record = byId.get(id);
+      return record ? [record.row] : [];
+    });
+  return {
+    list: async (query = {}) => {
+      const matching = rows().filter((row) => inGroup(row, query.kind ?? "all"));
+      const offset = query.offset ?? 0;
+      const limit = query.limit ?? LIST_PAGE_SIZE;
+      return {
+        rows: matching.slice(offset, offset + limit),
+        offset,
+        has_more: offset + limit < matching.length,
+      };
+    },
+    search: async (text, limit = 40) => {
+      const needle = text.trim().toLowerCase();
+      return rows()
+        .filter((row) => `${row.title} ${row.preview}`.toLowerCase().includes(needle))
+        .slice(0, limit)
+        .map((row, index) => hitRow(row, Math.max(0.35, 0.94 - index * 0.08)));
+    },
+    read: async (id) => {
+      const record = byId.get(id);
+      if (!record) throw new Error(`no preview record ${id}`);
+      return {
+        id: record.row.id,
+        title: record.row.title,
+        kind: record.row.kind,
+        tier: record.row.tier,
+        markdown: record.markdown,
+        path: record.path,
+        created: record.created,
+        status: "live",
+        superseded_by: null,
+        quarantined: null,
+        created_at: record.row.created_at,
+        last_accessed_at: record.row.last_accessed_at,
+        access_count: record.row.access_count,
+        strength: record.row.strength,
+        links: record.links,
+        backlinks: rowsFor(record.backlinks),
+      };
+    },
+    backlinks: async (id) => rowsFor(byId.get(id)?.backlinks ?? []),
+    overview: async () => ({
+      available: true,
+      reason: "",
+      model_id: "bge-small-en-v1.5",
+      dim: 384,
+      configured_model: "bge-small-en-v1.5",
+      fingerprints: [{ model: "bge-small-en-v1.5", dim: 384 }],
+      fingerprint_matches: true,
+      counts: { working: 128, episodic: 41, semantic: 214, procedural: 18, total: 401 },
+      index: {
+        authored_count: 386,
+        derived_count: 15,
+        last_built_at: Math.floor(NOW_MS / 1000) - 12 * 60,
+      },
+      embedder: "ready",
+    }),
+    recallTest: async (text, limit = 8) => {
+      const words = text
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((word) => word.length > 3);
+      return rows()
+        .map((row) => {
+          const haystack = `${row.title} ${row.preview}`.toLowerCase();
+          const overlap = words.filter((word) => haystack.includes(word)).length;
+          return hitRow(row, 0.58 + overlap * 0.06);
+        })
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+    },
+  };
+}
+
+/** The Memory tab over the same project, with the newest record open in the reader. */
+function memoryTab(): AppState {
+  seedMemoryPreview(sampleMemoryTransport());
+  return { ...baseState(), route: "memory" };
+}
+
 /** Every scene the preview page renders, in index order. */
 export const previewScenes: PreviewScene[] = [
   {
@@ -974,6 +1420,30 @@ export const previewScenes: PreviewScene[] = [
       app.set(plansTab());
       const shell = svelteMount(App, { target });
       target.querySelector<HTMLButtonElement>(".details-toggle")?.click();
+      return () => unmount(shell);
+    },
+  },
+  {
+    name: "memory",
+    title: "Memory",
+    description:
+      "The top-level Memory tab: the project's knowledge records newest first with the SPEC/DECISION/BUG/HOW chips, one record rendered as Markdown with its path, date and backlinks, and the Diagnostics card (embedder, per-tier counts, recall test).",
+    build: memoryTab,
+    // Diagnostics is collapsed by design, so the scene opens it and runs one
+    // recall after mounting — otherwise the screenshot would show an empty
+    // control row instead of the card the tab ships.
+    mount: (target) => {
+      app.set(memoryTab());
+      const shell = svelteMount(App, { target });
+      const diagnostics = target.querySelector<HTMLDetailsElement>(".diagnostics");
+      if (diagnostics) diagnostics.open = true;
+      const recallForm = target.querySelector<HTMLFormElement>(".recall-box");
+      const recallInput = target.querySelector<HTMLInputElement>("#recall-query");
+      if (recallForm && recallInput) {
+        recallInput.value = "why does the memory tab read the store";
+        recallInput.dispatchEvent(new Event("input", { bubbles: true }));
+        setTimeout(() => recallForm.requestSubmit(), 0);
+      }
       return () => unmount(shell);
     },
   },

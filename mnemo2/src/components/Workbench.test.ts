@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { seedFilesPreview } from "../lib/files";
+import { seedGitPreview } from "../lib/git";
 import { seedTracePreview, type TraceRow } from "../lib/trace";
 import { actions, app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
@@ -144,7 +145,7 @@ describe("Workbench", () => {
 
     const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
     const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
-    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Trace"]);
+    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Trace", "Git"]);
     expect(within(strip).getByRole("button", { name: "Files" }).getAttribute("aria-pressed")).toBe("true");
 
     // The body switch renders the tree, which lists only the project root.
@@ -189,7 +190,7 @@ describe("Workbench", () => {
 
     const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
     const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
-    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Trace"]);
+    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Trace", "Git"]);
     expect(within(strip).getByRole("button", { name: "Trace" }).getAttribute("aria-pressed")).toBe("true");
 
     // The body switch renders the log: one row for the refused worker request.
@@ -199,10 +200,61 @@ describe("Workbench", () => {
     const request = await screen.findByRole("button", { name: "Request 7: worker-model" });
     expect(request.textContent).toContain("400");
   });
+  it("appends the Git tab to the strip and fast-forwards main after confirmation", async () => {
+    const moved: string[] = [];
+    let main = "1111111";
+    seedGitPreview({
+      overview: async () => ({
+        branch: "work",
+        main,
+        main_worktree: null,
+        main_dirty: false,
+        branches: [
+          { name: "work", current: true, ahead: 2, behind: 0 },
+          { name: "main", current: false, ahead: 0, behind: 2 },
+          { name: "stale", current: false, ahead: 0, behind: 1 },
+        ],
+        commits: [
+          {
+            id: "aaaaaaa1111",
+            short: "aaaaaaa",
+            summary: "work two",
+            author: "Ana",
+            date: "2 hours ago",
+            refs: ["HEAD -> work"],
+          },
+        ],
+        truncated: false,
+      }),
+      moveMain: async (name) => {
+        moved.push(name);
+        main = "2222222";
+        return { branch: name, main, commits: 2 };
+      },
+    });
+    actions.openWorkbench("git");
+    render(Workbench);
+
+    const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
+    expect(within(strip).getByRole("button", { name: "Git" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("heading", { name: "Git" })).toBeTruthy();
+    expect(await screen.findByText("2 ahead main")).toBeTruthy();
+    expect(screen.getByText("work two")).toBeTruthy();
+
+    // A diverged branch gets no move button; only the fast-forwardable one does.
+    expect(screen.getAllByRole("button", { name: "Move main here" })).toHaveLength(1);
+    await fireEvent.click(screen.getByRole("button", { name: "Move main here" }));
+    expect(screen.getByText(/This fast-forwards main by 2 commits/)).toBeTruthy();
+    expect(moved).toEqual([]);
+    await fireEvent.click(screen.getByRole("button", { name: "Move main" }));
+    await vi.waitFor(() => expect(moved).toEqual(["work"]));
+    expect(await screen.findByText(/main now points at work/)).toBeTruthy();
+  });
 });
 
 afterEach(() => {
   seedFilesPreview(null);
+  seedGitPreview(null);
   seedTracePreview(null);
   vi.unstubAllGlobals();
 });

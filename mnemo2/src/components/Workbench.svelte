@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { Activity, ArrowLeft, FileDiff, FolderTree, Globe, ListTree, X } from "@lucide/svelte";
+  import { Activity, ArrowLeft, FileDiff, FolderTree, GitBranch, Globe, ListTree, X } from "@lucide/svelte";
   import { onMount, type Component } from "svelte";
   import { actions, app } from "../lib/store";
   import type { WorkbenchTab } from "../lib/types";
   import BrowserTab from "./BrowserTab.svelte";
   import DiffTab from "./DiffTab.svelte";
   import FilesTab from "./FilesTab.svelte";
+  import GitTab from "./GitTab.svelte";
   import PlanTab from "./PlanTab.svelte";
   import TraceTab from "./TraceTab.svelte";
 
@@ -15,6 +16,7 @@
     { id: "plan", label: "Plan", icon: ListTree },
     { id: "files", label: "Files", icon: FolderTree },
     { id: "trace", label: "Trace", icon: Activity },
+    { id: "git", label: "Git", icon: GitBranch },
   ];
 
   let resizing = $state(false);
@@ -85,6 +87,8 @@
       <FilesTab />
     {:else if $app.workbenchTab === "trace"}
       <TraceTab />
+    {:else if $app.workbenchTab === "git"}
+      <GitTab />
     {:else}
       <PlanTab scope="open" />
     {/if}

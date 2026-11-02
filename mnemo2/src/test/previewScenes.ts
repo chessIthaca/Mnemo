@@ -27,6 +27,7 @@ import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } f
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedFilesPreview, type FileEntry } from "../lib/files";
 import { seedTracePreview, type TraceDetail, type TraceRow } from "../lib/trace";
+import { seedGitPreview, type GitOverview } from "../lib/git";
 import { seedCostPreview, type CostInsights } from "../lib/cost";
 import {
   LIST_PAGE_SIZE,
@@ -955,6 +956,62 @@ function traceTab(): AppState {
   return { ...baseState(), workbenchOpen: true, workbenchTab: "trace", workbenchWidth: 460 };
 }
 
+/** The Git tab: branches at different distances from main, and the newest commits on one lane. */
+function gitTab(): AppState {
+  const overview: GitOverview = {
+    branch: "wt/agent-gitTab95",
+    main: "1f1621c",
+    main_worktree: null,
+    main_dirty: false,
+    branches: [
+      { name: "wt/agent-gitTab95", current: true, ahead: 3, behind: 0 },
+      { name: "main", current: false, ahead: 0, behind: 3 },
+      { name: "wt/dark-theme", current: false, ahead: 2, behind: 1 },
+      { name: "wt/files-tab", current: false, ahead: 0, behind: 2 },
+    ],
+    commits: [
+      {
+        id: "9e2b7a1c4d5e6f708192a3b4c5d6e7f8091a2b3c",
+        short: "9e2b7a1",
+        summary: "mnemo2: the Git tab reads branches, distances and the commit lane",
+        author: "Carsten Hess",
+        date: "4 minutes ago",
+        refs: ["HEAD -> wt/agent-gitTab95"],
+      },
+      {
+        id: "5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d",
+        short: "5c4d3e2",
+        summary: "mnemo2: the Trace tab reads the engine's shared request log",
+        author: "Carsten Hess",
+        date: "2 hours ago",
+        refs: [],
+      },
+      {
+        id: "1f1621c0ca075d9b8c17a4c9d2e3f40516273849",
+        short: "1f1621c",
+        summary: "mnemo2: a Files tab over a lazy, Git-aware project tree",
+        author: "Carsten Hess",
+        date: "yesterday",
+        refs: ["main"],
+      },
+      {
+        id: "404a8fb3a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        short: "404a8fb",
+        summary: "team: merge filesTab90 (filesTab90)",
+        author: "Mnemo2 Team",
+        date: "yesterday",
+        refs: [],
+      },
+    ],
+    truncated: false,
+  };
+  seedGitPreview({
+    overview: async () => overview,
+    moveMain: async (branch) => ({ branch, main: overview.commits[0].short, commits: 3 }),
+  });
+  return { ...baseState(), workbenchOpen: true, workbenchTab: "git", workbenchWidth: 460 };
+}
+
 /** The same thread, on a worker that stopped to ask: the needs-you banner shows. */
 function workerThread(): AppState {
   return {
@@ -1836,6 +1893,13 @@ export const previewScenes: PreviewScene[] = [
     description:
       "The Trace tab: the shared request log — lead and worker rows, tokens and durations, and one refused strict-mode request.",
     build: traceTab,
+  },
+  {
+    name: "git",
+    title: "Git",
+    description:
+      "The Git tab: the current branch, every branch's distance from main, and the newest commits on one lane.",
+    build: gitTab,
   },
   {
     name: "worker-thread",

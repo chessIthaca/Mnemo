@@ -67,6 +67,10 @@ pub mod files_view;
 /// are in it together.
 pub mod trace_view;
 
+/// The Git tab: branches and their distance from `main`, the newest commits,
+/// and the one write it performs — a local fast-forward of `main`.
+pub mod git_view;
+
 /// The per-instance run file the `mnemo2-mcp` helper finds a live Mnemo2 by.
 pub mod run_file;
 
@@ -535,6 +539,8 @@ pub fn run() {
             trace_view::trace_list,
             trace_view::trace_detail,
             trace_view::trace_clear,
+            git_view::git_overview,
+            git_view::git_move_main,
             browser::browser_supported,
             browser::browser_snapshot,
             browser::browser_ensure,

@@ -48,7 +48,7 @@ describe("worker model", () => {
   it("shows the model read-only while the worker is merging", () => {
     render(WorkerDetail, { worker: worker("merging") });
     expect(screen.queryByRole("combobox", { name: /model$/ })).toBeNull();
-    expect(screen.getByTitle("Pause or stop the worker to change its model")).toBeTruthy();
+    expect(screen.getByTitle("This worker's task is over, so its model cannot change")).toBeTruthy();
   });
 
   it("keeps an audit worker's model read-only, even mid-run", () => {

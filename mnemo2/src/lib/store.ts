@@ -269,6 +269,8 @@ export function createInitialState(): AppState {
     workbenchOpen: false,
     workbenchTab: "browser",
     workbenchWidth: 480,
+    /** No saved mission-control split until the user drags or the project restores one. */
+    boardWidth: null,
     workerPanelId: null,
     browserUrl: "about:blank",
     browserTitle: "",
@@ -399,6 +401,7 @@ function schedulePreferenceSave(): void {
       workbench_width: state.workbenchWidth,
       browser_url: state.browserUrl,
       diff_worker_id: state.diffWorkerId,
+      board_width: state.boardWidth,
     },
   };
   if (preferenceTimer) clearTimeout(preferenceTimer);
@@ -421,6 +424,7 @@ async function restoreWorkbench(project: Project): Promise<void> {
       browserUrl: preferences.browser_url,
       browserImage: null,
       diffWorkerId: preferences.diff_worker_id,
+      boardWidth: preferences.board_width,
       diff: null,
       diffFiles: [],
       diffError: null,
@@ -1198,6 +1202,58 @@ function reclampWorkbenchWidth(windowWidth: number = viewportWidth()) {
     if (workbenchWidth === state.workbenchWidth) return state;
     changed = true;
     return { ...state, workbenchWidth };
+  });
+  if (changed) schedulePreferenceSave();
+}
+
+/**
+ * The narrowest the mission-control worker list may be dragged to. The worker
+ * rows keep a fixed 152px status column, so the list needs real room.
+ */
+export const MIN_BOARD_WIDTH = 300;
+/** The narrowest the mission-control worker output may get; the list yields the rest. */
+export const MIN_BOARD_OUTPUT_WIDTH = 420;
+/** The draggable divider's own column between the list and the output, in CSS pixels. */
+export const BOARD_DIVIDER_WIDTH = 9;
+/** Share of the layout the worker list takes when nothing is saved (today's 0.88fr/1.12fr). */
+const DEFAULT_BOARD_SHARE = 0.44;
+
+/** The widest the worker list may get in a window this wide. */
+export function maxBoardWidth(windowWidth: number): number {
+  return Math.max(MIN_BOARD_WIDTH, windowWidth - MIN_BOARD_OUTPUT_WIDTH - BOARD_DIVIDER_WIDTH);
+}
+
+/** Keep a worker-list width between its floor and the window-relative ceiling. */
+export function clampBoardWidth(boardWidth: number, windowWidth: number): number {
+  return Math.min(maxBoardWidth(windowWidth), Math.max(MIN_BOARD_WIDTH, boardWidth));
+}
+
+/** The width a window this wide opens mission control with when nothing is saved. */
+export function defaultBoardWidth(windowWidth: number): number {
+  return clampBoardWidth(Math.round(windowWidth * DEFAULT_BOARD_SHARE), windowWidth);
+}
+
+/** Drag the mission-control divider; `null` restores the default proportion. */
+function setBoardWidth(boardWidth: number | null) {
+  app.update((state) => ({
+    ...state,
+    boardWidth: boardWidth === null ? null : clampBoardWidth(boardWidth, viewportWidth()),
+  }));
+  schedulePreferenceSave();
+}
+
+/**
+ * Re-clamp a saved or dragged list width after the window shrank, so the worker
+ * output never falls below its minimum. A default proportion adapts by itself.
+ */
+function reclampBoardWidth(windowWidth: number = viewportWidth()) {
+  let changed = false;
+  app.update((state) => {
+    if (state.boardWidth === null) return state;
+    const boardWidth = clampBoardWidth(state.boardWidth, windowWidth);
+    if (boardWidth === state.boardWidth) return state;
+    changed = true;
+    return { ...state, boardWidth };
   });
   if (changed) schedulePreferenceSave();
 }
@@ -2766,4 +2822,6 @@ export const actions = {
   resetDemo,
   /** Read the stored `[ui] theme` and paint it (see `lib/theme.ts`). */
   initTheme: applyStoredTheme,
+  setBoardWidth,
+  reclampBoardWidth,
 };

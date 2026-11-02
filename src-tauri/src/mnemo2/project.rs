@@ -89,6 +89,15 @@ const MIN_WORKBENCH_WIDTH: u32 = 320;
 /// legally hold a much wider panel than the old fixed 720 ceiling allowed.
 const MAX_WORKBENCH_WIDTH: u32 = 8_192;
 
+/// The narrowest the mission-control worker list may be dragged to, in CSS
+/// pixels: the row status column alone is 152px, so the list needs the room.
+const MIN_BOARD_WIDTH: u32 = 300;
+
+/// The widest mission-control worker list that may be persisted, in CSS
+/// pixels. The saved width is window-relative (the worker output keeps its
+/// own minimum), so a wide display may hold a wide list.
+const MAX_BOARD_WIDTH: u32 = 8_192;
+
 /// Workbench state restored independently for each project.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -104,6 +113,9 @@ pub struct ProjectPreferences {
     pub browser_url: String,
     /// Last selected diff worker, when it still exists.
     pub diff_worker_id: Option<String>,
+    /// Saved mission-control worker-list width in CSS pixels; `None` keeps
+    /// the default proportion between the list and the worker output.
+    pub board_width: Option<u32>,
 }
 
 impl Default for ProjectPreferences {
@@ -114,6 +126,7 @@ impl Default for ProjectPreferences {
             workbench_width: 480,
             browser_url: "about:blank".to_string(),
             diff_worker_id: None,
+            board_width: None,
         }
     }
 }
@@ -139,6 +152,13 @@ impl ProjectPreferences {
             id.is_empty() || id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric())
         }) {
             return Err("invalid worker id in project preferences".to_string());
+        }
+        if let Some(board_width) = self.board_width {
+            if !(MIN_BOARD_WIDTH..=MAX_BOARD_WIDTH).contains(&board_width) {
+                return Err(format!(
+                    "board width must be between {MIN_BOARD_WIDTH} and {MAX_BOARD_WIDTH} pixels"
+                ));
+            }
         }
         Ok(())
     }
@@ -733,6 +753,7 @@ mod tests {
             workbench_width: 640,
             browser_url: "http://localhost:3000/".to_string(),
             diff_worker_id: Some("worker1".to_string()),
+            board_width: Some(720),
         };
         save_preferences(one.path(), OWNER, &preferences).expect("save");
         let mut newer = preferences.clone();
@@ -744,6 +765,58 @@ mod tests {
         let mut invalid = preferences;
         invalid.browser_url = "file:///etc/passwd".to_string();
         assert!(save_preferences(one.path(), OWNER, &invalid).is_err());
+    }
+
+    #[test]
+    fn preferences_round_trip_the_mission_control_board_width_and_reject_out_of_range() {
+        let project = tempdir().expect("project");
+        let mut preferences = ProjectPreferences::default();
+        assert_eq!(
+            preferences.board_width, None,
+            "no saved width keeps the default proportion"
+        );
+        for width in [MIN_BOARD_WIDTH, 640, MAX_BOARD_WIDTH] {
+            preferences.board_width = Some(width);
+            save_preferences(project.path(), OWNER, &preferences).expect("save");
+            assert_eq!(
+                super::preferences(project.path(), OWNER)
+                    .expect("restored")
+                    .board_width,
+                Some(width)
+            );
+        }
+        for width in [MIN_BOARD_WIDTH - 1, MAX_BOARD_WIDTH + 1] {
+            preferences.board_width = Some(width);
+            assert!(
+                save_preferences(project.path(), OWNER, &preferences).is_err(),
+                "width {width} must be refused"
+            );
+        }
+    }
+
+    /// Regression: a preferences file written before the mission-control
+    /// divider existed carries no `board_width`, and must keep loading (on
+    /// the default proportion) instead of failing the whole restore.
+    #[test]
+    fn preferences_without_a_board_width_still_load() {
+        let project = tempdir().expect("project");
+        // Create the state dir the sanctioned way so it carries its owner stamp.
+        save_preferences(project.path(), OWNER, &ProjectPreferences::default()).expect("save");
+        let dir = state_dir(project.path()).expect("state");
+        write_json(
+            &dir.join("preferences.json"),
+            &serde_json::json!({
+                "workbench_open": true,
+                "workbench_tab": "diff",
+                "workbench_width": 640,
+                "browser_url": "about:blank",
+                "diff_worker_id": null,
+            }),
+        )
+        .expect("legacy preferences");
+        let restored = super::preferences(project.path(), OWNER).expect("legacy file loads");
+        assert_eq!(restored.board_width, None);
+        assert_eq!(restored.workbench_width, 640);
     }
 
     /// Regression: state lived in the app-data dir keyed by a hash of the

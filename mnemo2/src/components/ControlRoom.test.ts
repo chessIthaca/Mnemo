@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { get } from "svelte/store";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
 import type { BoardPlan } from "../lib/boardState";
 import { fixtureState } from "../test/fixtures";
@@ -67,6 +67,69 @@ describe("Mission Control", () => {
     render(ControlRoom);
     await fireEvent.input(screen.getByLabelText("New worker brief"), { target: { value: "x" } });
     expect((screen.getByRole("button", { name: "Dispatch" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  describe("list/output split", () => {
+    const originalInnerWidth = Object.getOwnPropertyDescriptor(window, "innerWidth");
+
+    const layout = () => document.querySelector(".control-layout") as HTMLElement;
+    const columns = () => layout().getAttribute("style") ?? "";
+    const divider = () => screen.getByRole("button", { name: "Resize worker list" });
+
+    beforeEach(() => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1600 });
+      app.update((state) => ({ ...state, boardWidth: null }));
+    });
+
+    afterEach(() => {
+      if (originalInnerWidth) Object.defineProperty(window, "innerWidth", originalInnerWidth);
+    });
+
+    it("keeps today's proportion until the divider moves", () => {
+      render(ControlRoom);
+      expect(columns()).toContain("--board-columns: minmax(300px, 0.88fr) 9px minmax(420px, 1.12fr)");
+      expect(divider().getAttribute("aria-label")).toBe("Resize worker list");
+    });
+
+    it("resizes the list with the arrow keys and clamps at both bounds", async () => {
+      app.update((state) => ({ ...state, boardWidth: 600 }));
+      render(ControlRoom);
+      expect(columns()).toContain("--board-columns: 600px 9px minmax(420px, 1fr)");
+
+      await fireEvent.keyDown(divider(), { key: "ArrowRight" });
+      expect(get(app).boardWidth).toBe(624);
+      await fireEvent.keyDown(divider(), { key: "ArrowLeft" });
+      await fireEvent.keyDown(divider(), { key: "ArrowLeft" });
+      expect(get(app).boardWidth).toBe(576);
+
+      app.update((state) => ({ ...state, boardWidth: 1171 }));
+      await fireEvent.keyDown(divider(), { key: "ArrowRight" });
+      expect(get(app).boardWidth).toBe(1171);
+      app.update((state) => ({ ...state, boardWidth: 300 }));
+      await fireEvent.keyDown(divider(), { key: "ArrowLeft" });
+      expect(get(app).boardWidth).toBe(300);
+    });
+
+    it("drags the divider with the pointer", async () => {
+      app.update((state) => ({ ...state, boardWidth: 600 }));
+      render(ControlRoom);
+      await fireEvent.pointerDown(divider(), { clientX: 600, pointerId: 1 });
+      await fireEvent.pointerMove(window, { clientX: 700, pointerId: 1 });
+      expect(get(app).boardWidth).toBe(700);
+      await fireEvent.pointerMove(window, { clientX: 400, pointerId: 1 });
+      expect(get(app).boardWidth).toBe(400);
+      await fireEvent.pointerUp(window, { clientX: 400, pointerId: 1 });
+      await fireEvent.pointerMove(window, { clientX: 900, pointerId: 1 });
+      expect(get(app).boardWidth).toBe(400);
+    });
+
+    it("resets to today's proportion on double-click", async () => {
+      app.update((state) => ({ ...state, boardWidth: 720 }));
+      render(ControlRoom);
+      await fireEvent.doubleClick(divider());
+      expect(get(app).boardWidth).toBeNull();
+      expect(columns()).toContain("0.88fr");
+    });
   });
 
   it("replaces the form with one line when no plan is open", () => {

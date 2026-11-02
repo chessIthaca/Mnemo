@@ -636,4 +636,6 @@ export interface AppState {
   newProjectParent: string | null;
   creatingProject: boolean;
   toast: ToastMessage | null;
+  /** Saved mission-control worker-list width; null keeps the default split. */
+  boardWidth: number | null;
 }

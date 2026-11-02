@@ -101,6 +101,7 @@ vi.mock("./projectEngine", () => ({
       workbench_width: 480,
       browser_url: "about:blank",
       diff_worker_id: null,
+  board_width: null,
     }),
   }),
 }));

@@ -21,6 +21,8 @@ export interface ProjectPreferences {
   workbench_width: number;
   browser_url: string;
   diff_worker_id: string | null;
+  /** Saved mission-control list width; null (or absent) keeps the default split. */
+  board_width: number | null;
 }
 
 export interface ProjectTransportBindings {

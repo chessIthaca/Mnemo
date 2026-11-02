@@ -39,7 +39,7 @@
 
 <style>
   .peek-layer { position: fixed; inset: 64px 0 0; z-index: 35; pointer-events: none; }
-  .peek-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgb(38 40 34 / 5%); pointer-events: auto; }
+  .peek-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: var(--backdrop-soft); pointer-events: auto; }
   .team-peek { position: absolute; top: 10px; right: 12px; bottom: 12px; display: flex; width: min(380px, calc(100vw - 24px)); flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); pointer-events: auto; }
   header { display: flex; align-items: center; justify-content: space-between; padding: 18px; }
   header p { margin: 0 0 3px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.12em; }

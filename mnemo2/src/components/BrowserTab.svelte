@@ -148,8 +148,8 @@
   .go-button { padding: 5px 8px; border: 0; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); cursor: pointer; font-size: var(--text-body); }
   .page-title { display: flex; justify-content: space-between; gap: 12px; padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--ink-soft); font-size: var(--text-body); }
   .page-title span { color: var(--muted); font-size: var(--text-body); }
-  .browser-error { padding: 8px 12px; border-bottom: 1px solid #e3c7c0; background: #fbf0ee; color: #8d4d46; font-size: var(--text-body); line-height: 1.5; }
-  .browser-content { position: relative; flex: 1; min-height: 0; overflow: hidden; background: white; }
+  .browser-error { padding: 8px 12px; border-bottom: 1px solid var(--danger-line); background: var(--danger-soft); color: var(--danger-ink); font-size: var(--text-body); line-height: 1.5; }
+  .browser-content { position: relative; flex: 1; min-height: 0; overflow: hidden; background: var(--surface); }
   .native-page { position: absolute; inset: 0; }
   .page-hidden { visibility: hidden; pointer-events: none; }
   .browser-empty { display: grid; height: 100%; align-content: center; justify-items: center; padding: 28px; color: var(--muted); text-align: center; }

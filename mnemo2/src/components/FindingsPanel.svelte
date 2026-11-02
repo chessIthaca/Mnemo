@@ -125,7 +125,7 @@
   .finding-topline { display: flex; align-items: center; gap: 8px; }
   .finding-topline > code { flex: 1; overflow: hidden; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
   .severity { padding: 3px 5px; border-radius: 5px; font-size: var(--text-meta); font-weight: 700; text-transform: uppercase; }
-  .severity[data-severity="high"] { background: #f4e4e1; color: var(--danger); }
+  .severity[data-severity="high"] { background: var(--risk-bg); color: var(--danger); }
   .severity[data-severity="low"] { background: var(--surface-soft); color: var(--muted); }
   .finding-status { color: var(--muted); font-size: var(--text-meta); }
   .finding h4 { margin: 10px 0 5px; font-size: var(--text-body); font-weight: 650; }

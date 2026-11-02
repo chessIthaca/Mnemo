@@ -72,8 +72,8 @@
   .diff-header div > span { color: var(--muted); font-family: var(--font-mono); font-size: var(--text-body); }
   .diff-totals { display: flex; gap: 8px; color: var(--muted); font-size: var(--text-body); }
   .diff-totals strong { color: var(--ink-soft); font-weight: 600; }
-  .additions { color: #4f7d48; }
-  .deletions { color: #a15b53; }
+  .additions { color: var(--stat-add); }
+  .deletions { color: var(--stat-remove); }
   .diff-file { margin-bottom: 12px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
   .diff-file > header { display: flex; align-items: center; gap: 7px; padding: 9px 12px; border-bottom: 1px solid var(--line); background: var(--surface-soft); color: var(--muted); }
   .diff-file header code { flex: 1; overflow: hidden; color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
@@ -81,16 +81,16 @@
   .diff-lines { overflow-x: auto; padding: 6px 0; }
   .diff-line { display: flex; min-width: max-content; padding: 1.5px 12px 1.5px 0; font-family: var(--font-mono); font-size: var(--text-meta); line-height: 1.6; }
   .diff-line code { white-space: pre; }
-  .line-sign { flex: 0 0 24px; color: #b0b4a9; text-align: center; }
-  .diff-line[data-type="add"] { background: #f1f7ee; color: #3f6f39; }
-  .diff-line[data-type="add"] .line-sign { color: #5a9452; }
-  .diff-line[data-type="remove"] { background: #fbf0ee; color: #8d4d46; }
-  .diff-line[data-type="remove"] .line-sign { color: #b26a61; }
-  .diff-line[data-type="hunk"] { margin: 4px 0; background: #f4f5f1; color: #7d8276; }
+  .line-sign { flex: 0 0 24px; color: var(--diff-sign); text-align: center; }
+  .diff-line[data-type="add"] { background: var(--diff-add-bg); color: var(--diff-add-ink); }
+  .diff-line[data-type="add"] .line-sign { color: var(--diff-add-sign); }
+  .diff-line[data-type="remove"] { background: var(--diff-remove-bg); color: var(--danger-ink); }
+  .diff-line[data-type="remove"] .line-sign { color: var(--diff-remove-sign); }
+  .diff-line[data-type="hunk"] { margin: 4px 0; background: var(--diff-hunk-bg); color: var(--diff-hunk-ink); }
   .diff-note { margin: 14px 2px 4px; color: var(--muted); font-size: var(--text-body); line-height: 1.6; }
   .diff-controls { display: flex; gap: 8px; margin-bottom: 12px; }
   .diff-controls select { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink-soft); font-size: var(--text-body); }
-  .diff-error { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #e3c7c0; border-radius: 8px; background: #fbf0ee; color: #8d4d46; font-size: var(--text-body); line-height: 1.5; }
+  .diff-error { margin-bottom: 12px; padding: 10px 12px; border: 1px solid var(--danger-line); border-radius: 8px; background: var(--danger-soft); color: var(--danger-ink); font-size: var(--text-body); line-height: 1.5; }
   .diff-revisions { display: grid; gap: 4px; margin: 0 0 12px; color: var(--muted); font-size: var(--text-body); }
   .diff-revisions code { overflow-wrap: anywhere; }
   .line-number { flex: 0 0 36px; padding-right: 7px; color: var(--muted); text-align: right; user-select: none; }

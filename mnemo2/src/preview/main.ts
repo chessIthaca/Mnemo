@@ -14,6 +14,7 @@ import "../app.css";
 import { mount } from "svelte";
 import App from "../App.svelte";
 import { app } from "../lib/store";
+import { applyTheme, parseTheme } from "../lib/theme";
 import { previewScene, previewScenes } from "../test/previewScenes";
 
 /**
@@ -60,6 +61,12 @@ if (!target) throw new Error("preview.html has no #app mount point");
 
 const requested = new URLSearchParams(window.location.search).get("scene");
 const scene = previewScene(requested);
+
+// A scene may pin its palette (the dark variants), and `?theme=` overrides it
+// for an ad-hoc check; either way the preview never rewrites the saved choice.
+const requestedTheme = new URLSearchParams(window.location.search).get("theme");
+const theme = requestedTheme === null || requestedTheme.trim() === "" ? scene?.theme : parseTheme(requestedTheme);
+if (theme) applyTheme(theme, false);
 
 if (scene) {
   if (scene.mount) {

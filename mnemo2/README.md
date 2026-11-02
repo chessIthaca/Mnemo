@@ -66,6 +66,12 @@ Pick a screen with `?scene=<name>`; a missing parameter renders
 - `lead-chat` — the lead conversation: plan, dispatch, review, merge, tool row.
 - `lead-idle` — the top bar with an idle Claude Code lead badge.
 - `delete-sheet` — the delete-old sheet with one superseded worker.
+- `mission-control-dark`, `lead-chat-dark`, `graph-dark` — the mission-control,
+  lead-chat and Graph scenes in the dark palette (`[ui] theme = "dark"`).
+
+Add `&theme=light` or `&theme=dark` to any scene to review it in that palette
+instead — for example `preview.html?scene=settings-appearance&theme=light`. A
+preview repaint never overwrites the saved theme.
 
 The sample data lives in `src/test/previewScenes.ts` (test-side code built on
 `src/test/fixtures.ts`). Nothing of it reaches the production bundle:

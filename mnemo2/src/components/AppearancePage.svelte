@@ -10,18 +10,21 @@
     type SoundToggles,
   } from "../lib/sounds";
   import { errorText } from "../lib/settingsState";
+  import { THEME_ROWS, applyTheme, parseTheme, type ThemeChoice } from "../lib/theme";
 
   /**
    * The Appearance page: the three `[ui]` notification-sound toggles, each
-   * with a Test button that plays it, plus the theme slot the dark theme
-   * (step 4 of the same plan) fills in.
+   * with a Test button that plays it, and the `[ui] theme` choice (Light /
+   * Dark / System, painted by `lib/theme.ts`).
    *
    * A toggle saves immediately through `appearance_settings_save` and pushes
    * the accepted snapshot into the sound module's live cache, so the very
    * next turn event obeys the new setting — no restart. The Test button calls
    * `playSound` directly (the click is the user's gesture and unlocks audio)
    * and deliberately ignores the toggle, so a muted sound can still be
-   * auditioned.
+   * auditioned. A theme click paints at once, before the save returns, so the
+   * whole app changes under the pointer; a failed save paints the old palette
+   * back.
    */
   let { transport }: { transport: AppearanceTransport } = $props();
 
@@ -30,9 +33,13 @@
   let loadError = $state("");
   /** The flag currently saving, or null when the page is idle. */
   let saving = $state<keyof SoundToggles | null>(null);
+  /** The theme word currently saving, or null when the page is idle. */
+  let themeSaving = $state<ThemeChoice | null>(null);
   let saveError = $state("");
-  /** Whether the last save landed (drives the quiet "Saved." note). */
-  let saved = $state(false);
+  /** The quiet "Saved." note after a successful save, empty when idle. */
+  let savedNote = $state("");
+  /** Which group owns `saveError` / `savedNote` — the last one acted on. */
+  let noteScope = $state<"sounds" | "theme" | null>(null);
 
   $effect(() => {
     let cancelled = false;
@@ -58,19 +65,44 @@
     settings = { ...settings, [flag]: next };
     saving = flag;
     saveError = "";
-    saved = false;
+    savedNote = "";
+    noteScope = "sounds";
     const patch: AppearancePatch = {};
     patch[flag] = next;
     try {
       const accepted = await transport.save(patch);
       settings = accepted;
       applySoundToggles(accepted);
-      saved = true;
+      savedNote = "Saved. The next turn obeys it — no restart.";
     } catch (error) {
       settings = previous;
       saveError = errorText(error);
     } finally {
       saving = null;
+    }
+  }
+
+  /** Choose a theme: paint it at once, then save it through the same command. */
+  async function chooseTheme(choice: ThemeChoice): Promise<void> {
+    if (!settings) return;
+    const previous = settings.theme;
+    settings = { ...settings, theme: choice };
+    themeSaving = choice;
+    saveError = "";
+    savedNote = "";
+    noteScope = "theme";
+    applyTheme(choice);
+    try {
+      const accepted = await transport.save({ theme: choice });
+      settings = accepted;
+      applyTheme(parseTheme(accepted.theme));
+      savedNote = "Saved. Every screen repaints — no restart.";
+    } catch (error) {
+      settings = { ...settings, theme: previous };
+      applyTheme(parseTheme(previous));
+      saveError = errorText(error);
+    } finally {
+      themeSaving = null;
     }
   }
 
@@ -116,12 +148,14 @@
           {/each}
         </div>
         <div class="section-actions">
-          {#if saveError}
-            <p class="section-error" role="alert">{saveError}</p>
-          {:else if saving !== null}
-            <p class="section-note">Saving…</p>
-          {:else if saved}
-            <p class="section-note">Saved. The next turn obeys it — no restart.</p>
+          {#if noteScope === "sounds"}
+            {#if saveError}
+              <p class="section-error" role="alert">{saveError}</p>
+            {:else if saving !== null}
+              <p class="section-note">Saving…</p>
+            {:else if savedNote}
+              <p class="section-note">{savedNote}</p>
+            {/if}
           {/if}
         </div>
       </section>
@@ -129,13 +163,40 @@
       <section class="group" aria-label="Theme">
         <header>
           <h3>Theme</h3>
-          <p class="micro">Dark theme coming next.</p>
+          <p class="micro">
+            The palette for every screen. <strong>System</strong> follows the operating system and switches with it
+            while the app is open.
+          </p>
         </header>
-        <p class="micro">
-          The appearance is still the single built-in palette. The stored preference is
-          <code>[ui] theme = "{settings.theme}"</code>; the Light / Dark / System choice lands in the next step of this
-          plan.
-        </p>
+        <div class="theme-list" role="radiogroup" aria-label="Theme">
+          {#each THEME_ROWS as row (row.choice)}
+            <label class="theme-row">
+              <input
+                type="radio"
+                name="theme"
+                value={row.choice}
+                checked={parseTheme(settings.theme) === row.choice}
+                disabled={themeSaving !== null}
+                onchange={() => chooseTheme(row.choice)}
+              />
+              <span class="sound-text">
+                <strong>{row.label}</strong>
+                <span class="micro">{row.description}</span>
+              </span>
+            </label>
+          {/each}
+        </div>
+        <div class="section-actions">
+          {#if noteScope === "theme"}
+            {#if saveError}
+              <p class="section-error" role="alert">{saveError}</p>
+            {:else if themeSaving !== null}
+              <p class="section-note">Saving…</p>
+            {:else if savedNote}
+              <p class="section-note">{savedNote}</p>
+            {/if}
+          {/if}
+        </div>
       </section>
     {/if}
   </div>
@@ -151,7 +212,6 @@
   .group header { display: grid; gap: 4px; }
   .group h3 { margin: 0; font-size: var(--text-title); font-weight: 650; }
   .micro { margin: 0; color: var(--muted); font-size: var(--text-body); line-height: 1.55; }
-  .micro code { padding: 1px 4px; border-radius: 5px; background: var(--surface-soft); font-size: 0.92em; }
 
   .sound-list { display: grid; gap: 4px; }
   .sound-row {
@@ -168,6 +228,19 @@
   .sound-text { display: grid; gap: 1px; }
   .sound-text strong { font-weight: 620; }
   .sound-test { min-height: 32px; padding: 5px 12px; flex-shrink: 0; }
+
+  .theme-list { display: grid; gap: 4px; }
+  .theme-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    cursor: pointer;
+    font-size: var(--text-body);
+  }
+  .theme-row input { width: 16px; height: 16px; flex-shrink: 0; accent-color: var(--accent); cursor: pointer; }
 
   .section-actions { display: flex; align-items: center; gap: 12px; min-height: 0; }
   .section-error { margin: 0; color: var(--danger); font-size: var(--text-body); overflow-wrap: anywhere; }

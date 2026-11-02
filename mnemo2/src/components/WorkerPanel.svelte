@@ -152,8 +152,8 @@
   .banner-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .banner-button { display: inline-flex; align-items: center; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-body); font-weight: 600; }
   .banner-button:hover { background: var(--surface-soft); color: var(--ink); }
-  .banner-button.continue { border-color: var(--danger); background: var(--danger); color: white; }
-  .banner-button.continue:hover { background: #8a423b; }
+  .banner-button.continue { border-color: var(--danger); background: var(--danger); color: var(--on-danger); }
+  .banner-button.continue:hover { background: var(--danger-hover); }
   .banner-button.delete { color: var(--danger); }
   .banner-button.delete:hover { border-color: var(--danger); background: var(--surface-soft); }
   .back-button { display: none; }

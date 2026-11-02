@@ -93,8 +93,11 @@ export interface AppearanceSettings extends SoundToggles {
   theme: string;
 }
 
-/** A partial toggle save — omitted flags keep their stored value. */
-export type AppearancePatch = Partial<SoundToggles>;
+/** A partial save — omitted flags (and the theme) keep their stored value. */
+export type AppearancePatch = Partial<SoundToggles> & {
+  /** New `[ui] theme` word: `light`, `dark` or `system`. */
+  theme?: string;
+};
 
 /** Every sound is on until the user says otherwise (matches `UiConfig`). */
 export const DEFAULT_SOUND_TOGGLES: SoundToggles = {

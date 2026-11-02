@@ -200,7 +200,7 @@
   .steps { margin: 10px 0 0; padding: 0; list-style: none; }
   .step { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
   .marker { display: grid; flex: 0 0 auto; width: 16px; height: 16px; place-items: center; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); }
-  .step[data-done="true"] .marker { border-color: #d6e0d0; background: var(--accent-soft); color: var(--accent-strong); }
+  .step[data-done="true"] .marker { border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent-strong); }
   .step-copy { flex: 1; min-width: 0; }
   .step-title { font-size: var(--text-body); line-height: 1.5; }
   .step[data-done="true"] .step-title { color: var(--muted); }

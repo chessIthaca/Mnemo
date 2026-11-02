@@ -88,7 +88,7 @@
   .evidence-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .evidence-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
   .risk-badge, .pass-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0; }
-  .risk-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
+  .risk-badge[data-risk="high"] { background: var(--risk-bg); color: var(--danger); }
   .pass-badge[data-recorded="true"] { background: var(--accent-soft); color: var(--accent-strong); }
   .pass-badge[data-recorded="false"] { background: var(--warning-soft); color: var(--warning); }
   .evidence-summary { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.5; }

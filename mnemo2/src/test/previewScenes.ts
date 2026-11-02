@@ -2052,6 +2052,139 @@ function memoryTab(): AppState {
   return { ...baseState(), route: "memory" };
 }
 
+/** The lead chat with the tool-row bodies: named-file headlines, the expanded
+ *  edit row showing its coloured diff, a replayed multi_edit rebuilt from
+ *  its arguments, a write's added lines, the read row's file-and-range list,
+ *  and the shell's command with split output. */
+function leadToolRows(): AppState {
+  const row = (id: string, toolName: string, args: Record<string, unknown>, result: ToolEntry["result"]): ToolEntry => ({
+    id,
+    kind: "tool",
+    time: "10:04",
+    toolCallId: `call-${id}`,
+    toolName,
+    arguments: JSON.stringify(args),
+    liveOutput: "",
+    result,
+  });
+  const readOutput = [
+    "=== mnemo2/src/lib/toolSummary.ts (lines 1-65 of 65) ===",
+    "1  import { actionPhrase, argPaths, basename, dedupePaths, prettyToolName } from …",
+    "",
+    "=== mnemo2/src/lib/types.ts (lines 272-276 of 316) ===",
+    "272  export interface LeadToolResult {",
+    "273    success: boolean;",
+    "274    output: string;",
+    "275    data?: unknown;",
+    "276  }",
+    "",
+  ].join("\n");
+  return {
+    ...baseState(),
+    route: "lead",
+    selectedWorkerId: null,
+    workerPanelId: null,
+    workbenchOpen: false,
+    workerDeletion: null,
+    leadEntries: [
+      {
+        id: "preview-lead-tools-intro",
+        kind: "message",
+        author: "lead",
+        time: "10:03",
+        body: "Expanding a tool row now shows what it did — the diff an edit applied, the content a write produced, the files and line ranges a read returned — instead of raw Arguments JSON. Every rich row keeps the raw call behind its Show raw call toggle.",
+      },
+      row(
+        "preview-lead-tools-read",
+        "read_files",
+        {
+          files: [
+            { path: "mnemo2/src/lib/toolSummary.ts" },
+            { path: "mnemo2/src/lib/types.ts", start_line: 272, max_lines: 5 },
+          ],
+        },
+        { success: true, output: readOutput },
+      ),
+      row(
+        "preview-lead-tools-edit",
+        "file_edit",
+        {
+          path: "mnemo2/src/lib/toolSummary.ts",
+          old_string: "export function toolSummary(",
+          new_string: "export function toolHeadline(",
+        },
+        {
+          success: true,
+          output: "Edited mnemo2/src/lib/toolSummary.ts",
+          data: {
+            diff: [
+              "--- a/mnemo2/src/lib/toolSummary.ts",
+              "+++ b/mnemo2/src/lib/toolSummary.ts",
+              "@@ -54,6 +54,7 @@",
+              " /** A compact human headline derived from the actual call, never its outcome. */",
+              "-export function toolSummary(",
+              "+export function toolHeadline(",
+              "   toolName: string,",
+              "   args: string,",
+              "   nameOf: (workerId: string) => string = (workerId) => workerId,",
+              "-): string {",
+              "+): { text: string; title: string } {",
+            ].join("\n"),
+          },
+        },
+      ),
+      row(
+        "preview-lead-tools-multi",
+        "multi_edit",
+        {
+          files: [
+            {
+              path: "mnemo2/src/components/ToolActivity.svelte",
+              ops: [
+                {
+                  old_string: "toolSummary(entry.toolName, entry.arguments, nameOf)",
+                  new_string: "toolHeadline(entry.toolName, entry.arguments, nameOf)",
+                },
+              ],
+            },
+            { path: "mnemo2/src/components/ToolDiff.svelte" },
+            { path: "mnemo2/src/components/ToolShellOutput.svelte" },
+            { path: "mnemo2/src/lib/toolDiff.ts" },
+            { path: "mnemo2/src/lib/toolDiff.test.ts" },
+          ],
+        },
+        // A replayed transcript rebuilds results from the message text: no
+        // structured diff, so the row reconstructs one from its arguments.
+        { success: true, output: "Edited 1 file" },
+      ),
+      row(
+        "preview-lead-tools-write",
+        "file_write",
+        {
+          path: "mnemo2/src/components/ToolShellOutput.svelte",
+          content: '<script lang="ts">\n  import TerminalText from "./TerminalText.svelte";\n</script>\n',
+        },
+        { success: true, output: "Wrote mnemo2/src/components/ToolShellOutput.svelte" },
+      ),
+      row(
+        "preview-lead-tools-shell",
+        "shell",
+        { command: "npx vitest run src/lib src/components", purpose: "running tests", cwd: "mnemo2" },
+        {
+          success: true,
+          output: "Test Files  1 passed (1)\n[stderr]\nnpm notice run mnemo@1.3.0\n[exit code: 0]",
+        },
+      ),
+      row(
+        "preview-lead-tools-git",
+        "git_read",
+        { op: "status" },
+        { success: true, output: "## wt/agent-toolRows\nM mnemo2/src/components/ToolActivity.svelte\n" },
+      ),
+    ],
+  };
+}
+
 /** Every scene the preview page renders, in index order. */
 export const previewScenes: PreviewScene[] = [
   {
@@ -2326,6 +2459,25 @@ export const previewScenes: PreviewScene[] = [
     title: "Trace tab (empty)",
     description: "The compact side Trace tab before any model call was recorded.",
     build: traceTabEmpty,
+  },
+  {
+    name: "lead-tool-rows",
+    title: "Lead tool rows",
+    description:
+      "The lead chat's tool rows with file-named headlines: the expanded edit row shows its coloured diff, a replayed multi_edit reconstructs one from its arguments, a write shows its added lines, a read lists its files and line ranges, and the shell row keeps its command and split output.",
+    build: leadToolRows,
+    // The rows' bodies are component-local state, so the scene opens the edit
+    // row after mounting — its diff is the body this scene is about; the
+    // other rows stay collapsed for the index click-through.
+    mount: (target) => {
+      app.set(leadToolRows());
+      const shell = svelteMount(App, { target });
+      const editRow = target.querySelector<HTMLDetailsElement>(
+        'article[aria-label^="Editing"] .tool-disclosure',
+      );
+      if (editRow !== null) editRow.open = true;
+      return () => unmount(shell);
+    },
   },
 ];
 

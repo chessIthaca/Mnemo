@@ -22,6 +22,7 @@ import { createWorkbenchTransport, type WorkbenchTransport } from "./workbenchEn
 import { createBrowserTransport, type BrowserTransport } from "./browserEngine";
 import { workerScreenshotPaths } from "./workbenchState";
 import {
+  applyModelSwitch,
   applyWorkerLiveEvent,
   emptyWorkerLive,
   STREAM_ONLY_EVENTS,
@@ -2034,20 +2035,56 @@ function resumeWorker(workerId: string) {
     .catch(noteTeamError);
 }
 
-/** Move a worker to another model; it comes back idle with its transcript. */
+/**
+ * Move a worker to another model. A worker mid-run (working, dispatching,
+ * fixing) keeps its session running: the switch applies to its next request
+ * and its thread notes the change; every other worker comes back idle
+ * with its transcript, as before.
+ */
 async function setWorkerModel(workerId: string, model: string, reasoningEffort: string | null): Promise<void> {
   const transport = requireTeam();
   if (!transport) return;
+  let switched = false;
   try {
     const record = await transport.setModel(workerId, model, reasoningEffort);
+    // A still-running record means the switch was applied live — the request
+    // in flight keeps serving on the old model.
+    switched = ["working", "dispatching", "fixing"].includes(record.status);
     app.update((state) => withToast(
       state,
-      `${workerDisplayName(record.id, record.name)} now runs on ${model}. Message it to continue.`,
+      switched
+        ? `${workerDisplayName(record.id, record.name)} keeps working; it runs on ${model} from its next call.`
+        : `${workerDisplayName(record.id, record.name)} now runs on ${model}. Message it to continue.`,
     ));
   } catch (error) {
     noteTeamError(error);
   }
   await syncTeam();
+  if (switched) noteWorkerModelSwitch(workerId, model);
+}
+
+/**
+ * Note a live model switch in the worker's open thread tail. The note rides
+ * the live entries (the saved transcript never holds it), stays in step with
+ * the current saved generation, and flips to "Now running on …" once the
+ * kernel's model_changed event reports the new model serving.
+ */
+function noteWorkerModelSwitch(workerId: string, model: string): void {
+  const saved = workerSaved.get(workerId);
+  if (!saved) return;
+  let live = workerLive.get(workerId);
+  if (!live || live.generation !== saved.generation || live.baseLength !== saved.length) {
+    live = emptyWorkerLive(saved.generation, saved.length);
+  }
+  workerLive.set(workerId, applyModelSwitch(live, model));
+  const thread = composeThread(workerId);
+  if (!thread) return;
+  app.update((state) => ({
+    ...state,
+    workers: state.workers.map((worker) =>
+      worker.id === workerId ? { ...worker, messages: thread } : worker,
+    ),
+  }));
 }
 
 async function compactWorker(workerId: string): Promise<void> {

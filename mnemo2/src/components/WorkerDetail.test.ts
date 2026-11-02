@@ -153,3 +153,42 @@ describe("WorkerDetail received messages", () => {
     expect(container.querySelector(".inbox-panel")).toBeNull();
   });
 });
+
+describe("worker thread model-switch note", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  it("renders the muted note in the thread, pending then confirmed", () => {
+    const worker: Worker = {
+      ...createWorkers()[0],
+      messages: [
+        { id: "m1", from: "worker", body: "Implementing the parser.", time: "now" },
+        {
+          id: "note-pending",
+          kind: "model_switch",
+          model: "test/deep",
+          body: "Model changed to deep by you; it takes effect on the next call",
+          time: "now",
+          applied: false,
+        },
+        {
+          id: "note-applied",
+          kind: "model_switch",
+          model: "test/fast",
+          body: "Now running on fast",
+          time: "now",
+          applied: true,
+        },
+      ],
+    };
+
+    const { container } = render(WorkerDetail, { worker });
+
+    // The notes render as muted status rows — not as worker messages with authors.
+    const notes = [...container.querySelectorAll(".thread-model-note")];
+    expect(notes.map((note) => note.getAttribute("role"))).toEqual(["status", "status"]);
+    expect(notes.map((note) => note.textContent)).toEqual([
+      "Model changed to deep by you; it takes effect on the next call",
+      "Now running on fast",
+    ]);
+  });
+});

@@ -104,6 +104,8 @@
           <p>{entry.body}</p>
         </div>
       {/if}
+    {:else if entry.kind === "model_switch"}
+      <div class="thread-model-note" role="status">{entry.body}</div>
     {:else}
       <div class="thread-message" class:from-lead={entry.from === "lead"} class:from-harness={entry.from === "harness"}>
         <span>{entry.from === "lead" ? "LEAD" : entry.from === "harness" ? "HARNESS NOTE" : worker.name.toUpperCase()} · {entry.time}</span>
@@ -173,6 +175,7 @@
   .thread-error p { margin: 0; color: var(--danger); font-size: var(--text-body); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
   .thread-error .failure-detail { margin-top: 5px; color: var(--muted); font-size: var(--text-body); }
   .thread-error-note { margin-top: 12px; padding: 8px 10px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--muted); font-size: var(--text-body); }
+  .thread-model-note { margin-top: 12px; padding: 8px 10px; border: 1px dashed var(--line-strong); border-radius: 4px 12px 12px 12px; color: var(--muted); font-size: var(--text-body); }
   .thread-activity { margin-top: 12px; }
   .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
   .screenshot-links > span { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }

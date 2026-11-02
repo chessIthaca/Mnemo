@@ -178,8 +178,25 @@ export interface WorkerErrorEntry {
   retrying: boolean;
 }
 
-/** One item of a worker's thread: a Markdown message, a tool activity, or a live error. */
-export type WorkerThreadEntry = WorkerMessage | WorkerErrorEntry | Extract<LeadEntry, { kind: "tool" }>;
+/** A muted note recording a live model switch the user made mid-run. */
+export interface WorkerModelSwitchEntry {
+  id: string;
+  kind: "model_switch";
+  time: string;
+  /** The `endpoint/model` spec the user moved this worker to. */
+  model: string;
+  /** The note's text; "Now running on …" once the switched model serves a request. */
+  body: string;
+  /** True once the kernel's model_changed event reports this model serving. */
+  applied: boolean;
+}
+
+/** One item of a worker's thread: a Markdown message, a tool activity, a live error, or a model-switch note. */
+export type WorkerThreadEntry =
+  | WorkerMessage
+  | WorkerErrorEntry
+  | WorkerModelSwitchEntry
+  | Extract<LeadEntry, { kind: "tool" }>;
 
 export interface DiffStats {
   files: number;

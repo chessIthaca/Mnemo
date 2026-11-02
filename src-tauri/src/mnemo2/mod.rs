@@ -53,6 +53,11 @@ pub mod browser;
 /// The per-instance run file the `mnemo2-mcp` helper finds a live Mnemo2 by.
 pub mod run_file;
 
+/// The Laya decision-model settings commands (status, setup, disable,
+/// save) — the backend of the Settings dialog's Laya page (plan
+/// e02de747).
+pub mod laya_settings;
+
 /// The local endpoint for an external lead (Claude Code over MCP).
 pub mod mcp_server;
 
@@ -412,6 +417,10 @@ pub fn run() {
             ipc::external_lead_status,
             ipc::external_open_failed,
             ipc::lead_open,
+            laya_settings::laya_status,
+            laya_settings::laya_setup,
+            laya_settings::laya_disable,
+            laya_settings::save_laya_settings,
             ipc::lead_snapshot,
             ipc::indexing_snapshot,
             ipc::lead_prompt,

@@ -345,6 +345,10 @@ pub struct SettingsSaveDto {
     /// the current value.
     #[serde(default)]
     pub laya_routing: Option<bool>,
+    /// Laya compound reflex (opt-in; enable only against a fine-tuned
+    /// checkpoint). Absent = keep the current value.
+    #[serde(default)]
+    pub laya_reflex: Option<bool>,
     /// Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22 — all
     /// ON by default since 2027-01-25; uncheck to opt out). Absent = keep the
     /// current value, so a dialog that never touched a lever leaves the section
@@ -711,6 +715,9 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(routing) = patch.laya_routing {
         general.general.laya.routing = routing;
+    }
+    if let Some(reflex) = patch.laya_reflex {
+        general.general.laya.reflex = reflex;
     }
     // Token-optimizer levers ([general.optimizer]): absent = keep, so an
     // untouched dialog never rewrites the section — and a config still on
@@ -1495,6 +1502,32 @@ mod tests {
             let err = validate_and_apply_settings_patch(&current, &patch).unwrap_err();
             assert!(err.contains("routing threshold"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn laya_reflex_patch_round_trips_and_keeps() {
+        // The compound reflex opt-in (LayaConfig.reflex, plan e02de747's
+        // seventh flag): present sets, absent keeps — the same semantics
+        // as the other laya_* patch fields.
+        let current = Config::default();
+        let patch = SettingsSaveDto {
+            laya_reflex: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.reflex);
+
+        // Absent keeps — an all-default patch never touches it.
+        let next = validate_and_apply_settings_patch(&next, &SettingsSaveDto::default()).unwrap();
+        assert!(next.general.general.laya.reflex);
+
+        // And a `false` rides back off.
+        let patch = SettingsSaveDto {
+            laya_reflex: Some(false),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(!next.general.general.laya.reflex);
     }
 
     #[test]

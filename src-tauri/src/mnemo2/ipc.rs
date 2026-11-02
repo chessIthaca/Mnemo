@@ -1118,7 +1118,7 @@ pub async fn lead_close(
 
 /// A `Setup` on the lead's config dir (attached to its engine when a lead is
 /// open), plus the lead for post-save catalog refresh.
-async fn settings_setup(
+pub(crate) async fn settings_setup(
     state: &Mnemo2State,
 ) -> Result<(mnemo::headless::Setup, Option<Arc<LeadRuntime>>), String> {
     let runtime = state.runtime.lock().await.clone();
@@ -1136,7 +1136,7 @@ async fn settings_setup(
     }
 }
 
-async fn settings_refresh(runtime: Option<Arc<LeadRuntime>>) -> Result<(), String> {
+pub(crate) async fn settings_refresh(runtime: Option<Arc<LeadRuntime>>) -> Result<(), String> {
     match runtime {
         Some(runtime) => runtime.refresh_catalog().await,
         None => Ok(()),

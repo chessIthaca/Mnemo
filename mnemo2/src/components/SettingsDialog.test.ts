@@ -6,11 +6,16 @@ import { fixtureState } from "../test/fixtures";
 import SettingsDialog from "./SettingsDialog.svelte";
 import TopBar from "./TopBar.svelte";
 
-const mocks = vi.hoisted(() => ({ transport: null as unknown }));
+const mocks = vi.hoisted(() => ({ transport: null as unknown, modelTransport: null as unknown }));
 
 vi.mock("../lib/settingsEngine", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/settingsEngine")>();
   return { ...original, createSettingsTransport: () => mocks.transport };
+});
+
+vi.mock("../lib/modelSettings", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/modelSettings")>();
+  return { ...original, createModelSettingsTransport: () => mocks.modelTransport };
 });
 
 function endpoint(name: string, overrides: Partial<EndpointDetailDto> = {}): EndpointDetailDto {
@@ -65,6 +70,7 @@ async function openDialog() {
 describe("SettingsDialog", () => {
   beforeEach(() => {
     mocks.transport = null;
+    mocks.modelTransport = null;
     app.set(fixtureState());
   });
 
@@ -209,5 +215,48 @@ describe("SettingsDialog", () => {
     await fireEvent.change(within(simple).getByLabelText("Add model to Simple and tools"), { target: { value: "alpha/m1" } });
     await fireEvent.click(screen.getByRole("button", { name: "Save tiers" }));
     expect(await screen.findByText("unknown model x/y")).toBeTruthy();
+  });
+
+  it("shows the Models and Savings pages beside Endpoints and Tiers", async () => {
+    makeTransport();
+    mocks.modelTransport = {
+      get: vi.fn(async () => ({
+        task_models: { planning: "alpha/m1", executing: null, bug_fixing: null, reviewing: null, summarize: null },
+        vision_model: null,
+        embedding: {
+          selected: "hash",
+          status: "keyword_only",
+          options: [{ id: "hash", label: "Keyword only", size_mb: 0, installed: true }],
+        },
+        optimizer: {
+          delta_reads: true,
+          compress_output: true,
+          archive: true,
+          compaction_survival: true,
+          quality_score: true,
+          lean_output_nudge: true,
+          recall_delta: false,
+          archive_min_chars: 2400,
+          compress_min_chars: 3000,
+          lean_output_fill_pct: 80,
+          nudge_cooldown_requests: 4,
+          compress_extra_commands: [],
+        },
+        pricing: [{ model: "m1", input_per_1m: 3, output_per_1m: 15, cached_per_1m: 0 }],
+        budget: { enabled: false, max_tokens_per_plan: 0, max_escalations_per_plan: 0, max_retries_per_lane: 0 },
+      })),
+      save: vi.fn(async () => undefined),
+      install: vi.fn(async () => undefined),
+      onEmbedderEvent: vi.fn(async () => () => {}),
+    };
+    await openDialog();
+    await fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    const work = await screen.findByRole("region", { name: "Models for each kind of work" });
+    expect(within(work).getByLabelText("Planning")).toBeTruthy();
+    expect(screen.getByText("Status: Keyword only")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Savings" }));
+    const levers = await screen.findByRole("region", { name: "Savings levers" });
+    expect(within(levers).getByText("Delta reads")).toBeTruthy();
+    expect((screen.getByLabelText("Model for row 1") as HTMLInputElement).value).toBe("m1");
   });
 });

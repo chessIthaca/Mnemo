@@ -1,16 +1,21 @@
 <script lang="ts">
+  import { createModelSettingsTransport } from "../lib/modelSettings";
   import { createSettingsTransport, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import EndpointsPage from "./EndpointsPage.svelte";
+  import ModelsPage from "./ModelsPage.svelte";
+  import SavingsPage from "./SavingsPage.svelte";
   import Sheet from "./Sheet.svelte";
   import TiersPage from "./TiersPage.svelte";
 
   let { open, onclose }: { open: boolean; onclose: () => void } = $props();
 
-  type Page = "endpoints" | "tiers";
+  type Page = "endpoints" | "tiers" | "models" | "savings";
   const pages: { id: Page; label: string }[] = [
     { id: "endpoints", label: "Endpoints" },
     { id: "tiers", label: "Tiers" },
+    { id: "models", label: "Models" },
+    { id: "savings", label: "Savings" },
   ];
 
   let page = $state<Page>("endpoints");
@@ -19,6 +24,7 @@
   let loading = $state(false);
   let loadError = $state("");
   const transport = $derived(open ? createSettingsTransport() : null);
+  const modelTransport = $derived(open ? createModelSettingsTransport() : null);
 
   $effect(() => {
     const active = transport;
@@ -67,6 +73,18 @@
           <p class="settings-empty">Loading…</p>
         {:else if page === "endpoints"}
           <EndpointsPage {transport} {endpoints} {tiers} onendpoints={refreshAfterEndpointChange} />
+        {:else if page === "models"}
+          {#if modelTransport}
+            <ModelsPage transport={modelTransport} {endpoints} />
+          {:else}
+            <p class="settings-empty">Model settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "savings"}
+          {#if modelTransport}
+            <SavingsPage transport={modelTransport} {endpoints} />
+          {:else}
+            <p class="settings-empty">Savings settings are available in the desktop app.</p>
+          {/if}
         {:else}
           <TiersPage {transport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />
         {/if}

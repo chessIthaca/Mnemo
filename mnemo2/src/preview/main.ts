@@ -30,7 +30,7 @@ function sceneIndex(requested: string): HTMLElement {
 
   const intro = document.createElement("p");
   intro.textContent =
-    "Dev-only page: each scene renders the real app shell against the sample data in src/test/previewScenes.ts.";
+    "Dev-only page: each scene renders the real app shell (or a bespoke frame, for scenes the store cannot express) against the sample data in src/test/previewScenes.ts.";
   page.append(intro);
 
   if (requested !== "") {
@@ -62,8 +62,13 @@ const requested = new URLSearchParams(window.location.search).get("scene");
 const scene = previewScene(requested);
 
 if (scene) {
-  app.set(scene.build());
-  mount(App, { target });
+  if (scene.mount) {
+    // Bespoke frames own their cleanup; the page runs them for its lifetime.
+    scene.mount(target);
+  } else {
+    app.set(scene.build());
+    mount(App, { target });
+  }
 } else {
   target.append(sceneIndex(requested ?? ""));
 }

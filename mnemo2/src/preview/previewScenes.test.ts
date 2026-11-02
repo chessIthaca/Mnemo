@@ -50,6 +50,7 @@ describe("preview scenes", () => {
       "lead-chat",
       "lead-idle",
       "delete-sheet",
+      "settings-models",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
     expect(previewScene("")?.name).toBe(defaultPreviewScene);

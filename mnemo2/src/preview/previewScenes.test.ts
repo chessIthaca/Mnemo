@@ -66,6 +66,7 @@ describe("preview scenes", () => {
       "lead-idle",
       "delete-sheet",
       "cost",
+      "plans",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
     expect(previewScene("")?.name).toBe(defaultPreviewScene);

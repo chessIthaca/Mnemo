@@ -1,6 +1,9 @@
 <script lang="ts">
-  import { Check, ChevronRight, Circle } from "@lucide/svelte";
+  import { onMount } from "svelte";
+  import { Check, ChevronDown, ChevronRight, Circle } from "@lucide/svelte";
+  import { createBoardTransport } from "../lib/boardEngine";
   import { closedPlans, openPlans, planProgress, type BoardPlan } from "../lib/boardState";
+  import { planDetailMarkdown } from "../lib/planDocument";
   import { actions, app } from "../lib/store";
   import { workerStatusLabel, type WorkerStatus } from "../lib/types";
   import Collapsible from "./Collapsible.svelte";
@@ -10,6 +13,71 @@
   const closed = $derived(closedPlans($app.board));
 
   const statusLabel = (status: string) => workerStatusLabel[status as WorkerStatus] ?? status;
+
+  /** One plan's expanded details: the raw document and its load state. */
+  interface PlanDetails {
+    markdown: string;
+    loading: boolean;
+    error: string;
+  }
+
+  const transport = createBoardTransport();
+  let expanded = $state<Record<string, boolean>>({});
+  let details = $state<Record<string, PlanDetails>>({});
+
+  const isExpanded = (plan: BoardPlan) => expanded[plan.id] === true;
+
+  /** Flatten a rejected invoke (string or Error) to display text. */
+  const errorText = (error: unknown) =>
+    typeof error === "string" ? error : error instanceof Error ? error.message : "Could not read the plan";
+
+  /** The details Markdown: the card already shows title, goal and step headers. */
+  const detailSource = (plan: BoardPlan) =>
+    planDetailMarkdown(
+      details[plan.id]?.markdown ?? "",
+      plan.steps.some((step) => (step.header ?? "").trim() !== ""),
+    );
+
+  async function loadDetails(plan: BoardPlan) {
+    const active = transport;
+    if (!active) {
+      details[plan.id] = { markdown: "", loading: false, error: "Plan details need the desktop app." };
+      return;
+    }
+    details[plan.id] = { markdown: details[plan.id]?.markdown ?? "", loading: true, error: "" };
+    try {
+      const markdown = await active.document(plan.id);
+      details[plan.id] = { markdown, loading: false, error: "" };
+    } catch (error) {
+      details[plan.id] = { markdown: "", loading: false, error: errorText(error) };
+    }
+  }
+
+  function toggleDetails(plan: BoardPlan) {
+    const opening = !isExpanded(plan);
+    expanded[plan.id] = opening;
+    if (opening && !details[plan.id]?.markdown) void loadDetails(plan);
+  }
+
+  // An open card re-reads its document on the board change, so the details
+  // follow edits the lead makes while the tab stays open.
+  onMount(() => {
+    const active = transport;
+    if (!active) return;
+    let live = true;
+    let unlisten: (() => void) | null = null;
+    void active.onChanged(() => {
+      if (!live) return;
+      for (const plan of $app.board) if (expanded[plan.id]) void loadDetails(plan);
+    }).then((stop) => {
+      if (live) unlisten = stop;
+      else stop();
+    });
+    return () => {
+      live = false;
+      unlisten?.();
+    };
+  });
 </script>
 
 {#snippet planCard(plan: BoardPlan)}
@@ -20,6 +88,12 @@
         <span class="kind">{plan.kind}</span>
         {#if plan.status !== "open"}<span class="state">{plan.status}</span>{/if}
         <span class="count">{progress.done}/{progress.total}</span>
+        <button
+          class="details-toggle"
+          aria-expanded={isExpanded(plan)}
+          aria-controls={`plan-details-${plan.id}`}
+          onclick={() => toggleDetails(plan)}
+        ><ChevronDown size={11} /> Details</button>
       </p>
       <h2>{plan.title}</h2>
       {#if plan.goal}<Collapsible maxHeight={60} label={`${plan.title} goal`}><Markdown source={plan.goal} onOpenLink={actions.openBrowser} /></Collapsible>{/if}
@@ -47,6 +121,17 @@
         </li>
       {/each}
     </ol>
+    {#if isExpanded(plan)}
+      <section class="plan-details" id={`plan-details-${plan.id}`} aria-label={`${plan.title} details`}>
+        {#if details[plan.id]?.loading}
+          <p class="details-note">Loading plan…</p>
+        {:else if details[plan.id]?.error}
+          <p class="details-note details-error">{details[plan.id].error}</p>
+        {:else}
+          <Markdown source={detailSource(plan)} onOpenLink={actions.openBrowser} />
+        {/if}
+      </section>
+    {/if}
   </article>
 {/snippet}
 
@@ -73,6 +158,18 @@
   .kind { padding: 2px 6px; border-radius: 6px; background: var(--surface-soft); text-transform: uppercase; }
   .state { text-transform: uppercase; }
   .count { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .details-toggle { display: inline-flex; align-items: center; gap: 3px; padding: 2px 6px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.06em; text-transform: uppercase; cursor: pointer; }
+  .details-toggle:hover { border-color: var(--line); background: var(--surface-soft); color: var(--ink-soft); }
+  .details-toggle:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 1px; }
+  .details-toggle :global(svg) { transition: transform 120ms ease; }
+  .details-toggle[aria-expanded="true"] :global(svg) { transform: rotate(180deg); }
+  .plan-details { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  .plan-details :global(.markdown) { font-size: var(--text-body); line-height: 1.55; }
+  .plan-details :global(.markdown h2) { margin: 16px 0 6px; font-size: var(--text-title); font-weight: 620; }
+  .plan-details :global(.markdown h2:first-child) { margin-top: 0; }
+  .plan-details :global(.markdown h3) { margin: 12px 0 4px; font-size: var(--text-body); font-weight: 650; }
+  .details-note { margin: 0; color: var(--muted); font-size: var(--text-body); }
+  .details-error { color: var(--danger); }
   .plan-header h2 { margin: 0 0 4px; font-family: var(--font-prose); font-size: var(--text-title); font-weight: 550; }
   .plan-header :global(.markdown) { color: var(--muted); font-size: var(--text-body); line-height: 1.45; }
   .plan-header :global(.markdown h1), .plan-header :global(.markdown h2), .plan-header :global(.markdown h3) { font-size: var(--text-body); }

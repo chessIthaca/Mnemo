@@ -950,6 +950,16 @@ function openGraph() {
   }));
 }
 
+/** Show every board plan with its expandable details; needs an open project. */
+function openPlans() {
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "plans" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: false,
+  }));
+}
+
 function toggleTeamPeek() {
   app.update((state) => ({ ...state, teamPeekOpen: !state.teamPeekOpen }));
 }
@@ -2478,6 +2488,7 @@ export const actions = {
   openTeam,
   openCost,
   openGraph,
+  openPlans,
   toggleTeamPeek,
   selectWorker,
   setTeamFilter,

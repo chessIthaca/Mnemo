@@ -432,6 +432,7 @@ pub fn run() {
             ipc::lead_close,
             ipc::team_snapshot,
             ipc::board_snapshot,
+            ipc::board_plan_document,
             ipc::settings_endpoints,
             ipc::settings_upsert_endpoint,
             ipc::settings_remove_endpoint,

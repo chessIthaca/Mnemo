@@ -3,7 +3,8 @@ import type { IndexingSnapshot } from "./indexingEngine";
 import type { BoardPlan } from "./boardState";
 import type { WorkerDeletionPreview } from "./teamState";
 
-export type Route = "start" | "lead" | "team" | "cost" | "graph";
+export type Route = "start" | "lead" | "team" | "cost" | "graph" | "plans";
+
 export type WorkbenchTab = "browser" | "diff" | "plan";
 export type TeamFilter = "all" | "needs" | "active" | "done";
 

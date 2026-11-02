@@ -785,6 +785,15 @@ pub async fn board_snapshot(state: State<'_, Mnemo2State>) -> Result<BoardSnapsh
     current_team(&state).await?.board_snapshot().await
 }
 
+/// One board plan's markdown, for the Plans tab's expanded details.
+#[tauri::command]
+pub async fn board_plan_document(
+    state: State<'_, Mnemo2State>,
+    plan_id: String,
+) -> Result<String, String> {
+    current_team(&state).await?.plan_document(&plan_id)
+}
+
 /// Delegate a real task to a worker on a board plan step (1-based).
 #[tauri::command]
 // Each parameter is one wire field of the JS invoke — the command mirrors the IPC payload.

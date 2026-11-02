@@ -8,13 +8,17 @@
  */
 
 import { mount as svelteMount, unmount } from "svelte";
+import App from "../App.svelte";
 import SettingsDialog from "../components/SettingsDialog.svelte";
+import { seedBoardPreview } from "../lib/boardEngine";
 import type { BoardPlan } from "../lib/boardState";
+import { app } from "../lib/store";
 import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
 import type { WorkerDeletionPreview } from "../lib/teamState";
 import { seedPreviewSettings } from "./previewSettings";
 import { seedPreviewLaya } from "./previewLaya";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
+
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedCostPreview, type CostInsights } from "../lib/cost";
 
@@ -614,6 +618,166 @@ function costTab(): AppState {
   return { ...baseState(), route: "cost" };
 }
 
+/** The plans the Plans tab scene shows: two open, one closed. */
+const PREVIEW_PLANS: BoardPlan[] = [
+  {
+    id: "plan-preview-plans-tab",
+    title: "Plans tab with expandable details",
+    goal: "Plans become a top-level tab whose cards expand to the whole plan document.",
+    kind: "implementation",
+    status: "open",
+    closed_at_ms: null,
+    report_path: null,
+    steps: [
+      {
+        number: 1,
+        header: "Plans tab and route",
+        text: "Add the Plans route, the top-bar button, and a full-width view that reuses the plan cards.",
+        done: true,
+        workers: [{ id: RICH_WORKER_ID, name: "Kai", status: "working" }],
+      },
+      {
+        number: 2,
+        header: "Expandable details",
+        text: "Give every card a Details control that lazily reads board_plan_document and renders the plan as Markdown; re-read an open card when the board changes.",
+        done: false,
+        workers: [{ id: "ana", name: "Ana", status: "working" }],
+      },
+      {
+        number: 3,
+        header: "Preview scene",
+        text: "Add the plans preview scene with several cards and one expanded.",
+        done: false,
+        workers: [],
+      },
+    ],
+  },
+  {
+    id: "plan-preview-cost-cache",
+    title: "Cost tab: prompt-cache savings",
+    goal: "Show prompt-cache tokens saved and their dollar value beside the other levers.",
+    kind: "implementation",
+    status: "open",
+    closed_at_ms: null,
+    report_path: null,
+    steps: [
+      {
+        number: 1,
+        header: "Cache report",
+        text: "Read cache tokens per model from the usage ledger and price them at the model's input rate.",
+        done: true,
+        workers: [],
+      },
+      {
+        number: 2,
+        header: null,
+        text: "Render the cache lever in the savings table with its event count.",
+        done: false,
+        workers: [{ id: "sol", name: "Sol", status: "working" }],
+      },
+    ],
+  },
+  {
+    id: "plan-preview-shell-close",
+    title: "Close the project from the top bar",
+    goal: "One control closes the project after a clean-worktree review.",
+    kind: "implementation",
+    status: "closed",
+    closed_at_ms: NOW_MS - 3 * 60 * 60_000,
+    report_path: ".coding/reviews/shell-close.md",
+    steps: [
+      {
+        number: 1,
+        header: null,
+        text: "Add the close request, the review sheet and the conflict route.",
+        done: true,
+        workers: [],
+      },
+    ],
+  },
+];
+
+/** Join plan-file lines into the markdown the preview seed serves. */
+const planMarkdown = (...lines: string[]) => lines.join("\n");
+
+/** The plan files the seed serves, in the shape `.coding/plans/<id>.md` writes. */
+const PREVIEW_PLAN_DOCUMENTS: Record<string, string> = {
+  "plan-preview-plans-tab": planMarkdown(
+    "# Plan: Plans tab with expandable details",
+    "",
+    "## Goal",
+    "Plans become a top-level tab whose cards expand to the whole plan document.",
+    "",
+    "## Kind",
+    "implementation",
+    "",
+    "## Context",
+    "The user opened the Workbench's Plan tab and saw a title, a collapsed goal and one",
+    "line per step — then asked whether plans are really that short. They are not: a plan",
+    "file is 4-10 KB, and every worker receives all of it.",
+    "",
+    "- The card already shows the title, goal and one line per step.",
+    "- Details stay lazy: the board snapshot carries no context, acceptance or decisions.",
+    "",
+    "## Acceptance scenarios",
+    "- The top bar shows Lead, Team, Cost, Graph and Plans; Plans opens the cards.",
+    "- A closed Details control leaves the card exactly as it was.",
+    "- Opening Details shows context, acceptance scenarios, decisions and the full steps.",
+    "- board_plan_document refuses an unknown id without reading any file.",
+    "",
+    "## Steps",
+    "- [x] 1. **Plans tab and route**: add the route, the top-bar button and a full-width view.",
+    "- [ ] 2. **Expandable details**: lazy-read the document and render it as Markdown.",
+    "- [ ] 3. **Preview scene**: plans shows several cards with one expanded.",
+    "",
+    "## Decisions",
+    "- Reuse PlanTab's cards so the look stays identical; PlansView only adds width.",
+    "- A card fetches once per open and re-reads on the board-changed event.",
+    "",
+    "## Interfaces",
+    "- board_plan_document(plan_id: String) -> Result<String, String>",
+    "- BoardTransport.document(planId: string): Promise<string>",
+    "",
+    "## Progress",
+    "Step 1 is merged on wt/agent-plansTab; step 2 is in review.",
+  ),
+  "plan-preview-cost-cache": planMarkdown(
+    "# Plan: Cost tab: prompt-cache savings",
+    "",
+    "## Goal",
+    "Show prompt-cache tokens saved and their dollar value beside the other levers.",
+    "",
+    "## Context",
+    "The Cost tab already prices usage per model. The cache rows exist in the report but",
+    "the savings table ignores them, so the biggest lever reads as zero.",
+    "",
+    "## Acceptance scenarios",
+    "- The savings table lists a Cache row with its tokens and dollars.",
+    "- A cache row with no cached tokens is omitted.",
+    "",
+    "## Steps",
+    "- [x] 1. **Cache report**: read cache tokens per model.",
+    "- [ ] 2. **Savings lever**: render the row with its event count.",
+    "",
+    "## Decisions",
+    "- Cache savings count toward the same total as the other levers.",
+  ),
+};
+
+/** The Plans tab over the same project, with one card expanded to its document. */
+function plansTab(): AppState {
+  seedBoardPreview({
+    snapshot: async () => ({ plans: PREVIEW_PLANS }),
+    document: async (planId) => {
+      const markdown = PREVIEW_PLAN_DOCUMENTS[planId];
+      if (markdown === undefined) throw new Error(`no preview plan document for ${planId}`);
+      return markdown;
+    },
+    onChanged: async () => () => {},
+  });
+  return { ...baseState(), board: PREVIEW_PLANS, route: "plans" };
+}
+
 /** Every scene the preview page renders, in index order. */
 export const previewScenes: PreviewScene[] = [
   {
@@ -698,6 +862,21 @@ export const previewScenes: PreviewScene[] = [
     title: "Cost",
     description: "The Cost tab: spend by model, savings per lever, prompt-cache hits and the last 14 days.",
     build: costTab,
+  },
+  {
+    name: "plans",
+    title: "Plans",
+    description:
+      "The top-level Plans tab: open and closed plan cards, the first one expanded to its context, acceptance scenarios, decisions and full steps.",
+    build: plansTab,
+    // Cards start closed by design, so the scene clicks the first Details
+    // control after mounting to show the expanded document.
+    mount: (target) => {
+      app.set(plansTab());
+      const shell = svelteMount(App, { target });
+      target.querySelector<HTMLButtonElement>(".details-toggle")?.click();
+      return () => unmount(shell);
+    },
   },
 ];
 

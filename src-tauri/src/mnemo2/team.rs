@@ -921,8 +921,9 @@ impl TeamRuntime {
     }
 
     /// The markdown of the board plan `plan_id`: what the high-risk gate
-    /// scans for acceptance scenarios and what an audit brief carries.
-    fn plan_document(&self, plan_id: &str) -> Result<String, String> {
+    /// scans for acceptance scenarios, what an audit brief carries, and what
+    /// the Plans tab expands into (through `board_plan_document`).
+    pub(crate) fn plan_document(&self, plan_id: &str) -> Result<String, String> {
         self.board()
             .ok_or_else(|| "the plan board is not available".to_string())?
             .read_markdown(plan_id)
@@ -7533,6 +7534,49 @@ models = [\"scripted-a\"]
         assert_eq!(answer["lead"]["attached"], false, "{answer}");
         assert!(answer["lead"]["since_ms"].is_null(), "{answer}");
         assert_eq!(answer["lead"]["idle_since_ms"], 4242, "{answer}");
+        team.shutdown().await;
+    }
+
+    /// The Plans tab reads a plan's markdown through the team. An id no board
+    /// row names is refused before any plan file is touched, so a stray file
+    /// in `.coding/plans/` can never leak out through the command.
+    #[tokio::test]
+    async fn plan_document_returns_the_markdown_and_refuses_unknown_ids() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let plans_dir = root.path().join(".coding/plans");
+        std::fs::create_dir_all(&plans_dir).expect("plans dir");
+        let board = PlanBoard::new(&plans_dir, root.path().join(".coding/reviews"));
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Plans tab".into(),
+                goal: "Show the whole plan".into(),
+                context: "verified: the card hides the context; src-tauri/src/mnemo2/ipc.rs and mnemo2/src/components/PlanTab.svelte carry the fix; verify with cargo test.".into(),
+                steps: vec!["**Expose** the document in src-tauri/src/mnemo2/ipc.rs".into()],
+
+                acceptance: vec!["Details shows the context".into()],
+                ..Default::default()
+            })
+            .expect("create the plan");
+        let stray = "deadbeef";
+        std::fs::write(
+            plans_dir.join(format!("{stray}.md")),
+            "# Plan: stray\n\n## Context\n\nunreachable\n",
+        )
+        .expect("stray plan file");
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        team.attach_board(Arc::new(board));
+
+        let document = team.plan_document(&plan.id).expect("the plan document");
+        assert!(document.contains("## Context"), "{document}");
+        assert!(document.contains("verified: the card hides the context"), "{document}");
+        assert!(document.contains("Details shows the context"), "{document}");
+
+        let refused = team
+            .plan_document(stray)
+            .expect_err("an id no board row names is refused");
+        assert!(refused.contains(stray), "{refused}");
         team.shutdown().await;
     }
 }

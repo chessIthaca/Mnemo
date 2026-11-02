@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ChartColumn, ChevronDown, MessageSquare, Network, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
+  import { ChartColumn, ChevronDown, ListChecks, MessageSquare, Network, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
   import { actions, app, currentProject, needsYouCount } from "../lib/store";
   import { formatTokenCount, formatUsageCost, usageIsPartial, usageTotalTokens } from "../lib/usage";
   import AvatarStack from "./AvatarStack.svelte";
@@ -56,6 +56,7 @@
     </button>
     <button class:active={$app.route === "cost"} aria-pressed={$app.route === "cost"} onclick={actions.openCost}><ChartColumn size={14} /> Cost</button>
     <button class:active={$app.route === "graph"} aria-pressed={$app.route === "graph"} onclick={actions.openGraph}><Network size={14} /> Graph</button>
+    <button class:active={$app.route === "plans"} aria-pressed={$app.route === "plans"} onclick={actions.openPlans}><ListChecks size={14} /> Plans</button>
   </nav>
 
   <div class="topbar-right">

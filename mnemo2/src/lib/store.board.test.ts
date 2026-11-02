@@ -101,11 +101,13 @@ describe("board store slice", () => {
     } as unknown as TeamTransport;
     board = {
       snapshot: vi.fn(async () => ({ plans })),
+      document: vi.fn(async () => "# Plan: fixture\n"),
       onChanged: vi.fn(async (handler: () => void) => {
         changed = handler;
         return () => {};
       }),
     };
+
     hoisted.team = team;
     hoisted.board = board;
     app.set(fixtureState());

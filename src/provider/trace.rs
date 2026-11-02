@@ -258,13 +258,20 @@ impl TraceIdentity {
     }
 
     /// The subagent inheritance: this identity's worker/plan labels with
-    /// the subagent actor kind and the subagent's own allocated ids.
-    pub fn as_subagent(&self, agent_id: &str, session_id: &str) -> Self {
+    /// the subagent actor kind, the subagent's own allocated ids, and the
+    /// subagent's OWN spawn name (design §2: the display name is the
+    /// session's, never the parent's).
+    pub fn as_subagent(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        agent_name: &str,
+    ) -> Self {
         Self {
             actor_kind: TraceActorKind::Subagent,
             agent_id: agent_id.to_string(),
             session_id: session_id.to_string(),
-            agent_name: self.agent_name.clone(),
+            agent_name: agent_name.to_string(),
             worker_id: self.worker_id.clone(),
             plan_id: self.plan_id.clone(),
             plan_step: self.plan_step,
@@ -3956,16 +3963,21 @@ mod tests {
     #[test]
     fn subagent_identity_inherits_worker_and_plan_labels() {
         // A subagent keeps its parent's worker/plan identity but gets the
-        // Subagent actor kind and its own allocated ids.
+        // Subagent actor kind, its own allocated ids, and its OWN spawn
+        // name — the display name is the session's (design §2), never the
+        // parent's.
         let parent = worker_identity("wt-delta", "21");
-        let child = parent.as_subagent("22", "22");
+        let child = parent.as_subagent("22", "22", "reviewer-sub");
         assert_eq!(child.actor_kind, TraceActorKind::Subagent);
         assert_eq!(child.agent_id, "22");
         assert_eq!(child.session_id, "22");
         assert_eq!(child.worker_id.as_deref(), Some("wt-delta"));
         assert_eq!(child.plan_id.as_deref(), Some("plan-9"));
         assert_eq!(child.plan_step, Some(2));
-        assert_eq!(child.agent_name, "wt-delta");
+        assert_eq!(
+            child.agent_name, "reviewer-sub",
+            "the child's own spawn name — never the parent's"
+        );
     }
 
     #[test]

@@ -2234,8 +2234,9 @@ mod tests {
         // call) must carry the calling loop's attribution: the same
         // identity, the same turn purpose — the fallback call is never
         // anonymous and never cross-labelled with another agent's
-        // identity. The two request cycles mint separate turn ids; the
-        // identity is what must survive the switch.
+        // identity. Turn ids stay millisecond-scoped (`new_turn_id` =
+        // `<unix-millis>-<agent_id>`) — the identity, not turn-id
+        // distinctness, is what must survive the switch.
         use crate::model_resolver::ModelResolver;
 
         let dir = tempdir().unwrap();
@@ -2396,13 +2397,13 @@ mod tests {
         assert_eq!(succeeded.http_status, Some(200));
         assert!(succeeded.is_complete);
         assert_eq!(succeeded.finish_reason.as_deref(), Some("stop"));
-        // The identity is identical across the switch (asserted above);
-        // the two request cycles minted separate turn ids.
-        assert_ne!(
-            failed.attribution.as_ref().unwrap().turn_id,
-            succeeded.attribution.as_ref().unwrap().turn_id,
-            "separate request cycles — the fallback re-ran the request"
-        );
+        // The identity is identical across the switch (asserted above) —
+        // that is the fallback invariant. NO distinctness claim on the
+        // turn IDS: `new_turn_id` is `<unix-millis>-<agent_id>`,
+        // millisecond-scoped, so the two request cycles minted within the
+        // same millisecond legitimately share one id (observed under
+        // full-suite load — the second run of this test flaked exactly
+        // here before this claim was dropped).
     }
 
     #[tokio::test]

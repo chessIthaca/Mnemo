@@ -61,20 +61,23 @@ fn parent_root_binding(
 /// Resolve a spawn's trace identity (plan c3ba2b58 step A): the
 /// host-supplied seed with the allocated agent/session ids filled in, or —
 /// for a subagent with no explicit seed — the parent's identity inherited
-/// with the `Subagent` actor kind and this agent's own allocated ids. The
-/// headless `SessionId` IS the allocated `AgentId` today, but it stays a
-/// separate wire concept (the design freezes `session_id` as its own
-/// field). `None` when neither applies: unattributed records (Mnemo1).
+/// with the `Subagent` actor kind, this agent's own allocated ids, and its
+/// OWN spawn name (design §2: the display name is the session's, never the
+/// parent's). The headless `SessionId` IS the allocated `AgentId` today,
+/// but it stays a separate wire concept (the design freezes `session_id`
+/// as its own field). `None` when neither applies: unattributed records
+/// (Mnemo1).
 fn session_trace_identity(
     seed: Option<&crate::provider::trace::TraceIdentity>,
     parent: Option<&Arc<AgentLoop>>,
     agent_id: &str,
+    name: &str,
 ) -> Option<crate::provider::trace::TraceIdentity> {
     match seed {
         Some(seed) => Some(seed.clone().with_runtime_ids(agent_id, agent_id)),
         None => parent
             .and_then(|p| p.trace_identity())
-            .map(|parent_identity| parent_identity.as_subagent(agent_id, agent_id)),
+            .map(|parent_identity| parent_identity.as_subagent(agent_id, agent_id, name)),
     }
 }
 
@@ -284,7 +287,9 @@ async fn spawn_agent_shared_inner(
     // by the request path, never read back from live state, so a Team
     // record deleted after capture can never rewrite history.
     let agent_id_str = agent_id.to_string();
-    if let Some(identity) = session_trace_identity(trace_identity.as_ref(), parent.as_ref(), &agent_id_str) {
+    if let Some(identity) =
+        session_trace_identity(trace_identity.as_ref(), parent.as_ref(), &agent_id_str, &name)
+    {
         agent_loop.set_trace_identity(identity);
     }
 
@@ -1845,6 +1850,10 @@ mod tests {
         assert_eq!(identity.plan_step, Some(2));
         assert_eq!(identity.agent_id, child_id.to_string());
         assert_ne!(identity.agent_id, parent_id.to_string(), "own ids, not the parent's");
+        assert_eq!(
+            identity.agent_name, "child",
+            "the subagent's OWN spawn name — never the parent's (design §2)"
+        );
     }
 
     #[tokio::test]

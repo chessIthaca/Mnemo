@@ -4661,10 +4661,19 @@ async fn complete_with_context_attributes_each_interleaved_stream() {
         ["wt-alpha", "wt-beta"],
         "each record keeps its own actor — nothing cross-labelled"
     );
-    for (row, expected_turn) in rows.iter().zip(["turn-a", "turn-b"]) {
+    for row in &rows {
         let a = row.attribution.as_ref().expect("attribution on every record");
+        // The records' order in the ring is whichever concurrent
+        // start_with_context won the records lock first — never assume it
+        // (audit: interleaveOrderFlaky). Key each row's expected turn id
+        // by the row's OWN actor name.
+        let expected_turn = if a.agent_name == "wt-alpha" {
+            "turn-a"
+        } else {
+            "turn-b"
+        };
         assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
-        assert_eq!(a.worker_id.as_deref(), a.agent_name.as_str().into());
+        assert_eq!(a.worker_id.as_deref(), Some(a.agent_name.as_str()));
         assert_eq!(a.turn_id.as_deref(), Some(expected_turn));
         assert_eq!(a.actor_kind, crate::provider::trace::TraceActorKind::Worker);
     }

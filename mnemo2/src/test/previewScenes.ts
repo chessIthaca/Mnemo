@@ -390,6 +390,10 @@ const SAMPLE_MODULES = [
 ] as const;
 
 /** Aggregated symbol edges between those modules: `[from, to, kind, count]`. */
+/** Symbols across the sample repository's modules — the whole graph the
+ * overview aggregates (the backend reads every symbol from the store). */
+const SAMPLE_TOTAL_SYMBOLS = SAMPLE_MODULES.reduce((total, [, symbols]) => total + symbols, 0);
+
 const SAMPLE_MODULE_EDGES = [
   ["src/agent", "src/headless", "calls", 41],
   ["src/agent", "src/provider", "calls", 33],
@@ -559,7 +563,7 @@ function sampleGraphTransport(): GraphTransport {
           ),
           total_nodes: SAMPLE_SYMBOLS.length,
           truncated: nodes.length < SAMPLE_SYMBOLS.length,
-          total_symbols: 12840,
+          total_symbols: SAMPLE_TOTAL_SYMBOLS,
           sampled_symbols: SAMPLE_SYMBOLS.length,
         };
       }
@@ -592,8 +596,8 @@ function sampleGraphTransport(): GraphTransport {
         ),
         total_nodes: SAMPLE_MODULES.length,
         truncated: nodes.length < SAMPLE_MODULES.length,
-        total_symbols: 12840,
-        sampled_symbols: 300,
+        total_symbols: SAMPLE_TOTAL_SYMBOLS,
+        sampled_symbols: SAMPLE_TOTAL_SYMBOLS,
       };
     },
     context: async (symbolId) => {

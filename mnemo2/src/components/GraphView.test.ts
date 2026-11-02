@@ -149,7 +149,7 @@ function makeTransport(overrides: Partial<GraphTransport> = {}): GraphTransport 
         total_nodes: nodes.length,
         truncated: false,
         total_symbols: 12840,
-        sampled_symbols: 300,
+        sampled_symbols: 12840,
       };
     }),
     context: vi.fn(async (symbolId: string) => contexts[symbolId] ?? contexts[ENGINE.id] ?? null as never),
@@ -346,7 +346,7 @@ describe("GraphView", () => {
     expect(within(canvas).getByRole("button", { name: "Open module memory" })).toBeTruthy();
     // The old empty canvas is gone: the graph is on screen from the start.
     expect(screen.queryByText(/Pick a symbol on the left/)).toBeNull();
-    expect(screen.getByText(/Overview of the 300 most-connected symbols of 12,840/)).toBeTruthy();
+    expect(screen.getByText(/The whole graph: 12,840 symbols in 2 modules/)).toBeTruthy();
   });
 
   it("draws compact nodes and 10px labels at any view size", async () => {

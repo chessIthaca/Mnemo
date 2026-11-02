@@ -317,11 +317,20 @@
   /** One line under the canvas: what the map is a map *of*. */
   const canvasNote = $derived(
     scene.kind === "overview"
-      ? `Overview of the ${formatCount(overview?.sampled_symbols ?? 0)} most-connected symbols of ${formatCount(overview?.total_symbols ?? 0)}.`
+      ? overview && overview.sampled_symbols >= overview.total_symbols
+        ? `The whole graph: ${formatCount(overview.total_symbols)} symbols in ${formatCount(overview.total_nodes)} modules${overview.truncated ? `, the ${formatCount(overview.nodes.length)} largest shown` : ""}.`
+        : `Overview of the ${formatCount(overview?.sampled_symbols ?? 0)} most-connected symbols of ${formatCount(overview?.total_symbols ?? 0)}.`
       : scene.kind === "module"
-        ? `The ${formatCount(drilledModule?.top.length ?? 0)} most-connected symbols here.`
+        ? `The ${formatCount(drilledModule?.top.length ?? 0)} most-connected symbols here${
+            drilledModule && drilledModule.top.length < drilledModule.symbols
+              ? ` of ${formatCount(drilledModule.symbols)}`
+              : ""
+          }.`
         : `Showing the closest ${formatCount(scene.nodes.length)} symbols.`,
   );
+
+  /** The note explains a map always; a neighbourhood only when it is cut short. */
+  const showCanvasNote = $derived(scene.kind !== "neighbourhood" || scene.truncated);
 
   const impactGroups = $derived(groupImpact(impact));
 
@@ -872,7 +881,7 @@
               <span><i class="legend-line legend-{entry.kind}"></i>{entry.label}</span>
             {/each}
           </div>
-          {#if scene.truncated}<p class="canvas-note">{canvasNote}</p>{/if}
+          {#if showCanvasNote}<p class="canvas-note">{canvasNote}</p>{/if}
         {/if}
       </div>
 

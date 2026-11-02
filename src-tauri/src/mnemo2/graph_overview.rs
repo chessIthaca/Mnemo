@@ -6,17 +6,18 @@
 //!
 //! The tab used to draw only the selected symbol's 1- or 2-hop neighbourhood,
 //! so with nothing selected the canvas was empty and the graph itself was
-//! invisible. A repo-scale graph cannot be drawn symbol by symbol — an
-//! unfiltered [`GraphView::slice`] is capped at `GRAPH_SLICE_CAP` nodes — so
-//! this command aggregates that degree-ranked slice into directory modules:
-//! one node per directory, sized by its symbol count, with the symbol edges
-//! between directories merged into counted bundles. Each module also carries
-//! its most-connected symbols, so a click can drill into a module without a
-//! second round-trip.
+//! invisible. A repo-scale graph cannot be drawn symbol by symbol, and the
+//! `GraphView` slice APIs cap at `GRAPH_SLICE_CAP` nodes, so this command
+//! aggregates the whole graph into directory modules: every symbol in the
+//! store is counted into its module, every cross-module symbol edge is merged
+//! into a counted `(from, to, kind)` bundle, and each module carries its
+//! most-connected symbols so a click can drill in without a second
+//! round-trip. The aggregation is whole-graph, not sampled: the module sizes
+//! and edge counts are the graph's real ones.
 //!
-//! `level` picks the directory depth to aggregate at (`0` draws the slice
-//! symbol by symbol, the "top symbols" view). Depth is measured in path
-//! segments: `level = 2` turns `mnemo2/src/lib/graph.ts` and
+//! `level` picks the directory depth to aggregate at (`0` draws the
+//! degree-ranked slice symbol by symbol, the "top symbols" view). Depth is
+//! measured in path segments: `level = 2` turns `mnemo2/src/lib/graph.ts` and
 //! `mnemo2/src/App.svelte` into one `mnemo2/src` node, while
 //! `src-tauri/src/mnemo2/graph.rs` lands in `src-tauri/src`. Two segments is
 //! the default because it keeps this repository at roughly forty modules for
@@ -24,13 +25,16 @@
 //! read — whereas depth 3 splits single packages into dozens of near-empty
 //! leaves and depth 1 collapses every `src/*` directory into one blob.
 //!
-//! The snapshot read and the aggregation run on the blocking pool: the
-//! SQLite read is synchronous and the traversals are CPU-bound. Like
+//! The snapshot read and the aggregation run on the blocking pool: the SQLite
+//! read is synchronous and the aggregation is CPU-bound. The read is a second
+//! connection to the graph store the engine already has open (WAL: concurrent
+//! readers never block the index writer), because `CodeGraph` owns its `Store`
+//! privately and only exposes the capped slice APIs. Like
 //! [`crate::mnemo2::graph`], the graph algorithms stay in
 //! `mnemo::codegraph::query`; this module only aggregates, orders and caps
 //! their answers for the tab.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -38,6 +42,7 @@ use tauri::State;
 
 use mnemo::codegraph::extract::{EdgeKind, Symbol, SymbolKind};
 use mnemo::codegraph::query::{GraphSliceFilter, GraphView};
+use mnemo::codegraph::store::{EdgeRow, Store};
 use mnemo::codegraph::CodeGraph;
 use mnemo::headless::Engine;
 
@@ -59,8 +64,8 @@ pub const OVERVIEW_MAX_LEVEL: usize = 3;
 /// [`OVERVIEW_MAX_LIMIT`]).
 pub const OVERVIEW_DEFAULT_LIMIT: usize = 60;
 
-/// Hard ceiling on overview nodes — the slice's own node cap, so the overview
-/// never draws more than the graph slice it aggregates.
+/// Hard ceiling on overview nodes: a readable map, capped like the graph slice
+/// the symbol-level view draws.
 pub const OVERVIEW_MAX_LIMIT: usize = 300;
 
 /// Symbols embedded per module for the click-to-drill-in ring.
@@ -117,8 +122,9 @@ pub struct GraphOverview {
     pub truncated: bool,
     /// Symbols in the whole graph snapshot.
     pub total_symbols: usize,
-    /// Symbols this overview aggregated (the degree-ranked slice); less than
-    /// `total_symbols` on a repo-scale graph, because the slice is capped.
+    /// Symbols this overview aggregated: the whole graph at levels 1..=3, the
+    /// (capped) degree-ranked slice at level 0 — and, for an in-memory graph
+    /// with no store file to read, the slice at every level.
     pub sampled_symbols: usize,
 }
 
@@ -156,94 +162,48 @@ fn project(symbol: &Symbol) -> GraphSymbol {
     }
 }
 
-/// Aggregate `view`'s degree-ranked slice into modules at `level`.
+/// Aggregate a whole-graph snapshot into directory modules at `level`
+/// (1..=[`OVERVIEW_MAX_LEVEL`]).
 ///
-/// Level 0 keeps the slice's symbols as nodes (the tab's "top symbols" view);
-/// level 1..=[`OVERVIEW_MAX_LEVEL`] groups them by directory, sizes each module
-/// by its symbol count and merges the symbol edges that cross modules into
-/// `(from, to, kind)` bundles with a `count`. Edges inside one module are not
-/// drawn (a self-loop says nothing on a module map), so a module's `degree`
-/// counts only the cross-module weight it carries.
+/// One node per directory module, sized by its real symbol count; every edge
+/// whose endpoints sit in different modules is merged into a `(from, to, kind)`
+/// bundle with a `count`; each module carries its most-connected symbols
+/// (ranked by full in+out degree over the whole graph) for the drill-in ring.
+/// Edges inside one module are not drawn — a self-loop says nothing on a
+/// module map — so a module's `degree` counts only the cross-module weight it
+/// carries. `limit` caps the MODULES (largest, then most-connected, then id)
+/// and `truncated`/`total_nodes` stay honest about the ones left out.
+///
+/// One pass over the snapshot: a map insert per symbol plus one per edge, no
+/// per-symbol queries, so a 2-3k file repository costs milliseconds.
 ///
 /// Deterministic: modules rank by symbol count, then degree, then id, and
 /// edges by `(from, to, kind)` — the same snapshot always draws the same map.
-pub fn overview_in(view: &GraphView, level: usize, limit: usize) -> GraphOverview {
-    let level = level.min(OVERVIEW_MAX_LEVEL);
+pub fn modules_over(
+    symbols: &[Symbol],
+    edges: &[EdgeRow],
+    level: usize,
+    limit: usize,
+) -> GraphOverview {
+    let level = level.clamp(1, OVERVIEW_MAX_LEVEL);
     let limit = limit.clamp(1, OVERVIEW_MAX_LIMIT);
-    let slice = view.slice(&GraphSliceFilter::default()).unwrap_or_default();
-    let total_symbols = view.symbol_count();
-    let sampled_symbols = slice.nodes.len();
 
-    // Degree inside the slice, both directions: the tie-breaker for symbol
-    // ranking and the "most-connected" order inside a module.
-    let mut degree: HashMap<&str, usize> = HashMap::new();
-    for edge in &slice.edges {
-        *degree.entry(edge.from_id.as_str()).or_default() += 1;
-        *degree.entry(edge.to_id.as_str()).or_default() += 1;
-    }
-
-    if level == 0 {
-        let mut nodes: Vec<OverviewNode> = slice
-            .nodes
-            .iter()
-            .map(|symbol| OverviewNode {
-                id: symbol.id.clone(),
-                label: symbol.name.clone(),
-                kind: Some(symbol.kind),
-                file: symbol.file.clone(),
-                line: symbol.start_line,
-                symbols: 1,
-                degree: degree.get(symbol.id.as_str()).copied().unwrap_or(0),
-                top: Vec::new(),
-            })
-            .collect();
-        nodes.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.id.cmp(&b.id)));
-        let total_nodes = nodes.len();
-        let truncated = total_nodes > limit;
-        nodes.truncate(limit);
-        let kept: std::collections::HashSet<&str> =
-            nodes.iter().map(|node| node.id.as_str()).collect();
-        let mut edges: Vec<OverviewEdge> = slice
-            .edges
-            .iter()
-            .filter(|edge| {
-                kept.contains(edge.from_id.as_str()) && kept.contains(edge.to_id.as_str())
-            })
-            .map(|edge| OverviewEdge {
-                from: edge.from_id.clone(),
-                to: edge.to_id.clone(),
-                kind: edge.kind,
-                count: 1,
-            })
-            .collect();
-        edges.sort_by(|a, b| {
-            a.from
-                .cmp(&b.from)
-                .then_with(|| a.to.cmp(&b.to))
-                .then_with(|| a.kind.as_str().cmp(b.kind.as_str()))
-        });
-        return GraphOverview {
-            level,
-            nodes,
-            edges,
-            total_nodes,
-            truncated,
-            total_symbols,
-            sampled_symbols,
-        };
-    }
-
+    let mut module_of_symbol: HashMap<&str, String> = HashMap::with_capacity(symbols.len());
     let mut members: BTreeMap<String, Vec<&Symbol>> = BTreeMap::new();
-    let mut module_of_symbol: HashMap<&str, String> = HashMap::new();
-    for symbol in &slice.nodes {
+    for symbol in symbols {
         let module = module_of(&symbol.file, level);
         module_of_symbol.insert(symbol.id.as_str(), module.clone());
         members.entry(module).or_default().push(symbol);
     }
 
+    // Full degree (in + out, over every edge) ranks the symbols inside a
+    // module; the cross-module weight is what a module node's edges show.
+    let mut degree: HashMap<&str, usize> = HashMap::with_capacity(symbols.len());
     let mut weight: HashMap<&str, usize> = HashMap::new();
     let mut bundles: HashMap<(&str, &str, &'static str), (EdgeKind, usize)> = HashMap::new();
-    for edge in &slice.edges {
+    for edge in edges {
+        *degree.entry(edge.from_id.as_str()).or_default() += 1;
+        *degree.entry(edge.to_id.as_str()).or_default() += 1;
         let (Some(from), Some(to)) = (
             module_of_symbol.get(edge.from_id.as_str()),
             module_of_symbol.get(edge.to_id.as_str()),
@@ -253,8 +213,6 @@ pub fn overview_in(view: &GraphView, level: usize, limit: usize) -> GraphOvervie
         if from == to {
             continue;
         }
-        // Only cross-module edges are drawn, so only they carry a module's
-        // weight.
         *weight.entry(from.as_str()).or_default() += 1;
         *weight.entry(to.as_str()).or_default() += 1;
         let row = bundles
@@ -302,7 +260,7 @@ pub fn overview_in(view: &GraphView, level: usize, limit: usize) -> GraphOvervie
     let truncated = total_nodes > limit;
     nodes.truncate(limit);
 
-    let kept: std::collections::HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    let kept: HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
     let mut edges: Vec<OverviewEdge> = bundles
         .into_iter()
         .filter(|((from, to, _), _)| kept.contains(from) && kept.contains(to))
@@ -326,9 +284,117 @@ pub fn overview_in(view: &GraphView, level: usize, limit: usize) -> GraphOvervie
         edges,
         total_nodes,
         truncated,
-        total_symbols,
-        sampled_symbols,
+        total_symbols: symbols.len(),
+        sampled_symbols: symbols.len(),
     }
+}
+
+/// The tab's "top symbols" view: the graph's degree-ranked slice, one node per
+/// symbol.
+///
+/// This is deliberately the capped slice (`GRAPH_SLICE_CAP` most-connected
+/// symbols): it is a hub list for orientation, not a map of the graph.
+pub fn top_symbols(view: &GraphView, limit: usize) -> GraphOverview {
+    let limit = limit.clamp(1, OVERVIEW_MAX_LIMIT);
+    let slice = view.slice(&GraphSliceFilter::default()).unwrap_or_default();
+
+    // Degree inside the slice, both directions, for the node size.
+    let mut degree: HashMap<&str, usize> = HashMap::new();
+    for edge in &slice.edges {
+        *degree.entry(edge.from_id.as_str()).or_default() += 1;
+        *degree.entry(edge.to_id.as_str()).or_default() += 1;
+    }
+
+    let mut nodes: Vec<OverviewNode> = slice
+        .nodes
+        .iter()
+        .map(|symbol| OverviewNode {
+            id: symbol.id.clone(),
+            label: symbol.name.clone(),
+            kind: Some(symbol.kind),
+            file: symbol.file.clone(),
+            line: symbol.start_line,
+            symbols: 1,
+            degree: degree.get(symbol.id.as_str()).copied().unwrap_or(0),
+            top: Vec::new(),
+        })
+        .collect();
+    nodes.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.id.cmp(&b.id)));
+    let total_nodes = nodes.len();
+    let truncated = total_nodes > limit;
+    nodes.truncate(limit);
+
+    let kept: HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    let mut edges: Vec<OverviewEdge> = slice
+        .edges
+        .iter()
+        .filter(|edge| {
+            kept.contains(edge.from_id.as_str()) && kept.contains(edge.to_id.as_str())
+        })
+        .map(|edge| OverviewEdge {
+            from: edge.from_id.clone(),
+            to: edge.to_id.clone(),
+            kind: edge.kind,
+            count: 1,
+        })
+        .collect();
+    edges.sort_by(|a, b| {
+        a.from
+            .cmp(&b.from)
+            .then_with(|| a.to.cmp(&b.to))
+            .then_with(|| a.kind.as_str().cmp(b.kind.as_str()))
+    });
+
+    GraphOverview {
+        level: 0,
+        nodes,
+        edges,
+        total_nodes,
+        truncated,
+        total_symbols: view.symbol_count(),
+        sampled_symbols: view.symbol_count(),
+    }
+}
+
+/// Aggregate one in-memory [`GraphView`] without touching the store.
+///
+/// The fallback for a graph with no store file to read (an in-memory graph:
+/// tests and scratch indexing). Level 0 is [`top_symbols`]; levels 1..=3
+/// aggregate the view's degree-ranked slice, so `sampled_symbols` stays honest
+/// about the cap instead of pretending to be the whole graph.
+pub fn overview_in(view: &GraphView, level: usize, limit: usize) -> GraphOverview {
+    let level = level.min(OVERVIEW_MAX_LEVEL);
+    if level == 0 {
+        return top_symbols(view, limit);
+    }
+    let slice = view.slice(&GraphSliceFilter::default()).unwrap_or_default();
+    let mut overview = modules_over(&slice.nodes, &slice.edges, level, limit);
+    overview.total_symbols = view.symbol_count();
+    overview.sampled_symbols = slice.nodes.len();
+    overview
+}
+
+/// Every symbol and edge of the open project's graph, read straight from the
+/// store [`GraphView::load`] reads.
+///
+/// The slice APIs cap at `GRAPH_SLICE_CAP` nodes, and the overview must see the
+/// whole graph, so it reads the store the engine has open
+/// (`<root>/.coding/codegraph.db`, WAL) through a second read connection.
+/// `None` when that file is not there — an in-memory graph — so the caller
+/// degrades to the capped slice instead of inventing a database at a guessed
+/// path.
+fn read_whole_graph(graph: &CodeGraph) -> Option<(Vec<Symbol>, Vec<EdgeRow>)> {
+    let path = graph
+        .root()
+        .join(mnemo::workspace::CODING_DIR_NAME)
+        .join("codegraph.db");
+    if !path.is_file() {
+        return None;
+    }
+    let store = Store::open(&path).ok()?;
+    let symbols = store.all_symbols().ok()?;
+    let edges = store.all_edges().ok()?;
+    Some((symbols, edges))
 }
 
 /// The open project's engine, or a clear "no project" error.
@@ -367,8 +433,9 @@ where
     .map_err(|error| format!("code graph task failed: {error}"))?
 }
 
-/// The whole-graph overview: the degree-ranked graph slice aggregated into
-/// directory modules at `level` (`0` = the slice symbol by symbol).
+/// The whole-graph overview: every symbol aggregated into directory modules at
+/// `level` (`0` = the degree-ranked slice symbol by symbol, the "top symbols"
+/// view).
 ///
 /// A project running with `index_codegraph: false` is a plain error string the
 /// tab renders, exactly like the other `graph_*` commands.
@@ -379,15 +446,33 @@ pub async fn graph_overview(
     limit: Option<usize>,
 ) -> Result<GraphOverview, String> {
     let graph = graph_handle(&state).await?;
-    let level = level.unwrap_or(OVERVIEW_DEFAULT_LEVEL);
-    let limit = limit.unwrap_or(OVERVIEW_DEFAULT_LIMIT);
-    run_view(graph, move |view| Ok(overview_in(view, level, limit))).await
+    let level = level
+        .unwrap_or(OVERVIEW_DEFAULT_LEVEL)
+        .min(OVERVIEW_MAX_LEVEL);
+    let limit = limit
+        .unwrap_or(OVERVIEW_DEFAULT_LIMIT)
+        .clamp(1, OVERVIEW_MAX_LIMIT);
+    if level == 0 {
+        return run_view(graph, move |view| Ok(top_symbols(view, limit))).await;
+    }
+    // The whole-graph read is a synchronous SQLite pass plus a CPU-bound
+    // aggregation: both belong on the blocking pool, never a tokio worker.
+    tokio::task::spawn_blocking(move || match read_whole_graph(&graph) {
+        Some((symbols, edges)) => Ok(modules_over(&symbols, &edges, level, limit)),
+        None => {
+            let view = graph
+                .view()
+                .map_err(|error| format!("could not read the code graph: {error}"))?;
+            Ok(overview_in(&view, level, limit))
+        }
+    })
+    .await
+    .map_err(|error| format!("code graph task failed: {error}"))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mnemo::codegraph::store::EdgeRow;
 
     fn sym(file: &str, name: &str, kind: SymbolKind, line: usize) -> Symbol {
         Symbol {
@@ -413,6 +498,8 @@ mod tests {
         start: Symbol,
         save: Symbol,
         stats: Symbol,
+        symbols: Vec<Symbol>,
+        edges: Vec<EdgeRow>,
         view: GraphView,
     }
 
@@ -428,32 +515,33 @@ mod tests {
         let slice = sym("src/codegraph/query.rs", "slice", SymbolKind::Method, 382);
         let main = sym("src/main.rs", "main", SymbolKind::Function, 1);
         let build = sym("build.rs", "build", SymbolKind::Function, 1);
-        let view = GraphView::from_parts(
-            vec![
-                run.clone(),
-                start.clone(),
-                save.clone(),
-                stats.clone(),
-                slice.clone(),
-                main.clone(),
-                build.clone(),
-            ],
-            vec![
-                edge(&run, &save, EdgeKind::Calls),
-                edge(&run, &stats, EdgeKind::Imports),
-                // Inside one module: aggregated away, never drawn.
-                edge(&start, &run, EdgeKind::Calls),
-                edge(&save, &start, EdgeKind::Calls),
-                edge(&slice, &run, EdgeKind::Calls),
-                edge(&main, &slice, EdgeKind::Calls),
-                edge(&build, &main, EdgeKind::Calls),
-            ],
-        );
+        let symbols = vec![
+            run.clone(),
+            start.clone(),
+            save.clone(),
+            stats.clone(),
+            slice.clone(),
+            main.clone(),
+            build.clone(),
+        ];
+        let edges = vec![
+            edge(&run, &save, EdgeKind::Calls),
+            edge(&run, &stats, EdgeKind::Imports),
+            // Inside one module: aggregated away, never drawn.
+            edge(&start, &run, EdgeKind::Calls),
+            edge(&save, &start, EdgeKind::Calls),
+            edge(&slice, &run, EdgeKind::Calls),
+            edge(&main, &slice, EdgeKind::Calls),
+            edge(&build, &main, EdgeKind::Calls),
+        ];
+        let view = GraphView::from_parts(symbols.clone(), edges.clone());
         Fixture {
             run,
             start,
             save,
             stats,
+            symbols,
+            edges,
             view,
         }
     }
@@ -481,13 +569,13 @@ mod tests {
     }
 
     #[test]
-    fn overview_aggregates_the_slice_into_directory_modules() {
+    fn overview_aggregates_the_whole_graph_into_directory_modules() {
         let fixture = fixture();
-        let overview = overview_in(&fixture.view, 2, 60);
+        let overview = modules_over(&fixture.symbols, &fixture.edges, 2, 60);
 
         assert_eq!(overview.level, 2);
         assert_eq!(overview.total_symbols, 7);
-        assert_eq!(overview.sampled_symbols, 7);
+        assert_eq!(overview.sampled_symbols, 7, "the whole graph, not a sample");
         assert!(!overview.truncated);
 
         let ids: Vec<&str> = overview.nodes.iter().map(|node| node.id.as_str()).collect();
@@ -510,7 +598,7 @@ mod tests {
     #[test]
     fn overview_merges_symbol_edges_into_counted_bundles() {
         let fixture = fixture();
-        let overview = overview_in(&fixture.view, 2, 60);
+        let overview = modules_over(&fixture.symbols, &fixture.edges, 2, 60);
 
         let rows: Vec<(&str, &str, &str, usize)> = overview
             .edges
@@ -542,19 +630,17 @@ mod tests {
     fn overview_counts_repeated_module_edges() {
         let fixture = fixture();
         // Two calls from src/agent into src/memory share one bundle.
-        let view = GraphView::from_parts(
-            vec![
-                fixture.run.clone(),
-                fixture.start.clone(),
-                fixture.save.clone(),
-                fixture.stats.clone(),
-            ],
-            vec![
-                edge(&fixture.run, &fixture.save, EdgeKind::Calls),
-                edge(&fixture.start, &fixture.stats, EdgeKind::Calls),
-            ],
-        );
-        let overview = overview_in(&view, 2, 60);
+        let symbols = vec![
+            fixture.run.clone(),
+            fixture.start.clone(),
+            fixture.save.clone(),
+            fixture.stats.clone(),
+        ];
+        let edges = vec![
+            edge(&fixture.run, &fixture.save, EdgeKind::Calls),
+            edge(&fixture.start, &fixture.stats, EdgeKind::Calls),
+        ];
+        let overview = modules_over(&symbols, &edges, 2, 60);
         assert_eq!(overview.edges.len(), 1);
         let bundle = &overview.edges[0];
         assert_eq!(
@@ -567,7 +653,7 @@ mod tests {
     #[test]
     fn overview_caps_modules_and_keeps_only_edges_between_kept_nodes() {
         let fixture = fixture();
-        let overview = overview_in(&fixture.view, 2, 2);
+        let overview = modules_over(&fixture.symbols, &fixture.edges, 2, 2);
 
         assert_eq!(overview.total_nodes, 5);
         assert!(overview.truncated);
@@ -584,9 +670,9 @@ mod tests {
     }
 
     #[test]
-    fn overview_carries_each_module_top_symbols_by_degree() {
+    fn overview_carries_each_module_top_symbols_by_full_degree() {
         let fixture = fixture();
-        let overview = overview_in(&fixture.view, 2, 60);
+        let overview = modules_over(&fixture.symbols, &fixture.edges, 2, 60);
         let agent = node(&overview, "src/agent");
         let top: Vec<&str> = agent
             .top
@@ -602,11 +688,14 @@ mod tests {
         assert_eq!(agent.top[0].symbol.name, "run_turn");
         assert_eq!(agent.top[0].symbol.kind, SymbolKind::Function);
         assert_eq!(agent.top[0].symbol.line, 812);
-        assert_eq!(node(&overview, "src/memory").top[0].symbol.id, fixture.save.id);
+        assert_eq!(
+            node(&overview, "src/memory").top[0].symbol.id,
+            fixture.save.id
+        );
     }
 
     #[test]
-    fn overview_at_level_zero_is_the_degree_ranked_symbol_slice() {
+    fn top_symbols_view_is_the_capped_degree_ranked_slice() {
         let fixture = fixture();
         let overview = overview_in(&fixture.view, 0, 60);
 
@@ -631,34 +720,147 @@ mod tests {
     fn overview_clamps_level_and_limit() {
         let fixture = fixture();
         assert_eq!(
-            overview_in(&fixture.view, 9, 60).level,
+            modules_over(&fixture.symbols, &fixture.edges, 9, 60).level,
             OVERVIEW_MAX_LEVEL
         );
-        let capped = overview_in(&fixture.view, 2, 0);
+        let capped = modules_over(&fixture.symbols, &fixture.edges, 2, 0);
         assert_eq!(capped.nodes.len(), 1, "a zero limit still draws one node");
         assert!(capped.truncated);
-        let wide = overview_in(&fixture.view, 2, 10_000);
+        let wide = modules_over(&fixture.symbols, &fixture.edges, 2, 10_000);
         assert_eq!(wide.nodes.len(), 5, "limit is clamped, not rejected");
         assert!(!wide.truncated);
+        // The command clamps before the store read, the pure functions after.
+        assert_eq!(overview_in(&fixture.view, 9, 60).level, OVERVIEW_MAX_LEVEL);
     }
 
     #[test]
     fn empty_graph_overview_is_empty_not_an_error() {
-        let view = GraphView::from_parts(Vec::new(), Vec::new());
-        let overview = overview_in(&view, OVERVIEW_DEFAULT_LEVEL, OVERVIEW_DEFAULT_LIMIT);
+        let overview = modules_over(&[], &[], 2, OVERVIEW_DEFAULT_LIMIT);
         assert!(overview.nodes.is_empty());
         assert!(overview.edges.is_empty());
         assert_eq!(overview.total_nodes, 0);
         assert_eq!(overview.total_symbols, 0);
         assert!(!overview.truncated);
+
+        let view = GraphView::from_parts(Vec::new(), Vec::new());
+        let symbols = overview_in(&view, 0, OVERVIEW_DEFAULT_LIMIT);
+        assert!(symbols.nodes.is_empty());
+        assert_eq!(symbols.level, 0);
     }
 
     #[test]
     fn overview_is_deterministic() {
         let fixture = fixture();
         assert_eq!(
-            overview_in(&fixture.view, 2, 60),
-            overview_in(&fixture.view, 2, 60)
+            modules_over(&fixture.symbols, &fixture.edges, 2, 60),
+            modules_over(&fixture.symbols, &fixture.edges, 2, 60)
         );
+        assert_eq!(
+            overview_in(&fixture.view, 0, 60),
+            overview_in(&fixture.view, 0, 60)
+        );
+    }
+
+    /// 40 modules × 12 symbols = 480 symbols — well past the 300-symbol slice
+    /// cap — chained so every symbol has degree 2. The chain's degree tiebreak
+    /// falls back to the id order, so the capped slice drops whole modules.
+    fn many_modules() -> (Vec<Symbol>, Vec<EdgeRow>) {
+        let mut symbols = Vec::new();
+        for module in 0..40 {
+            for file in 0..12 {
+                symbols.push(sym(
+                    &format!("mod-{module:02}/f{file:02}.rs"),
+                    &format!("sym_{module}_{file}"),
+                    SymbolKind::Function,
+                    file + 1,
+                ));
+            }
+        }
+        let edges = symbols
+            .windows(2)
+            .map(|pair| edge(&pair[0], &pair[1], EdgeKind::Calls))
+            .collect();
+        (symbols, edges)
+    }
+
+    #[test]
+    fn every_module_appears_with_its_full_symbol_count_beyond_the_slice_cap() {
+        let (symbols, edges) = many_modules();
+        let overview = modules_over(&symbols, &edges, 2, 60);
+
+        assert_eq!(symbols.len(), 480);
+        assert_eq!(overview.total_symbols, 480);
+        assert_eq!(overview.sampled_symbols, 480, "the whole graph was read");
+        assert_eq!(overview.total_nodes, 40, "every module is a node");
+        assert_eq!(overview.nodes.len(), 40);
+        assert!(!overview.truncated);
+        for module in &overview.nodes {
+            assert_eq!(module.symbols, 12, "module {} lost symbols", module.id);
+            assert_eq!(module.top.len(), OVERVIEW_MODULE_SYMBOLS);
+        }
+        let counted: usize = overview.nodes.iter().map(|module| module.symbols).sum();
+        assert_eq!(counted, 480);
+
+        // The capped-slice path this fix replaces cannot see the whole graph:
+        // its 300-node cap drops whole modules and undercounts the rest.
+        let view = GraphView::from_parts(symbols, edges);
+        let sampled = overview_in(&view, 2, 60);
+        assert_eq!(sampled.sampled_symbols, 300);
+        assert!(
+            sampled.nodes.len() < 40,
+            "the capped slice is exactly the defect the store read fixes"
+        );
+        assert_eq!(
+            sampled
+                .nodes
+                .iter()
+                .map(|module| module.symbols)
+                .sum::<usize>(),
+            300
+        );
+    }
+    /// The store read is what makes the overview whole-graph: it opens the
+    /// graph's own DB (`<root>/.coding/codegraph.db`) and returns every symbol,
+    /// not the 300-node slice.
+    #[test]
+    fn read_whole_graph_reads_the_store_beyond_the_slice_cap() {
+        use mnemo::codegraph::store::FileData;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let coding = dir.path().join(mnemo::workspace::CODING_DIR_NAME);
+        std::fs::create_dir_all(&coding).expect("coding dir");
+        let db_path = coding.join("codegraph.db");
+        {
+            let mut store = Store::open(&db_path).expect("store");
+            for symbol in many_modules().0 {
+                store
+                    .upsert_file(
+                        &symbol.file,
+                        "hash",
+                        1,
+                        &FileData {
+                            symbols: vec![symbol.clone()],
+                            refs: Vec::new(),
+                            contains: Vec::new(),
+                        },
+                        "",
+                    )
+                    .expect("upsert");
+            }
+        }
+        let graph = CodeGraph::open(dir.path().to_path_buf(), &db_path).expect("graph");
+        let (symbols, edges) = read_whole_graph(&graph).expect("store read");
+        assert_eq!(symbols.len(), 480, "every symbol, not the 300-node slice");
+        assert!(edges.is_empty());
+        let overview = modules_over(&symbols, &edges, 2, 60);
+        assert_eq!(overview.nodes.len(), 40);
+        assert!(overview.nodes.iter().all(|module| module.symbols == 12));
+
+        // An in-memory graph has no store file: the caller degrades to the
+        // capped slice instead of creating a database at the guessed path.
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let memory = CodeGraph::open_in_memory(scratch.path().to_path_buf()).expect("graph");
+        assert!(read_whole_graph(&memory).is_none());
+        assert!(!scratch.path().join(mnemo::workspace::CODING_DIR_NAME).exists());
     }
 }

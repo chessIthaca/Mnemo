@@ -11,7 +11,7 @@ import SavingsPage from "./SavingsPage.svelte";
 
 function sampleSettings(): ModelSettings {
   return {
-    task_models: { planning: null, executing: null, bug_fixing: null, reviewing: null, summarize: null },
+    task_models: { summarize: null },
     vision_model: null,
     embedding: { selected: "hash", status: "keyword_only", options: [] },
     optimizer: {

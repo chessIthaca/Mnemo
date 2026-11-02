@@ -80,10 +80,6 @@ const previewTiers: TiersDto = {
 function previewSettings(): ModelSettings {
   return {
     task_models: {
-      planning: "openrouter/glm-5.3-flash",
-      executing: null,
-      bug_fixing: null,
-      reviewing: "openrouter/gpt-5.2",
       summarize: null,
     },
     vision_model: "openrouter/gpt-5.2",

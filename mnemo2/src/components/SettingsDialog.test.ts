@@ -227,7 +227,7 @@ describe("SettingsDialog", () => {
     makeTransport();
     mocks.modelTransport = {
       get: vi.fn(async () => ({
-        task_models: { planning: "alpha/m1", executing: null, bug_fixing: null, reviewing: null, summarize: null },
+        task_models: { summarize: null },
         vision_model: null,
         embedding: {
           selected: "hash",
@@ -257,8 +257,9 @@ describe("SettingsDialog", () => {
     };
     await openDialog();
     await fireEvent.click(screen.getByRole("button", { name: "Models" }));
-    const work = await screen.findByRole("region", { name: "Models for each kind of work" });
-    expect(within(work).getByLabelText("Planning")).toBeTruthy();
+    const work = await screen.findByRole("region", { name: "Compaction" });
+    expect(within(work).getByLabelText("Compaction model")).toBeTruthy();
+    expect(screen.getByText(/Mnemo1's per-task models/)).toBeTruthy();
     expect(screen.getByText("Status: Keyword only")).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Savings" }));
     const levers = await screen.findByRole("region", { name: "Savings levers" });

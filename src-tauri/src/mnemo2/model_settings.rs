@@ -63,7 +63,7 @@ pub const EMBEDDER_EVENT_CHANNEL: &str = "mnemo2://embedder-event";
 /// model-role section the Models and Savings pages edit.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelSettingsWire {
-    /// Per-task `[models]` overrides.
+    /// The `[models]` slot this page edits (the compaction model).
     pub task_models: TaskModelsWire,
     /// The vision model as `"endpoint/model"`, or `null` (a multimodal
     /// main model serves vision directly).
@@ -78,25 +78,18 @@ pub struct ModelSettingsWire {
     pub budget: BudgetWire,
 }
 
-/// The five per-task `[models]` slots Mnemo2's Models page owns, each a
-/// compact `"endpoint/model"` string or `null` (no override — the
-/// tier/lead model applies).
+/// The one `[models]` slot Mnemo2's Models page owns — the compaction
+/// model — as a compact `"endpoint/model"` string or `null` (no override:
+/// the agent's own model applies).
 ///
-/// Slots outside this page (`complete`, `free`, `subagent`, per-skill)
-/// are neither read nor written here and survive every save; a slot
-/// carrying a `reasoning_effort` override keeps it when a save names the
-/// same endpoint + model (a changed model drops the effort — it belonged
-/// to the old pairing).
+/// Mnemo1's per-task slots (`planning`, `executing`, `bug_fixing`,
+/// `reviewing`) and the other slots outside this page (`complete`, `free`,
+/// `subagent`, per-skill) are neither read nor written here and survive
+/// every save. A slot carrying a `reasoning_effort` override keeps it when
+/// a save names the same endpoint + model (a changed model drops the effort
+/// — it belonged to the old pairing).
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskModelsWire {
-    /// The planning model override.
-    pub planning: Option<String>,
-    /// The executing (step) model override.
-    pub executing: Option<String>,
-    /// The bug-fixing lane's model override.
-    pub bug_fixing: Option<String>,
-    /// The reviewing lane's model override.
-    pub reviewing: Option<String>,
     /// The summarize (compaction) model override.
     pub summarize: Option<String>,
 }
@@ -204,10 +197,6 @@ pub(crate) fn model_settings_read(setup: &Setup) -> Result<ModelSettingsWire, St
     let general = &config.general.general;
     Ok(ModelSettingsWire {
         task_models: TaskModelsWire {
-            planning: compact_model_ref(config.general.models.planning.as_ref()),
-            executing: compact_model_ref(config.general.models.executing.as_ref()),
-            bug_fixing: compact_model_ref(config.general.models.bug_fixing.as_ref()),
-            reviewing: compact_model_ref(config.general.models.reviewing.as_ref()),
             summarize: compact_model_ref(config.general.models.summarize.as_ref()),
         },
         vision_model: general
@@ -344,20 +333,13 @@ fn parse_model_ref(text: &str) -> Result<(String, String), String> {
     Ok((endpoint.to_string(), model.to_string()))
 }
 
-/// The `"models"` save payload: the five task slots, with the shared
-/// double-Option semantics — absent keeps, `null` clears, a string
-/// sets.
+/// The `"models"` save payload: the one slot the page owns, with the shared
+/// double-Option semantics — absent keeps, `null` clears, a string sets.
+/// Everything else under `[models.*]` is absent from the DTO this patch
+/// builds, so the shared pipeline leaves it exactly as it was.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct TaskModelsPatch {
-    #[serde(deserialize_with = "deserialize_optional_nullable")]
-    planning: Option<Option<String>>,
-    #[serde(deserialize_with = "deserialize_optional_nullable")]
-    executing: Option<Option<String>>,
-    #[serde(deserialize_with = "deserialize_optional_nullable")]
-    bug_fixing: Option<Option<String>>,
-    #[serde(deserialize_with = "deserialize_optional_nullable")]
-    reviewing: Option<Option<String>>,
     #[serde(deserialize_with = "deserialize_optional_nullable")]
     summarize: Option<Option<String>>,
 }
@@ -385,9 +367,10 @@ fn slot_dto(
     }
 }
 
-/// The `"models"` section: `{planning?, executing?, bug_fixing?,
-/// reviewing?, summarize?}`, each `"endpoint/model"` (set), `null`
-/// (clear) or absent (keep). Slots outside the page are untouched.
+/// The `"models"` section: `{summarize?}`, each `"endpoint/model"` (set),
+/// `null` (clear) or absent (keep). Every other `[models.*]` key —
+/// Mnemo1's per-task slots, `complete`, `free`, `subagent`, per-skill —
+/// is untouched.
 async fn apply_models(setup: &Setup, value: Value) -> Result<(), String> {
     let patch: TaskModelsPatch = serde_json::from_value(value)
         .map_err(|err| format!("invalid models section: {err}"))?;
@@ -395,10 +378,6 @@ async fn apply_models(setup: &Setup, value: Value) -> Result<(), String> {
     let slots = &current.general.models;
     let dto = SettingsSaveDto {
         models: Some(ModelsConfigDto {
-            planning: slot_dto(patch.planning, slots.planning.as_ref())?,
-            executing: slot_dto(patch.executing, slots.executing.as_ref())?,
-            bug_fixing: slot_dto(patch.bug_fixing, slots.bug_fixing.as_ref())?,
-            reviewing: slot_dto(patch.reviewing, slots.reviewing.as_ref())?,
             summarize: slot_dto(patch.summarize, slots.summarize.as_ref())?,
             ..Default::default()
         }),
@@ -635,8 +614,15 @@ max_tokens_per_plan = 5000
 [models]
 planning = { endpoint = "ep1", model = "plan-model", reasoning_effort = "high" }
 executing = { endpoint = "ep1", model = "exec-model" }
+bug_fixing = { endpoint = "ep1", model = "plan-model" }
+reviewing = { endpoint = "ep1", model = "complete-model" }
 complete = { endpoint = "ep1", model = "complete-model" }
 subagent = { endpoint = "ep1", model = "sub-model" }
+free = { endpoint = "ep1", model = "sub-model" }
+summarize = { endpoint = "ep1", model = "sum-model", reasoning_effort = "high" }
+
+[models.skill]
+mnemo-review = { endpoint = "ep1", model = "sub-model" }
 
 [context]
 summarize_at_fill_rate = 0.5
@@ -655,7 +641,7 @@ skip_dirs = ["target"]
 name = "ep1"
 kind = "openai"
 base_url = "http://127.0.0.1:9/v1"
-models = ["plan-model", "exec-model", "complete-model", "sub-model", "vision-x", "other-model"]
+models = ["plan-model", "exec-model", "complete-model", "sub-model", "sum-model", "vision-x", "other-model"]
 
 [[pricing]]
 model = "plan-model"
@@ -674,15 +660,55 @@ simple = ["ep1/exec-model"]
         (dir, setup)
     }
 
+    /// Every `[models.*]` key the fixture carries, as `key = "endpoint/model"`,
+    /// sorted — so "everything else survived the save" is one comparison.
+    fn model_slots(config: &Config) -> Vec<String> {
+        let models = &config.general.models;
+        let mut out: Vec<String> = [
+            ("planning", &models.planning),
+            ("executing", &models.executing),
+            ("bug_fixing", &models.bug_fixing),
+            ("reviewing", &models.reviewing),
+            ("complete", &models.complete),
+            ("subagent", &models.subagent),
+            ("free", &models.free),
+            ("summarize", &models.summarize),
+        ]
+        .iter()
+        .filter_map(|(key, slot)| {
+            slot.as_ref()
+                .map(|r| format!("{key} = {}/{}", r.endpoint, r.model))
+        })
+        .collect();
+        out.extend(
+            models
+                .skill
+                .iter()
+                .map(|(name, r)| format!("skill.{name} = {}/{}", r.endpoint, r.model)),
+        );
+        out.sort();
+        out
+    }
+
+    /// The `[models.*]` keys a compaction save must leave exactly as the
+    /// fixture set them — Mnemo1's per-task slots, the complete/free/subagent
+    /// slots and the per-skill table.
+    const UNTOUCHED_MODEL_SLOTS: [&str; 8] = [
+        "bug_fixing = ep1/plan-model",
+        "complete = ep1/complete-model",
+        "executing = ep1/exec-model",
+        "free = ep1/sub-model",
+        "planning = ep1/plan-model",
+        "reviewing = ep1/complete-model",
+        "skill.mnemo-review = ep1/sub-model",
+        "subagent = ep1/sub-model",
+    ];
+
     #[test]
     fn get_reads_every_section_from_the_fixture() {
         let (_dir, setup) = fixture();
         let wire = model_settings_read(&setup).expect("read");
-        assert_eq!(wire.task_models.planning.as_deref(), Some("ep1/plan-model"));
-        assert_eq!(wire.task_models.executing.as_deref(), Some("ep1/exec-model"));
-        assert_eq!(wire.task_models.bug_fixing, None);
-        assert_eq!(wire.task_models.reviewing, None);
-        assert_eq!(wire.task_models.summarize, None);
+        assert_eq!(wire.task_models.summarize.as_deref(), Some("ep1/sum-model"));
         assert_eq!(wire.vision_model.as_deref(), Some("ep1/vision-x"));
         assert!(!wire.optimizer.archive, "the fixture opts lever 3 out");
         assert_eq!(wire.optimizer.archive_min_chars, 1234);
@@ -734,24 +760,25 @@ simple = ["ep1/exec-model"]
     }
 
     #[tokio::test]
-    async fn save_models_sets_clears_and_keeps_everything_else() {
+    async fn save_compaction_leaves_every_other_model_slot_alone() {
         let (dir, setup) = fixture();
-        model_settings_apply(
-            &setup,
-            "models",
-            json!({ "planning": null, "bug_fixing": "ep1/other-model" }),
-        )
-        .await
-        .expect("save");
-        // The wire reflects the patch.
+        model_settings_apply(&setup, "models", json!({ "summarize": "ep1/other-model" }))
+            .await
+            .expect("save");
+        // The one slot the page owns takes the save...
         let wire = model_settings_read(&setup).expect("read");
-        assert_eq!(wire.task_models.planning, None, "null clears the slot");
-        assert_eq!(wire.task_models.bug_fixing.as_deref(), Some("ep1/other-model"));
-        assert_eq!(wire.task_models.executing.as_deref(), Some("ep1/exec-model"), "absent keeps");
-        // Foreign [models] slots survive untouched.
+        assert_eq!(wire.task_models.summarize.as_deref(), Some("ep1/other-model"));
+        // ...and every other [models.*] key — Mnemo1's per-task slots, the
+        // complete/free/subagent slots and the per-skill table — is untouched.
         let config = Config::load(dir.path()).expect("reload");
-        assert_eq!(config.general.models.complete.as_ref().map(|r| r.model.as_str()), Some("complete-model"));
-        assert_eq!(config.general.models.subagent.as_ref().map(|r| r.model.as_str()), Some("sub-model"));
+        let mut expected: Vec<String> = UNTOUCHED_MODEL_SLOTS.iter().map(|s| s.to_string()).collect();
+        expected.push("summarize = ep1/other-model".to_string());
+        assert_eq!(model_slots(&config), expected);
+        assert_eq!(
+            config.general.models.planning.as_ref().unwrap().reasoning_effort.as_deref(),
+            Some("high"),
+            "Mnemo1's planning slot keeps its reasoning effort"
+        );
         // Unrelated schema keys survive the rewrite.
         assert_eq!(config.general.general.safety, SafetyMode::AutoApproveProject);
         assert_eq!(config.general.context.summarize_at_fill_rate, 0.5);
@@ -760,33 +787,63 @@ simple = ["ep1/exec-model"]
         // And so does the [tiers] table save_all carries through.
         let tiers = mnemo::config::endpoints::load_tiers(&dir.path().join("endpoints.toml"));
         assert_eq!(tiers.difficult, vec!["ep1/plan-model".to_string()]);
+
+        // Clearing the slot keeps them too.
+        model_settings_apply(&setup, "models", json!({ "summarize": null }))
+            .await
+            .expect("clear");
+        assert_eq!(model_settings_read(&setup).expect("read").task_models.summarize, None);
+        let expected: Vec<String> = UNTOUCHED_MODEL_SLOTS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(model_slots(&Config::load(dir.path()).expect("reload")), expected);
+
+        // A stale client still sending the old five-slot shape — the Mnemo1
+        // slots as nulls — must not clear them either: those fields are gone
+        // from the patch, so the shared pipeline never sees them. Before this
+        // page owned only `summarize`, these nulls cleared the slots (the red
+        // case this test pins).
+        model_settings_apply(
+            &setup,
+            "models",
+            json!({
+                "planning": null,
+                "executing": null,
+                "bug_fixing": null,
+                "reviewing": null,
+                "summarize": "ep1/other-model",
+            }),
+        )
+        .await
+        .expect("stale save");
+        let mut expected: Vec<String> = UNTOUCHED_MODEL_SLOTS.iter().map(|s| s.to_string()).collect();
+        expected.push("summarize = ep1/other-model".to_string());
+        assert_eq!(model_slots(&Config::load(dir.path()).expect("reload")), expected);
     }
 
     #[tokio::test]
-    async fn save_models_preserves_reasoning_effort_and_validates() {
+    async fn save_compaction_preserves_reasoning_effort_and_validates() {
         let (dir, setup) = fixture();
         // An identity match keeps the stored reasoning effort.
-        model_settings_apply(&setup, "models", json!({ "planning": "ep1/plan-model" }))
+        model_settings_apply(&setup, "models", json!({ "summarize": "ep1/sum-model" }))
             .await
             .expect("save");
         let config = Config::load(dir.path()).expect("reload");
         assert_eq!(
-            config.general.models.planning.as_ref().unwrap().reasoning_effort.as_deref(),
+            config.general.models.summarize.as_ref().unwrap().reasoning_effort.as_deref(),
             Some("high")
         );
         // A changed model drops it — the effort belonged to the old pair.
-        model_settings_apply(&setup, "models", json!({ "planning": "ep1/other-model" }))
+        model_settings_apply(&setup, "models", json!({ "summarize": "ep1/other-model" }))
             .await
             .expect("save");
         let config = Config::load(dir.path()).expect("reload");
-        assert_eq!(config.general.models.planning.as_ref().unwrap().reasoning_effort, None);
+        assert_eq!(config.general.models.summarize.as_ref().unwrap().reasoning_effort, None);
         // The shared pipeline's cross-reference validation rejects an
         // unknown endpoint, and the compact form must be "endpoint/model".
-        let err = model_settings_apply(&setup, "models", json!({ "reviewing": "ep9/x" }))
+        let err = model_settings_apply(&setup, "models", json!({ "summarize": "ep9/x" }))
             .await
             .expect_err("unknown endpoint");
         assert!(err.contains("does not match any configured endpoint"), "{err}");
-        let err = model_settings_apply(&setup, "models", json!({ "reviewing": "ep1" }))
+        let err = model_settings_apply(&setup, "models", json!({ "summarize": "ep1" }))
             .await
             .expect_err("no slash");
         assert!(err.contains("endpoint/model"), "{err}");

@@ -91,8 +91,8 @@
         <header>
           <h3>Sounds</h3>
           <p class="micro">
-            Short tones synthesized in the app — no sound files. A burst of events plays one sound, so a whole team of
-            workers finishing together is a single chime.
+            Short tones synthesized in the app — no sound files. A burst of the same sound plays once, so a whole
+            team of workers finishing together is a single chime — and a needs-you ping is never swallowed by one.
           </p>
         </header>
         <div class="sound-list">

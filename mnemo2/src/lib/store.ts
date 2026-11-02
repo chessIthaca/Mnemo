@@ -182,7 +182,8 @@ function handleNativeLeadEvent(token: number, event: LeadEvent): void {
   if (token !== leadSessionToken) return;
   app.update((state) => applyLeadEvent(state, event));
   // The lead's own turn-finished / needs-you / stopped-with-errors events ring
-  // the matching notification sound (gated by the [ui] toggles, burst-debounced).
+  // the matching notification sound (gated by the [ui] toggles, per-sound
+  // debounce, more urgent sounds always through).
   const runtime = get(app).leadRuntime;
   if (runtime.mode === "native" && runtime.generation === event.generation) {
     const sound = leadEventSound(event.event?.event);

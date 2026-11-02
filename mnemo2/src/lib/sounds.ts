@@ -18,10 +18,13 @@
  * by `sounds.test.ts`.
  *
  * The store calls `notifySound(kind)`, which gates on the cached toggles and
- * debounces so a burst of events — a team of workers finishing together —
- * plays one sound. The Appearance page pushes every save through
- * `applySoundToggles`, so a flipped toggle takes effect on the very next
- * event without a restart.
+ * debounces PER SOUND, so a burst of the same event — a team of workers
+ * finishing together — plays one chime. A more urgent sound is never buried
+ * by one that just played: `input_needed` gets through a `stopped_errors` or
+ * `complete` window, and `stopped_errors` through a `complete` one, so the
+ * sound that most needs the human is always heard. The Appearance page pushes
+ * every save through `applySoundToggles`, so a flipped toggle takes effect on
+ * the very next event without a restart.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -217,17 +220,33 @@ export function playSound(kind: SoundKind): void {
 // ── Live toggles + debounce ─────────────────────────────────────────────────
 
 /**
- * The burst window: events that land within this many ms of the last played
- * sound are treated as one burst (four workers finishing together play one
- * chime, not four).
+ * The burst window per sound: repeats of the SAME sound within this many ms
+ * are one burst (four workers finishing together play one chime, not four).
  */
 export const SOUND_DEBOUNCE_MS = 1500;
 
 /** The toggles the store gates on — updated by the Appearance page's saves. */
 let toggles: SoundToggles = { ...DEFAULT_SOUND_TOGGLES };
 
-/** When the last notification actually played (`-Infinity` = never). */
-let lastPlayedAtMs = Number.NEGATIVE_INFINITY;
+/** When each sound last actually played (`-Infinity` = never). */
+const lastPlayedAtMs: Record<SoundKind, number> = {
+  complete: Number.NEGATIVE_INFINITY,
+  input_needed: Number.NEGATIVE_INFINITY,
+  stopped_errors: Number.NEGATIVE_INFINITY,
+};
+
+/**
+ * How much a sound needs the human's attention. A higher-priority sound plays
+ * even inside a lower-priority one's burst window; the lower one waits.
+ */
+const SOUND_PRIORITY: Record<SoundKind, number> = {
+  complete: 0,
+  stopped_errors: 1,
+  input_needed: 2,
+};
+
+/** The most recent sound of any kind, for the priority rule. */
+let lastPlayed: { kind: SoundKind; atMs: number } | null = null;
 
 /** The toggles a just-saved page pushes here, so the next event obeys them. */
 export function applySoundToggles(next: Partial<SoundToggles>): SoundToggles {
@@ -250,18 +269,35 @@ export function currentSoundToggles(): SoundToggles {
  */
 export function resetSoundState(): void {
   toggles = { ...DEFAULT_SOUND_TOGGLES };
-  lastPlayedAtMs = Number.NEGATIVE_INFINITY;
+  lastPlayedAtMs.complete = Number.NEGATIVE_INFINITY;
+  lastPlayedAtMs.input_needed = Number.NEGATIVE_INFINITY;
+  lastPlayedAtMs.stopped_errors = Number.NEGATIVE_INFINITY;
+  lastPlayed = null;
 }
 
 /**
- * Play `kind` if its toggle is on and no sound played within the burst
- * window; returns whether a sound actually played (pure bookkeeping, the
- * audio itself is `playSound`). `atMs` is injectable for tests.
+ * Play `kind` if its toggle is on and it is not a repeat inside its own burst
+ * window; returns whether a sound actually played (pure bookkeeping, the audio
+ * itself is `playSound`). A sound of strictly higher priority — `input_needed`
+ * over `stopped_errors` over `complete` — plays even inside the window of the
+ * sound that just played, so a needs-you ping is never swallowed by a chime.
+ * `atMs` is injectable for tests.
  */
 export function notifySound(kind: SoundKind, atMs: number = Date.now()): boolean {
   if (!soundEnabled(kind, toggles)) return false;
-  if (atMs - lastPlayedAtMs < SOUND_DEBOUNCE_MS) return false;
-  lastPlayedAtMs = atMs;
+  // Per-sound debounce: a burst of the SAME sound plays once.
+  if (atMs - lastPlayedAtMs[kind] < SOUND_DEBOUNCE_MS) return false;
+  // A lower-priority (or equally urgent) sound gives way to the one that just
+  // played; only a strictly more urgent sound breaks into another's window.
+  if (
+    lastPlayed !== null &&
+    atMs - lastPlayed.atMs < SOUND_DEBOUNCE_MS &&
+    SOUND_PRIORITY[kind] <= SOUND_PRIORITY[lastPlayed.kind]
+  ) {
+    return false;
+  }
+  lastPlayedAtMs[kind] = atMs;
+  lastPlayed = { kind, atMs };
   playSound(kind);
   return true;
 }

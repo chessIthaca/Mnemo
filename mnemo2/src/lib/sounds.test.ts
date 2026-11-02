@@ -142,13 +142,39 @@ describe("worker sounds", () => {
 });
 
 describe("notifySound", () => {
-  it("plays when the toggle is on and swallows the burst", () => {
+  it("plays when the toggle is on and swallows a burst of the same sound", () => {
     expect(notifySound("complete", 10_000)).toBe(true);
     // A team of workers finishing together: one chime.
     expect(notifySound("complete", 10_100)).toBe(false);
-    expect(notifySound("input_needed", 10_500)).toBe(false);
-    // Past the window the next event is heard again.
-    expect(notifySound("input_needed", 10_000 + SOUND_DEBOUNCE_MS)).toBe(true);
+    // Past its own window the same sound is heard again.
+    expect(notifySound("complete", 10_000 + SOUND_DEBOUNCE_MS)).toBe(true);
+  });
+
+  it("lets a needs-you ping through a completion chime's burst window", () => {
+    // Regression (review finding needsYouSwallowedByDebounce): the single
+    // shared window used to swallow this — the sound that most needs the
+    // human's attention — whenever anything else played in the previous
+    // 1.5 s.
+    expect(notifySound("complete", 10_000)).toBe(true);
+    expect(notifySound("input_needed", 10_500)).toBe(true);
+    // The ping now owns the moment; a repeat of it is still one burst.
+    expect(notifySound("input_needed", 10_600)).toBe(false);
+  });
+
+  it("plays a more urgent sound inside a less urgent one's window", () => {
+    expect(notifySound("complete", 1_000)).toBe(true);
+    expect(notifySound("stopped_errors", 1_400)).toBe(true);
+    expect(notifySound("input_needed", 1_800)).toBe(true);
+  });
+
+  it("does not let a completion chime follow a needs-you ping inside its window", () => {
+    expect(notifySound("complete", 1_000)).toBe(true);
+    expect(notifySound("input_needed", 1_200)).toBe(true);
+    // Outside the chime's own window (1 000 + 1 500), but the ping still owns
+    // the moment: the least urgent sound waits.
+    expect(notifySound("complete", 2_600)).toBe(false);
+    // Once the ping's window has passed, the chime is heard again.
+    expect(notifySound("complete", 2_800)).toBe(true);
   });
 
   it("honours a toggle flipped at runtime", () => {

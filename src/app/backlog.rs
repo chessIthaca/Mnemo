@@ -26,6 +26,18 @@
 //! file. [`BacklogStore::open`] hard-purges items soft-deleted more than
 //! [`PURGE_AFTER_SECS`] (30 days) ago, so every startup cleans up expired
 //! deletions.
+//!
+//! ## Save guard
+//!
+//! Every write goes through the guarded save
+//! (`BacklogStore::persist_with_permitted_removals`): it re-reads the
+//! disk file and refuses — with a loud `error:` log — a write that would
+//! drop a live `Pending` or `InFlight` item that no explicit removal
+//! sanctioned, leaving the file untouched. [`BacklogStore::remove`] is
+//! the one sanctioned live-item removal (the delete button) and passes
+//! its id through the guard's allow-list; every other caller persists
+//! unpermitted, so a partial or stale in-memory list fails loudly
+//! instead of silently losing queued work.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -487,9 +499,10 @@ impl BacklogStore {
         self.items.retain(|i| !expired.contains(&i.id));
         self.persist();
         eprintln!(
-            "info: purged {} soft-deleted backlog item(s) older than {} days",
+            "info: purged {} soft-deleted backlog item(s) older than {} days from {}",
             expired.len(),
-            PURGE_AFTER_SECS / 86_400
+            PURGE_AFTER_SECS / 86_400,
+            self.path.display()
         );
     }
 
@@ -566,7 +579,9 @@ impl BacklogStore {
             return false;
         };
         item.deleted_at = Some(now_secs());
-        self.persist();
+        // The one sanctioned live-item removal: tell the save guard this
+        // id may leave the live queue — every other write must keep it.
+        self.persist_with_permitted_removals(&[id]);
         true
     }
 
@@ -1101,15 +1116,62 @@ impl BacklogStore {
         true
     }
 
-    /// Write the store to disk atomically: serialize to `path.tmp` (well,
-    /// `path` with its extension swapped for `tmp`), then rename over
-    /// `path`. Errors are logged and ignored — the in-memory state is the
-    /// source of truth and must never be lost to an IO hiccup.
+    /// Write the store to disk atomically through the guarded save with NO
+    /// permitted removals: every live pending or in-flight item currently
+    /// on disk must survive the write. See
+    /// [`Self::persist_with_permitted_removals`] for the guard's contract.
+    fn persist(&self) {
+        self.persist_with_permitted_removals(&[]);
+    }
+
+    /// The guarded save: write the store to disk atomically — serialize to
+    /// `path.tmp` (well, `path` with its extension swapped for `tmp`), then
+    /// rename over `path` — but refuse, with a loud `error:` log, a write
+    /// that would drop a live `Pending` or `InFlight` item that no explicit
+    /// removal sanctioned, leaving the file untouched (the backlog save
+    /// guard, plan f10ac89c: a partial or stale in-memory list must fail
+    /// loudly, never silently shrink the file).
+    ///
+    /// `permitted` names the ids this write may remove from the live queue.
+    /// Exactly one caller passes a non-empty list: [`Self::remove`], the
+    /// user's explicit single-item delete. Every other mutation — `add` and
+    /// `reorder` (which keep every unlisted id), `clear_finished` (which
+    /// only soft-deletes finished items), the status/note/plan/deferred
+    /// editors (which never remove items) and the startup purge (which only
+    /// hard-removes already-soft-deleted lines) — persists unpermitted, so
+    /// a future bug that builds a partial or stale in-memory list fails
+    /// HERE, loudly, with the file left as-is.
+    ///
+    /// The guard judges the save against the current disk state (re-read
+    /// here — the mutation's own [`Self::reload_from_disk`] ran before the
+    /// mutation, and a concurrent external writer may have landed since).
+    /// A live pending/in-flight item on disk violates the guard when the
+    /// in-memory list no longer carries it, or carries it soft-deleted. A
+    /// refused write leaves the file unchanged; the next mutation reloads
+    /// from disk, so one refused write never bricks the store. A missing
+    /// file (the first write, the legacy migration) has nothing to lose and
+    /// proceeds; an unparseable file is logged and proceeds — the store
+    /// tolerates corrupt files everywhere else, and persisting the
+    /// in-memory state is the recovery path.
     ///
     /// Format: jsonl — one JSON item per line, in display order. Line-oriented
     /// so a git UNION merge of two concurrently-written files concatenates
     /// both sides' lines (the UUID ids make the union collision-free).
-    fn persist(&self) {
+    /// IO errors are logged and ignored — the in-memory state is the source
+    /// of truth and must never be lost to an IO hiccup.
+    fn persist_with_permitted_removals(&self, permitted: &[&str]) {
+        let violations = self.save_guard_violations(permitted);
+        if !violations.is_empty() {
+            eprintln!(
+                "error: refused to write {}: the save would drop {} live pending/in-flight \
+                 backlog item(s) that no explicit removal sanctioned ({}) — the file is left \
+                 unchanged; the next store mutation reloads from disk and retries",
+                self.path.display(),
+                violations.len(),
+                violations.join(", "),
+            );
+            return;
+        }
         let lines = self
             .items
             .iter()
@@ -1145,6 +1207,42 @@ impl BacklogStore {
                 self.path.display()
             );
         }
+    }
+
+    /// The ids of the live pending/in-flight items on disk that a save of
+    /// the in-memory list would drop without permission — the guarded
+    /// save's violation list. Empty means the save is clear to proceed.
+    ///
+    /// Re-parses the disk file with [`parse_jsonl`] — the same
+    /// union-merge-aware collapse every load uses — so duplicate lines and
+    /// sticky deletions are judged exactly as the store itself judges
+    /// them. A tombstone (`deleted_at` set, any status) is not live and is
+    /// therefore NOT protected: its hard-removal by the startup purge is
+    /// by-design cleanup of already-removed work. A live item protected
+    /// here violates the guard when `permitted` doesn't list it AND the
+    /// in-memory list neither carries it nor keeps it live.
+    fn save_guard_violations(&self, permitted: &[&str]) -> Vec<String> {
+        let Ok(content) = std::fs::read_to_string(&self.path) else {
+            // No file yet — nothing on disk can be lost.
+            return Vec::new();
+        };
+        let Ok(disk) = parse_jsonl(&content) else {
+            eprintln!(
+                "warning: the backlog save guard could not parse {} to verify the write; \
+                 proceeding unverified",
+                self.path.display()
+            );
+            return Vec::new();
+        };
+        disk.iter()
+            .filter(|i| {
+                is_live(i)
+                    && matches!(i.status, BacklogStatus::Pending | BacklogStatus::InFlight)
+                    && !permitted.contains(&i.id.as_str())
+                    && !self.items.iter().any(|m| m.id == i.id && is_live(m))
+            })
+            .map(|i| i.id.clone())
+            .collect()
     }
 }
 
@@ -2700,5 +2798,169 @@ mod tests {
         assert_eq!(reloaded[0].id, disk_item_a.id);
         assert_eq!(reloaded[1].id, disk_item_b.id);
         assert_eq!(reloaded[2].text, "new item");
+    }
+
+    // ---- reorder subsets, the save guard and the 09:38 purge (f10ac89c) ----
+
+    #[test]
+    fn reorder_with_a_subset_keeps_every_other_item() {
+        // The Backlog section sends only the ids it displays; the store must
+        // keep every unlisted item (done, in-flight and not-shown pending
+        // alike) in their relative order — a subset must never shrink the
+        // file (plan f10ac89c, required behaviour 2).
+        let dir = TestDir::new("reorder_subset");
+        let mut store = BacklogStore::open(dir.path());
+        let done = store.add("done".into(), vec![]);
+        let first = store.add("first".into(), vec![]);
+        let inflight = store.add("inflight".into(), vec![]);
+        let last = store.add("last".into(), vec![]);
+        store.set_status(&done.id, BacklogStatus::Done, None);
+        store.set_status(&inflight.id, BacklogStatus::InFlight, None);
+
+        // The UI's call: only the two visible pending ids, in the user's
+        // chosen order.
+        store.reorder(&[last.id.clone(), first.id.clone()]);
+
+        // Every item survives — listed ids first in the given order, the
+        // unlisted rest after them in their original relative order.
+        let order: Vec<String> = store.items().iter().map(|i| i.id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![
+                last.id.clone(),
+                first.id.clone(),
+                done.id.clone(),
+                inflight.id.clone()
+            ]
+        );
+
+        // ...and the file on disk still carries every id.
+        let raw = std::fs::read_to_string(dir.path()).unwrap();
+        for id in [&done.id, &first.id, &inflight.id, &last.id] {
+            assert!(
+                raw.contains(&format!("\"id\":\"{id}\"")),
+                "reorder must not drop item {id} from the file: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_guard_refuses_a_write_that_drops_live_pending_and_in_flight_items() {
+        // The save guard, red→green: a save whose in-memory list no longer
+        // carries a live pending or in-flight item (the stale-in-mem clobber
+        // class, .coding/knowledge/bug/2026-08-31-backlog-jsonl-clobbered-…)
+        // must be refused with the file left untouched — not written as a
+        // shrunken backlog.
+        let dir = TestDir::new("save_guard_refuses");
+        let mut store = BacklogStore::open(dir.path());
+        let pending = store.add("pending".into(), vec![]);
+        let inflight = store.add("inflight".into(), vec![]);
+        store.set_status(&inflight.id, BacklogStatus::InFlight, None);
+        let before = std::fs::read_to_string(dir.path()).unwrap();
+
+        // Simulate the future bug: an in-memory list that lost the live
+        // items (a stale snapshot, a filtered reorder, a bad purge).
+        store
+            .items
+            .retain(|i| i.id != pending.id && i.id != inflight.id);
+        store.persist();
+
+        let after = std::fs::read_to_string(dir.path()).unwrap();
+        assert_eq!(
+            after, before,
+            "the save guard must refuse the write, not shrink the file"
+        );
+
+        // The refused write does not brick the store: the next mutation
+        // reloads from disk, recovers both items, and persists normally.
+        store.add("later".into(), vec![]);
+        let live: Vec<String> = store.items().iter().map(|i| i.id.clone()).collect();
+        assert!(live.contains(&pending.id));
+        assert!(live.contains(&inflight.id));
+        assert_eq!(live.len(), 3);
+    }
+
+    #[test]
+    fn save_guard_permits_the_explicit_single_item_remove() {
+        // `remove` is the ONE live-item removal the guard lets through: the
+        // user's explicit delete. Everything else must survive it.
+        let dir = TestDir::new("save_guard_permits_remove");
+        let mut store = BacklogStore::open(dir.path());
+        let doomed = store.add("doomed pending".into(), vec![]);
+        let survivor = store.add("survivor".into(), vec![]);
+        store.set_status(&survivor.id, BacklogStatus::InFlight, None);
+
+        assert!(store.remove(&doomed.id));
+
+        // The removal persisted (soft-delete on disk), and the live
+        // pending/in-flight survivor is untouched by it.
+        let raw = std::fs::read_to_string(dir.path()).unwrap();
+        assert!(raw.contains("deleted_at"), "the soft-delete persists: {raw}");
+        let reopened = BacklogStore::open(dir.path());
+        let live: Vec<String> = reopened.items().iter().map(|i| i.id.clone()).collect();
+        assert_eq!(live, vec![survivor.id]);
+    }
+
+    #[test]
+    fn purge_on_open_never_drops_live_pending_or_in_flight_items() {
+        // The 09:38 incident (f10ac89c), reproduced at store scale: open()
+        // hard-purges expired tombstones and REWRITES the whole file — even
+        // when the caller only wanted to read (every Mnemo2 backlog command
+        // opens the store fresh, reads included). Pins both sides of that
+        // contract: the live queue survives the rewrite untouched, and the
+        // 30-day tombstone cleanup still happens.
+        let dir = TestDir::new("purge_open_live_survivors");
+        let mut store = BacklogStore::open(dir.path());
+        let pending = store.add("pending".into(), vec![]);
+        let inflight = store.add("inflight".into(), vec![]);
+        store.set_status(&inflight.id, BacklogStatus::InFlight, None);
+        let fresh_removed = store.add("removed today".into(), vec![]);
+        assert!(store.remove(&fresh_removed.id));
+
+        // An expired tombstone: soft-deleted 31 days ago while still
+        // pending (the union-merge sticky class the 09:38 diff showed).
+        let expired = BacklogItem {
+            id: "bbbbbbbb-0000-0000-0000-000000000001".into(),
+            text: "removed weeks ago while pending".into(),
+            images: vec![],
+            status: BacklogStatus::Pending,
+            created_at: now_secs() - 60 * 86_400,
+            note: None,
+            deferred: false,
+            plan_id: None,
+            plan_title: None,
+            deleted_at: Some(now_secs() - 31 * 86_400),
+        };
+        let raw = std::fs::read_to_string(dir.path()).unwrap();
+        std::fs::write(
+            dir.path(),
+            format!("{raw}{}\n", serde_json::to_string(&expired).unwrap()),
+        )
+        .unwrap();
+
+        // The 09:38 operation: a plain open (a read command) purges and
+        // rewrites the file.
+        let reopened = BacklogStore::open(dir.path());
+
+        let live: Vec<(String, BacklogStatus)> = reopened
+            .items()
+            .iter()
+            .map(|i| (i.id.clone(), i.status))
+            .collect();
+        assert_eq!(
+            live,
+            vec![
+                (pending.id.clone(), BacklogStatus::Pending),
+                (inflight.id.clone(), BacklogStatus::InFlight),
+            ],
+            "every live pending and in-flight item survives the purge rewrite"
+        );
+
+        let raw = std::fs::read_to_string(dir.path()).unwrap();
+        assert!(!raw.contains(&expired.id), "the expired tombstone is purged");
+        assert!(
+            raw.contains(&fresh_removed.id),
+            "the fresh tombstone (deleted today) stays on disk: {raw}"
+        );
     }
 }

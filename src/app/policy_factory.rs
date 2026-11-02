@@ -190,16 +190,6 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         // direction. A mismatch means the kernel changed what it passes —
         // fail loudly rather than silently.
         let any_arc = ctx.workflow.as_any_arc();
-        eprintln!(
-            "DBG2b3: inner={} double={} unwired={}",
-            any_arc.downcast_ref::<Arc<Mutex<Workflow>>>().is_some(),
-            any_arc
-                .downcast_ref::<Arc<Arc<Mutex<Workflow>>>>()
-                .is_some(),
-            any_arc
-                .downcast_ref::<crate::agent::workflow_handle::UnwiredWorkflow>()
-                .is_some(),
-        );
         let workflow = any_arc
             .downcast_ref::<Arc<Mutex<Workflow>>>()
             .expect("the kernel hands the policy factory the workflow it built")

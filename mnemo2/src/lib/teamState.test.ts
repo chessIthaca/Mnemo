@@ -1,0 +1,428 @@
+import { describe, expect, it } from "vitest";
+import {
+  applyTeamEvent,
+  applyTeamSnapshot,
+  emptyProjectUsageView,
+  initialTeamState,
+  projectUsageFrom,
+  reviewEvidenceFrom,
+  reviewEvidenceToWire,
+  type TeamEvent,
+  workerDisplayName,
+  type TeamWorkerRecord,
+} from "./teamState";
+
+const worker: TeamWorkerRecord = {
+  id: "w1",
+  name: "Worker w1",
+  brief: "do the task",
+  model: "test/scripted-a",
+  model_id: "scripted-a",
+  branch: "wt/agent-w1",
+  worktree: "C:/repo/.worktrees/agent-w1",
+  status: "working",
+  generation: 1,
+  transcript: {
+    messages: [{ role: "assistant", content: "working on it" }],
+  },
+  pending: null,
+  used_tokens: 10,
+  max_tokens: 100,
+  total_tokens: 10,
+  prompt_tokens: 8,
+  completion_tokens: 2,
+  cached_tokens: 3,
+  requests: 2,
+  cost_micros: 500_000,
+  created_at_ms: 1_787_399_996_000,
+  elapsed_ms: 4000,
+  turns: 2,
+  last_activity_ms: 1_787_400_000_000,
+  checks: [{ name: "workspace tests", status: "passed", detail: "ok", tip: "tip-1" }],
+  findings: [{
+    id: "F-1",
+    severity: "low",
+    title: "Example",
+    detail: "Detail",
+    file: "src/lib.rs",
+    line: 1,
+    status: "open",
+    fix_commit: null,
+    evidence: null,
+    justification: null,
+  }],
+  review: { summary: "reviewed", tip: "tip-1", reviewed_at_ms: 1_787_400_000_000 },
+  fixer_finding_id: null,
+  merge: null,
+  error: null,
+};
+
+const event = (kind: string, extra: Record<string, unknown> = {}, generation = 1): TeamEvent => ({
+  worker_id: "w1",
+  generation,
+  event: { agent: 1, event: { kind, ...extra } },
+});
+
+describe("teamState", () => {
+  it("restores real workers from a snapshot", () => {
+    const state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() });
+    expect(state.workers).toHaveLength(1);
+    expect(state.workers[0]).toMatchObject({
+      id: "w1",
+      text: "working on it",
+      status: "working",
+      usedTokens: 10,
+    });
+    expect(state.active).toBe(1);
+    expect(state.workers[0].totalTokens).toBe(10);
+    expect(state.workers[0].costMicros).toBe(500_000);
+    expect(state.workers[0].elapsedMs).toBe(4000);
+    expect(state.workers[0].turns).toBe(2);
+    expect(state.workers[0].review?.tip).toBe("tip-1");
+    expect(state.workers[0].findings).toHaveLength(1);
+  });
+
+  it("restores durable merge telemetry and revert state", () => {
+    const state = applyTeamSnapshot({
+      workers: [{
+        ...worker,
+        status: "merged",
+        merge: {
+          commit: "merge-1",
+          worker_tip: "tip-1",
+          branch: "wt/agent-w1",
+          target: "wt/lead",
+          checks: ["workspace tests"],
+          review_summary: "reviewed",
+          files: 1,
+          additions: 4,
+          deletions: 2,
+          worker_model: "scripted-a",
+          worker_tokens: 10,
+          cost_micros: 500_000,
+          merged_at_ms: 1_787_400_000_000,
+          revert_commit: "revert-1",
+        },
+      }],
+      slots: 1,
+      active: 0,
+      usage: emptyProjectUsageView(),
+    });
+    expect(state.workers[0].merge).toMatchObject({
+      commit: "merge-1",
+      files: 1,
+      additions: 4,
+      deletions: 2,
+      cost_micros: 500_000,
+      revert_commit: "revert-1",
+    });
+  });
+
+  it("accumulates real usage into cumulative telemetry", () => {
+    const state = applyTeamEvent(
+      applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() }),
+      event("usage", { prompt_tokens: 80, completion_tokens: 20, cached_tokens: 10 }),
+    );
+    expect(state.workers[0]).toMatchObject({
+      totalTokens: 110,
+      promptTokens: 88,
+      completionTokens: 22,
+      cachedTokens: 13,
+      requests: 3,
+      usedTokens: 80,
+    });
+  });
+
+  it("ignores a tool execution start on the worker event stream", () => {
+    const base = applyTeamSnapshot({
+      workers: [worker],
+      slots: 2,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    const state = applyTeamEvent(
+      base,
+      event("tool_execution_start", { tool_call_id: "call-1" }),
+    );
+    expect(state.workers[0]).toEqual(base.workers[0]);
+    expect(state.workers[0]).toMatchObject({
+      text: "working on it",
+      status: "working",
+      totalTokens: 10,
+    });
+  });
+
+  it("accumulates streamed deltas for only the tagged worker", () => {
+    const state = applyTeamEvent(
+      applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() }),
+      event("text_delta", { text: " and done" }),
+    );
+    expect(state.workers[0].text).toBe("working on it and done");
+  });
+
+  it("rejects a stale generation", () => {
+    const state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() });
+    const stale = applyTeamEvent(state, event("text_delta", { text: " stale" }, 0));
+    expect(stale).toBe(state);
+  });
+
+  it("marks approvals as needs-you and clears them on finish", () => {
+    let state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() });
+    state = applyTeamEvent(state, event("approval_request", { tool_call_id: "t1" }));
+    expect(state.workers[0].needsYou).toBe(true);
+    expect(state.workers[0].status).toBe("needs_you");
+    state = applyTeamEvent(state, event("finished"));
+    expect(state.workers[0].needsYou).toBe(false);
+    expect(state.workers[0].status).toBe("completed");
+  });
+
+  it("treats a worker's auto-answered host-tool call as progress, not needs-you", () => {
+    let state = applyTeamSnapshot({
+      workers: [worker],
+      slots: 2,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    state = applyTeamEvent(
+      state,
+      event("host_tool_call", { call_id: "c1", name: "message_parent", args: { text: "halfway" } }),
+    );
+    expect(state.workers[0].needsYou).toBe(false);
+    expect(state.workers[0].status).toBe("working");
+    const restored = applyTeamSnapshot({
+      workers: [{ ...worker, pending: { kind: "host_tool_call", call_id: "c1" } }],
+      slots: 2,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    expect(restored.workers[0].needsYou).toBe(false);
+  });
+
+  it("tracks compaction completion and failure without a synthetic budget pause", () => {
+    let state = applyTeamSnapshot({ workers: [worker], slots: 1, active: 1, usage: emptyProjectUsageView() });
+    state = applyTeamEvent(state, event("compact_started"));
+    expect(state.workers[0]).toMatchObject({ compacting: true, status: "working" });
+    state = applyTeamEvent(state, event("compacted", { before: 100, after: 60 }));
+    expect(state.workers[0]).toMatchObject({ compacting: false, status: "idle", error: null });
+    state = applyTeamEvent(state, event("compact_started"));
+    state = applyTeamEvent(state, event("error", { error: "summarizer unavailable", retrying: false }));
+    expect(state.workers[0]).toMatchObject({
+      compacting: false,
+      status: "idle",
+      error: "summarizer unavailable",
+    });
+  });
+
+  it("does not turn stopped, idle, or interrupted sessions into phantom completions", () => {
+    let stopped = applyTeamSnapshot({ workers: [{ ...worker, status: "stopped" }], slots: 1, active: 0, usage: emptyProjectUsageView() });
+    stopped = applyTeamEvent(stopped, event("finished"));
+    stopped = applyTeamEvent(stopped, event("exited"));
+    expect(stopped.workers[0].status).toBe("stopped");
+    let idle = applyTeamSnapshot({ workers: [{ ...worker, status: "idle" }], slots: 1, active: 1, usage: emptyProjectUsageView() });
+    idle = applyTeamEvent(idle, event("exited"));
+    expect(idle.workers[0].status).toBe("idle");
+    const interrupted = applyTeamEvent(
+      applyTeamSnapshot({ workers: [worker], slots: 1, active: 1, usage: emptyProjectUsageView() }),
+      event("exited"),
+    );
+    expect(interrupted.workers[0]).toMatchObject({
+      status: "interrupted",
+      error: "the worker session exited before completing its turn",
+    });
+  });
+
+  it("starts empty", () => {
+    expect(initialTeamState.workers).toEqual([]);
+    expect(initialTeamState.active).toBe(0);
+    expect(initialTeamState.usage.costMicros).toBe(0);
+  });
+
+  it("carries the durable project usage aggregate into the view", () => {
+    const state = applyTeamSnapshot({
+      workers: [],
+      slots: 2,
+      active: 0,
+      usage: {
+        input_tokens: 900,
+        cached_tokens: 300,
+        output_tokens: 120,
+        cost_micros: 1_234_567,
+        unpriced_models: ["mystery-model", "mystery-model"],
+      },
+    });
+    expect(state.usage).toEqual({
+      inputTokens: 900,
+      cachedTokens: 300,
+      outputTokens: 120,
+      costMicros: 1_234_567,
+      unpricedModels: ["mystery-model"],
+    });
+  });
+
+  it("normalizes a malformed usage record without fabricating a negative cost", () => {
+    expect(projectUsageFrom(undefined)).toEqual({
+      inputTokens: 0,
+      cachedTokens: 0,
+      outputTokens: 0,
+      costMicros: 0,
+      unpricedModels: [],
+    });
+    expect(
+      projectUsageFrom({
+        input_tokens: -5,
+        cached_tokens: Number.NaN,
+        output_tokens: 12.9,
+        cost_micros: -1,
+        unpriced_models: ["a", 7 as unknown as string, "b"],
+      }),
+    ).toEqual({
+      inputTokens: 0,
+      cachedTokens: 0,
+      outputTokens: 12,
+      costMicros: 0,
+      unpricedModels: ["a", "b"],
+    });
+  });
+
+  it("reads a legacy ledger record as an implementation worker under standard risk", () => {
+    const state = applyTeamSnapshot({
+      workers: [worker],
+      slots: 1,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    expect(state.workers[0]).toMatchObject({
+      kind: "implementation",
+      reviewRisk: "standard",
+      auditTarget: null,
+      auditTip: null,
+    });
+    // A review recorded before structured evidence carries none, which is a
+    // distinct state from an evidence object with blank assessments.
+    expect(state.workers[0].review?.evidence).toBeUndefined();
+  });
+
+  it("normalizes an audit worker and the tip it inspected", () => {
+    const state = applyTeamSnapshot({
+      workers: [{
+        ...worker,
+        id: "audit-1",
+        kind: "audit",
+        review_risk: "high",
+        audit_target: "w1",
+        audit_tip: "tip-1",
+      }],
+      slots: 1,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    expect(state.workers[0]).toMatchObject({
+      kind: "audit",
+      reviewRisk: "high",
+      auditTarget: "w1",
+      auditTip: "tip-1",
+    });
+  });
+
+  it("carries recorded review evidence through the wire view and defaults unknown kinds and risks", () => {
+    const evidence = {
+      unanchored_pass: true,
+      intent: "intent",
+      execution: "execution",
+      integration: "integration",
+      test_quality: "test quality",
+      residual_risk: "residual risk",
+      independent_reviewer_id: "audit-1",
+      audit_adjudication: "accepted",
+    };
+    const state = applyTeamSnapshot({
+      workers: [{
+        ...worker,
+        kind: "something-else",
+        review_risk: "unknown",
+        review: {
+          summary: "reviewed with evidence",
+          tip: "tip-1",
+          reviewed_at_ms: 1_787_400_000_000,
+          evidence,
+        },
+      }],
+      slots: 1,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    expect(state.workers[0].kind).toBe("implementation");
+    expect(state.workers[0].reviewRisk).toBe("standard");
+    // The wire view keeps the host's field names; `store.ts` owns the camelCase
+    // mapping into the UI `Worker` (covered by store.phase3.test.ts).
+    expect(state.workers[0].review?.evidence).toEqual(evidence);
+  });
+
+  it("treats evidence with an absent unanchored pass as not recorded", () => {
+    expect(reviewEvidenceFrom({ intent: "only intent" })).toMatchObject({
+      unanchoredPass: false,
+      intent: "only intent",
+      execution: "",
+    });
+    expect(reviewEvidenceFrom(null)).toBeUndefined();
+  });
+
+  it("serializes review evidence into the host's team_review wire shape", () => {
+    expect(
+      reviewEvidenceToWire({
+        unanchoredPass: true,
+        intent: "intent",
+        execution: "execution",
+        integration: "integration",
+        testQuality: "test quality",
+        residualRisk: "residual risk",
+      }),
+    ).toEqual({
+      unanchored_pass: true,
+      intent: "intent",
+      execution: "execution",
+      integration: "integration",
+      test_quality: "test quality",
+      residual_risk: "residual risk",
+    });
+
+    // The optional audit linkage travels only when the lead recorded it.
+    expect(
+      reviewEvidenceToWire({
+        unanchoredPass: true,
+        intent: "intent",
+        execution: "execution",
+        integration: "integration",
+        testQuality: "test quality",
+        residualRisk: "residual risk",
+        independentReviewerId: "audit-1",
+        auditAdjudication: "accepted",
+      }),
+    ).toMatchObject({
+      independent_reviewer_id: "audit-1",
+      audit_adjudication: "accepted",
+    });
+
+    // Round-tripping the wire shape preserves the assessments the host gates on.
+    expect(reviewEvidenceFrom(reviewEvidenceToWire({
+      unanchoredPass: true,
+      intent: "intent",
+      execution: "execution",
+      integration: "integration",
+      testQuality: "test quality",
+      residualRisk: "residual risk",
+    }))).toMatchObject({ unanchoredPass: true, intent: "intent" });
+  });
+});
+
+describe("workerDisplayName", () => {
+  it("shows the full name the lead chose, even from records saved in the short form", () => {
+    expect(workerDisplayName("ghostai0001", "Worker ghostai0")).toBe("ghostai0001");
+    expect(workerDisplayName("ghostai0001", "ghostai0001")).toBe("ghostai0001");
+  });
+
+  it("keeps the short form for a generated id and any other name as is", () => {
+    expect(workerDisplayName("0000000a019a1b2c3d4e", "Worker 0000000a")).toBe("Worker 0000000a");
+    expect(workerDisplayName("w1", "Ana")).toBe("Ana");
+  });
+});

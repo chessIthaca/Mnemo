@@ -1,6 +1,7 @@
 +++
 title = "knowledge exports back-dated by stale OS clock — fixed with monotonic artifact floor (d7b2e722)"
 created = "2026-09-01"
+status = "superseded"
 +++
 
 BUG (backlog d7b2e722, review LOW 2 of .coding/reviews/2026-12-06-reviewer-spawn-only-reviewing-slot.md): knowledge exports always carried filename date + created = "2026-09-01" regardless of the real record date (e.g. the 2026-12-06 decision exported as .coding/knowledge/decision/2026-09-01-models-reviewing-is-reviewer-spawn-only-main-age.md; the 2026-12-05 429 bug digest likewise).

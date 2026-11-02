@@ -289,7 +289,7 @@ describe("backlog_add chip — inline markdown wiring", () => {
     // stay plain text: the flag is set only on backlog_add's argLabel chip
     // at the push site, and the render site renders markdown only when the
     // chip is flagged — never by tool name.
-    expect(source).toContain('md: name === "backlog_add",');
+    expect(source).toContain('md: call.name === "backlog_add",');
     expect(source).toContain("{chip.md ? <InlineMarkdown text={chip.text} /> : chip.text}");
   });
 });

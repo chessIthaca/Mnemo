@@ -159,11 +159,18 @@ pub struct Ref {
     pub kind: RefKind,
 }
 
-/// Whether a [`Ref`] is a call or an import.
+/// Whether a [`Ref`] is a call or an import. Call refs further split by
+/// callee syntax (plan 0d53d659): a receiver call (`x.m(...)`) is
+/// [`RefKind::MethodCall`], a bare callee is [`RefKind::Call`] — both
+/// become `calls` edges, but only a `Method`-kind symbol can answer a
+/// method-call ref, so `x.join(` never resolves to a free `fn join`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefKind {
-    /// A call or `new` expression.
+    /// A call with a bare callee (`helper(1)`, `new Greeter()`).
     Call,
+    /// A call with a receiver (`x.join(",")`, `$obj->run()`) — the callee
+    /// node is a member/field/attribute/selector expression.
+    MethodCall,
     /// A name brought in by `use` / `import`.
     Import,
 }
@@ -448,7 +455,7 @@ fn visit_rust(node: tree_sitter::Node, ctx: &mut Ctx) {
             "call_expression" => {
                 if let Some(fn_node) = child.child_by_field_name("function") {
                     let name = callee_name(fn_node, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    ctx.reference(&name, callee_call_kind(fn_node));
                 }
                 visit_rust(child, ctx);
             }
@@ -562,7 +569,7 @@ fn visit_ts(node: tree_sitter::Node, ctx: &mut Ctx) {
             "call_expression" => {
                 if let Some(fn_node) = child.child_by_field_name("function") {
                     let name = callee_name(fn_node, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    ctx.reference(&name, callee_call_kind(fn_node));
                 }
                 visit_ts(child, ctx);
             }
@@ -624,7 +631,7 @@ fn visit_python(node: tree_sitter::Node, ctx: &mut Ctx) {
             "call" => {
                 if let Some(fn_node) = child.child_by_field_name("function") {
                     let name = callee_name(fn_node, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    ctx.reference(&name, callee_call_kind(fn_node));
                 }
                 visit_python(child, ctx);
             }
@@ -691,7 +698,15 @@ fn visit_ruby(node: tree_sitter::Node, ctx: &mut Ctx) {
             "call" => {
                 if let Some(m) = child.child_by_field_name("method") {
                     let name = callee_name(m, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    // `g.greet` carries a `receiver` field; a bare
+                    // `assist(self)` does not — only the receiver form is
+                    // method-call syntax.
+                    let kind = if child.child_by_field_name("receiver").is_some() {
+                        RefKind::MethodCall
+                    } else {
+                        RefKind::Call
+                    };
+                    ctx.reference(&name, kind);
                 }
                 visit_ruby(child, ctx);
             }
@@ -761,7 +776,15 @@ fn visit_php(node: tree_sitter::Node, ctx: &mut Ctx) {
                     .or_else(|| child.child_by_field_name("name"));
                 if let Some(fn_node) = fn_node {
                     let name = callee_name(fn_node, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    // `member_call_expression` is receiver syntax
+                    // (`$g->greet()`) — a method call; the other two have
+                    // bare callees.
+                    let kind = if child.kind() == "member_call_expression" {
+                        RefKind::MethodCall
+                    } else {
+                        RefKind::Call
+                    };
+                    ctx.reference(&name, kind);
                 }
                 visit_php(child, ctx);
             }
@@ -841,7 +864,7 @@ fn visit_go(node: tree_sitter::Node, ctx: &mut Ctx) {
             "call_expression" => {
                 if let Some(fn_node) = child.child_by_field_name("function") {
                     let name = callee_name(fn_node, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    ctx.reference(&name, callee_call_kind(fn_node));
                 }
                 visit_go(child, ctx);
             }
@@ -907,7 +930,14 @@ fn visit_java(node: tree_sitter::Node, ctx: &mut Ctx) {
             "method_invocation" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = callee_name(name_node, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    // `g.greet()` carries an `object` field; a bare
+                    // `helper()` (an own-class method or a static) does not.
+                    let kind = if child.child_by_field_name("object").is_some() {
+                        RefKind::MethodCall
+                    } else {
+                        RefKind::Call
+                    };
+                    ctx.reference(&name, kind);
                 }
                 visit_java(child, ctx);
             }
@@ -1034,7 +1064,7 @@ fn visit_c(node: tree_sitter::Node, ctx: &mut Ctx) {
             "call_expression" => {
                 if let Some(fn_node) = child.child_by_field_name("function") {
                     let name = callee_name(fn_node, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    ctx.reference(&name, callee_call_kind(fn_node));
                 }
                 visit_c(child, ctx);
             }
@@ -1094,7 +1124,7 @@ fn visit_csharp(node: tree_sitter::Node, ctx: &mut Ctx) {
             "invocation_expression" => {
                 if let Some(fn_node) = child.child_by_field_name("function") {
                     let name = callee_name(fn_node, ctx);
-                    ctx.reference(&name, RefKind::Call);
+                    ctx.reference(&name, callee_call_kind(fn_node));
                 }
                 visit_csharp(child, ctx);
             }
@@ -1544,6 +1574,33 @@ pub struct Resolved {
     pub unresolved: usize,
 }
 
+/// The language family a file belongs to (from its extension) — the
+/// boundary the resolver's bare-name match never crosses (plan
+/// 0d53d659): a Python or TypeScript `.join(` must never resolve to a
+/// Rust `fn join`. Dialects that freely call each other's code share a
+/// family (TS/TSX/JS with HTML script blocks, which extract as JS; C
+/// with C++ — `.h` headers parse as C even in C++ projects). `None`
+/// when the extension is no parseable source file.
+pub(crate) fn lang_family(file: &str) -> Option<Lang> {
+    let ext = file.rsplit('.').next()?.to_ascii_lowercase();
+    Lang::from_extension(&ext).map(Lang::family)
+}
+
+/// [`RefKind`] for a call whose callee node is `callee`: receiver syntax
+/// (`x.m(...)`, `x->m(...)`) is a [`RefKind::MethodCall`]; every other
+/// shape keeps [`RefKind::Call`] — a `new Greeter()` or path call may
+/// legitimately target a class or a free fn. The receiver shapes per
+/// grammar: `field_expression` (Rust, C, C++), `member_expression`
+/// (TS/JS and HTML scripts), `attribute` (Python), `selector_expression`
+/// (Go), `member_access_expression` (C#).
+fn callee_call_kind(callee: tree_sitter::Node) -> RefKind {
+    match callee.kind() {
+        "field_expression" | "member_expression" | "attribute"
+        | "selector_expression" | "member_access_expression" => RefKind::MethodCall,
+        _ => RefKind::Call,
+    }
+}
+
 /// Resolve all files' refs into cross-file edges, given every symbol.
 ///
 /// Resolution order per ref: an exact-name symbol **in the same file**, else
@@ -1552,6 +1609,12 @@ pub struct Resolved {
 /// means local helpers win over a same-named import; project-wide requires
 /// uniqueness so a common name (`new`, `open`) never produces a false edge.
 /// Contains pairs pass straight through (already resolved ids).
+///
+/// Two target gates keep a bare name honest (plan 0d53d659): a ref only
+/// ever resolves within its own language family, and a
+/// [`RefKind::MethodCall`] ref only ever resolves to a `Method`-kind
+/// symbol — never a free function. An unresolvable ref is dropped, not
+/// guessed.
 pub fn resolve_edges(files: &[FileExtract]) -> Resolved {
     // Index: name → symbols with that name, per file and project-wide.
     let mut by_name_project: HashMap<String, Vec<&Symbol>> = HashMap::new();
@@ -1578,7 +1641,7 @@ pub fn resolve_edges(files: &[FileExtract]) -> Resolved {
         let file = &f.symbols[0].file;
         for r in &f.refs {
             let kind = match r.kind {
-                RefKind::Call => EdgeKind::Calls,
+                RefKind::Call | RefKind::MethodCall => EdgeKind::Calls,
                 RefKind::Import => EdgeKind::Imports,
             };
             let target = resolve_one(&by_name_project, file, &r.name, r.kind);
@@ -1595,7 +1658,12 @@ pub fn resolve_edges(files: &[FileExtract]) -> Resolved {
     resolved
 }
 
-/// Resolve one ref against the index, same-file-first (see [`resolve_edges`]).
+/// Resolve one ref against the index, same-file-first (see
+/// [`resolve_edges`]). Both target gates apply before uniqueness is judged
+/// (plan 0d53d659): a candidate outside the ref's language family, or a
+/// non-`Method` symbol answering a method-call ref, is no candidate —
+/// `x.join(` in a file whose only `join` is a free `fn join` stays
+/// unresolved instead of guessing.
 fn resolve_one<'a>(
     by_name: &HashMap<String, Vec<&'a Symbol>>,
     file: &str,
@@ -1603,15 +1671,24 @@ fn resolve_one<'a>(
     kind: RefKind,
 ) -> Option<&'a Symbol> {
     let candidates = by_name.get(name)?;
-    let same_file: Vec<&&Symbol> = candidates.iter().filter(|s| s.file == file).collect();
+    let family = lang_family(file);
+    let answerable = |symbol: &&Symbol| {
+        lang_family(&symbol.file) == family
+            && (kind != RefKind::MethodCall || symbol.kind == SymbolKind::Method)
+    };
+    let same_file: Vec<&&Symbol> = candidates
+        .iter()
+        .filter(|s| s.file == file && answerable(s))
+        .collect();
     if let [only] = same_file[..] {
         return Some(*only);
     }
-    if candidates.len() == 1 {
-        return Some(candidates[0]);
+    let project: Vec<&Symbol> = candidates.iter().filter(|s| answerable(s)).copied().collect();
+    if let [only] = project[..] {
+        return Some(only);
     }
-    if kind == RefKind::Call {
-        let ci: Vec<&&Symbol> = candidates
+    if matches!(kind, RefKind::Call | RefKind::MethodCall) {
+        let ci: Vec<&&Symbol> = project
             .iter()
             .filter(|s| s.name.eq_ignore_ascii_case(name))
             .collect();
@@ -1918,7 +1995,7 @@ def main():
         assert!(f
             .refs
             .iter()
-            .any(|r| r.kind == RefKind::Call && r.name == "greet" && r.from == main_id));
+            .any(|r| r.kind == RefKind::MethodCall && r.name == "greet" && r.from == main_id));
         // from helpers import assist, util as u → assist + util (originals);
         // the module prefix is skipped — it is not used bare in code.
         assert!(f
@@ -1964,17 +2041,17 @@ end
             .refs
             .iter()
             .any(|r| r.kind == RefKind::Call && r.name == "assist" && r.from == greet_id));
-        // Greeter.new — the `new` call targets the class.
+        // Greeter.new — a receiver call reduces to the implicit `new` method.
         let main_id = sym(&f, "main").id.clone();
         assert!(f
             .refs
             .iter()
-            .any(|r| r.kind == RefKind::Call && r.name == "new" && r.from == main_id));
+            .any(|r| r.kind == RefKind::MethodCall && r.name == "new" && r.from == main_id));
         // g.greet — a receiver call reduces to the method name.
         assert!(f
             .refs
             .iter()
-            .any(|r| r.kind == RefKind::Call && r.name == "greet" && r.from == main_id));
+            .any(|r| r.kind == RefKind::MethodCall && r.name == "greet" && r.from == main_id));
     }
 
     const PHP_SRC: &str = r#"
@@ -2014,7 +2091,7 @@ function main() {
         assert!(f
             .refs
             .iter()
-            .any(|r| r.kind == RefKind::Call && r.name == "greet" && r.from == main_id));
+            .any(|r| r.kind == RefKind::MethodCall && r.name == "greet" && r.from == main_id));
         // use App\Util\helper → import ref for the leaf.
         assert!(f
             .refs
@@ -2065,7 +2142,7 @@ func main() {
         assert!(f
             .refs
             .iter()
-            .any(|r| r.kind == RefKind::Call && r.name == "Println" && r.from == main_id));
+            .any(|r| r.kind == RefKind::MethodCall && r.name == "Println" && r.from == main_id));
         // imports: "fmt" and "helper" (path leaves).
         assert!(f.refs.iter().any(|r| r.kind == RefKind::Import && r.name == "fmt"));
         assert!(f.refs.iter().any(|r| r.kind == RefKind::Import && r.name == "helper"));
@@ -2119,7 +2196,7 @@ class Main {
         assert!(f
             .refs
             .iter()
-            .any(|r| r.kind == RefKind::Call && r.name == "greet" && r.from == run_id));
+            .any(|r| r.kind == RefKind::MethodCall && r.name == "greet" && r.from == run_id));
         // import com.example.helper → the final segment.
         assert!(f
             .refs
@@ -2260,7 +2337,7 @@ namespace App {
         assert!(f
             .refs
             .iter()
-            .any(|r| r.kind == RefKind::Call && r.name == "Greet" && r.from == run_id));
+            .any(|r| r.kind == RefKind::MethodCall && r.name == "Greet" && r.from == run_id));
         // using System.Linq → the final segment.
         assert!(f
             .refs
@@ -2449,5 +2526,90 @@ namespace App {
         assert_eq!(f.symbols[0].kind, SymbolKind::Module);
         let t = extract_file("bad.ts", "function broken({", Lang::Ts);
         assert_eq!(t.symbols[0].kind, SymbolKind::Module);
+    }
+
+    #[test]
+    fn method_call_in_another_language_does_not_resolve_to_a_rust_fn() {
+        // The incident (plan 0d53d659): a tiny Rust test helper named `join`
+        // was the project's only `join`, so bare-name resolution credited it
+        // with every `.join(` call site in the repo — Python, TypeScript and
+        // the `lines.join` method call inside its own body. A ref only ever
+        // resolves to a definition it can plausibly target: same language
+        // family, and a method-call ref (`x.join(...)`) never to a free fn.
+        let files = vec![
+            extract_file(
+                "src/tool/agent/shell_filter.rs",
+                "fn join(lines: &[&str]) -> String { lines.join(\"\\n\") }\n",
+                Lang::Rust,
+            ),
+            extract_file(
+                "cache_hit.py",
+                "def dump(lines):\n    return \"\\n\".join(lines)\n",
+                Lang::Python,
+            ),
+            extract_file(
+                "GitView.tsx",
+                "export function render(lines: string[]): string {\n  return lines.join(\"\\n\");\n}\n",
+                Lang::Tsx,
+            ),
+        ];
+        let r = resolve_edges(&files);
+        let join_id = files[0]
+            .symbols
+            .iter()
+            .find(|s| s.name == "join")
+            .unwrap()
+            .id
+            .clone();
+        assert!(
+            !r.edges.iter().any(|(_, to, k)| {
+                to == &join_id && matches!(k, EdgeKind::Calls | EdgeKind::Imports)
+            }),
+            "no call/import ref — cross-language or method-call — may target the Rust fn {join_id}"
+        );
+        assert_eq!(
+            r.unresolved, 3,
+            "all three method-call refs (Rust self, Python, TSX) stay unresolved"
+        );
+    }
+
+    #[test]
+    fn method_calls_resolve_to_same_language_methods() {
+        // The positive control: gating must not over-block. A method call
+        // resolves to a same-language Method-kind symbol — the edge the
+        // tab draws for a real call target.
+        let files = vec![
+            extract_file(
+                "model.ts",
+                "export class Model {\n  fetch() { return 1; }\n}\n",
+                Lang::Ts,
+            ),
+            extract_file(
+                "view.ts",
+                "import { Model } from \"./model\";\nexport function render(m: Model) {\n  return m.fetch();\n}\n",
+                Lang::Ts,
+            ),
+        ];
+        let r = resolve_edges(&files);
+        let fetch_id = files[0]
+            .symbols
+            .iter()
+            .find(|s| s.name == "fetch")
+            .unwrap()
+            .id
+            .clone();
+        let render_id = files[1]
+            .symbols
+            .iter()
+            .find(|s| s.name == "render")
+            .unwrap()
+            .id
+            .clone();
+        assert!(
+            r.edges.iter().any(|(from, to, k)| {
+                from == &render_id && to == &fetch_id && *k == EdgeKind::Calls
+            }),
+            "a method call resolves to the same-language method it targets"
+        );
     }
 }

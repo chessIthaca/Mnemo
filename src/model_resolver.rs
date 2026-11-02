@@ -462,7 +462,6 @@ impl ModelResolver for ConfigModelResolver {
             .expect("ConfigModelResolver config lock poisoned");
         let preflight = config.general.context.preflight_compact;
         let headroom = config.general.context.compact_headroom_tokens;
-        let ceiling = config.general.context.proxy_cache_ceiling_tokens;
         // Check the cache first — a provider for this (endpoint, model,
         // effort) may already exist from a prior turn (reusing its
         // reqwest::Client connection pool). The cache read is a cheap
@@ -480,8 +479,7 @@ impl ModelResolver for ConfigModelResolver {
             if let Some(provider) = cache.get(&key) {
                 let max_context = provider.capabilities().max_context;
                 let cm = ContextManager::new(max_context, fill_rate)
-                    .with_preflight(preflight, headroom)
-                    .with_proxy_cache_ceiling(ceiling);
+                    .with_preflight(preflight, headroom);
                 return Some((Arc::clone(provider), cm));
             }
         }
@@ -493,8 +491,7 @@ impl ModelResolver for ConfigModelResolver {
         )?;
         let max_context = provider.capabilities().max_context;
         let cm = ContextManager::new(max_context, fill_rate)
-            .with_preflight(preflight, headroom)
-            .with_proxy_cache_ceiling(ceiling);
+            .with_preflight(preflight, headroom);
         self.cache
             .write()
             .expect("ConfigModelResolver cache lock poisoned")

@@ -59,14 +59,15 @@ impl AgentManager {
         self.agents.insert(handle.id, handle);
     }
 
-    /// Send a command to an agent by id.
-    pub fn send(&self, id: AgentId, cmd: AgentCommand) -> Result<(), AgentCommand> {
+    /// Send a command to an agent by id, preserving a full versus closed queue.
+    pub fn send(
+        &self,
+        id: AgentId,
+        cmd: AgentCommand,
+    ) -> Result<(), mpsc::error::TrySendError<AgentCommand>> {
         match self.agents.get(&id) {
-            Some(handle) => handle.command_tx.try_send(cmd).map_err(|e| match e {
-                mpsc::error::TrySendError::Full(cmd) => cmd,
-                mpsc::error::TrySendError::Closed(cmd) => cmd,
-            }),
-            None => Err(cmd),
+            Some(handle) => handle.command_tx.try_send(cmd),
+            None => Err(mpsc::error::TrySendError::Closed(cmd)),
         }
     }
 
@@ -125,6 +126,18 @@ impl AgentManager {
         self.agents.remove(&id);
     }
 
+    /// Replace one command sender to observe close behavior in unit tests.
+    #[cfg(test)]
+    pub(crate) fn replace_command_sender(
+        &mut self,
+        id: AgentId,
+        sender: mpsc::Sender<AgentCommand>,
+    ) -> Option<mpsc::Sender<AgentCommand>> {
+        self.agents
+            .get_mut(&id)
+            .map(|handle| std::mem::replace(&mut handle.command_tx, sender))
+    }
+
     /// The id of the "main" agent — the primary interactive agent that backlog
     /// prompts are dispatched to. The main agent is the one with no parent
     /// (`parent_id == None`) and the smallest id (it's built first in
@@ -151,6 +164,15 @@ impl AgentManager {
         self.agents
             .values()
             .any(|h| h.is_running() && self.is_descendant_of(h.id, id))
+    }
+
+    /// List every registered descendant of `id`, including grandchildren.
+    pub fn descendant_ids(&self, id: AgentId) -> Vec<AgentId> {
+        self.agents
+            .values()
+            .filter(|handle| self.is_descendant_of(handle.id, id))
+            .map(|handle| handle.id)
+            .collect()
     }
 
     /// Whether `candidate` is a descendant of `ancestor` via the `parent_id`

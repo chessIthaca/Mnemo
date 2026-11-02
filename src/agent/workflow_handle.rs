@@ -80,6 +80,15 @@ pub trait AgentWorkflowHandle: Send + Sync {
         &self,
     ) -> (String, Option<String>, Option<String>, Option<String>);
 
+    /// The active plan's goal+context as one text block (backlog
+    /// c68a8c3b): the task-scoping signal the kernel's auto-recall query
+    /// embeds alongside the last user message, so the plan's own records
+    /// outrank generic similarity rows. `None` when no plan is active.
+    /// The same plan fields the volatile tail's workflow section renders
+    /// (the title stays out — the goal+context carry the task signal);
+    /// the kernel caps and shapes the query (`recall_query_text`).
+    async fn plan_recall_text(&self) -> Option<String>;
+
     /// The active skill's name (the skill-routing probe needs the NAME as a
     /// plain string — the kernel never sees the skill overlay type).
     async fn active_skill_name(&self) -> Option<String>;
@@ -170,6 +179,11 @@ impl AgentWorkflowHandle for UnwiredWorkflow {
         &self,
     ) -> (String, Option<String>, Option<String>, Option<String>) {
         ("complete".to_string(), None, None, None)
+    }
+
+    async fn plan_recall_text(&self) -> Option<String> {
+        // The free agent has no live plan to scope recall with.
+        None
     }
 
     async fn active_skill_name(&self) -> Option<String> {

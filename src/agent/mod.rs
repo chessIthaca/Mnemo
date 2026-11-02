@@ -15,10 +15,13 @@
 //! # Module layout
 //!
 //! - [`loop_impl`] — the `AgentLoop` struct, constructors, and public handles.
-//! - [`turn`] — the `run_turn` driver (streaming, summarization, auto-recall).
+//! - [`turn`] — the `run_turn` driver (streaming, summarization, auto-recall
+//!   — task-scoped on the active plan's goal+context and filtered by the
+//!   session's dismissed rows, backlog c68a8c3b).
 //! - [`recall_delta`] — the `recall_delta` lever's per-session cache: what the
 //!   volatile tail has already injected, so a repeat recall renders as a
-//!   reference instead of re-sending the snippet.
+//!   reference instead of re-sending the snippet — and an ALL-elided set
+//!   renders one sentinel line instead of N references (backlog c68a8c3b).
 //! - [`dispatch`] — tool-call dispatch, the approval gate, provider retry.
 //! - [`failure_triage`] — the Laya classifier's failure-classification
 //!   decision layer (classes, confidence gate, auto-retry policy, the

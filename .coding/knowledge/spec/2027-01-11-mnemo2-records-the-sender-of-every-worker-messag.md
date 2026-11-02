@@ -1,0 +1,8 @@
++++
+title = "Mnemo2 records the sender of every worker message in the team ledger"
+created = "2027-01-11"
++++
+
+Every message sent to a Mnemo2 worker carries a MessageSender (src-tauri/src/mnemo2/team.rs): external_lead (Claude Code via MCP, through TeamRuntime::handle_lead_host_tool_from in mcp_server.rs call_tool), lead (the built-in lead's host tool), user (mission control, ipc.rs team_message), or mnemo (generated route-fix briefs, kind fix). TeamRuntime::message persists an InboxEntry {sender, kind prompt|steer|brief|fix, text, at_ms} on WorkerRecord.inbox (serde default, capped at 200) BEFORE sending the session command, and rolls it back if the send fails. So .coding/mnemo2/team.json shows who sent what even mid-turn. The worker receives the text behind a header such as "[From the lead (Claude Code)]". message_parent's result and the executor prompt state that a lead reply only ever arrives as a new [From …] message and must not be assumed. To check whether a worker really received a message, read its inbox entries (team_status) rather than its transcript.
+
+Amended 2027-01-11: Mission control shows the inbox: the worker detail's thread tab renders mnemo2/src/components/WorkerInbox.svelte above the thread, a collapsed "RECEIVED MESSAGES · N" section hidden when empty. Entries are oldest first with sender labels Claude Code / Built-in lead / You / Mnemo2, a tag only for steer/fix, a relative time (elapsed.ts formatAgo) and the stored text (without the delivery header) as clamped Markdown. teamState.ts inboxFromWire maps the optional wire field; old ledgers map to [] and unknown sender/kind values degrade to mnemo/prompt.

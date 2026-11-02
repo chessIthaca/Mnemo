@@ -285,6 +285,10 @@ pub trait AgentPolicyFactory: Send + Sync {
     /// trio); the plan/skill registrations stay kernel-side until 2b.3
     /// carries their workflow/skill dependencies across the seam.
     fn register_tools(&self, reg: &mut ToolRegistry, ctx: &PolicyBuildCtx);
+
+    /// Apply policy vetoes after every kernel and app registration, before
+    /// deferred tool schemas are captured.
+    fn finalize_tools(&self, _reg: &mut ToolRegistry) {}
 }
 
 /// The kernel-default policy factory: builds [`NoPolicy`] policies and
@@ -1105,10 +1109,12 @@ impl AgentPolicy for DeclarativePolicy {
         self.inner.volatile_tail(caps).await
     }
     async fn tool_surface(&self) -> ToolSurface {
-        // The ungated engine form: advertise None — the registry is
-        // already narrowed at registration by the factory clone — and
-        // gate Free (no workflow state ever gates a session).
-        self.inner.tool_surface().await
+        // The registry is narrowed at spawn, but an unset advertisement filter
+        // falls back to the unwired workflow's read-only Complete surface.
+        ToolSurface {
+            advertise: Some(crate::tool::ToolFilter::Free),
+            gate: Some(crate::tool::ToolFilter::Free),
+        }
     }
     async fn gate_call(&self, name: &str, args: &Value) -> GateVerdict {
         for (rule, pattern) in self.guardrails.gate_rules.iter().zip(&self.arg_patterns) {

@@ -358,6 +358,26 @@ describe("countGitMutations", () => {
     expect(countGitMutations(transcript)).toBe(5);
   });
 
+  it("counts a mutation bundled into a mixed card (the call's own name wins)", () => {
+    // Regression (review round 1, H3): the entry name is the run's FIRST call,
+    // so a git mutation riding a card led by read_files must still count.
+    const transcript = [
+      {
+        kind: "tool" as const,
+        name: "read_files",
+        calls: [
+          { name: "read_files", args: '{"path":"a.rs"}', result: { success: true } },
+          {
+            name: "git",
+            args: '{"subcommand":"commit","message":"m"}',
+            result: { success: true },
+          },
+        ],
+      },
+    ];
+    expect(countGitMutations(transcript)).toBe(1);
+  });
+
   it("returns 0 for an empty transcript", () => {
     expect(countGitMutations([])).toBe(0);
   });

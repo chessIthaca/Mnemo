@@ -109,6 +109,12 @@ fn event_fixtures_match_serde() {
             },
         ),
         (
+            "event-tool-execution-start",
+            SerializableAgentEvent::ToolExecutionStart {
+                tool_call_id: "call-1".into(),
+            },
+        ),
+        (
             "event-tool-output-delta",
             SerializableAgentEvent::ToolOutputDelta {
                 tool_call_id: "call-1".into(),

@@ -759,8 +759,10 @@ impl Workflow {
     /// skeleton is locked — `steps` replacement is refused in every state, and
     /// `steps` append is refused except in `Reviewing` (backlog 37f8631a: the
     /// follow-on window — a review-surfaced fix becomes a checkable appended
-    /// step; it stays unchecked through the review, and a crash mid-follow-on
-    /// resumes with it as the active step);
+    /// step; it stays unchecked through the review, a crash mid-follow-on
+    /// resumes with it as the active step, and `finish` ticks it on the
+    /// Reviewing → Complete transition so the completed frame shows no open
+    /// checkbox);
     /// title/goal/context/regression_test/landed_design updates are always
     /// allowed.
     pub fn update_plan(&mut self, update: PlanUpdate<'_>) -> Result<()> {
@@ -775,7 +777,8 @@ impl Workflow {
         // only; bug plans included — the Reviewing append window, backlog
         // 37f8631a). Two invariants hold: complete_step stays hidden in Reviewing
         // (steps can't be checked off mid-review; finish still gates the exit
-        // on the review report), and the reviewer subagent never sees the tool
+        // on the review report and ticks any still-unchecked step on the way
+        // out), and the reviewer subagent never sees the tool
         // at all (ToolFilter::Reviewer strict allow-list never names
         // plan-mutation tools; every subagent additionally runs with
         // plan_mutations_allowed(false), enforced at dispatch). The
@@ -804,7 +807,8 @@ impl Workflow {
         // mid-follow-on resumes with the step as the active item (the reload
         // derives Executing from the unchecked step; completing it returns to
         // Reviewing). Appended steps stay unchecked through the review
-        // (complete_step is hidden mid-review); finish does not gate on them.
+        // (complete_step is hidden mid-review); finish does not gate on them
+        // and ticks them on the Reviewing → Complete transition.
         if frame.plan.kind == PlanKind::BugFixing
             && steps.is_some()
             && !(self.state == WorkflowState::Reviewing && append)
@@ -1065,6 +1069,24 @@ impl Workflow {
                 current: self.state.to_string(),
                 expected: WorkflowState::Reviewing.to_string(),
             });
+        }
+        // A Complete plan must never render an open checkbox (plan-frame
+        // bookkeeping, live case .coding/plans/8813e7ab.md): complete_step is
+        // hidden in Reviewing, so steps appended there via update_plan
+        // append=true were never ticked and the finished frame showed open
+        // items. Tick every still-unchecked step (top-level + detailed) in
+        // memory, then persist the marks onto the frame WITHOUT re-serializing
+        // the model — FinishTool appends the `## Cost report` section to the
+        // file just before this transition, and a serialize() rewrite would
+        // drop it.
+        if let Some(frame) = self.stack.last_mut() {
+            frame.plan.complete_all_steps();
+            // Persist even when nothing flipped: a retried finish after a
+            // transient write error must heal the frame (the in-memory tick
+            // already happened on the failed attempt), and the flip is
+            // idempotent and byte-preserving (review L2).
+            let plans_dir = &self.plans_dir;
+            frame.plan.persist_completed_marks(plans_dir, &frame.id)?;
         }
         self.state = WorkflowState::Complete;
         self.reviewed = true;
@@ -3417,6 +3439,17 @@ impl crate::agent::workflow_handle::AgentWorkflowHandle
             wf.plan().map(|p| p.title.clone()),
             wf.plan().map(|p| p.goal.clone()),
         )
+    }
+
+    async fn plan_recall_text(&self) -> Option<String> {
+        // Backlog c68a8c3b: the goal+context block the auto-recall query
+        // embeds alongside the last user message (task-scoped ranking).
+        // The same plan fields the volatile tail's workflow section
+        // renders (workflow_policy.rs); the kernel caps and shapes the
+        // query (recall_query_text).
+        let wf = self.lock().await;
+        let plan = wf.plan()?;
+        Some(format!("{}\n{}", plan.goal, plan.context))
     }
 
     async fn active_skill_name(&self) -> Option<String> {

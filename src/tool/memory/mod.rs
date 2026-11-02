@@ -4,8 +4,10 @@
 
 //! Memory tools — `memory_write`, `memory_recall`, `memory_consolidate`, plus the
 //! hygiene tools `memory_update`, `memory_amend`, `memory_supersede`, `memory_delete`,
-//! `memory_list`, and the Phase-3 retrieval tools `plans_search`, `reviews_search`,
-//! `past_fixes`, `context_pack` (in [`retrieval`]).
+//! `memory_list`, the session-dismissal tool `recall_feedback` (backlog c68a8c3b —
+//! a per-loop Arc shared with the auto-recall injector), and the Phase-3 retrieval
+//! tools `memory_search`, `plans_search`, `reviews_search`, `past_fixes`,
+//! `context_pack` (in [`retrieval`]).
 //!
 //! Always available regardless of workflow state. All are auto-run — they
 //! only touch the project's own memory store (sandboxed bookkeeping), so they
@@ -22,6 +24,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::memory::auto_typing::{self, TypingDecision};
+use crate::memory::plan_scope;
 use crate::memory::classifier::Classifier;
 use crate::memory::consolidation::consolidate_session;
 use crate::memory::indexer::{index_derived, reindex_knowledge_files};
@@ -262,11 +265,17 @@ impl Tool for MemoryWriteTool {
             None => None,
         };
         let record_type = MemoryRecordType::from_title(&title);
+        // Plan-scoped notes (plan id / branch references) are only true while
+        // the plan lives: file them episodic + tagged, and keep them out of
+        // the durable knowledge store, so closing the plan can retire them.
+        let scope = plan_scope::scoped_tier(tier, &title, &args.content);
+        let rerouted = scope.tier != tier;
+        let tier = scope.tier;
         // Knowledge-backed typed write: the record's FILE is the truth — the
         // body is UNBOUNDED (the indexer budgets the derived digest, so the
         // digest stays a budgeted pointer while the file carries everything).
         let is_knowledge_type = record_type != MemoryRecordType::None
-            && knowledge::dir_for_record_type(record_type).is_some();
+            && knowledge::dir_for_record_type(record_type).is_some() && !scope.is_scoped();
         // Knowledge-backed write: the record's FILE is the truth —
         // write it, reindex the one file (the derived row), and report the
         // deterministic row id. Without a knowledge
@@ -331,7 +340,8 @@ impl Tool for MemoryWriteTool {
             }
         } else {
             let now = (self.now)();
-            let memory = Memory::new(tier, title.clone(), args.content, now);
+            let mut memory = Memory::new(tier, title.clone(), args.content, now);
+            memory.data = scope.data();
             match self.store.write(memory).await {
                 Ok(id) => {
                     // Human-readable confirmation (backlog 2026-08-20: "wrote
@@ -351,10 +361,20 @@ impl Tool for MemoryWriteTool {
                         msg.push_str(" — ");
                         msg.push_str(note);
                     }
+                    if scope.is_scoped() {
+                        msg.push_str(" — filed as a plan-scoped note");
+                        if rerouted {
+                            msg.push_str(" (episodic, not semantic)");
+                        }
+                        msg.push_str("; it references a plan/branch, so it is retired when the plan closes.");
+                        msg.push_str(" Store any durable fact separately, WITHOUT plan or branch references");
+                    }
                     ToolResult::success(msg).with_data(json!({
                         "id": id,
                         "tier": tier.as_str(),
                         "title": title,
+                        "plan_scoped": scope.is_scoped(),
+                        "plan_ids": scope.plan_ids,
                         "auto_typed": typing_note,
                     }))
                 }
@@ -1275,7 +1295,7 @@ impl Tool for MemorySupersedeTool {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "The id of the memory being superseded (from recall/list output)."},
-                    "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "The successor's tier (same tiers as memory_write)."},
+                    "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "The successor's tier (same tiers as memory_write). A file-backed knowledge record's successor is always stored as semantic — a working/episodic/procedural request is stored as semantic instead of refused."},
                     "title": {"type": "string", "description": "The successor's title — keep the same typed prefix when the topic is unchanged."},
                     "content": {"type": "string", "description": "The successor's content."}
                 },
@@ -1295,26 +1315,35 @@ impl Tool for MemorySupersedeTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
-        let tier = match MemoryTier::from_str_opt(&args.tier) {
+        let mut tier = match MemoryTier::from_str_opt(&args.tier) {
             Some(t) => t,
             None => return ToolResult::error(format!("unknown tier '{}'", args.tier)),
         };
+        let requested_tier = tier;
         let old_id = args.id;
         let title = args.title;
-        // Knowledge-backed supersede: the record's FILE is the truth. The
-        // successor's tier must be a distilled tier (knowledge records are
-        // semantic rows — an episodic/working successor has no file home).
+        // Knowledge-backed supersede: the record's FILE is the truth, and a
+        // file-backed record's successor is ALWAYS a distilled (semantic)
+        // row — working/episodic/procedural rows have no file home. A
+        // requested non-semantic tier is therefore COERCED, never refused
+        // (2026-11-01 lead friction: `memory_supersede` with tier
+        // "procedural" on a file-backed record errored instead of doing the
+        // obvious thing, and the agent had to retry); the result says so.
         let knowledge_rel = match &self.knowledge {
             Some(support) => support.knowledge_for_id(&old_id).await.map(|kr| kr.rel),
             None => None,
         };
+        let tier_note = if knowledge_rel.is_some() && tier != MemoryTier::Semantic {
+            tier = MemoryTier::Semantic;
+            format!(
+                ". The successor is stored as semantic (file-backed records are always \
+                 semantic), not {}",
+                requested_tier.as_str()
+            )
+        } else {
+            String::new()
+        };
         if let Some(old_rel) = knowledge_rel {
-            if tier != MemoryTier::Semantic {
-                return ToolResult::error(format!(
-                    "knowledge record {old_id} lives in a file — the successor must be \
-                     semantic (the record file carries the truth)"
-                ));
-            }
             let Some(support) = &self.knowledge else {
                 return ToolResult::error(format!(
                     "knowledge record {old_id} exists but the file backing is not wired"
@@ -1352,7 +1381,8 @@ impl Tool for MemorySupersedeTool {
                     let msg = format!(
                         "Superseded knowledge record {old_id} with \"{title}\" — old file \
                          .coding/knowledge/{old_rel} marked superseded (history), successor \
-                         at .coding/knowledge/{new_rel}{pointer_note}; memory rows re-indexed"
+                         at .coding/knowledge/{new_rel}{pointer_note}; memory rows re-indexed\
+                         {tier_note}"
                     );
                     ToolResult::success(msg).with_data(json!({
                         "id": new_id,
@@ -1502,6 +1532,107 @@ impl Tool for MemoryDeleteTool {
                 Err(e) => ToolResult::error(format!("failed to delete memory: {e}")),
             }
         }
+    }
+}
+
+/// Per-session dismissal of auto-recalled rows (backlog c68a8c3b).
+///
+/// The agent calls this after judging recall rows as noise: the ids are
+/// the `(id: ...)` values printed in the volatile tail's RECALLED
+/// MEMORIES block. Dismissal is SESSION-SCOPED — the tool and this loop's
+/// auto-recall injector share ONE `Arc<Mutex<HashSet>>` (the factory mints
+/// it per built loop), and the store is never touched: a dismissed row
+/// still ranks in `memory_search` and re-derives normally next session.
+pub struct RecallFeedbackTool {
+    /// Dismissed record ids, shared with this agent loop's injector.
+    dismissed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl RecallFeedbackTool {
+    /// Wire the tool to the per-loop dismissal set — the same Arc the
+    /// loop's injector filters on (see `AgentLoop::with_dismissed_recall`).
+    pub fn new(dismissed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>) -> Self {
+        Self { dismissed }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RecallFeedbackArgs {
+    dismissed: Vec<String>,
+}
+
+#[async_trait]
+impl Tool for RecallFeedbackTool {
+    fn name(&self) -> &str {
+        "recall_feedback"
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Memory
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "recall_feedback",
+            "Dismiss noisy auto-recalled memories for the REST of this session. Call it when the \
+             RECALLED MEMORIES block surfaces rows irrelevant to the active task — pass their \
+             (id: ...) values. Dismissed rows never re-inject this session (the store is \
+             untouched; they rank again next session and stay reachable via memory_search).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "dismissed": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The memory ids to dismiss — the (id: ...) values from the RECALLED MEMORIES block."
+                    }
+                },
+                "required": ["dismissed"]
+            }),
+        )
+    }
+
+    fn safety(&self) -> SafetyLevel {
+        // Session-scoped prompt-rendering bookkeeping only — never prompts
+        // for approval.
+        SafetyLevel::AutoRun
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> ToolResult {
+        let args: RecallFeedbackArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => {
+                return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(
+                    self.name(),
+                    &e,
+                ))
+            }
+        };
+        if args.dismissed.is_empty() {
+            return ToolResult::error(
+                "dismissed must name at least one memory id — the (id: ...) values from the RECALLED MEMORIES block.",
+            );
+        }
+        let mut set = match self.dismissed.lock() {
+            Ok(set) => set,
+            Err(_) => {
+                return ToolResult::error(
+                    "the dismissal set is unavailable (poisoned lock); nothing was dismissed",
+                )
+            }
+        };
+        let newly = args
+            .dismissed
+            .iter()
+            .filter(|id| set.insert((*id).clone()))
+            .count();
+        let total = set.len();
+        drop(set);
+        ToolResult::success(format!(
+            "{newly} dismissed ({total} total this session): they will not be auto-recalled again \
+             this session. The store is untouched — memory_search still finds them, and future \
+             sessions re-derive normally."
+        ))
     }
 }
 
@@ -2492,6 +2623,50 @@ mod tests {
         assert_eq!(data["title"], "auth fact");
     }
 
+    /// Plan/branch-referencing notes are filed episodic + tagged with the
+    /// plan id; a plain SPEC stays semantic and untagged.
+    #[tokio::test]
+    async fn plan_scoped_note_is_filed_episodic_and_tagged() {
+        let store = make_store();
+        let tool = MemoryWriteTool::new(store.clone());
+        let r = tool
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: Pac-Man Game module contract",
+                "content": "Plan 64694f06, branch feature/pacman-game. src/game.js exports Game."
+            }))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.output.contains("plan-scoped"), "{}", r.output);
+        assert!(r.output.contains("WITHOUT plan or branch references"), "{}", r.output);
+        let plain = tool
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: Game export",
+                "content": "Game is a named ES-module export."
+            }))
+            .await;
+        assert!(plain.success && !plain.output.contains("plan-scoped"), "{}", plain.output);
+
+        let all = store
+            .list_filtered(&MemoryFilter::new())
+            .await
+            .unwrap();
+        let scoped = all.iter().find(|m| m.title.contains("module contract")).unwrap();
+        assert_eq!(scoped.tier, MemoryTier::Episodic);
+        assert_eq!(scoped.data["plan_ids"][0], "64694f06");
+        let durable = all.iter().find(|m| m.title == "SPEC: Game export").unwrap();
+        assert_eq!(durable.tier, MemoryTier::Semantic);
+        assert!(durable.data.is_null());
+
+        let notes = crate::memory::plan_scope::settle_plan_memories(store.as_ref(), "64694f06")
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        let left = store.list_filtered(&MemoryFilter::new()).await.unwrap();
+        assert_eq!(left.len(), 1);
+    }
+
     /// Every tier gets its own human phrase (+ its tier word), and none of
     /// them leak the id.
     #[tokio::test]
@@ -3022,6 +3197,126 @@ mod tests {
         assert!(result.success, "{}", result.output);
         assert!(result.output.contains("postgres"), "{}", result.output);
         assert!(result.output.contains("[superseded]"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn supersede_file_backed_record_stores_semantic_instead_of_refusing() {
+        // 2026-11-01 lead friction: `memory_supersede` with tier "procedural"
+        // on a file-backed record was REFUSED ("the successor must be
+        // semantic") instead of doing the obvious thing — the caller had to
+        // retry. A file-backed predecessor's successor is always semantic
+        // (working/episodic/procedural rows have no file home), so the tool
+        // coerces the tier and says so in the result.
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, write, _update, supersede, _delete) =
+            make_knowledge_tools(&dir, store.clone());
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "HOW: release checklist",
+                "content": "Run the checklist. Body one.",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let write_data = result.data.expect("structured data");
+        let old_id = write_data["id"].as_str().unwrap().to_string();
+        let old_rel = write_data["knowledge"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches(".coding/knowledge/")
+            .to_string();
+        assert!(dir
+            .path()
+            .join(".coding/knowledge")
+            .join(&old_rel)
+            .exists());
+
+        let result = supersede
+            .execute(json!({
+                "id": old_id,
+                "tier": "procedural",
+                "title": "HOW: release checklist",
+                "content": "Run the checklist. Body two.",
+            }))
+            .await;
+        assert!(
+            result.success,
+            "a non-semantic tier is coerced, never refused: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("stored as semantic (file-backed records are always semantic)"),
+            "the result says which tier was stored: {}",
+            result.output
+        );
+        assert!(result.output.contains("not procedural"), "{}", result.output);
+        let data = result.data.expect("structured data");
+        assert_eq!(
+            data["tier"], "semantic",
+            "the reported tier is what was stored"
+        );
+        let new_id = data["id"].as_str().unwrap().to_string();
+        let new_rel = data["knowledge"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches(".coding/knowledge/")
+            .to_string();
+        let new_file = dir.path().join(".coding/knowledge").join(&new_rel);
+        let text = std::fs::read_to_string(&new_file).unwrap();
+        assert!(text.contains("Run the checklist. Body two."), "{text}");
+        // The predecessor FILE stays as history, flipped to superseded.
+        let old_text = std::fs::read_to_string(
+            dir.path().join(".coding/knowledge").join(&old_rel),
+        )
+        .unwrap();
+        assert!(old_text.contains("status = \"superseded\""), "{old_text}");
+        assert!(old_text.contains("Body one."), "{old_text}");
+        let m = store.get_memory(&old_id).await.unwrap().unwrap();
+        assert_eq!(m.superseded_by.as_deref(), Some(new_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn supersede_db_native_record_keeps_the_requested_tier() {
+        // Non-file-backed rows behave exactly as before: the requested tier
+        // is stored as asked and no coercion note appears.
+        let store = make_store();
+        let write = MemoryWriteTool::new(store.clone());
+        let supersede = MemorySupersedeTool::new(store.clone());
+        let result = write
+            .execute(json!({
+                "tier": "procedural",
+                "title": "a reusable workflow",
+                "content": "step one",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let old_id = result.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        let result = supersede
+            .execute(json!({
+                "id": old_id,
+                "tier": "procedural",
+                "title": "a reusable workflow",
+                "content": "step two",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            !result.output.contains("stored as semantic"),
+            "no tier coercion for a DB-native row: {}",
+            result.output
+        );
+        let data = result.data.expect("structured data");
+        assert_eq!(
+            data["tier"], "procedural",
+            "the requested tier is stored as asked"
+        );
+        let new_id = data["id"].as_str().unwrap().to_string();
+        let m = store.get_memory(&new_id).await.unwrap().unwrap();
+        assert_eq!(m.tier, MemoryTier::Procedural);
     }
 
     #[tokio::test]

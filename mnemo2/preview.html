@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#141510" />
+    <meta name="robots" content="noindex" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Mnemo2 preview</title>
+    <!-- Dev-only page: `vite` serves it, `vite build` never builds it. See README. -->
+    <style>
+      /* The scene index (unknown or missing ?scene=). Scenes render the real shell. */
+      .preview-index {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        height: 100%;
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 56px 24px;
+        overflow-y: auto;
+        color: var(--ink);
+        font-family: var(--font-ui);
+        font-size: var(--text-body);
+      }
+      .preview-index h1 { margin: 0; font-size: var(--text-page); font-weight: 650; }
+      .preview-index p { margin: 0; color: var(--muted); line-height: 1.6; }
+      .preview-index .preview-index-unknown { color: var(--danger); font-weight: 600; }
+      .preview-index ul { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+      .preview-index li {
+        display: grid;
+        gap: 2px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--surface);
+        box-shadow: var(--shadow-soft);
+      }
+      .preview-index a { color: var(--accent-strong); font-size: var(--text-title); font-weight: 650; text-decoration: none; }
+      .preview-index a:hover { text-decoration: underline; }
+      .preview-index span { color: var(--muted); line-height: 1.5; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/preview/main.ts"></script>
+  </body>
+</html>

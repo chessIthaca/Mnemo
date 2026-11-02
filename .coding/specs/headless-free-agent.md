@@ -328,7 +328,7 @@ impl AgentSession {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
     Prompt { text: String, images: Vec<String> },
-    Steer { text: String },
+    Steer { text: String, images: Vec<String> },  // images is #[serde(default)]: legacy steer JSON without the key still decodes
     CancelSteer { text: String },
     Interrupt, Compact, Clear,
     Approve { request_id: String, decision: Approval },  // only reachable under ApproveViaApi

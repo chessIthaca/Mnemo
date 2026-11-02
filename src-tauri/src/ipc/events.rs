@@ -2050,6 +2050,10 @@ mod watchdog_note_tests {
                 index: 0,
                 fragment: "{".into(),
             },
+            // Execution-start marker (plan b2052a9c): display-only, skipped.
+            SerializableAgentEvent::ToolExecutionStart {
+                tool_call_id: "t".into(),
+            },
             SerializableAgentEvent::ToolResult {
                 tool_call_id: "t".into(),
                 result: mnemo::tool::ToolResult::success("ok"),

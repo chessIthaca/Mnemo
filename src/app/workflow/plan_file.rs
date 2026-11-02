@@ -15,6 +15,25 @@ use crate::error::Result;
 pub use crate::memory::plan_format::{PlanFile, PlanKind, ReviewRoundStamp, Step};
 use crate::memory::plan_format::{extract_bold_header, parse_checkbox};
 
+/// Flip one checkbox line's mark to done, preserving its indentation and the
+/// raw text after `] `. Returns `None` when the line is not an unchecked
+/// checkbox (already done, a plain bullet, or prose).
+fn tick_checkbox_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    match parse_checkbox(trimmed) {
+        Some((false, _)) => {
+            let indent_len = line.len() - trimmed.len();
+            let (indent, _) = line.split_at(indent_len);
+            // Everything after the `]` survives verbatim — the separating
+            // space, extra spaces, a step number, or an empty remainder
+            // (`- [ ]` becomes `- [x]`, with no injected trailing space).
+            let after_mark = trimmed.strip_prefix("- [")?.split_once(']')?.1;
+            Some(format!("{indent}- [x]{after_mark}"))
+        }
+        _ => None,
+    }
+}
+
 impl PlanFile {
     /// Create a new plan with the given title, goal, context, and unchecked steps.
     pub fn new(
@@ -46,6 +65,10 @@ impl PlanFile {
             landed_design: false,
             detailed_steps: None,
             reviews: Vec::new(),
+            decisions: None,
+            interfaces: None,
+            acceptance: None,
+            progress: None,
             steps,
         }
     }
@@ -53,12 +76,16 @@ impl PlanFile {
     /// Serialize the plan back to markdown.
     pub fn serialize(&self) -> String {
         let mut out = format!(
-            "# Plan: {}\n\n## Goal\n{}\n\n## Kind\n{}\n\n## Context\n{}\n\n## Steps\n",
+            "# Plan: {}\n\n## Goal\n{}\n\n## Kind\n{}\n\n## Context\n{}\n\n",
             self.title,
             self.goal,
             self.kind.as_str(),
             self.context
         );
+        if let Some(acceptance) = &self.acceptance {
+            out.push_str(&format!("## Acceptance scenarios\n{acceptance}\n\n"));
+        }
+        out.push_str("## Steps\n");
         for step in &self.steps {
             let mark = if step.done { 'x' } else { ' ' };
             out.push_str(&format!("- [{}] {}. {}\n", mark, step.index + 1, step.text));
@@ -80,6 +107,18 @@ impl PlanFile {
             for stamp in &self.reviews {
                 out.push_str(&format!("{} {}\n", stamp.round, stamp.base));
             }
+        }
+        if let Some(decisions) = &self.decisions {
+            out.push_str(&format!("\n## Decisions\n{decisions}\n"));
+        }
+        if let Some(interfaces) = &self.interfaces {
+            out.push_str(&format!("
+## Interfaces
+{interfaces}
+"));
+        }
+        if let Some(progress) = &self.progress {
+            out.push_str(&format!("\n## Progress\n{progress}\n"));
         }
         out
     }
@@ -217,6 +256,39 @@ impl PlanFile {
         Ok(format!("{done}/{total} detailed steps done — {preview}"))
     }
 
+    /// Mark every still-unchecked step done — the top-level `## Steps`
+    /// checkboxes and every unchecked checkbox in `## Detailed steps` —
+    /// returning the number of marks flipped.
+    ///
+    /// Used at the Reviewing → Complete transition (plan-frame bookkeeping,
+    /// live case `.coding/plans/8813e7ab.md`): `complete_step` is hidden in
+    /// Reviewing by design, so steps appended there via `update_plan
+    /// append=true` could never be ticked, and a completed plan rendered open
+    /// checkboxes (steps 8-13). A Complete plan must never show an open
+    /// checkbox. Every step's TEXT is preserved verbatim — only the marks
+    /// change (the frame is the crash-resumption document; never drop steps).
+    pub fn complete_all_steps(&mut self) -> usize {
+        let mut flipped = 0usize;
+        for step in self.steps.iter_mut().filter(|s| !s.done) {
+            step.done = true;
+            flipped += 1;
+        }
+        if let Some(body) = self.detailed_steps.as_mut() {
+            let mut lines: Vec<String> = Vec::new();
+            for line in body.lines() {
+                match tick_checkbox_line(line) {
+                    Some(ticked) => {
+                        flipped += 1;
+                        lines.push(ticked);
+                    }
+                    None => lines.push(line.to_string()),
+                }
+            }
+            *body = lines.join("\n");
+        }
+        flipped
+    }
+
     /// Whether marking `step_index` done would complete the plan: the step
     /// is in range, not already done, and every other step is done. Used by
     /// the dispatch layer's review-exit gate to detect the FINAL
@@ -237,6 +309,61 @@ impl PlanFile {
     pub fn write_to_dir(&self, plans_dir: &Path, id: &str) -> Result<PathBuf> {
         let path = plans_dir.join(format!("{id}.md"));
         std::fs::write(&path, self.serialize())?;
+        Ok(path)
+    }
+
+    /// Persist the completed marks onto the on-disk frame WITHOUT
+    /// re-serializing the model: flip every unchecked checkbox mark to
+    /// `- [x]` line by line, preserving indentation and the raw text after
+    /// `] `, and preserving every other line verbatim.
+    ///
+    /// [`complete_all_steps`](Self::complete_all_steps) ticks the in-memory
+    /// model; this makes the frame agree with it. A plain
+    /// [`write_to_dir`](Self::write_to_dir) rewrite is deliberately avoided at
+    /// finish time: the per-plan `## Cost report` section is appended to the
+    /// frame just before the Reviewing → Complete transition, and
+    /// re-serializing the model over the file would silently drop it. Falls
+    /// back to a full write only when the frame file does not exist.
+    pub fn persist_completed_marks(&self, plans_dir: &Path, id: &str) -> Result<PathBuf> {
+        let path = plans_dir.join(format!("{id}.md"));
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return self.write_to_dir(plans_dir, id);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // Preserve every byte outside the checkbox marks — including the
+        // file's line-ending style (LF/CRLF) and trailing-newline shape — and
+        // flip marks ONLY inside the plan's step sections: a `- [ ]` literal
+        // quoted in Goal/Context (a bug-symptom fixture, a pasted findings
+        // list) is prose, not a step, and must survive untouched (review L1).
+        let mut in_step_section = false;
+        let mut out = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            let (content, terminator) = match line.strip_suffix('\n') {
+                Some(without_lf) => match without_lf.strip_suffix('\r') {
+                    Some(without_crlf) => (without_crlf, "\r\n"),
+                    None => (without_lf, "\n"),
+                },
+                None => (line, ""),
+            };
+            if let Some(header) = content.trim_start().strip_prefix("## ") {
+                let header = header.trim_end();
+                in_step_section = header == "Steps" || header == "Detailed steps";
+            }
+            let ticked = if in_step_section {
+                tick_checkbox_line(content)
+            } else {
+                None
+            };
+            match ticked {
+                Some(ticked) => out.push_str(&ticked),
+                None => out.push_str(content),
+            }
+            out.push_str(terminator);
+        }
+        std::fs::write(&path, out)?;
         Ok(path)
     }
 
@@ -660,6 +787,103 @@ Some context
     }
 
     #[test]
+    fn complete_all_steps_ticks_every_open_mark() {
+        // Plan-frame bookkeeping (live case .coding/plans/8813e7ab.md): a
+        // Complete plan must never render an open checkbox, including steps
+        // appended during Reviewing (complete_step is hidden there). The tick
+        // covers the top-level `## Steps` marks AND the `## Detailed steps`
+        // checkboxes, preserving every step's text.
+        let mut plan = PlanFile::new("T", "G", "C", vec!["a".into(), "b".into(), "c".into()]);
+        plan.complete_step(0).unwrap();
+        plan.detailed_steps = Some(
+            "- [x] Reproduce — run the test\n- [ ] Fix — guard src/app.rs:42\n- [ ] Verify — cargo test"
+                .into(),
+        );
+        assert_eq!(plan.complete_all_steps(), 4); // b, c + 2 detailed
+        assert!(plan.is_complete());
+        assert_eq!(plan.completed_count(), 3);
+        let body = plan.detailed_steps.as_deref().unwrap();
+        assert!(!body.contains("- [ ]"), "{body}");
+        assert!(body.contains("- [x] Fix — guard src/app.rs:42"), "{body}");
+        // Idempotent: nothing left to flip.
+        assert_eq!(plan.complete_all_steps(), 0);
+        // Every mark round-trips through serialize→parse.
+        let parsed = PlanFile::parse(&plan.serialize()).unwrap();
+        assert!(parsed.is_complete());
+        assert!(
+            !parsed.detailed_steps.as_deref().unwrap().contains("- [ ]"),
+            "the detailed marks must round-trip"
+        );
+    }
+
+    #[test]
+    fn persist_completed_marks_preserves_appended_sections() {
+        // finish ticks the frame on disk by flipping ONLY checkbox marks: the
+        // per-plan `## Cost report` section appended by FinishTool before the
+        // transition must survive verbatim (re-serializing the model over the
+        // file would silently drop it).
+        let dir = tempdir().unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let mut plan = PlanFile::new("T", "G", "C", vec!["a".into(), "b".into()]);
+        let path = plan.write_to_dir(&plans_dir, "abc123").unwrap();
+        let with_report = format!(
+            "{}\n## Cost report\n\n3 request(s), 4100 tokens\n",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        std::fs::write(&path, with_report).unwrap();
+        assert_eq!(plan.complete_all_steps(), 2);
+        plan.persist_completed_marks(&plans_dir, "abc123").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("- [ ]"), "{text}");
+        assert!(text.contains("- [x] 1. a"), "{text}");
+        assert!(text.contains("- [x] 2. b"), "{text}");
+        assert!(
+            text.contains("## Cost report\n\n3 request(s), 4100 tokens"),
+            "the appended cost report must survive the mark flip:\n{text}"
+        );
+        // The on-disk frame agrees with the model.
+        assert!(PlanFile::read_from_file(&path).unwrap().is_complete());
+        // A hand-edited CRLF frame keeps its line endings — only marks flip.
+        std::fs::write(&path, "## Steps\r\n- [ ] 1. a\r\n- [ ] 2. b\r\n").unwrap();
+        plan.persist_completed_marks(&plans_dir, "abc123").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "## Steps\r\n- [x] 1. a\r\n- [x] 2. b\r\n"
+        );
+        // A missing frame is recreated fully ticked via the write_to_dir
+        // fallback (review L3).
+        std::fs::remove_file(&path).unwrap();
+        plan.persist_completed_marks(&plans_dir, "abc123").unwrap();
+        let recreated = std::fs::read_to_string(&path).unwrap();
+        assert!(!recreated.contains("- [ ]"), "{recreated}");
+        assert!(PlanFile::read_from_file(&path).unwrap().is_complete());
+    }
+
+    #[test]
+    fn persist_completed_marks_skips_checkbox_literals_outside_steps() {
+        // A `- [ ]` literal quoted in Goal or Context (a bug-symptom fixture,
+        // a pasted findings list) is prose, not a step — only the
+        // `## Steps` / `## Detailed steps` marks flip (review L1).
+        let dir = tempdir().unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let mut plan = PlanFile::new(
+            "T",
+            "- [ ] goal literal",
+            "Context quotes the fixture:\n- [ ] symptom literal",
+            vec!["a".into()],
+        );
+        let path = plan.write_to_dir(&plans_dir, "abc123").unwrap();
+        assert_eq!(plan.complete_all_steps(), 1);
+        plan.persist_completed_marks(&plans_dir, "abc123").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("- [ ] goal literal"), "{text}");
+        assert!(text.contains("- [ ] symptom literal"), "{text}");
+        assert!(text.contains("- [x] 1. a"), "{text}");
+    }
+
+    #[test]
     fn completed_count() {
         let mut plan = PlanFile::new("T", "G", "C", vec!["a".into(), "b".into(), "c".into()]);
         assert_eq!(plan.completed_count(), 0);
@@ -951,5 +1175,63 @@ C
         // A header containing `*` (e.g. a glob) is still extracted.
         let plan4 = PlanFile::new("T", "G", "C", vec!["**src/*.rs** — clean up".into()]);
         assert_eq!(plan4.steps[0].header.as_deref(), Some("src/*.rs"));
+    }
+
+    #[test]
+    fn decisions_and_progress_sections_roundtrip_and_stay_optional() {
+        let mut plan = PlanFile::new("T", "G", "C", vec!["one".into(), "two".into()]);
+        plan.steps[0].done = true;
+        plan.decisions = Some("- 2026-10-29: use serde\n- 2026-10-30: drop the cache".into());
+        plan.interfaces = Some("- 2026-10-29: `src/game.js` — exports `Game` (named)".into());
+        plan.progress = Some("- 2026-10-30 step 1 done: merged abc".into());
+        let text = plan.serialize();
+        assert!(text.contains("
+## Interfaces
+- 2026-10-29: `src/game.js`"), "{text}");
+        assert!(text.contains("\n## Decisions\n- 2026-10-29: use serde\n"), "{text}");
+        let parsed = PlanFile::parse(&text).unwrap();
+        assert_eq!(parsed.decisions, plan.decisions);
+        assert_eq!(parsed.interfaces, plan.interfaces);
+        assert_eq!(parsed.progress, plan.progress);
+        assert_eq!(parsed.steps.len(), 2);
+        assert!(parsed.steps[0].done);
+        assert_eq!(parsed.context, "C");
+        assert_eq!(parsed.serialize(), text);
+
+        // Mnemo1 plans carry neither section, and serialize without them.
+        let old = PlanFile::new("T", "G", "C", vec!["one".into()]);
+        assert!(old.decisions.is_none() && old.progress.is_none());
+        assert!(old.interfaces.is_none());
+        assert!(!old.serialize().contains("## Decisions"));
+        assert!(!old.serialize().contains("## Interfaces"));
+        assert!(!old.serialize().contains("## Progress"));
+    }
+
+    #[test]
+    fn acceptance_section_roundtrips_and_stays_optional() {
+        let mut plan = PlanFile::new("T", "G", "C", vec!["one".into()]);
+        plan.acceptance =
+            Some("- A restart reloads every record.\n- The export is byte-identical.".into());
+        let text = plan.serialize();
+        assert!(
+            text.contains(
+                "\n## Context\nC\n\n## Acceptance scenarios\n- A restart reloads every record.\n- The export is byte-identical.\n\n## Steps\n- [ ] 1. one\n"
+            ),
+            "{text}"
+        );
+        let parsed = PlanFile::parse(&text).unwrap();
+        assert_eq!(parsed.acceptance, plan.acceptance);
+        assert_eq!(parsed.context, "C");
+        assert_eq!(parsed.steps.len(), 1);
+        assert_eq!(parsed.serialize(), text);
+
+        // A plan without scenarios serializes exactly as before the section
+        // existed.
+        let old = PlanFile::new("T", "G", "C", vec!["one".into()]);
+        assert!(old.acceptance.is_none());
+        assert_eq!(
+            old.serialize(),
+            "# Plan: T\n\n## Goal\nG\n\n## Kind\nimplementation\n\n## Context\nC\n\n## Steps\n- [ ] 1. one\n"
+        );
     }
 }

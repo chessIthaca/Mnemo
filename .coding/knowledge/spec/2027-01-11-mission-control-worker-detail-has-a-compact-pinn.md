@@ -1,0 +1,6 @@
++++
+title = "Mission control worker detail has a compact pinned header"
+created = "2027-01-11"
++++
+
+mnemo2/src/components/WorkerDetail.svelte opens with a header pinned (position sticky) to the top of the .worker-detail scroll container, about 160px tall collapsed. It holds the avatar; a 16px title row whose status, kind/risk, model and tier chips share one height and centre line; the plan label; the brief clamped to about 3 lines with a fade cue; a right-aligned Show more / Show less toggle in a fixed .brief-controls row above the brief, so it never moves; the expanded brief capped at 40vh, scrolling inside the header; clickable workflow steps (TaskWorkflow `onselect`: Brief expands the brief, Implement opens Thread, Verify/Review open Review, Merge opens Review and scrolls to the merge panel); a compact action toolbar (Diff, Steer, Compact, Pause/Resume, Stop, Delete, same disabled rules and aria-labels); and the Thread/Review/Timeline tabs as its last row. Overflow detection is injectable (`measureBriefOverflow`) for jsdom tests. The thread does not repeat the brief as a synthetic "LEAD · dispatched" bubble (lib/workerThread.ts); the opening prompt appears once the first turn is saved.

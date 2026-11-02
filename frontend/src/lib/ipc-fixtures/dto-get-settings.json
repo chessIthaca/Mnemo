@@ -1,8 +1,7 @@
 {
   "config_dir": "/home/user/.mnemo",
   "context": {
-    "summarize_at_fill_rate": 0.5,
-    "proxy_cache_ceiling_tokens": 340000
+    "summarize_at_fill_rate": 0.5
   },
   "endpoints": [],
   "general": {

@@ -1,0 +1,6 @@
++++
+title = "Mnemo2 host macOS test builds double-embed Info.plist"
+created = "2027-01-11"
++++
+
+macOS dev/test builds of the `mnemo-app` crate double-embed `_EMBED_INFO_PLIST`. F1: `src-tauri/src/mnemo2/mod.rs`'s `context_uses_mnemo2_identifier` calls `tauri::generate_context!("mnemo2-app/tauri.conf.json")` without `test = true`; tauri-codegen emits `embed_info_plist!` for every non-test expansion on macOS dev builds, and the lib test binary contains both `run()` and the test, so embed_plist 1.2.2's reuse protection fails the compile. Fix: `generate_context!("mnemo2-app/tauri.conf.json", test = true)`. F2 (pre-existing since Phase 1): the lib's `mnemo2::run()` context plus `src-tauri/src/main.rs:1095`'s own context collide in the main-bin test target. Fix direction: add a `mnemo2` Cargo feature, cfg-gate `pub mod mnemo2` in `src-tauri/src/lib.rs`, declare `[[bin]] name="mnemo2" required-features=["mnemo2"]`, update native npm scripts/docs; verify default `cargo test --workspace` (main bin, feature off) and `cargo test -p mnemo-app --features mnemo2 --lib` (Mnemo2 lib tests). Reviewer report: .coding/reviews/2026-10-24-mnemo2-native-host-startup-fix-review.md, FINDINGS (1 high, 1 low).

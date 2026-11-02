@@ -213,7 +213,10 @@ impl KeySource {
 /// Shared with the provider trace log ([`crate::provider::trace`]) so the
 /// `.coding/logs/*.jsonl` files — which persist full request/response bodies
 /// that may embed secrets — get the same user-only restriction as `keys.toml`.
-pub(crate) fn restrict_permissions(path: &Path) -> std::io::Result<()> {
+///
+/// Public so the Mnemo2 shell can protect its run file (which carries a
+/// bearer token) the same way.
+pub fn restrict_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -224,7 +227,41 @@ pub(crate) fn restrict_permissions(path: &Path) -> std::io::Result<()> {
 
     #[cfg(windows)]
     {
-        restrict_permissions_windows(path)?;
+        use windows_sys::Win32::Foundation::GENERIC_ALL;
+        use windows_sys::Win32::Security::NO_INHERITANCE;
+        restrict_permissions_windows(path, GENERIC_ALL, NO_INHERITANCE)?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+/// Restrict a directory to the current user only, including what is created
+/// in it later.
+///
+/// - **Unix**: sets the mode to `0o700`.
+/// - **Windows**: the same user-only DACL as [`restrict_permissions`], but
+///   inherited by new files and folders inside. Without inheritance a file
+///   another process creates there gets an empty DACL, and nobody, its
+///   creator included, can open it again.
+pub fn restrict_dir_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+        // FILE_ALL_ACCESS, not GENERIC_ALL: an inheritable generic right is
+        // split into a second, inherit-only entry.
+        restrict_permissions_windows(path, FILE_ALL_ACCESS, SUB_CONTAINERS_AND_OBJECTS_INHERIT)?;
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -237,33 +274,37 @@ pub(crate) fn restrict_permissions(path: &Path) -> std::io::Result<()> {
 
 /// Windows user-only DACL via `windows-sys` (Quality M6).
 ///
-/// Builds a DACL that grants the current user `GENERIC_ALL` (full control)
-/// and attaches it via `SetNamedSecurityInfoW` with
+/// Builds a DACL that grants the current user `access` (full control) with
+/// `inheritance`, and attaches it via `SetNamedSecurityInfoW` with
 /// `DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION`. The
 /// `PROTECTED` flag prevents inherited ACEs from re-granting access, so only
 /// the current user can read/write the file.
 #[cfg(windows)]
-fn restrict_permissions_windows(path: &Path) -> std::io::Result<()> {
+fn restrict_permissions_windows(
+    path: &Path,
+    access: u32,
+    inheritance: windows_sys::Win32::Security::ACE_FLAGS,
+) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{LocalFree, GENERIC_ALL};
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
         SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT,
         TRUSTEE_IS_SID, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
+        ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
     // 1. Current user's SID (owned bytes; a SID is variable-length).
     let user_sid = current_user_sid()?;
 
-    // 2. One explicit-access entry: the user gets GENERIC_ALL (set, not
-    //    merged), no inheritance. TRUSTEE_IS_SID means ptstrName points at
+    // 2. One explicit-access entry: the user gets `access` (set, not
+    //    merged) with `inheritance`. TRUSTEE_IS_SID means ptstrName points at
     //    the SID bytes (cast to PWSTR — the union is discriminated by the form).
     let ea = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: GENERIC_ALL,
+        grfAccessPermissions: access,
         grfAccessMode: SET_ACCESS,
-        grfInheritance: NO_INHERITANCE,
+        grfInheritance: inheritance,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: 0,
@@ -518,5 +559,36 @@ api_key = "sk-xyz"
         fs::write(&path, "[x]\napi_key = \"k\"\n").unwrap();
         restrict_permissions(&path).unwrap();
         restrict_permissions(&path).unwrap();
+    }
+
+    /// A file created in a restricted folder after the fact (by another
+    /// process, without restricting it itself) stays readable and removable
+    /// by the user: the folder's entry is inherited.
+    #[test]
+    fn files_created_in_a_restricted_dir_stay_usable() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("run");
+        fs::create_dir(&sub).unwrap();
+        restrict_dir_permissions(&sub).unwrap();
+        restrict_dir_permissions(&sub).unwrap();
+        let late = sub.join("late.lock");
+        fs::write(&late, "token").unwrap();
+        assert_eq!(fs::read_to_string(&late).unwrap(), "token");
+        fs::remove_file(&late).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("icacls").arg(&sub).output().unwrap();
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            // One inheritable entry for the user, nobody else.
+            assert_eq!(text.matches(":(").count(), 1, "{text}");
+            assert!(text.contains("(OI)(CI)(F)"), "{text}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&sub).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
     }
 }

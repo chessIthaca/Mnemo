@@ -42,8 +42,8 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | **Multi-model routing** | Per-workflow-state model slots, per-model context/reasoning budgets, effort control, stop-boundary handling for exotic tokenizers. |
 | **Optional Laya classifier** | An opt-in "System 1" text classifier: a managed `laya-serve` sidecar — downloaded in Settings, auto-started/stopped by the app on 127.0.0.1 — answers typed questions (choice / score / yes-no) with calibrated probabilities for cheap decisions. Off by default — while it is off, nothing is called. Optional memory auto-typing corrects a record's typed prefix when the classifier is confident (needs a fine-tuned checkpoint; seed examples cover SPEC/DECISION/BUG/HOW), and optional failure triage classifies every tool/provider failure (transient / permanent / needs-user / flaky-test) to steer retries — read-only calls auto-retry without a model roundtrip — while every classified failure is logged with its true outcome so a startup fine-tune can retrain the checkpoint from real dispositions (managed mode) — and an optional kNN overlay (`failure_triage_knn`) learns from that same log immediately, embedding each failure with the local memory embedder and majority-voting the most similar logged failures (vote share = confidence; needs no `laya-serve`). Optional tool-choice steering (`steer_tool_choice`) lets the classifier pick how `search`/`search_read` auto-delegation routes a query — symbol / text / memory — instead of the shape heuristics, and every steered search is logged with its disposition (delegated? escaped?) to seed a fine-tune. Optional pre-prompt model routing (`routing` + a `[general.routing]` block) classifies each main-agent turn's task text as trivial vs architectural and — once enforcement is on and the answer clears the confidence gate — runs the turn on the configured cheap / capable model instead of the state/default chain, never overriding a skill, subagent or bug-fixing pin; it ships **shadow-first** (enforcement off by default), logging every decision and its outcome (task text → label/confidence → target → turn status, iterations, tool calls) to `routing.jsonl` for the fine-tune that must precede enforcement. Optional step-granular escalation lanes (`lane_medium` / `lane_high` / `escalate`, needing the same routing opt-in plus the compound reflex opt-in) classify each **plan step** in one call and serve it on the matching user-chosen model — a step keeps its configured model while a lane target is unset, the ladder re-asks only after a failed cycle, and it shares the same confidence gate and shadow-first switch. Optional harness-run verification (`[general.verify]`: `enabled` + `test_command` + `timeout_secs`, off by default and inert with an empty command) runs the project's own checks at each plan-step boundary — a successful skeleton `complete_step` — and appends a compact evidence note (exit status, distinct error lines, counts, always capped) to the tool result, so deterministic evidence costs no model roundtrip; a decided reflex `verify` action re-runs the checks harness-side and rides the note on the next request's prompt tail, and a hang is killed at `timeout_secs` and surfaced as a failure-shaped note. Optional budget caps (`[general.budget]`: `enabled` + `max_tokens_per_plan` (0 = off) / `max_escalations_per_plan` / `max_retries_per_lane`, off by default) make spend deterministic: a cap reached at a plan-step boundary PAUSES the plan through a pending question (continue for this plan / double the cap / end the turn) instead of killing it, a per-decision `spend_events` ledger traces every main plan request to its lane/model/reason, and `finish` appends a per-plan cost report — tokens per lane, lane per step, retries, escalations, deterministic checks, cache hits; real numbers only — to the plan file. |
 | **Parallel agents** | Spawn sub-agents for research or review; a Run-All backlog dispatches queued plans into parallel worktrees. |
-| **Token-optimizer levers** | Seven context-economy levers (`[general.optimizer]`, all on by default since 2027-01-25 — uncheck any in Settings → Savings): delta/skeleton re-reads, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, cache-safe lean-output nudges, and recall delta (a repeat auto-recall renders as a compact reference instead of re-sending the memory snippet) — each writing a `savings_events` row. Settable in **Settings → Savings**. |
-| **Desktop shell** | Tauri 2 + React UI, embedded WebView2 browser tab (Windows), headless REPL console mode, MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns. |
+| **Token-optimizer levers** | Seven context-economy levers (`[general.optimizer]`, all on by default since 2027-01-25 — uncheck any in Settings → Savings): delta/skeleton re-reads plus outline-first reads of big files, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, cache-safe lean-output nudges, and recall delta (a repeat auto-recall renders as a compact reference instead of re-sending the memory snippet) — each writing a `savings_events` row. Settable in **Settings → Savings**. |
+| **Desktop shell** | Tauri 2 + React UI, embedded WebView2 browser tab (Windows), headless REPL console mode, MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns (the warning retracts once the other instance exits; the instance marker is cleaned up on exit). |
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
 
@@ -175,6 +175,29 @@ npx tsc --noEmit           # type check (vitest hides type defects)
 npm test                   # frontend unit tests
 ```
 
+The Mnemo2 Phase 4 workspace is a separate Svelte 5 cockpit. In its native Tauri
+host the lead conversation and the worker team are real — one shared
+headless-engine `Engine` backs one streaming lead session and every worker
+session, each worker gets its own `wt/agent-*` branch and linked git worktree,
+and messages route both ways. The workbench shows actual lead plans, real Git
+diffs, and a native WebView2 browser; state and preferences are isolated per
+project. The browser-only Vite session has no engine behind
+it and says so instead of simulating. The interface is conversation-first: each
+task has its own lead-enforced workflow, and lead/worker model identities are
+visible in the UI. Durable reviews, exact-tip checks, finding resolution, local
+merge/revert, idempotent worker dispatch, and cumulative usage telemetry are
+enforced in the native host; workers have no cumulative token/cost budget, and
+nothing pushes or merges into `main`:
+
+```bash
+npm run dev:mnemo2         # http://127.0.0.1:5180 — browser (no engine)
+npm run dev:mnemo2:native  # Tauri host + real lead and team (run dev:mnemo2 first)
+npm run check:mnemo2       # svelte-check
+npm run test:mnemo2        # Vitest interaction + adapter + reducer tests
+npm run build:mnemo2       # -> target/mnemo2-dist
+npm run build:mnemo2:native
+```
+
 Two heavyweight optional cargo features exist on the library — `browser` (headless-browser tooling) and `embeddings` (local ONNX memory search) — plus a dev-only `test-support` feature for cross-crate test factories. The two heavyweight ones are off by default for light builds; the app always selects both.
 
 ## A few configs you should check right away
@@ -198,7 +221,7 @@ as written:
 
 ```toml
 [general.optimizer]
-delta_reads = false          # opt out: re-reads serve whole files again
+delta_reads = false          # opt out: first reads and re-reads serve whole files again
 compress_output = false      # opt out: command output is served verbatim
 archive = false              # opt out: large tool results are not archived
 compaction_survival = false  # opt out: no checkpoint or preserved decisions

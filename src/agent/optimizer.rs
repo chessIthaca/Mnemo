@@ -229,8 +229,8 @@ fn paths_from_call(tool: &str, arguments: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(files) = value.get("files").and_then(|f| f.as_array()) {
         for spec in files {
-            if let Some(path) = spec.get("path").and_then(|p| p.as_str()) {
-                out.push(path.to_string());
+            if let Some(spec) = crate::tool::agent::read_files::parse_spec(spec) {
+                out.push(spec.path);
             }
         }
     }
@@ -475,7 +475,9 @@ impl OptimizerState {
                 self.skeleton_serves.fetch_add(1, Ordering::Relaxed);
                 self.waste_tokens.fetch_add(after, Ordering::Relaxed);
             }
-            "delta_read" => {
+            // An outline is a FIRST read of a big file — not a re-read, so
+            // not waste.
+            "delta_read" | "outline" => {
                 self.reads_total.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
@@ -863,20 +865,21 @@ mod tests {
         let state = OptimizerState::default();
         state.record("skeleton", 400);
         state.record("delta_read", 100);
+        state.record("outline", 30);
         state.record("compression", 50);
         state.note_decisions(3);
         let snapshot = state.snapshot();
-        assert_eq!(snapshot.reads_total, 2, "skeleton + delta are both reads");
+        assert_eq!(snapshot.reads_total, 3, "skeleton, delta and outline are all reads");
         assert_eq!(snapshot.skeleton_serves, 1);
         assert_eq!(
-            snapshot.served_tokens, 550,
+            snapshot.served_tokens, 580,
             "every kind contributes what it served"
         );
         assert_eq!(snapshot.waste_tokens, 400, "only the skeleton is redundant");
         assert_eq!(snapshot.decisions_seen, 3);
         // A negative `after` (a re-expansion row) never underflows a counter.
         state.record("archive_expand", -100);
-        assert_eq!(state.snapshot().served_tokens, 550);
+        assert_eq!(state.snapshot().served_tokens, 580);
     }
 
     /// A report built from the given fill / served / waste signals.

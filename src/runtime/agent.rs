@@ -86,6 +86,55 @@ pub struct AgentTask {
 /// completing the plan (a genuine deadlock the user must break).
 const MAX_AUTO_CONTINUE: u32 = 12;
 
+#[cfg(test)]
+pub(crate) mod digest_test_gate {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// Controls one path-scoped digest pause without affecting other tests.
+    pub(crate) struct DigestTestControl {
+        pub(crate) entered: Arc<tokio::sync::Notify>,
+        pub(crate) release: Arc<tokio::sync::Notify>,
+    }
+
+    struct Gate {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    static GATE: OnceLock<
+        Mutex<std::collections::HashMap<std::path::PathBuf, Gate>>,
+    > = OnceLock::new();
+
+    pub(crate) fn install(plans_dir: std::path::PathBuf) -> DigestTestControl {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        GATE
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .expect("digest gate")
+            .insert(
+                plans_dir,
+                Gate {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                },
+            );
+        DigestTestControl { entered, release }
+    }
+
+    pub(crate) async fn wait(plans_dir: &std::path::Path) {
+        let gate = GATE
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .expect("digest gate")
+            .remove(plans_dir);
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+}
+
 /// Fire a background memory consolidation every N auto-continue turns so
 /// working-memory events are compressed + pruned proactively during long
 /// auto-continue chains, instead of accumulating unboundedly until exit.
@@ -379,7 +428,7 @@ impl AgentTask {
                         // the turn. Only fires during auto-continue chains, which
                         // is exactly when context pressure builds up.
                         if self.auto_continue_streak.is_multiple_of(CONSOLIDATE_EVERY_N_TURNS) {
-                            self.spawn_consolidation();
+                            self.spawn_consolidation().await;
                         }
                         // Unattended variant: the model may have ended its
                         // turn with a question despite the preamble's
@@ -1066,20 +1115,24 @@ impl AgentTask {
         // inbox-closed exit and the Cancel break above (there is no separate
         // Cancel-path spawn), so working-tier events are compressed + pruned
         // whenever a session ends.
-        self.spawn_consolidation();
-        let _ = fanin_tx.send((self.id, AgentEvent::Exited)).await;
+        self.spawn_consolidation().await;
+        let id = self.id;
+        // Release the loop (including a worktree's open codegraph SQLite
+        // connection) before announcing Exited. A closer waiting on that event
+        // may immediately remove the worktree folder.
+        drop(self);
+        let _ = fanin_tx.send((id, AgentEvent::Exited)).await;
     }
 
     /// Best-effort background consolidation of the current session's working
     /// memory into an episodic summary (+ semantic/procedural extraction when
     /// an LLM is available), then prune the raw working-tier events.
     ///
-    /// Fire-and-forget: spawns a task holding `Arc` clones of the store +
-    /// provider + session id, so it runs safely after this `AgentTask` is
-    /// dropped. Never blocks the caller (used on both the Cancel and the
-    /// natural-termination paths so the agent exits promptly). No-op when
-    /// there is no memory store or no active session.
-    fn spawn_consolidation(&self) {
+    /// Finish the worktree corpus digest before releasing the agent loop, then
+    /// run the remaining memory/session consolidation in the background. This
+    /// lets `AgentSession::close_and_wait` prove that no later task still needs
+    /// to read the checkout while avoiding a wait for consolidation's LLM call.
+    async fn spawn_consolidation(&self) {
         if let Some(store) = self.agent_loop.memory_handle() {
             if let Some(sid) = &self.session_id {
                 // Dedup guard: if a consolidation is already in flight for
@@ -1096,55 +1149,34 @@ impl AgentTask {
                 let store = store.clone();
                 let provider = self.agent_loop.provider();
                 let sid = sid.clone();
-                // 2a.8: the policy's session-end hook consults inside the
-                // task (the caller's never-blocks promise holds; the hook
-                // precedes the memory session teardown). NoPolicy's hook is
-                // a no-op; WorkflowPolicy's is a documented no-op until the
-                // 2b/2c engine seam — the advisory seam, master-spec :230.
-                let agent_loop = self.agent_loop.clone();
-                // RAII guard: clears the dedup flag when the spawned task
-                // ends (success, failure, OR panic — Drop runs during
-                // unwinding). Moved into the task below.
+                let policy = self.agent_loop.policy();
                 let guard = ConsolidationFlagGuard {
                     flag: self.consolidation_in_flight.clone(),
                 };
-                // Digest the accumulated plan/review corpus so extraction
-                // merges this session's knowledge with what earlier
-                // plans/reviews established (learning across sessions).
-                // N5 (2026-06-14): the digest reads up to ~20 files sync —
-                // compute it INSIDE the spawned task (owned paths moved in)
-                // so the agent's exit path never blocks on disk I/O, keeping
-                // this function's "never blocks the caller" promise true.
                 let plans_dir = self.agent_loop.plans_dir().to_path_buf();
                 let reviews_dir = plans_dir
                     .parent()
                     .map(|p| p.join("reviews"))
                     .unwrap_or_else(|| std::path::PathBuf::from(".coding/reviews"));
+                #[cfg(test)]
+                digest_test_gate::wait(&plans_dir).await;
+                // The digest reads up to ~20 files synchronously — keep it on
+                // the blocking pool, but finish it before the loop is dropped.
+                let corpus = match tokio::task::spawn_blocking(move || {
+                    corpus_digest(&plans_dir, &reviews_dir)
+                })
+                .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("memory: corpus digest task failed during consolidation: {e}");
+                        String::new()
+                    }
+                };
                 tokio::spawn(async move {
-                    // Move the RAII guard into the task so the dedup flag is
-                    // cleared when this task ends (success, failure, OR
-                    // panic — Drop runs during unwinding).
                     let _guard = guard;
-                    // 2a.8: the policy hook precedes the teardown.
-                    agent_loop.policy().on_session_end().await;
-                    // The digest reads up to ~20 files synchronously — run it
-                    // on the blocking pool so it never occupies a tokio
-                    // worker either (review I2, 2026-08-18). Paths are owned;
-                    // a join error (unreachable short of a panic) degrades to
-                    // an empty corpus — consolidation still runs.
-                    let corpus = match tokio::task::spawn_blocking(move || {
-                        corpus_digest(&plans_dir, &reviews_dir)
-                    })
-                    .await
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!(
-                                "memory: corpus digest task failed during consolidation: {e}"
-                            );
-                            String::new()
-                        }
-                    };
+                    // The policy hook still precedes memory session teardown.
+                    policy.on_session_end().await;
                     if let Err(e) = store.end_session(&sid).await {
                         eprintln!("memory: end_session({sid}) failed during consolidation: {e}");
                     }
@@ -1154,8 +1186,6 @@ impl AgentTask {
                     {
                         eprintln!("memory: consolidate_session({sid}) failed: {e}");
                     }
-                    // The dedup flag is cleared by `_guard`'s Drop impl when
-                    // this task ends (success, failure, OR panic).
                 });
             }
         }

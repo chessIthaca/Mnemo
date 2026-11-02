@@ -1,0 +1,6 @@
+{
+  "name": "mnemo-workers",
+  "version": "0.1.0",
+  "description": "Shows the running Mnemo2 workers and their models above the prompt; click a worker to open it in mission control.",
+  "types": "./types/index.d.ts"
+}

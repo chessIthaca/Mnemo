@@ -33,6 +33,11 @@ use crate::config::keys::{KeySource, Secret};
 use crate::config::mcp::McpServerWire;
 use crate::config::settings_dto::{SettingsSaveDto, VisionModelDto};
 
+mod endpoint_detail;
+pub use endpoint_detail::{
+    EndpointDetailDto, EndpointTestDto, ModelDetailDto, PriceDto, ProviderModelDto, TiersDto,
+};
+
 /// Which agent.md a Setup method addresses (§5.8 :557): the install's
 /// GLOBAL one (under the config dir) or a PROJECT's root one.
 #[derive(Debug, Clone, PartialEq)]
@@ -723,6 +728,123 @@ impl Setup {
         Ok(EventReceiver { rx })
     }
 
+    /// The pure attach gate [`Setup::attach_laya`] runs — attach only
+    /// when the LIVE config selects Laya AND the English checkpoint is
+    /// already installed under `<config_dir>/laya` (first-time installs
+    /// go through [`Setup::classifier_setup`], which owns the download
+    /// pipeline AND the autostart swap). Pure by design — no port probe,
+    /// no venv, no child — so the gate is unit-testable without the
+    /// network-bound spawn leg (the discipline noted at
+    /// [`Setup::classifier_setup`]'s doc; .coding/design/mnemo2-laya.md
+    /// §4).
+    fn attach_decision(laya: &crate::config::LayaConfig, installed: bool) -> bool {
+        laya.enabled && installed
+    }
+
+    /// Attach the already-installed managed Laya runtime to the LIVE
+    /// engine — the headless twin of the app's startup attach
+    /// (main.rs:78-127): the "enabled + the checkpoint is already on
+    /// disk → attach at engine start" leg that until now existed only
+    /// in the GUI host (a headless [`Setup`] autostarted solely inside
+    /// its own install pipeline; .coding/design/mnemo2-laya.md §1).
+    ///
+    /// The gate re-reads the LIVE config (the brain's shared Arc — the
+    /// same live view [`Setup::live_laya_enabled`] serves) and requires
+    /// `[general.laya] enabled` AND `is_checkpoint_installed` for the
+    /// English checkpoint. On the gate passing: allocate a loopback
+    /// port, park the shared status on `Starting`, build the managed
+    /// classifier client (constructing it does no I/O — startup is
+    /// never blocked, brain.rs:543-546), write it into the brain's live
+    /// slot, then fire-and-forget `start_managed_server` on the
+    /// pre-allocated port through this Setup's own manager
+    /// (main.rs:816-830's discipline: the caller never waits — the
+    /// spawned task drives the status to `Ready`/`Failed`). Returns
+    /// the allocated port.
+    ///
+    /// Otherwise a NO-OP: the slot stays `None`, the status stays
+    /// `Disabled`, the return is `None` — a disabled or
+    /// not-yet-installed Laya changes nothing (every consumer
+    /// short-circuits on the empty slot; the enabled-but-not-installed
+    /// case logs the same install hint the app's startup attach logs).
+    /// A STANDALONE Setup (no engine attached) no-ops too — nothing
+    /// consumes a sidecar until an engine starts (the install-only
+    /// philosophy of [`Setup::classifier_setup`]'s standalone arm). The
+    /// gate leg (marker/venv file stats + the port probe) is offline
+    /// and instant; the spawn leg is a REAL child — never exercised in
+    /// tests (the network-bound discipline at [`Setup::classifier_setup`]'s
+    /// doc).
+    pub async fn attach_laya(&self) -> Option<u16> {
+        let live = self.live.as_ref()?;
+        let checkpoint = crate::host::laya::english_checkpoint();
+        let installed = self.laya.is_checkpoint_installed(checkpoint.id);
+        let (attach, enabled) = {
+            let laya_cfg = &live.config.lock().await.general.general.laya;
+            (Self::attach_decision(laya_cfg, installed), laya_cfg.enabled)
+        };
+        if !attach {
+            // The honest startup hint (main.rs:111-118's twin): an
+            // operator with Laya enabled but never installed sees WHY
+            // the attach no-ops; a disabled config stays silent.
+            if enabled {
+                eprintln!(
+                    "info: [general.laya] is enabled but the '{}' checkpoint is \
+                     not installed — call classifier_setup(true) to install it",
+                    checkpoint.id
+                );
+            }
+            return None;
+        }
+        let Some(port) = LayaManager::alloc_free_port() else {
+            eprintln!(
+                "warning: no free loopback port for the managed laya-serve; \
+                 the classifier stays disabled"
+            );
+            return None;
+        };
+        // The fill is I/O-free (main.rs:96-102's twin): park Starting,
+        // build the no-I/O client, swap the slot — the spawned start
+        // below drives Starting → Ready/Failed.
+        *self
+            .classifier_status
+            .write()
+            .expect("classifier status lock poisoned") = ClassifierStatus::Starting;
+        let classifier = crate::host::laya::build_managed_classifier(
+            port,
+            Arc::clone(&self.classifier_status),
+        );
+        if let Some(slot) = &live.classifier_slot {
+            *slot.write().expect("classifier slot lock poisoned") = classifier;
+        }
+        // Fire-and-forget the server start (main.rs:816-830): the
+        // classifier client already points at the pre-allocated port,
+        // and the caller never waits on the child.
+        let manager = Arc::clone(&self.laya);
+        tokio::spawn(async move {
+            crate::host::laya::start_managed_server(&None, manager, checkpoint, port).await;
+        });
+        Some(port)
+    }
+
+    /// The brain's shared CLASSIFIER SLOT Arc (D5) — the handle a host
+    /// needs to steer the live classifier lifecycle (the startup
+    /// fine-tune's hot-swap, a disable's clear) without reaching for
+    /// the brain itself. Engine-backed only: `None` on a standalone
+    /// Setup, like the other live handles.
+    pub fn classifier_slot(&self) -> Option<ClassifierSlot> {
+        self.live
+            .as_ref()
+            .and_then(|live| live.classifier_slot.clone())
+    }
+
+    /// The brain's LIVE config Arc — the shared config every later
+    /// spawn re-reads, re-rooted here by [`Setup::for_engine`]. The
+    /// last piece the startup fine-tune needs (`spawn_startup_finetune`
+    /// — main.rs:844 passes `brain.config` today). Engine-backed only:
+    /// `None` on a standalone Setup.
+    pub fn live_config(&self) -> Option<Arc<tokio::sync::Mutex<Config>>> {
+        self.live.as_ref().map(|live| Arc::clone(&live.config))
+    }
+
     /// The LIVE view of the managed-classifier flag — the value the
     /// runtime actually reads (the brain's shared config Arc), which
     /// can differ from disk between a flip and the next engine save.
@@ -1191,6 +1313,17 @@ impl Setup {
         }
     }
 
+    /// §5.8 :552 — the live per-server status (connected, tool count, last
+    /// error, restarts) from the attached engine's shared manager, sorted by
+    /// name. A standalone Setup holds no connections, so the list is empty
+    /// without a live engine.
+    pub async fn mcp_statuses(&self) -> Vec<(String, crate::mcp::ServerStatus)> {
+        match self.live.as_ref().and_then(|live| live.factory.mcp_manager()) {
+            Some(manager) => manager.statuses().await,
+            None => Vec::new(),
+        }
+    }
+
     /// Load the config for the endpoints group — one error mapping for
     /// every read.
     fn load_config(&self) -> Result<Config, EngineError> {
@@ -1312,16 +1445,43 @@ impl Setup {
             default_model.as_deref(),
         )
         .map_err(EngineError::start_failed)?;
-        let new_config = crate::config::patch::apply_endpoints(
+        let mut new_config = crate::config::patch::apply_endpoints(
             &current,
             built,
             default_provider,
             default_model,
             &api_keys,
         );
+        // Prices no remaining endpoint needs go with the endpoint.
+        let served: std::collections::HashSet<String> = new_config
+            .endpoints
+            .iter()
+            .flat_map(|e| e.models.iter().map(|m| m.id.clone()))
+            .collect();
+        let gone: Vec<String> = current
+            .endpoints
+            .iter()
+            .filter(|e| e.name == name)
+            .flat_map(|e| e.models.iter().map(|m| m.id.clone()))
+            .collect();
+        new_config
+            .pricing
+            .retain(|p| !gone.contains(&p.model) || served.contains(&p.model));
+        // Tier entries naming the endpoint drop with it.
+        let tiers_path = self.config_dir.join("endpoints.toml");
+        let old_tiers = crate::config::endpoints::load_tiers(&tiers_path);
+        let mut tiers = old_tiers.clone();
+        let prefix = format!("{name}/");
+        for list in tiers.lists_mut() {
+            list.retain(|s| !s.starts_with(&prefix));
+        }
         new_config
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(e.to_string()))?;
+        if tiers != old_tiers {
+            crate::config::endpoints::save_tiers(&tiers_path, &tiers)
+                .map_err(|e| EngineError::start_failed(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -1576,6 +1736,67 @@ mod tests {
         std::fs::write(dir.join("keys.toml"), "[test]\napi_key = \"sk-test\"\n").unwrap();
     }
 
+    /// `[general.laya] enabled = true` in the fixture's config.toml —
+    /// appended as the `[general.laya]` subtable `GeneralSection` nests
+    /// (general.rs:101-102). Written BEFORE `Engine::start` loads it.
+    fn enable_laya_in_config(dir: &Path) {
+        let path = dir.join("config.toml");
+        let mut text = std::fs::read_to_string(&path).expect("fixture config.toml");
+        text.push_str("\n[general.laya]\nenabled = true\n");
+        std::fs::write(&path, text).expect("writing config.toml");
+    }
+
+    /// Doctor a PRETEND-installed managed runtime under
+    /// `<config_dir>/laya` — exactly the two files
+    /// `is_checkpoint_installed` probes (the marker + the venv's
+    /// `laya-serve`, laya.rs:355-357). The fake binary is deliberately
+    /// NOT a valid executable image: even if a test ever let the
+    /// fire-and-forget start task run, the child spawn fails instantly
+    /// — no real sidecar, no network (the network-bound discipline at
+    /// [`Setup::classifier_setup`]'s doc).
+    fn doctor_installed_laya(dir: &Path) {
+        let base = dir.join("laya");
+        std::fs::create_dir_all(base.join("markers")).expect("markers dir");
+        std::fs::write(
+            base.join("markers")
+                .join(crate::host::laya::english_checkpoint().id),
+            b"installed",
+        )
+        .expect("marker file");
+        let serve = crate::host::laya::venv_bin(
+            &base.join("venv"),
+            std::env::consts::OS,
+            "laya-serve",
+        );
+        std::fs::create_dir_all(serve.parent().expect("venv bin dir")).expect("venv bin dir");
+        std::fs::write(&serve, b"not a real executable").expect("fake laya-serve");
+    }
+
+    /// The pure attach gate (design §4): attach only when the LIVE
+    /// config selects Laya AND the checkpoint is already installed —
+    /// the four combinations, unit-tested without any file or child.
+    #[test]
+    fn attach_decision_requires_enabled_and_installed() {
+        let mut laya = crate::config::LayaConfig::default();
+        assert!(
+            !Setup::attach_decision(&laya, false),
+            "disabled + not installed never attaches"
+        );
+        assert!(
+            !Setup::attach_decision(&laya, true),
+            "disabled never attaches even when installed"
+        );
+        laya.enabled = true;
+        assert!(
+            !Setup::attach_decision(&laya, false),
+            "enabled without an install never attaches (the setup leg owns that)"
+        );
+        assert!(
+            Setup::attach_decision(&laya, true),
+            "enabled + installed attaches"
+        );
+    }
+
     /// D4's live-apply pin (§5.8 :540): `patch_settings` through a
     /// `for_engine` Setup flips the LIVE brain pieces — the safety flag
     /// + the shared config the next spawn reads — without a restart.
@@ -1617,5 +1838,194 @@ mod tests {
         );
         drop(shared);
         engine.shutdown().await.expect("shutdown");
+    }
+
+    /// The attach seam's RED-first pin (design §6 step 1): an
+    /// engine-backed Setup with `[general.laya] enabled` and the
+    /// checkpoint installed fills the brain's live slot and parks the
+    /// spawn request (`Starting`) — the headless twin of the GUI's
+    /// startup attach (main.rs:78-127). Before the change this test
+    /// ran RED: the slot stayed `None` (no attach path existed — the
+    /// Setup autostarted only inside the install pipeline). No real
+    /// sidecar ever runs here: the fire-and-forget task cannot run
+    /// before the test's first await after the call (the assertions
+    /// are synchronous), and the doctored binary is an invalid image
+    /// anyway.
+    #[tokio::test]
+    async fn attach_laya_enabled_and_installed_fills_the_live_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        enable_laya_in_config(cfg.path());
+        doctor_installed_laya(cfg.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let port = setup.attach_laya().await;
+        assert!(
+            port.is_some(),
+            "enabled + installed attaches — a loopback port was allocated"
+        );
+        // classifier_slot() hands out the brain's OWN slot Arc…
+        let slot = setup
+            .classifier_slot()
+            .expect("engine-backed: the slot handle");
+        let brain = engine.brain();
+        assert!(
+            Arc::ptr_eq(&slot, &brain.classifier_slot),
+            "classifier_slot() re-roots onto the brain's Arc"
+        );
+        // …and the fill happened before the fire-and-forget spawn: the
+        // slot holds the managed client.
+        assert!(
+            slot.read().expect("classifier slot lock").is_some(),
+            "the live classifier slot is filled"
+        );
+        // The spawn request is parked on the shared status (Starting →
+        // Ready/Failed later, driven by the spawned task).
+        assert!(matches!(
+            *brain
+                .classifier_status
+                .read()
+                .expect("classifier status lock"),
+            ClassifierStatus::Starting
+        ));
+        // live_config() hands out the brain's live config Arc.
+        let live_cfg = setup
+            .live_config()
+            .expect("engine-backed: the live config");
+        assert!(
+            Arc::ptr_eq(&live_cfg, &brain.config),
+            "live_config() re-roots onto the brain's Arc"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Design §3's "disabled changes nothing" pin: an ABSENT
+    /// `[general.laya]` section (the default) leaves the slot `None`
+    /// and the status `Disabled` — even with the runtime installed on
+    /// disk.
+    #[tokio::test]
+    async fn attach_laya_disabled_is_a_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        doctor_installed_laya(cfg.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        assert!(
+            setup.attach_laya().await.is_none(),
+            "disabled never attaches"
+        );
+        let slot = setup
+            .classifier_slot()
+            .expect("engine-backed: the slot handle");
+        assert!(
+            slot.read().expect("classifier slot lock").is_none(),
+            "the slot is untouched"
+        );
+        assert!(matches!(
+            *engine
+                .brain()
+                .classifier_status
+                .read()
+                .expect("classifier status lock"),
+            ClassifierStatus::Disabled
+        ));
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Design §3's "enabled but not installed" pin: the gate requires
+    /// `is_checkpoint_installed`, so an enabled config with NO install
+    /// under `<config_dir>/laya` no-ops the same way — the install leg
+    /// (classifier_setup) owns that path.
+    #[tokio::test]
+    async fn attach_laya_not_installed_is_a_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        enable_laya_in_config(cfg.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        assert!(
+            setup.attach_laya().await.is_none(),
+            "enabled without an install never attaches"
+        );
+        let slot = setup
+            .classifier_slot()
+            .expect("engine-backed: the slot handle");
+        assert!(
+            slot.read().expect("classifier slot lock").is_none(),
+            "the slot is untouched"
+        );
+        assert!(matches!(
+            *engine
+                .brain()
+                .classifier_status
+                .read()
+                .expect("classifier status lock"),
+            ClassifierStatus::Disabled
+        ));
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A STANDALONE Setup (no engine attached) exposes no live handles
+    /// and attaches nothing — nothing consumes a sidecar before an
+    /// engine starts (the install-only philosophy of
+    /// classifier_setup's standalone arm).
+    #[tokio::test]
+    async fn attach_laya_on_a_standalone_setup_is_a_no_op() {
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        enable_laya_in_config(cfg.path());
+        doctor_installed_laya(cfg.path());
+        let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+        assert!(
+            setup.classifier_slot().is_none(),
+            "no engine — no slot handle"
+        );
+        assert!(
+            setup.live_config().is_none(),
+            "no engine — no live config"
+        );
+        assert!(
+            setup.attach_laya().await.is_none(),
+            "a standalone Setup attaches nothing"
+        );
     }
 }

@@ -275,6 +275,16 @@ pub struct AgentLoop {
     /// Per-session state (session id + prompt-token cache heuristic).
     /// Extracted from the flat fields (A2).
     pub(crate) session: SessionState,
+    /// Session-scoped dismissal of auto-recalled rows (backlog c68a8c3b):
+    /// the record ids the agent dismissed via the `recall_feedback` tool.
+    /// Shared with that tool — the factory mints ONE Arc per built loop and
+    /// hands clones to both — so the tool's writes and the auto-recall
+    /// injector's filter see the same set, and a dismissed row never
+    /// re-injects for this session's remainder. Fresh per loop (a new
+    /// session starts with nothing dismissed); a directly-built loop
+    /// without wiring keeps an empty set, so recall is unfiltered.
+    pub(crate) dismissed_recall:
+        Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// This agent's id in the runtime (`AgentManager`), used so the agent's
     /// `spawn_agent` tool can record itself as the parent of any background
     /// agent it spawns (for the completion-notification feedback loop).
@@ -313,6 +323,9 @@ pub struct AgentLoop {
     /// be set through a `&AgentLoop` reference (mirroring
     /// `plan_mutations_allowed`).
     pub(crate) is_subagent: std::sync::Mutex<bool>,
+    /// Stable root of this agent family, inherited at spawn and unaffected by
+    /// intermediate agents exiting or being removed from the manager.
+    pub(crate) family_root: std::sync::Mutex<Option<crate::runtime::AgentId>>,
     /// Failed-reviewer protocol latch: set by the event forwarder when a
     /// `role: "reviewer"` child of this agent finishes with a final error and
     /// NO report (the review did not happen). While set, `spawn_agent` calls
@@ -1058,11 +1071,15 @@ impl AgentLoop {
             safety_rules: None,
             vision,
             session: SessionState::new(),
+            dismissed_recall: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             agent_id: std::sync::Mutex::new(None),
             event_fanin: std::sync::Mutex::new(None),
             plan_mutations_allowed: std::sync::Mutex::new(true),
             model_resolver: None,
             is_subagent: std::sync::Mutex::new(false),
+            family_root: std::sync::Mutex::new(None),
             reviewer_failure_pending: std::sync::Mutex::new(false),
             reviewer_retry_sanctioned: std::sync::Mutex::new(false),
             fill_rate: 0.5,
@@ -1101,6 +1118,20 @@ impl AgentLoop {
                 crate::agent::policy::NoPolicy::with_coding_default(),
             )),
         }
+    }
+
+    /// Wire the per-loop dismissal set (backlog c68a8c3b): the factory
+    /// mints ONE `Arc<Mutex<HashSet>>` per built loop and shares it with
+    /// the `recall_feedback` tool registered for the same loop, so the
+    /// tool's writes and the auto-recall injector's filter see the same
+    /// per-session set. Directly-built loops keep the fresh empty set
+    /// from `from_config` (recall unfiltered).
+    pub fn with_dismissed_recall(
+        mut self,
+        dismissed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.dismissed_recall = dismissed;
+        self
     }
 
     /// Attach the project's plans dir so consolidation can digest the
@@ -1395,6 +1426,16 @@ impl AgentLoop {
     ) -> Self {
         self.model_resolver = Some(resolver);
         self
+    }
+
+    /// Set the stable family root during shared host spawn.
+    pub fn set_family_root(&self, root: crate::runtime::AgentId) {
+        *self.family_root.lock().expect("family_root lock poisoned") = Some(root);
+    }
+
+    /// The stable family root, if this loop was built through the shared host.
+    pub fn family_root(&self) -> Option<crate::runtime::AgentId> {
+        *self.family_root.lock().expect("family_root lock poisoned")
     }
 
     /// Set whether this agent is a subagent. Used by the IPC spawner

@@ -35,8 +35,8 @@ type Knobs = {
 const LEVERS: { field: BoolField; label: string; hint: string }[] = [
   {
     field: "delta_reads",
-    label: "Delta & skeleton re-reads",
-    hint: "read_files serves a signature skeleton (or a diff) instead of the full file on a re-read.",
+    label: "Delta, skeleton & outline reads",
+    hint: "read_files serves a signature skeleton (or a diff) on a re-read, and an outline first for source files over 300 lines.",
   },
   {
     field: "compress_output",

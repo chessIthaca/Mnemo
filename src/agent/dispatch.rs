@@ -266,7 +266,15 @@ impl AgentLoop {
         // tool's own deserialization all see clean args. The raw
         // tc.arguments string is untouched (the UI keeps fidelity).
         let mut args = args;
-        crate::tool::drop_stringified_nulls(&tool.schema().parameters, &mut args);
+        let schema = tool.schema();
+        crate::tool::drop_stringified_nulls(&schema.parameters, &mut args);
+        // Backlog c19ec2ff (c): the same transport degradation also
+        // delivers sequence-typed arguments as one stringified JSON array
+        // (read_files' `files` was hit 3x in one turn, 2027-01-25, and
+        // the generic "an argument must be a sequence, not a string"
+        // error taught nothing). Repair a CLEAN parse at the seam;
+        // anything left unparseable stays for the tool's positional error.
+        crate::tool::repair_stringified_sequences(&schema.parameters, &mut args);
 
         let parsed_call = ParsedToolCall {
             id: tc.id.clone(),
@@ -1588,21 +1596,13 @@ fn observe_edit_freshness(
 }
 
 /// The paths a `read_files` call touches: the single `path` arg and/or the
-/// batch `files[].path` entries (plan be16ea36 step 3 — a read of path P
-/// clears P's drift state).
+/// batch `files` entries, compact strings or objects (plan be16ea36 step 3
+/// — a read of path P clears P's drift state).
 fn read_files_paths(args: &serde_json::Value) -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-        paths.push(p.to_string());
-    }
-    if let Some(files) = args.get("files").and_then(|v| v.as_array()) {
-        for f in files {
-            if let Some(p) = f.get("path").and_then(|v| v.as_str()) {
-                paths.push(p.to_string());
-            }
-        }
-    }
-    paths
+    crate::tool::agent::read_files::read_specs(args)
+        .into_iter()
+        .map(|spec| spec.path)
+        .collect()
 }
 
 /// The `files[].path` entries a `multi_edit` call touches (plan 2e27f896) —

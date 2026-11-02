@@ -32,7 +32,11 @@ use crate::ipc::state::IpcState;
 /// tracked in the `agent_loops` map so `get_workflow_state(agent_id)` can read
 /// its plan. Returns the new agent's id + name.
 #[tauri::command]
-pub async fn spawn_agent(state: State<'_, IpcState>, name: String) -> Result<AgentInfo, IpcError> {
+pub async fn spawn_agent(
+    state: State<'_, IpcState>,
+    name: String,
+    review_only: Option<bool>,
+) -> Result<AgentInfo, IpcError> {
     let factory = state
         .runtime
         .factory
@@ -51,8 +55,13 @@ pub async fn spawn_agent(state: State<'_, IpcState>, name: String) -> Result<Age
         SessionOptions {
             // no forced model — UI spawns use the default
             model: None,
-            // no role — UI spawns are unrestricted
-            role: None,
+            // Review-only UI agents are parentless; the shared spawn path
+            // applies the strict reviewer allow-list without a parent.
+            role: if review_only == Some(true) {
+                Some("reviewer".to_string())
+            } else {
+                None
+            },
             // own_plans_dir — UI spawns get .coding/plans/agents/<id>/
             own_plans_dir: true,
             // no worktree binding — a main-tree agent

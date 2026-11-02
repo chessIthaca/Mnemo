@@ -1,0 +1,263 @@
+:root {
+  font-family: var(--font-ui);
+  font-size: var(--text-body);
+  color: var(--ink);
+  background: var(--canvas);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  color-scheme: light;
+  --font-ui: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-prose: "Source Serif 4 Variable", "Source Serif 4", Georgia, serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  /* Four sizes: meta (chips, labels, timestamps), body (text, buttons, tabs), title (names, headings), page (page titles). */
+  --text-meta: 10px;
+  --text-body: 12px;
+  --text-title: 14px;
+  --text-page: 22px;
+  /*
+   * Every colour in the app is a token declared here (light) and overridden in
+   * `:root[data-theme="dark"]` below — no component carries a literal colour.
+   * `lib/theme.ts` sets `data-theme` on <html> from the `[ui] theme` choice;
+   * `system` follows `prefers-color-scheme` live.
+   */
+  --canvas: #f7f7f4;
+  --surface: #ffffff;
+  --surface-soft: #f0f1eb;
+  --ink: #242620;
+  --ink-soft: #5e6258;
+  --muted: #83877b;
+  --line: #e4e5dd;
+  --line-strong: #d4d7cc;
+  --accent: #64795a;
+  --accent-strong: #465b3e;
+  --accent-soft: #e8eee3;
+  --accent-line: #d7ded1;
+  /* Worker avatars derive their fill/text from a per-worker hue; only the
+     lightness flips with the theme. */
+  --avatar-bg-lightness: 87%;
+  --avatar-ink-lightness: 32%;
+  --warning: #94672f;
+  --warning-soft: #f2e9da;
+  --warning-line: #ddd2bd;
+  --warning-pending: #f8f4ea;
+  --warning-blocker-line: #ead7bd;
+  --danger: #a24f47;
+  --danger-ink: #8d4d46;
+  --danger-soft: #fbf0ee;
+  --danger-line: #e3c7c0;
+  --danger-tint: #fbf3f1;
+  --danger-tint-line: #e3c7c2;
+  --danger-hover: #8a4039;
+  --on-danger: #ffffff;
+  --risk-bg: #f4e4e1;
+  --running-bg: #e9edf3;
+  --running-ink: #536c89;
+  --event-merge-bg: #e2ebdc;
+  --event-review-bg: #ece8de;
+  --event-review-ink: #6f6046;
+  --badge-decision-bg: #e7ecf3;
+  --badge-decision-ink: #3f5675;
+  --badge-bug-bg: #f5e7e4;
+  --badge-bug-ink: #8d4139;
+  --badge-how-ink: #7a5626;
+  --primary-bg: #242620;
+  --primary-ink: #ffffff;
+  --primary-hover: #363a31;
+  --placeholder: #999c91;
+  --disabled-ink: #adb0a6;
+  --focus-line: #aeb8a5;
+  --selection: #dce6d4;
+  --scrollbar: #d2d5cb;
+  --float: rgb(255 255 255 / 85%);
+  --overlay: rgb(247 247 244 / 88%);
+  --overlay-strong: rgb(247 247 244 / 82%);
+  --backdrop: rgb(35 38 30 / 18%);
+  --backdrop-soft: rgb(38 40 34 / 5%);
+  --toast-bg: #242620;
+  --toast-ink: #f2f4ec;
+  --toast-button-bg: rgb(255 255 255 / 9%);
+  --toast-button-ink: #cfd5c7;
+  --stat-add: #4f7d48;
+  --stat-remove: #a15b53;
+  --diff-sign: #b0b4a9;
+  --diff-add-bg: #f1f7ee;
+  --diff-add-ink: #3f6f39;
+  --diff-add-sign: #5a9452;
+  --diff-remove-bg: #fbf0ee;
+  --diff-remove-sign: #b26a61;
+  --diff-hunk-bg: #f4f5f1;
+  --diff-hunk-ink: #7d8276;
+  /* The code block keeps its own dark palette in both themes. */
+  --code-bg: #20231f;
+  --code-line: #2f332e;
+  --code-head-line: #343832;
+  --code-meta: #aeb6a7;
+  --code-button: #c4ccbd;
+  --code-ink: #e5e9df;
+  --code-keyword: #c3b5f2;
+  --code-string: #b8d59f;
+  --code-number: #e3bc8d;
+  --code-comment: #7f8879;
+  --level-ok: #34d399;
+  --level-warn: #fbbf24;
+  --level-critical: #f87171;
+  --shadow-soft: 0 12px 34px rgb(37 40 32 / 5%);
+  --shadow: 0 22px 60px rgb(37 40 32 / 12%);
+  --shadow-chip: 0 1px 3px rgb(35 38 30 / 8%);
+  --shadow-nav: 0 1px 4px rgb(35 38 30 / 8%);
+  --shadow-composer: 0 12px 36px rgb(37 40 32 / 7%);
+  --shadow-composer-focus: 0 12px 40px rgb(37 40 32 / 9%);
+}
+
+/*
+ * Dark palette (plan f1bd54e5, step 4). Only the tokens whose value changes
+ * are listed; anything absent above (the code block, the level colours) is
+ * shared with both themes. Text keeps at least WCAG AA contrast against
+ * `--canvas`, `--surface` and `--surface-soft`.
+ */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: #141510;
+  --surface: #1b1d16;
+  --surface-soft: #23261c;
+  --ink: #e9ebdf;
+  --ink-soft: #b4b9a8;
+  --muted: #949988;
+  --line: #2d3126;
+  --line-strong: #3b4033;
+  --accent: #8fae82;
+  --accent-strong: #bdd5ae;
+  --accent-soft: #232c1c;
+  --accent-line: #3f4a36;
+  --avatar-bg-lightness: 24%;
+  --avatar-ink-lightness: 78%;
+  --warning: #d9a75e;
+  --warning-soft: #322818;
+  --warning-line: #4a3f2b;
+  --warning-pending: #2c2517;
+  --warning-blocker-line: #4a3f2b;
+  --danger: #e28b80;
+  --danger-ink: #e8a79d;
+  --danger-soft: #2e1c1a;
+  --danger-line: #4b302c;
+  --danger-tint: #2e1c1a;
+  --danger-tint-line: #4b302c;
+  --danger-hover: #f0a096;
+  --on-danger: #2a1411;
+  --risk-bg: #3a221f;
+  --running-bg: #1f2833;
+  --running-ink: #a8c3e4;
+  --event-merge-bg: #26301e;
+  --event-review-bg: #2b2a22;
+  --event-review-ink: #cdc4a6;
+  --badge-decision-bg: #202836;
+  --badge-decision-ink: #b3c8e6;
+  --badge-bug-bg: #3a221f;
+  --badge-bug-ink: #ebaa9f;
+  --badge-how-ink: #d8b177;
+  --primary-bg: #bdd5ae;
+  --primary-ink: #131809;
+  --primary-hover: #d0e2c2;
+  --placeholder: #7f8478;
+  --disabled-ink: #6f7468;
+  --focus-line: #4f5d45;
+  --selection: #33412a;
+  --scrollbar: #3a3f31;
+  --float: rgb(27 29 22 / 88%);
+  --overlay: rgb(20 21 16 / 88%);
+  --overlay-strong: rgb(20 21 16 / 86%);
+  --backdrop: rgb(6 7 4 / 55%);
+  --backdrop-soft: rgb(0 0 0 / 30%);
+  --toast-bg: #2b2f24;
+  --toast-ink: #eef0e7;
+  --toast-button-bg: rgb(255 255 255 / 9%);
+  --toast-button-ink: #d8ddcd;
+  --stat-add: #94c884;
+  --stat-remove: #dd938a;
+  --diff-sign: #5f6558;
+  --diff-add-bg: #1f2b1c;
+  --diff-add-ink: #a6d694;
+  --diff-add-sign: #74b863;
+  --diff-remove-bg: #2e1c1a;
+  --diff-remove-sign: #cf867e;
+  --diff-hunk-bg: #22251c;
+  --diff-hunk-ink: #9aa08f;
+  --shadow-soft: 0 12px 34px rgb(0 0 0 / 45%);
+  --shadow: 0 22px 60px rgb(0 0 0 / 55%);
+  --shadow-chip: 0 1px 3px rgb(0 0 0 / 45%);
+  --shadow-nav: 0 1px 4px rgb(0 0 0 / 45%);
+  --shadow-composer: 0 12px 36px rgb(0 0 0 / 40%);
+  --shadow-composer-focus: 0 12px 40px rgb(0 0 0 / 50%);
+}
+
+* { box-sizing: border-box; }
+html, body, #app { width: 100%; height: 100%; min-width: 320px; margin: 0; }
+body { overflow: hidden; }
+button, input, textarea, select { font: inherit; }
+button, a { -webkit-tap-highlight-color: transparent; }
+button { color: inherit; }
+a { color: inherit; }
+::selection { background: var(--selection); color: var(--ink); }
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+  font-size: var(--text-body);
+  font-weight: 620;
+  text-decoration: none;
+}
+
+.button-quiet { border-color: var(--line); background: var(--surface); color: var(--ink-soft); }
+.button-quiet:hover { border-color: var(--line-strong); background: var(--surface-soft); color: var(--ink); }
+.button-primary { background: var(--primary-bg); color: var(--primary-ink); }
+.button-primary:hover { background: var(--primary-hover); }
+.button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.icon-button {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+.icon-button:hover { border-color: var(--line-strong); color: var(--ink); }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+* { scrollbar-color: var(--scrollbar) transparent; scrollbar-width: thin; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 8px; background: var(--scrollbar); background-clip: padding-box; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+}
+

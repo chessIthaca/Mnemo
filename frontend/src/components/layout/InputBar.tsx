@@ -533,6 +533,18 @@ export const InputBar = memo(function InputBar() {
           // loaded file is untrusted in size; keep the most recent entries).
           // Stamp stable entryIds on any entries lacking one (legacy saves
           // predate the field) so the React keys stay stable past the cap.
+          // Normalize legacy saves for the current transcript shape: a tool
+          // call written before the per-call `name` field inherits its card's
+          // name (a pre-bundling card held exactly one tool), so the phrase and
+          // chip helpers never see a missing name. Then stamp stable entryIds.
+          const normalized = parsed.map((entry) =>
+            entry.kind === "tool"
+              ? {
+                  ...entry,
+                  calls: entry.calls.map((c) => ({ ...c, name: c.name ?? entry.name })),
+                }
+              : entry,
+          );
           useAgentStore.setState((s) => {
             const agent = s.agents[agentId] ?? emptyAgentState();
             return {
@@ -540,7 +552,7 @@ export const InputBar = memo(function InputBar() {
                 ...s.agents,
                 [agentId]: {
                   ...agent,
-                  transcript: capTranscript(stampEntryIds(parsed)),
+                  transcript: capTranscript(stampEntryIds(normalized)),
                 },
               },
             };

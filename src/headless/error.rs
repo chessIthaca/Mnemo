@@ -105,6 +105,14 @@ impl EngineError {
         }
     }
 
+    /// A session's active plan could not be read or parsed.
+    pub(crate) fn plan_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "plan_failed".to_string(),
+            message: message.into(),
+        }
+    }
+
     /// The request id is unknown or already resolved (review round-1
     /// F5): an Approve/Answer naming it cannot be honored — the session
     /// itself is LIVE (never read this as closed).

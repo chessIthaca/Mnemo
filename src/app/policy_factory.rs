@@ -10,25 +10,27 @@
 //! the kernel never names the app's wiring types at the trait (master-spec
 //! :255-258; the D5 register pattern: kernel-called, app-owned).
 
-use tokio::sync::Mutex;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::agent::policy::{
-    AgentPolicyFactory, KernelError, PolicyBuildCtx, PolicyBuildResult,
-    PolicyFactoryCtx,
+    AgentPolicyFactory, KernelError, PolicyBuildCtx, PolicyBuildResult, PolicyFactoryCtx,
 };
 use crate::app::backlog::BacklogStore;
+use crate::app::plan_board::PlanBoard;
 use crate::app::tool::workflow::ask_user::AskUserTool;
 use crate::app::tool::workflow::backlog::{BacklogAddTool, BacklogListTool, BacklogStatusTool};
-use crate::app::workflow::Workflow;
+use crate::app::tool::workflow::board::{
+    PlanAbandonTool, PlanCreateTool, PlanListTool, PlanShowTool, PlanStepDoneTool, PlanUpdateTool,
+};
 use crate::app::tool::workflow::plan::{
-    AbandonPlanTool, CompleteStepTool, CreatePlanTool, CurrentPlanTool, FinishTool,
-    UpdatePlanTool,
+    AbandonPlanTool, CompleteStepTool, CreatePlanTool, CurrentPlanTool, FinishTool, UpdatePlanTool,
 };
 use crate::app::tool::workflow::skill::{
     AbandonSkillTool, SkillCreateTool, SkillEndTool, SkillReloadTool, SkillStartTool,
 };
-use crate::app::workflow_policy::WorkflowPolicy;
+use crate::app::workflow::Workflow;
+use crate::app::workflow_policy::{WorkflowPolicy, TEAM_HIDDEN_TOOLS};
 use crate::tool::ToolRegistry;
 
 /// The shared backlog wiring handed to every `backlog_add` tool: the store
@@ -54,6 +56,19 @@ pub struct WorkflowPolicyFactory {
     codegraph: Option<Arc<crate::codegraph::CodeGraph>>,
     reviews_dir: std::path::PathBuf,
     skills: Option<Arc<crate::app::skill::SkillLibrary>>,
+    /// Tools the lead must refuse outright (Mnemo2 blocks `spawn_agent`).
+    blocked_tools: Vec<String>,
+    /// The Mnemo2 TeamLead wiring (`with_team_lead`); `None` = Classic.
+    team_lead: Option<TeamLeadWiring>,
+}
+
+/// The TeamLead mode's host wiring (`.coding/design/mnemo2.md` Phase 6).
+#[derive(Clone)]
+pub struct TeamLeadWiring {
+    /// The lead's read-only view of its team.
+    pub ledger: Arc<dyn crate::app::team_ledger::TeamLedger>,
+    /// The plans the lead runs in parallel.
+    pub board: Arc<PlanBoard>,
 }
 
 impl WorkflowPolicyFactory {
@@ -71,7 +86,30 @@ impl WorkflowPolicyFactory {
             codegraph,
             reviews_dir,
             skills,
+            blocked_tools: Vec::new(),
+            team_lead: None,
         }
+    }
+
+    /// Add outright tool vetoes for every policy this factory builds.
+    pub fn with_blocked_tools(mut self, blocked: Vec<String>) -> Self {
+        self.blocked_tools = blocked;
+        self
+    }
+
+    /// Build every policy in the Mnemo2 TeamLead mode: a free tool surface,
+    /// the plan-board tools instead of the classic plan tools and
+    /// `spawn_agent` (both unregistered and refused), the board head text,
+    /// and turn-end Stop.
+    pub fn with_team_lead(
+        mut self,
+        ledger: Arc<dyn crate::app::team_ledger::TeamLedger>,
+        board: Arc<PlanBoard>,
+    ) -> Self {
+        self.blocked_tools
+            .extend(TEAM_HIDDEN_TOOLS.iter().map(|name| name.to_string()));
+        self.team_lead = Some(TeamLeadWiring { ledger, board });
+        self
     }
 
     /// Wire in the shared backlog store that backs the `backlog_add` tool.
@@ -145,24 +183,13 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         Arc::new(Arc::new(tokio::sync::Mutex::new(workflow)))
     }
 
-    fn build_policy(
-        &self,
-        ctx: &PolicyFactoryCtx,
-    ) -> Result<PolicyBuildResult, KernelError> {
+    fn build_policy(&self, ctx: &PolicyFactoryCtx) -> Result<PolicyBuildResult, KernelError> {
         // The kernel hands the loop's workflow handle back through the
         // neutral trait (2b.3); the app factory recovers its concrete
         // lockable Arc via as_any_arc — an app→app cast, the legal
         // direction. A mismatch means the kernel changed what it passes —
         // fail loudly rather than silently.
         let any_arc = ctx.workflow.as_any_arc();
-        eprintln!(
-            "DBG2b3: inner={} double={} unwired={}",
-            any_arc.downcast_ref::<Arc<Mutex<Workflow>>>().is_some(),
-            any_arc
-                .downcast_ref::<Arc<Arc<Mutex<Workflow>>>>()
-                .is_some(),
-            any_arc.downcast_ref::<crate::agent::workflow_handle::UnwiredWorkflow>().is_some(),
-        );
         let workflow = any_arc
             .downcast_ref::<Arc<Mutex<Workflow>>>()
             .expect("the kernel hands the policy factory the workflow it built")
@@ -170,7 +197,11 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         // The concrete policy stays app-side; the tail attach rides the
         // returned closure (the 2a.6 loop back-ref — idempotent OnceLock,
         // the first attach wins).
-        let policy = Arc::new(WorkflowPolicy::new(workflow));
+        let mut policy = WorkflowPolicy::new(workflow).with_blocked_tools(self.blocked_tools.clone());
+        if let Some(wiring) = &self.team_lead {
+            policy = policy.with_team_lead(wiring.clone());
+        }
+        let policy = Arc::new(policy);
         let concrete: Arc<WorkflowPolicy> = Arc::clone(&policy);
         Ok(PolicyBuildResult {
             policy,
@@ -254,6 +285,20 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
             workflow.clone(),
             ctx.plans_dir.clone(),
         )));
+        // The Mnemo2 lead's plan board (the classic plan tools above are
+        // unregistered for it in `finalize_tools`).
+        if let Some(wiring) = &self.team_lead {
+            let board = &wiring.board;
+            registry.register(Box::new(PlanCreateTool::new(Arc::clone(board))));
+            registry.register(Box::new(PlanUpdateTool::new(Arc::clone(board))));
+            registry.register(Box::new(PlanShowTool::new(Arc::clone(board))));
+            registry.register(Box::new(PlanListTool::new(Arc::clone(board))));
+            registry.register(Box::new(PlanStepDoneTool::new(
+                Arc::clone(board),
+                Arc::clone(&wiring.ledger),
+            )));
+            registry.register(Box::new(PlanAbandonTool::new(Arc::clone(board))));
+        }
         // ask_user is always available (not gated by ToolFilter — like memory
         // tools) so the agent can ask a question in any workflow state. The
         // pause is driven from dispatch, not the tool's execute().
@@ -266,20 +311,20 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         // Backlog tab updates live. Omitted entirely when no store is
         // wired (tests / NeedsProject).
         if let Some(wiring) = self.backlog.read().expect("backlog lock poisoned").as_ref() {
-            registry.register(Box::new(
-                BacklogAddTool::new(Arc::clone(&wiring.store), wiring.on_changed.clone()),
-            ));
+            registry.register(Box::new(BacklogAddTool::new(
+                Arc::clone(&wiring.store),
+                wiring.on_changed.clone(),
+            )));
             // backlog_status — same wiring; changes status through the same
             // guarded transition table the harness uses (see the tool docs).
-            registry.register(Box::new(
-                BacklogStatusTool::new(Arc::clone(&wiring.store), wiring.on_changed.clone()),
-            ));
+            registry.register(Box::new(BacklogStatusTool::new(
+                Arc::clone(&wiring.store),
+                wiring.on_changed.clone(),
+            )));
             // backlog_list — read-only query; needs no notifier (it never
             // mutates). Safe for read-only reviewers (their strict allow-list
             // names it): querying the backlog is allowed, modifying it is not.
-            registry.register(Box::new(
-                BacklogListTool::new(Arc::clone(&wiring.store)),
-            ));
+            registry.register(Box::new(BacklogListTool::new(Arc::clone(&wiring.store))));
         }
         // The skill tools (2b.3: moved from the kernel factory). The
         // authoring tool gets the AGENT's sandbox (a root-spec agent gets
@@ -300,6 +345,12 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
                 Arc::clone(skills),
                 ctx.sandbox.clone(),
             )));
+        }
+    }
+
+    fn finalize_tools(&self, registry: &mut ToolRegistry) {
+        for name in &self.blocked_tools {
+            registry.unregister(name);
         }
     }
 }

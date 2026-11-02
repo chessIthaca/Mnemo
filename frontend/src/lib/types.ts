@@ -483,6 +483,13 @@ export interface SafetyRule {
 export interface ToolInvocation {
   id: string;
   index: number; // correlates arg-delta fragments during streaming
+  /**
+   * The call's own tool name. One card may bundle a RUN of different tools
+   * (user decision 2026-10-18), so the card-level `name` (the run's first
+   * call) can no longer identify a call for per-call rendering — raw name,
+   * human phrase, shell body, diffs and chips all read this field.
+   */
+  name: string;
   args: string;
   result: ToolResult | null; // null = still running
   /**
@@ -526,7 +533,7 @@ export type TranscriptEntry = (
   | {
       kind: "tool";
       name: string;
-      calls: ToolInvocation[]; // consecutive calls to the same tool, merged
+      calls: ToolInvocation[]; // consecutive calls, merged into one card — may mix tools; `name` is the FIRST call's tool
     }
   | { kind: "error"; text: string }
   | {

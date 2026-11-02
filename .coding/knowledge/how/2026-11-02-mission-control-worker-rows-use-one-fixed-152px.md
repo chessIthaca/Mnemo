@@ -1,0 +1,6 @@
++++
+title = "Mission-control worker rows use one fixed 152px status column"
+created = "2026-11-02"
++++
+
+mnemo2/src/components/WorkerRow.svelte: `.worker-meta` is a fixed status column — `display: flex; flex: 0 0 152px; flex-direction: column; align-items: flex-start; min-width: 0` — so the status pill and the line under it (live phase + timer via ActivityStatus, or the cost/elapsed `<small>`) start at the same x on every row and never resize with their text. 152px fits "Running a command… · 29:23" at `--text-meta: 10px` (mnemo2/src/app.css:13): ~130px of glyphs + 5px dot + 2×6px gaps. The pill keeps its natural width; `.worker-live` and `.worker-meta small` fill the column and truncate (width 100%, min-width 0, overflow hidden, text-overflow ellipsis, nowrap). ActivityStatus.svelte has an opt-in `truncate` prop (default false) that gives the label min-width 0 + ellipsis and the `.elapsed-time` timer `flex: none`; only WorkerRow passes it, so the lead chat and worker thread keep their natural width. The hide rules for the line stay: `.worker-row.compact` and `@media (max-width: 1100px)`. If the longest phase label must fit without an ellipsis, raise the flex basis and the matching assertion in WorkerRow.test.ts together.

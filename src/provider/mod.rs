@@ -793,17 +793,17 @@ pub(crate) fn estimate_tools_tokens(tools: &[ToolSchema]) -> usize {
 
 /// Ceiling on total input tokens above which LiteLLM-class proxies drop
 /// whole-conversation prefix caching (observed around ~340K tokens; hit rate
-/// collapses from ~99% to ~4%). Two consumers keep requests below it:
-/// `ContextManager` summarizes before the cliff (agent-side compaction
-/// ceiling), and the request builders treat
-/// `ceiling - PROXY_CACHE_PRESSURE_MARGIN_TOKENS` as the pressure threshold
-/// for vendor-specific reasoning retention (wire-side).
+/// collapses from ~99% to ~4%). One consumer keeps requests below it: the
+/// request builders treat `ceiling - PROXY_CACHE_PRESSURE_MARGIN_TOKENS` as
+/// the pressure threshold for vendor-specific reasoning retention
+/// (wire-side). The agent-side compaction ceiling that also used this was
+/// removed 2027-01-25 — the summarize trigger respects only
+/// `summarize_at_fill_rate` now.
 pub const PROXY_CACHE_CEILING_TOKENS: usize = 340_000;
 
 /// Safety margin kept below [`PROXY_CACHE_CEILING_TOKENS`]: the prompt
-/// estimate is a conservative byte heuristic, so consumers act on pressure
-/// this many tokens before the estimated cliff. Also the gap `ContextManager`
-/// keeps between its summarize trigger and the ceiling.
+/// estimate is a conservative byte heuristic, so the request builders act
+/// on pressure this many tokens before the estimated cliff.
 pub const PROXY_CACHE_PRESSURE_MARGIN_TOKENS: usize = 32_768;
 
 /// Remove reasoning-text keys from an outgoing assistant message object.

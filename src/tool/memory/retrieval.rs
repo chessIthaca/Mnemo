@@ -45,14 +45,23 @@ fn format_hit(sm: &crate::memory::ScoredMemory) -> String {
     } else {
         ""
     };
+    // Quarantined rows likewise only appear when the caller opted into
+    // the sweep's finds — flag them so a malformed record is never
+    // mistaken for live knowledge (backlog c68a8c3b).
+    let quarantined = if sm.memory.quarantined.is_some() {
+        " [quarantined]"
+    } else {
+        ""
+    };
     format!(
-        "[{}] {} (id: {}, score: {:.2}, strength: {:.2}){}\n  {}\n\n",
+        "[{}] {} (id: {}, score: {:.2}, strength: {:.2}){}{}\n  {}\n\n",
         sm.memory.tier,
         sm.memory.title,
         sm.memory.id,
         sm.score,
         sm.memory.strength,
         superseded,
+        quarantined,
         sm.memory.content.chars().take(200).collect::<String>(),
     )
 }
@@ -74,6 +83,10 @@ struct MemorySearchArgs {
     limit: Option<usize>,
     #[serde(default)]
     include_superseded: bool,
+    /// Include quarantined records (the startup digest-integrity sweep's
+    /// finds — recoverable history), annotated `[quarantined]`.
+    #[serde(default)]
+    include_quarantined: bool,
 }
 
 /// `memory_search` — the single read path into the memory store.
@@ -130,7 +143,8 @@ impl Tool for MemorySearchTool {
                     "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "Optional: restrict to one tier."},
                     "prefix": {"type": "string", "description": "Optional: title starts-with filter (case-sensitive), e.g. \"BUG: login\"."},
                     "limit": {"type": "integer", "description": "Max rows (default 12 searching, 50 browsing)."},
-                    "include_superseded": {"type": "boolean", "description": "Include superseded records (history), annotated [superseded]. Default false — they are excluded, not downranked."}
+                    "include_superseded": {"type": "boolean", "description": "Include superseded records (history), annotated [superseded]. Default false — they are excluded, not downranked."},
+                    "include_quarantined": {"type": "boolean", "description": "Include quarantined records (the startup digest-integrity sweep's finds — recoverable history), annotated [quarantined]. Default false — they are excluded, not downranked."}
                 }
             }),
         )
@@ -169,6 +183,9 @@ impl Tool for MemorySearchTool {
         if args.include_superseded {
             filter = filter.include_superseded();
         }
+        if args.include_quarantined {
+            filter = filter.include_quarantined();
+        }
 
         let query = args
             .query
@@ -191,14 +208,23 @@ impl Tool for MemorySearchTool {
                             } else {
                                 ""
                             };
+                            // Quarantined rows likewise only appear on an
+                            // explicit history opt-in — flag them (backlog
+                            // c68a8c3b).
+                            let quarantined = if m.quarantined.is_some() {
+                                " [quarantined]"
+                            } else {
+                                ""
+                            };
                             out.push_str(&format!(
-                                "{}  {}  {}  {}  {}{}\n",
+                                "{}  {}  {}  {}  {}{}{}\n",
                                 m.id,
                                 m.tier,
                                 m.record_type,
                                 crate::tool::memory::format_epoch_date(m.created_at),
                                 m.title,
                                 superseded,
+                                quarantined,
                             ));
                         }
                         ToolResult::success(out)

@@ -286,6 +286,16 @@ export interface InstanceConflict {
 }
 
 /**
+ * Re-check the incumbent's liveness for the same-project conflict dialog
+ * (the launch-time conflict is a snapshot that goes stale when the other
+ * instance exits — lib/incumbentWatch.ts drives the cadence and retracts
+ * the dialog once this reports dead; backlog ea9576d7).
+ */
+export async function isIncumbentAlive(pid: number): Promise<boolean> {
+  return await invoke("incumbent_pid_alive", { pid });
+}
+
+/**
  * Fetch the startup snapshot in one call. Seeds agents, context caps, ALL
  * workflow states, backlog, and embedder + classifier status on mount.
  */
@@ -297,9 +307,15 @@ export async function getStartupSnapshot(): Promise<StartupSnapshot> {
  * Spawn a new agent with the given name. Returns the new agent's id + name.
  * The new agent gets its own workflow + tool registry (via the factory) while
  * sharing the provider, memory store, sandbox, and safety rules.
+ *
+ * `reviewOnly` (plan 2c26d533): when true the backend assigns the agent the
+ * "reviewer" role, restricting it to exactly the strict read-only reviewer
+ * tool surface — the same allowlist a spawned review subagent gets
+ * (REVIEWER_BASE_TOOLS). Callers that omit the flag get an unrestricted
+ * agent, exactly as before this flag existed.
  */
-export async function spawnAgent(name: string): Promise<AgentInfo> {
-  return await invoke("spawn_agent", { name });
+export async function spawnAgent(name: string, reviewOnly = false): Promise<AgentInfo> {
+  return await invoke("spawn_agent", { name, reviewOnly });
 }
 
 /**
@@ -572,7 +588,6 @@ export interface AppSettings {
   };
   context: {
     summarize_at_fill_rate: number;
-    proxy_cache_ceiling_tokens: number | null;
   };
   ui: {
     theme: string;
@@ -722,7 +737,6 @@ export interface SettingsSavePatch {
    *  it. Entries are trimmed and blanks dropped by the backend. */
   optimizer_compress_extra_commands?: string[];
   summarize_at_fill_rate?: number;
-  proxy_cache_ceiling_tokens?: number | null;
   theme?: string;
   show_token_usage?: boolean;
   show_tool_images?: boolean;

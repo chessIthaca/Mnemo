@@ -345,6 +345,10 @@ pub struct SettingsSaveDto {
     /// the current value.
     #[serde(default)]
     pub laya_routing: Option<bool>,
+    /// Laya compound reflex (opt-in; enable only against a fine-tuned
+    /// checkpoint). Absent = keep the current value.
+    #[serde(default)]
+    pub laya_reflex: Option<bool>,
     /// Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22 — all
     /// ON by default since 2027-01-25; uncheck to opt out). Absent = keep the
     /// current value, so a dialog that never touched a lever leaves the section
@@ -407,9 +411,6 @@ pub struct SettingsSaveDto {
     pub optimizer_compress_extra_commands: Option<Vec<String>>,
     #[serde(default)]
     pub summarize_at_fill_rate: Option<f64>,
-    /// Proxy cache ceiling in tokens (cliff guard). `Some(0)` clears it.
-    #[serde(default)]
-    pub proxy_cache_ceiling_tokens: Option<usize>,
     // G9 (§5.9.9 :733-738, job 4 D3): the `[ui]` fields (theme, the
     // show_*/chat_*/sound_* toggles, steering_notes) are ABSENT from
     // the engine patch — compile-time absent (row 33: "SettingsPatch
@@ -466,13 +467,6 @@ pub fn validate_and_apply_settings_patch(
         if !(0.05..=0.95).contains(&rate) {
             return Err(format!(
                 "summarize_at_fill_rate must be between 0.05 and 0.95 (got {rate})"
-            ));
-        }
-    }
-    if let Some(ceiling) = patch.proxy_cache_ceiling_tokens {
-        if ceiling > 0 && ceiling < 65_536 {
-            return Err(format!(
-                "proxy_cache_ceiling_tokens must be 0 (disable) or at least 65_536 tokens (got {ceiling})"
             ));
         }
     }
@@ -722,6 +716,9 @@ pub fn validate_and_apply_settings_patch(
     if let Some(routing) = patch.laya_routing {
         general.general.laya.routing = routing;
     }
+    if let Some(reflex) = patch.laya_reflex {
+        general.general.laya.reflex = reflex;
+    }
     // Token-optimizer levers ([general.optimizer]): absent = keep, so an
     // untouched dialog never rewrites the section — and a config still on
     // defaults keeps it omitted from config.toml entirely.
@@ -768,9 +765,6 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(rate) = patch.summarize_at_fill_rate {
         general.context.summarize_at_fill_rate = rate;
-    }
-    if let Some(ceiling) = patch.proxy_cache_ceiling_tokens {
-        general.context.proxy_cache_ceiling_tokens = if ceiling == 0 { None } else { Some(ceiling) };
     }
     if let Some(mb) = patch.trace_memory_budget_mb {
         general.trace.memory_budget_mb = super::TraceConfig::clamp_budget(mb);
@@ -1183,32 +1177,6 @@ mod tests {
     }
 
     #[test]
-    fn proxy_cache_ceiling_validation_rejects_tiny_and_accepts_disable_or_sane() {
-        // Ported from the removed patch.rs twin (quality review HIGH 3): a
-        // tiny ceiling would summarize constantly — meaningless as a cliff
-        // guard, so it is rejected. 0 (disable) and sane values pass, and 0
-        // clears the stored guard to None.
-        let current = Config::default();
-        let patch = SettingsSaveDto {
-            proxy_cache_ceiling_tokens: Some(1024),
-            ..Default::default()
-        };
-        let r = validate_and_apply_settings_patch(&current, &patch).unwrap_err();
-        assert!(r.contains("proxy_cache_ceiling_tokens"));
-        let patch = SettingsSaveDto {
-            proxy_cache_ceiling_tokens: Some(340_000),
-            ..Default::default()
-        };
-        assert!(validate_and_apply_settings_patch(&current, &patch).is_ok());
-        let patch = SettingsSaveDto {
-            proxy_cache_ceiling_tokens: Some(0),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
-        assert_eq!(next.general.context.proxy_cache_ceiling_tokens, None);
-    }
-
-    #[test]
     fn models_patch_double_option_semantics() {
         // Ported from the removed patch.rs twin (quality review HIGH 3): the
         // [models] overrides are double-Option — outer None keeps the
@@ -1534,6 +1502,32 @@ mod tests {
             let err = validate_and_apply_settings_patch(&current, &patch).unwrap_err();
             assert!(err.contains("routing threshold"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn laya_reflex_patch_round_trips_and_keeps() {
+        // The compound reflex opt-in (LayaConfig.reflex, plan e02de747's
+        // seventh flag): present sets, absent keeps — the same semantics
+        // as the other laya_* patch fields.
+        let current = Config::default();
+        let patch = SettingsSaveDto {
+            laya_reflex: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.reflex);
+
+        // Absent keeps — an all-default patch never touches it.
+        let next = validate_and_apply_settings_patch(&next, &SettingsSaveDto::default()).unwrap();
+        assert!(next.general.general.laya.reflex);
+
+        // And a `false` rides back off.
+        let patch = SettingsSaveDto {
+            laya_reflex: Some(false),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(!next.general.general.laya.reflex);
     }
 
     #[test]

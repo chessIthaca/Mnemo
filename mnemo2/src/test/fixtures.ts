@@ -1,0 +1,647 @@
+import type {
+  AppState,
+  Check,
+  DiffFile,
+  LeadEntry,
+  PlanItem,
+  Project,
+  TimelineStep,
+  Worker,
+} from "../lib/types";
+import { createInitialState } from "../lib/store";
+
+const passingChecks = (tip?: string): Check[] => [
+  {
+    name: "cargo test --workspace",
+    status: "passed",
+    detail: "Merge-time tip · 38s",
+    tip,
+  },
+];
+
+const defaultTimeline = (id: string): TimelineStep[] => [
+  {
+    id: `${id}-brief`,
+    label: "Brief accepted",
+    detail: "Plan excerpt, paths, and acceptance criteria",
+    status: "done",
+    time: "09:28",
+  },
+  {
+    id: `${id}-work`,
+    label: "Implementation",
+    detail: "Scoped to the delegated files",
+    status: "active",
+  },
+  {
+    id: `${id}-checks`,
+    label: "Checks",
+    detail: "Run on the branch tip",
+    status: "queued",
+  },
+];
+
+type WorkerInput = Pick<Worker, "id" | "name" | "task" | "summary" | "status"> &
+  Partial<Worker>;
+
+function makeWorker(input: WorkerInput): Worker {
+  const { id, name, task, summary, status, ...overrides } = input;
+  return {
+    id,
+    name,
+    initials: name.slice(0, 2).toUpperCase(),
+    hue: 96,
+    task,
+    summary,
+    status,
+    model: "glm-5.3-flash",
+    branch: `wt/agent-${id}`,
+    worktree: `.worktrees/agent-${id}`,
+    files: [],
+    tokens: 8400,
+    cost: 0.48,
+    elapsed: "9m",
+    turns: 3,
+    progress: 40,
+    lastActivity: "just now",
+    createdAtMs: 0,
+    activity: null,
+    needsYou: false,
+    kind: "implementation",
+    reviewRisk: "standard",
+    checks: passingChecks(),
+    findings: [],
+    messages: [{ id: `${id}-note`, from: "worker", body: summary, time: "09:42" }],
+    inbox: [],
+    screenshots: [],
+    timeline: defaultTimeline(id),
+    diff: { files: 3, additions: 84, deletions: 12 },
+    ...overrides,
+  };
+}
+
+export function createProjects(): Project[] {
+  return [
+    {
+      id: "mnemo",
+      name: "Mnemo",
+      path: "C:/AgenticCoder/AgenticCoder",
+      branch: "wt/mnemo",
+      leadModel: "claude-opus-5-5",
+      description: "Agentic coding harness · Mnemo2 cockpit",
+      lastSession: "12 min ago",
+      workerSlots: 8,
+      budgetSpent: 8.64,
+      budgetLimit: 20,
+    },
+    {
+      id: "garden-game",
+      name: "Garden game",
+      path: "C:/Games/Garden",
+      branch: "wt/prototype",
+      leadModel: "claude-opus-5-5",
+      description: "Godot experiment · local multiplayer",
+      lastSession: "Yesterday",
+      workerSlots: 4,
+      budgetSpent: 2.1,
+      budgetLimit: 12,
+    },
+    {
+      id: "field-notes",
+      name: "Field notes",
+      path: "C:/Writing/FieldNotes",
+      branch: "main",
+      leadModel: "gemini-3-flash-preview",
+      description: "Research notes · static site",
+      lastSession: "Monday",
+      workerSlots: 2,
+      budgetSpent: 0,
+      budgetLimit: 6,
+    },
+  ];
+}
+
+export function createWorkers(): Worker[] {
+  return [
+    makeWorker({
+      id: "ana",
+      name: "Ana",
+      hue: 82,
+      task: "Team state and review flow",
+      summary: "The review flow is ready. Two findings need a lead decision before merge.",
+      status: "in_review",
+      model: "kimi-k3.1-pro",
+      files: ["mnemo2/src/lib/store.ts", "mnemo2/src/lib/review.ts"],
+      tokens: 18420,
+      cost: 1.84,
+      elapsed: "26m",
+      turns: 7,
+      progress: 92,
+      lastActivity: "4m ago",
+      needsYou: true,
+      diff: { files: 5, additions: 184, deletions: 32 },
+      checks: passingChecks("tip-ana"),
+      review: {
+        summary: "Two findings need resolution before merge.",
+        tip: "tip-ana",
+        reviewedAtMs: 1_787_400_000_000,
+        evidence: {
+          unanchoredPass: true,
+          intent: "Ship the intent-driven review core: risk record, review evidence, and the audit gate.",
+          execution: "store.ts maps record.kind/review_risk/evidence; review.ts mirrors the host merge gate.",
+          integration: "TeamManager merge policy reads the same evidence; legacy records keep their old shape.",
+          testQuality: "Reducer tests cover legacy defaults; component tests drive the evidence panel from fixtures.",
+          residualRisk: "Host-side validation of the audit tip stays authoritative; the UI only mirrors it.",
+        },
+      },
+      findings: [
+        {
+          id: "ana-copy",
+          severity: "low",
+          title: "Give the merge action an accessible name",
+          detail: "The icon-only action needs an aria-label before it ships.",
+          file: "mnemo2/src/components/WorkerDetail.svelte",
+          line: 118,
+          status: "open",
+        },
+        {
+          id: "ana-merge",
+          severity: "high",
+          title: "Recheck the tip after a fixer commit",
+          detail: "A review fix invalidates the previous check result until the affected scope passes again.",
+          file: "mnemo2/src/lib/review.ts",
+          line: 42,
+          status: "open",
+        },
+      ],
+      timeline: [
+        { id: "ana-brief", label: "Brief accepted", detail: "Store, review guard, tests", status: "done", time: "09:12" },
+        { id: "ana-work", label: "Implementation", detail: "5 files · +184 −32", status: "done", time: "09:31" },
+        { id: "ana-checks", label: "Checks passed", detail: "cargo test --workspace", status: "done", time: "09:38" },
+        { id: "ana-review", label: "Lead review", detail: "2 findings awaiting resolution", status: "active" },
+      ],
+    }),
+    makeWorker({
+      id: "kai",
+      name: "Kai",
+      hue: 38,
+      task: "Markdown renderer and code blocks",
+      summary: "Tables and fenced code are rendering; I’m checking link sanitization now.",
+      status: "working",
+      model: "gemini-3-flash-preview",
+      files: ["mnemo2/src/lib/markdown.ts", "mnemo2/src/components/Markdown.svelte"],
+      tokens: 12040,
+      cost: 0.92,
+      elapsed: "18m",
+      turns: 5,
+      progress: 62,
+      lastActivity: "18s ago",
+      checks: [{ name: "npm test --workspace mnemo2", status: "running", detail: "14/18 tests" }],
+    }),
+    makeWorker({
+      id: "sol",
+      name: "Sol",
+      hue: 158,
+      task: "Design tokens and responsive shell",
+      summary: "The light theme is in place. I’m tuning the narrow-screen workbench transition.",
+      status: "working",
+      model: "glm-5.3",
+      files: ["mnemo2/src/app.css", "mnemo2/src/App.svelte"],
+      tokens: 10680,
+      cost: 1.12,
+      elapsed: "21m",
+      turns: 4,
+      progress: 48,
+      lastActivity: "1m ago",
+      diff: { files: 4, additions: 212, deletions: 28 },
+    }),
+    makeWorker({
+      id: "milo",
+      name: "Milo",
+      hue: 214,
+      task: "Workbench keyboard navigation",
+      summary: "The fixer is adding focus restoration after the review found a keyboard trap.",
+      status: "fixing",
+      fixerFindingId: "milo-focus",
+      model: "deepseek-flash",
+      files: ["mnemo2/src/components/Workbench.svelte"],
+      tokens: 14220,
+      cost: 1.06,
+      elapsed: "24m",
+      turns: 6,
+      progress: 78,
+      lastActivity: "32s ago",
+      checks: [{ name: "npm test --workspace mnemo2", status: "running", detail: "Fixer tip · running" }],
+      findings: [{
+        id: "milo-focus",
+        severity: "high",
+        title: "Restore focus when the overlay closes",
+        detail: "Keyboard users must return to the workbench button.",
+        file: "mnemo2/src/components/Workbench.svelte",
+        line: 76,
+        status: "open",
+      }],
+    }),
+    makeWorker({
+      id: "june",
+      name: "June",
+      hue: 284,
+      task: "Project recovery states",
+      summary: "Brief received; waiting for a worker slot and the recovery acceptance criteria.",
+      status: "dispatching",
+      tokens: 640,
+      cost: 0.08,
+      elapsed: "2m",
+      turns: 1,
+      progress: 8,
+      lastActivity: "2m ago",
+      diff: { files: 0, additions: 0, deletions: 0 },
+    }),
+    makeWorker({
+      id: "theo",
+      name: "Theo",
+      hue: 12,
+      task: "Plan persistence adapter",
+      summary: "Merge stopped cleanly: the plan adapter conflicts with the lead branch. No files were auto-resolved.",
+      status: "conflict",
+      model: "kimi-k3.1-pro-highspeed",
+      needsYou: true,
+      files: ["mnemo2/src/lib/persistence.ts"],
+      tokens: 15600,
+      cost: 1.32,
+      elapsed: "31m",
+      turns: 6,
+      progress: 86,
+      lastActivity: "7m ago",
+      diff: { files: 2, additions: 96, deletions: 18 },
+    }),
+    makeWorker({
+      id: "iris",
+      name: "Iris",
+      hue: 182,
+      task: "Merge record typography",
+      summary: "Review is closed and checks passed. The serialized merge is in progress.",
+      status: "merging",
+      progress: 100,
+      lastActivity: "now",
+      tokens: 6240,
+      cost: 0.54,
+      elapsed: "11m",
+      findings: [{
+        id: "iris-space",
+        severity: "low",
+        title: "Use a quieter merge timestamp",
+        detail: "Reduce visual competition with the commit summary.",
+        file: "mnemo2/src/components/MergeCard.svelte",
+        line: 34,
+        status: "fixed",
+        fixCommit: "f2a91c4",
+        evidence: "Lead review_fix · checks re-run",
+      }],
+    }),
+    makeWorker({
+      id: "ren",
+      name: "Ren",
+      hue: 48,
+      task: "Start-screen project cards",
+      summary: "Merged into wt/mnemo after lead review. The worktree is free for the next task.",
+      status: "merged",
+      progress: 100,
+      lastActivity: "18m ago",
+      tokens: 9840,
+      cost: 0.76,
+      elapsed: "16m",
+      diff: { files: 3, additions: 112, deletions: 20 },
+      findings: [
+        {
+          id: "ren-focus",
+          severity: "low",
+          title: "Tighten the project-card focus ring",
+          detail: "Use the shared focus token.",
+          file: "mnemo2/src/components/StartScreen.svelte",
+          line: 58,
+          status: "fixed",
+          fixCommit: "9ab31ef",
+        },
+        {
+          id: "ren-copy",
+          severity: "low",
+          title: "Keep the recovery copy concise",
+          detail: "The longer explanation is useful in the recovered-project sheet.",
+          file: "mnemo2/src/components/StartScreen.svelte",
+          line: 81,
+          status: "wontfix",
+          justification: "The longer copy only appears in the recovery sheet, where the extra context is intentional.",
+        },
+      ],
+      merge: {
+        id: "merge-ren",
+        workerId: "ren",
+        commit: "a7c9e2f",
+        branch: "wt/agent-ren",
+        target: "wt/mnemo",
+        files: 3,
+        additions: 112,
+        deletions: 20,
+        checks: ["cargo test --workspace"],
+        reviewSummary: "2 findings · 1 fixed · 1 wontfix",
+        model: "glm-5.3-flash",
+        tokens: 9840,
+        cost: 0.76,
+        time: "09:26",
+      },
+    }),
+    makeWorker({
+      id: "noa",
+      name: "Noa",
+      hue: 336,
+      task: "Budget telemetry formatting",
+      summary: "The check run failed on a locale-sensitive cost assertion. I need a lead decision on the expected format.",
+      status: "failed",
+      model: "deepseek-flash",
+      needsYou: true,
+      tokens: 7280,
+      cost: 0.61,
+      elapsed: "14m",
+      turns: 4,
+      progress: 66,
+      lastActivity: "11m ago",
+      checks: [{ name: "npm test --workspace mnemo2", status: "failed", detail: "1 assertion · currency locale" }],
+    }),
+    makeWorker({
+      id: "liv",
+      name: "Liv",
+      hue: 252,
+      task: "Icon consistency audit",
+      summary: "Cancelled by the lead after the icon set was standardized in the design tokens task.",
+      status: "cancelled",
+      tokens: 1820,
+      cost: 0.14,
+      elapsed: "5m",
+      turns: 2,
+      progress: 24,
+      lastActivity: "32m ago",
+      diff: { files: 0, additions: 0, deletions: 0 },
+    }),
+  ];
+}
+
+const leadPlan = [
+  "I’ve split this into **one plan of record** and small executor briefs. I’ll keep the architecture and review here; the team’s tool logs stay in their own threads.",
+  "",
+  "### Delegation map",
+  "",
+  "| Area | Owner | Why it is separate |",
+  "| --- | --- | --- |",
+  "| State + review | Ana | Merge invariants need focused tests |",
+  "| Markdown | Kai | Rendering and sanitization are self-contained |",
+  "| Visual shell | Sol | Tokens and responsive behavior can move independently |",
+  "",
+  "The merge guard is the important part:",
+  "",
+  "```ts",
+  "const eligible = checksPassed && findings.every((finding) => finding.status !== \"open\");",
+  "```",
+  "",
+  "Open **Team** when you want the exception view. I’ll only bring decisions and merge records back into this conversation.",
+].join("\n");
+
+export function createLeadEntries(workers: Worker[]): LeadEntry[] {
+  const entries: LeadEntry[] = [
+    {
+      id: "entry-user-brief",
+      kind: "message",
+      author: "user",
+      time: "09:08",
+      body: "Ship a first-run experience that makes delegation feel obvious — calm for me, clear for the workers.",
+    },
+    {
+      id: "entry-lead-plan",
+      kind: "message",
+      author: "lead",
+      time: "09:11",
+      body: leadPlan,
+    },
+    {
+      id: "entry-spawn-team",
+      kind: "spawn",
+      title: "Team dispatched · 10 briefs",
+      body: "Four active now, six queued or already through review. Worker slots can be changed per project.",
+      time: "09:12",
+      workerIds: ["ana", "kai", "sol", "milo", "june", "theo", "iris", "ren", "noa", "liv"],
+    },
+    {
+      id: "entry-ana-review",
+      kind: "team-message",
+      workerId: "ana",
+      body: "Review is ready. I’ve kept the merge guard and the UI fix separate so the high-risk finding can go to a fixer.",
+      time: "09:41",
+    },
+  ];
+
+  const ren = workers.find((worker) => worker.id === "ren");
+  if (ren?.merge) {
+    entries.push({
+      id: "entry-ren-merge",
+      kind: "merge",
+      workerId: "ren",
+      record: ren.merge,
+      time: "09:26",
+    });
+  }
+
+  return entries;
+}
+
+export function createPlanItems(): PlanItem[] {
+  return [
+    {
+      id: "plan-foundation",
+      title: "Define the lead/team contract",
+      detail: "One project, one plan of record, worker briefs with explicit paths and limits.",
+      owner: "Lead",
+      status: "done",
+    },
+    {
+      id: "plan-shell",
+      title: "Build the calm visual shell",
+      detail: "Warm-white surfaces, readable prose, responsive Focus and Split views.",
+      owner: "Sol",
+      status: "done",
+    },
+    {
+      id: "plan-state",
+      title: "Connect the mock workflow",
+      detail: "Dispatch, worker messages, findings, checks, and merge records share one store.",
+      owner: "Ana",
+      status: "active",
+    },
+    {
+      id: "plan-content",
+      title: "Render rich lead responses",
+      detail: "Sanitized Markdown, tables, code blocks, and links into the workbench.",
+      owner: "Kai",
+      status: "active",
+    },
+    {
+      id: "plan-review",
+      title: "Close the lead review",
+      detail: "Resolve every finding, re-run the affected checks, then merge the reviewed tip.",
+      owner: "Lead + Ana",
+      status: "queued",
+    },
+    {
+      id: "plan-polish",
+      title: "Verify desktop and narrow layouts",
+      detail: "Keyboard flow, reduced motion, overflow, and ten-worker Mission Control.",
+      owner: "Milo",
+      status: "queued",
+    },
+  ];
+}
+
+export function createDiffFiles(): DiffFile[] {
+  return [
+    {
+      path: "mnemo2/src/lib/review.ts",
+      additions: 46,
+      deletions: 8,
+      lines: [
+        { type: "hunk", text: "@@ -38,7 +38,11 @@ export function canMerge(worker: Worker) {" },
+        { type: "context", text: "  const open = findings.filter((finding) => finding.status === 'open');" },
+        { type: "remove", text: "  if (open.length > 0) return { ok: false };" },
+        { type: "add", text: "  if (open.length > 0) {" },
+        { type: "add", text: "    return { ok: false, reason: `${open.length} findings are open` };" },
+        { type: "add", text: "  }" },
+        { type: "context", text: "  const check = worker.checks.find((item) => item.status !== 'passed');" },
+        { type: "add", text: "  if (check) return { ok: false, reason: `${check.name} has not passed` };" },
+        { type: "add", text: "  return { ok: true };" },
+      ],
+    },
+    {
+      path: "mnemo2/src/components/WorkerDetail.svelte",
+      additions: 28,
+      deletions: 4,
+      lines: [
+        { type: "hunk", text: "@@ -112,6 +112,9 @@" },
+        { type: "context", text: "  <div class=\"worker-actions\">" },
+        { type: "remove", text: "    <button><GitMerge size={16} /></button>" },
+        { type: "add", text: "    <button aria-label=\"Merge reviewed worker\">" },
+        { type: "add", text: "      <GitMerge size={16} />" },
+        { type: "add", text: "      <span>Merge reviewed branch</span>" },
+        { type: "add", text: "    </button>" },
+      ],
+    },
+    {
+      path: "mnemo2/src/lib/store.test.ts",
+      additions: 38,
+      deletions: 0,
+      lines: [
+        { type: "hunk", text: "@@ -0,0 +1,38 @@" },
+        { type: "add", text: "it('blocks a merge while a finding is open', () => {" },
+        { type: "add", text: "  actions.mergeWorker('ana');" },
+        { type: "add", text: "  expect(worker('ana').status).toBe('in_review');" },
+        { type: "add", text: "  expect(worker('ana').merge).toBeUndefined();" },
+        { type: "add", text: "});" },
+      ],
+    },
+  ];
+}
+/**
+ * A complete, already-opened fixture state for tests only; production starts
+ * empty. Component tests render straight from this (no `openProject`, which
+ * correctly clears workers until the real team sync repopulates them).
+ */
+export function fixtureState(): AppState {
+  const workers = createWorkers();
+  return {
+    ...createInitialState(),
+    route: "lead",
+    projectId: "mnemo",
+    projects: createProjects(),
+    workers,
+    leadEntries: createLeadEntries(workers),
+    selectedWorkerId: "ana",
+    planItems: createPlanItems(),
+    diffFiles: createDiffFiles(),
+    projectUsage: {
+      inputTokens: 486_200,
+      cachedTokens: 212_400,
+      outputTokens: 64_800,
+      costMicros: 4_320_000,
+      unpricedModels: [],
+    },
+  };
+}
+
+/**
+ * A high-risk implementation worker whose review is complete and audited.
+ * Kept out of `createWorkers()` so the default fixture team keeps its shape.
+ */
+export function createHighRiskWorker(): Worker {
+  return makeWorker({
+    id: "mara",
+    name: "Mara",
+    hue: 12,
+    task: "TeamManager serialized merge",
+    summary: "Merge policy is ready; the independent audit found one low-risk note.",
+    status: "in_review",
+    model: "kimi-k3.1-pro",
+    files: ["src-tauri/src/team/mod.rs"],
+    tokens: 24_100,
+    cost: 2.14,
+    elapsed: "31m",
+    turns: 9,
+    progress: 88,
+    reviewRisk: "high",
+    checks: passingChecks("tip-mara"),
+    review: {
+      summary: "Audit adjudicated: shipped as reviewed, no blocking findings.",
+      tip: "tip-mara",
+      reviewedAtMs: 1_787_400_000_000,
+      evidence: {
+        unanchoredPass: true,
+        intent: "Serialize worker merges behind one TeamManager queue.",
+        execution: "The merge path locks the lead branch before applying the worker tip.",
+        integration: "Merge records keep the reviewed tip; reverts reuse the same commit id.",
+        testQuality: "Reducer tests cover queue ordering; the audit added a conflict case.",
+        residualRisk: "Windows file locking is still unverified under a live worktree.",
+        independentReviewerId: "ada",
+        auditAdjudication: "Accepted the audit's conflict-case finding and fixed it at tip-mara.",
+      },
+    },
+    findings: [],
+    timeline: [
+      { id: "mara-brief", label: "Brief accepted", detail: "Merge policy scope", status: "done" },
+      { id: "mara-review", label: "Lead review", detail: "High risk · audit adjudicated", status: "done" },
+    ],
+  });
+}
+
+/** A read-only audit worker inspecting the high-risk worker's tip. */
+export function createAuditWorker(): Worker {
+  return makeWorker({
+    id: "ada",
+    name: "Ada",
+    hue: 210,
+    task: "Audit: TeamManager serialized merge",
+    summary: "Read-only audit of tip-mara. One low finding on conflict handling.",
+    status: "completed",
+    model: "glm-5.3-flash",
+    files: [],
+    tokens: 6_200,
+    cost: 0.31,
+    elapsed: "6m",
+    turns: 2,
+    progress: 100,
+    kind: "audit",
+    auditTarget: "mara",
+    auditTip: "tip-mara",
+    checks: [],
+    findings: [],
+    timeline: [
+      { id: "ada-brief", label: "Audit dispatched", detail: "Read-only · no plan step", status: "done" },
+      { id: "ada-report", label: "Audit reported", detail: "1 low finding · adjudication pending", status: "active" },
+    ],
+  });
+}

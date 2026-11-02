@@ -1,0 +1,12 @@
+{
+  "name": "mnemo",
+  "version": "0.1.1",
+  "description": "Lead a Mnemo2 team from Claude Code: plan on the Mnemo2 plan board, dispatch workers by tier, review and merge through Mnemo2's team tools. Hooks deliver worker notices and keep Claude Code's own agents as a last resort.",
+  "author": {
+    "name": "Carsten Hess"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/chessIthaca/Mnemo",
+  "homepage": "https://github.com/chessIthaca/Mnemo",
+  "keywords": ["mnemo", "mnemo2", "team", "lead", "workers", "review", "merge"]
+}

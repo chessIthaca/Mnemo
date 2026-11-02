@@ -705,12 +705,12 @@ impl AgentLoop {
             // abandons the summary and returns the original messages. Any
             // non-interrupt commands buffered during the call are re-injected
             // as system messages below.
-            // The effective trigger respects the proxy cache ceiling (when
-            // set) so compaction fires before the request crosses the ~340K
-            // cliff where proxies drop whole-conversation prefix caching. It
-            // also carries the session's temporary raise (backlog 11513ee5),
-            // so a session that compaction could not bring under the fill-rate
-            // dial is not re-triggered on every iteration.
+            // The effective trigger is exactly the fill-rate dial
+            // (`summarize_at_fill_rate` × window; the proxy-cache ceiling
+            // cap was removed 2027-01-25). It also carries the session's
+            // temporary raise (backlog 11513ee5), so a session that
+            // compaction could not bring under the fill-rate dial is not
+            // re-triggered on every iteration.
             if token_count >= context_manager.effective_limit() {
                 if let Some(outcome) = self
                     .maybe_compact(
@@ -2172,6 +2172,25 @@ impl AgentLoop {
                 break;
             }
 
+            // Execution-start marker (plan b2052a9c): the per-call execution
+            // clock starts HERE — not back at `ToolCallStart`, which fired
+            // mid-stream when the model ANNOUNCED the whole batch. This loop
+            // runs calls one at a time, so a card anchored on the announcement
+            // would bill earlier calls' running time to later ones and make
+            // the suffixes look cumulative. Emitted exactly once per logical
+            // call — the failure-triage retry below and the not-run synthesis
+            // above never re-emit it — so one card measures the whole logical
+            // call (approval + execution + retry) minus the queue time behind
+            // earlier siblings.
+            let _ = fanin_tx
+                .send((
+                    agent_id,
+                    AgentEvent::ToolExecutionStart {
+                        tool_call_id: tc.id.clone(),
+                    },
+                ))
+                .await;
+
             let (mut result, mut buffered) = self
                 .execute_tool_call(
                     tc,
@@ -2191,6 +2210,7 @@ impl AgentLoop {
             // denial => `batch_triage` stays `None` and every branch below
             // keeps its pre-classifier behavior byte-for-byte.
             if !result.success
+                && !is_domain_tool_error(&result)
                 && !is_user_denial_tool_output(&result.output)
                 && batch_triage.is_none()
                 && stop_signal.is_none()
@@ -2549,6 +2569,7 @@ impl AgentLoop {
             // not a stuck model — excluded, mirroring the MAX_RETRIES
             // rule at the top of this loop.
             if !result.success
+                && !is_domain_tool_error(&result)
                 && !is_user_denial_tool_output(&result.output)
                 && pending_correction.is_none()
                 && repeated_tool_failure(messages, &tc.name, &tool_content)
@@ -3373,7 +3394,16 @@ impl AgentLoop {
         // MemoryRecalled lines after every >4 KiB tool output (defect
         // fixed 2026-08-20).
         if let Some(store) = &self.memory {
-            let query = last_user_query(messages);
+            // Task scoping (backlog c68a8c3b): with a plan active, the
+            // recall query embeds the plan's goal+context alongside the
+            // last user message, so the plan's own records outrank rows
+            // that merely match the message's generic tokens. The
+            // per-turn cache keys on the COMBINED query — a plan-frame
+            // change (step tick, context amendment) re-embeds once:
+            // correctness over cache.
+            let plan_text = self.workflow.plan_recall_text().await;
+            let query =
+                last_user_query(messages).map(|q| recall_query_text(&q, plan_text.as_deref()));
             if let Some(q_text) = query {
                 let q: &str = &q_text;
                 let filter = crate::memory::MemoryFilter::new().limit(5);
@@ -3420,6 +3450,24 @@ impl AgentLoop {
                             }
                             _ => Vec::new(),
                         }
+                    };
+                // Session dismissal (backlog c68a8c3b): rows the agent
+                // dismissed via the recall_feedback tool never re-inject
+                // for this session's remainder. Applied at the RENDER
+                // boundary — after the cache write (the per-turn cache
+                // keeps the UNFILTERED set, so a dismissal that lands
+                // between turns is honored even on a cache hit) and
+                // before the visibility event, so both the
+                // MemoryRecalled announcement and the block respect it.
+                // Lock poisoning degrades to "no filtering" (the block
+                // still renders; nothing is silently hidden).
+                let results: Vec<crate::memory::ScoredMemory> =
+                    match self.dismissed_recall.lock() {
+                        Ok(set) if !set.is_empty() => results
+                            .into_iter()
+                            .filter(|sm| !set.contains(&sm.memory.id))
+                            .collect(),
+                        _ => results,
                     };
                 if !results.is_empty() {
                     // Visibility of memory access (user request
@@ -3508,6 +3556,36 @@ impl AgentLoop {
         if elided == 0 {
             // Nothing to elide: keep today's bytes and record no savings.
             return full;
+        }
+        // (d) Set-level sentinel (backlog c68a8c3b): EVERY row in the
+        // set is already injected — the set is unchanged since its last
+        // sighting. N per-row references collapse into ONE line (a
+        // 5-row repeat costs ~1 line instead of ~5). The decisions stay
+        // recorded (the cache is already updated above), and the
+        // not-smaller guard keeps the delta path's semantics: only a
+        // strictly smaller block ships; a pathological set where the
+        // sentinel is not smaller falls through to the per-row
+        // references, which carry more information for the same cost.
+        if elided == decisions.len() {
+            let first_turn = decisions.iter().flatten().min().copied().unwrap_or(0);
+            let sentinel = prompt::format_recall_sentinel(results.len(), first_turn);
+            let before = crate::tool::agent::optimizer::estimate_tokens(&full);
+            let after = crate::tool::agent::optimizer::estimate_tokens(&sentinel);
+            if after < before {
+                self.record_savings_event(
+                    session_id,
+                    "recall_delta",
+                    Some(format!(
+                        "{} memories ({} elided → sentinel)",
+                        results.len(),
+                        elided
+                    )),
+                    before,
+                    after,
+                    false,
+                );
+                return sentinel;
+            }
         }
         let delta = prompt::format_recall_context_delta(results, &|i, _| decisions[i]);
         let before = crate::tool::agent::optimizer::estimate_tokens(&full);
@@ -4185,9 +4263,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             return Some(path.to_string());
         }
         if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
-            let paths: Vec<&str> = files
+            let paths: Vec<String> = files
                 .iter()
-                .filter_map(|s| s.get("path").and_then(|p| p.as_str()))
+                .filter_map(|s| crate::tool::agent::read_files::parse_spec(s).map(|s| s.path))
                 .collect();
             if !paths.is_empty() {
                 return Some(paths.join(", "));
@@ -4291,7 +4369,10 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             // ExportHistory answers from this (the pinned future holds the
             // live borrow; the snapshot is the conversation as of the
             // request start, missing only the in-flight assistant turn).
-            let history_at_request = messages.to_vec();
+            // The volatile tail + CONTEXT_FOOTER are pushed for THIS request
+            // only and popped after it; an export must not carry them, or a
+            // host that saves/resumes the export makes them permanent history.
+            let history_at_request = prompt::strip_request_scaffolding(messages.to_vec());
             tokio::pin!(complete_fut);
             loop {
                 tokio::select! {
@@ -5283,6 +5364,15 @@ fn repair_empty_assistant_messages(messages: &mut [Message]) {
     }
 }
 
+fn is_domain_tool_error(result: &ToolResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("error_kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("domain")
+}
+
 /// Whether a tool-result error string is a user denial / interrupt rather than
 /// a model/tool failure. Used so DenyAll batches and interrupt/cancel stops do
 /// not trip `MAX_RETRIES`.
@@ -5317,6 +5407,41 @@ fn repeated_tool_failure(messages: &[Message], tool_name: &str, failed_content: 
                     MessageContent::Parts(_) => false,
                 }
         })
+}
+
+/// Build the auto-recall query (backlog c68a8c3b): the last user message
+/// alone (today's behavior) when no plan is active, or the message plus a
+/// capped `[ACTIVE PLAN — goal+context]` block when one is — the ranking
+/// (query similarity + the keyword boost) then scores the plan's own
+/// records above rows that merely match the message's generic tokens.
+/// The plan text is capped at ~1 000 bytes, cut at a whitespace boundary
+/// (never mid-word), so the embed stays cheap and the plan's lexical mass
+/// stays balanced against the user's own message.
+pub(crate) fn recall_query_text(last: &str, plan_goal_context: Option<&str>) -> String {
+    match plan_goal_context.map(str::trim).filter(|p| !p.is_empty()) {
+        None => last.to_string(),
+        Some(p) => format!(
+            "{last}\n\n[ACTIVE PLAN — goal+context]\n{}",
+            cap_at_whitespace(p, 1_000)
+        ),
+    }
+}
+
+/// Cut `text` to at most `cap` bytes on a whitespace boundary — never a
+/// mid-word cut, never a mid-UTF-8-sequence cut (the boundary is walked
+/// back to a char boundary first); a single long token is hard-cut.
+fn cap_at_whitespace(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    match text[..end].rfind(char::is_whitespace) {
+        Some(i) => &text[..i],
+        None => &text[..end],
+    }
 }
 
 /// The auto-recall query: the latest User-role message text, skipping

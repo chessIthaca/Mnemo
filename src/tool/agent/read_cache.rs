@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use super::read_files::numbered_line;
 use crate::codegraph::walk::Lang;
 
 /// Maximum number of files tracked per agent cache. When full, the whole
@@ -109,7 +110,8 @@ pub(crate) fn skeleton_for(content: &str, lang: Lang) -> Skeleton {
         }
         if is_signature_line(lang, line) {
             kept += 1;
-            body.push_str(&format!("{:>4}: {line}\n", i + 1));
+            body.push_str(&numbered_line(i + 1, line));
+            body.push('\n');
         }
     }
     Skeleton { body, kept, capped }
@@ -193,7 +195,7 @@ mod tests {
         let src = "//! doc\nuse std::fmt;\n\npub struct A { x: u32 }\n\nimpl A {\n    \
                    pub fn new() -> Self {\n        let b = 1 + 2;\n    }\n}\n\nfn helper() {}\n";
         let sk = skeleton_for(src, Lang::Rust);
-        assert!(sk.body.contains("   2: use std::fmt;"), "{}", sk.body);
+        assert!(sk.body.starts_with("2: use std::fmt;\n"), "{}", sk.body);
         assert!(sk.body.contains("pub struct A { x: u32 }"));
         assert!(sk.body.contains("impl A {"));
         assert!(sk.body.contains("fn helper() {}"));

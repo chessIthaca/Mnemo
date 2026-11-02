@@ -26,6 +26,7 @@ function shellCall(liveOutput?: string): ToolInvocation {
   return {
     id: "c1",
     index: 0,
+    name: "shell",
     args: JSON.stringify({ command: "cargo test" }),
     result: null,
     ...(liveOutput !== undefined ? { liveOutput } : {}),
@@ -61,7 +62,7 @@ describe("live shell-output preview — fixed height, reserved (backlog 6f25fb7e
     // Only shell emits ToolOutputDelta (the shell.rs sink) — no reservation
     // for any other tool, even with a stray liveOutput.
     const markup = renderToStaticMarkup(
-      <Message entry={toolEntry("search", [shellCall("partial output")])} />,
+      <Message entry={toolEntry("search", [{ ...shellCall("partial output"), name: "search" }])} />,
     );
     expect(markup).not.toContain('aria-live="polite"');
     expect(markup).not.toContain("h-[10em]");
@@ -76,6 +77,7 @@ describe("live shell-output preview — fixed height, reserved (backlog 6f25fb7e
           {
             id: "c1",
             index: 0,
+            name: "shell",
             args: JSON.stringify({ command: "cargo test" }),
             result: { success: true, output: "done" },
           },
@@ -90,14 +92,15 @@ describe("live shell-output preview — fixed height, reserved (backlog 6f25fb7e
 describe("tool-card timing — duration + wall-clock next to the check (user request 2027-01-24)", () => {
   /** A completed call with explicit timing stamps (deterministic duration). */
   function doneCall(startedAt: number, endedAt: number): ToolInvocation {
-    return {
-      id: "c1",
-      index: 0,
-      args: JSON.stringify({ command: "cargo test" }),
-      result: { success: true, output: "done" },
-      startedAt,
-      endedAt,
-    };
+  return {
+    id: "c1",
+    index: 0,
+    name: "shell",
+    args: JSON.stringify({ command: "cargo test" }),
+    result: { success: true, output: "done" },
+    startedAt,
+    endedAt,
+  };
   }
 
   it("renders the duration and the wall-clock start next to the check", () => {
@@ -120,6 +123,7 @@ describe("tool-card timing — duration + wall-clock next to the check (user req
           {
             id: "c1",
             index: 0,
+            name: "shell",
             args: JSON.stringify({ command: "cargo test" }),
             result: { success: true, output: "done" },
           },

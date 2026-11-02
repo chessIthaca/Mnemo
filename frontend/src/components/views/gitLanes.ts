@@ -260,6 +260,7 @@ export function countGitMutations(
     kind: string;
     name?: string;
     calls?: ReadonlyArray<{
+      name?: string;
       args: string;
       result: { success: boolean } | null;
     }>;
@@ -270,7 +271,9 @@ export function countGitMutations(
     if (entry.kind !== "tool" || !entry.calls) continue;
     for (const call of entry.calls) {
       if (call.result === null || !call.result.success) continue;
-      if (isGitMutation(entry.name ?? "", call.args)) count += 1;
+      // The CALL's own name (a run may bundle different tools); the entry name
+      // is only the run's first call and would miss a bundled mutation.
+      if (isGitMutation(call.name ?? entry.name ?? "", call.args)) count += 1;
     }
   }
   return count;
@@ -293,6 +296,7 @@ export function countGitMutationsCached(
     kind: string;
     name?: string;
     calls?: ReadonlyArray<{
+      name?: string;
       args: string;
       result: { success: boolean } | null;
     }>;

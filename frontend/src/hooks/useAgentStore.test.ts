@@ -241,7 +241,7 @@ describe("agent event reducers (table-driven)", () => {
     if (t.kind === "tool") {
       expect(t.name).toBe("shell");
       expect(t.calls).toEqual([
-        { id: "call-1", index: 0, args: "", result: null, startedAt: expect.any(Number) },
+        { id: "call-1", index: 0, name: "shell", args: "", result: null, startedAt: expect.any(Number) },
       ]);
     }
   });
@@ -259,9 +259,9 @@ describe("agent event reducers (table-driven)", () => {
   });
 
   it("tool_call_start: merges consecutive same-tool calls into one card", () => {
-    // Generic tools still merge (shell/browser/search are the never-merge
-    // exception, covered by the dedicated tests below — backlog daa38cbe +
-    // 24ddb845).
+    // Consecutive calls merge into one card — including calls to DIFFERENT
+    // tools (2026-10-18 one-headline decision; the old shell/browser/search
+    // never-merge rule is superseded — see the bundling tests below).
     useAgentStore.getState().handleAgentEvent({
       agent_id: ID,
       event: { kind: "tool_call_start", index: 0, id: "call-1", name: "file_edit" },
@@ -363,182 +363,76 @@ describe("agent event reducers (table-driven)", () => {
     if (tools[0].kind === "tool") expect(tools[0].calls).toHaveLength(2);
   });
 
-  it("shell calls never merge: sequential calls stay on separate lines", () => {
-    // Shell commands never group (backlog daa38cbe): the command of each call
-    // is the point of the card. call→result→call stays TWO cards, one call
-    // each — same-tool non-shell tools would merge into one card with two
-    // calls (see the merge-chain test above).
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
-    });
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: {
-        kind: "tool_result",
-        tool_call_id: "call-1",
-        result: { success: true, output: "ok" },
-      },
-    });
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "shell" },
-    });
-    const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
-    expect(tools).toHaveLength(2);
-    if (tools[0].kind === "tool") {
-      expect(tools[0].name).toBe("shell");
-      expect(tools[0].calls).toHaveLength(1);
-    }
-    if (tools[1].kind === "tool") {
-      expect(tools[1].name).toBe("shell");
-      expect(tools[1].calls).toHaveLength(1);
-    }
-  });
-
-  it("shell calls never merge even within one parallel batch", () => {
-    // Two tool_call_start(shell) with no intervening result would merge for
-    // any other tool; shell always renders one call per card (backlog daa38cbe).
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
-    });
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "shell" },
-    });
-    const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
-    expect(tools).toHaveLength(2);
-    if (tools[0].kind === "tool") expect(tools[0].calls).toHaveLength(1);
-    if (tools[1].kind === "tool") expect(tools[1].calls).toHaveLength(1);
-  });
-
-  it("browser_navigate calls never merge: each action is its own line", () => {
-    // The live-tab browser_* family never groups (backlog daa38cbe): each
-    // action's target is the point of the card.
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "browser_navigate" },
-    });
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: {
-        kind: "tool_result",
-        tool_call_id: "call-1",
-        result: { success: true, output: "navigated to https://example.com" },
-      },
-    });
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "browser_navigate" },
-    });
-    const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
-    expect(tools).toHaveLength(2);
-    if (tools[0].kind === "tool") {
-      expect(tools[0].name).toBe("browser_navigate");
-      expect(tools[0].calls).toHaveLength(1);
-    }
-    if (tools[1].kind === "tool") {
-      expect(tools[1].name).toBe("browser_navigate");
-      expect(tools[1].calls).toHaveLength(1);
-    }
-  });
-
-  it("offscreen_browser_navigate calls never merge: the headless family too", () => {
-    // The headless offscreen_browser_* family is in the never-merge set
-    // (backlog daa38cbe).
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "offscreen_browser_navigate" },
-    });
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: {
-        kind: "tool_result",
-        tool_call_id: "call-1",
-        result: { success: true, output: "navigated to https://example.com" },
-      },
-    });
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "offscreen_browser_navigate" },
-    });
-    const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
-    expect(tools).toHaveLength(2);
-    if (tools[0].kind === "tool") {
-      expect(tools[0].name).toBe("offscreen_browser_navigate");
-      expect(tools[0].calls).toHaveLength(1);
-    }
-    if (tools[1].kind === "tool") {
-      expect(tools[1].name).toBe("offscreen_browser_navigate");
-      expect(tools[1].calls).toHaveLength(1);
-    }
-  });
-
-  it("search calls never merge even within one parallel batch", () => {
-    // Two tool_call_start(search) with no intervening result would merge for
-    // any other tool; each search query is distinct and must render one call
-    // per card (backlog 24ddb845, extending the daa38cbe directive).
+  it("consecutive calls to DIFFERENT tools bundle into ONE card, each stamped with its name", () => {
+    // The 2026-10-18 bundling decision: a run of calls — same tool or not —
+    // is one card whose headline summarizes it, and every invocation carries
+    // its own `name` so the expanded rows can render the raw tool name and
+    // the per-call phrase derived from it.
     useAgentStore.getState().handleAgentEvent({
       agent_id: ID,
       event: { kind: "tool_call_start", index: 0, id: "call-1", name: "search" },
     });
     useAgentStore.getState().handleAgentEvent({
       agent_id: ID,
-      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "search" },
-    });
-    const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
-    expect(tools).toHaveLength(2);
-    if (tools[0].kind === "tool") expect(tools[0].calls).toHaveLength(1);
-    if (tools[1].kind === "tool") expect(tools[1].calls).toHaveLength(1);
-  });
-
-  it("search_read calls never merge: the auto-read variant too", () => {
-    // search_read shares the search never-merge set (backlog 24ddb845):
-    // each query is distinct even when the calls run back to back.
-    useAgentStore.getState().handleAgentEvent({
-      agent_id: ID,
-      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "search_read" },
+      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "file_edit" },
     });
     useAgentStore.getState().handleAgentEvent({
       agent_id: ID,
-      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "search_read" },
+      event: { kind: "tool_call_start", index: 2, id: "call-3", name: "read_files" },
     });
     const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
-    expect(tools).toHaveLength(2);
+    expect(tools).toHaveLength(1);
     if (tools[0].kind === "tool") {
-      expect(tools[0].name).toBe("search_read");
-      expect(tools[0].calls).toHaveLength(1);
-    }
-    if (tools[1].kind === "tool") {
-      expect(tools[1].name).toBe("search_read");
-      expect(tools[1].calls).toHaveLength(1);
+      // The entry keeps the FIRST call's tool as its representative name.
+      expect(tools[0].name).toBe("search");
+      expect(tools[0].calls.map((c) => c.name)).toEqual(["search", "file_edit", "read_files"]);
     }
   });
 
-  it("sequential search calls stay separate cards even after a result", () => {
-    // call → result → call: the completed result must not let the next
-    // search merge into the first card (backlog 24ddb845).
+  it("a completed result does not break the run (call → result → call stays one card)", () => {
     useAgentStore.getState().handleAgentEvent({
       agent_id: ID,
-      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "search" },
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
     });
     useAgentStore.getState().handleAgentEvent({
       agent_id: ID,
-      event: {
-        kind: "tool_result",
-        tool_call_id: "call-1",
-        result: { success: true, output: "1 match" },
-      },
+      event: { kind: "tool_result", tool_call_id: "call-1", result: { success: true, output: "ok" } },
     });
     useAgentStore.getState().handleAgentEvent({
       agent_id: ID,
       event: { kind: "tool_call_start", index: 1, id: "call-2", name: "search" },
     });
     const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
-    expect(tools).toHaveLength(2);
-    if (tools[0].kind === "tool") expect(tools[0].calls).toHaveLength(1);
-    if (tools[1].kind === "tool") expect(tools[1].calls).toHaveLength(1);
+    expect(tools).toHaveLength(1);
+    if (tools[0].kind === "tool") {
+      expect(tools[0].calls).toHaveLength(2);
+      expect(tools[0].calls.map((c) => c.name)).toEqual(["shell", "search"]);
+    }
+  });
+
+  it("shell, browser and search calls bundle like any other tool (never-merge superseded)", () => {
+    // The old never-merge set (backlog daa38cbe + 24ddb845) is superseded by
+    // the one-headline decision: shell, live-tab browser_*, the headless
+    // offscreen_* family and search/search_read merge into the run like
+    // everything else.
+    const names = [
+      "shell",
+      "browser_navigate",
+      "offscreen_browser_navigate",
+      "search",
+      "search_read",
+    ];
+    names.forEach((name, i) => {
+      useAgentStore.getState().handleAgentEvent({
+        agent_id: ID,
+        event: { kind: "tool_call_start", index: i, id: `call-${i}`, name },
+      });
+    });
+    const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
+    expect(tools).toHaveLength(1);
+    if (tools[0].kind === "tool") {
+      expect(tools[0].calls.map((c) => c.name)).toEqual(names);
+    }
   });
 
   it("regression (review M2): same-tool runs split past MAX_CALLS_PER_TOOL_CARD and split cards still resolve results", () => {
@@ -950,20 +844,19 @@ describe("agent event reducers (table-driven)", () => {
       { tool_call_id: "call-1", text: "c" }, // second chunk for the same call
       { tool_call_id: "ghost", text: "x" }, // unknown call → dropped
     ]);
-    // Shell calls never merge into one card (neverGroups), so the two running
-    // calls live in two entries — and ONE batched write updated both.
+    // Both running calls now live in ONE card (the bundling decision), and ONE
+    // batched write appended every flushed chunk.
     const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
-    expect(tools.length).toBe(2);
-    const first = tools[0];
-    const second = tools[1];
-    if (!first || first.kind !== "tool" || !second || second.kind !== "tool") {
-      throw new Error("both shell cards must exist — a guard would skip the assertions below");
+    expect(tools.length).toBe(1);
+    const card = tools[0];
+    if (!card || card.kind !== "tool") {
+      throw new Error("the shell card must exist — a guard would skip the assertions below");
     }
-    expect(first.calls.length).toBe(1);
-    expect(first.calls[0].id).toBe("call-1");
-    expect(first.calls[0].liveOutput).toBe("ac");
-    expect(second.calls[0].id).toBe("call-2");
-    expect(second.calls[0].liveOutput).toBe("b");
+    expect(card.calls.length).toBe(2);
+    expect(card.calls[0].id).toBe("call-1");
+    expect(card.calls[0].liveOutput).toBe("ac");
+    expect(card.calls[1].id).toBe("call-2");
+    expect(card.calls[1].liveOutput).toBe("b");
 
     // A batch that matches NOTHING must not write state at all: the dispatcher
     // flushes buffered chunks just ahead of a structural event, so a batch whose
@@ -1004,6 +897,36 @@ describe("agent event reducers (table-driven)", () => {
     const planDiffs = useAgentStore.getState().planDiffs;
     expect(planDiffs).toHaveLength(1);
     expect(planDiffs[0]).toMatchObject({ toolName: "file_edit", path: "a.ts" });
+  });
+
+  it("tool_result: a file_edit completing inside a MIXED card still snapshots lastDiff", () => {
+    // Regression (review round 1, H1): the entry name is the run's FIRST call
+    // (read_files here), so keying the snapshot off it silently dropped the
+    // diff of the file_edit that actually completed.
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "read_files" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "file_edit" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: {
+        kind: "tool_call_arg_delta",
+        index: 1,
+        fragment: '{"path":"b.ts","old_string":"p","new_string":"q"}',
+      },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_result", tool_call_id: "call-2", result: { success: true, output: "edited" } },
+    });
+    const ld = useAgentStore.getState().lastDiff;
+    expect(ld).not.toBeNull();
+    expect(ld?.toolName).toBe("file_edit");
+    expect(ld?.path).toBe("b.ts");
   });
 
   it("tool_result: planDiffs dedupes per path, newest first", () => {
@@ -2817,5 +2740,31 @@ describe("browserUrl (the child webview's current URL)", () => {
     useAgentStore.setState({ browserUrl: "" });
     useAgentStore.getState().setBrowserUrl("https://example.com/page");
     expect(useAgentStore.getState().browserUrl).toBe("https://example.com/page");
+  });
+});
+
+/**
+ * The other half of the bundling contract (2026-10-18 one-headline decision):
+ * a run merges ACROSS tools, but intervening text still breaks it — the next
+ * call opens a new card above which the flushed prose sits.
+ */
+describe("bundling — a text entry breaks the run", () => {
+  beforeEach(resetStore);
+
+  it("a text delta between two calls flushes them into separate cards", () => {
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "read_files" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "text_delta", text: "now the fix" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "file_edit" },
+    });
+    // read_files card → the flushed assistant text → the file_edit card.
+    expect(agent(ID).transcript.map((e) => e.kind)).toEqual(["tool", "assistant", "tool"]);
   });
 });

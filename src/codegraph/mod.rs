@@ -1072,6 +1072,7 @@ impl CodeGraph {
                 .map(|r| {
                     let kind = match r.kind {
                         RefKind::Call => "call",
+                        RefKind::MethodCall => "method_call",
                         RefKind::Import => "import",
                     };
                     (r.from, r.name, kind.to_string())
@@ -1169,7 +1170,16 @@ fn extract_job(
     let stored_hash = meta.and_then(|m| m.content_hash.as_deref());
     let stored_mtime = meta.and_then(|m| m.mtime);
     let has_content = meta.map(|m| m.has_content).unwrap_or(false);
-    if trust_mtime && stored_mtime == Some(disk_mtime) && has_content && stored_hash.is_some() {
+    let indexed_version = meta.and_then(|m| m.extract_version);
+    // The extract-version clause keeps the fast path honest for the
+    // version backfill (plan 0d53d659): an unchanged mtime alone must not
+    // skip a file whose rows predate the current extractor.
+    if trust_mtime
+        && stored_mtime == Some(disk_mtime)
+        && has_content
+        && stored_hash.is_some()
+        && indexed_version == Some(schema::EXTRACTOR_VERSION)
+    {
         // Unchanged since last index — already indexed with identical
         // content. Skip the read+hash+reparse.
         return None;
@@ -1183,13 +1193,17 @@ fn extract_job(
     let hash = content_hash(&bytes);
 
     // Re-parse when the content changed OR when the file predates
-    // the content index (no cg_content_meta row). The latter makes a
-    // plain index() pass backfill old DBs — and every app startup
-    // already runs one in the background, so existing projects gain
-    // the content index with no manual step. The meta row is written
-    // for every upsert (even empty files), so this fires once per
-    // old file, never perpetually.
-    let needs_reindex = stored_hash != Some(hash.as_str()) || !has_content;
+    // the content index (no cg_content_meta row) OR when its rows were
+    // written by an older extractor (no/mismatched `cg_extract_meta`
+    // version). The latter two make a plain index() pass backfill old
+    // DBs — and every app startup already runs one in the background,
+    // so existing projects gain the content index and the ref-semantics
+    // change with no manual step. The meta rows are written for every
+    // upsert (even empty files), so this fires once per old file,
+    // never perpetually.
+    let needs_reindex = stored_hash != Some(hash.as_str())
+        || !has_content
+        || indexed_version != Some(schema::EXTRACTOR_VERSION);
     if !needs_reindex {
         return None;
     }
@@ -1211,6 +1225,7 @@ fn extract_job(
                     .map(|r| {
                         let kind = match r.kind {
                             RefKind::Call => "call",
+                            RefKind::MethodCall => "method_call",
                             RefKind::Import => "import",
                         };
                         (r.from, r.name, kind.to_string())
@@ -2008,6 +2023,40 @@ mod tests {
         assert!(!graph.search_content("helper", 10).unwrap().is_empty());
         // Steady state: the next pass re-parses nothing — the meta row is
         // written for every upsert, so the backfill never fires perpetually.
+        let stats = graph.index(None).unwrap();
+        assert_eq!(stats.files_reindexed, 0);
+    }
+
+    #[test]
+    fn index_backfills_refs_when_the_extractor_version_moves() {
+        // The extractor-semantics backfill (plan 0d53d659), the same shape
+        // as the content backfill above: rows written by an older
+        // extractor (refs without the method-call shape) cannot be
+        // re-derived in place, so a plain index() pass must re-parse every
+        // file whose `cg_extract_meta` stamp is missing or old, exactly
+        // once, and be quiet afterwards — never perpetually.
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
+        let db = dir.path().join(".coding/codegraph.db");
+        {
+            let graph = CodeGraph::open(dir.path().to_path_buf(), &db).unwrap();
+            graph.index(None).unwrap();
+        }
+        // Rewind to the pre-version-marker state (an older extractor
+        // wrote no cg_extract_meta rows).
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("DELETE FROM cg_extract_meta", []).unwrap();
+        }
+        let graph = CodeGraph::open(dir.path().to_path_buf(), &db).unwrap();
+        let stats = graph.index(None).unwrap();
+        assert_eq!(
+            stats.files_reindexed, 3,
+            "every file re-parsed once to stamp the extractor version"
+        );
+        // Steady state: the version row is written for every upsert, so
+        // the backfill never fires perpetually.
         let stats = graph.index(None).unwrap();
         assert_eq!(stats.files_reindexed, 0);
     }

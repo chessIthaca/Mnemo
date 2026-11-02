@@ -23,6 +23,79 @@ pub struct EndpointsFile {
     /// `endpoints.toml` file as `[[endpoint]]`).
     #[serde(default)]
     pub pricing: Vec<PricingEntry>,
+    /// Optional `[tiers]` table (Mnemo2's model tiers). Mnemo1 never edits
+    /// it; every save path preserves it.
+    #[serde(default, skip_serializing_if = "Tiers::is_empty")]
+    pub tiers: Tiers,
+}
+
+/// Mnemo2 model tiers: for each tier an ordered list of `endpoint/model`
+/// specs (the first entry is the tier's default).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tiers {
+    /// Design-heavy / debugging / shared-contract work.
+    #[serde(default)]
+    pub difficult: Vec<String>,
+    /// Typical implementation steps.
+    #[serde(default)]
+    pub average: Vec<String>,
+    /// Mechanical single-file edits, checks, lookups.
+    #[serde(default)]
+    pub simple: Vec<String>,
+}
+
+impl Tiers {
+    /// True when no tier lists any model.
+    pub fn is_empty(&self) -> bool {
+        self.difficult.is_empty() && self.average.is_empty() && self.simple.is_empty()
+    }
+
+    /// Each tier with its name, in difficulty order.
+    pub fn named(&self) -> [(&'static str, &Vec<String>); 3] {
+        [
+            ("difficult", &self.difficult),
+            ("average", &self.average),
+            ("simple", &self.simple),
+        ]
+    }
+
+    /// The ordered specs of a tier by name.
+    pub fn get(&self, tier: &str) -> Option<&Vec<String>> {
+        self.named()
+            .into_iter()
+            .find(|(n, _)| *n == tier)
+            .map(|(_, v)| v)
+    }
+
+    /// Mutable access to every tier list.
+    pub fn lists_mut(&mut self) -> [&mut Vec<String>; 3] {
+        [&mut self.difficult, &mut self.average, &mut self.simple]
+    }
+}
+
+/// Load just the `[tiers]` table of `endpoints.toml` (empty when the file or
+/// table is absent or unparsable).
+pub fn load_tiers(path: &Path) -> Tiers {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Tiers::default();
+    };
+    toml::from_str::<EndpointsFile>(&text)
+        .map(|f| f.tiers)
+        .unwrap_or_default()
+}
+
+/// Rewrite the `[tiers]` table of `endpoints.toml` in place, leaving
+/// endpoints and pricing as loaded.
+pub fn save_tiers(path: &Path, tiers: &Tiers) -> Result<()> {
+    let (endpoints, pricing) = load_or_default(path)?;
+    let file = EndpointsFile {
+        endpoint: endpoints,
+        pricing,
+        tiers: tiers.clone(),
+    };
+    let text = toml::to_string_pretty(&file)?;
+    crate::config::write_atomic(path, &text)?;
+    Ok(())
 }
 
 /// Per-model pricing — $ per 1M tokens (input/output/cached). Lives in a
@@ -742,6 +815,8 @@ pub fn save(path: &Path, endpoints: &[Endpoint], pricing: &[PricingEntry]) -> Re
     let file = EndpointsFile {
         endpoint: endpoints.to_vec(),
         pricing: pricing.to_vec(),
+        // Mnemo1 saves never own tiers: keep whatever is on disk.
+        tiers: load_tiers(path),
     };
     let text = toml::to_string_pretty(&file)?;
     crate::config::write_atomic(path, &text)?;
@@ -860,6 +935,7 @@ workspace_id = "ws_abc123"
         let ser = toml::to_string_pretty(&EndpointsFile {
             endpoint: vec![bare],
             pricing: vec![],
+            tiers: Tiers::default(),
         })
         .unwrap();
         assert!(

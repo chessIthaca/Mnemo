@@ -52,7 +52,9 @@ describe("preview scenes", () => {
     expect(state.projectId).not.toBeNull();
     const transport = createGraphTransport();
     expect(transport).not.toBeNull();
-    expect(await transport?.status()).toMatchObject({ available: true, indexing: false });
+    // The scene opens mid-rebuild, so the Graph tab's rebuild notice is visible.
+    expect(state.indexing?.code).toMatchObject({ state: "running", done: 1200, total: 2400 });
+    expect(await transport?.status()).toMatchObject({ available: true, indexing: true });
     expect((await transport?.top(3))?.length).toBe(3);
     // The scene opens on a whole-graph module map, not an empty canvas.
     const overview = await transport?.overview(2, 60);

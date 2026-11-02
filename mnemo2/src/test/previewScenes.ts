@@ -481,9 +481,10 @@ const SAMPLE_SYMBOL_BY_ID = new Map(SAMPLE_SYMBOLS.map((symbol) => [symbol.id, s
 
 const toSymbol = ({ id, name, kind, file, line }: SampleSymbol): GraphSymbol => ({ id, name, kind, file, line });
 
-/** A tiny in-memory answer service over the sample symbols, so the preview's search, focus and refocus all work. */
+/** A tiny in-memory answer service over the sample symbols, so the preview's search, focus and refocus all work.
+ *  The graph scene opens mid-pass (see `graphScene`), so this starts out indexing. */
 function sampleGraphTransport(): GraphTransport {
-  let indexing = false;
+  let indexing = true;
   let pollsLeft = 0;
 
   const status = (): GraphStatus => ({
@@ -642,6 +643,13 @@ function graphScene(): AppState {
     workerPanelId: null,
     workbenchOpen: false,
     workerDeletion: null,
+    // The scene opens on a rebuild in progress: the notice shows 1,200/2,400 files.
+    indexing: {
+      revision: 1,
+      firstRun: false,
+      code: { state: "running", done: 1200, total: 2400, detail: null },
+      memory: null,
+    },
   };
 }
 

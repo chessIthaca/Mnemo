@@ -10,6 +10,7 @@
 import { mount as svelteMount, unmount } from "svelte";
 import SettingsDialog from "../components/SettingsDialog.svelte";
 import type { BoardPlan } from "../lib/boardState";
+import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
 import type { WorkerDeletionPreview } from "../lib/teamState";
 import { seedPreviewSettings } from "./previewSettings";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
@@ -290,6 +291,157 @@ function missionControl(): AppState {
   };
 }
 
+/** One symbol of the sample code graph; `degree` is its global link count. */
+interface SampleSymbol extends GraphSymbol {
+  degree: number;
+}
+
+/** A plausible slice of this project's own code graph for the Graph scene. */
+const SAMPLE_SYMBOLS: SampleSymbol[] = [
+  { id: "src/agent/turn.rs::turn::1", name: "turn", kind: "module", file: "src/agent/turn.rs", line: 1, degree: 3 },
+  { id: "src/agent/turn.rs::run_turn::812", name: "run_turn", kind: "function", file: "src/agent/turn.rs", line: 812, degree: 14 },
+  { id: "src/agent/turn.rs::record_request_stats::3908", name: "record_request_stats", kind: "function", file: "src/agent/turn.rs", line: 3908, degree: 5 },
+  { id: "src/agent/mod.rs::start_agent::96", name: "start_agent", kind: "function", file: "src/agent/mod.rs", line: 96, degree: 9 },
+  { id: "src/headless/engine.rs::engine::1", name: "engine", kind: "module", file: "src/headless/engine.rs", line: 1, degree: 4 },
+  { id: "src/headless/engine.rs::Engine::stats::680", name: "Engine::stats", kind: "method", file: "src/headless/engine.rs", line: 680, degree: 11 },
+  { id: "src/headless/stats.rs::EngineStats::188", name: "EngineStats", kind: "struct", file: "src/headless/stats.rs", line: 188, degree: 8 },
+  { id: "src/headless/stats.rs::ProjectStats::844", name: "ProjectStats", kind: "struct", file: "src/headless/stats.rs", line: 844, degree: 7 },
+  { id: "src/memory/types.rs::SavingsStats::682", name: "SavingsStats", kind: "struct", file: "src/memory/types.rs", line: 682, degree: 6 },
+  { id: "src/memory/mod.rs::MemoryStore::savings_stats::2457", name: "MemoryStore::savings_stats", kind: "method", file: "src/memory/mod.rs", line: 2457, degree: 6 },
+  { id: "src/codegraph/query.rs::GraphView::slice::382", name: "GraphView::slice", kind: "method", file: "src/codegraph/query.rs", line: 382, degree: 7 },
+  { id: "src/codegraph/query.rs::GraphSliceFilter::117", name: "GraphSliceFilter", kind: "struct", file: "src/codegraph/query.rs", line: 117, degree: 3 },
+  { id: "src/codegraph/extract.rs::extract::1", name: "extract", kind: "module", file: "src/codegraph/extract.rs", line: 1, degree: 4 },
+  { id: "src/codegraph/extract.rs::SymbolKind::18", name: "SymbolKind", kind: "enum", file: "src/codegraph/extract.rs", line: 18, degree: 9 },
+  { id: "src/codegraph/extract.rs::EdgeKind::31", name: "EdgeKind", kind: "enum", file: "src/codegraph/extract.rs", line: 31, degree: 8 },
+];
+
+/** The sample graph's directed edges. */
+const SAMPLE_EDGES: GraphEdge[] = [
+  { from: "src/agent/mod.rs::start_agent::96", to: "src/agent/turn.rs::run_turn::812", kind: "calls" },
+  { from: "src/agent/turn.rs::turn::1", to: "src/agent/turn.rs::run_turn::812", kind: "contains" },
+  { from: "src/agent/turn.rs::turn::1", to: "src/agent/turn.rs::record_request_stats::3908", kind: "contains" },
+  { from: "src/agent/turn.rs::run_turn::812", to: "src/agent/turn.rs::record_request_stats::3908", kind: "calls" },
+  { from: "src/agent/turn.rs::run_turn::812", to: "src/headless/engine.rs::Engine::stats::680", kind: "calls" },
+  { from: "src/agent/turn.rs::run_turn::812", to: "src/headless/stats.rs::ProjectStats::844", kind: "imports" },
+  { from: "src/headless/engine.rs::engine::1", to: "src/headless/engine.rs::Engine::stats::680", kind: "contains" },
+  { from: "src/headless/engine.rs::Engine::stats::680", to: "src/memory/mod.rs::MemoryStore::savings_stats::2457", kind: "calls" },
+  { from: "src/headless/engine.rs::Engine::stats::680", to: "src/memory/types.rs::SavingsStats::682", kind: "imports" },
+  { from: "src/headless/stats.rs::EngineStats::188", to: "src/headless/stats.rs::ProjectStats::844", kind: "contains" },
+  { from: "src/headless/stats.rs::EngineStats::188", to: "src/memory/types.rs::SavingsStats::682", kind: "contains" },
+  { from: "src/memory/mod.rs::MemoryStore::savings_stats::2457", to: "src/memory/types.rs::SavingsStats::682", kind: "imports" },
+  { from: "src/codegraph/query.rs::GraphView::slice::382", to: "src/codegraph/query.rs::GraphSliceFilter::117", kind: "imports" },
+  { from: "src/codegraph/query.rs::GraphView::slice::382", to: "src/codegraph/extract.rs::EdgeKind::31", kind: "imports" },
+  { from: "src/codegraph/extract.rs::extract::1", to: "src/codegraph/extract.rs::SymbolKind::18", kind: "contains" },
+  { from: "src/codegraph/extract.rs::extract::1", to: "src/codegraph/extract.rs::EdgeKind::31", kind: "contains" },
+];
+
+const SAMPLE_SYMBOL_BY_ID = new Map(SAMPLE_SYMBOLS.map((symbol) => [symbol.id, symbol]));
+
+const toSymbol = ({ id, name, kind, file, line }: SampleSymbol): GraphSymbol => ({ id, name, kind, file, line });
+
+/** A tiny in-memory answer service over the sample symbols, so the preview's search, focus and refocus all work. */
+function sampleGraphTransport(): GraphTransport {
+  let indexing = false;
+  let pollsLeft = 0;
+
+  const status = (): GraphStatus => ({
+    available: true,
+    indexing,
+    files: 3945,
+    symbols: 12840,
+    edges: 34210,
+    last_indexed_at: Math.floor(NOW_MS / 1000) - 7 * 60,
+  });
+
+  return {
+    status: async () => {
+      if (indexing && pollsLeft > 0) {
+        pollsLeft -= 1;
+        if (pollsLeft === 0) indexing = false;
+      }
+      return status();
+    },
+    refresh: async () => {
+      indexing = true;
+      pollsLeft = 2;
+      return status();
+    },
+    search: async (query, kind, limit = 50) =>
+      SAMPLE_SYMBOLS
+        .filter((symbol) => symbol.name.toLowerCase().includes(query.toLowerCase()))
+        .filter((symbol) => !kind || symbol.kind === kind)
+        .slice(0, limit)
+        .map(toSymbol),
+    neighbourhood: async (symbolId, depth = 1) => {
+      const center = SAMPLE_SYMBOL_BY_ID.get(symbolId);
+      if (!center) throw new Error(`unknown symbol ${symbolId}`);
+      const distance = new Map([[center.id, 0]]);
+      const queue = [center.id];
+      while (queue.length > 0) {
+        const current = queue.shift() as string;
+        const hops = distance.get(current) as number;
+        if (hops >= depth) continue;
+        for (const edge of SAMPLE_EDGES) {
+          const next = edge.from === current ? edge.to : edge.to === current ? edge.from : null;
+          if (next && !distance.has(next)) {
+            distance.set(next, hops + 1);
+            queue.push(next);
+          }
+        }
+      }
+      const ids = new Set(distance.keys());
+      const nodes = SAMPLE_SYMBOLS.filter((symbol) => ids.has(symbol.id) && symbol.id !== center.id);
+      return {
+        center,
+        nodes,
+        edges: SAMPLE_EDGES.filter((edge) => ids.has(edge.from) && ids.has(edge.to)),
+        truncated: false,
+      };
+    },
+    impact: async (symbolId) => {
+      const distance = new Map<string, number>();
+      const queue = [symbolId];
+      while (queue.length > 0) {
+        const current = queue.shift() as string;
+        const hops = current === symbolId ? 0 : (distance.get(current) as number);
+        for (const edge of SAMPLE_EDGES.filter((entry) => entry.to === current)) {
+          if (!distance.has(edge.from) && edge.from !== symbolId) {
+            distance.set(edge.from, hops + 1);
+            queue.push(edge.from);
+          }
+        }
+      }
+      const rows: GraphImpactSymbol[] = [...distance.entries()].map(([id, hops]) => ({
+        ...toSymbol(SAMPLE_SYMBOL_BY_ID.get(id) as SampleSymbol),
+        distance: hops,
+      }));
+      return rows.sort((a, b) => a.distance - b.distance || a.name.localeCompare(b.name));
+    },
+    top: async (limit = 20) => [...SAMPLE_SYMBOLS].sort((a, b) => b.degree - a.degree).slice(0, limit),
+    context: async (symbolId) => {
+      const center = SAMPLE_SYMBOL_BY_ID.get(symbolId);
+      if (!center) throw new Error(`unknown symbol ${symbolId}`);
+      const callers = SAMPLE_EDGES.filter((edge) => edge.to === symbolId).map((edge) => SAMPLE_SYMBOL_BY_ID.get(edge.from) as SampleSymbol);
+      const callees = SAMPLE_EDGES.filter((edge) => edge.from === symbolId).map((edge) => SAMPLE_SYMBOL_BY_ID.get(edge.to) as SampleSymbol);
+      const uniqueBy = (symbols: SampleSymbol[]) => [...new Map(symbols.map((symbol) => [symbol.id, symbol])).values()];
+      return { symbol: center, callers: uniqueBy(callers).map(toSymbol), callees: uniqueBy(callees).map(toSymbol), caller_total: uniqueBy(callers).length, callee_total: uniqueBy(callees).length };
+    },
+  };
+}
+
+/** The Graph tab: the code-graph explorer seeded with a sample slice of this project. */
+function graphScene(): AppState {
+  seedGraphPreview(sampleGraphTransport());
+  return {
+    ...baseState(),
+    route: "graph",
+    selectedWorkerId: null,
+    workerPanelId: null,
+    workbenchOpen: false,
+    workerDeletion: null,
+  };
+}
+
 /** The same thread, on a worker that stopped to ask: the needs-you banner shows. */
 function workerThread(): AppState {
   return {
@@ -468,6 +620,12 @@ export const previewScenes: PreviewScene[] = [
     title: "Mission control",
     description: "The team list with a live status row per running worker, and a selected worker whose thread has Markdown and tool rows.",
     build: missionControl,
+  },
+  {
+    name: "graph",
+    title: "Code graph",
+    description: "The Graph tab: status and entry points, then a focused neighbourhood with callers, callees and change impact.",
+    build: graphScene,
   },
   {
     name: "worker-thread",

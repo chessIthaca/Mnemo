@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createGraphTransport } from "../lib/graph";
 import type { AppState, LeadEntry, Worker, WorkerThreadEntry } from "../lib/types";
 import { costPreviewInsights } from "../lib/cost";
 import {
@@ -43,10 +44,21 @@ describe("preview scenes", () => {
     }
   });
 
+  it("graph routes to the explorer and seeds its preview transport", async () => {
+    const state = build("graph");
+    expect(state.route).toBe("graph");
+    expect(state.projectId).not.toBeNull();
+    const transport = createGraphTransport();
+    expect(transport).not.toBeNull();
+    expect(await transport?.status()).toMatchObject({ available: true, indexing: false });
+    expect((await transport?.top(3))?.length).toBe(3);
+  });
+
   it("resolves the default scene for an empty parameter and null for an unknown one", () => {
     const scenes: PreviewScene[] = previewScenes;
     expect(scenes.map((scene) => scene.name)).toEqual([
       "mission-control",
+      "graph",
       "worker-thread",
       "lead-chat",
       "settings-models",

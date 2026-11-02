@@ -1697,21 +1697,24 @@ impl AgentLoop {
                 // [models.summarize] routes the summary to the dedicated slot
                 // when set; unset rides the old provider (today's behavior).
                 let summary_provider = self.summarize_provider(&old_provider);
+                // Plan c3ba2b58 step A: the pre-swap summary is compaction —
+                // same turn id as the turn it serves when that turn is
+                // already running.
+                let compaction_context = self.llm_request_context(
+                    turn_id,
+                    crate::provider::trace::TracePurpose::Compaction,
+                );
                 let summarize_result = old_context_manager
                     .summarize_with_interrupt(
                         messages,
-                        KEEP_RECENT_ON_SWAP,
-                        // The result must fit the window it is being swapped
-                        // TO — the new model is what will receive it.
-                        context::sendable_budget(pending.provider.capabilities()),
                         summary_provider.as_ref(),
                         cmd_rx,
-                        // Plan c3ba2b58 step A: the pre-swap summary is
-                        // compaction — same turn id as the turn it serves
-                        // when that turn is already running.
-                        &self.llm_request_context(
-                            turn_id,
-                            crate::provider::trace::TracePurpose::Compaction,
+                        // The result must fit the window it is being swapped
+                        // TO — the new model is what will receive it.
+                        context::SummarizeRequest::new(
+                            KEEP_RECENT_ON_SWAP,
+                            context::sendable_budget(pending.provider.capabilities()),
+                            &compaction_context,
                         ),
                     )
                     .await;
@@ -3050,23 +3053,25 @@ impl AgentLoop {
         } else {
             None
         };
+        // Plan c3ba2b58 step A: auto-compaction carries the loop's identity
+        // + the compaction purpose, grouped under the current turn id.
+        let compaction_context = self.llm_request_context(
+            state.spend_turn_id.as_deref(),
+            crate::provider::trace::TracePurpose::Compaction,
+        );
         let summarize_result = context_manager
             .summarize_with_interrupt_opts(
                 messages,
-                keep_recent,
                 // The compacted result is what the TURN provider sends next, so
                 // its window is the one that has to fit — not the summarizer's.
-                context::sendable_budget(provider.capabilities()),
                 summary_provider.as_ref(),
-                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
-                // Plan c3ba2b58 step A: auto-compaction carries the loop's
-                // identity + the compaction purpose, grouped under the
-                // current turn id.
-                &self.llm_request_context(
-                    state.spend_turn_id.as_deref(),
-                    crate::provider::trace::TracePurpose::Compaction,
+                context::SummarizeRequest::new(
+                    keep_recent,
+                    context::sendable_budget(provider.capabilities()),
+                    &compaction_context,
                 ),
+                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
             )
             .await;
         // Park the compaction time on the provider — the request's
@@ -4400,10 +4405,12 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 provider,
                 messages,
                 tool_schemas,
-                fanin_tx,
-                agent_id,
-                session_id,
-                &llm_context,
+                super::dispatch::TurnRequest {
+                    fanin_tx,
+                    agent_id,
+                    session_id,
+                    llm_context: &llm_context,
+                },
             );
             // G5 (3a.6): the pre-request history snapshot — a mid-request
             // ExportHistory answers from this (the pinned future holds the

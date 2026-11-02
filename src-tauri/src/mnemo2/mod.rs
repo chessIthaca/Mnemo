@@ -110,6 +110,13 @@ pub mod model_settings;
 /// Diagnostics card (embedder status, per-tier counts, recall test).
 pub mod memory_view;
 
+/// The UI log: every popup and every uncaught frontend error, appended to
+/// `<project>/.coding/logs/mnemo2-ui.jsonl` (or the config dir's `logs/` when no
+/// project is open) so a popup that vanished before it could be read can still
+/// be looked up.
+pub mod ui_log;
+
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
 /// also exposes `__TAURI_INTERNALS__`.
@@ -560,6 +567,7 @@ pub fn run() {
             memory_view::memory_backlinks,
             memory_view::memory_overview,
             memory_view::memory_recall_test,
+            ui_log::ui_log,
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to build the Mnemo2 desktop host")

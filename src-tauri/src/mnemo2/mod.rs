@@ -43,6 +43,10 @@ pub mod project;
 /// Read-only worker diffs and screenshot artifacts for the workbench.
 pub mod workbench;
 
+/// The Graph tab's code-graph commands (status, search, neighbourhood,
+/// impact, entry points, context).
+pub mod graph;
+
 /// The native child-WebView2 Browser pane and its non-Windows fallback.
 pub mod browser;
 
@@ -397,6 +401,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             mnemo2_host_ping,
+            graph::graph_status,
+            graph::graph_refresh,
+            graph::graph_search,
+            graph::graph_neighbourhood,
+            graph::graph_impact,
+            graph::graph_top,
+            graph::graph_context,
             ipc::mnemo2_startup_project,
             ipc::external_lead_status,
             ipc::external_open_failed,

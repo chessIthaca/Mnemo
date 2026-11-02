@@ -1,5 +1,6 @@
-import { render } from "@testing-library/svelte";
+import { fireEvent, render, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { RepoPathRef } from "../lib/repoPaths";
 import Markdown from "./Markdown.svelte";
 
 const markdown = vi.hoisted(() => ({
@@ -49,5 +50,36 @@ describe("Markdown", () => {
     await rerender({ source: "unchanged", onOpenLink: () => {} });
 
     expect(markdown.renderMarkdown).not.toHaveBeenCalled();
+  });
+
+  it("leaves the paths of the text as plain text without the callback", () => {
+    markdown.renderMarkdown.mockImplementation(() => "<p>See <code>src/agent/turn.rs</code>.</p>");
+    const { container } = render(Markdown, { source: "See src/agent/turn.rs." });
+
+    expect(container.querySelector("button.md-path")).toBeNull();
+    expect(container.textContent).toContain("src/agent/turn.rs");
+  });
+
+  it("makes inline-code and plain-text paths clickable when given the callback", async () => {
+    markdown.renderMarkdown.mockImplementation(
+      () => "<p>See <code>src/agent/turn.rs:4352</code> and the plan .coding/plans/fc536488.md.</p>",
+    );
+    const opened: RepoPathRef[] = [];
+    const { container } = render(Markdown, {
+      source: "See src/agent/turn.rs:4352 and the plan .coding/plans/fc536488.md.",
+      onOpenPath: (ref: RepoPathRef) => opened.push(ref),
+    });
+
+    await waitFor(() => expect(container.querySelectorAll("button.md-path")).toHaveLength(2));
+    const buttons = [...container.querySelectorAll<HTMLButtonElement>("button.md-path")];
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      "src/agent/turn.rs:4352",
+      ".coding/plans/fc536488.md",
+    ]);
+    expect(buttons[0].title).toBe("Open src/agent/turn.rs at line 4352 in the Files tab");
+    expect(buttons[1].title).toBe("Open plan fc536488 in the Plans tab");
+
+    await fireEvent.click(buttons[0]);
+    expect(opened).toEqual([{ path: "src/agent/turn.rs", line: 4352, kind: "file", planId: null }]);
   });
 });

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { ArrowUpRight, Check, ChevronDown, ChevronRight, Circle } from "@lucide/svelte";
   import { createBoardTransport } from "../lib/boardEngine";
   import { closedPlans, openPlans, planProgress, type BoardPlan } from "../lib/boardState";
@@ -34,6 +34,10 @@
   const transport = createBoardTransport();
   let expanded = $state<Record<string, boolean>>({});
   let details = $state<Record<string, PlanDetails>>({});
+  /** A handed-over plan id the board does not list, for the not-found note. */
+  let missingPlan = $state("");
+  /** The tab's root, used to bring a handed-over plan's card into view. */
+  let tabSection = $state<HTMLElement | null>(null);
 
   const isExpanded = (plan: BoardPlan) => expanded[plan.id] === true;
 
@@ -69,6 +73,36 @@
     if (opening && !details[plan.id]?.markdown) void loadDetails(plan);
   }
 
+  /**
+   * A plan id the Memory tab handed over: expand it, read its document and
+   * scroll it into view once the board lists it. An id the board never lists
+   * shows a short note instead, so the click is never a silent no-op.
+   */
+  $effect(() => {
+    const id = $app.planDocumentId;
+    if (id === null || scope !== "all") return;
+    const plan = $app.board.find((entry) => entry.id === id);
+    if (!plan) {
+      // The board syncs when a project opens: an empty one is not proof.
+      if ($app.board.length === 0) return;
+      actions.clearPlanDocument();
+      missingPlan = id;
+      return;
+    }
+    actions.clearPlanDocument();
+    missingPlan = "";
+    expanded[plan.id] = true;
+    if (!details[plan.id]?.markdown) void loadDetails(plan);
+    void scrollToPlan(plan.id);
+  });
+
+  /** Bring an expanded plan's card into view, after its details render. */
+  async function scrollToPlan(planId: string) {
+    await tick();
+    const card = tabSection?.querySelector<HTMLElement>(`[data-plan-id="${planId}"]`);
+    card?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+  }
+
   // An open card re-reads its document on the board change, so the details
   // follow edits the lead makes while the tab stays open.
   onMount(() => {
@@ -92,7 +126,7 @@
 
 {#snippet planCard(plan: BoardPlan)}
   {@const progress = planProgress(plan)}
-  <article class="plan" data-status={plan.status} aria-label={plan.title}>
+  <article class="plan" data-plan-id={plan.id} data-status={plan.status} aria-label={plan.title}>
     <header class="plan-header">
       <p>
         <span class="kind">{plan.kind}</span>
@@ -145,11 +179,15 @@
   </article>
 {/snippet}
 
-<section class="plan-tab" aria-label="Plan">
+<section class="plan-tab" aria-label="Plan" bind:this={tabSection}>
   {#if scope === "open"}
     <p class="scope-header">
       <button class="all-plans" type="button" onclick={actions.openPlans}>All plans <ArrowUpRight size={11} /></button>
     </p>
+  {/if}
+
+  {#if missingPlan !== ""}
+    <p class="plan-missing" role="status">Plan “{missingPlan}” is not on this project's board.</p>
   {/if}
 
   {#each open as plan (plan.id)}{@render planCard(plan)}{/each}
@@ -196,6 +234,7 @@
   .plan-header :global(.markdown h4), .plan-header :global(.markdown h5), .plan-header :global(.markdown h6) { font-size: var(--text-body); }
   .report { display: block; margin-top: 6px; color: var(--muted); font-size: var(--text-body); }
   .plan-empty { padding: 40px 4px; color: var(--muted); }
+  .plan-missing { margin: 0 0 14px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--warning-soft); color: var(--warning); font-size: var(--text-body); }
   .plan-empty h2 { margin: 0; color: var(--ink); font-family: var(--font-prose); font-size: var(--text-page); font-weight: 550; }
   .steps { margin: 10px 0 0; padding: 0; list-style: none; }
   .step { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }

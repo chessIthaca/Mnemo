@@ -9,6 +9,7 @@
     type FileContent,
     type FileEntry,
   } from "../lib/files";
+  import { actions, app } from "../lib/store";
 
   const transport = createFilesTransport();
 
@@ -21,6 +22,10 @@
   let openFile = $state<FileContent | null>(null);
   let openError = $state("");
   let reading = $state(false);
+  /** The line a hand-over asked to reveal, or null when it named none. */
+  let openLine = $state<number | null>(null);
+  /** The code block, so a requested line can be scrolled into view. */
+  let codeView = $state<HTMLPreElement | null>(null);
 
   let query = $state("");
   let matches = $state<FileEntry[]>([]);
@@ -64,20 +69,44 @@
     if (opening) void loadDir(entry.path);
   }
 
-  async function openPath(path: string) {
+  async function openPath(path: string, line: number | null = null) {
     const active = transport;
     if (!active) return;
     reading = true;
     openError = "";
+    openLine = line;
     try {
       openFile = await active.read(path);
     } catch (error) {
       openFile = null;
+      openLine = null;
       openError = errorText(error);
     } finally {
       reading = false;
     }
   }
+
+  // The Memory tab hands a path (and maybe a line) over: open it once, then
+  // clear the hand-over so returning to the tab starts on the tree.
+  $effect(() => {
+    const request = $app.workbenchFile;
+    if (!request) return;
+    actions.clearWorkbenchFile();
+    if (transport) void openPath(request.path, request.line);
+  });
+
+  // Reveal the requested line once its file is on screen. The viewer sets its
+  // line height in CSS, so the number maps to a scroll offset in the browser.
+  $effect(() => {
+    const view = codeView;
+    const line = openLine;
+    if (!view || line === null) return;
+    const style = getComputedStyle(view);
+    const lineHeight = Number.parseFloat(style.lineHeight);
+    const padding = Number.parseFloat(style.paddingTop) || 0;
+    if (!Number.isFinite(lineHeight) || lineHeight <= 0) return;
+    view.scrollTop = Math.max(0, padding + (line - 1) * lineHeight - view.clientHeight / 2);
+  });
 
   /** Select a row from either the tree or the filtered list. */
   function select(entry: FileEntry) {
@@ -93,6 +122,7 @@
 
   function closeFile() {
     openFile = null;
+    openLine = null;
     openError = "";
   }
 
@@ -141,6 +171,7 @@
     truncatedDirs = {};
     treeError = "";
     openFile = null;
+    openLine = null;
     openError = "";
     await loadDir("");
   }
@@ -188,6 +219,7 @@
         <div class="viewer-head">
           <button class="button button-quiet" aria-label="Back to the file tree" onclick={closeFile}><ArrowLeft size={12} /> Files</button>
           <code>{openFile?.path ?? ""}</code>
+          {#if openLine !== null}<span class="viewer-line">line {openLine}</span>{/if}
           {#if openFile}<span>{formatBytes(openFile.bytes)}</span>{/if}
         </div>
         {#if reading}
@@ -200,7 +232,11 @@
           {#if openFile.truncated}
             <p class="files-note">Showing the first {formatBytes(256 * 1024)} of {formatBytes(openFile.bytes)}.</p>
           {/if}
-          <pre class="code" aria-label={`Contents of ${openFile.path}`}><code>{@html highlighted}</code></pre>
+          <pre
+            class="code"
+            bind:this={codeView}
+            aria-label={openLine === null ? `Contents of ${openFile.path}` : `Contents of ${openFile.path}, line ${openLine}`}
+          ><code>{@html highlighted}</code></pre>
         {/if}
       </div>
     {:else if filtering}
@@ -271,6 +307,7 @@
   .viewer-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .viewer-head code { flex: 1; overflow: hidden; color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
   .viewer-head span { color: var(--muted); font-size: var(--text-meta); white-space: nowrap; }
+  .viewer-line { color: var(--accent-strong); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
   .code { max-height: 62vh; margin: 0; overflow: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); font-family: var(--font-mono); font-size: var(--text-meta); line-height: 1.55; tab-size: 2; }
   .code code { white-space: pre; }
   .files-note { margin: 10px 2px; color: var(--muted); font-size: var(--text-body); line-height: 1.6; }

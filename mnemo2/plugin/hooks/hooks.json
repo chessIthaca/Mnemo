@@ -1,5 +1,5 @@
 {
-  "description": "Mnemo lead hooks: add the team summary and pending worker notices at session start, deliver notices after tool calls, remind the lead to keep the background waiter running, and ask before Claude Code's own agents run. All of them stay silent outside a Mnemo2 project.",
+  "description": "Mnemo lead hooks: add the team summary and pending worker notices at session start, deliver notices after tool calls, remind the lead to keep the background waiter running, point code and knowledge searches at the Mnemo tools that answer them better, and ask before Claude Code's own agents run. No hook blocks a tool call by itself, and all of them stay silent outside a Mnemo2 project.",
   "hooks": {
     "SessionStart": [
       {
@@ -46,6 +46,17 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
             "args": ["gate-agent"],
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
+            "args": ["hint", "--pre-search"],
             "timeout": 10
           }
         ]

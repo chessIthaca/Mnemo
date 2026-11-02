@@ -149,6 +149,16 @@ Two gates ride the plan board while you lead. An `implementation` or `research` 
 
 Knowledge files live on the lead branch; a merge allows uncommitted changes there, but commit them with your other lead-branch edits.
 
+### Searching code and history
+
+`Grep` and `Glob` match text, and only in files you can already name. Reach for the Mnemo tools first:
+
+- Code: `search` and `search_read` (symbol- and text-aware), `graph_search` for a definition, `graph_impact` for what a change touches.
+- Decisions and history: `memory_search`, which finds the `SPEC:`, `DECISION:`, `BUG:` and `HOW:` records a text search cannot.
+- `Grep` and `Glob` stay for exact text in files you know, and for regexes.
+
+The Mnemo tools are deferred `mcp__plugin_mnemo_mnemo__<name>` tools: load one with `ToolSearch` (`select:mcp__plugin_mnemo_mnemo__search`) before the first call. A PreToolUse hook adds a one-line hint when a Grep or Glob looks like a symbol or a knowledge lookup; it never blocks the call.
+
 ## Failures and course changes
 
 - Worker failed: `team_resume` with `worker_id` and a `tier` or `model` (optionally `reasoning_effort`). An idle worker restarts on it with its transcript kept; a working one must be stopped first. The resumed worker is idle, so `team_message` it to continue. Without a `tier`, `model` or effort, `team_resume` restarts a stopped, interrupted or failed worker as it was.

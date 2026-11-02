@@ -407,6 +407,130 @@ fn gate_agent_gives_ask_a_default_reason() {
     assert!(reason.as_str().is_some_and(|text| !text.is_empty()));
 }
 
+// ---- hint --pre-search -----------------------------------------------------
+
+fn search_input(sandbox: &Sandbox, tool_name: &str, tool_input: Value) -> String {
+    hook_stdin(
+        &sandbox.deep,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        }),
+    )
+}
+
+/// The `additionalContext` a hinted search earns, asserting the hook JSON
+/// shape on the way; `None` when the hook stays silent.
+fn hint_context(sandbox: &Sandbox, tool_name: &str, tool_input: Value) -> Option<String> {
+    let output = hint(&sandbox.env(), &search_input(sandbox, tool_name, tool_input))?;
+    let value = parsed(Some(output));
+    let hook = &value["hookSpecificOutput"];
+    assert_eq!(hook["hookEventName"], "PreToolUse");
+    // A hint never decides anything: the search it rides on always runs.
+    assert!(hook.get("permissionDecision").is_none(), "{value}");
+    Some(hook["additionalContext"].as_str().expect("context").to_string())
+}
+
+#[test]
+fn the_hint_points_an_identifier_search_at_the_code_graph() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let context = hint_context(&sandbox, "Grep", json!({ "pattern": "attach_external_lead" }))
+        .expect("a hint for an identifier");
+    assert!(
+        context.contains(r#"graph_search {"query": "attach_external_lead"}"#),
+        "{context}"
+    );
+    assert!(context.contains(r#"search {"pattern": "attach_external_lead"}"#), "{context}");
+    assert!(context.contains("select:mcp__plugin_mnemo_mnemo__graph_search"), "{context}");
+    assert!(context.contains("select:mcp__plugin_mnemo_mnemo__search"), "{context}");
+    assert!(context.contains("Grep still runs"), "{context}");
+}
+
+#[test]
+fn the_hint_reads_declaration_and_qualified_patterns() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    for (pattern, query) in [
+        ("fn attach_external_lead", "attach_external_lead"),
+        ("struct TeamManager", "TeamManager"),
+        ("SteeringStats::shared()", "shared"),
+        ("TeamManager", "TeamManager"),
+        ("snake_case_name", "snake_case_name"),
+        ("attachWorker", "attachWorker"),
+    ] {
+        let context =
+            hint_context(&sandbox, "Grep", json!({ "pattern": pattern })).expect(pattern);
+        assert!(
+            context.contains(&format!(r#"graph_search {{"query": "{query}"}}"#)),
+            "{pattern}: {context}"
+        );
+    }
+}
+
+#[test]
+fn the_hint_points_a_knowledge_lookup_at_memory_search() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    for input in [
+        json!({ "pattern": "DECISION: cache eviction" }),
+        json!({ "pattern": ".coding/knowledge/**/*.md" }),
+        json!({ "pattern": "cache eviction", "path": ".coding/knowledge" }),
+    ] {
+        let context = hint_context(&sandbox, "Grep", input.clone())
+            .unwrap_or_else(|| panic!("no hint for {input}"));
+        assert!(context.contains("memory_search"), "{input}: {context}");
+        assert!(context.contains("select:mcp__plugin_mnemo_mnemo__memory_search"), "{input}: {context}");
+        assert!(!context.contains("graph_search"), "{input}: {context}");
+    }
+    let context = hint_context(&sandbox, "Grep", json!({ "pattern": "BUG: worker merge races" }));
+    let context = context.expect("a memory hint");
+    assert!(context.contains(r#"memory_search {"query": "worker merge races"}"#), "{context}");
+}
+
+#[test]
+fn the_hint_stays_silent_for_prose_regexes_paths_and_other_tools() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let env = sandbox.env();
+    for tool_input in [
+        // Ordinary text and single words: exactly what Grep is for.
+        json!({ "pattern": "how does the cache evict entries" }),
+        json!({ "pattern": "cache" }),
+        // A regex, a path and a file glob.
+        json!({ "pattern": "^fn\\s+\\w+" }),
+        json!({ "pattern": "src-tauri/src/mnemo2/mcp_server.rs" }),
+        json!({ "pattern": "**/*.rs" }),
+        // Nothing to search for.
+        json!({ "pattern": "" }),
+        json!({ "path": "src" }),
+    ] {
+        let stdin = search_input(&sandbox, "Grep", tool_input.clone());
+        assert!(hint(&env, &stdin).is_none(), "{tool_input}");
+    }
+    // Only Grep and Glob earn a hint; every other tool stays silent.
+    for tool in ["Bash", "Read", "Agent", "Task", ""] {
+        let stdin = search_input(&sandbox, tool, json!({ "pattern": "attach_external_lead" }));
+        assert!(hint(&env, &stdin).is_none(), "{tool}");
+    }
+}
+
+#[test]
+fn the_hint_stays_silent_outside_a_registered_project_without_touching_the_network() {
+    let sandbox = Sandbox::new();
+    // An instance is running for this project, but the directory is not
+    // registered: the hint must not even look at it.
+    let server = FakeServer::start("tok", |_| json_reply(json!({})));
+    sandbox.write_run(66, server.port, "tok", Some(&sandbox.project_str()));
+    let env = sandbox.env();
+    let started = std::time::Instant::now();
+    let stdin = search_input(&sandbox, "Grep", json!({ "pattern": "attach_external_lead" }));
+    assert!(hint(&env, &stdin).is_none());
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    assert!(server.requests().is_empty());
+}
+
 // ---- wait ------------------------------------------------------------------
 
 #[test]

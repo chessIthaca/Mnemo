@@ -8762,6 +8762,7 @@ mod tests {
         config: &TempDir,
         state: &TempDir,
         addr: std::net::SocketAddr,
+        slots: usize,
     ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
@@ -8774,7 +8775,7 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
-                slots: Some(1),
+                slots: Some(slots),
                 models: lead.models(),
                 pricing: Vec::new(),
             })
@@ -8807,7 +8808,7 @@ mod tests {
             },
         ])
         .await;
-        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr).await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
         let worker = team
             .dispatch_with_id(
                 "implement the counting feature".into(),
@@ -8881,7 +8882,7 @@ mod tests {
             gate: None,
         }])
         .await;
-        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr).await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
         let worker = team
             .dispatch_with_id(
                 "implement the counting feature".into(),
@@ -8932,6 +8933,156 @@ mod tests {
             matches!(resumed.status, crate::mnemo2::team::WorkerStatus::Idle),
             "the resumed worker idles: {resumed:?}"
         );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// The live switch must never erase an already-observed model id that
+    /// already matches the new model: the new model's events can be pumped
+    /// before change_model's record update (the pin landed mid-turn, or the
+    /// target was already serving) — an unconditional clear would leave
+    /// the record without its correct id, with no later event to repair it.
+    #[tokio::test]
+    async fn change_model_keeps_the_already_observed_model_id() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("done on the switch target"),
+            gate: Some(gate),
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        // The worker runs ON the switch target from the start: its first
+        // request is held in flight, so the new model's model_changed event
+        // is pumped BEFORE the switch runs.
+        let worker = team
+            .dispatch_with_id(
+                "implement the counting feature".into(),
+                Some("test/model-b".into()),
+                Some("worker0001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.model, Some("test/model-b".into()));
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        wait_for_worker_model(&team, "worker0001", "model-b").await;
+        let generation = worker.generation;
+
+        // Switch to the model already serving: the observed id must survive
+        // the record update — the returned record still carries it.
+        let switched = team
+            .change_model("worker0001", Some("test/model-b".into()), None)
+            .await
+            .expect("the live switch is applied");
+        assert_eq!(
+            switched.model_id.as_deref(),
+            Some("model-b"),
+            "the already-observed id for the new model is kept: {switched:?}"
+        );
+        assert_eq!(switched.generation, generation);
+        release.send(()).expect("release the held response");
+
+        // The turn ends on the target model with the id intact — no further
+        // event was needed to repair it.
+        let settled =
+            wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+                .await;
+        assert_eq!(settled.model_id.as_deref(), Some("model-b"));
+        assert_eq!(settled.generation, generation);
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// An audit worker's model is not user-switchable: the busy-path switch
+    /// refuses an audit worker outright, and the refusal leaves its record
+    /// and its session untouched.
+    #[tokio::test]
+    async fn change_model_refuses_a_busy_audit_worker() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = StubServer::start(vec![
+            StubTurn {
+                body: stub_text_turn("implementation done"),
+                gate: None,
+            },
+            StubTurn {
+                body: stub_text_turn("audit done"),
+                gate: Some(gate),
+            },
+        ])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 2).await;
+        let plan = new_audited_plan(
+            &lead,
+            "Ship the counting feature",
+            "A step's implementation can be audited while the audit runs.",
+        );
+        let (worker, _) = team
+            .dispatch_on_plan(
+                "implement the counting feature".into(),
+                Some("test/model-a".into()),
+                None,
+                Some("worker0001".into()),
+                None,
+                &plan,
+                1,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.generation, 1);
+        // The implementation turn finishes so the audit can be dispatched;
+        // stop the worker and move its tip so there is something to audit.
+        wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+            .await;
+        team.stop("worker0001").await.expect("stop the worker");
+        std::fs::write(worker.worktree.join("feature.rs"), "pub fn feature() {}\n")
+            .expect("worker source");
+        run_git(&worker.worktree, &["add", "feature.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "feature"]);
+
+        // The audit worker runs on model-a with its request held in flight —
+        // busy.
+        team.audit_dispatch(
+            "worker0001",
+            "auditor1",
+            Some("test/model-a".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("dispatch the audit worker");
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the audit worker's first request arrives");
+        let audit = team.worker("auditor1").await.expect("the audit record");
+        assert_eq!(audit.kind, "audit");
+        let generation = audit.generation;
+
+        // The busy switch refuses an audit worker.
+        let refused = team
+            .change_model("auditor1", Some("test/model-b".into()), None)
+            .await
+            .expect_err("an audit worker's model is not switchable");
+        assert!(
+            refused.contains("audit worker"),
+            "the refusal names the audit rule: {refused}"
+        );
+        release.send(()).expect("release the held response");
+
+        // The audit kept its model and its session (no stop, no restart).
+        let settled =
+            wait_for_worker_status(&team, "auditor1", crate::mnemo2::team::WorkerStatus::Completed)
+                .await;
+        assert_eq!(settled.model, Some("test/model-a".into()));
+        assert_eq!(settled.generation, generation);
+        assert_eq!(stub.models(), ["model-a", "model-a"]);
         team.shutdown().await;
         lead.shutdown().await;
     }

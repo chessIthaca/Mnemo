@@ -244,16 +244,24 @@ pub struct AgentSession {
 }
 
 /// What [`AgentSession::set_model`](AgentSession::set_model) did with the
-/// switch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// switch. The `model` payload is the serving model id — the same string
+/// the kernel's `model_changed` event carries once the new model first
+/// serves, and the one a caller's records keep for the served model.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelSwitch {
     /// Pinned now — the new model serves the session's very next request
     /// (the request in flight, if any, finishes on the old model).
-    NextRequest,
+    NextRequest {
+        /// The serving model id of the switch target.
+        model: String,
+    },
     /// Deferred — the new model's context window is smaller than the
-    /// conversation: the kernel first compacts on the OLD model
+    /// current one: the kernel first compacts on the OLD model
     /// (the pending-swap path), then the new model serves.
-    CompactsFirst,
+    CompactsFirst {
+        /// The serving model id of the switch target.
+        model: String,
+    },
 }
 
 impl AgentSession {
@@ -442,14 +450,26 @@ impl AgentSession {
     /// [`set_explicit_provider`](crate::agent::AgentLoop::set_explicit_provider)
     /// — the kernel's existing picker seam. The pin is applied immediately,
     /// never queued behind the running turn, so it lands before the next
-    /// request; the kernel emits its `model_changed` agent event once the
-    /// new model actually serves.
+    /// request.
     ///
-    /// A model whose context window is SMALLER than the conversation
+    /// The served-model baseline is seeded from the PRE-switch provider
+    /// before the pin: a loop that never served is otherwise seeded at
+    /// turn entry from the ALREADY-switched provider, so a switch landing
+    /// before the session's first request (the dispatch/turn-start
+    /// window) would never emit `model_changed` when the new model first
+    /// serves. For a loop that already served the seed is a no-op — the
+    /// pin's first serve announces via the kernel's normal diff.
+    ///
+    /// A model whose context window is SMALLER than the current one
     /// defers the swap (the kernel's pending-swap path): the conversation
     /// is compacted on the OLD model first, then the new one serves —
     /// reported as [`ModelSwitch::CompactsFirst`] so the caller can say
-    /// so.
+    /// so. The outcome is decided by the window comparison itself (the
+    /// same rule the pin applies), never by sampling the kernel's
+    /// pending-swap slot afterwards — a running turn may consume that
+    /// slot in between and misreport the result. The `model` payload is
+    /// the serving model id — the same string the kernel's
+    /// `model_changed` event carries once the new model serves.
     ///
     /// Errors: `session_closed` when the session or its agent task ended;
     /// the spawn path's spec errors (a malformed model spec — `spawn_failed`,
@@ -484,14 +504,32 @@ impl AgentSession {
                     "model '{model}' is not configured for this engine"
                 ))
             })?;
+        // The serving model id the kernel's `model_changed` event will carry
+        // once the new model serves — the same string a caller's records
+        // keep for the served model.
+        let new_model = provider.model().to_string();
+        // The deferral rule the pin itself applies — the new window against
+        // the current one — decided HERE rather than by sampling
+        // `has_pending_swap` afterwards: a running turn may consume the
+        // deferred swap in between, which would misreport the outcome.
+        let deferred =
+            provider.capabilities().max_context < loop_arc.context_manager().max_tokens();
+        // Seed the served-model baseline from the PRE-switch provider while
+        // the loop still shows the old model: a loop that never served is
+        // otherwise seeded at turn entry from the ALREADY-switched provider,
+        // and a switch that landed before the session's first request would
+        // never emit `model_changed` when the new model first serves. For a
+        // loop that already served this is a no-op — the pin's first serve
+        // announces via the kernel's normal diff.
+        loop_arc.seed_served_effective_if_empty();
         // The kernel seam: pin the pair — an immediate swap, or a deferred
         // one when the new window is smaller (compaction on the old model
         // first).
         loop_arc.set_explicit_provider(provider, context_manager);
-        Ok(if loop_arc.has_pending_swap() {
-            ModelSwitch::CompactsFirst
+        Ok(if deferred {
+            ModelSwitch::CompactsFirst { model: new_model }
         } else {
-            ModelSwitch::NextRequest
+            ModelSwitch::NextRequest { model: new_model }
         })
     }
 
@@ -1736,7 +1774,10 @@ mod model_tests {
             .set_model("test/model-b", None)
             .await
             .expect("the live switch pins the new model");
-        assert_eq!(outcome, ModelSwitch::NextRequest);
+        assert_eq!(
+            outcome,
+            ModelSwitch::NextRequest { model: "model-b".into() }
+        );
         release.send(()).expect("release the held response");
 
         // The follow-up request serves on the new model; the turn ends.
@@ -1834,7 +1875,10 @@ mod model_tests {
             .set_model("test/model-b", None)
             .await
             .expect("the live switch is accepted");
-        assert_eq!(outcome, ModelSwitch::CompactsFirst);
+        assert_eq!(
+            outcome,
+            ModelSwitch::CompactsFirst { model: "model-b".into() }
+        );
         release.send(()).expect("release the held response");
 
         let mut compacted = false;
@@ -1860,6 +1904,78 @@ mod model_tests {
             Some("model-b"),
             "the kernel announced the new model once it served: {changes:?}"
         );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A switch that lands in the dispatch/turn-start window — before the
+    /// session's first request — still announces: the served-model baseline
+    /// is seeded from the PRE-switch model when the switch is applied, so
+    /// `model_changed` fires when the new model first serves. Without the
+    /// seed the baseline would be seeded at turn entry from the
+    /// already-switched provider and swallow the announcement.
+    #[tokio::test]
+    async fn set_model_before_the_first_request_still_announces() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let stub = SseStub::start(vec![StubTurn {
+            body: text_turn("done on the switched model"),
+            gate: None,
+        }])
+        .await;
+        write_switch_config(config.path(), &stub.base_url(), 200000);
+        let engine = switch_engine(&root, &config).await;
+        let session = engine
+            .spawn(SpawnOptions {
+                name: Some("pre-turn switch".into()),
+                // A ROUTING session — no forced model. With a forced model
+                // the spawn pin already seeds the baseline and the bug does
+                // not reproduce; routing is the window where the turn-entry
+                // seed falls back to the already-switched provider.
+                model: None,
+                ..SpawnOptions::default()
+            })
+            .await
+            .expect("spawn");
+
+        // The switch lands BEFORE the session's first request — the
+        // dispatch/turn-start window.
+        let outcome = session
+            .set_model("test/model-b", None)
+            .await
+            .expect("the live switch pins the new model");
+        assert_eq!(
+            outcome,
+            ModelSwitch::NextRequest { model: "model-b".into() }
+        );
+
+        let mut events = session.events();
+        session
+            .send(SessionCommand::Prompt {
+                text: "count the stars".into(),
+                images: vec![],
+            })
+            .await
+            .expect("prompt");
+
+        // The session's very first request serves on the new model AND the
+        // kernel announces it — a UI "now running on" note depends on
+        // this event.
+        let mut changes: Vec<String> = Vec::new();
+        while let Ok(ev) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await
+        {
+            match ev.expect("event").event {
+                SerializableAgentEvent::ModelChanged { model, .. } => changes.push(model),
+                SerializableAgentEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            changes.as_slice(),
+            ["model-b"],
+            "the first serve announced the new model: {changes:?}"
+        );
+        assert_eq!(stub.models(), ["model-b"]);
         engine.shutdown().await.expect("shutdown");
     }
 }

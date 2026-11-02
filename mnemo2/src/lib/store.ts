@@ -29,6 +29,7 @@ import {
   type WorkerLive,
 } from "./workerThread";
 import { applyWorkerEvent, applyWorkerStatus } from "./workerActivity";
+import { leadEventSound, loadSoundToggles, notifySound, workerTransitionSound } from "./sounds";
 import {
   createOpenWorkerTransport,
   openWorkerNotice,
@@ -184,6 +185,14 @@ async function refreshNativeLead(token: number): Promise<void> {
 function handleNativeLeadEvent(token: number, event: LeadEvent): void {
   if (token !== leadSessionToken) return;
   app.update((state) => applyLeadEvent(state, event));
+  // The lead's own turn-finished / needs-you / stopped-with-errors events ring
+  // the matching notification sound (gated by the [ui] toggles, per-sound
+  // debounce, more urgent sounds always through).
+  const runtime = get(app).leadRuntime;
+  if (runtime.mode === "native" && runtime.generation === event.generation) {
+    const sound = leadEventSound(event.event?.event);
+    if (sound) notifySound(sound);
+  }
   if (leadEventAffectsUsage(event)) {
     // The durable per-project accumulator changed; re-read the team snapshot
     // (debounced and project-guarded) so the header cost follows the lead too.
@@ -288,6 +297,11 @@ export function createInitialState(): AppState {
 }
 
 export const app = writable<AppState>(createInitialState());
+
+// Notification-sound toggles ([ui] sound_*): read once at startup so the store
+// can gate on them; the Appearance page pushes every later save through
+// applySoundToggles, so a flipped toggle applies to the very next event.
+void loadSoundToggles();
 
 /**
  * Whether the layout leaves room for the native Browser pane. The pane is an
@@ -2551,6 +2565,16 @@ async function syncTeam(): Promise<void> {
       };
     });
     scheduleDiffSync();
+    // A worker that just finished, started waiting for the human, or failed
+    // rings the matching sound; a burst across the team collapses to one via
+    // the module's debounce window. A snapshot for an already-closed project
+    // stays silent (the update above skipped it).
+    if (get(app).projectId === projectId) {
+      for (const record of snapshot.workers) {
+        const sound = workerTransitionSound(before.get(record.id)?.status, record.status);
+        if (sound) notifySound(sound);
+      }
+    }
   } catch (error) {
     if (token === teamToken) noteTeamError(error);
   }

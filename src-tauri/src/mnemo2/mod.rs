@@ -31,6 +31,10 @@ pub mod usage;
 /// The Cost tab's spend and savings insight commands.
 pub mod insights;
 
+/// The Plans tab's backlog section: the project's `.coding/backlog.jsonl`
+/// ideas, read and edited in place.
+pub mod backlog;
+
 /// The lead's team ledger for the TeamLead workflow.
 pub(crate) mod ledger;
 
@@ -433,6 +437,13 @@ pub fn run() {
             ipc::team_snapshot,
             ipc::board_snapshot,
             ipc::board_plan_document,
+            backlog::backlog_items,
+            backlog::backlog_add,
+            backlog::backlog_edit,
+            backlog::backlog_remove,
+            backlog::backlog_reorder,
+            backlog::backlog_set_deferred,
+            backlog::backlog_clear_finished,
             ipc::settings_endpoints,
             ipc::settings_upsert_endpoint,
             ipc::settings_remove_endpoint,

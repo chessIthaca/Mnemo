@@ -11,6 +11,7 @@ import { mount as svelteMount, unmount } from "svelte";
 import App from "../App.svelte";
 import SettingsDialog from "../components/SettingsDialog.svelte";
 import { seedBoardPreview } from "../lib/boardEngine";
+import { seedBacklogPreview, type BacklogItem, type BacklogTransport } from "../lib/backlog";
 import type { BoardPlan } from "../lib/boardState";
 import { app } from "../lib/store";
 import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
@@ -764,6 +765,79 @@ const PREVIEW_PLAN_DOCUMENTS: Record<string, string> = {
   ),
 };
 
+/** The plan inbox the Plans tab's Backlog section shows above the cards. */
+const PREVIEW_BACKLOG: BacklogItem[] = [
+  {
+    id: "idea-preview-diff",
+    text: "Show each worker's diff beside its thread, collapsed to the changed files first.",
+    images: [],
+    status: "pending",
+    created_at: 0,
+  },
+  {
+    id: "idea-preview-reopen",
+    text: "Let the lead reopen a closed plan from the Plans tab and dispatch its remaining steps.",
+    images: [],
+    status: "pending",
+    created_at: 0,
+    deferred: true,
+  },
+  {
+    id: "idea-preview-archive",
+    text: "Archive the backlog's finished ideas into the project memory index.",
+    images: [],
+    status: "pending",
+    created_at: 0,
+  },
+  {
+    id: "idea-preview-burndown",
+    text: "Show the plan board's steps as a burn-down per worker.",
+    images: [],
+    status: "done",
+    created_at: 0,
+  },
+];
+
+/** A tiny in-memory backlog that mirrors the native transport's write semantics. */
+function previewBacklog(initial: BacklogItem[]): BacklogTransport {
+  let items = initial.map((item) => ({ ...item }));
+  const copy = () => items.map((item) => ({ ...item }));
+  return {
+    items: async () => copy(),
+    add: async (text) => {
+      items = [
+        ...items,
+        { id: `idea-preview-${items.length + 1}`, text, images: [], status: "pending", created_at: 0 },
+      ];
+      return copy();
+    },
+    edit: async (id, text) => {
+      items = items.map((item) => (item.id === id ? { ...item, text } : item));
+      return copy();
+    },
+    remove: async (id) => {
+      items = items.filter((item) => item.id !== id);
+      return copy();
+    },
+    reorder: async (ids) => {
+      const rank = new Map(ids.map((id, index) => [id, index]));
+      items = [...items].sort(
+        (a, b) => (rank.get(a.id) ?? ids.length) - (rank.get(b.id) ?? ids.length),
+      );
+      return copy();
+    },
+    setDeferred: async (id, deferred) => {
+      items = items.map((item) => (item.id === id ? { ...item, deferred } : item));
+      return copy();
+    },
+    clearFinished: async () => {
+      items = items.filter((item) => item.status === "pending");
+      return copy();
+    },
+    onChanged: async () => () => {},
+  };
+}
+
 /** The Plans tab over the same project, with one card expanded to its document. */
 function plansTab(): AppState {
   seedBoardPreview({
@@ -775,6 +849,7 @@ function plansTab(): AppState {
     },
     onChanged: async () => () => {},
   });
+  seedBacklogPreview(previewBacklog(PREVIEW_BACKLOG));
   return { ...baseState(), board: PREVIEW_PLANS, route: "plans" };
 }
 

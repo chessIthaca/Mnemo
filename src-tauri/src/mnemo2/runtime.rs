@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::mnemo2::ledger::LeadTeamLedger;
 use crate::mnemo2::team::{BoardSignal, MessageSender, TeamRuntime, TeamRuntimeOptions};
+use crate::mnemo2::trace_view::TraceSupport;
 use crate::mnemo2::usage::event_session;
 
 /// The Tauri event channel name used by the IPC layer.
@@ -271,6 +272,11 @@ pub struct LeadRuntime {
     /// explicit stop in [`LeadRuntime::shutdown`] is the primary path,
     /// the manager's Drop is only the safety net.
     laya: std::sync::Mutex<Option<Arc<LayaManager>>>,
+    /// The trace backend for the current engine (plan c3ba2b58 step B):
+    /// the ring raised to 128 records, the metadata journal at
+    /// `.coding/logs/`, and its background writer. `None` before the first
+    /// engine start and after [`LeadRuntime::shutdown`].
+    trace_support: std::sync::Mutex<Option<Arc<TraceSupport>>>,
 }
 
 /// The project stores the engine wired into its own agent registries. The
@@ -365,6 +371,7 @@ impl LeadRuntime {
             stores: std::sync::Mutex::new(None),
             indexing: crate::mnemo2::indexing::IndexingTracker::new(),
             laya: std::sync::Mutex::new(None),
+            trace_support: std::sync::Mutex::new(None),
         };
         runtime.start_engine(provider).await?;
         let team = TeamRuntime::open(TeamRuntimeOptions {
@@ -569,6 +576,16 @@ impl LeadRuntime {
             .map_err(|err| format!("could not load model pricing: {err}"))
     }
 
+    /// The trace backend for the current engine — the raised ring, the
+    /// metadata journal, and its writer. `None` when no engine is running.
+    pub(crate) fn trace_support(&self) -> Option<Arc<TraceSupport>> {
+        self.trace_support
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The shared team runtime for this lead.
     /// The shared team runtime for this lead.
     pub(crate) async fn team_handle(&self) -> Result<Arc<TeamRuntime>, String> {
         self.team
@@ -889,6 +906,10 @@ impl LeadRuntime {
         if let Some(team) = self.team.lock().await.take() {
             team.shutdown().await;
         }
+        // Stop the trace journal's background writer before the engine
+        // drops: it polls the engine's shared trace log (plan c3ba2b58
+        // step B).
+        self.trace_support.lock().unwrap_or_else(|e| e.into_inner()).take();
         // Stop the managed Laya sidecar BEFORE the engine drops: every
         // classifier consumer (routing, auto-typing, triage) reads the
         // shared slot at call time, and the manager's Drop kill is only
@@ -991,6 +1012,12 @@ impl LeadRuntime {
         // The classifier attach is last and never gates the start: the
         // fill is I/O-free and every failure only logs.
         self.attach_laya(&engine).await;
+        // Plan c3ba2b58 step B: the trace backend per engine — the ring
+        // raised to 128 records and the metadata journal's background
+        // writer. A restarted engine replaces the slot (dropping the old
+        // support aborts its writer).
+        *self.trace_support.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::new(TraceSupport::start(&engine)));
         *self.engine.lock().await = Some(engine);
         Ok(())
     }
@@ -1110,9 +1137,19 @@ impl LeadRuntime {
                 host_tools,
                 external_policy: None,
                 guardrails: None,
-                // Plan c3ba2b58 step B wires the lead's trace identity here;
-                // `None` until then (unattributed records).
-                trace_identity: None,
+                // Plan c3ba2b58 step B: the lead's trace identity — the
+                // spawn path fills the allocated agent/session ids and
+                // stamps it on the loop, so every lead call's record
+                // carries `actor_kind: lead` and the display name.
+                trace_identity: Some(mnemo::provider::trace::TraceIdentity {
+                    actor_kind: mnemo::provider::trace::TraceActorKind::Lead,
+                    agent_id: String::new(),
+                    session_id: String::new(),
+                    agent_name: "Lead".to_string(),
+                    worker_id: None,
+                    plan_id: None,
+                    plan_step: None,
+                }),
             })
             .await
             .map_err(|err| format!("could not spawn the lead session: {err}"))?;
@@ -1719,7 +1756,197 @@ fn configured_default(config: &Config) -> Option<String> {
         .find(|endpoint| endpoint.models.iter().any(|spec| spec.id == model))
         .map(|endpoint| format!("{}/{}", endpoint.name, model))
 }
+/// Trace identity tests (plan c3ba2b58 step B) — in their own module so the
+/// append-heavy `mod tests` below stays untouched by concurrent work.
+#[cfg(test)]
+mod trace_tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
 
+    use super::*;
+    use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions};
+    use mnemo::headless::{Engine, EngineOptions, SessionCommand, TraceApi};
+    use mnemo::provider::trace::{TraceActorKind, TraceIdentity, LlmRequestSummary};
+
+    /// A minimal worker identity for tests that spawn worker sessions
+    /// without a full WorkerRecord (the tool-profile tests reuse it).
+    pub(super) fn worker_identity(name: &str) -> TraceIdentity {
+        TraceIdentity {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: String::new(),
+            session_id: String::new(),
+            agent_name: name.to_string(),
+            worker_id: Some("w-trace".to_string()),
+            plan_id: Some("plan-trace".to_string()),
+            plan_step: Some(1),
+        }
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git(root: &Path) {
+        run_git(root, &["init", "-b", "main"]);
+        run_git(root, &["config", "user.name", "Mnemo2 Test"]);
+        run_git(root, &["config", "user.email", "mnemo2@example.invalid"]);
+        std::fs::write(root.join("README.md"), "seed\n").expect("seed file");
+        std::fs::write(root.join(".gitignore"), ".worktrees/\n.coding/\n")
+            .expect("ignore worktrees and state");
+        run_git(root, &["add", "README.md", ".gitignore"]);
+        run_git(root, &["commit", "-m", "seed"]);
+    }
+
+    /// A config whose only endpoint is unreachable (port 9), so the first
+    /// provider call fails fast and lands in the trace log with its
+    /// stamped identity — no scripted provider needed.
+    fn write_unreachable_config(config: &Path) {
+        std::fs::create_dir_all(config).expect("config dir");
+        std::fs::write(
+            config.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            config.join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"scripted-a\"]\n",
+        )
+        .expect("endpoints.toml");
+    }
+
+    /// Wait until the trace log holds a terminal record, then return the
+    /// newest one: the first model call over the unreachable endpoint is
+    /// terminal the moment its connect fails.
+    async fn wait_for_terminal_record(
+        trace: &TraceApi,
+        budget_ms: u64,
+    ) -> Option<LlmRequestSummary> {
+        let deadline = Instant::now() + Duration::from_millis(budget_ms);
+        while Instant::now() < deadline {
+            if let Some(record) = trace.list().into_iter().rev().find(|s| s.is_complete) {
+                return Some(record);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn lead_calls_carry_the_lead_identity() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_unreachable_config(config.path());
+        let lead = LeadRuntime::open(LeadRuntimeOptions {
+            workspace_root: root.path().to_path_buf(),
+            config_dir: Some(config.path().to_path_buf()),
+            state_dir: state.path().to_path_buf(),
+            model: None,
+        })
+        .await
+        .expect("open the lead");
+
+        // One prompt: the provider call fails fast (connection refused) but
+        // its trace record carries the identity stamped at spawn.
+        lead.send_prompt("hello".to_string(), Vec::new())
+            .await
+            .expect("send the prompt");
+        let engine = lead.engine_handle().await.expect("the engine");
+        let trace = engine.trace();
+        let record =
+            wait_for_terminal_record(&trace, 15_000).await.expect("a terminal lead record");
+
+        assert_eq!(trace.run_id(), record.run_id, "the record names its run");
+        let attribution = record.attribution.expect("the lead call is attributed");
+        assert_eq!(attribution.actor_kind, TraceActorKind::Lead);
+        assert_eq!(attribution.agent_name, "Lead");
+        assert_eq!(attribution.worker_id, None);
+        assert_eq!(attribution.plan_id, None);
+        assert_eq!(attribution.plan_step, None);
+        assert!(
+            !attribution.agent_id.is_empty(),
+            "the spawn path filled the agent id"
+        );
+        assert!(
+            !attribution.session_id.is_empty(),
+            "the spawn path filled the session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_calls_carry_worker_plan_and_step() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_unreachable_config(config.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: mnemo::workspace::Workspace::new(root.path()),
+            config_dir: Some(config.path().to_path_buf()),
+            permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+            memory: mnemo::headless::MemoryBackend::Disabled,
+            index_codegraph: false,
+            require_git: true,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("start the engine");
+        let engine = std::sync::Arc::new(engine);
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: engine.clone(),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: Some(2),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("open the team runtime");
+
+        let session = team
+            .spawn_worker_session(
+                None,
+                None,
+                root.path().to_path_buf(),
+                None,
+                "implementation",
+                worker_identity("Trace worker"),
+            )
+            .await
+            .expect("spawn the worker session");
+        session
+            .send(SessionCommand::Prompt {
+                text: "hello from the worker".to_string(),
+                images: Vec::new(),
+            })
+            .await
+            .expect("prompt the worker");
+        let trace = engine.trace();
+        let record =
+            wait_for_terminal_record(&trace, 15_000).await.expect("a terminal worker record");
+
+        assert_eq!(trace.run_id(), record.run_id, "one shared log, one run");
+        let attribution = record.attribution.expect("the worker call is attributed");
+        assert_eq!(attribution.actor_kind, TraceActorKind::Worker);
+        assert_eq!(attribution.agent_name, "Trace worker");
+        assert_eq!(attribution.worker_id.as_deref(), Some("w-trace"));
+        assert_eq!(attribution.plan_id.as_deref(), Some("plan-trace"));
+        assert_eq!(attribution.plan_step, Some(1));
+        assert!(!attribution.session_id.is_empty(), "ids filled at spawn");
+    }
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8510,12 +8737,12 @@ mod tests {
             open_git_team(&root, &config, &state, Arc::new(ScriptedLlm::new(vec![]))).await;
         let session = team
             .spawn_worker_session(
-                "Executor test".to_string(),
                 None,
                 None,
                 root.path().to_path_buf(),
                 None,
                 "implementation",
+                super::trace_tests::worker_identity("Executor test"),
             )
             .await
             .expect("spawn executor");
@@ -8553,7 +8780,14 @@ mod tests {
         // The audit profile is the read-only counterpart: every mutation
         // surface is gone, and the identity forbids lifecycle actions.
         let audit = team
-            .spawn_worker_session("Audit test".to_string(), None, None, root.path().to_path_buf(), None, "audit")
+            .spawn_worker_session(
+                None,
+                None,
+                root.path().to_path_buf(),
+                None,
+                "audit",
+                super::trace_tests::worker_identity("Audit test"),
+            )
             .await
             .expect("spawn audit");
         let audit_tools = audit.tool_names().await.expect("registered audit tools");

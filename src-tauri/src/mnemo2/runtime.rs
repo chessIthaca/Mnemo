@@ -2033,6 +2033,16 @@ mod tests {
         std::fs::write(&path, text).expect("writing config.toml");
     }
 
+    /// Append Mnemo1's per-state `[models]` section to the fixture config —
+    /// the shared-config shape plan 7f0b3848 tests against: the slots belong
+    /// to Mnemo1's workflow and live in the same config.toml Mnemo2 reads.
+    fn enable_per_state_models_in_config(dir: &Path) {
+        let path = dir.join("config.toml");
+        let mut text = std::fs::read_to_string(&path).expect("fixture config.toml");
+        text.push_str("\n[models.executing]\nendpoint = \"test\"\nmodel = \"scripted-b\"\n");
+        std::fs::write(&path, text).expect("writing config.toml");
+    }
+
     /// Doctor a PRETEND-installed managed runtime under `<config_dir>/laya`
     /// — the same fake the kernel seam's tests plant (setup.rs's
     /// `doctor_installed_laya`): exactly the two files
@@ -2782,6 +2792,110 @@ mod tests {
             .set_model("test/not-configured".to_string(), None)
             .await
             .is_err());
+        runtime.shutdown().await;
+    }
+
+    /// Plan 7f0b3848: the lead's model is the picker's choice (or the
+    /// default model) in every workflow state. With Mnemo1's
+    /// `[models.executing]` configured in the shared config — the shape
+    /// the user's real config.toml has — a Planning → Executing move must
+    /// NOT hand the lead's next request to that slot. The protection is
+    /// the TeamLead policy's stateless route (`WorkflowPolicy::route()`
+    /// emits `["lead"]` for TeamLead mode, pinned kernel-side by the route
+    /// test in workflow_policy.rs; `ModelsConfig` has no `lead` slot, so
+    /// the resolver's walk resolves nothing for the lead). This test pins
+    /// the end-to-end outcome at the runtime seam: both turns serve on the
+    /// lead's own scripted provider and no model switch is announced —
+    /// if per-state routing ever returns for the lead, this goes red.
+    #[tokio::test]
+    async fn lead_ignores_the_mnemo1_per_state_models_across_a_state_change() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a", "scripted-b"]);
+        enable_per_state_models_in_config(config.path());
+        // Non-vacuous guard: prove the fixture's `[models.executing]` slot
+        // is live under Mnemo's own parse path — it parses and resolves
+        // against the fixture endpoint. If the section ever stopped
+        // parsing, the lead-turn assertions below would pass vacuously.
+        let loaded =
+            mnemo::config::Config::load(config.path()).expect("the fixture config parses");
+        let executing = loaded
+            .general
+            .models
+            .executing
+            .as_ref()
+            .expect("[models.executing] parsed");
+        assert!(
+            loaded.resolve_model_ref(Some(executing)).is_some(),
+            "the fixture's [models.executing] resolves against the fixture endpoint"
+        );
+        let scripted = std::sync::Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["first"]),
+            text_turn(&["second"]),
+        ]));
+        let runtime = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(scripted.clone()),
+        )
+        .await
+        .expect("the lead opens");
+        let mut rx = runtime.subscribe();
+        runtime
+            .send_prompt("first turn".to_string(), Vec::new())
+            .await
+            .expect("prompt");
+        drain_turn(&mut rx).await;
+        assert_eq!(
+            scripted.calls(),
+            1,
+            "the Planning turn serves on the lead's own provider"
+        );
+
+        // Planning → Executing, the transition the lead's create_plan
+        // drives in production.
+        let session_id = {
+            let live = runtime.live.lock().await;
+            live.as_ref().expect("live lead").session.id()
+        };
+        let engine = runtime.engine_handle().await.expect("engine");
+        let agent_loop = engine
+            .host()
+            .agent_loops
+            .lock()
+            .await
+            .get(&session_id.agent_id())
+            .cloned()
+            .expect("the lead loop is registered");
+        let workflow = agent_loop
+            .workflow_handle()
+            .as_any_arc()
+            .downcast::<std::sync::Arc<tokio::sync::Mutex<mnemo::app::workflow::Workflow>>>()
+            .expect("the lead's workflow is the concrete app workflow");
+        workflow
+            .lock()
+            .await
+            .create_plan("Lead plan", "goal", "ctx", vec!["step".into()])
+            .expect("create_plan");
+
+        // The Executing turn: still the lead's own provider (scripted-a) —
+        // `[models.executing]` (scripted-b) must never take it over.
+        runtime
+            .send_prompt("second turn".to_string(), Vec::new())
+            .await
+            .expect("prompt");
+        drain_turn(&mut rx).await;
+        assert_eq!(
+            scripted.calls(),
+            2,
+            "the Executing turn stays on the lead's own model, not [models.executing]"
+        );
+        let snapshot = runtime.snapshot().await.expect("snapshot");
+        assert_ne!(
+            snapshot.model_id.as_deref(),
+            Some("scripted-b"),
+            "the lead never announces [models.executing]'s model"
+        );
         runtime.shutdown().await;
     }
 

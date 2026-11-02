@@ -71,6 +71,11 @@ pub mod laya_settings;
 /// f1bd54e5).
 pub mod safety_settings;
 
+/// The MCP server settings commands (list/save/test the global and
+/// project `mcp.toml` sets) — the backend of the Settings dialog's MCP
+/// servers page (plan f1bd54e5).
+pub mod mcp_settings;
+
 /// The local endpoint for an external lead (Claude Code over MCP).
 pub mod mcp_server;
 
@@ -443,6 +448,9 @@ pub fn run() {
             safety_settings::safety_settings_get,
             safety_settings::save_safety_mode,
             safety_settings::save_safety_rules,
+            mcp_settings::mcp_settings_get,
+            mcp_settings::mcp_settings_save,
+            mcp_settings::mcp_settings_test,
             ipc::lead_snapshot,
             ipc::indexing_snapshot,
             ipc::lead_prompt,

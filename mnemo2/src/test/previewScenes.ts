@@ -19,6 +19,7 @@ import type { WorkerDeletionPreview } from "../lib/teamState";
 import { seedPreviewSettings } from "./previewSettings";
 import { seedPreviewLaya } from "./previewLaya";
 import { seedPreviewSafety } from "./previewSafety";
+import { seedPreviewMcp } from "./previewMcp";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
@@ -1563,6 +1564,29 @@ export const previewScenes: PreviewScene[] = [
       return () => {
         unmount(dialog);
         restoreSafety();
+        restoreSettings();
+      };
+    },
+  },
+  {
+    name: "settings-mcp",
+    title: "Settings: MCP servers",
+    description:
+      "The settings dialog's MCP page: a global stdio server (connected, with its live tool count), a project remote server and a disabled entry, each with Test/Edit/Remove, plus the add form and the note on when a save reaches the lead and its workers.",
+    // Same mount pattern as settings-safety; the rail click opens the MCP
+    // page directly so the scene shows the page it names.
+    build: missionControl,
+    mount: (target) => {
+      const restoreSettings = seedPreviewSettings();
+      const restoreMcp = seedPreviewMcp();
+      const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {} } });
+      const mcp = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
+        (button) => button.textContent === "MCP",
+      );
+      mcp?.click();
+      return () => {
+        unmount(dialog);
+        restoreMcp();
         restoreSettings();
       };
     },

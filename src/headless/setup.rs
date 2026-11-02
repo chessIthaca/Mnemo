@@ -1313,6 +1313,17 @@ impl Setup {
         }
     }
 
+    /// §5.8 :552 — the live per-server status (connected, tool count, last
+    /// error, restarts) from the attached engine's shared manager, sorted by
+    /// name. A standalone Setup holds no connections, so the list is empty
+    /// without a live engine.
+    pub async fn mcp_statuses(&self) -> Vec<(String, crate::mcp::ServerStatus)> {
+        match self.live.as_ref().and_then(|live| live.factory.mcp_manager()) {
+            Some(manager) => manager.statuses().await,
+            None => Vec::new(),
+        }
+    }
+
     /// Load the config for the endpoints group — one error mapping for
     /// every read.
     fn load_config(&self) -> Result<Config, EngineError> {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createGraphTransport } from "../lib/graph";
+import { canMoveMain, createGitTransport } from "../lib/git";
 import type { AppState, LeadEntry, Worker, WorkerThreadEntry } from "../lib/types";
 import { costPreviewInsights } from "../lib/cost";
 import { createMemoryTransport } from "../lib/memoryView";
@@ -71,6 +72,7 @@ describe("preview scenes", () => {
       "graph",
       "files",
       "trace",
+      "git",
       "worker-thread",
       "lead-chat",
       "settings-models",
@@ -134,6 +136,24 @@ describe("preview scenes", () => {
     const recall = await transport!.recallTest("memory store", 4);
     expect(recall.length).toBe(4);
     expect(recall[0].score).toBeGreaterThanOrEqual(recall[3].score);
+  });
+
+  it("git seeds one fast-forwardable branch and a commit lane", async () => {
+    const state = build("git");
+    expect(state.workbenchOpen).toBe(true);
+    expect(state.workbenchTab).toBe("git");
+
+    const transport = createGitTransport();
+    expect(transport).not.toBeNull();
+    const overview = await transport!.overview();
+    expect(overview.branch).toBe("wt/agent-gitTab95");
+    expect(overview.main_worktree).toBeNull();
+    expect(overview.commits.length).toBeGreaterThan(1);
+    const movable = overview.branches.filter((branch) => canMoveMain(branch, overview.main_worktree));
+    expect(movable.map((branch) => branch.name)).toEqual(["wt/agent-gitTab95"]);
+
+    const moved = await transport!.moveMain(movable[0].name);
+    expect(moved.commits).toBeGreaterThan(0);
   });
 
   it("mission-control selects a worker whose thread shows Markdown prose and every tool row state", () => {

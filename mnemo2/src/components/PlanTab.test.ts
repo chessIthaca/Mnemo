@@ -1,6 +1,7 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { seedBoardPreview, type BoardTransport } from "../lib/boardEngine";
 import type { BoardPlan } from "../lib/boardState";
 import { app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
@@ -119,5 +120,129 @@ describe("worker row plan label", () => {
       onSelect: () => {},
     });
     expect(screen.getByText("zzzzzzzz · step 1")).toBeTruthy();
+  });
+});
+
+/** A plan file for the open card: context, acceptance, steps and decisions. */
+const PLAN_DOCUMENT = [
+  "# Plan: Open plan",
+  "",
+  "## Goal",
+  "Make it work",
+  "",
+  "## Context",
+  "The card shows only a title and one line per step.",
+  "",
+  "## Acceptance scenarios",
+  "- Details shows the context.",
+  "",
+  "## Steps",
+  "- [x] 1. Build the engine",
+  "- [ ] 2. Wire the UI",
+  "",
+  "## Decisions",
+  "- Details is lazy.",
+].join("\n");
+
+describe("PlanTab details", () => {
+  let changed: (() => void) | null = null;
+
+  /** Plant the board transport the tab reads a plan's document through. */
+  function seedDetails(document: (planId: string) => Promise<string>): BoardTransport {
+    const transport: BoardTransport = {
+      snapshot: vi.fn(async () => ({ plans: [open, closed] })),
+      document: vi.fn(document),
+      onChanged: vi.fn(async (handler: () => void) => {
+        changed = handler;
+        return () => {};
+      }),
+    };
+    seedBoardPreview(transport);
+    return transport;
+  }
+
+  const openCard = () => screen.getByRole("article", { name: "Open plan" });
+
+  beforeEach(() => {
+    changed = null;
+    const state = fixtureState();
+    state.board = [open, closed];
+    app.set(state);
+  });
+
+  afterEach(() => seedBoardPreview(null));
+
+  it("keeps the card closed by default and expands the document on the first open", async () => {
+    const transport = seedDetails(async () => PLAN_DOCUMENT);
+    render(PlanTab);
+    const card = openCard();
+    const toggle = within(card).getByRole("button", { name: "Details" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(card.querySelector(".plan-details")).toBeNull();
+
+    await fireEvent.click(toggle);
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    const details = within(card).getByRole("region", { name: "Open plan details" });
+    await waitFor(() => expect(within(details).getByRole("heading", { name: "Context" })).toBeTruthy());
+    expect(within(details).getByRole("heading", { name: "Acceptance scenarios" })).toBeTruthy();
+    expect(within(details).getByRole("heading", { name: "Decisions" })).toBeTruthy();
+    expect(within(details).getByText("The card shows only a title and one line per step.")).toBeTruthy();
+    expect(within(details).getByText("Details shows the context.")).toBeTruthy();
+    // The title and goal the card already shows are not repeated.
+    expect(details.textContent).not.toContain("## Goal");
+    expect(details.textContent).not.toContain("Make it work");
+    expect(transport.document).toHaveBeenCalledTimes(1);
+    expect(transport.document).toHaveBeenCalledWith("plan-open-0001");
+  });
+
+  it("fetches once per card: closing and reopening keeps the loaded document", async () => {
+    const transport = seedDetails(async () => PLAN_DOCUMENT);
+    render(PlanTab);
+    const card = openCard();
+    const toggle = within(card).getByRole("button", { name: "Details" });
+
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(within(card).getByRole("region", { name: "Open plan details" })).toBeTruthy());
+    await fireEvent.click(toggle);
+    expect(card.querySelector(".plan-details")).toBeNull();
+    await fireEvent.click(toggle);
+
+    await waitFor(() => expect(card.querySelector(".plan-details")?.textContent).toContain("Details is lazy."));
+    expect(transport.document).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-reads an open card when the board changes", async () => {
+    const transport = seedDetails(async () => PLAN_DOCUMENT);
+    render(PlanTab);
+    const card = openCard();
+    await fireEvent.click(within(card).getByRole("button", { name: "Details" }));
+    await waitFor(() => expect(transport.document).toHaveBeenCalledTimes(1));
+
+    changed?.();
+
+    await waitFor(() => expect(transport.document).toHaveBeenCalledTimes(2));
+  });
+
+  it("shows an error line when the document cannot be read", async () => {
+    seedDetails(async () => {
+      throw "could not read plan plan-open-0001";
+    });
+    render(PlanTab);
+    const card = openCard();
+
+    await fireEvent.click(within(card).getByRole("button", { name: "Details" }));
+
+    await waitFor(() => expect(within(card).getByText("could not read plan plan-open-0001")).toBeTruthy());
+    expect(card.querySelector(".details-error")).toBeTruthy();
+  });
+
+  it("explains that details need the desktop app when there is no host", async () => {
+    render(PlanTab);
+    const card = openCard();
+
+    await fireEvent.click(within(card).getByRole("button", { name: "Details" }));
+
+    expect(within(card).getByText("Plan details need the desktop app.")).toBeTruthy();
   });
 });

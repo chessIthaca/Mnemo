@@ -601,18 +601,45 @@ mod tests {
         assert!(add(Some(config.path().to_path_buf()), &file).is_err());
     }
 
+    /// Kills and reaps a helper child on drop, so a failing assertion cannot
+    /// leave a live process running for the rest of the suite.
+    struct LiveChild(std::process::Child);
+
+    impl LiveChild {
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for LiveChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A live incumbent must force confirmation. The stand-in process has to
+    /// genuinely stay alive for the whole test: `cmd /c timeout /t 5` — the
+    /// original helper — exits immediately once its stdin is redirected, so
+    /// under full-suite load the "live" pid could already be gone, `pid_alive`
+    /// correctly read it as dead, and the conflict assertion failed
+    /// intermittently. Loopback `ping` never reads stdin and lives ~30 s.
     #[test]
     fn attach_requires_confirmation_for_a_live_incumbent() {
         let root = tempdir().expect("project");
         #[cfg(windows)]
-        let mut command = std::process::Command::new("cmd");
+        let mut command = std::process::Command::new("ping");
         #[cfg(windows)]
-        command.args(["/c", "timeout", "/t", "5"]);
+        command.args(["-n", "30", "127.0.0.1"]);
         #[cfg(not(windows))]
-        let mut command = std::process::Command::new("sh");
+        let mut command = std::process::Command::new("sleep");
         #[cfg(not(windows))]
-        command.args(["-c", "sleep 5"]);
-        let mut child = command.spawn().expect("live helper process");
+        command.args(["30"]);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = LiveChild(command.spawn().expect("live helper process"));
         crate::instance_marker::InstanceMarker {
             pid: child.id(),
             started_at: 1,
@@ -623,8 +650,6 @@ mod tests {
         assert!(attach(root.path(), true).expect("allowed attachment").conflict_pid.is_none());
         detach(root.path());
         assert!(crate::instance_marker::read_marker(root.path()).is_none());
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     #[test]

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ArrowLeft, FileDiff, FolderTree, Globe, ListTree, X } from "@lucide/svelte";
+  import { Activity, ArrowLeft, FileDiff, FolderTree, Globe, ListTree, X } from "@lucide/svelte";
   import { onMount, type Component } from "svelte";
   import { actions, app } from "../lib/store";
   import type { WorkbenchTab } from "../lib/types";
@@ -7,12 +7,14 @@
   import DiffTab from "./DiffTab.svelte";
   import FilesTab from "./FilesTab.svelte";
   import PlanTab from "./PlanTab.svelte";
+  import TraceTab from "./TraceTab.svelte";
 
   const tabs: { id: WorkbenchTab; label: string; icon: Component }[] = [
     { id: "browser", label: "Browser", icon: Globe },
     { id: "diff", label: "Diff", icon: FileDiff },
     { id: "plan", label: "Plan", icon: ListTree },
     { id: "files", label: "Files", icon: FolderTree },
+    { id: "trace", label: "Trace", icon: Activity },
   ];
 
   let resizing = $state(false);
@@ -81,6 +83,8 @@
       <DiffTab />
     {:else if $app.workbenchTab === "files"}
       <FilesTab />
+    {:else if $app.workbenchTab === "trace"}
+      <TraceTab />
     {:else}
       <PlanTab scope="open" />
     {/if}

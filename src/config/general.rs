@@ -891,7 +891,7 @@ pub const EMBEDDING_MODEL_SENTINEL_HASH: &str = "hash";
 /// recall (no external service) with a small download on first use. Used as
 /// the serde default for `bundled_embedding_model` so existing configs with
 /// no key upgrade to semantic recall automatically.
-fn default_bundled_embedding_model() -> Option<String> {
+pub fn default_bundled_embedding_model() -> Option<String> {
     Some("all-MiniLM-L6-v2".into())
 }
 

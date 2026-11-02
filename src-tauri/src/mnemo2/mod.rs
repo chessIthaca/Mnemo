@@ -52,6 +52,11 @@ pub mod mcp_server;
 /// Compact model names for external worker displays.
 pub mod model_label;
 
+/// Model-role settings for the Models and Savings pages: per-task
+/// models, vision, the code-indexing (embedding) model with install
+/// progress, optimizer levers, per-model pricing and budget caps.
+pub mod model_settings;
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
 /// also exposes `__TAURI_INTERNALS__`.
@@ -413,6 +418,9 @@ pub fn run() {
             ipc::settings_endpoint_usage,
             ipc::settings_tiers,
             ipc::settings_save_tiers,
+            model_settings::model_settings_get,
+            model_settings::model_settings_save,
+            model_settings::embedding_install,
             ipc::team_dispatch,
             ipc::team_audit_dispatch,
             ipc::team_message,

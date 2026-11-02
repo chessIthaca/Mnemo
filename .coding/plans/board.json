@@ -258,10 +258,10 @@
     },
     {
       "id": "971ffa5e",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793578095507,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793609340164,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-971ffa5e-20261102-084900.md",
       "abandon_reason": null
     },
     {

@@ -50,6 +50,7 @@
           startedAtMs={worker.createdAtMs}
           pulse={worker.activity.phase !== "waiting"}
           size="meta"
+          truncate
         />
       </span>
     {:else}
@@ -66,6 +67,9 @@
   .worker-row.compact { min-height: 56px; padding: 8px 7px; }
   .avatar { display: grid; flex: 0 0 auto; width: 32px; height: 32px; place-items: center; border-radius: 10px; background: hsl(var(--hue) 32% 87%); color: hsl(var(--hue) 30% 32%); font-size: var(--text-meta); font-weight: 750; }
   .worker-copy { flex: 1; min-width: 0; }
+  /* One status column, the same x and the same width on every row: the pill keeps
+     its natural width and the line under it fills the column, truncating its label. */
+  .worker-meta { display: flex; flex: 0 0 152px; flex-direction: column; align-items: flex-start; min-width: 0; }
   .worker-name { display: flex; align-items: center; gap: 5px; }
   .worker-name strong { font-size: var(--text-title); font-weight: 650; }
   .worker-name :global(svg) { color: var(--warning); }
@@ -77,8 +81,8 @@
   .worker-task { display: -webkit-box; line-clamp: 3; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; color: var(--muted); font-family: var(--font-ui); font-size: var(--text-meta); }
   .worker-progress { display: block; height: 2px; margin-top: 7px; overflow: hidden; border-radius: 2px; background: var(--line); }
   .worker-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width 240ms ease; }
-  .worker-meta small { display: block; margin-top: 4px; color: var(--muted); font-size: var(--text-meta); white-space: nowrap; }
-  .worker-live { display: block; margin-top: 4px; white-space: nowrap; }
+  .worker-meta small { display: block; width: 100%; min-width: 0; margin-top: 4px; overflow: hidden; color: var(--muted); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
+  .worker-live { display: block; width: 100%; min-width: 0; margin-top: 4px; white-space: nowrap; }
   .status-label { display: inline-flex; padding: 3px 6px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; white-space: nowrap; }
   .status-label[data-status="in_review"], .status-label[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }
   .status-label[data-status="failed"] { background: #f4e4e1; color: var(--danger); }

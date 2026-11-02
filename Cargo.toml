@@ -141,13 +141,16 @@ tree-sitter-html = "0.23.2"
 # Windows-only: user-only DACL for keys.toml (Quality M6). Already present
 # transitively via Tauri; pinned here so the security features are compiled in.
 # Win32_Storage_FileSystem carries GetShortPathNameW for the 8.3-alias sandbox
-# regression test (plan b4812291).
+# regression test (plan b4812291); Win32_System_JobObjects carries the
+# CreateJobObjectW/AssignProcessToJobObject sequence for the shell tool's
+# process-tree kill (plan bfe2b09f).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
 

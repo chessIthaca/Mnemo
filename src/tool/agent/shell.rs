@@ -5,8 +5,10 @@
 //! `shell` — shell execution (platform-aware: PowerShell on Windows, sh elsewhere).
 //!
 //! Captures stdout, stderr, and exit code. Goes through approval (mutations).
-//! Working directory is confined to the project sandbox. Commands are bounded
-//! by a default timeout; on expiry the child is killed (`kill_on_drop`).
+//! Working directory is confined to the project sandbox. Commands are
+//! bounded by a default timeout; on expiry — and when a call returns at
+//! all — the whole process TREE the command started is killed (Job Object
+//! on Windows, process group on Unix — see [`TreeKillGuard`]).
 //!
 //! LIVE OUTPUT (user request 2027-01-16): both pipes are read incrementally by
 //! two reader tasks while the child runs, and throttled, UTF-8-safe chunks go
@@ -30,6 +32,13 @@
 //! separate calls next time. `purpose` is required at deserialization — the
 //! schema always advertised it, and a call without it is rejected with a
 //! clear error.
+//!
+//! TREE OWNERSHIP (plan bfe2b09f): the post-exit reader join is bounded by
+//! [`READER_JOIN_GRACE`], and no process a command starts outlives the
+//! call — a backgrounded dev server that inherited the pipes used to hang
+//! the join forever and hold the agent's worktree open (blocking
+//! team_merge). Workers must not run dev servers; the lead renders
+//! previews.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -102,6 +111,24 @@ const CHAIN_TRANSLATION_NOTE: &str = "NOTE: the command's && / || chaining was \
      auto-translated to PowerShell 5.1 if ($?) gates (PowerShell 5.1 rejects \
      bash-style chaining) — prefer ; or separate calls.\n";
 
+/// Plan bfe2b09f: how long the post-exit reader join waits for EOF after
+/// the shell itself has exited. A grandchild that inherited the pipe
+/// handles (a backgrounded dev server, `npx` → `cmd` → `node`) keeps the
+/// pipes open, so the readers may never see EOF — the unbounded join used
+/// to hang the call forever (two workers sat 50-90 minutes on a vite dev
+/// server). A few seconds let the readers drain everything the shell
+/// actually wrote before the call stops them and kills the tree.
+const READER_JOIN_GRACE: Duration = Duration::from_secs(3);
+
+/// Plan bfe2b09f: the note that rides the output when the post-exit reader
+/// join hit the [`READER_JOIN_GRACE`] deadline — a background process the
+/// command started kept the pipes open, so the readers were stopped and
+/// the tree was killed; the captured output may be truncated mid-stream.
+/// Like the nudges above it shapes only the displayed `output`; the raw
+/// stdout/stderr in `data` stay note-free.
+const BACKGROUND_HOLD_NOTE: &str = "NOTE: a background process started by the command \
+     kept the output pipe open; it was stopped and the captured output may be \
+     truncated.\n";
 /// Whether the command redirects stdout/stderr to a null sink — `>$null`,
 /// `>/dev/null`, or `>nul` (PowerShell / POSIX / cmd forms; `2>$null`,
 /// `1>$null`, `2>&1>$null` all contain one of these substrings). C4: the
@@ -523,10 +550,31 @@ impl Tool for ShellTool {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
+        // Unix half of the tree ownership (see [`TreeKillGuard`]): the
+        // shell leads its own process group, so the group kill on drop
+        // reaches the whole tree at once.
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("failed to execute command: {e}")),
         };
+
+        // Plan bfe2b09f: own the whole process TREE from here on. The shell
+        // is in a Job Object (Windows) / leads its own process group
+        // (Unix), so when this guard drops — the success return, the
+        // timeout error, or an agent interrupt dropping this future —
+        // every process the command started dies with the call.
+        // `kill_on_drop` kills only the shell itself: before this guard a
+        // backgrounded grandchild (a vite dev server) outlived the call,
+        // hung the reader join forever and held the agent's worktree
+        // open, blocking team_merge. That no command may leave a server
+        // behind is intended policy: workers must not run dev servers —
+        // the lead renders previews.
+        let _tree_guard = TreeKillGuard::attach(&child);
 
         // Take both pipes so two reader tasks can stream them while the child
         // runs — they are `Some` because both were piped just above.
@@ -537,12 +585,21 @@ impl Tool for ShellTool {
         // flag and the card renders a single merged tail, so a call whose stdout
         // and stderr both reach the budget still says it once.
         let noted = Arc::new(AtomicBool::new(false));
+        // Graceful-stop channels for the BOUNDED post-exit join below — one
+        // per reader, because a oneshot receiver is single-consumer. Sending
+        // makes that reader break out of its read loop NORMALLY and return
+        // the bytes it captured so far (an abort would discard the task's
+        // stack, and the bytes with it); dropping the senders without
+        // sending is a harmless wakeup on already-finished tasks.
+        let (stop_out, stop_out_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stop_err, stop_err_rx) = tokio::sync::oneshot::channel::<()>();
         let out_task = tokio::spawn(pump_stream(
             stdout_pipe,
             ToolOutputStream::Stdout,
             sink.clone(),
             Arc::clone(&streamed),
             Arc::clone(&noted),
+            stop_out_rx,
         ));
         let err_task = tokio::spawn(pump_stream(
             stderr_pipe,
@@ -550,6 +607,7 @@ impl Tool for ShellTool {
             sink,
             Arc::clone(&streamed),
             Arc::clone(&noted),
+            stop_err_rx,
         ));
         // Abort the readers if this call never reaches the join below: an agent
         // interrupt DROPS this future, and dropping a `JoinHandle` does not
@@ -595,8 +653,36 @@ impl Tool for ShellTool {
         // synthetic result — which is why every consumer ALSO gates on the call
         // having no result yet (the frontend reducers drop such a chunk) instead
         // of trusting arrival order alone.
-        let stdout_bytes = (&mut readers.out).await.unwrap_or_default();
-        let stderr_bytes = (&mut readers.err).await.unwrap_or_default();
+        //
+        // The join is BOUNDED (plan bfe2b09f): a grandchild the command
+        // started inherits the pipe handles, so after the shell itself
+        // exits the readers may never see EOF — an unbounded join here hung
+        // the call forever. Give the readers a short grace period to drain
+        // and finish, then stop them gracefully (they return what they
+        // captured — an abort would discard it) and note it; the
+        // `_tree_guard` drop when this future completes kills the tree
+        // that held the pipes.
+        let (stdout_bytes, stderr_bytes, background_held) =
+            match tokio::time::timeout(READER_JOIN_GRACE, async {
+                let out = (&mut readers.out).await.unwrap_or_default();
+                let err = (&mut readers.err).await.unwrap_or_default();
+                (out, err)
+            })
+            .await
+            {
+                Ok((out, err)) => (out, err, false),
+                Err(_grace_expired) => {
+                    // The shell has exited but something it started still
+                    // holds the pipes open. Stop both readers — a no-op
+                    // for one that already reached EOF — and take the
+                    // bytes they captured so far.
+                    let _ = stop_out.send(());
+                    let _ = stop_err.send(());
+                    let out = (&mut readers.out).await.unwrap_or_default();
+                    let err = (&mut readers.err).await.unwrap_or_default();
+                    (out, err, true)
+                }
+            };
 
         match status {
             Ok(status) => {
@@ -684,6 +770,13 @@ impl Tool for ShellTool {
                 if translated {
                     combined.insert_str(0, CHAIN_TRANSLATION_NOTE);
                 }
+                // Plan bfe2b09f: the reader join hit the grace deadline — a
+                // background process the command started kept the pipes open.
+                // Say that it was stopped (the tree kill on the guard's
+                // drop) and that the captured output may be truncated.
+                if background_held {
+                    combined.insert_str(0, BACKGROUND_HOLD_NOTE);
+                }
                 // Cap the displayed output to prevent unbounded context (M3).
                 // Preserve full raw data for the LLM's structured `data` field.
                 let capped = super::cap_tool_output(format!("{combined}\n[exit code: {code}]"));
@@ -730,7 +823,155 @@ impl Drop for ReaderGuard {
     }
 }
 
-/// Pump one child pipe to EOF: every byte lands in the returned `Vec` (the
+/// Plan bfe2b09f: owns the lifetime of the whole process tree a shell
+/// command starts, so no process it starts outlives the call — a leaked
+/// `node.exe` once held its agent's worktree open and blocked team_merge.
+/// Windows: the spawned shell is assigned to a Job Object created with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and descendants inherit the job,
+/// so closing the handle this guard owns terminates the whole job. Unix:
+/// the shell is spawned in its own process group (`process_group(0)` in
+/// [`execute_streaming`]) and the group is killed at drop.
+///
+/// The guard drops on EVERY exit path — the success return, the timeout
+/// error, and an agent interrupt dropping the tool future — which is why
+/// the kill lives in [`Drop`] rather than in the happy path. That a shell
+/// command cannot leave a dev server behind is intended policy: workers
+/// must not run servers (the lead renders previews).
+///
+/// Windows race, accepted and documented (plan bfe2b09f): assignment
+/// happens immediately after spawn, but the shell could in principle
+/// spawn a grandchild in the microseconds between `spawn()` returning
+/// and `AssignProcessToJobObject` — in practice the shell needs hundreds
+/// of milliseconds (loading powershell.exe) before it can run any
+/// command. A grandchild spawned before assignment would escape the
+/// job; starting the shell CREATE_SUSPENDED to close the window is not
+/// supported by this spawn path.
+///
+/// If the job cannot be created or assigned the guard goes inert (the
+/// pre-fix behaviour — only `kill_on_drop` of the shell) rather than
+/// failing every command.
+struct TreeKillGuard {
+    #[cfg(windows)]
+    job: OwnedJobHandle,
+    #[cfg(unix)]
+    pid: u32,
+}
+
+/// Owned job-object handle. A newtype because windows-sys' `HANDLE` is a
+/// raw pointer (not `Send`), while the guard must live inside the tool
+/// future — `async_trait` requires `Send`.
+#[cfg(windows)]
+struct OwnedJobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: an owned kernel handle is a plain kernel-object reference with
+// no thread affinity — moving it between threads is as sound as moving
+// the guard that owns it, and access stays single-threaded (drop).
+#[cfg(windows)]
+unsafe impl Send for OwnedJobHandle {}
+
+impl TreeKillGuard {
+    /// Attach to the freshly spawned shell so its whole tree dies with
+    /// this guard. Never fails the call: on any setup failure the guard
+    /// is inert and the command still runs.
+    fn attach(child: &tokio::process::Child) -> Self {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW,
+                JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, SetInformationJobObject,
+            };
+
+            let inert = Self {
+                job: OwnedJobHandle(std::ptr::null_mut()),
+            };
+            // The child's raw handle exists only while it is not reaped;
+            // right after spawn it is always present. If it were not, the
+            // process is already gone and there is nothing to own.
+            let Some(handle) = child.raw_handle() else {
+                return inert;
+            };
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            // Kill every process in the job when the LAST handle to it
+            // closes — the handle this guard owns, so the tree dies on
+            // drop on every exit path. Descendants inherit job
+            // membership, and breakaway is not granted.
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: a plain Win32 call sequence on objects created and
+            // owned here.
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() {
+                    return inert;
+                }
+                let configured = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                let assigned = configured != 0 && AssignProcessToJobObject(job, handle) != 0;
+                if !assigned {
+                    // SAFETY: the handle comes from CreateJobObjectW above
+                    // and is no longer used.
+                    CloseHandle(job);
+                    return inert;
+                }
+                Self {
+                    job: OwnedJobHandle(job),
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            // `process_group(0)` in execute_streaming made the shell the
+            // leader of its own group, so the group id IS the shell's pid
+            // (0 only if the child somehow exited already — drop then has
+            // nothing to kill).
+            Self {
+                pid: child.id().unwrap_or(0),
+            }
+        }
+    }
+}
+
+impl Drop for TreeKillGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if !self.job.0.is_null() {
+                // SAFETY: the handle was created by CreateJobObjectW in
+                // `attach` and is owned here exclusively; closing the last
+                // handle terminates the job (KILL_ON_JOB_CLOSE was set
+                // at attach) — every process the command started.
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job.0) };
+            }
+        }
+        #[cfg(unix)]
+        {
+            if self.pid != 0 {
+                // The shell leads its own process group, so the negative
+                // pid reaches the whole group. std has no signal API and
+                // this crate deliberately does not depend on libc, so the
+                // POSIX `kill` utility does the group kill — a ~1 ms child
+                // on the drop path, and a non-zero status (no such group)
+                // is the ordinary no-op case for commands that left
+                // nothing running.
+                let pgid = format!("-{}", self.pid);
+                let _ = std::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(pgid)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+/// Pump one child pipe to EOF — or to the caller's stop signal (see
+/// [`READER_JOIN_GRACE`]): every byte lands in the returned `Vec` (the
 /// final result's source of truth), while the live view receives throttled,
 /// UTF-8-safe chunks through `sink`.
 ///
@@ -747,6 +988,7 @@ async fn pump_stream<R>(
     sink: OutputSink,
     streamed: Arc<AtomicUsize>,
     noted: Arc<AtomicBool>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Vec<u8>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -778,6 +1020,15 @@ where
                     last_emit = Instant::now();
                 }
             }
+            // STOP arm: the caller fires `stop` (or drops its sender) once
+            // the shell has exited and READER_JOIN_GRACE elapsed without EOF
+            // — a grandchild the command started holds the pipe's write end
+            // open. Break NORMALLY so the bytes read so far reach the caller
+            // through the JoinHandle; an abort would discard the task's
+            // stack, and the captured bytes with it. A sender dropped without
+            // sending (every other exit path) is a harmless wakeup for an
+            // already-finished or about-to-be-aborted task.
+            _ = &mut stop => break,
             // TIMER arm: flush a pending chunk once the interval has elapsed
             // with no further bytes. Without it the throttle would only be
             // EVALUATED when data arrives, so a line printed just before a quiet
@@ -1837,5 +2088,171 @@ mod tests {
             live_b.contains("beta-only") && !live_b.contains("alpha-only"),
             "sink b: {live_b:?}"
         );
+    }
+
+    /// Windows probe for the regression tests below: is the process with
+    /// `pid` still running? Mirrors the app crate's `instance_marker::
+    /// pid_alive` (this crate cannot import it): `OpenProcess` alone is not
+    /// enough — an exited process keeps its kernel object alive while any
+    /// process still holds a handle — so the pid counts as alive only
+    /// while `GetExitCodeProcess` reports `STILL_ACTIVE`.
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: fixed query flags, no handle inheritance; the handle is
+        // closed on every path below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: the handle comes from OpenProcess above; query access
+        // suffices for GetExitCodeProcess.
+        let mut exit_code: u32 = 0;
+        let probed = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: the handle is no longer used.
+        unsafe { CloseHandle(handle) };
+        probed != 0 && exit_code == STILL_ACTIVE as u32
+    }
+
+    /// Unix probe for the regression tests below — no libc dependency, the
+    /// same choice the app crate's `pid_alive` makes.
+    #[cfg(not(windows))]
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Poll until the process `pid` is gone, bounded at ~10 s. The tree
+    /// kill runs on the guard's drop right before the call returns, but a
+    /// terminated process's exit code lands asynchronously, so the first
+    /// probe can still see it alive.
+    async fn assert_eventually_dead(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if !pid_alive(pid) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} started by the command is still running after the call returned"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Regression (plan bfe2b09f): a grandchild that inherits the stdout
+    /// pipe used to hang the post-exit reader join forever — the worker
+    /// hung for the full tool timeout while the backgrounded process held
+    /// the worktree open. The call must return within ~15 s, note the
+    /// stopped background process, and leave the grandchild dead.
+    #[tokio::test]
+    async fn background_child_holding_the_pipes_does_not_hang_the_call() {
+        let dir = tempdir().unwrap();
+        // The tool's NORMAL timeout: the bug is the post-exit join, not the
+        // timeout path, so nothing but the outer bound below may rescue the
+        // call.
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            // -NoNewWindow makes ping inherit the piped stdout handle — the
+            // exact leak; `-n 60` bounds the damage if the kill ever
+            // regresses. `.Id` prints the grandchild's pid for the
+            // liveness check.
+            "(Start-Process -NoNewWindow -PassThru ping -ArgumentList '-n','60','127.0.0.1').Id"
+        } else {
+            "sleep 60 & echo $!"
+        };
+        let started = Instant::now();
+        // Outer bound: a regression FAILS here instead of hanging the test
+        // binary (and, before the fix, the worker) until the tool timeout.
+        let result = match tokio::time::timeout(
+            Duration::from_secs(30),
+            tool.execute(json!({"command": cmd, "purpose": "background grandchild regression"})),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_never_returned) => panic!(
+                "the shell call never returned — a background child hangs the post-exit reader join"
+            ),
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "call took {:?} — expected the few-seconds grace bound, not a hang",
+            started.elapsed()
+        );
+        assert!(result.success, "output: {}", result.output);
+        assert!(
+            result.output.contains("background process"),
+            "expected the note that a background process kept the output open and was \
+             stopped, got: {}",
+            result.output
+        );
+        // The grandchild's pid — printed by the command — must not survive
+        // the call.
+        let data = result.data.unwrap();
+        let stdout = data["stdout"].as_str().unwrap();
+        let pid = stdout
+            .lines()
+            .find_map(|line| line.trim().parse::<u32>().ok())
+            .expect("the command printed the grandchild's pid");
+        assert_eventually_dead(pid).await;
+    }
+
+    /// Regression (plan bfe2b09f), timeout path: `kill_on_drop` killed
+    /// only the shell itself, so a grandchild a timed-out command had
+    /// started kept running — and held the agent's worktree open. The
+    /// whole tree the command started must die with the call.
+    #[tokio::test]
+    async fn timed_out_command_kills_the_background_grandchild() {
+        let dir = tempdir().unwrap();
+        // Long enough that the shell reliably reaches the background spawn
+        // and the pid write BEFORE the timeout fires (a PowerShell boot can
+        // take several seconds when the whole test module spawns shells in
+        // parallel — a 5 s cut killed the shell mid-write in the first red
+        // run); short enough to keep the test quick.
+        let tool = tool_in(dir.path()).with_timeout(Duration::from_secs(10));
+        let cmd = if cfg!(target_os = "windows") {
+            // Start the 60 s grandchild — -PassThru, or $p carries no pid
+            // to record (the pid goes to a file because the timeout path
+            // returns an error and discards stdout) — then hold the shell
+            // open so the call goes through the timeout.
+            "$p = Start-Process -NoNewWindow -PassThru ping -ArgumentList \
+             '-n','60','127.0.0.1'; Set-Content grandchild.pid $p.Id; \
+             Start-Sleep -Seconds 30"
+        } else {
+            "sleep 60 & echo $! > grandchild.pid; sleep 30"
+        };
+        let result = tool
+            .execute(json!({"command": cmd, "purpose": "timeout tree-kill regression"}))
+            .await;
+        assert!(
+            !result.success,
+            "the command must hit the tool timeout, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("timed out"),
+            "output: {}",
+            result.output
+        );
+        let pid_text = std::fs::read_to_string(dir.path().join("grandchild.pid"))
+            .expect("the shell wrote the grandchild's pid before the timeout fired");
+        let pid: u32 = pid_text
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .expect("the pid file holds the grandchild's pid");
+        assert_eventually_dead(pid).await;
     }
 }

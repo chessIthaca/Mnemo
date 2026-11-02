@@ -47,12 +47,15 @@ function sampleEndpoints(): EndpointDetailDto[] {
 }
 
 /** The transport fake: a mutable live snapshot, and handlers the test drives. */
-function makePage(initial: LayaStatus = sampleStatus()) {
+function makePage(initial: LayaStatus = sampleStatus(), options: { pendingSetup?: boolean } = {}) {
   const status = initial;
   const handlers: ((event: LayaEvent) => void)[] = [];
   const transport = {
     status: vi.fn(async () => structuredClone(status)),
-    setup: vi.fn(async () => undefined),
+    // A pending setup pins the pipeline's in-flight window open: the real
+    // `laya_setup` returns as soon as the forwarder spawns, and only the
+    // channel events settle the run.
+    setup: vi.fn(() => (options.pendingSetup ? new Promise<void>(() => {}) : Promise.resolve())),
     disable: vi.fn(async () => undefined),
     save: vi.fn(async (_flags?: LayaFlags, _routing?: RoutingPatch) => undefined),
     onLayaEvent: vi.fn(async (handler: (event: LayaEvent) => void) => {
@@ -173,6 +176,24 @@ describe("LayaPage", () => {
     await screen.findByText("Status: Ready");
     expect(screen.queryByRole("progressbar")).toBeNull();
     expect(screen.getByRole("button", { name: "Disable" })).toBeTruthy();
+  });
+
+  it("shows Installing, not Off, on the stale snapshot while the setup pipeline runs", async () => {
+    // Red check for review finding statusOffWhileInstalling: the snapshot
+    // is re-read only when the pipeline settles, so mid-flight the status
+    // line must show the pipeline, not the stale pre-click "Off".
+    const { transport, emit } = makePage(sampleStatus({ enabled: false, installed: false, status: "disabled" }), {
+      pendingSetup: true,
+    });
+    expect(await screen.findByText("Status: Off")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Enable" }));
+    await waitFor(() => expect(transport.setup).toHaveBeenCalledTimes(1));
+    emit({ type: "progress", step: "laya_runtime", label: "Installing laya[serve]", fraction: 0.5 });
+    expect(await screen.findByText("Status: Installing…")).toBeTruthy();
+    expect(screen.queryByText("Status: Off")).toBeNull();
+    expect(screen.getByText("Downloading the managed runtime — the bar follows its progress.")).toBeTruthy();
+    expect(screen.getByText("Installing laya[serve]")).toBeTruthy();
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("50");
   });
 
   it("shows an indeterminate progress without a bar, and a failed setup inline", async () => {

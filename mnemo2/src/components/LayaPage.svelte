@@ -65,6 +65,19 @@
   /** The setup pipeline runs: the buttons go quiet and the bar may tick. */
   const busy = $derived(setupBusy || snapshot?.status === "installing" || snapshot?.status === "starting");
 
+  /**
+   * The status word the status line and hint show. The snapshot is
+   * re-read only when the pipeline settles, so while it runs a stale
+   * disabled/not_installed/failed snapshot would read "Off" under the
+   * ticking bar — the pipeline is underway, so "Installing…" outranks it.
+   */
+  const shownStatus = $derived(
+    (setupBusy || progress !== null) &&
+      (snapshot?.status === "disabled" || snapshot?.status === "not_installed" || snapshot?.status === "failed")
+      ? "installing"
+      : (snapshot?.status ?? "disabled"),
+  );
+
   function different(a: unknown, b: unknown): boolean {
     return JSON.stringify(a) !== JSON.stringify(b);
   }
@@ -237,7 +250,7 @@
           </p>
         </header>
         <div class="status-row">
-          <span class="status-state">Status: {LAYA_STATUS_META[snapshot.status]}</span>
+          <span class="status-state">Status: {LAYA_STATUS_META[shownStatus]}</span>
           {#if !snapshot.enabled}
             <button class="button button-primary" disabled={busy} onclick={setup}>{busy ? "Enabling…" : "Enable"}</button>
           {:else if !snapshot.installed}
@@ -247,7 +260,7 @@
             <button class="button button-quiet" onclick={disable}>Disable</button>
           {/if}
         </div>
-        <p class="micro">{layaStatusHint(snapshot.status)}</p>
+        <p class="micro">{layaStatusHint(shownStatus)}</p>
         {#if progress}
           {#if progress.fraction !== null}
             <div

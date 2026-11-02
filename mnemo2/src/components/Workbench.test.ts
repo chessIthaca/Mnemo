@@ -73,6 +73,59 @@ describe("Workbench", () => {
     expect(state().workbenchTab).toBe("browser");
     expect(state().browserUrl).toBe("https://example.com/docs");
   });
+
+  it("shows only open plans in its Plan tab and links to the full list", async () => {
+    const current = fixtureState();
+    current.board = [
+      {
+        id: "contract",
+        title: "Open contract",
+        goal: "",
+        kind: "feature",
+        status: "open",
+        closed_at_ms: null,
+        report_path: null,
+        steps: [],
+      },
+      {
+        id: "done",
+        title: "Finished plan",
+        goal: "",
+        kind: "bug_fixing",
+        status: "closed",
+        closed_at_ms: 5,
+        report_path: null,
+        steps: [],
+      },
+    ];
+    app.set(current);
+    actions.openWorkbench("plan");
+    const { container } = render(Workbench);
+
+    expect(await screen.findByRole("heading", { name: "Open contract", level: 2 })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Finished plan" })).toBeNull();
+    expect(container.querySelector("details.closed")).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: "All plans" }));
+    expect(state().route).toBe("plans");
+    expect(state().workbenchOpen).toBe(false);
+  });
+
+  it("gives width back to the lead when the window shrinks", async () => {
+    const original = Object.getOwnPropertyDescriptor(window, "innerWidth");
+    Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1600 });
+    try {
+      actions.setWorkbenchWidth(1100);
+      render(Workbench);
+      expect(state().workbenchWidth).toBe(1100);
+
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
+      await fireEvent(window, new Event("resize"));
+      await vi.waitFor(() => expect(state().workbenchWidth).toBe(860));
+    } finally {
+      if (original) Object.defineProperty(window, "innerWidth", original);
+    }
+  });
 });
 
 afterEach(() => {

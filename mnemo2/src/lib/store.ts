@@ -1127,12 +1127,50 @@ function setWorkbenchTab(workbenchTab: WorkbenchTab) {
   schedulePreferenceSave();
 }
 
+/** The narrowest the lead's conversation may get; the side panel yields the rest of the window. */
+export const MIN_LEAD_WIDTH = 420;
+/** The narrowest the workbench or the worker panel may be dragged to. */
+export const MIN_WORKBENCH_WIDTH = 320;
+
+/** The window width the side-panel bounds are measured against. */
+function viewportWidth(): number {
+  return typeof window === "undefined" ? Number.POSITIVE_INFINITY : window.innerWidth;
+}
+
+/**
+ * The widest a side panel may get in a window this wide: every pixel the lead
+ * does not need, but never below the panel's own floor.
+ */
+export function maxWorkbenchWidth(windowWidth: number): number {
+  return Math.max(MIN_WORKBENCH_WIDTH, windowWidth - MIN_LEAD_WIDTH);
+}
+
+/** Keep a side-panel width between its floor and the window-relative ceiling. */
+export function clampWorkbenchWidth(workbenchWidth: number, windowWidth: number): number {
+  return Math.min(maxWorkbenchWidth(windowWidth), Math.max(MIN_WORKBENCH_WIDTH, workbenchWidth));
+}
+
 function setWorkbenchWidth(workbenchWidth: number) {
   app.update((state) => ({
     ...state,
-    workbenchWidth: Math.min(720, Math.max(320, workbenchWidth)),
+    workbenchWidth: clampWorkbenchWidth(workbenchWidth, viewportWidth()),
   }));
   schedulePreferenceSave();
+}
+
+/**
+ * Re-clamp a saved or dragged width after the window shrank, so a wide panel
+ * never squeezes the lead below its minimum. No-op while the width still fits.
+ */
+function reclampWorkbenchWidth(windowWidth: number = viewportWidth()) {
+  let changed = false;
+  app.update((state) => {
+    const workbenchWidth = clampWorkbenchWidth(state.workbenchWidth, windowWidth);
+    if (workbenchWidth === state.workbenchWidth) return state;
+    changed = true;
+    return { ...state, workbenchWidth };
+  });
+  if (changed) schedulePreferenceSave();
 }
 
 function approximateBrowserUrl(value: string): string {
@@ -2498,6 +2536,7 @@ export const actions = {
   closeWorkbench,
   setWorkbenchTab,
   setWorkbenchWidth,
+  reclampWorkbenchWidth,
   refreshDiff,
   selectDiffWorker,
   openWorkerDiff,

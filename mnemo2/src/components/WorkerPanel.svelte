@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { ArrowLeft, ArrowUpRight, X } from "@lucide/svelte";
   import { workerPlanLabel } from "../lib/boardState";
   import { actions, app } from "../lib/store";
@@ -59,6 +60,9 @@
     resizing = false;
   }
 
+  // A saved wide panel yields to the lead when the window cannot hold both.
+  onMount(() => actions.reclampWorkbenchWidth());
+
   function resizeKeydown(event: KeyboardEvent) {
     if (event.key === "ArrowLeft") {
       event.preventDefault();
@@ -70,7 +74,7 @@
   }
 </script>
 
-<svelte:window onpointermove={handleMove} onpointerup={stopResize} onpointercancel={stopResize} />
+<svelte:window onpointermove={handleMove} onpointerup={stopResize} onpointercancel={stopResize} onresize={() => actions.reclampWorkbenchWidth()} />
 
 {#if worker}
   <aside class="worker-panel" style={`width: ${$app.workbenchWidth}px`} aria-label="Worker output">

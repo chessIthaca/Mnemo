@@ -905,10 +905,10 @@ impl Tool for FileEditTool {
                     "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line-range mode: exactly [start, end] — 1-indexed, inclusive; use the numbers shown by file_read. That range is replaced by new_string — old_string, replace_all, use_regex, count and fuzzy_whitespace are all ignored in this mode. One tuple, so the pair can never be half-filled."},
                     "fuzzy_whitespace": {"type": "boolean", "description": "Literal mode only: locate old_string with whitespace normalized — runs of spaces/tabs collapse to one space, trailing whitespace ignored — catching tab-vs-space and off-by-one mismatches. The replacement is spliced in verbatim (default: false)."},
                     "from_read": {"type": "string", "description": "Read-receipt cite (backlog 3fdc605f): the id from a prior read_files section trailer. With lines: [start, end] the range becomes a VALIDATED anchor — the current bytes at those lines must match what the cited read served (drift hard-fails with a fresh-read steer, never a fuzzy apply), so the edit needs no old_string and survives context compaction. Mutually exclusive with every other field; requires lines + new_string."},
-                    "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops. An anchor object {old_string, new_string, count?, fuzzy_whitespace?} — or the \
+                    "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops — EXCEPT a read-receipt cite, whose [start, end] is in the CITED READ's line numbers (plan f302cc0e: it is translated through the earlier ops' line shifts, so it lands on exactly the lines it validated, and a cite whose lines an earlier op already changed is refused with a steer to split the edit and re-read). An anchor object {old_string, new_string, count?, fuzzy_whitespace?} — or the \
                   read-receipt cite {from_read, lines, new_string} (backlog \
                   3fdc605f: validated server-side against the cited read's bytes; \
-                  drift hard-fails with a fresh-read steer) — is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines — leave those empty or null (never placeholder) when using ops; placeholder filler is ignored with a NOTE. An empty array is treated as absent (falls back to single-edit/append/line-range mode).", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive — validated against the receipt."}}, "required": ["new_string"]}]}},
+                  drift hard-fails with a fresh-read steer) — is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines — leave those empty or null (never placeholder) when using ops; placeholder filler is ignored with a NOTE. An empty array is treated as absent (falls back to single-edit/append/line-range mode).", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive in the CITED READ's numbering (not the running content's) — validated against the receipt."}}, "required": ["new_string"]}]}},
                     "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. With an empty/omitted new_string it instead ENSURES the file ends with exactly one final newline (adds the detected line ending when missing; idempotent success + note when already terminated) — the affordance for restoring a lost trailing EOF newline. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."},
                     "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation (see the rejection message)."}
                 },
@@ -1328,6 +1328,137 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "a\nB\nc\nd\nE\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_read_cite_after_an_insert_lands_on_the_cited_lines() {
+        // Plan f302cc0e regression (bug 2026-11-02): a batched ops array
+        // whose earlier ops shift line numbers applied a from_read cite at
+        // its raw cited numbers against the RUNNING content — the
+        // replacement landed three lines too high and silently corrupted
+        // the file (store.ts et al., worker memoryPaths122 on
+        // deepseek-flash). The cite's range lives in the CITED READ's
+        // coordinates — the file as the receipt validated it, BEFORE any
+        // op applies — and must land on exactly those lines however many
+        // ops precede it in the array.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+        )
+        .unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        // Op 1 inserts three lines after line 2 (compact-op coordinates:
+        // the content as op 1 leaves it). The cite then names lines 8-9 of
+        // the READ — 'eight'/'nine', running lines 11-12 after the insert.
+        // Pre-fix red: the cite replaced running lines 8-9 ('six'/'seven')
+        // instead, with every check passing.
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "ops": [
+                    "i2:INS1\nINS2\nINS3",
+                    {"from_read": id, "lines": [8, 9], "new_string": "REPLACED"}
+                ]
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "one\ntwo\nINS1\nINS2\nINS3\nthree\nfour\nfive\nsix\nseven\nREPLACED\nten\n",
+            "exactly the cited lines replaced, nothing else"
+        );
+    }
+    #[tokio::test]
+    async fn from_read_two_disjoint_cites_with_a_deletion_between_them() {
+        // Plan f302cc0e acceptance: several disjoint cites of ONE receipt in
+        // ONE array all land on their cited lines, across a deletion that
+        // shifts the later cite. Pre-fix red: the second cite replaced the
+        // lines the deletion had slid into its raw numbers.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+        )
+        .unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "ops": [
+                    {"from_read": id, "lines": [8, 9], "new_string": "EIGHT-NINE"},
+                    "d1",
+                    {"from_read": id, "lines": [3, 4], "new_string": "THREE-FOUR"}
+                ]
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "two\nTHREE-FOUR\nfive\nsix\nseven\nEIGHT-NINE\nten\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_read_cite_overlapping_an_earlier_op_is_refused_atomically() {
+        // Plan f302cc0e: a cite whose cited lines an earlier op in the SAME
+        // array already changed cannot be applied — the contiguous block it
+        // validated no longer exists. The whole call is refused (nothing
+        // written, the earlier op's change discarded too) with a steer to
+        // split the edit and re-read. Pre-fix: the blind apply silently
+        // replaced whatever had slid into those line numbers.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let original = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+        std::fs::write(dir.path().join("a.txt"), original).unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        // Case 1: an earlier op REPLACED a line inside the cited range.
+        let replaced = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "ops": [
+                    "r5:FIVE!",
+                    {"from_read": id, "lines": [4, 6], "new_string": "REPLACED"}
+                ]
+            }))
+            .await;
+        assert!(!replaced.success, "overlap must refuse: {}", replaced.output);
+        assert!(
+            replaced.output.contains("read-receipt cite")
+                && replaced.output.contains("[4, 6]"),
+            "the refusal names the cite and its range: {}",
+            replaced.output
+        );
+        assert!(
+            replaced.output.contains("Split the edit")
+                && replaced.output.contains("re-read the file"),
+            "the refusal steers to split the edit and re-read: {}",
+            replaced.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            original,
+            "atomic: the earlier op's change is not written either"
+        );
+        // Case 2: an earlier op INSERTED a line strictly inside the range —
+        // no cited line was modified, but the contiguous block is gone.
+        let inserted = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "ops": [
+                    "i4:NEW",
+                    {"from_read": id, "lines": [4, 6], "new_string": "REPLACED"}
+                ]
+            }))
+            .await;
+        assert!(!inserted.success, "overlap must refuse: {}", inserted.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            original,
+            "atomic: still untouched"
         );
     }
 

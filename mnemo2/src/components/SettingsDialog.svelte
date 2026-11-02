@@ -1,8 +1,10 @@
 <script lang="ts">
+  import { createLayaTransport } from "../lib/layaSettings";
   import { createModelSettingsTransport } from "../lib/modelSettings";
   import { createSettingsTransport, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import EndpointsPage from "./EndpointsPage.svelte";
+  import LayaPage from "./LayaPage.svelte";
   import ModelsPage from "./ModelsPage.svelte";
   import SavingsPage from "./SavingsPage.svelte";
   import Sheet from "./Sheet.svelte";
@@ -10,12 +12,13 @@
 
   let { open, onclose }: { open: boolean; onclose: () => void } = $props();
 
-  type Page = "endpoints" | "tiers" | "models" | "savings";
+  type Page = "endpoints" | "tiers" | "models" | "savings" | "laya";
   const pages: { id: Page; label: string }[] = [
     { id: "endpoints", label: "Endpoints" },
     { id: "tiers", label: "Tiers" },
     { id: "models", label: "Models" },
     { id: "savings", label: "Savings" },
+    { id: "laya", label: "Decisions" },
   ];
 
   let page = $state<Page>("endpoints");
@@ -25,6 +28,7 @@
   let loadError = $state("");
   const transport = $derived(open ? createSettingsTransport() : null);
   const modelTransport = $derived(open ? createModelSettingsTransport() : null);
+  const layaTransport = $derived(open ? createLayaTransport() : null);
 
   $effect(() => {
     const active = transport;
@@ -84,6 +88,12 @@
             <SavingsPage transport={modelTransport} {endpoints} />
           {:else}
             <p class="settings-empty">Savings settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "laya"}
+          {#if layaTransport}
+            <LayaPage transport={layaTransport} {endpoints} />
+          {:else}
+            <p class="settings-empty">Decision settings are available in the desktop app.</p>
           {/if}
         {:else}
           <TiersPage {transport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />

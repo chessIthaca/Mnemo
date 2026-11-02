@@ -1173,6 +1173,14 @@ impl AgentTask {
                         String::new()
                     }
                 };
+                // Plan c3ba2b58 step A: stamp this session's identity + the
+                // consolidation purpose onto the pipeline's LLM calls. Snapshotted
+                // BEFORE the spawn so the closure owns it (identity reads stay
+                // off the spawned task's path).
+                let llm_context = self.agent_loop.llm_request_context(
+                    None,
+                    crate::provider::trace::TracePurpose::MemoryConsolidation,
+                );
                 tokio::spawn(async move {
                     let _guard = guard;
                     // The policy hook still precedes memory session teardown.
@@ -1180,9 +1188,14 @@ impl AgentTask {
                     if let Err(e) = store.end_session(&sid).await {
                         eprintln!("memory: end_session({sid}) failed during consolidation: {e}");
                     }
-                    if let Err(e) =
-                        consolidate_session(store.as_ref(), &sid, Some(provider.as_ref()), &corpus)
-                            .await
+                    if let Err(e) = consolidate_session(
+                        store.as_ref(),
+                        &sid,
+                        Some(provider.as_ref()),
+                        &corpus,
+                        &llm_context,
+                    )
+                    .await
                     {
                         eprintln!("memory: consolidate_session({sid}) failed: {e}");
                     }
@@ -1269,6 +1282,13 @@ impl AgentTask {
                 provider.as_ref(),
                 (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
+                // Plan c3ba2b58 step A: manual compaction carries the loop's
+                // identity + the compaction purpose. No turn id — the
+                // command runs between turns.
+                &self.agent_loop.llm_request_context(
+                    None,
+                    crate::provider::trace::TracePurpose::Compaction,
+                ),
             )
             .await
         {

@@ -14,6 +14,7 @@ use mnemo::headless::{
     RecvError, SessionCommand, SessionEvent, SessionId, SessionLimits, SpawnOptions,
     TimeoutAction, Transcript,
 };
+use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent, UserAnswer};
 use mnemo::workspace::Workspace;
 
@@ -108,6 +109,18 @@ fn public_types_serde_roundtrip() {
             }],
             question_policy: QuestionPolicy::AnswerConstant("decide yourself".into()),
             ..Guardrails::default()
+        }),
+        // Plan c3ba2b58 step A: a representative trace identity — the
+        // worker actor + its worker/plan labels with the runtime-filled
+        // ids. The field's None form round-trips via the default above.
+        trace_identity: Some(TraceIdentity {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: "13".into(),
+            session_id: "13".into(),
+            agent_name: "wt-roundtrip".into(),
+            worker_id: Some("wt-roundtrip".into()),
+            plan_id: Some("plan-9".into()),
+            plan_step: Some(2),
         }),
     });
 

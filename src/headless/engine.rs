@@ -425,6 +425,11 @@ impl Engine {
                 limits: effective_limits,
                 // 3c/G2 (§5.9.2): the session's host tools.
                 host_tools,
+                // Plan c3ba2b58 step A: the session's trace identity
+                // (lead/worker/subagent/system + worker/plan labels) —
+                // the host spawn path fills the allocated ids and stamps
+                // it on the loop. `None` keeps records unattributed.
+                trace_identity: opts.trace_identity.clone(),
             },
         )
         .await

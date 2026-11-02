@@ -1110,6 +1110,9 @@ impl LeadRuntime {
                 host_tools,
                 external_policy: None,
                 guardrails: None,
+                // Plan c3ba2b58 step B wires the lead's trace identity here;
+                // `None` until then (unattributed records).
+                trace_identity: None,
             })
             .await
             .map_err(|err| format!("could not spawn the lead session: {err}"))?;

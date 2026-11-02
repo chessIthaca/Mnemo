@@ -58,6 +58,26 @@ fn parent_root_binding(
         .map(|spec| (spec, parent.plans_dir().to_path_buf()))
 }
 
+/// Resolve a spawn's trace identity (plan c3ba2b58 step A): the
+/// host-supplied seed with the allocated agent/session ids filled in, or —
+/// for a subagent with no explicit seed — the parent's identity inherited
+/// with the `Subagent` actor kind and this agent's own allocated ids. The
+/// headless `SessionId` IS the allocated `AgentId` today, but it stays a
+/// separate wire concept (the design freezes `session_id` as its own
+/// field). `None` when neither applies: unattributed records (Mnemo1).
+fn session_trace_identity(
+    seed: Option<&crate::provider::trace::TraceIdentity>,
+    parent: Option<&Arc<AgentLoop>>,
+    agent_id: &str,
+) -> Option<crate::provider::trace::TraceIdentity> {
+    match seed {
+        Some(seed) => Some(seed.clone().with_runtime_ids(agent_id, agent_id)),
+        None => parent
+            .and_then(|p| p.trace_identity())
+            .map(|parent_identity| parent_identity.as_subagent(agent_id, agent_id)),
+    }
+}
+
 /// The host dependencies a spawn needs: the loop factory (builds the
 /// agent's loop), the manager (registers it), and the per-agent loop map
 /// (tracks it for `get_workflow_state`). The three always travel
@@ -105,6 +125,15 @@ pub struct SessionOptions {
     /// calls via the `host_tool_timeout_ms` marker. `vec![]` for every
     /// pre-3c caller.
     pub host_tools: Vec<std::sync::Arc<dyn crate::tool::Tool>>,
+    /// Trace attribution (plan c3ba2b58 step A): the identity stamped on
+    /// this loop's model-call records (who the agent is in the trace:
+    /// lead/worker/subagent/system + worker/plan labels). `None` keeps
+    /// the records unattributed (every pre-c3ba2b58 caller = Mnemo1).
+    /// Applied post-build via [`AgentLoop::set_trace_identity`] with the
+    /// allocated agent/session ids filled in; a subagent with no explicit
+    /// seed inherits its parent's identity instead (see
+    /// [`session_trace_identity`]).
+    pub trace_identity: Option<crate::provider::trace::TraceIdentity>,
 }
 
 /// Spawn a background agent: build its loop via the factory, spawn its task,
@@ -163,6 +192,7 @@ async fn spawn_agent_shared_inner(
         initial_messages,
         limits,
         host_tools,
+        trace_identity,
     } = session;
     match role.as_deref() {
         None | Some("reviewer") => {}
@@ -247,6 +277,16 @@ async fn spawn_agent_shared_inner(
         .or(parent_id)
         .unwrap_or(agent_id);
     agent_loop.set_family_root(family_root);
+
+    // Trace attribution (plan c3ba2b58 step A): stamp the loop's identity
+    // post-build (pre-registration — the task is only spawned below, so no
+    // request can race the stamp). The identity is snapshotted per request
+    // by the request path, never read back from live state, so a Team
+    // record deleted after capture can never rewrite history.
+    let agent_id_str = agent_id.to_string();
+    if let Some(identity) = session_trace_identity(trace_identity.as_ref(), parent.as_ref(), &agent_id_str) {
+        agent_loop.set_trace_identity(identity);
+    }
 
     // 3c/G2 (§5.9.2): register the session's host tools into the registry
     // via the shared dynamic slot — the late-registration path the MCP
@@ -768,6 +808,9 @@ impl ParentAwareSpawner for HostSpawner {
                 limits: None,
                 // subagents register no host tools (3c/G2)
                 host_tools: vec![],
+                // trace identity: none explicit — spawn_agent_shared inherits
+                // the parent's with the subagent actor kind (c3ba2b58 step A)
+                trace_identity: None,
             },
         )
         .await?;
@@ -870,6 +913,8 @@ impl HostRuntime {
                 limits: None,
                 // the main agent registers no host tools (3c/G2)
                 host_tools: vec![],
+                // Mnemo1's main agent is unattributed (c3ba2b58 step A)
+                trace_identity: None,
             },
         )
         .await
@@ -1551,6 +1596,7 @@ mod tests {
             initial_messages: None,
             limits: None,
             host_tools: vec![],
+            trace_identity: None,
         }
     }
 
@@ -1700,5 +1746,126 @@ mod tests {
         assert_eq!(root.project_root, worktree_root);
         assert_eq!(root.sandbox.root(), worktree_root);
         assert_eq!(child.plans_dir(), parent_plans);
+    }
+
+    /// A worker [`TraceIdentity`] seed for the spawn tests (plan c3ba2b58
+    /// step A): ids intentionally EMPTY — the spawn path must fill them
+    /// with the allocation.
+    fn worker_seed(worker: &str) -> crate::provider::trace::TraceIdentity {
+        crate::provider::trace::TraceIdentity {
+            actor_kind: crate::provider::trace::TraceActorKind::Worker,
+            agent_id: String::new(),
+            session_id: String::new(),
+            agent_name: worker.to_string(),
+            worker_id: Some(worker.to_string()),
+            plan_id: Some("plan-77".to_string()),
+            plan_step: Some(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_stamps_the_trace_identity_seed_with_the_allocated_ids() {
+        // Plan c3ba2b58 step A: the SessionOptions seed reaches the loop
+        // post-build with the runtime-allocated agent/session ids filled
+        // in — a snapshot, so the loop's records can never be relabelled
+        // by a later Team-record change.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let mut session = test_session(None);
+        session.trace_identity = Some(worker_seed("wt-spawn"));
+        let (agent_id, _) = spawn_agent_shared(
+            host,
+            "worker".to_string(),
+            None,
+            None,
+            session,
+        )
+        .await
+        .unwrap();
+
+        let agent = agent_loops.lock().await.get(&agent_id).cloned().unwrap();
+        let identity = agent.trace_identity().expect("identity stamped");
+        assert_eq!(identity.actor_kind, crate::provider::trace::TraceActorKind::Worker);
+        assert_eq!(identity.agent_name, "wt-spawn");
+        assert_eq!(identity.worker_id.as_deref(), Some("wt-spawn"));
+        assert_eq!(identity.plan_id.as_deref(), Some("plan-77"));
+        assert_eq!(identity.plan_step, Some(2));
+        assert_eq!(
+            identity.agent_id, agent_id.to_string(),
+            "the allocated AgentId is filled in"
+        );
+        assert_eq!(
+            identity.session_id, agent_id.to_string(),
+            "the headless SessionId (the same allocation today) is its own wire concept"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_inherits_the_parent_worker_trace_identity() {
+        // A subagent (parent_id set, no explicit seed) inherits its
+        // parent's worker/plan labels with the Subagent actor kind and its
+        // own allocated ids — a subagent of a worker stays attributable to
+        // that worker's plan step.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        // SpawnHost is consumed by value; a second host sharing the same
+        // factory/manager/loop-map drives the child spawn below.
+        let host2 = SpawnHost {
+            factory: host.factory.clone(),
+            manager: host.manager.clone(),
+            agent_loops: host.agent_loops.clone(),
+        };
+        let mut parent_session = test_session(None);
+        parent_session.trace_identity = Some(worker_seed("wt-parent"));
+        let (parent_id, _) = spawn_agent_shared(
+            host,
+            "parent".to_string(),
+            None,
+            None,
+            parent_session,
+        )
+        .await
+        .unwrap();
+
+        let (child_id, _) = spawn_agent_shared(
+            host2,
+            "child".to_string(),
+            None,
+            Some(parent_id),
+            test_session(None),
+        )
+        .await
+        .unwrap();
+
+        let child = agent_loops.lock().await.get(&child_id).cloned().unwrap();
+        let identity = child.trace_identity().expect("the child inherits an identity");
+        assert_eq!(identity.actor_kind, crate::provider::trace::TraceActorKind::Subagent);
+        assert_eq!(identity.worker_id.as_deref(), Some("wt-parent"));
+        assert_eq!(identity.plan_id.as_deref(), Some("plan-77"));
+        assert_eq!(identity.plan_step, Some(2));
+        assert_eq!(identity.agent_id, child_id.to_string());
+        assert_ne!(identity.agent_id, parent_id.to_string(), "own ids, not the parent's");
+    }
+
+    #[tokio::test]
+    async fn spawn_without_a_trace_identity_stays_unattributed() {
+        // Mnemo1's path, unchanged: no seed → no identity → unattributed
+        // records. A parentless seedless spawn never fabricates one.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let (agent_id, _) = spawn_agent_shared(
+            host,
+            "plain".to_string(),
+            None,
+            None,
+            test_session(None),
+        )
+        .await
+        .unwrap();
+        let agent = agent_loops.lock().await.get(&agent_id).cloned().unwrap();
+        assert_eq!(agent.trace_identity(), None, "no seed must stay unattributed");
+        // Its request contexts are unattributed too (the empty handle).
+        let ctx = agent.llm_request_context(Some("t-1"), crate::provider::trace::TracePurpose::Turn);
+        assert_eq!(ctx.attribution, None);
     }
 }

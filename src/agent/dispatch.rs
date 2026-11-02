@@ -1240,6 +1240,10 @@ impl AgentLoop {
     /// "sending" window (user report 2026-08-22). The frontend keeps
     /// `running = true` for retrying errors and shows the note in the
     /// activity log.
+    // Plan c3ba2b58 step A added the `llm_context` param. Grouping into a
+    // struct would churn every test caller for no behavioral gain — the
+    // failure_triage.rs precedent (arity-bound internal fn) applies.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn complete_with_retry<'a>(
         &self,
         provider: &'a Arc<dyn LlmClient>,
@@ -1248,10 +1252,16 @@ impl AgentLoop {
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
         agent_id: AgentId,
         session_id: Option<&str>,
+        llm_context: &crate::provider::trace::LlmRequestContext,
     ) -> Result<futures::stream::BoxStream<'a, LlmEvent>> {
         let mut last_err = None;
         for attempt in 0..3 {
-            match provider.complete(messages, tool_schemas, None).await {
+            // Plan c3ba2b58 step A: every attempt (retry, backoff) opens its
+            // own trace record, all stamped with the same per-call context.
+            match provider
+                .complete_with_context(messages, tool_schemas, None, llm_context)
+                .await
+            {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     // R21: every failed attempt re-sent the full prompt —

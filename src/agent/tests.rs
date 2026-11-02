@@ -4455,7 +4455,15 @@ async fn complete_with_retry_emits_one_retrying_error_per_failure() {
 
     let (fanin_tx, mut fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    &fanin_tx,
+                    1,
+                    None,
+                    &crate::provider::trace::LlmRequestContext::unattributed(),
+                )
         .await;
     assert!(result.is_ok(), "the third attempt must succeed");
 
@@ -4482,6 +4490,120 @@ async fn complete_with_retry_emits_one_retrying_error_per_failure() {
         3,
         "fail twice, then succeed on the third call"
     );
+}
+
+/// A provider that records every `complete_with_context` call's trace
+/// context (plan c3ba2b58 step A) and fails the first `fail_times` calls
+/// before succeeding — the retry path must see the SAME attributed
+/// context on every attempt, never a neighbouring agent's.
+struct ContextRecordingFlakyProvider {
+    caps: Capabilities,
+    /// The trace contexts received, in call order.
+    contexts: Arc<std::sync::Mutex<Vec<crate::provider::trace::LlmRequestContext>>>,
+    fail_times: u32,
+}
+
+#[async_trait]
+impl LlmClient for ContextRecordingFlakyProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "mock-context-recording"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        // The attribution threading must go through complete_with_context;
+        // a plain `complete` reaching this mock means the threading broke.
+        panic!("complete_with_retry must call complete_with_context");
+    }
+    async fn complete_with_context(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+        context: &crate::provider::trace::LlmRequestContext,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        let mut seen = self
+            .contexts
+            .lock()
+            .expect("ContextRecordingFlakyProvider lock poisoned");
+        seen.push(context.clone());
+        if seen.len() as u32 <= self.fail_times {
+            return Err(crate::error::Error::Provider("flaky failure".into()));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }])))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn complete_with_retry_keeps_attribution_across_attempts() {
+    // Plan c3ba2b58 step A: attribution travels with the request, so every
+    // attempt of a retried request — and every attempt of a request running
+    // beside others on the SAME shared provider — carries the calling
+    // agent's identity and the turn purpose. A mutable "current label" on
+    // the provider (the forbidden design) would cross-label exactly here.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let recorded: Arc<
+        std::sync::Mutex<Vec<crate::provider::trace::LlmRequestContext>>,
+    > = Arc::default();
+    let provider: Arc<dyn LlmClient> = Arc::new(ContextRecordingFlakyProvider {
+        caps: Capabilities::openai(),
+        contexts: Arc::clone(&recorded),
+        fail_times: 2,
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+    let provider = agent.provider();
+
+    let identity = crate::provider::trace::TraceIdentity {
+        actor_kind: crate::provider::trace::TraceActorKind::Worker,
+        agent_id: "55".into(),
+        session_id: "55".into(),
+        agent_name: "wt-retry".into(),
+        worker_id: Some("wt-retry".into()),
+        plan_id: Some("plan-2".into()),
+        plan_step: Some(3),
+    };
+    let ctx = crate::provider::trace::LlmRequestContext::attributed(
+        identity.attribution(Some("turn-r"), crate::provider::trace::TracePurpose::Turn),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let result = agent
+        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None, &ctx)
+        .await;
+    assert!(result.is_ok(), "the third attempt must succeed");
+
+    let recorded = recorded.lock().expect("recorded lock poisoned");
+    assert_eq!(recorded.len(), 3, "one context per attempt (2 failures + 1 success)");
+    for attempt_ctx in recorded.iter() {
+        let a = attempt_ctx
+            .attribution
+            .as_ref()
+            .expect("every attempt carries the attribution");
+        assert_eq!(a.actor_kind, crate::provider::trace::TraceActorKind::Worker);
+        assert_eq!(a.agent_id, "55");
+        assert_eq!(a.worker_id.as_deref(), Some("wt-retry"));
+        assert_eq!(a.plan_step, Some(3));
+        assert_eq!(a.turn_id.as_deref(), Some("turn-r"));
+        assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -4604,7 +4726,15 @@ async fn complete_with_retry_attributes_backoff_sleeps_to_next_attempt() {
 
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    &fanin_tx,
+                    1,
+                    None,
+                    &crate::provider::trace::LlmRequestContext::unattributed(),
+                )
         .await;
     assert!(result.is_ok(), "the third attempt must succeed");
 
@@ -4844,7 +4974,15 @@ async fn complete_with_retry_returns_err_not_panic() {
     let provider = agent.provider();
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    &fanin_tx,
+                    1,
+                    None,
+                    &crate::provider::trace::LlmRequestContext::unattributed(),
+                )
         .await;
 
     // Must be an error, not a panic.
@@ -4984,7 +5122,15 @@ async fn complete_with_retry_does_not_retry_context_overflow() {
     let provider = agent.provider();
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    &fanin_tx,
+                    1,
+                    None,
+                    &crate::provider::trace::LlmRequestContext::unattributed(),
+                )
         .await;
     assert!(result.is_err(), "context overflow must produce Err");
     assert_eq!(
@@ -5052,7 +5198,15 @@ async fn complete_with_retry_does_not_retry_rate_limit() {
     let provider = agent.provider();
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    &fanin_tx,
+                    1,
+                    None,
+                    &crate::provider::trace::LlmRequestContext::unattributed(),
+                )
         .await;
     assert!(result.is_err(), "429 must produce Err");
     assert_eq!(
@@ -5124,7 +5278,15 @@ async fn complete_with_retry_does_not_retry_deterministic_4xx() {
     let provider = agent.provider();
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    &fanin_tx,
+                    1,
+                    None,
+                    &crate::provider::trace::LlmRequestContext::unattributed(),
+                )
         .await;
     assert!(result.is_err(), "a deterministic 400 must produce Err");
     assert_eq!(

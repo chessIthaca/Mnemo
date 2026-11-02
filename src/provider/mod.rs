@@ -1066,6 +1066,28 @@ pub trait LlmClient: Send + Sync {
         tool_choice: Option<ToolChoice>,
     ) -> Result<BoxStream<'_, LlmEvent>>;
 
+    /// Like [`Self::complete`], but carrying the request-scoped trace
+    /// [`LlmRequestContext`] so the trace record can be attributed to the
+    /// calling agent (who, which turn, why) at creation — before any
+    /// retry, streaming, or ring eviction can reorder things (plan
+    /// c3ba2b58 step A).
+    ///
+    /// The default implementation drops the context and behaves exactly
+    /// like [`Self::complete`] — external implementors and legacy call
+    /// sites keep today's (unattributed) behavior. The OpenAI and
+    /// Anthropic clients override it to stamp the context into the record
+    /// via [`LlmRequestLog::start_with_context`].
+    async fn complete_with_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        tool_choice: Option<ToolChoice>,
+        context: &crate::provider::trace::LlmRequestContext,
+    ) -> Result<BoxStream<'_, LlmEvent>> {
+        let _ = context;
+        self.complete(messages, tools, tool_choice).await
+    }
+
     /// Record the tools phase (stream end → tool batch finished) for the
     /// request whose response produced the tool calls, in milliseconds.
     ///

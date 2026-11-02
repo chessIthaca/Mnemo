@@ -423,9 +423,17 @@ impl AgentLoop {
         // ends the turn here.
         // The pre-swap summary's rewrite marker needs no handling here: this
         // call runs before `TurnState::fresh()`, so the accounting starts
-        // empty anyway.
+        // empty anyway. `turn_id` is `None` here too — this call runs before
+        // the turn id is minted.
         let swap = self
-            .handle_pending_swap(messages, fanin_tx, agent_id, session_id, cmd_rx)
+            .handle_pending_swap(
+                messages,
+                fanin_tx,
+                agent_id,
+                session_id,
+                cmd_rx,
+                None,
+            )
             .await;
         if let Some(outcome) = swap.early {
             return Ok(outcome);
@@ -474,7 +482,14 @@ impl AgentLoop {
             // run, not the next turn. The turn-top call above covers swaps
             // deferred between turns. Cheap no-op when nothing is pending.
             let swap = self
-                .handle_pending_swap(messages, fanin_tx, agent_id, session_id, cmd_rx)
+                .handle_pending_swap(
+                    messages,
+                    fanin_tx,
+                    agent_id,
+                    session_id,
+                    cmd_rx,
+                    state.spend_turn_id.as_deref(),
+                )
                 .await;
             if let Some(outcome) = swap.early {
                 return Ok(outcome);
@@ -1645,6 +1660,7 @@ impl AgentLoop {
         agent_id: AgentId,
         session_id: Option<&str>,
         cmd_rx: &mut mpsc::Receiver<AgentCommand>,
+        turn_id: Option<&str>,
     ) -> PendingSwapOutcome {
         // Set when the pre-swap summary replaced `messages` — reported to the
         // caller so it can reset its incremental token accounting.
@@ -1690,6 +1706,13 @@ impl AgentLoop {
                         context::sendable_budget(pending.provider.capabilities()),
                         summary_provider.as_ref(),
                         cmd_rx,
+                        // Plan c3ba2b58 step A: the pre-swap summary is
+                        // compaction — same turn id as the turn it serves
+                        // when that turn is already running.
+                        &self.llm_request_context(
+                            turn_id,
+                            crate::provider::trace::TracePurpose::Compaction,
+                        ),
                     )
                     .await;
                 // The summary path (Ok) rewrote `messages`; the failure path
@@ -3037,6 +3060,13 @@ impl AgentLoop {
                 summary_provider.as_ref(),
                 (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
+                // Plan c3ba2b58 step A: auto-compaction carries the loop's
+                // identity + the compaction purpose, grouped under the
+                // current turn id.
+                &self.llm_request_context(
+                    state.spend_turn_id.as_deref(),
+                    crate::provider::trace::TracePurpose::Compaction,
+                ),
             )
             .await;
         // Park the compaction time on the provider — the request's
@@ -4319,6 +4349,15 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // record gets stamped with it as `prep_ms`. Deliberately excludes
         // the POST + retries (that's `connect_ms`).
         provider.record_prep_ms(prep_started.elapsed().as_millis() as u32);
+        // Plan c3ba2b58 step A: the turn request's trace context — the
+        // loop's identity + the current turn id + the turn purpose, so
+        // every attempt of this request (inner retries, the turn-level
+        // endpoint-fallback ladder) carries the same attribution on its
+        // own record.
+        let llm_context = self.llm_request_context(
+            state.spend_turn_id.as_deref(),
+            crate::provider::trace::TracePurpose::Turn,
+        );
         // We have handed off to the network — TCP/TLS connect, POST upload,
         // time-to-first-token, AND any retry backoff sleeps are all
         // "waiting" (the user sees "waiting for response…"), not "sending"
@@ -4364,6 +4403,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 fanin_tx,
                 agent_id,
                 session_id,
+                &llm_context,
             );
             // G5 (3a.6): the pre-request history snapshot — a mid-request
             // ExportHistory answers from this (the pinned future holds the

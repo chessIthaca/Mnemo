@@ -991,6 +991,7 @@ mod lifecycle_tests {
                 initial_messages: None,
                 limits: None,
                 host_tools: Vec::new(),
+                trace_identity: None,
             },
         )
         .await
@@ -1068,6 +1069,7 @@ mod lifecycle_tests {
             initial_messages: None,
             limits: None,
             host_tools: Vec::new(),
+            trace_identity: None,
         };
         let (child, _) = crate::host::runtime::spawn_agent_shared(
             make_host(),
@@ -1390,5 +1392,54 @@ mod lifecycle_tests {
             .expect("join close")
             .expect("closed channel is exit-in-progress, not a close failure");
         assert!(weak_loop.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_trace_identity_reaches_the_session_loop() {
+        // Plan c3ba2b58 step A: the SpawnOptions trace identity survives
+        // the engine's pass-through to the host spawn path and lands on the
+        // session's loop with the allocated agent/session ids filled in —
+        // the Mnemo2 lead/worker spawn contract.
+        let project = tempfile::tempdir().expect("project");
+        let config = tempfile::tempdir().expect("config");
+        write_test_config(config.path());
+        let engine = Engine::start(test_engine_options(project.path(), config.path()))
+            .await
+            .expect("start engine");
+        let session = engine
+            .spawn(SpawnOptions {
+                trace_identity: Some(crate::provider::trace::TraceIdentity {
+                    actor_kind: crate::provider::trace::TraceActorKind::Worker,
+                    agent_id: String::new(),
+                    session_id: String::new(),
+                    agent_name: "wt-engine".to_string(),
+                    worker_id: Some("wt-engine".to_string()),
+                    plan_id: Some("plan-42".to_string()),
+                    plan_step: Some(1),
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("spawn with a trace identity");
+        let loop_arc = session.agent_loop.upgrade().expect("session loop alive");
+        let identity = loop_arc.trace_identity().expect("identity stamped");
+        assert_eq!(
+            identity.actor_kind,
+            crate::provider::trace::TraceActorKind::Worker
+        );
+        assert_eq!(identity.agent_name, "wt-engine");
+        assert_eq!(identity.worker_id.as_deref(), Some("wt-engine"));
+        assert_eq!(identity.plan_id.as_deref(), Some("plan-42"));
+        assert_eq!(identity.plan_step, Some(1));
+        assert_eq!(
+            identity.agent_id,
+            session.agent.to_string(),
+            "the allocated AgentId is filled in"
+        );
+        assert_eq!(
+            identity.session_id,
+            session.agent.to_string(),
+            "the headless SessionId (the same allocation today) stays its own wire concept"
+        );
     }
 }

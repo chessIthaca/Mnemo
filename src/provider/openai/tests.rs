@@ -4565,3 +4565,171 @@ async fn ttft_measures_post_send_to_first_chunk() {
         "connect keeps its record→headers window (got {connect}ms)"
     );
 }
+// --- Plan c3ba2b58 step A: attribution through the real client pipeline ---
+
+/// A worker trace context for the attribution tests: distinct worker label,
+/// turn id, and allocated ids, purpose `Turn` — the shape the agent loop
+/// stamps on its requests.
+fn worker_trace_context(worker: &str, agent_id: &str, turn: &str) -> crate::provider::trace::LlmRequestContext {
+    crate::provider::trace::LlmRequestContext::attributed(
+        crate::provider::trace::TraceIdentity {
+            actor_kind: crate::provider::trace::TraceActorKind::Worker,
+            agent_id: agent_id.to_string(),
+            session_id: agent_id.to_string(),
+            agent_name: worker.to_string(),
+            worker_id: Some(worker.to_string()),
+            plan_id: Some("plan-1".to_string()),
+            plan_step: Some(1),
+        }
+        .attribution(Some(turn), crate::provider::trace::TracePurpose::Turn),
+    )
+}
+
+#[tokio::test]
+async fn complete_with_context_attributes_each_interleaved_stream() {
+    // Two attributed request streams over ONE shared provider + ONE shared
+    // trace log, driven concurrently — the exact sharing shape Mnemo2 runs
+    // (lead + workers share one engine provider). Attribution travels with
+    // the request (never a mutable "current label" on the client), so each
+    // record must carry ITS OWN actor, turn, and purpose — nothing
+    // cross-labelled, nothing unattributed, no record lost.
+    let server = StubServer::start(vec![
+        StubResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            body: SSE_OK,
+        },
+        StubResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            body: SSE_OK,
+        },
+    ])
+    .await;
+    let log = std::sync::Arc::new(LlmRequestLog::new());
+    let client = std::sync::Arc::new(OpenAiClient::new_with_trace(
+        OpenAiClientConfig {
+            base_url: format!("http://{}/v1", server.addr),
+            ..OpenAiClientConfig::test_default()
+        },
+        Some(log.clone()),
+    ));
+
+    let a = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let stream = client
+                .complete_with_context(
+                    &[Message::user_text("from worker A")],
+                    &[],
+                    None,
+                    &worker_trace_context("wt-alpha", "101", "turn-a"),
+                )
+                .await
+                .expect("worker A's request must succeed");
+            collect_stream_to_end(stream).await
+        }
+    });
+    let b = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let stream = client
+                .complete_with_context(
+                    &[Message::user_text("from worker B")],
+                    &[],
+                    None,
+                    &worker_trace_context("wt-beta", "202", "turn-b"),
+                )
+                .await
+                .expect("worker B's request must succeed");
+            collect_stream_to_end(stream).await
+        }
+    });
+    let (a, b) = tokio::join!(a, b);
+    a.expect("worker A's task must not panic");
+    b.expect("worker B's task must not panic");
+
+    let rows = log.list();
+    assert_eq!(rows.len(), 2, "both concurrent requests must be recorded");
+    let mut names: Vec<&str> = rows
+        .iter()
+        .map(|r| r.attribution.as_ref().map(|a| a.agent_name.as_str()).unwrap_or("<none>"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["wt-alpha", "wt-beta"],
+        "each record keeps its own actor — nothing cross-labelled"
+    );
+    for (row, expected_turn) in rows.iter().zip(["turn-a", "turn-b"]) {
+        let a = row.attribution.as_ref().expect("attribution on every record");
+        assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
+        assert_eq!(a.worker_id.as_deref(), a.agent_name.as_str().into());
+        assert_eq!(a.turn_id.as_deref(), Some(expected_turn));
+        assert_eq!(a.actor_kind, crate::provider::trace::TraceActorKind::Worker);
+    }
+    assert_ne!(rows[0].run_id, "");
+    assert_eq!(rows[0].run_id, rows[1].run_id, "one log, one run");
+}
+
+/// Drain an LLM event stream to its terminal event (helper for the
+/// interleaving test — every spawned task must fully own its stream; the
+/// stream borrows its client, which the task also owns, so the lifetimes
+/// stay inside the task).
+async fn collect_stream_to_end(mut stream: futures::stream::BoxStream<'_, LlmEvent>) {
+    use futures::StreamExt;
+    while let Some(_event) = stream.next().await {}
+}
+
+#[tokio::test]
+async fn reasoning_effort_fallback_keeps_attribution() {
+    // The self-healing 400→200 fallback must not lose the request's
+    // attribution: the record covers the retried request (the first
+    // rejection stays invisible by design) and still names its actor.
+    let server = StubServer::start(vec![
+        StubResponse {
+            status: 400,
+            content_type: "application/json",
+            body: EFFORT_REJECTION,
+        },
+        StubResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            body: SSE_OK,
+        },
+    ])
+    .await;
+    let log = std::sync::Arc::new(LlmRequestLog::new());
+    let client = OpenAiClient::new_with_trace(
+        OpenAiClientConfig {
+            base_url: format!("http://{}/v1", server.addr),
+            reasoning_effort: Some("max".to_string()),
+            ..OpenAiClientConfig::test_default()
+        },
+        Some(log.clone()),
+    );
+
+    let mut stream = client
+        .complete_with_context(
+            &[Message::user_text("hi")],
+            &[],
+            None,
+            &worker_trace_context("wt-gamma", "303", "turn-c"),
+        )
+        .await
+        .expect("complete must succeed via the fallback retry");
+    use futures::StreamExt;
+    while let Some(_event) = stream.next().await {}
+
+    assert_eq!(server.received().len(), 2, "original + one retry");
+    let rows = log.list();
+    assert_eq!(rows.len(), 1, "the fallback covers ONE record");
+    let a = rows[0]
+        .attribution
+        .as_ref()
+        .expect("the fallback record keeps its attribution");
+    assert_eq!(a.agent_name, "wt-gamma");
+    assert_eq!(a.turn_id.as_deref(), Some("turn-c"));
+    assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
+    assert_eq!(rows[0].http_status, Some(200), "the retried outcome stands");
+}

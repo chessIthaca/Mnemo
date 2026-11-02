@@ -478,6 +478,7 @@ impl ContextManager {
         keep_recent: usize,
         sendable_budget: usize,
         provider: &dyn LlmClient,
+        llm_context: &crate::provider::trace::LlmRequestContext,
     ) -> Result<Vec<Message>> {
         if messages.len() <= keep_recent + 1 {
             // Not enough to summarize.
@@ -516,7 +517,10 @@ impl ContextManager {
         // this harness can see (its own chat template, tool schemas, a smaller
         // window than advertised) — so fall back to the mechanical compaction
         // rather than wedging the session until `/new`.
-        let stream = match provider.complete(&summary_messages, &[], None).await {
+        let stream = match provider
+            .complete_with_context(&summary_messages, &[], None, llm_context)
+            .await
+        {
             Ok(stream) => stream,
             Err(e) if e.is_context_overflow() => {
                 return Ok(mechanical_compaction(messages, cut, sendable_budget));
@@ -560,6 +564,10 @@ impl ContextManager {
     /// Returns `(messages, buffered, stop_reason)`. `stop_reason` is `Some`
     /// when an `Interrupt` or `Cancel` aborted the summary (so the caller can
     /// end the turn / terminate the agent); `None` on normal completion.
+    // Plan c3ba2b58 step A added the `llm_context` param. Grouping into a
+    // struct would churn every test caller for no behavioral gain — the
+    // failure_triage.rs precedent (arity-bound internal fn) applies.
+    #[allow(clippy::too_many_arguments)]
     pub async fn summarize_with_interrupt(
         &self,
         messages: &[Message],
@@ -567,6 +575,7 @@ impl ContextManager {
         sendable_budget: usize,
         provider: &dyn LlmClient,
         cmd_rx: &mut tokio::sync::mpsc::Receiver<crate::runtime::AgentCommand>,
+        llm_context: &crate::provider::trace::LlmRequestContext,
     ) -> Result<(
         Vec<Message>,
         Vec<crate::runtime::AgentCommand>,
@@ -580,6 +589,7 @@ impl ContextManager {
             provider,
             None,
             cmd_rx,
+            llm_context,
         )
         .await
     }
@@ -590,6 +600,10 @@ impl ContextManager {
     /// verbatim instead of compressing away. `None` renders exactly the prompt
     /// the plain entry point always built, so the flag-off path and every
     /// existing call site stay byte-identical.
+    // Plan c3ba2b58 step A added the `llm_context` param. Grouping into a
+    // struct would churn every test caller for no behavioral gain — the
+    // failure_triage.rs precedent (arity-bound internal fn) applies.
+    #[allow(clippy::too_many_arguments)]
     pub async fn summarize_with_interrupt_opts(
         &self,
         messages: &[Message],
@@ -598,6 +612,7 @@ impl ContextManager {
         provider: &dyn LlmClient,
         must_preserve: Option<&str>,
         cmd_rx: &mut tokio::sync::mpsc::Receiver<crate::runtime::AgentCommand>,
+        llm_context: &crate::provider::trace::LlmRequestContext,
     ) -> Result<(
         Vec<Message>,
         Vec<crate::runtime::AgentCommand>,
@@ -639,7 +654,10 @@ impl ContextManager {
 
         // Request the summary from the LLM. See [`ContextManager::summarize`]
         // for why a size rejection falls back instead of failing.
-        let stream = match provider.complete(&summary_messages, &[], None).await {
+        let stream = match provider
+            .complete_with_context(&summary_messages, &[], None, llm_context)
+            .await
+        {
             Ok(stream) => stream,
             Err(e) if e.is_context_overflow() => {
                 return Ok((
@@ -2266,6 +2284,7 @@ fn role_str(role: Role) -> &'static str {
 mod tests {
     use super::*;
     use crate::provider::ImageUrl;
+    use crate::provider::trace::LlmRequestContext;
 
     /// Budget handed to compaction by tests that are NOT about the sendable
     /// post-condition: large enough that [`enforce_sendable`] is a no-op, so
@@ -3507,7 +3526,7 @@ mod tests {
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
 
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -3537,7 +3556,7 @@ mod tests {
         let messages_clone = messages.clone();
         let handle = tokio::spawn(async move {
             cm_clone
-                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
                 .await
         });
 
@@ -3568,7 +3587,7 @@ mod tests {
         let messages_clone = messages.clone();
         let handle = tokio::spawn(async move {
             cm_clone
-                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
                 .await
         });
 
@@ -3595,7 +3614,7 @@ mod tests {
         let messages_clone = messages.clone();
         let handle = tokio::spawn(async move {
             cm_clone
-                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
                 .await
         });
 
@@ -3631,7 +3650,7 @@ mod tests {
         let messages = make_messages(2); // system + 2 = 3, keep_recent=2 → 3 <= 3
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -3689,7 +3708,7 @@ mod tests {
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
 
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -3787,7 +3806,7 @@ mod tests {
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
 
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -3951,7 +3970,7 @@ mod tests {
             caps: Capabilities::openai(),
         };
         let messages = make_messages(10);
-        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &LlmRequestContext::unattributed()).await.unwrap();
         // system + summary + 2 recent = 4 messages.
         assert_eq!(result.len(), 4);
         // System prompt preserved verbatim.
@@ -3973,7 +3992,7 @@ mod tests {
             caps: Capabilities::openai(),
         };
         let messages = make_messages(2); // system + 2 = 3, keep_recent=2 → 3 <= 3
-        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &LlmRequestContext::unattributed()).await.unwrap();
         assert_eq!(result.len(), messages.len());
         // Unchanged.
         assert_eq!(result[0].content.as_text(), "system prompt");
@@ -4087,7 +4106,7 @@ mod tests {
             caps: Capabilities::openai(),
         };
         let messages = make_tool_batch_messages();
-        let result = cm.summarize(&messages, 3, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 3, TEST_SENDABLE_BUDGET, &provider, &LlmRequestContext::unattributed()).await.unwrap();
         assert_tool_pairing_intact(&result);
         // The cut advanced past the orphaned tool result: the kept tail is
         // the trailing assistant + user, so result = system + summary + 2.
@@ -4116,7 +4135,7 @@ mod tests {
         let messages = make_tool_batch_messages();
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 3, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 3, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -4124,6 +4143,109 @@ mod tests {
         assert_tool_pairing_intact(&result);
         assert_eq!(result.len(), 4);
         assert_eq!(result[2].content.as_text(), "done");
+    }
+
+    /// A [`SummaryMockProvider`] that also records the trace context of
+    /// every `complete_with_context` call (plan c3ba2b58 step A), so tests
+    /// can assert the compaction attribution threading end to end.
+    struct ContextRecordingSummaryMock {
+        events: Vec<LlmEvent>,
+        contexts: std::sync::Mutex<Vec<LlmRequestContext>>,
+        caps: Capabilities,
+    }
+
+    #[async_trait]
+    impl LlmClient for ContextRecordingSummaryMock {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> crate::provider::ProviderKind {
+            crate::provider::ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            "mock-summary-recording"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<ToolChoice>,
+        ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+            panic!("summarize must call complete_with_context");
+        }
+        async fn complete_with_context(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<ToolChoice>,
+            context: &LlmRequestContext,
+        ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+            self.contexts
+                .lock()
+                .expect("ContextRecordingSummaryMock lock poisoned")
+                .push(context.clone());
+            Ok(Box::pin(futures::stream::iter(self.events.clone())))
+        }
+    }
+
+    #[tokio::test]
+    async fn summarize_threads_compaction_attribution_to_the_llm_call() {
+        // Plan c3ba2b58 step A: compaction's LLM call carries the calling
+        // loop's identity + the compaction purpose — the call site replaces
+        // ONLY the purpose on the turn's context. Nothing here may end up
+        // unattributed or cross-labelled with a neighbouring agent's turn.
+        let cm = ContextManager::new(128_000, 0.5);
+        let provider = ContextRecordingSummaryMock {
+            events: vec![
+                LlmEvent::TextDelta {
+                    text: "summary".into(),
+                },
+                LlmEvent::Finish {
+                    reason: crate::provider::FinishReason::Stop,
+                },
+            ],
+            contexts: std::sync::Mutex::new(Vec::new()),
+            caps: Capabilities::openai(),
+        };
+        let identity = crate::provider::trace::TraceIdentity {
+            actor_kind: crate::provider::trace::TraceActorKind::Worker,
+            agent_id: "77".into(),
+            session_id: "77".into(),
+            agent_name: "wt-compact".into(),
+            worker_id: Some("wt-compact".into()),
+            plan_id: Some("plan-3".into()),
+            plan_step: Some(4),
+        };
+        // The turn context the loop built (purpose Turn) — summarize swaps
+        // only the purpose, keeping identity + turn id.
+        let turn_ctx = LlmRequestContext::attributed(identity.attribution(
+            Some("turn-comp"),
+            crate::provider::trace::TracePurpose::Turn,
+        ));
+        let compaction_ctx = turn_ctx.with_purpose(crate::provider::trace::TracePurpose::Compaction);
+        let messages = make_messages(10);
+        let result = cm
+            .summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &compaction_ctx)
+            .await
+            .unwrap();
+        assert!(result.len() >= 2, "a summary + kept tail");
+
+        let recorded = provider
+            .contexts
+            .lock()
+            .expect("recorded contexts lock poisoned");
+        assert_eq!(recorded.len(), 1, "one LLM call per compaction");
+        let a = recorded[0].attribution.as_ref().expect("attributed");
+        assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Compaction);
+        assert_eq!(a.actor_kind, crate::provider::trace::TraceActorKind::Worker);
+        assert_eq!(a.agent_id, "77");
+        assert_eq!(a.worker_id.as_deref(), Some("wt-compact"));
+        assert_eq!(a.turn_id.as_deref(), Some("turn-comp"));
+        assert_eq!(
+            turn_ctx.attribution.as_ref().expect("source intact").purpose,
+            crate::provider::trace::TracePurpose::Turn,
+            "with_purpose must not mutate the source context"
+        );
     }
 
     #[test]
@@ -4178,7 +4300,7 @@ mod tests {
         let messages = make_all_tool_tail_messages();
         // The cut advances off the end.
         assert_eq!(summary_cut_index(&messages, 6), messages.len());
-        let result = cm.summarize(&messages, 6, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &LlmRequestContext::unattributed()).await.unwrap();
         // system + summary + synthetic user continuation = 3 messages.
         assert_eq!(result.len(), 3);
         assert!(
@@ -4209,7 +4331,7 @@ mod tests {
         let messages = make_all_tool_tail_messages();
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -4317,7 +4439,7 @@ mod tests {
         // keep_recent=4 → naive cut 5 (inside the loop) → retreats to 3.
         let cut = summary_cut_index(&messages, 4);
         assert_eq!(cut, 3, "cut must retreat to the open-loop start");
-        let result = cm.summarize(&messages, 4, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 4, TEST_SENDABLE_BUDGET, &provider, &LlmRequestContext::unattributed()).await.unwrap();
         // system + summary + [user, assistant(tool_calls), tool(c1..c4)] = 8.
         assert_eq!(result.len(), 8);
         // The kept tail starts at the user message (loop start) — the entire
@@ -4364,7 +4486,7 @@ mod tests {
         // Retreat to loop_start = 1 (the user message). cut = 1 ≤ 1 → skip.
         let cut = summary_cut_index(&messages, 2);
         assert_eq!(cut, 1);
-        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &LlmRequestContext::unattributed()).await.unwrap();
         // Compaction did not run — original messages returned unchanged.
         assert_eq!(result.len(), messages.len());
         assert_eq!(result[1].role, Role::User);
@@ -4400,6 +4522,7 @@ mod tests {
                     TEST_SENDABLE_BUDGET,
                     &failing,
                     &mut cmd_rx,
+                    &LlmRequestContext::unattributed(),
                 )
                 .await
                 .expect("a size rejection must fall back, not fail");
@@ -4433,6 +4556,7 @@ mod tests {
                     TEST_SENDABLE_BUDGET,
                     &streaming,
                     &mut cmd_rx,
+                    &LlmRequestContext::unattributed(),
                 )
                 .await
                 .expect("a mid-stream size rejection must fall back too");
@@ -4466,6 +4590,7 @@ mod tests {
                     TEST_SENDABLE_BUDGET,
                     &failing,
                     &mut cmd_rx,
+                    &LlmRequestContext::unattributed(),
                 )
                 .await;
             assert!(result.is_err(), "a non-size error must surface: {error}");
@@ -4484,6 +4609,7 @@ mod tests {
                     TEST_SENDABLE_BUDGET,
                     &streaming,
                     &mut cmd_rx,
+                    &LlmRequestContext::unattributed(),
                 )
                 .await;
             assert!(
@@ -4543,7 +4669,7 @@ mod tests {
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
         let sendable = 8_192;
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 2, sendable, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 2, sendable, &provider, &mut cmd_rx, &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(buffered.is_empty());

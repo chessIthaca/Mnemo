@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! The Claude Code hook modes (`notices`, `gate-agent`) and the background
-//! `wait` command.
+//! The Claude Code hook modes (`notices`, `gate-agent`, `hint`) and the
+//! background `wait` command.
 //!
 //! A hook must never break the user's session: every failure here ends in "no
 //! output", and no mode starts Mnemo2. Without a run file naming the caller's
@@ -16,7 +16,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::instance::{
-    call, find_instance, find_instance_for_hook, root_body, Env, Instance, HOOK_TIMEOUT,
+    call, find_instance, find_instance_for_hook, registered_root, root_body, Env, Instance,
+    HOOK_TIMEOUT,
 };
 
 /// Extra read time on top of the wait's own timeout, so the server's "no events"
@@ -271,6 +272,180 @@ pub fn gate_agent(env: &Env, stdin_text: &str) -> Option<String> {
         })
         .to_string(),
     )
+}
+
+// ---- hint --pre-search -----------------------------------------------------
+
+/// The names Claude Code lists the plugin's Mnemo tools under (the skills use
+/// the short ones). A hint names the full one so `ToolSearch` can load it.
+const MCP_TOOL_PREFIX: &str = "mcp__plugin_mnemo_mnemo__";
+
+/// Where Mnemo keeps the project's knowledge records.
+const KNOWLEDGE_DIR: &str = ".coding/knowledge";
+
+/// The typed titles Mnemo writes on knowledge records: a search for one of
+/// them asks about project history, which `memory_search` answers better.
+const KNOWLEDGE_PREFIXES: [&str; 6] = ["SPEC:", "DECISION:", "BUG:", "HOW:", "PLAN:", "REVIEW:"];
+
+/// The declaration keywords that turn a name into a symbol search (`fn X`).
+const DECLARATION_KEYWORDS: [&str; 14] = [
+    "fn", "struct", "enum", "trait", "impl", "type", "mod", "const", "static", "def", "class",
+    "func", "function", "interface",
+];
+
+/// The hint a Grep or Glob call earns: which Mnemo tool answers it better, and
+/// the call to make.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Hint {
+    /// A code identifier: the code graph and the content index know it.
+    Code(String),
+    /// A project-knowledge lookup: the memory store knows it, with the query
+    /// to ask when the pattern names one.
+    Memory(Option<String>),
+}
+
+impl Hint {
+    /// The `additionalContext` text. It never says the search was wrong: the
+    /// call always runs, and the hint only names the better tool and how to
+    /// load it.
+    fn context(&self) -> String {
+        match self {
+            Hint::Code(query) => format!(
+                "Mnemo answers this from its code graph: graph_search {{\"query\": \"{query}\"}} \
+                 (load with ToolSearch select:{MCP_TOOL_PREFIX}graph_search) or \
+                 search {{\"pattern\": \"{query}\"}} (select:{MCP_TOOL_PREFIX}search). \
+                 Grep still runs."
+            ),
+            Hint::Memory(Some(query)) => format!(
+                "Mnemo keeps this project's decisions, bugs and how-tos: memory_search \
+                 {{\"query\": \"{query}\"}} (load with ToolSearch \
+                 select:{MCP_TOOL_PREFIX}memory_search). Grep still runs."
+            ),
+            Hint::Memory(None) => format!(
+                "Mnemo keeps this project's decisions, bugs and how-tos in {KNOWLEDGE_DIR}/: \
+                 memory_search (load with ToolSearch select:{MCP_TOOL_PREFIX}memory_search) \
+                 recalls them. Grep still runs."
+            ),
+        }
+    }
+}
+
+/// True when `text` asks for a typed knowledge record (`DECISION: …`).
+fn is_knowledge(text: &str) -> bool {
+    let upper = text.to_uppercase();
+    KNOWLEDGE_PREFIXES.iter().any(|prefix| upper.starts_with(prefix))
+}
+
+/// True when `text` points into Mnemo's knowledge folder.
+fn is_knowledge_path(text: &str) -> bool {
+    text.replace('\\', "/").to_lowercase().contains(KNOWLEDGE_DIR)
+}
+
+/// What to ask `memory_search` for: the words after a typed prefix, when they
+/// are words and not a path or a glob.
+fn knowledge_query(pattern: &str) -> Option<String> {
+    let mut rest = pattern.trim();
+    if is_knowledge(rest) {
+        rest = rest.split_once(':').map(|(_, after)| after).unwrap_or("").trim();
+    }
+    let usable = !rest.is_empty()
+        && !is_knowledge_path(rest)
+        && !rest.chars().any(|c| {
+            matches!(
+                c,
+                '/' | '\\' | '*' | '?' | '"' | '^' | '$' | '|' | '(' | ')' | '[' | ']'
+            )
+        });
+    usable.then(|| rest.to_string())
+}
+
+/// True when a bare token looks like a code identifier rather than a word:
+/// snake_case (`attach_lead`) or CamelCase (`TeamManager`, `HTTPClient`). A
+/// single lower-case word ("cache") stays with Grep.
+fn is_identifier(token: &str) -> bool {
+    if token.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
+        return false;
+    }
+    token.contains('_')
+        || token
+            .chars()
+            .zip(token.chars().skip(1))
+            .any(|(lower, upper)| lower.is_lowercase() && upper.is_uppercase())
+}
+
+/// The name to look up for a single-token pattern: `Type::member` asks for
+/// `member`, and a bare word only counts when it looks like an identifier.
+fn single_name(token: &str) -> Option<String> {
+    if let Some((_, member)) = token.rsplit_once("::") {
+        return (!member.is_empty()).then(|| member.to_string());
+    }
+    is_identifier(token).then(|| token.to_string())
+}
+
+/// True when `word` is a declaration keyword (`fn X`, `struct X`).
+fn is_declaration_keyword(word: &str) -> bool {
+    DECLARATION_KEYWORDS.contains(&word.to_ascii_lowercase().as_str())
+}
+
+/// The hint one Grep or Glob call earns, or `None` when the pattern is
+/// ordinary text, a regex, a path or a file glob — exactly what Grep and Glob
+/// are for.
+fn classify(tool_input: &Value) -> Option<Hint> {
+    let pattern = tool_input
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let path = tool_input.get("path").and_then(Value::as_str).unwrap_or("");
+    // A typed title (`DECISION: …`) or a search inside the knowledge folder
+    // asks about project history, whether the pattern or the path says so.
+    if is_knowledge(pattern) || is_knowledge_path(pattern) || is_knowledge_path(path) {
+        return Some(Hint::Memory(knowledge_query(pattern)));
+    }
+    // `X()` and `X(` name a call: the parentheses are not part of the name.
+    let text = pattern.trim_end_matches("()").trim_end_matches('(');
+    // Regexes and paths cannot name a symbol, and Mnemo's search takes plain
+    // patterns, not regular expressions.
+    if !text
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | ' '))
+    {
+        return None;
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    match words.as_slice() {
+        [word] => Some(Hint::Code(single_name(word)?)),
+        [keyword, word] if is_declaration_keyword(keyword) && is_identifier(word) => {
+            Some(Hint::Code((*word).to_string()))
+        }
+        // Plain prose ("how does eviction work") stays with Grep.
+        _ => None,
+    }
+}
+
+/// The `tool_input` of a Grep or Glob call (the two tools Mnemo's search
+/// replaces); `None` for every other tool.
+fn search_input(input: &Value) -> Option<&Value> {
+    let tool = input.get("tool_name").and_then(Value::as_str)?;
+    if !matches!(tool, "Grep" | "Glob") {
+        return None;
+    }
+    input.get("tool_input").filter(|value| value.is_object())
+}
+
+/// `hint --pre-search`: the PreToolUse context that points a Grep or Glob at
+/// the Mnemo tool that answers it better, when there is one.
+///
+/// Silent outside a registered project, for ordinary text, regexes and paths,
+/// and for every other tool. It never blocks and never sets a permission
+/// decision: the search it rides on always runs.
+pub fn hint(env: &Env, stdin_text: &str) -> Option<String> {
+    let input = parse_input(stdin_text);
+    let found = classify(search_input(&input)?)?;
+    // Registration is the whole check: no `/health` probe, so a hint costs one
+    // file read and never delays the search it rides on.
+    registered_root(env, &hook_cwd(env, &input)).ok().flatten()?;
+    Some(hook_output("PreToolUse", &found.context()))
 }
 
 /// The instance `wait` should listen to: the process cwd first, then

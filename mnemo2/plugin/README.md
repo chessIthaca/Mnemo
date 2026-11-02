@@ -11,7 +11,7 @@ Only the lead runs on your Claude subscription. If you want a Claude model as a 
 | `.mcp.json` | Runs `bin/mnemo2-mcp serve`, a stdio bridge to Mnemo2's local MCP endpoint. It exposes the lead tools (`team_dispatch`, `team_status`, `team_review`, `team_merge` and the rest), the plan board tools, and `open_mission_control`. |
 | `skills/mnemo-lead` | The long lead guide: tiers, briefs, the review and merge cycle, notices, failures. |
 | `skills/mnemo-plan`, `mnemo-review`, `mnemo-status` | Plan-first workflow, the review checklist, and a quick status command (`/mnemo:mnemo-status`). |
-| `hooks/hooks.json` | SessionStart adds the team summary. PostToolUse delivers worker notices. Stop reminds the lead to keep the background waiter running. PreToolUse asks before Claude Code's own agents run. |
+| `hooks/hooks.json` | SessionStart adds the team summary. PostToolUse delivers worker notices. Stop reminds the lead to keep the background waiter running. PreToolUse asks before Claude Code's own agents run, and hints at `search`, `graph_search` or `memory_search` when a Grep or Glob looks like a symbol or a knowledge lookup (it never blocks the call). |
 | `bin/mnemo2-mcp` | The helper itself. It is built from this repository and is not checked in. |
 
 ## Mnemo2's memory workflow is enforced

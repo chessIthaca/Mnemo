@@ -48,6 +48,7 @@ use instance::Env;
 const USAGE: &str = "usage: mnemo2-mcp serve\n       \
     mnemo2-mcp notices --drain | --session-start | --stop-check\n       \
     mnemo2-mcp wait [--timeout <seconds>] [--session <id>]\n       \
+    mnemo2-mcp hint --pre-search\n       \
     mnemo2-mcp gate-agent\n       \
     mnemo2-mcp team-summary [--json] [--cwd <dir>]\n       \
     mnemo2-mcp show-worker <worker_id> [--cwd <dir>]";
@@ -149,6 +150,9 @@ fn run_delegated_hook(target: &Path, args: &[String], input: &str) -> Option<Str
 enum Hook {
     Notices(NoticesMode),
     GateAgent,
+    /// PreToolUse on Grep/Glob: point a code or knowledge lookup at the
+    /// Mnemo tool that answers it better. Never blocks.
+    Hint,
 }
 
 /// Which hook `command rest...` names; the error is a note for stderr.
@@ -157,6 +161,11 @@ fn parse_hook(command: &str, rest: &[String]) -> Result<Hook, String> {
         "notices" => parse_notices_mode(rest).map(Hook::Notices).ok_or_else(|| {
             "notices needs exactly one of --drain, --session-start, --stop-check".to_string()
         }),
+        "hint" => match rest {
+            [flag] if flag == "--pre-search" => Ok(Hook::Hint),
+            [] => Ok(Hook::Hint),
+            _ => Err("hint takes no arguments other than --pre-search".to_string()),
+        },
         "gate-agent" if rest.is_empty() => Ok(Hook::GateAgent),
         "gate-agent" => Err("gate-agent takes no arguments".to_string()),
         other => Err(format!("{other} is not a hook")),
@@ -175,7 +184,12 @@ fn hook_for_event(input: &str) -> Option<Hook> {
         "SessionStart" => Some(Hook::Notices(NoticesMode::SessionStart)),
         "PostToolUse" => Some(Hook::Notices(NoticesMode::Drain)),
         "Stop" => Some(Hook::Notices(NoticesMode::StopCheck)),
-        "PreToolUse" => Some(Hook::GateAgent),
+        // One event, two hooks: the search hint rides on Grep and Glob, the
+        // agent gate on everything else (its plugin matcher lists the agents).
+        "PreToolUse" => match event.get("tool_name").and_then(serde_json::Value::as_str) {
+            Some("Grep" | "Glob") => Some(Hook::Hint),
+            _ => Some(Hook::GateAgent),
+        },
         _ => None,
     }
 }
@@ -188,6 +202,7 @@ fn hook_args(hook: Hook) -> Vec<String> {
         Hook::Notices(NoticesMode::SessionStart) => &["notices", "--session-start"],
         Hook::Notices(NoticesMode::StopCheck) => &["notices", "--stop-check"],
         Hook::GateAgent => &["gate-agent"],
+        Hook::Hint => &["hint", "--pre-search"],
     };
     args.iter().map(|arg| arg.to_string()).collect()
 }
@@ -201,7 +216,7 @@ fn main() -> ExitCode {
     let command = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or_default();
     match command {
-        "notices" | "gate-agent" => run_hook_command(command, rest, &args),
+        "notices" | "gate-agent" | "hint" => run_hook_command(command, rest, &args),
         // A bare call with a hook's JSON on stdin (see `hook_for_event`).
         "" if !std::io::stdin().is_terminal() => run_event_hook(),
         "serve" => {
@@ -327,6 +342,7 @@ fn run_hook(hook: Hook, args: &[String], input: String) -> ExitCode {
         let output = match hook {
             Hook::Notices(mode) => hooks::notices(&env, mode, &input),
             Hook::GateAgent => hooks::gate_agent(&env, &input),
+            Hook::Hint => hooks::hint(&env, &input),
         };
         if let Some(output) = output {
             print_line(&output);
@@ -377,6 +393,20 @@ mod tests {
         assert_eq!(hook_for_event(&event("PostToolUse")), Some(Hook::Notices(NoticesMode::Drain)));
         assert_eq!(hook_for_event(&event("Stop")), Some(Hook::Notices(NoticesMode::StopCheck)));
         assert_eq!(hook_for_event(&event("PreToolUse")), Some(Hook::GateAgent));
+        // One PreToolUse hook per tool: the search hint on Grep and Glob, the
+        // agent gate everywhere else (its plugin matcher lists the agents).
+        let tool_event = |name: &str, tool: &str| {
+            format!(r#"{{"hook_event_name":"{name}","tool_name":"{tool}","cwd":"C:/x"}}"#)
+        };
+        assert_eq!(hook_for_event(&tool_event("PreToolUse", "Agent")), Some(Hook::GateAgent));
+        assert_eq!(hook_for_event(&tool_event("PreToolUse", "Task")), Some(Hook::GateAgent));
+        assert_eq!(hook_for_event(&tool_event("PreToolUse", "Grep")), Some(Hook::Hint));
+        assert_eq!(hook_for_event(&tool_event("PreToolUse", "Glob")), Some(Hook::Hint));
+        // A Grep after a tool call is the notice drain, not a hint.
+        assert_eq!(
+            hook_for_event(&tool_event("PostToolUse", "Grep")),
+            Some(Hook::Notices(NoticesMode::Drain))
+        );
         assert_eq!(hook_for_event(&event("SubagentStop")), None);
         assert_eq!(hook_for_event("not json"), None);
         assert_eq!(hook_for_event("{}"), None);
@@ -386,6 +416,7 @@ mod tests {
             Hook::Notices(NoticesMode::SessionStart),
             Hook::Notices(NoticesMode::StopCheck),
             Hook::GateAgent,
+            Hook::Hint,
         ] {
             let args = hook_args(hook);
             assert_eq!(parse_hook(&args[0], &args[1..]), Ok(hook));
@@ -426,6 +457,9 @@ mod tests {
             Ok(Hook::Notices(NoticesMode::Drain))
         );
         assert_eq!(parse_hook("gate-agent", &strings(&[])), Ok(Hook::GateAgent));
+        // The hint's flag is optional (the bare event-name dispatch passes none).
+        assert_eq!(parse_hook("hint", &strings(&["--pre-search"])), Ok(Hook::Hint));
+        assert_eq!(parse_hook("hint", &strings(&[])), Ok(Hook::Hint));
         // Missing, unknown and surplus arguments are all notes (main prints
         // them to stderr and still exits 0).
         for (command, args) in [
@@ -433,6 +467,8 @@ mod tests {
             ("notices", strings(&["--bogus"])),
             ("notices", strings(&["--drain", "--stop-check"])),
             ("gate-agent", strings(&["extra"])),
+            ("hint", strings(&["--drain"])),
+            ("hint", strings(&["--pre-search", "--drain"])),
         ] {
             let note = parse_hook(command, &args).expect_err("bad arguments");
             assert!(!note.is_empty());

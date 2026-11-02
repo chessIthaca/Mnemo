@@ -1,11 +1,13 @@
 <script lang="ts">
   import { createLayaTransport } from "../lib/layaSettings";
+  import { createMcpTransport } from "../lib/mcpSettings";
   import { createModelSettingsTransport } from "../lib/modelSettings";
   import { createSafetyTransport } from "../lib/safetySettings";
   import { createSettingsTransport, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import EndpointsPage from "./EndpointsPage.svelte";
   import LayaPage from "./LayaPage.svelte";
+  import McpPage from "./McpPage.svelte";
   import ModelsPage from "./ModelsPage.svelte";
   import SafetyPage from "./SafetyPage.svelte";
   import SavingsPage from "./SavingsPage.svelte";
@@ -14,7 +16,7 @@
 
   let { open, onclose }: { open: boolean; onclose: () => void } = $props();
 
-  type Page = "endpoints" | "tiers" | "models" | "savings" | "laya" | "safety";
+  type Page = "endpoints" | "tiers" | "models" | "savings" | "laya" | "safety" | "mcp";
   const pages: { id: Page; label: string }[] = [
     { id: "endpoints", label: "Endpoints" },
     { id: "tiers", label: "Tiers" },
@@ -22,6 +24,7 @@
     { id: "savings", label: "Savings" },
     { id: "laya", label: "Decisions" },
     { id: "safety", label: "Safety" },
+    { id: "mcp", label: "MCP" },
   ];
 
   let page = $state<Page>("endpoints");
@@ -33,6 +36,7 @@
   const modelTransport = $derived(open ? createModelSettingsTransport() : null);
   const layaTransport = $derived(open ? createLayaTransport() : null);
   const safetyTransport = $derived(open ? createSafetyTransport() : null);
+  const mcpTransport = $derived(open ? createMcpTransport() : null);
 
   $effect(() => {
     const active = transport;
@@ -104,6 +108,12 @@
             <SafetyPage transport={safetyTransport} />
           {:else}
             <p class="settings-empty">Safety settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "mcp"}
+          {#if mcpTransport}
+            <McpPage transport={mcpTransport} />
+          {:else}
+            <p class="settings-empty">MCP server settings are available in the desktop app.</p>
           {/if}
         {:else}
           <TiersPage {transport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />

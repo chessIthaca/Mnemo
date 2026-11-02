@@ -2,8 +2,9 @@ import type { ExternalLeadState } from "./externalLeadEngine";
 import type { IndexingSnapshot } from "./indexingEngine";
 import type { BoardPlan } from "./boardState";
 import type { WorkerDeletionPreview } from "./teamState";
+import type { TraceEntry } from "./trace";
 
-export type Route = "start" | "lead" | "team" | "cost" | "graph" | "plans" | "memory";
+export type Route = "start" | "lead" | "team" | "cost" | "trace" | "graph" | "plans" | "memory";
 
 export type WorkbenchTab = "browser" | "diff" | "plan" | "files" | "trace" | "git";
 export type TeamFilter = "all" | "needs" | "active" | "done";
@@ -651,4 +652,6 @@ export interface AppState {
   toast: ToastMessage | null;
   /** Saved mission-control worker-list width; null keeps the default split. */
   boardWidth: number | null;
+  /** Filter hand-over planted by openTrace for the Trace route to consume. */
+  traceEntry: TraceEntry | null;
 }

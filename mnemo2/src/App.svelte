@@ -12,6 +12,7 @@
   import TeamPeek from "./components/TeamPeek.svelte";
   import Toast from "./components/Toast.svelte";
   import TopBar from "./components/TopBar.svelte";
+  import TraceView from "./components/TraceView.svelte";
   import WorkerPanel from "./components/WorkerPanel.svelte";
   import Workbench from "./components/Workbench.svelte";
   import WorkerDeleteSheet from "./components/WorkerDeleteSheet.svelte";
@@ -44,6 +45,8 @@
         <ControlRoom />
       {:else if $app.route === "cost"}
         <CostView />
+      {:else if $app.route === "trace"}
+        <TraceView />
       {:else if $app.route === "plans"}
         <PlansView />
       {:else if $app.route === "memory"}

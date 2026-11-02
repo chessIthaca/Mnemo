@@ -179,6 +179,11 @@ describe("Workbench", () => {
       response_truncated: false,
       response_evicted: false,
       guard_cut: null,
+      run_id: "run-1",
+      attribution: null,
+      cost_micros: null,
+      priced: false,
+      retained: false,
     };
     seedTracePreview({
       list: async () => ({ requests: [row], capacity: 32 }),

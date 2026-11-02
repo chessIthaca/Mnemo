@@ -31,6 +31,7 @@ import {
 import { applyWorkerEvent, applyWorkerStatus } from "./workerActivity";
 import { leadEventSound, loadSoundToggles, notifySound, workerTransitionSound } from "./sounds";
 import { applyStoredTheme } from "./theme";
+import { logUi } from "./uiLog";
 import {
   createOpenWorkerTransport,
   openWorkerNotice,
@@ -75,6 +76,7 @@ import type {
   Project,
   ReviewEvidence,
   TeamFilter,
+  ToastLevel,
   Worker,
   WorkerActivity,
   WorkerStatus,
@@ -352,8 +354,9 @@ export const needsYouCount = derived(
   ($app) => $app.workers.filter((worker) => worker.needsYou).length,
 );
 
-function withToast(state: AppState, message: string): AppState {
-  return { ...state, toast: { id: ++sequence, message } };
+function withToast(state: AppState, message: string, level: ToastLevel = "info"): AppState {
+  logUi(level, message, { source: "toast", route: state.route });
+  return { ...state, toast: { id: ++sequence, message, level } };
 }
 
 function updateWorker(
@@ -381,7 +384,7 @@ async function flushWorkbenchPreferences(): Promise<void> {
     await pending.transport.savePreferences(pending.workspaceRoot, pending.preferences);
   } catch (error) {
     app.update((state) => state.projectId === pending.projectId
-      ? withToast(state, `Could not save workbench preferences: ${leadError(error)}`)
+      ? withToast(state, `Could not save workbench preferences: ${leadError(error)}`, "error")
       : state);
   }
 }
@@ -434,7 +437,7 @@ async function restoreWorkbench(project: Project): Promise<void> {
     }
   } catch (error) {
     app.update((state) => state.projectId === project.id
-      ? withToast(state, `Could not restore workbench preferences: ${leadError(error)}`)
+      ? withToast(state, `Could not restore workbench preferences: ${leadError(error)}`, "error")
       : state);
   }
 }
@@ -460,19 +463,19 @@ function projectFromRecord(record: ProjectRecord): Project {
 async function openProject(projectId: string, allowConflict = false): Promise<void> {
   const project = get(app).projects.find((item) => item.id === projectId);
   if (!project) {
-    app.update((state) => withToast(state, "That project is not registered."));
+    app.update((state) => withToast(state, "That project is not registered.", "error"));
     return;
   }
   if (preferenceSave) await flushWorkbenchPreferences();
   if (project.available === false) {
-    app.update((state) => withToast(state, project.description || "The project folder is unavailable."));
+    app.update((state) => withToast(state, project.description || "The project folder is unavailable.", "error"));
     return;
   }
   const transport = createProjectTransport();
   if (transport) {
     try {
       if (!(await probeMnemo2Host())) {
-        app.update((state) => withToast(state, "The native project host is unavailable."));
+        app.update((state) => withToast(state, "The native project host is unavailable.", "error"));
         return;
       }
       const attachment = await transport.attach(project.path, allowConflict);
@@ -488,7 +491,7 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
         return;
       }
     } catch (error) {
-      app.update((state) => withToast(state, leadError(error)));
+      app.update((state) => withToast(state, leadError(error), "error"));
       return;
     }
   }
@@ -563,7 +566,7 @@ async function loadProjects(): Promise<void> {
       projects: records.map(projectFromRecord),
     }));
   } catch (error) {
-    app.update((state) => withToast(state, `Could not load projects: ${leadError(error)}`));
+    app.update((state) => withToast(state, `Could not load projects: ${leadError(error)}`, "error"));
   }
 }
 
@@ -637,7 +640,11 @@ async function openExternalRoot(root: string): Promise<void> {
   }
   if (!project) {
     app.update((state) =>
-      withToast(state, `Claude Code asked to open ${root}, which is not a Mnemo2 project. Add it first.`),
+      withToast(
+        state,
+        `Claude Code asked to open ${root}, which is not a Mnemo2 project. Add it first.`,
+        "error",
+      ),
     );
     reportExternalOpenFailure(root, "it is not a registered Mnemo2 project");
     return;
@@ -650,7 +657,11 @@ async function openExternalRoot(root: string): Promise<void> {
     // Switching would stop the open project's lead; the user decides that.
     const name = project.name;
     app.update((state) =>
-      withToast(state, `Claude Code asked to open ${name}, but another project is open. Close it first.`),
+      withToast(
+        state,
+        `Claude Code asked to open ${name}, but another project is open. Close it first.`,
+        "error",
+      ),
     );
     reportExternalOpenFailure(root, "another project is open in this Mnemo2 window");
     return;
@@ -754,20 +765,20 @@ function handleOpenWorkerRequest(request: OpenWorkerRequest): void {
     selectWorker(outcome.workerId);
     return;
   }
-  app.update((current) => withToast(current, openWorkerNotice(outcome)));
+  app.update((current) => withToast(current, openWorkerNotice(outcome), "error"));
 }
 
 async function openFolder(): Promise<void> {
   const transport = createProjectTransport();
   if (!transport) {
-    app.update((state) => withToast(state, "Opening a folder needs the native shell."));
+    app.update((state) => withToast(state, "Opening a folder needs the native shell.", "error"));
     return;
   }
   // A Tauri WebView is not necessarily the Mnemo2 host: Mnemo1's Browser tab
   // has one too, and its IPC never registered this command (Tauri answers
   // "not allowed by ACL"). Confirm the handshake before invoking anything.
   if (!(await probeMnemo2Host())) {
-    app.update((state) => withToast(state, "Opening a folder needs the native shell."));
+    app.update((state) => withToast(state, "Opening a folder needs the native shell.", "error"));
     return;
   }
   try {
@@ -777,7 +788,7 @@ async function openFolder(): Promise<void> {
     await loadProjects();
     await openProject(record.path);
   } catch (error) {
-    app.update((state) => withToast(state, `Could not open the folder: ${leadError(error)}`));
+    app.update((state) => withToast(state, `Could not open the folder: ${leadError(error)}`, "error"));
   }
 }
 
@@ -839,7 +850,7 @@ async function confirmCloseProject(): Promise<void> {
     await closeProjectNow();
   } catch (error) {
     app.update((state) => ({
-      ...withToast(state, `Could not stop the team: ${leadError(error)}`),
+      ...withToast(state, `Could not stop the team: ${leadError(error)}`, "error"),
       closeProjectPending: false,
     }));
   }
@@ -890,7 +901,7 @@ async function confirmCleanup(): Promise<void> {
     await loadProjects();
   } catch (error) {
     app.update((state) => ({
-      ...withToast(state, `Cleanup failed: ${leadError(error)}`),
+      ...withToast(state, `Cleanup failed: ${leadError(error)}`, "error"),
       cleanupBusy: false,
     }));
   }
@@ -899,18 +910,18 @@ async function confirmCleanup(): Promise<void> {
 async function openNewProject(): Promise<void> {
   const transport = createProjectTransport();
   if (!transport) {
-    app.update((state) => withToast(state, "Project creation needs the native shell."));
+    app.update((state) => withToast(state, "Project creation needs the native shell.", "error"));
     return;
   }
   try {
     if (!(await probeMnemo2Host())) {
-      app.update((state) => withToast(state, "Project creation needs the native shell."));
+      app.update((state) => withToast(state, "Project creation needs the native shell.", "error"));
       return;
     }
     const parent = await transport.pickFolder();
     if (parent) app.update((state) => ({ ...state, newProjectParent: parent }));
   } catch (error) {
-    app.update((state) => withToast(state, leadError(error)));
+    app.update((state) => withToast(state, leadError(error), "error"));
   }
 }
 
@@ -926,7 +937,7 @@ async function createProject(name: string): Promise<void> {
     app.update((state) => ({ ...state, newProjectParent: null }));
     await openProject(record.path);
   } catch (error) {
-    app.update((state) => withToast(state, `Could not create the project: ${leadError(error)}`));
+    app.update((state) => withToast(state, `Could not create the project: ${leadError(error)}`, "error"));
   } finally {
     app.update((state) => ({ ...state, creatingProject: false }));
   }
@@ -1499,7 +1510,7 @@ async function sendNativeLeadMessage(message: string, images: string[]): Promise
               turnStartedAtMs: before.turnStartedAtMs,
               streamingEntryId: before.streamingEntryId,
             };
-        return withToast({ ...state, leadEntries: entries, leadRuntime: runtime }, failure);
+        return withToast({ ...state, leadEntries: entries, leadRuntime: runtime }, failure, "error");
       });
     }
     return false;
@@ -1523,7 +1534,7 @@ async function sendLeadMessage(body: string, images: string[] = []): Promise<boo
   const state = get(app);
   if (state.leadRuntime.mode === "native") {
     if (!leadTransport) {
-      app.update((current) => withToast(current, "The native lead is not connected."));
+      app.update((current) => withToast(current, "The native lead is not connected.", "error"));
       return false;
     }
     if (state.leadRuntime.status !== "ready") {
@@ -1547,6 +1558,7 @@ async function sendLeadMessage(body: string, images: string[] = []): Promise<boo
     ...withToast(
       current,
       "This build has no native shell; open Mnemo2's desktop app to run the lead.",
+      "error",
     ),
     leadEntries: [
       ...current.leadEntries,
@@ -1608,15 +1620,15 @@ function clearLeadDraft(): void {
 }
 
 /** Surface a transient status or failure message to the user. */
-function showToast(message: string): void {
-  app.update((state) => withToast(state, message));
+function showToast(message: string, level: ToastLevel = "info"): void {
+  app.update((state) => withToast(state, message, level));
 }
 
 async function interruptLead(): Promise<void> {
   const transport = leadTransport;
   if (!transport) {
     const error = new Error("The native lead is not connected, so it cannot be interrupted.");
-    app.update((state) => withToast(state, error.message));
+    app.update((state) => withToast(state, error.message, "error"));
     throw error;
   }
   const token = leadSessionToken;
@@ -1624,7 +1636,7 @@ async function interruptLead(): Promise<void> {
     await transport.interrupt();
   } catch (error) {
     if (token === leadSessionToken) {
-      app.update((state) => withToast(state, leadError(error)));
+      app.update((state) => withToast(state, leadError(error), "error"));
     }
     throw error;
   }
@@ -1635,7 +1647,11 @@ async function compactLead(): Promise<void> {
   const transport = leadTransport;
   if (!transport) {
     app.update((state) =>
-      withToast(state, "The native lead is not connected, so its context cannot be compacted."),
+      withToast(
+        state,
+        "The native lead is not connected, so its context cannot be compacted.",
+        "error",
+      ),
     );
     return;
   }
@@ -1644,7 +1660,7 @@ async function compactLead(): Promise<void> {
     await transport.compact();
   } catch (error) {
     if (token === leadSessionToken) {
-      app.update((state) => withToast(state, leadError(error)));
+      app.update((state) => withToast(state, leadError(error), "error"));
     }
   }
 }
@@ -1658,7 +1674,7 @@ function approveLead(requestId: string, decision: LeadApprovalDecision) {
     .then(() => refreshNativeLead(token))
     .catch((error) => {
       if (token === leadSessionToken) {
-        app.update((state) => withToast(state, leadError(error)));
+        app.update((state) => withToast(state, leadError(error), "error"));
       }
     });
 }
@@ -1681,7 +1697,7 @@ async function answerLead(
     await transport.answer(questionId, answer);
   } catch (error) {
     if (token === leadSessionToken) {
-      app.update((state) => withToast(state, leadError(error)));
+      app.update((state) => withToast(state, leadError(error), "error"));
     }
     return false;
   }
@@ -1710,7 +1726,7 @@ function setLeadModel(spec: string, reasoningEffort: string | null = null) {
     })
     .catch((error) => {
       if (token === leadSessionToken) {
-        app.update((current) => withToast(current, leadError(error)));
+        app.update((current) => withToast(current, leadError(error), "error"));
       }
     });
 }
@@ -1726,14 +1742,14 @@ function retryLead() {
 
 function requireTeam(): TeamTransport | null {
   if (!teamTransport) {
-    app.update((state) => withToast(state, "The native team runtime is not connected."));
+    app.update((state) => withToast(state, "The native team runtime is not connected.", "error"));
     return null;
   }
   return teamTransport;
 }
 
 function noteTeamError(error: unknown): void {
-  app.update((state) => withToast(state, leadError(error)));
+  app.update((state) => withToast(state, leadError(error), "error"));
 }
 
 function replyWorker(workerId: string, body: string) {
@@ -1977,6 +1993,7 @@ async function confirmDeleteWorkers(): Promise<void> {
           ? { ...state, workerDeletion: { ...state.workerDeletion, phase: "ready" } }
           : state,
         `Delete failed: ${leadError(error)}`,
+        "error",
       ),
     );
   }
@@ -2085,7 +2102,7 @@ async function fixFinding(
     .find((worker) => worker.id === workerId)
     ?.findings.find((item) => item.id === findingId);
   if (!finding) {
-    app.update((state) => withToast(state, `Unknown finding '${findingId}'.`));
+    app.update((state) => withToast(state, `Unknown finding '${findingId}'.`, "error"));
     return;
   }
   await performTeam((transport) =>
@@ -2689,7 +2706,7 @@ async function connectTeam(): Promise<void> {
 
 function setWorkerSlots(workerSlots: number): void {
   if (!Number.isInteger(workerSlots) || workerSlots < 1 || workerSlots > 32) {
-    app.update((state) => withToast(state, "Worker slots must be a whole number from 1 to 32."));
+    app.update((state) => withToast(state, "Worker slots must be a whole number from 1 to 32.", "error"));
     return;
   }
   const transport = requireTeam();

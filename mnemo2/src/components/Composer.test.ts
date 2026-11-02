@@ -232,8 +232,9 @@ describe("Composer", () => {
     await fireEvent(textbox(), paste);
 
     await vi.waitFor(() =>
-      expect(toast).toHaveBeenCalledWith("Could not attach the pasted image."),
+      expect(toast).toHaveBeenCalledWith("Could not attach the pasted image.", "error"),
     );
+
     expect(draft().images).toEqual([]);
   });
 

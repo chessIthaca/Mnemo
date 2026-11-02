@@ -391,9 +391,22 @@ export interface DiffSnapshot {
   truncated: boolean;
 }
 
+/**
+ * How loud a popup is: `error` for something that failed or was refused — an
+ * exception, a missing host or runtime, an unknown target, an invalid value —
+ * and `info` for a confirmation, a neutral notice, or a hint about doing
+ * something first.
+ *
+ * An error toast stays until it is dismissed or 12 s pass (and pauses while the
+ * pointer rests on it); an info toast clears itself after 4.2 s. Both kinds are
+ * appended to the UI log, so nothing is lost when one disappears.
+ */
+export type ToastLevel = "info" | "error";
+
 export interface ToastMessage {
   id: number;
   message: string;
+  level: ToastLevel;
 }
 
 /** One configured lead model, as returned by the native runtime. */

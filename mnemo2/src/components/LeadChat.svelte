@@ -255,7 +255,7 @@
 </section>
 
 <style>
-  .lead-workspace { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; background: var(--canvas); }
+  .lead-workspace { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; container-type: inline-size; background: var(--canvas); }
   .lead-scroll { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
   .lead-content { width: 100%; min-width: 0; margin: 0; padding: 22px 32px 18px; }
   .lead-stream { display: flow-root; min-width: 0; }
@@ -311,5 +311,10 @@
   }
   @media (max-width: 560px) {
     .chat-entry:not(.user-entry), .tool-activity-row { margin-left: 0; }
+  }
+  /* The side panel, not the window, narrows the lead — so the gutters follow the
+     lead column's own width (container query, not a viewport media query). */
+  @container (max-width: 600px) {
+    .lead-content, .composer-dock, .external-lead-bar { padding-left: 16px; padding-right: 16px; }
   }
 </style>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ArrowLeft, FileDiff, Globe, ListTree, X } from "@lucide/svelte";
-  import type { Component } from "svelte";
+  import { onMount, type Component } from "svelte";
   import { actions, app } from "../lib/store";
   import type { WorkbenchTab } from "../lib/types";
   import BrowserTab from "./BrowserTab.svelte";
@@ -30,6 +30,9 @@
     resizing = false;
   }
 
+  // A saved wide panel yields to the lead when the window cannot hold both.
+  onMount(() => actions.reclampWorkbenchWidth());
+
   function resizeKeydown(event: KeyboardEvent) {
     if (event.key === "ArrowLeft") {
       event.preventDefault();
@@ -41,7 +44,7 @@
   }
 </script>
 
-<svelte:window onpointermove={handleMove} onpointerup={stopResize} onpointercancel={stopResize} />
+<svelte:window onpointermove={handleMove} onpointerup={stopResize} onpointercancel={stopResize} onresize={() => actions.reclampWorkbenchWidth()} />
 
 <aside class="workbench" style={`width: ${$app.workbenchWidth}px`} aria-label="Workbench">
   <button
@@ -75,7 +78,7 @@
     {:else if $app.workbenchTab === "diff"}
       <DiffTab />
     {:else}
-      <PlanTab />
+      <PlanTab scope="open" />
     {/if}
   </div>
 </aside>

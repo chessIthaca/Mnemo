@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Check, ChevronDown, ChevronRight, Circle } from "@lucide/svelte";
+  import { ArrowUpRight, Check, ChevronDown, ChevronRight, Circle } from "@lucide/svelte";
   import { createBoardTransport } from "../lib/boardEngine";
   import { closedPlans, openPlans, planProgress, type BoardPlan } from "../lib/boardState";
   import { planDetailMarkdown } from "../lib/planDocument";
@@ -9,8 +9,18 @@
   import Collapsible from "./Collapsible.svelte";
   import Markdown from "./Markdown.svelte";
 
+  /**
+   * Which plans the tab lists: `"all"` for the Plans route (open and closed),
+   * `"open"` for the Workbench tab, which shows only work in progress and
+   * links out to the full list.
+   */
+  interface Props {
+    scope?: "all" | "open";
+  }
+  let { scope = "all" }: Props = $props();
+
   const open = $derived(openPlans($app.board));
-  const closed = $derived(closedPlans($app.board));
+  const closed = $derived(scope === "all" ? closedPlans($app.board) : []);
 
   const statusLabel = (status: string) => workerStatusLabel[status as WorkerStatus] ?? status;
 
@@ -136,6 +146,12 @@
 {/snippet}
 
 <section class="plan-tab" aria-label="Plan">
+  {#if scope === "open"}
+    <p class="scope-header">
+      <button class="all-plans" type="button" onclick={actions.openPlans}>All plans <ArrowUpRight size={11} /></button>
+    </p>
+  {/if}
+
   {#each open as plan (plan.id)}{@render planCard(plan)}{/each}
 
   {#if closed.length > 0}
@@ -146,12 +162,16 @@
   {/if}
 
   {#if open.length === 0 && closed.length === 0}
-    <div class="plan-empty"><h2>No plans</h2></div>
+    <div class="plan-empty"><h2>{scope === "open" ? "No open plans" : "No plans"}</h2></div>
   {/if}
 </section>
 
 <style>
   .plan-tab { padding: 14px 16px; }
+  .scope-header { display: flex; justify-content: flex-end; margin: 0 0 8px; }
+  .all-plans { display: inline-flex; align-items: center; gap: 4px; padding: 2px 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-body); font-weight: 650; cursor: pointer; }
+  .all-plans:hover { text-decoration: underline; }
+  .all-plans:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
   .plan { margin-bottom: 20px; }
   .plan[data-status="closed"], .plan[data-status="abandoned"] { opacity: 0.8; }
   .plan-header p { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }

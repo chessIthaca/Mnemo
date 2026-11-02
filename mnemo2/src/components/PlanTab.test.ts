@@ -103,6 +103,44 @@ describe("PlanTab", () => {
   });
 });
 
+describe("PlanTab open scope", () => {
+  beforeEach(() => {
+    const state = fixtureState();
+    state.board = [open, closed];
+    app.set(state);
+  });
+
+  it("lists only open plans and links out to the full Plans route", async () => {
+    app.update((state) => ({ ...state, workbenchOpen: true }));
+    const { container } = render(PlanTab, { scope: "open" });
+
+    expect(screen.getByRole("heading", { name: "Open plan" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Closed plan" })).toBeNull();
+    expect(container.querySelector("details.closed")).toBeNull();
+    expect(container.textContent).not.toContain(".coding/reviews/closed.md");
+
+    await fireEvent.click(screen.getByRole("button", { name: "All plans" }));
+    expect(get(app).route).toBe("plans");
+    expect(get(app).workbenchOpen).toBe(false);
+  });
+
+  it("keeps the link and says so when there are no open plans", () => {
+    app.update((state) => ({ ...state, board: [closed] }));
+    render(PlanTab, { scope: "open" });
+
+    expect(screen.getByRole("heading", { name: "No open plans" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "All plans" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Closed plan" })).toBeNull();
+  });
+
+  it("still lists open and closed plans in the default scope", () => {
+    const { container } = render(PlanTab);
+    expect(screen.getByRole("heading", { name: "Open plan" })).toBeTruthy();
+    expect(container.querySelector("details.closed")?.textContent).toContain("Closed plan");
+    expect(screen.queryByRole("button", { name: "All plans" })).toBeNull();
+  });
+});
+
 describe("worker row plan label", () => {
   it("shows the plan title and 1-based step, or the id prefix when unknown", () => {
     const state = fixtureState();

@@ -4,15 +4,21 @@ import { isTauriRuntime } from "./runtime";
 vi.mock("./runtime", () => ({ isTauriRuntime: vi.fn(() => false) }));
 
 import {
+  compactNodeRadius,
   computeGraphLayout,
+  computeOverviewLayout,
   createGraphTransport,
   errorText,
+  fitTransform,
   formatCount,
   formatRelativeTime,
   groupImpact,
+  NODE_RADIUS_MAX,
+  NODE_RADIUS_MIN,
   nodeLabel,
   seedGraphPreview,
   symbolKindLabel,
+  visibleLabels,
   type GraphEdge,
   type GraphImpactSymbol,
   type GraphNode,
@@ -64,6 +70,15 @@ describe("graph transport", () => {
       neighbourhood: vi.fn(async () => null as never),
       impact: vi.fn(async () => []),
       top: vi.fn(async () => []),
+      overview: vi.fn(async () => ({
+        level: 2,
+        nodes: [],
+        edges: [],
+        total_nodes: 0,
+        truncated: false,
+        total_symbols: 0,
+        sampled_symbols: 0,
+      })),
       context: vi.fn(async () => null as never),
     };
     seedGraphPreview(planted);
@@ -216,9 +231,11 @@ describe("computeGraphLayout", () => {
       expect(layout.radii[id]).toBeGreaterThan(0);
     }
     expect(layout.positions[center.id]).toEqual({ x: 270, y: 210 });
-    expect(layout.radii[center.id]).toBe(12);
+    expect(layout.radii[center.id]).toBe(NODE_RADIUS_MAX);
+    expect(NODE_RADIUS_MAX).toBe(7);
     for (const entry of ring) {
-      expect(layout.radii[entry.id]).toBeLessThan(12);
+      expect(layout.radii[entry.id]).toBeGreaterThanOrEqual(NODE_RADIUS_MIN);
+      expect(layout.radii[entry.id]).toBeLessThan(NODE_RADIUS_MAX);
     }
     const distinct = new Set(ring.map((entry) => `${layout.positions[entry.id].x},${layout.positions[entry.id].y}`));
     expect(distinct.size).toBe(ring.length);
@@ -260,5 +277,140 @@ describe("computeGraphLayout", () => {
     );
     expect(layout.positions[center.id]).toEqual({ x: 270, y: 210 });
     expect(layout.positions[lone.id]).toBeTruthy();
+  });
+});
+describe("compact node sizing", () => {
+  it("keeps every node between 3 and 7 CSS pixels whatever the degree", () => {
+    expect(compactNodeRadius(0)).toBe(NODE_RADIUS_MIN);
+    expect(compactNodeRadius(1)).toBeGreaterThan(NODE_RADIUS_MIN);
+    expect(compactNodeRadius(10_000)).toBe(NODE_RADIUS_MAX);
+    for (const weight of [0, 1, 4, 9, 25, 100, 400]) {
+      const radius = compactNodeRadius(weight);
+      expect(radius).toBeGreaterThanOrEqual(NODE_RADIUS_MIN);
+      expect(radius).toBeLessThanOrEqual(NODE_RADIUS_MAX);
+    }
+    expect(compactNodeRadius(400)).toBeGreaterThan(compactNodeRadius(4));
+  });
+});
+
+describe("computeOverviewLayout", () => {
+  const modules = Array.from({ length: 40 }, (_, index) => ({
+    id: `mod-${index}`,
+    radius: compactNodeRadius(index),
+  }));
+  const edges = modules.slice(1).map((entry, index) => ({ from: modules[index].id, to: entry.id }));
+
+  it("places every node on the canvas with finite coordinates", () => {
+    const layout = computeOverviewLayout(modules, edges, 540, 420);
+    for (const entry of modules) {
+      expect(Number.isFinite(layout.positions[entry.id].x)).toBe(true);
+      expect(Number.isFinite(layout.positions[entry.id].y)).toBe(true);
+      expect(layout.radii[entry.id]).toBe(entry.radius);
+    }
+    const distinct = new Set(
+      modules.map((entry) => `${layout.positions[entry.id].x.toFixed(2)},${layout.positions[entry.id].y.toFixed(2)}`),
+    );
+    expect(distinct.size).toBe(modules.length);
+  });
+
+  it("is deterministic and tolerates dangling edges and empty graphs", () => {
+    expect(computeOverviewLayout(modules, edges, 540, 420)).toEqual(
+      computeOverviewLayout(modules, edges, 540, 420),
+    );
+    expect(
+      computeOverviewLayout(
+        modules.slice(0, 3),
+        [{ from: "mod-0", to: "ghost" }, { from: "mod-1", to: "mod-1" }],
+        540,
+        420,
+      ).positions["ghost"],
+    ).toBeUndefined();
+    expect(computeOverviewLayout([], [], 540, 420)).toEqual({ positions: {}, radii: {} });
+  });
+});
+
+describe("visibleLabels", () => {
+  const candidate = (id: string, x: number, y: number, priority: number) => ({
+    id,
+    text: id,
+    x,
+    y,
+    radius: NODE_RADIUS_MIN,
+    priority,
+  });
+
+  it("keeps labels apart and inside the canvas", () => {
+    const shown = visibleLabels(
+      [
+        candidate("a", 100, 100, 0),
+        candidate("b", 104, 102, 10),
+        candidate("c", 300, 200, 20),
+        candidate("off", 539, 419, 30),
+      ],
+      540,
+      420,
+      10,
+    );
+    expect(shown.has("a")).toBe(true);
+    expect(shown.has("b")).toBe(false);
+    expect(shown.has("c")).toBe(true);
+    expect(shown.has("off")).toBe(false);
+  });
+
+  it("spends the budget in priority order", () => {
+    const shown = visibleLabels(
+      [
+        candidate("low", 60, 60, 10),
+        candidate("hovered", 300, 300, 0),
+        candidate("mid", 60, 300, 5),
+      ],
+      540,
+      420,
+      2,
+    );
+    expect([...shown].sort()).toEqual(["hovered", "mid"]);
+  });
+
+  it("draws the selected node and its neighbours before the rest", () => {
+    const shown = visibleLabels(
+      [
+        candidate("hub", 60, 60, 1),
+        candidate("near", 200, 60, 2),
+        candidate("far", 340, 60, 30),
+      ],
+      540,
+      420,
+      2,
+    );
+    expect(shown.has("hub")).toBe(true);
+    expect(shown.has("near")).toBe(true);
+    expect(shown.has("far")).toBe(false);
+  });
+});
+
+describe("fitTransform", () => {
+  it("centres a layout and keeps it inside the canvas", () => {
+    const layout = {
+      positions: { a: { x: 0, y: 0 }, b: { x: 200, y: 100 } },
+      radii: { a: 5, b: 5 },
+    };
+    const fit = fitTransform(layout, 540, 420, 28);
+    expect(fit.zoom).toBeGreaterThan(1);
+    expect(fit.x + fit.zoom * 100).toBeCloseTo(270, 6);
+    expect(fit.y + fit.zoom * 50).toBeCloseTo(210, 6);
+    // Both endpoints land inside the margins.
+    for (const point of [layout.positions.a, layout.positions.b]) {
+      expect(fit.x + fit.zoom * point.x).toBeGreaterThanOrEqual(0);
+      expect(fit.x + fit.zoom * point.x).toBeLessThanOrEqual(540);
+      expect(fit.y + fit.zoom * point.y).toBeGreaterThanOrEqual(0);
+      expect(fit.y + fit.zoom * point.y).toBeLessThanOrEqual(420);
+    }
+  });
+
+  it("clamps a single node and an empty layout", () => {
+    expect(fitTransform({ positions: { a: { x: 10, y: 10 } }, radii: { a: 3 } }, 540, 420)).toEqual(
+      { zoom: 2.4, x: 270 - 2.4 * 10, y: 210 - 2.4 * 10 },
+    );
+    expect(fitTransform({ positions: {}, radii: {} }, 540, 420)).toEqual({ zoom: 1, x: 0, y: 0 });
   });
 });

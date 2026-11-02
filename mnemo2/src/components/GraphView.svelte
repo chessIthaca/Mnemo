@@ -1,23 +1,33 @@
 <script lang="ts">
   import { Check, Copy, LoaderCircle, Minus, Network, Plus, RefreshCw, RotateCcw, Search } from "@lucide/svelte";
   import {
+    compactNodeRadius,
     computeGraphLayout,
+    computeOverviewLayout,
     createGraphTransport,
     EDGE_KINDS,
     errorText,
+    fitTransform,
     formatCount,
     formatRelativeTime,
     groupImpact,
     KIND_FILTERS,
+    LABEL_FONT_PX,
+    NODE_RADIUS_MAX,
     nodeLabel,
     symbolKindLabel,
+    visibleLabels,
     type GraphContext,
     type GraphImpactSymbol,
+    type GraphLayout,
     type GraphNeighbourhood,
     type GraphNode,
+    type GraphOverview,
+    type GraphOverviewNode,
     type GraphStatus,
     type GraphSymbol,
     type GraphTransport,
+    type LabelCandidate,
   } from "../lib/graph";
 
   const CANVAS_W = 540;
@@ -25,6 +35,12 @@
   const SEARCH_DEBOUNCE_MS = 220;
   const INDEX_POLL_MS = 1500;
   const TOP_LIMIT = 12;
+  /** Module cap of the whole-graph overview (the backend's default). */
+  const OVERVIEW_MODULE_LIMIT = 60;
+  /** Symbol cap of the "Top symbols" overview. */
+  const OVERVIEW_SYMBOL_LIMIT = 40;
+  /** Directory depth the overview aggregates at (see `graph_overview.rs`). */
+  const OVERVIEW_LEVEL = 2;
 
   const transport = createGraphTransport();
 
@@ -49,6 +65,16 @@
   let viewError = $state("");
   let loadingView = $state(false);
 
+  /** The whole-graph overview: modules by default, the top symbols on demand. */
+  let overview = $state<GraphOverview | null>(null);
+  let overviewMode = $state<"modules" | "symbols">("modules");
+  /** The module clicked on the overview; the canvas then draws its symbols. */
+  let drilledModule = $state<GraphOverviewNode | null>(null);
+  let loadingOverview = $state(false);
+  let overviewError = $state("");
+  /** The node under the pointer — its label always wins a slot. */
+  let hovered = $state<string | null>(null);
+
   /** Node positions in canvas units — the layout's output, drag moves these. */
   let positions = $state<Record<string, { x: number; y: number }>>({});
   let radii = $state<Record<string, number>>({});
@@ -62,18 +88,169 @@
   let statusSeq = 0;
   let searchSeq = 0;
   let viewSeq = 0;
+  let overviewSeq = 0;
 
-  /** The drawn nodes: the centre first, then its ring(s), de-duplicated. */
-  const drawnNodes = $derived.by(() => {
-    if (!hood) return [] as GraphNode[];
-    const seen = new Set<string>();
-    const nodes: GraphNode[] = [];
-    for (const node of [hood.center, ...hood.nodes]) {
-      if (seen.has(node.id)) continue;
-      seen.add(node.id);
-      nodes.push(node);
+  /** Measured canvas size in CSS pixels (0 before mount, and in jsdom). */
+  let canvasWidth = $state(0);
+  let canvasHeight = $state(0);
+
+  /** ViewBox units → CSS pixels: how far the SVG is scaled up on screen. */
+  const viewportScale = $derived(
+    canvasWidth > 0 && canvasHeight > 0
+      ? Math.min(canvasWidth / CANVAS_W, canvasHeight / CANVAS_H)
+      : 1,
+  );
+  /** Counter-scale for node glyphs: circles and labels keep a fixed CSS-pixel size. */
+  const glyphScale = $derived(1 / Math.max(0.0001, viewportScale * zoom));
+
+  /** One drawn node, whichever view supplied it. */
+  interface SceneNode {
+    id: string;
+    label: string;
+    /** Symbol kind; null for a directory module. */
+    kind: string | null;
+    /** Secondary line for the details panel. */
+    meta: string;
+    /** Compact on-screen radius in CSS pixels. */
+    radius: number;
+    /** Label priority: lower is placed first and survives the budget. */
+    priority: number;
+    /** Directory modules drill in; symbols focus. */
+    isModule: boolean;
+    /** The symbol a click focuses (null for modules). */
+    symbol: GraphSymbol | null;
+  }
+
+  interface Scene {
+    kind: "neighbourhood" | "module" | "overview";
+    nodes: SceneNode[];
+    edges: { key: string; from: string; to: string; kind: string }[];
+    truncated: boolean;
+  }
+
+  /** A module's symbols, shaped for the neighbourhood layout. */
+  function moduleHood(module: GraphOverviewNode): GraphNeighbourhood {
+    return {
+      center: {
+        id: module.id,
+        name: module.label,
+        kind: "module",
+        file: module.file,
+        line: 0,
+        degree: module.degree,
+      },
+      nodes: module.top,
+      edges: [],
+      truncated: module.symbols > module.top.length,
+    };
+  }
+
+  /** What the canvas draws: the selected symbol's neighbourhood, a drilled-in
+   *  module's symbols, or the whole-graph overview. */
+  const scene = $derived.by((): Scene => {
+    if (selected && hood) {
+      const ringRank = new Map(
+        [...hood.nodes]
+          .sort((a, b) => b.degree - a.degree || a.id.localeCompare(b.id))
+          .map((node, index) => [node.id, index]),
+      );
+      const seen = new Set<string>();
+      const nodes: SceneNode[] = [];
+      for (const node of [hood.center, ...hood.nodes]) {
+        if (seen.has(node.id)) continue;
+        seen.add(node.id);
+        const centre = node.id === hood.center.id;
+        nodes.push({
+          id: node.id,
+          label: node.name,
+          kind: node.kind,
+          meta: `${symbolKindLabel(node.kind)} · ${node.file}:${node.line}`,
+          radius: centre ? NODE_RADIUS_MAX : compactNodeRadius(node.degree),
+          priority: centre ? 1 : 10 + (ringRank.get(node.id) ?? 0),
+          isModule: false,
+          symbol: node,
+        });
+      }
+      return {
+        kind: "neighbourhood",
+        nodes,
+        edges: hood.edges.map((edge) => ({
+          key: `${edge.from}\u{2192}${edge.to}:${edge.kind}`,
+          from: edge.from,
+          to: edge.to,
+          kind: edge.kind,
+        })),
+        truncated: hood.truncated,
+      };
     }
-    return nodes;
+
+    if (drilledModule) {
+      const module = drilledModule;
+      const centre: SceneNode = {
+        id: module.id,
+        label: module.label,
+        kind: null,
+        meta: `${formatCount(module.symbols)} symbols`,
+        radius: NODE_RADIUS_MAX,
+        priority: 1,
+        isModule: true,
+        symbol: null,
+      };
+      const nodes: SceneNode[] = module.top.map((node, index) => ({
+        id: node.id,
+        label: node.name,
+        kind: node.kind,
+        meta: `${symbolKindLabel(node.kind)} · ${node.file}:${node.line}`,
+        radius: compactNodeRadius(node.degree),
+        priority: 10 + index,
+        isModule: false,
+        symbol: node,
+      }));
+      return {
+        kind: "module",
+        nodes: [centre, ...nodes],
+        edges: [],
+        truncated: module.symbols > module.top.length,
+      };
+    }
+
+    if (overview) {
+      const loaded = overview;
+      const symbolLevel = loaded.level === 0;
+      const nodes: SceneNode[] = loaded.nodes.map((node, index) => ({
+        id: node.id,
+        label: node.label,
+        kind: node.kind,
+        meta: symbolLevel
+          ? `${symbolKindLabel(node.kind ?? "module")} · ${node.file}:${node.line}`
+          : `${formatCount(node.symbols)} symbols · ${formatCount(node.degree)} links`,
+        radius: compactNodeRadius(symbolLevel ? node.degree : node.symbols),
+        priority: 10 + index,
+        isModule: !symbolLevel,
+        symbol: symbolLevel
+          ? {
+              id: node.id,
+              name: node.label,
+              kind: node.kind ?? "function",
+              file: node.file,
+              line: node.line,
+            }
+          : null,
+      }));
+      return {
+        kind: "overview",
+        nodes,
+        edges: loaded.edges.map((edge) => ({
+          key: `${edge.from}\u{2192}${edge.to}:${edge.kind}`,
+          from: edge.from,
+          to: edge.to,
+          kind: edge.kind,
+        })),
+        truncated: loaded.truncated || loaded.sampled_symbols < loaded.total_symbols,
+      };
+    }
+
+    return { kind: "overview", nodes: [], edges: [], truncated: false };
   });
 
   interface DrawnEdge {
@@ -87,16 +264,73 @@
 
   /** The drawn edges with both endpoints resolved to current positions. */
   const drawnEdges = $derived.by(() => {
-    if (!hood) return [] as DrawnEdge[];
     const edges: DrawnEdge[] = [];
-    for (const edge of hood.edges) {
+    for (const edge of scene.edges) {
       const from = positions[edge.from];
       const to = positions[edge.to];
       if (!from || !to) continue;
-      edges.push({ key: `${edge.from}\u{2192}${edge.to}:${edge.kind}`, x1: from.x, y1: from.y, x2: to.x, y2: to.y, kind: edge.kind });
+      edges.push({ key: edge.key, x1: from.x, y1: from.y, x2: to.x, y2: to.y, kind: edge.kind });
     }
     return edges;
   });
+
+  /** Label candidates in screen pixels; the budget and the collision pass
+   *  below decide which of them are drawn. */
+  const labelCandidates = $derived.by((): LabelCandidate[] => {
+    const candidates: LabelCandidate[] = [];
+    for (const node of scene.nodes) {
+      const at = positions[node.id];
+      if (!at) continue;
+      candidates.push({
+        id: node.id,
+        text: nodeLabel(node.label),
+        x: viewportScale * (pan.x + zoom * at.x),
+        y: viewportScale * (pan.y + zoom * at.y),
+        radius: node.radius,
+        priority: node.id === hovered ? 0 : node.priority,
+      });
+    }
+    return candidates;
+  });
+
+  /** More labels fit as the user zooms in, because the gaps grow with it. */
+  const labelBudget = $derived(Math.round(8 * Math.min(4, Math.max(1, zoom))));
+
+  const shownLabels = $derived(
+    visibleLabels(
+      labelCandidates,
+      canvasWidth > 0 ? canvasWidth : CANVAS_W,
+      canvasHeight > 0 ? canvasHeight : CANVAS_H,
+      labelBudget,
+    ),
+  );
+
+  /** The canvas's accessible name for the current view. */
+  const sceneLabel = $derived(
+    selected
+      ? `Neighbourhood of ${selected.name}`
+      : drilledModule
+        ? `Symbols in ${drilledModule.label}`
+        : "Code graph overview",
+  );
+
+  /** One line under the canvas: what the map is a map *of*. */
+  const canvasNote = $derived(
+    scene.kind === "overview"
+      ? overview && overview.sampled_symbols >= overview.total_symbols
+        ? `The whole graph: ${formatCount(overview.total_symbols)} symbols in ${formatCount(overview.total_nodes)} modules${overview.truncated ? `, the ${formatCount(overview.nodes.length)} largest shown` : ""}.`
+        : `Overview of the ${formatCount(overview?.sampled_symbols ?? 0)} most-connected symbols of ${formatCount(overview?.total_symbols ?? 0)}.`
+      : scene.kind === "module"
+        ? `The ${formatCount(drilledModule?.top.length ?? 0)} most-connected symbols here${
+            drilledModule && drilledModule.top.length < drilledModule.symbols
+              ? ` of ${formatCount(drilledModule.symbols)}`
+              : ""
+          }.`
+        : `Showing the closest ${formatCount(scene.nodes.length)} symbols.`,
+  );
+
+  /** The note explains a map always; a neighbourhood only when it is cut short. */
+  const showCanvasNote = $derived(scene.kind !== "neighbourhood" || scene.truncated);
 
   const impactGroups = $derived(groupImpact(impact));
 
@@ -118,15 +352,91 @@
       if (seq !== statusSeq) return;
       if (statusResult.status === "fulfilled") status = statusResult.value;
       else statusError = errorText(statusResult.reason);
-      if (statusResult.status === "fulfilled" && statusResult.value.available && topResult.status === "fulfilled") {
-        entryPoints = topResult.value;
+      if (statusResult.status === "fulfilled" && statusResult.value.available) {
+        if (topResult.status === "fulfilled") entryPoints = topResult.value;
+        if (!overview) loadOverview(active);
       }
       loadingStatus = false;
     })();
   }
 
+  /** Load the whole-graph overview for the current mode; `seq` drops stale answers. */
+  function loadOverview(active: GraphTransport) {
+    const seq = ++overviewSeq;
+    const mode = overviewMode;
+    loadingOverview = true;
+    overviewError = "";
+    void active
+      .overview(mode === "modules" ? OVERVIEW_LEVEL : 0, mode === "modules" ? OVERVIEW_MODULE_LIMIT : OVERVIEW_SYMBOL_LIMIT)
+      .then((loaded) => {
+        if (seq !== overviewSeq) return;
+        overview = loaded;
+        loadingOverview = false;
+        // Keep a drilled-in module pointing at the refreshed answer.
+        const drilled = drilledModule?.id;
+        if (drilled) drilledModule = loaded.nodes.find((node) => node.id === drilled) ?? null;
+      })
+      .catch((error) => {
+        if (seq !== overviewSeq) return;
+        overview = null;
+        overviewError = errorText(error);
+        loadingOverview = false;
+      });
+  }
+
+  /** Switch the overview between directory modules and the top symbols. */
+  function setOverviewMode(mode: "modules" | "symbols") {
+    if (mode === overviewMode) return;
+    overviewMode = mode;
+    drilledModule = null;
+    if (transport) loadOverview(transport);
+  }
+
+  /** Clicking a module draws its symbols around it (a drill-in, not a focus). */
+  function drillInto(module: GraphOverviewNode) {
+    if (drilledModule?.id === module.id) return;
+    drilledModule = module;
+    selected = null;
+    hood = null;
+    context = null;
+    impact = [];
+    viewError = "";
+    copied = false;
+  }
+
+  /** Back to the whole graph: nothing selected, nothing drilled in. */
+  function showOverview() {
+    drilledModule = null;
+    selected = null;
+    hood = null;
+    context = null;
+    impact = [];
+    viewError = "";
+    copied = false;
+    if (!overview && transport) loadOverview(transport);
+  }
+
   $effect(() => {
     if (transport) loadStatus(transport);
+  });
+
+  /**
+   * Measure the canvas in CSS pixels: the glyph counter-scale needs the
+   * viewBox-to-screen factor, and jsdom has no ResizeObserver — there the
+   * measurement stays 0 and the viewBox's own scale of 1 applies.
+   */
+  $effect(() => {
+    const svg = canvasSvg;
+    if (!svg) return;
+    const measure = () => {
+      canvasWidth = svg.clientWidth;
+      canvasHeight = svg.clientHeight;
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(svg);
+    return () => observer.disconnect();
   });
 
   /** While the indexer runs, keep the status line (counts, pulse) fresh. */
@@ -212,7 +522,6 @@
         hood = hoodLoaded;
         context = contextLoaded;
         impact = impactLoaded;
-        applyLayout(hoodLoaded);
       } catch (error) {
         if (seq !== viewSeq) return;
         hood = null;
@@ -238,18 +547,42 @@
       .then((hoodLoaded) => {
         if (seq !== viewSeq) return;
         hood = hoodLoaded;
-        applyLayout(hoodLoaded);
       })
       .catch((error) => {
         if (seq === viewSeq) viewError = errorText(error);
       });
   }
 
-  function applyLayout(next: GraphNeighbourhood) {
-    const layout = computeGraphLayout(next, CANVAS_W, CANVAS_H);
+  /** Adopt a layout and fit the whole drawing on screen. */
+  function placeLayout(layout: GraphLayout) {
     positions = layout.positions;
     radii = layout.radii;
+    const fit = fitTransform(layout, CANVAS_W, CANVAS_H);
+    zoom = fit.zoom;
+    pan = { x: fit.x, y: fit.y };
   }
+
+  /** Lay the current scene out: a neighbourhood ring, a module's ring, or the
+   *  whole-graph overview. */
+  function layoutScene() {
+    if (scene.kind === "neighbourhood" && hood) {
+      placeLayout(computeGraphLayout(hood, CANVAS_W, CANVAS_H));
+    } else if (scene.kind === "module" && drilledModule) {
+      placeLayout(computeGraphLayout(moduleHood(drilledModule), CANVAS_W, CANVAS_H));
+    } else {
+      placeLayout(computeOverviewLayout(scene.nodes, scene.edges, CANVAS_W, CANVAS_H));
+    }
+  }
+
+  /** Re-lay the canvas whenever the drawn scene changes, so a fresh overview
+   *  or a new neighbourhood is on screen the moment it appears. */
+  let laidOutKey = "";
+  $effect(() => {
+    const key = `${scene.kind}:${scene.nodes.map((node) => node.id).join("|")}`;
+    if (key === laidOutKey) return;
+    laidOutKey = key;
+    layoutScene();
+  });
 
   /** Re-index now; the poll effect keeps the counts moving until it settles. */
   async function refreshIndex() {
@@ -294,7 +627,7 @@
   }
 
   function onCanvasPointerDown(event: PointerEvent) {
-    if (!hood) return;
+    if (scene.nodes.length === 0) return;
     drag = { kind: "pan", startX: event.clientX, startY: event.clientY, origX: pan.x, origY: pan.y };
     canvasSvg?.setPointerCapture?.(event.pointerId);
   }
@@ -325,14 +658,21 @@
     drag = null;
   }
 
-  /** Clicking a node focuses it — unless the click ended a drag. */
+  /** Clicking a node focuses its symbol, or drills into its module — unless
+   *  the click ended a drag. */
   function onNodeClick(id: string) {
     if (clickBlocked) {
       clickBlocked = false;
       return;
     }
-    const node = hood?.center.id === id ? hood.center : hood?.nodes.find((entry) => entry.id === id);
-    if (node) focus(node);
+    const node = scene.nodes.find((entry) => entry.id === id);
+    if (!node) return;
+    if (node.isModule) {
+      const module = overview?.nodes.find((entry) => entry.id === id);
+      if (module) drillInto(module);
+      return;
+    }
+    if (node.symbol) focus(node.symbol);
   }
 
   function onNodeKey(event: KeyboardEvent, id: string) {
@@ -350,9 +690,11 @@
     zoom = Math.min(3, Math.max(0.4, zoom * factor));
   }
 
+  /** Fit the whole drawing on screen again. */
   function resetView() {
-    zoom = 1;
-    pan = { x: 0, y: 0 };
+    const fit = fitTransform({ positions, radii }, CANVAS_W, CANVAS_H);
+    zoom = fit.zoom;
+    pan = { x: fit.x, y: fit.y };
   }
 </script>
 
@@ -452,24 +794,34 @@
       </aside>
 
       <div class="graph-canvas-wrap">
-        {#if !selected}
-          <div class="canvas-empty">
-            <Network size={22} />
-            <p>Pick a symbol on the left — the canvas draws its callers and callees around it.</p>
-          </div>
-        {:else if loadingView}
-          <div class="canvas-empty">
-            <span class="spin"><LoaderCircle size={18} /></span>
-            <p>Loading the neighbourhood…</p>
-          </div>
-        {:else if viewError}
+        {#if viewError}
           <div class="canvas-empty">
             <p role="alert">{viewError}</p>
             <p class="canvas-hint">The index may have moved on — refresh and search again.</p>
           </div>
-        {:else if hood}
+        {:else if overviewError && !selected}
+          <div class="canvas-empty">
+            <p role="alert">{overviewError}</p>
+            <button class="button button-quiet" onclick={() => transport && loadOverview(transport)}>Try again</button>
+          </div>
+        {:else if loadingOverview && !overview && !selected}
+          <div class="canvas-empty">
+            <span class="spin"><LoaderCircle size={18} /></span>
+            <p>Loading the whole graph…</p>
+          </div>
+        {:else}
           <div class="canvas-tools">
-            <button class="tool-chip" aria-pressed={depth === 2} onclick={() => setDepth(depth === 2 ? 1 : 2)}>Two hops</button>
+            {#if selected}
+              <button class="tool-chip" aria-pressed={depth === 2} onclick={() => setDepth(depth === 2 ? 1 : 2)}>Two hops</button>
+              <button class="tool-chip" onclick={showOverview}>Whole graph</button>
+            {:else}
+              <button class="tool-chip" aria-pressed={overviewMode === "modules"} onclick={() => setOverviewMode("modules")}>Modules</button>
+              <button class="tool-chip" aria-pressed={overviewMode === "symbols"} onclick={() => setOverviewMode("symbols")}>Top symbols</button>
+              {#if drilledModule}
+                <button class="tool-chip" aria-pressed={true} onclick={showOverview}>{drilledModule.label}</button>
+              {/if}
+            {/if}
+            {#if loadingView}<span class="canvas-loading"><LoaderCircle size={12} /> Loading…</span>{/if}
             <span class="canvas-spacer"></span>
             <button class="icon-button canvas-zoom" aria-label="Zoom out" onclick={() => zoomBy(1 / 1.25)}><Minus size={13} /></button>
             <button class="icon-button canvas-zoom" aria-label="Zoom in" onclick={() => zoomBy(1.25)}><Plus size={13} /></button>
@@ -480,7 +832,7 @@
             class="graph-canvas"
             viewBox="0 0 {CANVAS_W} {CANVAS_H}"
             role="img"
-            aria-label="Neighbourhood of {selected.name}"
+            aria-label={sceneLabel}
             onpointerdown={onCanvasPointerDown}
             onpointermove={onCanvasPointerMove}
             onpointerup={onCanvasPointerUp}
@@ -489,24 +841,36 @@
           >
             <g transform="translate({pan.x} {pan.y}) scale({zoom})">
               {#each drawnEdges as edge (edge.key)}
-                <line class="edge edge-{edge.kind}" x1={edge.x1} y1={edge.y1} x2={edge.x2} y2={edge.y2} />
+                <line
+                  class="edge edge-{edge.kind}"
+                  x1={edge.x1}
+                  y1={edge.y1}
+                  x2={edge.x2}
+                  y2={edge.y2}
+                  vector-effect="non-scaling-stroke"
+                />
               {/each}
-              {#each drawnNodes as node (node.id)}
+              {#each scene.nodes as node (node.id)}
                 {@const at = positions[node.id]}
                 {#if at}
                   <g
                     class="graph-node"
-                    class:is-center={node.id === hood.center.id}
-                    transform="translate({at.x} {at.y})"
+                    class:is-center={node.priority === 1}
+                    class:is-module={node.isModule}
+                    transform="translate({at.x} {at.y}) scale({glyphScale})"
                     role="button"
                     tabindex="0"
-                    aria-label={`Focus ${node.name}`}
+                    aria-label={node.isModule ? `Open module ${node.label}` : `Focus ${node.label}`}
+                    onpointerenter={() => (hovered = node.id)}
+                    onpointerleave={() => (hovered = hovered === node.id ? null : hovered)}
                     onpointerdown={(event) => onNodePointerDown(event, node.id)}
                     onclick={() => onNodeClick(node.id)}
                     onkeydown={(event) => onNodeKey(event, node.id)}
                   >
-                    <circle r={radii[node.id] ?? 6}></circle>
-                    <text y={(radii[node.id] ?? 6) + 12}>{nodeLabel(node.name)}</text>
+                    <circle r={node.radius}></circle>
+                    {#if shownLabels.has(node.id)}
+                      <text y={node.radius + 4} style="font-size: {LABEL_FONT_PX}px">{nodeLabel(node.label)}</text>
+                    {/if}
                   </g>
                 {/if}
               {/each}
@@ -517,13 +881,41 @@
               <span><i class="legend-line legend-{entry.kind}"></i>{entry.label}</span>
             {/each}
           </div>
-          {#if hood.truncated}<p class="canvas-note">Showing the closest {formatCount(drawnNodes.length)} symbols.</p>{/if}
+          {#if showCanvasNote}<p class="canvas-note">{canvasNote}</p>{/if}
         {/if}
       </div>
 
       <aside class="graph-detail" aria-label="Symbol details">
-        {#if !selected}
-          <p class="detail-empty">Nothing selected — pick a symbol to see its callers, callees and change impact.</p>
+        {#if drilledModule}
+          <div class="detail-head">
+            <h2>{drilledModule.label}</h2>
+            <span class="kind-pill">module</span>
+            <div class="detail-location">
+              <code>{drilledModule.file}</code>
+            </div>
+          </div>
+          <section class="detail-section" aria-label="Symbols in this module">
+            <h3>Symbols <span class="detail-count">{formatCount(drilledModule.symbols)}</span></h3>
+            {#if drilledModule.top.length === 0}
+              <p class="detail-none">No symbols drawn from this module — try the Top symbols view.</p>
+            {:else}
+              <ul>
+                {#each drilledModule.top as symbol (symbol.id)}
+                  <li>
+                    <button class="detail-row" onclick={() => focus(symbol)}>
+                      <span class="detail-name">{symbol.name}</span>
+                      <span class="detail-meta">{symbolKindLabel(symbol.kind)} · {formatCount(symbol.degree)} links</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+              {#if drilledModule.top.length < drilledModule.symbols}
+                <p class="detail-more">+{formatCount(drilledModule.symbols - drilledModule.top.length)} more</p>
+              {/if}
+            {/if}
+          </section>
+        {:else if !selected}
+          <p class="detail-empty">Nothing selected — the canvas shows the whole graph. Pick a module to drill into it, or a symbol to see its callers, callees and change impact.</p>
         {:else}
           <div class="detail-head">
             <h2>{selected.name}</h2>
@@ -649,11 +1041,13 @@
   .edge-contains { stroke: var(--accent); stroke-width: 1.1; stroke-dasharray: 2 4; }
   .graph-node { cursor: pointer; }
   .graph-node circle { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.2; }
-  .graph-node:hover circle { stroke: var(--accent-strong); }
+  .graph-node:hover circle { stroke: var(--accent-strong); stroke-width: 2; }
   .graph-node:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .graph-node text { fill: var(--ink-soft); font-family: var(--font-ui); font-size: var(--text-meta); text-anchor: middle; }
+  .graph-node text { fill: var(--ink-soft); font-family: var(--font-ui); font-size: 10px; text-anchor: middle; }
   .graph-node.is-center circle { fill: var(--accent-soft); stroke: var(--accent-strong); stroke-width: 1.6; }
   .graph-node.is-center text { fill: var(--ink); font-weight: 650; }
+  .graph-node.is-module circle { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+  .canvas-loading { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: var(--text-meta); }
   .graph-legend { position: absolute; bottom: 10px; left: 12px; display: flex; gap: 12px; color: var(--muted); font-size: var(--text-meta); }
   .legend-line { display: inline-block; width: 16px; margin-right: 5px; vertical-align: middle; border-top: 2px solid var(--ink-soft); }
   .legend-imports { border-top: 2px dashed var(--muted); }

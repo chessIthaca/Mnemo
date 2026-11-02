@@ -63,6 +63,52 @@ export interface GraphNeighbourhood {
   truncated: boolean;
 }
 
+/** One node of the whole-graph overview: a directory module, or a symbol. */
+export interface GraphOverviewNode {
+  /** Module directory path, or the symbol id at level 0. */
+  id: string;
+  /** Short label: the directory's last segment, or the symbol name. */
+  label: string;
+  /** Symbol kind at level 0; null for a directory module. */
+  kind: string | null;
+  /** Project-relative file (symbols) or directory path (modules). */
+  file: string;
+  /** Definition start line (symbols); 0 for a module. */
+  line: number;
+  /** Symbols the node stands for (1 for a symbol node). */
+  symbols: number;
+  /** Aggregated edge weight touching the node. */
+  degree: number;
+  /** Modules: their most-connected symbols, for the drill-in ring. */
+  top: GraphNode[];
+}
+
+/** One counted, aggregated edge between two overview nodes. */
+export interface GraphOverviewEdge {
+  from: string;
+  to: string;
+  /** `calls` / `imports` / `contains`. */
+  kind: string;
+  /** How many symbol edges this row stands for. */
+  count: number;
+}
+
+/** The graph's opening view: directory modules (level ≥ 1) or symbols (level 0). */
+export interface GraphOverview {
+  /** Directory depth aggregated at; 0 is the symbol level. */
+  level: number;
+  nodes: GraphOverviewNode[];
+  edges: GraphOverviewEdge[];
+  /** Candidate nodes before the cap. */
+  total_nodes: number;
+  /** True when the cap dropped nodes. */
+  truncated: boolean;
+  /** Symbols in the whole graph snapshot. */
+  total_symbols: number;
+  /** Symbols this overview aggregated (the degree-ranked slice). */
+  sampled_symbols: number;
+}
+
 /** The details panel's exact caller/callee lists. */
 export interface GraphContext {
   symbol: GraphNode;
@@ -81,6 +127,8 @@ export interface GraphTransport {
   impact(symbolId: string): Promise<GraphImpactSymbol[]>;
   /** The most-connected symbols — the tab's entry points. */
   top(limit?: number): Promise<GraphNode[]>;
+  /** The whole-graph overview: directory modules, or the symbol slice at level 0. */
+  overview(level?: number, limit?: number): Promise<GraphOverview>;
   context(symbolId: string): Promise<GraphContext>;
 }
 
@@ -112,6 +160,8 @@ function createTauriGraphTransport(bindings: GraphTransportBindings): GraphTrans
       bindings.invoke<GraphNeighbourhood>("graph_neighbourhood", { symbolId, depth }),
     impact: (symbolId) => bindings.invoke<GraphImpactSymbol[]>("graph_impact", { symbolId }),
     top: (limit) => bindings.invoke<GraphNode[]>("graph_top", { limit: limit ?? null }),
+    overview: (level, limit) =>
+      bindings.invoke<GraphOverview>("graph_overview", { level: level ?? null, limit: limit ?? null }),
     context: (symbolId) => bindings.invoke<GraphContext>("graph_context", { symbolId }),
   };
 }
@@ -233,10 +283,28 @@ interface SimNode extends SimulationNodeDatum {
 
 interface SimLink extends SimulationLinkDatum<SimNode> {}
 
-/** Circle radius for a node: hubs grow with degree, the centre is emphasised. */
+/** Compact on-screen node radius: 3px for a leaf. */
+export const NODE_RADIUS_MIN = 3;
+/** Largest on-screen node radius, in CSS pixels. */
+export const NODE_RADIUS_MAX = 7;
+/** On-screen label size; a constant, so the zoom never inflates the text. */
+export const LABEL_FONT_PX = 10;
+
+/**
+ * Compact node radius in CSS pixels: 3px for a leaf, 7px for a hub.
+ *
+ * The radius is a *screen* size, not a canvas-unit one: the view counter-scales
+ * each node group by the current zoom and viewport scale, so a hub never
+ * swallows its neighbours and the drawing stays legible with 5 nodes or 300.
+ */
+export function compactNodeRadius(weight: number, max: number = NODE_RADIUS_MAX): number {
+  const scaled = NODE_RADIUS_MIN + Math.sqrt(Math.max(0, weight)) * 0.55;
+  return Math.min(max, scaled);
+}
+
+/** Circle radius for a neighbourhood node: hubs grow with degree, the centre is emphasised. */
 function nodeRadius(symbol: GraphNode, centerId: string): number {
-  if (symbol.id === centerId) return 12;
-  return 5 + Math.min(8, Math.round(Math.sqrt(Math.max(0, symbol.degree)) * 1.6));
+  return symbol.id === centerId ? NODE_RADIUS_MAX : compactNodeRadius(symbol.degree);
 }
 
 const LAYOUT_TICKS = 240;
@@ -305,4 +373,191 @@ export function computeGraphLayout(
     positions[node.id] = { x, y };
   }
   return { positions, radii };
+}
+/** One node a whole-graph layout is computed for. */
+export interface LayoutNode {
+  id: string;
+  /** Compact on-screen radius, in CSS pixels. */
+  radius: number;
+}
+
+/** One edge a whole-graph layout is computed for. */
+export interface LayoutEdge {
+  from: string;
+  to: string;
+}
+
+/**
+ * Lay the whole-graph overview out on a `width × height` canvas: there is no
+ * centre to pin, so the nodes start on a golden-angle sunflower (even coverage
+ * from the first tick) and the same synchronous d3-force pass the
+ * neighbourhood uses refines them. Deterministic — same input, same output.
+ */
+export function computeOverviewLayout(
+  nodes: readonly LayoutNode[],
+  edges: readonly LayoutEdge[],
+  width: number,
+  height: number,
+): GraphLayout {
+  const positions: Record<string, { x: number; y: number }> = {};
+  const radii: Record<string, number> = {};
+  if (nodes.length === 0) return { positions, radii };
+
+  const ids = new Set(nodes.map((node) => node.id));
+  for (const node of nodes) radii[node.id] = node.radius;
+
+  const cx = width / 2;
+  const cy = height / 2;
+  const spread = Math.min(width, height) * 0.44;
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+  const simNodes: SimNode[] = nodes.map((node, index) => {
+    const angle = index * goldenAngle;
+    const distance = spread * Math.sqrt((index + 0.5) / nodes.length);
+    return {
+      id: node.id,
+      x: cx + Math.cos(angle) * distance,
+      y: cy + Math.sin(angle) * distance,
+    };
+  });
+
+  const links: SimLink[] = [];
+  for (const edge of edges) {
+    if (edge.from === edge.to) continue;
+    if (!ids.has(edge.from) || !ids.has(edge.to)) continue;
+    links.push({ source: edge.from, target: edge.to });
+  }
+
+  // 300 symbols need much shorter springs than 40 modules to stay on canvas.
+  const crowded = nodes.length > 120;
+  const radiusOf = new Map(nodes.map((node) => [node.id, node.radius]));
+  const simulation = forceSimulation<SimNode>(simNodes)
+    .force(
+      "link",
+      forceLink<SimNode, SimLink>(links)
+        .id((node) => node.id)
+        .distance(crowded ? 44 : 64)
+        .strength(0.35),
+    )
+    .force("charge", forceManyBody<SimNode>().strength(crowded ? -70 : -170))
+    .force(
+      "collide",
+      forceCollide<SimNode>()
+        .radius((node) => (radiusOf.get(node.id) ?? NODE_RADIUS_MIN) + (crowded ? 5 : 9))
+        .iterations(2),
+    )
+    .stop();
+  for (let tick = 0; tick < LAYOUT_TICKS; tick += 1) simulation.tick();
+
+  for (const node of simNodes) {
+    const x = typeof node.x === "number" && Number.isFinite(node.x) ? node.x : cx;
+    const y = typeof node.y === "number" && Number.isFinite(node.y) ? node.y : cy;
+    positions[node.id] = { x, y };
+  }
+  return { positions, radii };
+}
+
+/** One candidate label, positioned in on-screen pixels. */
+export interface LabelCandidate {
+  id: string;
+  /** Label text, already shortened. */
+  text: string;
+  /** Node centre, in CSS pixels. */
+  x: number;
+  y: number;
+  /** Node radius, in CSS pixels. */
+  radius: number;
+  /** 0 is drawn first (selected, hovered); larger values lose the budget. */
+  priority: number;
+}
+
+interface LabelBox {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+/** Rough advance width of one 10px label character, in CSS pixels. */
+const LABEL_CHAR_PX = 5.6;
+/** Label line height, in CSS pixels. */
+const LABEL_LINE_PX = 11;
+
+/**
+ * Pick the labels that fit without piling up: placed in priority order (the
+ * selected node, its neighbours and the hovered node first, then by size),
+ * each under its node, skipping any that would touch a placed label or leave
+ * the canvas. `budget` caps how many labels one zoom level may draw, so a
+ * dense overview shows only its biggest nodes until the user zooms in.
+ */
+export function visibleLabels(
+  candidates: readonly LabelCandidate[],
+  width: number,
+  height: number,
+  budget: number,
+): Set<string> {
+  const shown = new Set<string>();
+  const placed: LabelBox[] = [];
+  const ordered = [...candidates].sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
+  for (const candidate of ordered) {
+    if (shown.size >= budget) break;
+    const textWidth = Math.max(8, candidate.text.length * LABEL_CHAR_PX);
+    const left = candidate.x - textWidth / 2;
+    const top = candidate.y + candidate.radius + 2;
+    const box: LabelBox = { left, top, right: left + textWidth, bottom: top + LABEL_LINE_PX };
+    if (box.left < 0 || box.right > width || box.bottom > height) continue;
+    const collides = placed.some(
+      (other) =>
+        box.left < other.right &&
+        other.left < box.right &&
+        box.top < other.bottom &&
+        other.top < box.bottom,
+    );
+    if (collides) continue;
+    placed.push(box);
+    shown.add(candidate.id);
+  }
+  return shown;
+}
+
+/** The canvas transform: `translate(x y) scale(zoom)`. */
+export interface ViewTransform {
+  zoom: number;
+  x: number;
+  y: number;
+}
+
+/**
+ * Fit a laid-out graph into the `width × height` canvas: the zoom and pan that
+ * centre it with a little margin, clamped so a two-node ring does not fill the
+ * screen. Called on load and on every view switch, so the whole graph is on
+ * screen the moment it is drawn.
+ */
+export function fitTransform(
+  layout: GraphLayout,
+  width: number,
+  height: number,
+  margin = 28,
+): ViewTransform {
+  const entries = Object.entries(layout.positions);
+  if (entries.length === 0) return { zoom: 1, x: 0, y: 0 };
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const [id, at] of entries) {
+    const radius = layout.radii[id] ?? NODE_RADIUS_MIN;
+    minX = Math.min(minX, at.x - radius);
+    minY = Math.min(minY, at.y - radius);
+    maxX = Math.max(maxX, at.x + radius);
+    maxY = Math.max(maxY, at.y + radius);
+  }
+  const boxWidth = Math.max(1, maxX - minX);
+  const boxHeight = Math.max(1, maxY - minY);
+  const zoom = Math.min(
+    2.4,
+    Math.max(0.4, Math.min((width - margin * 2) / boxWidth, (height - margin * 2) / boxHeight)),
+  );
+  const centreX = (minX + maxX) / 2;
+  const centreY = (minY + maxY) / 2;
+  return { zoom, x: width / 2 - zoom * centreX, y: height / 2 - zoom * centreY };
 }

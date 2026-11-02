@@ -51,6 +51,10 @@ pub mod workbench;
 /// impact, entry points, context).
 pub mod graph;
 
+/// The Graph tab's whole-graph overview: the graph aggregated into directory
+/// modules (or drawn symbol by symbol), for the tab's opening view.
+pub mod graph_overview;
+
 /// The native child-WebView2 Browser pane and its non-Windows fallback.
 pub mod browser;
 
@@ -427,6 +431,7 @@ pub fn run() {
             graph::graph_impact,
             graph::graph_top,
             graph::graph_context,
+            graph_overview::graph_overview,
             ipc::mnemo2_startup_project,
             ipc::external_lead_status,
             ipc::external_open_failed,

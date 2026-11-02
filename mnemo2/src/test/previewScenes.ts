@@ -11,6 +11,7 @@ import type { BoardPlan } from "../lib/boardState";
 import type { WorkerDeletionPreview } from "../lib/teamState";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
+import { seedCostPreview, type CostInsights } from "../lib/cost";
 
 /** The fixture worker whose thread the preview shows in full. */
 const RICH_WORKER_ID = "kai";
@@ -363,6 +364,92 @@ function deleteSheet(): AppState {
   };
 }
 
+/** Seconds in a day — the engine's Cost series buckets UTC days. */
+const DAY_SECONDS = 86_400;
+
+/** The UTC day bucket of "today" at the time the scene is built. */
+const TODAY_SECONDS = Math.floor(NOW_MS / 1000 / DAY_SECONDS) * DAY_SECONDS;
+
+/**
+ * The sample the `cost` scene seeds: two priced models and one unpriced, every
+ * lever active, and a two-week series that ramps up. The browser preview has no
+ * Tauri host, so these reports stand in for the two `insights_*` commands.
+ */
+function previewCostInsights(): CostInsights {
+  const spendPerDay = [
+    240_000, 510_000, 380_000, 720_000, 660_000, 990_000, 1_240_000, 860_000,
+    1_120_000, 1_460_000, 1_020_000, 1_580_000, 1_810_000, 2_050_000,
+  ];
+  const savedPerDay = [
+    380_000, 420_000, 330_000, 560_000, 520_000, 640_000, 760_000, 590_000,
+    700_000, 810_000, 660_000, 890_000, 980_000, 706_000,
+  ];
+  const day = (index: number): number => TODAY_SECONDS - (13 - index) * DAY_SECONDS;
+  return {
+    cost: {
+      total: {
+        input_tokens: 4_540_000,
+        cached_tokens: 6_060_000,
+        output_tokens: 580_000,
+        cost_micros: 13_510_000,
+      },
+      models: [
+        {
+          model: "anthropic/claude-opus-5-5",
+          input_tokens: 3_200_000,
+          cached_tokens: 5_100_000,
+          output_tokens: 420_000,
+          cost_micros: 12_470_000,
+        },
+        {
+          model: "glm-5.3-flash",
+          input_tokens: 1_100_000,
+          cached_tokens: 900_000,
+          output_tokens: 130_000,
+          cost_micros: 1_040_000,
+        },
+        {
+          model: "ollama/qwen3:32b",
+          input_tokens: 240_000,
+          cached_tokens: 60_000,
+          output_tokens: 30_000,
+          cost_micros: null,
+        },
+      ],
+      unpriced_models: ["ollama/qwen3:32b"],
+      per_day: spendPerDay.map((costMicros, index) => ({ day: day(index), cost_micros: costMicros })),
+    },
+    savings: {
+      tokens_saved: 8_946_000,
+      estimated_saved_micros: 2_380_000,
+      levers: [
+        { kind: "delta_read", events: 1_240, tokens_saved: 4_180_000, estimated_saved_micros: 1_090_000 },
+        { kind: "skeleton", events: 862, tokens_saved: 1_910_000, estimated_saved_micros: 505_000 },
+        { kind: "recall_delta", events: 214, tokens_saved: 1_060_000, estimated_saved_micros: 280_000 },
+        { kind: "compression", events: 388, tokens_saved: 940_000, estimated_saved_micros: 248_000 },
+        { kind: "archive", events: 46, tokens_saved: 580_000, estimated_saved_micros: 153_000 },
+        { kind: "outline", events: 102, tokens_saved: 246_000, estimated_saved_micros: 65_000 },
+        { kind: "truncation", events: 61, tokens_saved: 150_000, estimated_saved_micros: 39_000 },
+        { kind: "compaction_checkpoint", events: 9, tokens_saved: 0, estimated_saved_micros: 0 },
+        { kind: "archive_expand", events: 6, tokens_saved: -120_000, estimated_saved_micros: 0 },
+      ],
+      cache: {
+        prompt_tokens: 12_400_000,
+        cached_tokens: 8_900_000,
+        hit_rate: 0.718,
+        estimated_saved_micros: 1_850_000,
+      },
+      per_day: savedPerDay.map((tokensSaved, index) => ({ day: day(index), tokens_saved: tokensSaved })),
+    },
+  };
+}
+
+/** The Cost tab over the same project: spend, savings, cache, and two weeks of bars. */
+function costTab(): AppState {
+  seedCostPreview(previewCostInsights());
+  return { ...baseState(), route: "cost" };
+}
+
 /** Every scene the preview page renders, in index order. */
 export const previewScenes: PreviewScene[] = [
   {
@@ -394,6 +481,12 @@ export const previewScenes: PreviewScene[] = [
     title: "Delete-old sheet",
     description: "The delete sheet with one superseded worker.",
     build: deleteSheet,
+  },
+  {
+    name: "cost",
+    title: "Cost",
+    description: "The Cost tab: spend by model, savings per lever, prompt-cache hits and the last 14 days.",
+    build: costTab,
   },
 ];
 

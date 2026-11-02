@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AppState, LeadEntry, Worker, WorkerThreadEntry } from "../lib/types";
+import { costPreviewInsights } from "../lib/cost";
 import {
   defaultPreviewScene,
   previewScene,
@@ -50,6 +51,7 @@ describe("preview scenes", () => {
       "lead-chat",
       "lead-idle",
       "delete-sheet",
+      "cost",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
     expect(previewScene("")?.name).toBe(defaultPreviewScene);
@@ -125,6 +127,17 @@ describe("preview scenes", () => {
     expect(request?.previews).toHaveLength(1);
     expect(request?.previews[0].superseded_by).toBeTruthy();
     expect(request?.previews[0].unmerged_commits).toBeGreaterThan(0);
+  });
+
+  it("cost opens the Cost tab with the reports the browser preview renders", () => {
+    const state = build("cost");
+    expect(state.route).toBe("cost");
+    const insights = costPreviewInsights();
+    expect(insights).not.toBeNull();
+    expect(insights?.cost.models.length).toBe(3);
+    expect(insights?.cost.unpriced_models).toEqual(["ollama/qwen3:32b"]);
+    expect(insights?.cost.per_day).toHaveLength(14);
+    expect(insights?.savings.levers.some((lever) => lever.kind === "delta_read")).toBe(true);
   });
 
   it("mission-control shows one running worker in every live phase", () => {

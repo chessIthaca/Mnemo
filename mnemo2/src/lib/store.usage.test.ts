@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LeadTransport } from "./leadEngine";
 import type { TeamTransport } from "./teamEngine";
 import type { LeadEvent, LeadSnapshot } from "./types";
-import type { ProjectUsageView, TeamEvent, TeamSnapshot } from "./teamState";
+import type { ProjectUsageView, TeamDeleteOutcome, TeamEvent, TeamSnapshot } from "./teamState";
 
 const harness = vi.hoisted(() => ({
   team: null as TeamTransport | null,
@@ -81,11 +81,14 @@ function makeTeam(initial: ProjectUsageView) {
       usage,
     })),
     deletePreview: vi.fn(async () => []),
-    deleteWorkers: vi.fn(async (): Promise<TeamSnapshot> => ({
-      workers: [],
-      slots: 2,
-      active: 0,
-      usage,
+    deleteWorkers: vi.fn(async (): Promise<TeamDeleteOutcome> => ({
+      results: [],
+      snapshot: {
+        workers: [],
+        slots: 2,
+        active: 0,
+        usage,
+      },
     })),
     messages: vi.fn(async () => []),
     onEvent: vi.fn(async (handler: (event: TeamEvent) => void) => {

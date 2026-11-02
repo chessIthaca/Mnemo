@@ -43,7 +43,9 @@ use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
 use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
-    BoardSignal, BoardSnapshot, MessageSender, TeamMessage, TeamRuntime, TeamSnapshot, WorkerDeletion, WorkerRecord, TEAM_EVENT_CHANNEL,
+    BoardSignal, BoardSnapshot, DeletionPhase, DeletionProgress, MessageSender, TeamMessage,
+    TeamRuntime, TeamSnapshot, TeamDeleteOutcome, WorkerDeletion, WorkerRecord,
+    DELETION_EVENT_CHANNEL, TEAM_EVENT_CHANNEL,
 };
 use crate::mnemo2::workbench::{self, DiffSnapshot};
 
@@ -1012,25 +1014,57 @@ pub async fn team_stop_all(state: State<'_, Mnemo2State>) -> Result<(), String> 
     current_team(&state).await?.stop_all().await
 }
 
-/// Report what deleting these workers would remove, changing nothing.
+/// Report what deleting these workers would remove, changing nothing. Each
+/// worker's finished preview is streamed on `mnemo2://worker-deletion` the
+/// moment its checks are done, so the open sheet fills its rows in.
 #[tauri::command]
 pub async fn team_delete_preview(
+    app: AppHandle,
     state: State<'_, Mnemo2State>,
     worker_ids: Vec<String>,
 ) -> Result<Vec<WorkerDeletion>, String> {
-    current_team(&state).await?.deletion_preview(&worker_ids).await
+    current_team(&state)
+        .await?
+        .deletion_preview_streaming(&worker_ids, |preview| {
+            let _ = app.emit(
+                DELETION_EVENT_CHANNEL,
+                DeletionProgress {
+                    phase: DeletionPhase::Checking,
+                    worker_id: preview.worker_id.clone(),
+                    name: preview.name.clone(),
+                    preview: Some(preview),
+                    error: None,
+                },
+            );
+        })
+        .await
 }
 
-/// Delete inactive workers with their history, checkout, and branch.
+/// Delete inactive workers with their history, checkout, and branch. Every
+/// worker that can be deleted is deleted even when some fail: the outcome
+/// carries one per-worker result plus the team snapshot, and each worker's
+/// result is streamed on `mnemo2://worker-deletion` the moment it is known.
 #[tauri::command]
 pub async fn team_delete(
+    app: AppHandle,
     state: State<'_, Mnemo2State>,
     worker_ids: Vec<String>,
     discard_work: bool,
-) -> Result<TeamSnapshot, String> {
+) -> Result<TeamDeleteOutcome, String> {
     current_team(&state)
         .await?
-        .delete_workers(&worker_ids, discard_work)
+        .delete_workers_streaming(&worker_ids, discard_work, |result| {
+            let _ = app.emit(
+                DELETION_EVENT_CHANNEL,
+                DeletionProgress {
+                    phase: DeletionPhase::Deleting,
+                    worker_id: result.worker_id.clone(),
+                    name: result.name.clone(),
+                    preview: None,
+                    error: result.error.clone(),
+                },
+            );
+        })
         .await
 }
 

@@ -91,7 +91,10 @@ function makeTransport(record: TeamWorkerRecord): { transport: TeamTransport; em
     stopAll: vi.fn(async () => {}),
     setSlots: vi.fn(async () => ({ workers: [record], slots: 3, active: 1, usage: emptyProjectUsageView() })),
     deletePreview: vi.fn(async () => []),
-    deleteWorkers: vi.fn(async () => ({ workers: [], slots: 3, active: 0, usage: emptyProjectUsageView() })),
+    deleteWorkers: vi.fn(async () => ({
+      results: [],
+      snapshot: { workers: [], slots: 3, active: 0, usage: emptyProjectUsageView() },
+    })),
     compact: vi.fn(async () => record),
     messages: vi.fn(async () => []),
     onEvent: vi.fn(async (handler: (event: TeamEvent) => void) => {

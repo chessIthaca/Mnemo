@@ -566,10 +566,23 @@ export interface ProjectUsage {
   unpricedModels: string[];
 }
 
-/** A pending worker deletion awaiting the user's confirmation. */
+/** One worker's row in the open deletion sheet. */
+export interface WorkerDeletionRow {
+  workerId: string;
+  name: string;
+  /** The worker's finished preview; null while its checks still run. */
+  preview: WorkerDeletionPreview | null;
+  /** Why this worker's deletion failed; null unless it failed. */
+  error: string | null;
+  /** The worker was deleted. */
+  deleted: boolean;
+}
+
+/** An open worker-deletion sheet: rows stream in per worker. */
 export interface WorkerDeletionRequest {
-  previews: WorkerDeletionPreview[];
-  busy: boolean;
+  /** "checking" while previews stream in, "ready" once every worker is checked, "deleting" while workers are removed. */
+  phase: "checking" | "ready" | "deleting";
+  rows: WorkerDeletionRow[];
 }
 
 export interface AppState {

@@ -111,7 +111,7 @@
     <div class="team-settings">
       <span class="slot-pill">{$app.teamActive} live / {$app.teamSlots} slots</span>
       <button class="button button-quiet" disabled={$app.teamActive === 0} onclick={() => actions.stopAll()}><Square size={11} /> Stop all</button>
-      <button class="button button-quiet" title="Delete merged, cancelled, stopped, interrupted, and failed workers, plus finished audits, with their history" disabled={oldCount === 0} onclick={() => actions.requestDeleteOldWorkers()}><Trash2 size={11} /> Delete old ({oldCount})</button>
+      <button class="button button-quiet" title="Delete merged, cancelled, stopped, interrupted, and failed workers, plus finished audits, with their history" disabled={oldCount === 0 || $app.workerDeletion !== null} onclick={() => actions.requestDeleteOldWorkers()}><Trash2 size={11} /> Delete old ({oldCount})</button>
     </div>
   </header>
 

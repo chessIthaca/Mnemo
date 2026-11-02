@@ -2,7 +2,11 @@ import { derived, get, writable } from "svelte/store";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
 import { createProjectTransport, type ProjectPreferences, type ProjectRecord, type ProjectTransport } from "./projectEngine";
 import { probeMnemo2Host } from "./runtime";
-import { createTeamTransport, type TeamTransport } from "./teamEngine";
+import {
+  createTeamTransport,
+  type TeamTransport,
+  type WorkerDeletionProgress,
+} from "./teamEngine";
 import { createBoardTransport, type BoardTransport } from "./boardEngine";
 import { createIndexingTransport, newerIndexing, type IndexingSnapshot, type IndexingTransport } from "./indexingEngine";
 import {
@@ -1676,14 +1680,103 @@ export function isOldWorker(worker: Pick<Worker, "status" | "kind">): boolean {
     (worker.kind === "audit" && worker.status === "completed");
 }
 
-/** Ask what deleting these workers removes, then open the confirmation. */
+/** A token that invalidates promises and events of superseded deletion
+ * flows: each open request bumps it, so a canceled or reopened sheet never
+ * applies a stale result. */
+let deletionFlow = 0;
+
+/** The streamed per-worker deletion progress listener; null while none is
+ * subscribed. One listener serves the open request and is removed when
+ * the sheet closes. */
+let deletionUnlisten: (() => void) | null = null;
+
+/** Merge one streamed deletion update into the open sheet's rows. */
+function applyDeletionProgress(event: WorkerDeletionProgress): void {
+  app.update((state) => {
+    const request = state.workerDeletion;
+    if (!request) return state;
+    return {
+      ...state,
+      workerDeletion: {
+        ...request,
+        rows: request.rows.map((row) => {
+          if (row.workerId !== event.worker_id) return row;
+          return {
+            ...row,
+            name: event.name || row.name,
+            preview: event.preview
+              ? deletionPreviewFromWire(event.preview)
+              : row.preview,
+            error: event.error ?? row.error,
+            deleted: event.phase === "deleting" && event.error === null,
+          };
+        }),
+      },
+    };
+  });
+}
+
+/** Close the sheet, invalidating anything its flow still has in flight. */
+function closeDeletionSheet(): void {
+  deletionFlow += 1;
+  deletionUnlisten?.();
+  deletionUnlisten = null;
+  app.update((state) => (state.workerDeletion ? { ...state, workerDeletion: null } : state));
+}
+
+/**
+ * Open the deletion sheet at once: rows start in a checking state and fill
+ * in per worker as the host streams finished previews
+ * (`mnemo2://worker-deletion`), so slow Git checks never delay the
+ * dialog. A request that is already open is ignored — the button cannot
+ * open the sheet twice.
+ */
 async function requestDeleteWorkers(workerIds: string[]): Promise<void> {
   const transport = requireTeam();
   if (!transport || workerIds.length === 0) return;
+  if (get(app).workerDeletion) return;
+  const ids = [...new Set(workerIds)];
+  const workers = get(app).workers;
+  app.update((state) => ({
+    ...state,
+    workerDeletion: {
+      phase: "checking",
+      rows: ids.map((workerId) => ({
+        workerId,
+        name: workers.find((worker) => worker.id === workerId)?.name ?? workerId,
+        preview: null,
+        error: null,
+        deleted: false,
+      })),
+    },
+  }));
+  const flow = ++deletionFlow;
+  deletionUnlisten?.();
+  deletionUnlisten = transport.onDeletionEvent
+    ? await transport.onDeletionEvent(applyDeletionProgress)
+    : null;
   try {
-    const previews = (await transport.deletePreview(workerIds)).map(deletionPreviewFromWire);
-    app.update((state) => ({ ...state, workerDeletion: { previews, busy: false } }));
+    const previews = (await transport.deletePreview(ids)).map(deletionPreviewFromWire);
+    if (flow !== deletionFlow) return;
+    app.update((state) => {
+      const request = state.workerDeletion;
+      if (!request) return state;
+      return {
+        ...state,
+        workerDeletion: {
+          ...request,
+          rows: request.rows.map((row) => ({
+            ...row,
+            preview:
+              previews.find((preview) => preview.worker_id === row.workerId) ?? row.preview,
+          })),
+          phase: "ready",
+        },
+      };
+    });
   } catch (error) {
+    if (flow !== deletionFlow) return;
+    closeDeletionSheet();
     noteTeamError(error);
   }
 }
@@ -1699,33 +1792,77 @@ async function requestDeleteOldWorkers(): Promise<void> {
 }
 
 function cancelDeleteWorkers(): void {
-  if (!get(app).workerDeletion?.busy) app.update((state) => ({ ...state, workerDeletion: null }));
+  const request = get(app).workerDeletion;
+  if (!request || request.phase === "deleting") return;
+  closeDeletionSheet();
 }
 
-/** Delete the confirmed workers; blocked ones are left in place. */
+/**
+ * Delete the confirmed workers; blocked ones are left in place. Results
+ * stream in per worker; when some fail the sheet stays open with a retry
+ * for exactly those workers, and closes only once nothing failed.
+ */
 async function confirmDeleteWorkers(): Promise<void> {
-  const request = get(app).workerDeletion;
   const transport = requireTeam();
-  if (!request || request.busy || !transport) return;
-  const deletable = request.previews.filter((preview) => preview.blocked === null);
-  if (deletable.length === 0) return;
-  app.update((state) => ({
-    ...state,
-    workerDeletion: state.workerDeletion ? { ...state.workerDeletion, busy: true } : null,
-  }));
+  const request = get(app).workerDeletion;
+  if (!transport || !request || request.phase !== "ready") return;
+  // After a failed round, retry only the workers that failed.
+  const retrying = request.rows.some((row) => row.error !== null && !row.deleted);
+  const rows = retrying
+    ? request.rows.filter((row) => row.error !== null && !row.deleted)
+    : request.rows.filter((row) => row.preview && row.preview.blocked === null);
+  if (rows.length === 0) return;
+  const discardWork = rows.some((row) => row.preview && deletionDiscardsWork(row.preview));
+  const flow = deletionFlow;
+  app.update((state) =>
+    state.workerDeletion
+      ? { ...state, workerDeletion: { ...state.workerDeletion, phase: "deleting" } }
+      : state,
+  );
   try {
-    await transport.deleteWorkers(
-      deletable.map((preview) => preview.worker_id),
-      deletable.some(deletionDiscardsWork),
+    const outcome = await transport.deleteWorkers(
+      rows.map((row) => row.workerId),
+      discardWork,
     );
-    app.update((state) => withToast(
-      { ...state, workerDeletion: null },
-      `Deleted ${deletable.length} worker${deletable.length === 1 ? "" : "s"} and ${deletable.length === 1 ? "its" : "their"} history.`,
-    ));
+    if (flow !== deletionFlow) return;
+    app.update((state) => {
+      const current = state.workerDeletion;
+      if (!current || current.phase !== "deleting") return state;
+      const nextRows = current.rows.map((row) => {
+        const result = outcome.results.find((entry) => entry.worker_id === row.workerId);
+        if (!result) return row;
+        return {
+          ...row,
+          name: result.name || row.name,
+          error: result.error ?? row.error,
+          deleted: result.error === null,
+        };
+      });
+      const failed = nextRows.filter((row) => row.error !== null && !row.deleted);
+      if (failed.length === 0) {
+        return withToast(
+          { ...state, workerDeletion: null },
+          `Deleted ${rows.length} worker${rows.length === 1 ? "" : "s"} and ${rows.length === 1 ? "its" : "their"} history.`,
+        );
+      }
+      // Keep the sheet open: the failed rows show their errors, with a
+      // retry for exactly those workers.
+      return { ...state, workerDeletion: { phase: "ready", rows: nextRows } };
+    });
   } catch (error) {
-    app.update((state) => withToast({ ...state, workerDeletion: null }, `Delete failed: ${leadError(error)}`));
+    if (flow !== deletionFlow) return;
+    // The whole command failed: keep the sheet so the user can retry.
+    app.update((state) =>
+      withToast(
+        state.workerDeletion
+          ? { ...state, workerDeletion: { ...state.workerDeletion, phase: "ready" } }
+          : state,
+        `Delete failed: ${leadError(error)}`,
+      ),
+    );
   }
   await syncTeam();
+  if (!get(app).workerDeletion) closeDeletionSheet();
 }
 
 function pauseWorker(workerId: string) {

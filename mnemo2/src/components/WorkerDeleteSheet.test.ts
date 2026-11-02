@@ -22,7 +22,19 @@ function preview(overrides: Partial<WorkerDeletionPreview> = {}): WorkerDeletion
 }
 
 function open(previews: WorkerDeletionPreview[]) {
-  app.update((state) => ({ ...state, workerDeletion: { previews, busy: false } }));
+  app.update((state) => ({
+    ...state,
+    workerDeletion: {
+      phase: "ready",
+      rows: previews.map((preview) => ({
+        workerId: preview.worker_id,
+        name: preview.name,
+        preview,
+        error: null,
+        deleted: false,
+      })),
+    },
+  }));
 }
 
 describe("WorkerDeleteSheet", () => {
@@ -73,6 +85,21 @@ describe("WorkerDeleteSheet", () => {
     expect(screen.getByText(/Its step landed through senderReplay36/)).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toContain("1 worker has work that is not on the lead branch");
     expect(screen.getByRole("button", { name: "Delete and discard work" })).toBeTruthy();
+  });
+
+  it("shows each worker as checking until its preview arrives", () => {
+    app.update((state) => ({
+      ...state,
+      workerDeletion: {
+        phase: "checking",
+        rows: [{ workerId: "w1", name: "Worker w1", preview: null, error: null, deleted: false }],
+      },
+    }));
+    render(WorkerDeleteSheet);
+    expect(screen.getByText("Checking workers…")).toBeTruthy();
+    expect(screen.getAllByText("Checking…")).not.toHaveLength(0);
+    const confirm = screen.getByRole("button", { name: "Checking…" });
+    expect(confirm.hasAttribute("disabled")).toBe(true);
   });
 
   it("keeps a shared branch and lists blocked workers without deleting them", () => {

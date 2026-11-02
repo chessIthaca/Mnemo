@@ -528,7 +528,18 @@ function leadIdle(): AppState {
 function deleteSheet(): AppState {
   return {
     ...missionControl(),
-    workerDeletion: { previews: [SUPERSEDED_PREVIEW], busy: false },
+    workerDeletion: {
+      phase: "ready",
+      rows: [
+        {
+          workerId: SUPERSEDED_PREVIEW.worker_id,
+          name: SUPERSEDED_PREVIEW.name,
+          preview: SUPERSEDED_PREVIEW,
+          error: null,
+          deleted: false,
+        },
+      ],
+    },
   };
 }
 

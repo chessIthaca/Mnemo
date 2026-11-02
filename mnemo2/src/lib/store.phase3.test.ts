@@ -160,9 +160,12 @@ function makeTransport(initial: TeamWorkerRecord) {
       blocked: null,
       superseded_by: null,
     }))),
-    deleteWorkers: vi.fn(async () => {
+    deleteWorkers: vi.fn(async (ids: string[]) => {
       deleted = true;
-      return { workers: [], slots: 3, active: 0, usage: emptyProjectUsageView() };
+      return {
+        results: ids.map((id) => ({ worker_id: id, name: current.name, error: null })),
+        snapshot: { workers: [], slots: 3, active: 0, usage: emptyProjectUsageView() },
+      };
     }),
     compact: vi.fn(async () => current),
     messages: vi.fn(async () => []),
@@ -309,7 +312,7 @@ describe("native Phase 3 store integration", () => {
 
     await actions.requestDeleteWorkers(["ana"]);
     expect(transport.deletePreview).toHaveBeenCalledWith(["ana"]);
-    expect(get(app).workerDeletion?.previews[0]).toMatchObject({ worker_id: "ana", unmerged_commits: 2 });
+    expect(get(app).workerDeletion?.rows[0].preview).toMatchObject({ worker_id: "ana", unmerged_commits: 2 });
     expect(transport.deleteWorkers).not.toHaveBeenCalled();
 
     await actions.confirmDeleteWorkers();
@@ -318,6 +321,95 @@ describe("native Phase 3 store integration", () => {
     expect(get(app).workerDeletion).toBeNull();
     expect(get(app).workers).toHaveLength(0);
     expect(get(app).selectedWorkerId).toBeNull();
+  });
+
+  it("opens the deletion sheet at once and ignores a second request while one is open", async () => {
+    const transport = makeTransport(nativeWorker());
+    let resolvePreview: (previews: WorkerDeletionPreview[]) => void = () => {};
+    const preview = new Promise<WorkerDeletionPreview[]>((resolve) => {
+      resolvePreview = resolve;
+    });
+    transport.deletePreview = vi.fn(() => preview);
+    await openNativeTeam(transport);
+
+    // The sheet opens before the preview resolves, its rows checking.
+    const opening = actions.requestDeleteWorkers(["ana"]);
+    expect(get(app).workerDeletion).toMatchObject({
+      phase: "checking",
+      rows: [{ workerId: "ana", name: "Ana", preview: null, error: null, deleted: false }],
+    });
+
+    // A second request while one is open does nothing.
+    await actions.requestDeleteWorkers(["ana"]);
+    expect(transport.deletePreview).toHaveBeenCalledTimes(1);
+
+    resolvePreview([
+      {
+        worker_id: "ana",
+        name: "Ana",
+        branch: "wt/agent-ana",
+        live: false,
+        checkout: true,
+        uncommitted: false,
+        unmerged_commits: 0,
+        shared_branch: false,
+        blocked: null,
+        superseded_by: null,
+      },
+    ]);
+    await opening;
+    expect(get(app).workerDeletion?.phase).toBe("ready");
+    expect(get(app).workerDeletion?.rows[0].preview?.worker_id).toBe("ana");
+    actions.cancelDeleteWorkers();
+    expect(get(app).workerDeletion).toBeNull();
+  });
+
+  it("keeps the sheet open with a retry when a worker's deletion fails", async () => {
+    const worker = nativeWorker();
+    const transport = makeTransport(worker);
+    let attempts = 0;
+    transport.deleteWorkers = vi.fn(async (ids: string[]) => {
+      attempts += 1;
+      const failedAttempt = attempts === 1;
+      return {
+        results: ids.map((id) => ({
+          worker_id: id,
+          name: "Ana",
+          error: failedAttempt ? "could not remove its checkout" : null,
+        })),
+        snapshot: {
+          workers: failedAttempt ? [worker] : [],
+          slots: 3,
+          active: 0,
+          usage: emptyProjectUsageView(),
+        },
+      };
+    });
+    // The team still lists the worker until a delete attempt succeeds.
+    transport.snapshot = vi.fn(async () => ({
+      workers: attempts < 2 ? [worker] : [],
+      slots: 3,
+      active: attempts < 2 ? 1 : 0,
+      usage: emptyProjectUsageView(),
+    }));
+    await openNativeTeam(transport);
+    await actions.requestDeleteWorkers(["ana"]);
+
+    await actions.confirmDeleteWorkers();
+
+    // The sheet stays open with the failed worker's error and its retry.
+    const failed = get(app).workerDeletion;
+    expect(failed?.phase).toBe("ready");
+    expect(failed?.rows[0].error).toContain("could not remove");
+    expect(failed?.rows[0].deleted).toBe(false);
+    expect(get(app).workers).toHaveLength(1);
+
+    // The retry deletes only the failed worker, then the sheet closes.
+    await actions.confirmDeleteWorkers();
+    expect(transport.deleteWorkers).toHaveBeenCalledTimes(2);
+    expect(transport.deleteWorkers).toHaveBeenLastCalledWith(["ana"], true);
+    expect(get(app).workerDeletion).toBeNull();
+    expect(get(app).workers).toHaveLength(0);
   });
 
   it("offers only finished workers for bulk deletion", async () => {
@@ -379,7 +471,9 @@ describe("native Phase 3 store integration", () => {
     // implementation worker still awaits review and is never offered.
     expect(transport.deletePreview).toHaveBeenCalledWith(["mia", "rex"]);
     // An older host's previews read superseded_by as null, never undefined.
-    expect(get(app).workerDeletion?.previews.every((preview) => preview.superseded_by === null)).toBe(true);
+    expect(
+      get(app).workerDeletion?.rows.every((row) => row.preview?.superseded_by === null),
+    ).toBe(true);
   });
 
   it("routes every finding and check operation through the real transport", async () => {

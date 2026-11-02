@@ -138,10 +138,10 @@ describe("preview scenes", () => {
   it("delete-sheet opens the delete-old sheet with one superseded worker", () => {
     const request = build("delete-sheet").workerDeletion;
     expect(request).not.toBeNull();
-    expect(request?.busy).toBe(false);
-    expect(request?.previews).toHaveLength(1);
-    expect(request?.previews[0].superseded_by).toBeTruthy();
-    expect(request?.previews[0].unmerged_commits).toBeGreaterThan(0);
+    expect(request?.phase).toBe("ready");
+    expect(request?.rows).toHaveLength(1);
+    expect(request?.rows[0].preview?.superseded_by).toBeTruthy();
+    expect(request?.rows[0].preview?.unmerged_commits).toBeGreaterThan(0);
   });
 
   it("cost opens the Cost tab with the reports the browser preview renders", () => {

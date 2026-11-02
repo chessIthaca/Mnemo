@@ -8592,4 +8592,347 @@ mod tests {
         team.shutdown().await;
         lead.shutdown().await;
     }
+
+    // ---------------------------------------------------------------------
+    // change_model's live switch on a working worker (plan 1586c6c7): these
+    // fixtures run WITHOUT an injected transport — a real config-resolved
+    // provider against a local SSE stub server — so the tests observe which
+    // model actually serves each worker request.
+    // ---------------------------------------------------------------------
+
+    /// One scripted SSE response, optionally held behind a gate so the test
+    /// can switch the model while the worker's request is in flight.
+    struct StubTurn {
+        body: String,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    /// A one-request-per-connection SSE server: the i-th request gets the
+    /// i-th scripted turn and every request body's `model` field is
+    /// recorded. The repo has no mock-HTTP crate; like the provider tests
+    /// this speaks just enough HTTP/1.1.
+    struct StubServer {
+        addr: std::net::SocketAddr,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+    }
+
+    impl StubServer {
+        /// Start the server. The test must make exactly as many requests as
+        /// scripted turns (the accept task ends after the last one).
+        async fn start(mut turns: Vec<StubTurn>) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the stub listener");
+            let addr = listener.local_addr().expect("the stub address");
+            let (arrivals_tx, arrivals_rx) = tokio::sync::mpsc::unbounded_channel();
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&bodies);
+            tokio::spawn(async move {
+                for turn in turns.drain(..) {
+                    let (mut socket, _) = listener.accept().await.expect("accept a request");
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let head_end = loop {
+                        let mut chunk = [0u8; 4096];
+                        let read = socket.read(&mut chunk).await.expect("read the head");
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .expect("the request carries content-length");
+                    let mut body = buffer[head_end..].to_vec();
+                    while body.len() < content_length {
+                        let mut chunk = [0u8; 4096];
+                        let read = socket.read(&mut chunk).await.expect("read the body");
+                        body.extend_from_slice(&chunk[..read]);
+                    }
+                    body.truncate(content_length);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body).expect("a JSON request body");
+                    recorded.lock().expect("the request log").push(body);
+                    arrivals_tx.send(()).expect("the arrival channel");
+                    if let Some(gate) = turn.gate {
+                        let _ = gate.await;
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                        turn.body.len(),
+                        turn.body
+                    );
+                    socket
+                        .write_all(reply.as_bytes())
+                        .await
+                        .expect("write the scripted reply");
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                addr,
+                bodies,
+                arrivals: arrivals_rx,
+            }
+        }
+
+        /// Wait for the next request to arrive (still in flight while its
+        /// response is gated).
+        async fn next_arrival(&mut self) {
+            self.arrivals.recv().await.expect("a request arrives");
+        }
+
+        /// The `model` field of every request so far, in order.
+        fn models(&self) -> Vec<String> {
+            self.bodies
+                .lock()
+                .expect("the request log")
+                .iter()
+                .map(|body| {
+                    body["model"]
+                        .as_str()
+                        .expect("the request names its model")
+                        .to_string()
+                })
+                .collect()
+        }
+    }
+
+    /// Concatenate SSE `data:` chunks plus the `[DONE]` terminator.
+    fn stub_sse(chunks: &[serde_json::Value]) -> String {
+        chunks
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+            .collect()
+    }
+
+    /// An SSE turn answering with `text` and ending the turn.
+    fn stub_text_turn(text: &str) -> String {
+        stub_sse(&[
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
+        ])
+    }
+
+    /// An SSE turn calling a tool the worker does not have: the loop
+    /// records the "unknown tool" result and issues the next request — the
+    /// second provider call in the SAME turn the live switch pins across.
+    fn stub_unknown_tool_turn() -> String {
+        stub_sse(&[
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"definitely_not_a_tool","arguments":"{}"}}]},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
+        ])
+    }
+
+    /// The two-model fixture config over a stub server: `model-a` (the
+    /// worker's first model) and `model-b` (the switch target).
+    fn write_stub_config(dir: &Path, addr: std::net::SocketAddr) {
+        std::fs::create_dir_all(dir).expect("config dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"model-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            format!(
+                "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://{addr}/v1/\"\nmodels = [\"model-a\", \"model-b\"]\n"
+            ),
+        )
+        .expect("endpoints.toml");
+    }
+
+    /// open_git_team's shape WITHOUT the injected transport: the engine
+    /// resolves providers from the fixture config (kind local pointing at
+    /// the stub server), so the live model-switch tests observe which model
+    /// actually serves each worker request.
+    async fn open_stub_team(
+        root: &TempDir,
+        config: &TempDir,
+        state: &TempDir,
+        addr: std::net::SocketAddr,
+    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_stub_config(config.path(), addr);
+        let lead = LeadRuntime::open_inner(options(root, config, state), None)
+            .await
+            .expect("lead opens");
+        let team =
+            crate::mnemo2::team::TeamRuntime::open(crate::mnemo2::team::TeamRuntimeOptions {
+                engine: lead.engine_handle().await.expect("engine"),
+                workspace_root: root.path().to_path_buf(),
+                state_dir: state.path().to_path_buf(),
+                slots: Some(1),
+                models: lead.models(),
+                pricing: Vec::new(),
+            })
+            .await
+            .expect("team opens");
+        team.attach_board(lead.board_handle().expect("the lead's plan board"));
+        (lead, team)
+    }
+
+    /// A working worker switches models LIVE: the provider request in
+    /// flight finishes on the old model, the worker's next request serves
+    /// on the new one, and no stop/resume happens — the record is updated
+    /// and persisted, the status stays Working, the session generation does
+    /// not advance, and the kernel's model_changed re-points the observed
+    /// model id once the new model serves.
+    #[tokio::test]
+    async fn change_model_switches_a_working_worker_live() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = StubServer::start(vec![
+            StubTurn {
+                body: stub_unknown_tool_turn(),
+                gate: Some(gate),
+            },
+            StubTurn {
+                body: stub_text_turn("done on the new model"),
+                gate: None,
+            },
+        ])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr).await;
+        let worker = team
+            .dispatch_with_id(
+                "implement the counting feature".into(),
+                Some("test/model-a".into()),
+                Some("worker0001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.model, Some("test/model-a".into()));
+        assert_eq!(worker.generation, 1);
+        let generation_before = worker.generation;
+
+        // Request 1 is in flight on the old model — hold it there.
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the first worker request arrives");
+        assert_eq!(stub.models(), ["model-a"]);
+
+        // The switch applies while the worker is working: it returns at once
+        // with the record updated and the status STILL Working — no stop,
+        // no restart.
+        let switched = team
+            .change_model("worker0001", Some("test/model-b".into()), None)
+            .await
+            .expect("the live switch is applied");
+        assert_eq!(switched.model, Some("test/model-b".into()));
+        assert_eq!(switched.generation, generation_before);
+        assert!(
+            matches!(switched.status, crate::mnemo2::team::WorkerStatus::Working),
+            "the worker keeps working through the switch: {switched:?}"
+        );
+        release.send(()).expect("release the held response");
+
+        // The follow-up request serves on the new model, the turn ends, and
+        // the kernel's model_changed re-points the observed model id.
+        wait_for_worker_model(&team, "worker0001", "model-b").await;
+        let settled =
+            wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+                .await;
+        assert_eq!(
+            settled.generation,
+            generation_before,
+            "no stop/resume: the session generation did not advance: {settled:?}"
+        );
+        assert_eq!(
+            stub.models(),
+            ["model-a", "model-b"],
+            "the in-flight request finished on the old model, the next one served on the new one"
+        );
+        // The record change persisted to the team ledger.
+        let ledger = std::fs::read_to_string(state.path().join("team.json")).expect("ledger");
+        assert!(
+            ledger.contains("test/model-b"),
+            "the switch persisted: {ledger}"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// Idle and stopped workers keep the restart path: the record is
+    /// updated the same way, but the session is restarted (the generation
+    /// ADVANCES) — the live switch must not hijack a non-working worker.
+    #[tokio::test]
+    async fn change_model_still_restarts_idle_and_stopped_workers() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("done"),
+            gate: None,
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr).await;
+        let worker = team
+            .dispatch_with_id(
+                "implement the counting feature".into(),
+                Some("test/model-a".into()),
+                Some("worker0001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.generation, 1);
+
+        // The turn finishes on its own: the worker is live but not busy.
+        let finished =
+            wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+                .await;
+        assert_eq!(finished.model_id.as_deref(), Some("model-a"));
+
+        // Today's idle path: restart on the new model — the generation
+        // advances (a NEW session), the worker comes back idle.
+        let restarted = team
+            .change_model("worker0001", Some("test/model-b".into()), None)
+            .await
+            .expect("the idle path restarts on the new model");
+        assert_eq!(restarted.model, Some("test/model-b".into()));
+        assert_eq!(restarted.generation, 2, "the idle path restarts the session");
+        assert!(
+            matches!(restarted.status, crate::mnemo2::team::WorkerStatus::Idle),
+            "the restarted worker idles: {restarted:?}"
+        );
+        assert_eq!(
+            stub.models(),
+            ["model-a"],
+            "the restarted session idles without a request"
+        );
+
+        // Stopped path: stop, then change — resumed idle on the new model,
+        // again through a new session.
+        team.stop("worker0001").await.expect("stop the worker");
+        wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Stopped)
+            .await;
+        let resumed = team
+            .change_model("worker0001", Some("test/model-a".into()), None)
+            .await
+            .expect("the stopped path resumes on the new model");
+        assert_eq!(resumed.model, Some("test/model-a".into()));
+        assert_eq!(resumed.generation, 3, "the stopped path resumes in a new session");
+        assert!(
+            matches!(resumed.status, crate::mnemo2::team::WorkerStatus::Idle),
+            "the resumed worker idles: {resumed:?}"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
 }

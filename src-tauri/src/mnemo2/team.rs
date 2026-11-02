@@ -3085,10 +3085,12 @@ impl TeamRuntime {
     }
 
     /// Move a worker to another model (and reasoning effort), keeping its
-    /// transcript, branch, and worktree. An idle live session is restarted
-    /// on the new model; a stopped, interrupted, or failed one is resumed on
-    /// it; a worker whose brief never reached a session is started with it.
-    /// A working worker is refused: stop or pause it first.
+    /// transcript, branch, and worktree. A WORKING worker switches live at
+    /// its next request: the call in flight finishes on the old model, the
+    /// next one serves on the new one — no stop, no restart. An idle live
+    /// session is restarted on the new model; a stopped, interrupted, or
+    /// failed one is resumed on it; a worker whose brief never reached a
+    /// session is started with it.
     pub async fn change_model(
         &self,
         worker_id: &str,
@@ -3105,9 +3107,41 @@ impl TeamRuntime {
         }
         self.validate_model(&model, &reasoning_effort)?;
         if self.worker_is_busy(worker_id).await {
-            return Err(format!(
-                "worker '{worker_id}' is working; pause or stop it before changing its model"
-            ));
+            // Live switch — no stop, no restart: the provider request in
+            // flight finishes on the old model; the worker's next request
+            // serves on the new one. The kernel emits its model_changed
+            // agent event once the new model serves, and the pump re-points
+            // `model_id` from it. Moving a working worker to routing
+            // (model: None) needs the restart path below — refuse it.
+            let Some(spec) = model.clone() else {
+                return Err(format!(
+                    "worker '{worker_id}' is working; a live model switch needs a model; stop the worker to move it to routing"
+                ));
+            };
+            let switched = {
+                let live = self.live.lock().await;
+                let live = live
+                    .get(worker_id)
+                    .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+                live.admit_session_command(worker_id)?;
+                live.session
+                    .set_model(&spec, reasoning_effort.clone())
+                    .await
+            };
+            if let Err(error) = switched {
+                return Err(format!(
+                    "could not switch worker '{worker_id}' to '{spec}': {error}"
+                ));
+            }
+            self.update_worker(worker_id, |worker| {
+                worker.model = model.clone();
+                worker.model_id = None;
+                worker.reasoning_effort = reasoning_effort.clone();
+                worker.tier = None;
+            })
+            .await;
+            self.persist().await?;
+            return self.worker(worker_id).await;
         }
         if self.live.lock().await.contains_key(worker_id) {
             self.stop_inner(worker_id).await?;

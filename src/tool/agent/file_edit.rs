@@ -539,18 +539,19 @@ fn prepare_edit_ops(
     content: &str,
     validated_path: &Path,
 ) -> Result<PreparedEdit> {
-    let ops = validate_ops(args)?;
+    let (ops, mut notes) = validate_ops(args)?;
     // The read-receipt cites resolve against the CURRENT bytes BEFORE any
     // op applies (backlog 3fdc605f): drift hard-fails with the fresh-read
     // steering and nothing is written.
     let ops = crate::tool::agent::edit_ops::resolve_read_anchors(validated_path, content, ops)?;
-    let (new_content, notes) = apply_ops(
+    let (new_content, apply_notes) = apply_ops(
         &args.path,
         content,
         &ops,
         args.fuzzy_whitespace,
         artifact_checks_enabled(args),
     )?;
+    notes.extend(apply_notes);
     let diff = compute_diff(&args.path, content, &new_content);
     Ok(PreparedEdit {
         path: args.path.clone(),
@@ -683,8 +684,20 @@ fn prepare_edit_append(args: &FileEditArgs, content: &str) -> Result<PreparedEdi
 /// every single-edit field — the ops carry their own replacements — and must
 /// be non-empty. The element forms and the anchor item-level checks are the
 /// shared engine's (`edit_ops::parse_ops` / `edit_ops::validate_op_items`).
-/// Returns the parsed ops on success.
-fn validate_ops(args: &FileEditArgs) -> Result<Vec<EditOp>> {
+///
+/// Placeholder tolerance (plan b583528b): workers on Ollama-hosted models
+/// fill every schema key — a strict-mode endpoint's normalized schema puts
+/// all of them in `required`, so the model cannot omit — emitting literal
+/// filler (`"placeholder"`, whitespace) instead of null for the single-edit
+/// keys it does not need. A top-level `old_string`/`new_string` pair that
+/// cannot be a real single edit is ignored with a note in the result (so the
+/// model learns); only a pair where BOTH halves look like a real edit stays
+/// an error (genuinely ambiguous intent). Null-equivalent `count: 0` / an
+/// empty `lines` array get the same treatment; `use_regex`/`replace_all`/
+/// `append` true or a non-zero `count` / non-empty `lines` still signals
+/// real single-edit intent and still rejects. Returns the parsed ops plus
+/// the ignore notes.
+fn validate_ops(args: &FileEditArgs) -> Result<(Vec<EditOp>, Vec<String>)> {
     let values = args
         .ops
         .as_deref()
@@ -694,19 +707,37 @@ fn validate_ops(args: &FileEditArgs) -> Result<Vec<EditOp>> {
             "ops is empty — provide at least one op".into(),
         ));
     }
-    if !args.old_string.is_empty() {
+    // A top-level single-edit half "looks like a real edit" when it is
+    // non-empty, non-whitespace, and not the literal placeholder filler
+    // weak models emit for keys a strict endpoint's required list forced
+    // them to fill (plan b583528b).
+    let real_half = |s: &str| {
+        let trimmed = s.trim();
+        !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("placeholder")
+    };
+    if real_half(&args.old_string) && real_half(&args.new_string) {
+        // Both halves look like a real single edit — the model may have
+        // meant BOTH a single edit and a batch. Genuinely ambiguous.
         return Err(crate::error::Error::InvalidInput(
-            "ops is mutually exclusive with old_string — the anchor items carry their \
-             own old_string"
+            "ops is mutually exclusive with old_string/new_string — the anchor \
+             items carry their own edits. Both top-level fields look like a real \
+             edit, so the intent is ambiguous: send the ops array ONLY (leave the \
+             single-edit fields empty or null in ops mode), or drop ops and use \
+             single-edit mode"
                 .into(),
         ));
     }
+    // The pair cannot be a real single edit (one half is empty,
+    // whitespace-only, or placeholder filler): ignore whatever filler was
+    // sent and note it, so the model learns instead of the call dying on a
+    // field its endpoint's required list made it fill.
+    let mut notes = Vec::new();
+    let mut ignored: Vec<&str> = Vec::new();
+    if !args.old_string.is_empty() {
+        ignored.push("old_string");
+    }
     if !args.new_string.is_empty() {
-        return Err(crate::error::Error::InvalidInput(
-            "ops is mutually exclusive with new_string — the anchor items carry their \
-             own new_string"
-                .into(),
-        ));
+        ignored.push("new_string");
     }
     if args.use_regex {
         return Err(crate::error::Error::InvalidInput(
@@ -722,25 +753,46 @@ fn validate_ops(args: &FileEditArgs) -> Result<Vec<EditOp>> {
                 .into(),
         ));
     }
-    if args.count.is_some() {
-        return Err(crate::error::Error::InvalidInput(
-            "ops is mutually exclusive with count — set it on the anchor items instead"
-                .into(),
-        ));
+    match args.count {
+        // Some(0) is null-equivalent filler ("replace at most 0 matches"
+        // is never a real intent); a non-zero count is real intent.
+        Some(0) => ignored.push("count"),
+        Some(_) => {
+            return Err(crate::error::Error::InvalidInput(
+                "ops is mutually exclusive with count — set it on the anchor items \
+                 instead"
+                    .into(),
+            ));
+        }
+        None => {}
     }
-    if args.lines.is_some() {
-        return Err(crate::error::Error::InvalidInput(
-            "ops is mutually exclusive with line-range mode (lines)".into(),
-        ));
+    match args.lines.as_deref() {
+        // An empty array is null-equivalent filler; a non-empty one is a
+        // real line-range intent.
+        Some(&[]) => ignored.push("lines"),
+        Some(_) => {
+            return Err(crate::error::Error::InvalidInput(
+                "ops is mutually exclusive with line-range mode (lines)".into(),
+            ));
+        }
+        None => {}
     }
     if args.append {
         return Err(crate::error::Error::InvalidInput(
             "ops is mutually exclusive with append — an append has no anchors".into(),
         ));
     }
+    if !ignored.is_empty() {
+        notes.push(format!(
+            "NOTE: ignored the top-level {} filler in ops mode — the ops array \
+             carries every edit; leave the single-edit fields empty or null (never \
+             placeholder) when using ops",
+            ignored.join(", ")
+        ));
+    }
     let ops = parse_ops(values)?;
     validate_op_items(&ops)?;
-    Ok(ops)
+    Ok((ops, notes))
 }
 
 /// Regex edit path: `old_string` is a Rust regex; `new_string` may reference
@@ -835,16 +887,18 @@ impl Tool for FileEditTool {
              array with the file untouched on disk; an element is a compact \
              line op like 'd202-205' or an anchor object), and APPEND (append — add \
              new_string at EOF on a fresh line; no old_string needed; the file must \
-             exist — use file_write to create it). OPS and APPEND are mutually \
-             exclusive with every single-edit field. replace_all / count=N widen a \
+              exist — use file_write to create it). OPS and APPEND are mutually \
+              exclusive with every single-edit field (in ops mode, \
+              placeholder-filled single-edit fields are ignored with a NOTE). \
+              replace_all / count=N widen a \
              literal or regex match. An invalid regex is rejected with an actionable \
              error — match semantics never change silently before an edit.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file, relative to the project root."},
-                    "old_string": {"type": ["string", "null"], "description": "The exact text to find, or a regex when use_regex=true."},
-                    "new_string": {"type": ["string", "null"], "description": "The replacement text; supports $1/${name} capture refs when use_regex=true. Required in single mode (empty deletes old_string); omit in ops mode — the ops carry their own replacements. A replacement of exactly 'null' is dropped by the transport's null-stringify defense (empty = deletion) — use batch mode or include surrounding context."},
+                    "old_string": {"type": ["string", "null"], "description": "The exact text to find, or a regex when use_regex=true. Leave empty or null when using ops (placeholder filler is ignored with a NOTE)."},
+                    "new_string": {"type": ["string", "null"], "description": "The replacement text; supports $1/${name} capture refs when use_regex=true. Required in single mode (empty deletes old_string); leave empty or null in ops mode — the ops carry their own replacements (placeholder filler is ignored with a NOTE). A replacement of exactly 'null' is dropped by the transport's null-stringify defense (empty = deletion) — use batch mode or include surrounding context."},
                     "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)."},
                     "use_regex": {"type": "boolean", "description": "Treat old_string as a Rust regex (default: false). In the replacement (new_string), use real newlines — a literal backslash-n is inserted as-is, not converted to a newline."},
                     "count": {"type": "integer", "description": "Replace at most N matches (vi-style count); overrides replace_all."},
@@ -854,7 +908,7 @@ impl Tool for FileEditTool {
                     "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops. An anchor object {old_string, new_string, count?, fuzzy_whitespace?} — or the \
                   read-receipt cite {from_read, lines, new_string} (backlog \
                   3fdc605f: validated server-side against the cited read's bytes; \
-                  drift hard-fails with a fresh-read steer) — is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines. An empty array is treated as absent (falls back to single-edit/append/line-range mode).", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive — validated against the receipt."}}, "required": ["new_string"]}]}},
+                  drift hard-fails with a fresh-read steer) — is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines — leave those empty or null (never placeholder) when using ops; placeholder filler is ignored with a NOTE. An empty array is treated as absent (falls back to single-edit/append/line-range mode).", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive — validated against the receipt."}}, "required": ["new_string"]}]}},
                     "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. With an empty/omitted new_string it instead ENSURES the file ends with exactly one final newline (adds the detected line ending when missing; idempotent success + note when already terminated) — the affordance for restoring a lost trailing EOF newline. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."},
                     "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation (see the rejection message)."}
                 },
@@ -2546,7 +2600,12 @@ mod tests {
                 fuzzy_whitespace: None,
             }],
         );
+        // Plan b583528b: only a pair where BOTH halves look like a real
+        // edit is genuinely ambiguous and still rejects; placeholder /
+        // empty-half filler is ignored instead — see
+        // ops_with_placeholder_top_level_old_string_applies_the_ops.
         args.old_string = "z".into();
+        args.new_string = "w".into();
         assert!(prepare_edit(&args, "x\n").is_err());
 
         let mut args = batch_args(
@@ -2865,13 +2924,79 @@ mod tests {
 
     #[test]
     fn ops_rejects_conflicting_single_edit_fields() {
+        // Plan b583528b: only a top-level old_string/new_string pair where
+        // BOTH halves look like a real edit is genuinely ambiguous (which
+        // edit did the model mean?); placeholder/whitespace/empty-half
+        // filler is ignored instead — see
+        // ops_with_placeholder_top_level_old_string_applies_the_ops.
         let mut args = batch_args("a.txt", vec![]);
         args.ops = Some(vec![json!("d1")]);
-        args.old_string = "x".into();
+        args.old_string = "a".into();
+        args.new_string = "b".into();
         let err = prepare_edit(&args, "a\n").unwrap_err().to_string();
         assert!(
             err.contains("ops is mutually exclusive with old_string"),
             "{err}"
+        );
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ops_with_placeholder_top_level_old_string_applies_the_ops() {
+        // Plan b583528b regression: workers on Ollama-hosted models fill
+        // every schema key (a strict-mode endpoint advertises a required
+        // list that includes them all), emitting placeholder/whitespace
+        // filler for the single-edit fields alongside a real ops array —
+        // rejected with "ops is mutually exclusive with old_string"
+        // (graphView69 failed twice on three consecutive such errors).
+        // The ops must apply, and the result must carry a note that
+        // teaches the model to leave those fields empty or null.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "path": "a.txt",
+                "ops": ["d1", {"old_string": "c", "new_string": "C"}],
+                "old_string": "placeholder",
+                "new_string": ""
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "b\nC\n"
+        );
+        assert!(
+            result.output.contains("ignored"),
+            "the ignore note must teach the model: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("old_string"),
+            "the note names the ignored field: {}",
+            result.output
+        );
+
+        // Whitespace-only filler — the other observed form — is treated
+        // the same way.
+        let result = tool
+            .execute(json!({
+                "path": "a.txt",
+                "ops": [{"old_string": "C", "new_string": "see"}],
+                "old_string": "   ",
+                "new_string": "   "
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "b\nsee\n"
+        );
+        assert!(
+            result.output.contains("ignored"),
+            "the whitespace filler gets the same note: {}",
+            result.output
         );
     }
 

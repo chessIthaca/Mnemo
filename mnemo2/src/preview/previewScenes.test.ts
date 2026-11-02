@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createGraphTransport } from "../lib/graph";
 import { canMoveMain, createGitTransport } from "../lib/git";
-import type { AppState, LeadEntry, Worker, WorkerErrorEntry, WorkerThreadEntry } from "../lib/types";
+import type { AppState, LeadEntry, Worker, WorkerErrorEntry, WorkerModelSwitchEntry, WorkerThreadEntry } from "../lib/types";
 import { costPreviewInsights } from "../lib/cost";
 import { createMemoryTransport } from "../lib/memoryView";
 import {
@@ -18,8 +18,8 @@ const isToolRow = (entry: WorkerThreadEntry): entry is ToolEntry => entry.kind =
 
 const isMessage = (
   entry: WorkerThreadEntry,
-): entry is Exclude<WorkerThreadEntry, ToolEntry | WorkerErrorEntry> =>
-  entry.kind !== "tool" && entry.kind !== "error";
+): entry is Exclude<WorkerThreadEntry, ToolEntry | WorkerErrorEntry | WorkerModelSwitchEntry> =>
+  entry.kind !== "tool" && entry.kind !== "error" && entry.kind !== "model_switch";
 
 function build(name: string): AppState {
   const scene = previewScene(name);

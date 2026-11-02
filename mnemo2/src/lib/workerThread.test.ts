@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TeamEvent, TeamWorkerRecord } from "./teamState";
 import type { WorkerThreadEntry } from "./types";
 import {
+  applyModelSwitch,
   applyWorkerLiveEvent,
   CONTEXT_FOOTER,
   emptyWorkerLive,
@@ -49,7 +50,9 @@ function shape(entries: WorkerThreadEntry[]): string[] {
       ? `tool:${entry.toolName}:${entry.result === null ? "running" : entry.result.success ? "ok" : "failed"}`
       : entry.kind === "error"
         ? `error${entry.retrying ? "-retrying" : ""}:${entry.body}`
-        : `${entry.from}:${entry.body}`,
+        : entry.kind === "model_switch"
+          ? `model-switch${entry.applied ? "-applied" : "-pending"}:${entry.body}`
+          : `${entry.from}:${entry.body}`,
   );
 }
 
@@ -217,5 +220,75 @@ describe("worker thread", () => {
   it("falls back to the generic stop error when the event carries no text", () => {
     const live = applyWorkerLiveEvent(emptyWorkerLive(1, 0), event("error", { retrying: false }));
     expect(shape(live.entries)).toEqual(["error:The worker stopped with an error."]);
+  });
+});
+
+describe("live model switch", () => {
+  it("notes the switch with the badge's short model name, keeping the stream open", () => {
+    let live = emptyWorkerLive(1, 0);
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "Halfway" }));
+
+    live = applyModelSwitch(live, "test/deep");
+
+    // The request in flight still serves on the old model: the muted note
+    // lands at the thread's end while the open message keeps streaming.
+    expect(live.streamingId).not.toBeNull();
+    expect(shape(live.entries)).toEqual([
+      "worker:Halfway",
+      "model-switch-pending:Model changed to deep by you; it takes effect on the next call",
+    ]);
+
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: " there." }));
+    expect(shape(live.entries)).toEqual([
+      "worker:Halfway there.",
+      "model-switch-pending:Model changed to deep by you; it takes effect on the next call",
+    ]);
+  });
+
+  it("confirms the note once the switched model serves, ignoring other models", () => {
+    let live = applyModelSwitch(emptyWorkerLive(1, 0), "test/deep");
+
+    // A different model serving does not confirm the pending note.
+    live = applyWorkerLiveEvent(live, event("model_changed", { model: "fast", provider: "test" }));
+    expect(shape(live.entries)).toEqual([
+      "model-switch-pending:Model changed to deep by you; it takes effect on the next call",
+    ]);
+
+    // The kernel's ModelChanged names the model it serves, not the spec.
+    live = applyWorkerLiveEvent(
+      live,
+      event("model_changed", { model: "deep", provider: "test", reasoning_effort: null }),
+    );
+    expect(shape(live.entries)).toEqual(["model-switch-applied:Now running on deep"]);
+
+    // Repeated ModelChanged events for the same model change nothing.
+    live = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
+    expect(shape(live.entries)).toEqual(["model-switch-applied:Now running on deep"]);
+  });
+
+  it("replaces a pending note with a newer switch, keeping confirmed history", () => {
+    let live = applyModelSwitch(emptyWorkerLive(1, 0), "test/deep");
+    live = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
+    live = applyModelSwitch(live, "test/fast");
+
+    expect(shape(live.entries)).toEqual([
+      "model-switch-applied:Now running on deep",
+      "model-switch-pending:Model changed to fast by you; it takes effect on the next call",
+    ]);
+
+    // The newer switch replaces the pending note; confirmed history stays,
+    // and the note names the model the badge shows even for a vendor-prefixed spec.
+    live = applyModelSwitch(live, "openrouter/anthropic/claude-opus-5-5");
+    expect(shape(live.entries)).toEqual([
+      "model-switch-applied:Now running on deep",
+      "model-switch-pending:Model changed to claude-opus-5-5 by you; it takes effect on the next call",
+    ]);
+  });
+
+  it("leaves the thread alone when a model change arrives with no pending note", () => {
+    let live = emptyWorkerLive(1, 0);
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "Working" }));
+    const next = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
+    expect(next).toBe(live);
   });
 });

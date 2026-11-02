@@ -1,6 +1,12 @@
+import { shortModelLabel } from "./cost";
 import { messageText, normalizeToolResult } from "./leadState";
 import type { TeamEvent, TeamMessage, TeamWorkerRecord } from "./teamState";
-import type { LeadEntry, LeadTranscriptMessage, WorkerThreadEntry } from "./types";
+import type {
+  LeadEntry,
+  LeadTranscriptMessage,
+  WorkerModelSwitchEntry,
+  WorkerThreadEntry,
+} from "./types";
 
 type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
 
@@ -165,6 +171,41 @@ function dropRetryNotes(live: WorkerLive): WorkerLive {
   };
 }
 
+/** The muted note a user's live model switch leaves in the worker's thread. */
+export function modelSwitchNoteBody(model: string): string {
+  return `Model changed to ${shortModelLabel(model)} by you; it takes effect on the next call`;
+}
+
+/** The note's text once the switched model actually serves a request. */
+export function modelSwitchedBody(model: string): string {
+  return `Now running on ${shortModelLabel(model)}`;
+}
+
+/**
+ * Record a live model switch as a muted note at the end of the worker's
+ * thread. The request in flight still serves on the old model, so the note
+ * stays pending until the kernel's model_changed event reports the new one
+ * serving; a newer switch replaces any still-pending note.
+ */
+export function applyModelSwitch(live: WorkerLive, model: string): WorkerLive {
+  const entries = live.entries.filter((entry) => !(entry.kind === "model_switch" && !entry.applied));
+  return {
+    ...live,
+    sequence: live.sequence + 1,
+    entries: [
+      ...entries,
+      {
+        id: `model-switch-${live.sequence}`,
+        kind: "model_switch",
+        time: "now",
+        model,
+        body: modelSwitchNoteBody(model),
+        applied: false,
+      },
+    ],
+  };
+}
+
 /** Fold one worker event into its live thread tail. */
 export function applyWorkerLiveEvent(live: WorkerLive, event: TeamEvent): WorkerLive {
   const payload = event.event?.event as Record<string, unknown> | undefined;
@@ -301,6 +342,25 @@ export function applyWorkerLiveEvent(live: WorkerLive, event: TeamEvent): Worker
         ],
       };
     }
+    case "model_changed": {
+      const model = typeof payload.model === "string" ? payload.model : "";
+      if (!model) return live;
+      // The switched model serves its first request: the pending note's
+      // wait is over, so from here on it reads "Now running on …".
+      const pending = live.entries.find(
+        (entry): entry is WorkerModelSwitchEntry =>
+          entry.kind === "model_switch" &&
+          !entry.applied &&
+          shortModelLabel(entry.model) === shortModelLabel(model),
+      );
+      if (!pending) return live;
+      return {
+        ...live,
+        entries: live.entries.map((entry) =>
+          entry === pending ? { ...pending, applied: true, body: modelSwitchedBody(pending.model) } : entry,
+        ),
+      };
+    }
     default:
       return live;
   }
@@ -313,4 +373,5 @@ export const STREAM_ONLY_EVENTS = new Set([
   "tool_call_arg_delta",
   "tool_execution_start",
   "tool_output_delta",
+  "model_changed",
 ]);

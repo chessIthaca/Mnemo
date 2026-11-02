@@ -55,10 +55,15 @@
   const modelSpec = $derived(
     worker.modelSpec ?? models.find((model) => model.is_default)?.spec ?? "",
   );
-  /** A worker can move to another model unless it is mid-turn or its task is over. */
+  /**
+   * A worker can move to another model unless its task is over or it only
+   * reviews (an audit's model is never user-switchable). A worker mid-run
+   * switches live: the current call finishes, the next one uses the new model.
+   */
   const modelChangeable = $derived(
-    models.some((model) => model.spec === modelSpec) &&
-      !["working", "dispatching", "merging", "merged", "cancelled"].includes(worker.status),
+    !audit &&
+      models.some((model) => model.spec === modelSpec) &&
+      !["merging", "merged", "cancelled"].includes(worker.status),
   );
 
   $effect(() => {
@@ -135,7 +140,10 @@
                   onchange={(spec, effort) => actions.setWorkerModel(worker.id, spec, effort)}
                 />
               {:else}
-                <span class="model-locked" title="Pause or stop the worker to change its model"><ModelBadge model={worker.model} /></span>
+                <span
+                  class="model-locked"
+                  title={audit ? "An audit worker's model is not user-switchable" : "This worker's task is over, so its model cannot change"}
+                ><ModelBadge model={worker.model} /></span>
               {/if}
             </span>
             {#if !modelChangeable && worker.reasoningEffort}<span class="effort-pill" title="Reasoning effort">effort: {worker.reasoningEffort}</span>{/if}

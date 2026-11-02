@@ -33,6 +33,16 @@ describe("WorkerThread", () => {
     expect(style.whiteSpace).toBe("pre-wrap");
   });
 
+  it("keeps the failure block out of the compact panel, which has its own banner", () => {
+    const { container: full } = render(WorkerThread, { worker: worker() });
+    const { container: compact } = render(WorkerThread, { worker: worker(), compact: true });
+
+    expect(full.querySelector(".thread-failure")).not.toBeNull();
+    expect(compact.querySelector(".thread-failure")).toBeNull();
+    // The compact thread itself still renders — only the duplicate block goes.
+    expect(compact.querySelector(".thread-message")).not.toBeNull();
+  });
+
   it("shows no failure block while the worker works, nor for a completed one", () => {
     const { container: working } = render(WorkerThread, {
       worker: worker({ status: "working", error: null }),

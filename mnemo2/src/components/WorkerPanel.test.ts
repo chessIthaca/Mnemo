@@ -490,9 +490,9 @@ describe("WorkerPanel", () => {
     expect(state().workerPanelId).toBe("kai");
 
     // The panel shows the failure banner: the error and the three ways out.
+    // The thread itself stays clean — its compact failure block is skipped.
     const panel = container.querySelector(".worker-panel") as HTMLElement;
-    // The error text appears twice: the banner and the thread's failure block.
-    expect(within(panel).getAllByText("cargo test failed: 2 errors").length).toBe(2);
+    expect(within(panel).getByText("cargo test failed: 2 errors")).toBeTruthy();
     expect(within(panel).getByRole("button", { name: "Continue" })).toBeTruthy();
     expect(within(panel).getByRole("button", { name: "Delete Kai" })).toBeTruthy();
     const missionButtons = within(panel).getAllByRole("button", { name: "Open in Mission Control" });

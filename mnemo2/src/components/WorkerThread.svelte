@@ -120,7 +120,9 @@
       />
     </div>
   {/if}
-  {#if worker.status === "failed" && worker.error}
+  <!-- The compact panel already carries the error in its blocked banner with its
+       way-out actions; only mission control needs the thread's failure block. -->
+  {#if !compact && worker.status === "failed" && worker.error}
     <article class="thread-error thread-failure" role="alert">
       <span>WORKER FAILED</span>
       <p>{worker.error}</p>

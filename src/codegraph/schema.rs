@@ -11,12 +11,19 @@
 //!   contains), indexed in both directions for neighborhood queries
 //! - `cg_refs` — unresolved per-file references. Persisting these lets
 //!   `Store::rebuild_edges` re-resolve every cross-file edge after any file
-//!   changes, without re-parsing the unchanged files.
+//!   changes, without re-parsing the unchanged files. The `kind` column is
+//!   the persisted form of `RefKind`: `"call"`, `"method_call"` (receiver
+//!   syntax, plan 0d53d659), `"import"`.
 //! - `cg_content` — FTS5 full-text index of every source line, the
 //!   index-backed path for the `search` tool's literal queries.
 //! - `cg_content_meta` — one row per file (path → content hash). It doubles
 //!   as the backfill detector: indexed files without a meta row predate the
 //!   content index and need a rebuild.
+//! - `cg_extract_meta` — one row per file (path → [`EXTRACTOR_VERSION`]),
+//!   the extractor-semantics backfill detector: files stamped with an
+//!   older (or missing) version predate a change in what the extractor
+//!   persists (v1: refs carry the method-call shape, plan 0d53d659) and
+//!   need one re-parse — their rows cannot be re-derived in place.
 //!
 //! The DB is a derivable cache (gitignored, rebuilt from source on startup),
 //! so the schema is applied idempotently with `CREATE TABLE IF NOT EXISTS` and
@@ -26,6 +33,15 @@
 use rusqlite::Connection;
 
 use crate::error::Result;
+
+/// The version of the extractor's persisted output semantics, stamped per
+/// file in `cg_extract_meta` on every upsert. Bump it whenever a change
+/// alters what `extract_file` persists (v1: `RefKind::MethodCall` — refs
+/// record receiver syntax so the resolver can refuse cross-language and
+/// method-call-to-free-fn targets, plan 0d53d659). A plain index pass
+/// re-parses stamped-older files exactly once — same backfill shape as
+/// `cg_content_meta`, never perpetual.
+pub const EXTRACTOR_VERSION: i64 = 1;
 
 /// Enable the same pragmas the memory store relies on: WAL (concurrent readers
 /// never block the background index writer), a busy timeout so a reader waits
@@ -93,6 +109,11 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS cg_content_meta (
             path         TEXT PRIMARY KEY,
             content_hash TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS cg_extract_meta (
+            path    TEXT PRIMARY KEY,
+            version INTEGER NOT NULL
         );
         "#,
     )?;

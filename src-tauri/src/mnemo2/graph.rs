@@ -218,9 +218,11 @@ fn search_in(view: &GraphView, query: &str, kind: Option<&str>, limit: usize) ->
 /// Both edge directions are walked (a focused subgraph needs callers AND
 /// callees). When the cap bites, the 1-hop ring survives first: the requested
 /// depth is sliced twice — once at 1 hop for the closeness ring, once at the
-/// full depth — and nodes are ordered ring-first. Edges are taken from the
-/// full-depth slice filtered to kept nodes, so the drawn subgraph is always
-/// self-contained. An unknown id is `None` (the command reports it).
+/// full depth — and nodes are ordered centre-first, then ring-first. Edges
+/// are taken from the full-depth slice filtered to kept nodes, so the drawn
+/// subgraph is always self-contained. The focused symbol ALWAYS survives
+/// the cap — it is the one node the tab must always draw. An unknown id is
+/// `None` (the command reports it).
 fn neighbourhood_capped(
     view: &GraphView,
     symbol_id: &str,
@@ -258,7 +260,14 @@ fn neighbourhood_capped(
         nodes.insert(0, view.context(symbol_id)?.symbol);
     }
     let ring = |symbol: &Symbol| u8::from(!nearest.contains(&symbol.id));
-    nodes.sort_by(|a, b| ring(a).cmp(&ring(b)).then_with(|| a.id.cmp(&b.id)));
+    // The centre outranks the ring under the cap (plan 0d53d659): a hub's
+    // id sorts after its own 1-hop caller ring (`src/...` sorts after
+    // `aNNN.rs`), so an id-only sort once let the truncate bite the centre
+    // out of its own neighbourhood — and the find-the-centre `?` below
+    // misread the cap bite as "no such symbol" for an id the view HAD
+    // (the `join` incident).
+    let rank = |symbol: &Symbol| (u8::from(symbol.id != symbol_id), ring(symbol));
+    nodes.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.id.cmp(&b.id)));
     let truncated = nodes.len() > cap;
     nodes.truncate(cap);
     let kept: HashSet<&str> = nodes.iter().map(|symbol| symbol.id.as_str()).collect();
@@ -376,11 +385,14 @@ fn context_in(view: &GraphView, symbol_id: &str) -> Option<GraphContext> {
     })
 }
 
-/// The error an unknown symbol id produces — one wording for every command, so
-/// the tab can show one recovery hint ("refresh").
+/// The error a genuinely unknown symbol id produces — one wording for every
+/// command, so the tab can show one recovery hint. The id commands refresh
+/// the index once and retry BEFORE this fires (plan 0d53d659), so by the
+/// time the user reads it the miss is proven against a fresh index and
+/// "search again" is the only move left.
 fn unknown_symbol(symbol_id: &str) -> String {
     format!(
-        "the code graph has no symbol with id `{symbol_id}`; the index may have moved on — refresh and try again"
+        "the code graph has no symbol with id `{symbol_id}` even after one automatic refresh — the index has moved on; search for the symbol again"
     )
 }
 
@@ -418,6 +430,65 @@ where
     })
     .await
     .map_err(|error| format!("code graph task failed: {error}"))?
+}
+
+/// [`run_view`] for a symbol-id query that can miss: `None` (the id is
+/// unknown to THIS view) instead of a ready-made error, so
+/// [`resolve_or_refresh`] can tell "no such symbol" apart from real
+/// failures and retry after a refresh.
+async fn run_view_opt<T, F>(graph: Arc<CodeGraph>, ok: F) -> Result<Option<T>, String>
+where
+    F: FnOnce(&GraphView) -> Option<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let view = graph
+            .view()
+            .map_err(|error| format!("could not read the code graph: {error}"))?;
+        Ok(ok(&view))
+    })
+    .await
+    .map_err(|error| format!("code graph task failed: {error}"))?
+}
+
+/// One incremental index pass — the [`graph_refresh`] core, reused by
+/// [`resolve_or_refresh`]'s automatic retry.
+async fn refresh_index(state: &Mnemo2State) -> Result<(), String> {
+    let engine = engine(state).await?;
+    engine
+        .codegraph()
+        .refresh()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Run one symbol-id query against a fresh view with the honest-error retry
+/// (plan 0d53d659): an id that misses gets exactly ONE automatic index
+/// refresh and a second attempt before the unknown-symbol error — the Graph
+/// tab hands us ids from an earlier snapshot, and the background index pass
+/// can move the index between listing and click. A miss on the refreshed
+/// index is a genuinely unknown symbol. `first` and `retry` are the SAME
+/// query (each owns its id clone — a `FnOnce` attempt cannot run twice).
+async fn resolve_or_refresh<T, Q1, Q2>(
+    state: &Mnemo2State,
+    symbol_id: &str,
+    first: Q1,
+    retry: Q2,
+) -> Result<T, String>
+where
+    Q1: FnOnce(&GraphView) -> Option<T> + Send + 'static,
+    Q2: FnOnce(&GraphView) -> Option<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let graph = graph_handle(state).await?;
+    if let Some(value) = run_view_opt(graph.clone(), first).await? {
+        return Ok(value);
+    }
+    refresh_index(state).await?;
+    run_view_opt(graph, retry)
+        .await?
+        .ok_or_else(|| unknown_symbol(symbol_id))
 }
 
 /// The Graph tab's status line: availability, size, indexing pulse and the
@@ -479,11 +550,15 @@ pub async fn graph_neighbourhood(
     symbol_id: String,
     depth: Option<usize>,
 ) -> Result<GraphNeighbourhood, String> {
-    let graph = graph_handle(&state).await?;
     let depth = depth.unwrap_or(1);
-    run_view(graph, move |view| {
-        neighbourhood_in(view, &symbol_id, depth).ok_or_else(|| unknown_symbol(&symbol_id))
-    })
+    let first_id = symbol_id.clone();
+    let retry_id = symbol_id.clone();
+    resolve_or_refresh(
+        &state,
+        &symbol_id,
+        move |view| neighbourhood_in(view, &first_id, depth),
+        move |view| neighbourhood_in(view, &retry_id, depth),
+    )
     .await
 }
 
@@ -494,10 +569,14 @@ pub async fn graph_impact(
     state: State<'_, Mnemo2State>,
     symbol_id: String,
 ) -> Result<Vec<GraphImpactSymbol>, String> {
-    let graph = graph_handle(&state).await?;
-    run_view(graph, move |view| {
-        impact_in(view, &symbol_id).ok_or_else(|| unknown_symbol(&symbol_id))
-    })
+    let first_id = symbol_id.clone();
+    let retry_id = symbol_id.clone();
+    resolve_or_refresh(
+        &state,
+        &symbol_id,
+        move |view| impact_in(view, &first_id),
+        move |view| impact_in(view, &retry_id),
+    )
     .await
 }
 
@@ -521,10 +600,14 @@ pub async fn graph_context(
     state: State<'_, Mnemo2State>,
     symbol_id: String,
 ) -> Result<GraphContext, String> {
-    let graph = graph_handle(&state).await?;
-    run_view(graph, move |view| {
-        context_in(view, &symbol_id).ok_or_else(|| unknown_symbol(&symbol_id))
-    })
+    let first_id = symbol_id.clone();
+    let retry_id = symbol_id.clone();
+    resolve_or_refresh(
+        &state,
+        &symbol_id,
+        move |view| context_in(view, &first_id),
+        move |view| context_in(view, &retry_id),
+    )
     .await
 }
 
@@ -617,7 +700,7 @@ mod tests {
             .iter()
             .map(|node| node.symbol.id.as_str())
             .collect();
-        assert_eq!(ids, vec![RUN, SAVE, SAVE_ALL], "id order within the ring");
+        assert_eq!(ids, vec![SAVE, RUN, SAVE_ALL], "centre first, then the ring in id order");
         assert!(
             !ids.contains(&BOOTSTRAP),
             "a two-hop caller stays out of a one-hop neighbourhood"
@@ -635,7 +718,7 @@ mod tests {
             .iter()
             .map(|node| node.symbol.id.as_str())
             .collect();
-        assert_eq!(ids, vec![RUN, SAVE, SAVE_ALL, BOOTSTRAP]);
+        assert_eq!(ids, vec![SAVE, RUN, SAVE_ALL, BOOTSTRAP]);
         assert_eq!(two.edges.len(), 3);
         assert_eq!(
             neighbourhood_in(&view, SAVE, 9).map(|answer| answer.nodes.len()),
@@ -654,7 +737,7 @@ mod tests {
             .iter()
             .map(|node| node.symbol.id.as_str())
             .collect();
-        assert_eq!(ids, vec![RUN, SAVE, SAVE_ALL], "the 1-hop ring survives");
+        assert_eq!(ids, vec![SAVE, RUN, SAVE_ALL], "centre first, then the surviving 1-hop ring");
         assert!(
             capped
                 .edges
@@ -762,4 +845,63 @@ mod tests {
             serde_json::json!({"id": "a.rs::n::3", "name": "n", "kind": "function", "file": "a.rs", "line": 3})
         );
     }
+
+    #[test]
+    fn graph_tab_opens_every_listed_symbol() {
+        // The incident (plan 0d53d659): the tab listed `join` — a tiny test
+        // helper whose bare name had collected hundreds of callers — but
+        // clicking it answered `unknown_symbol` for an id the view HAD.
+        // The neighbourhood's node cap sorts kept nodes by (ring, id), and
+        // the centre sorted after its own 1-hop caller ring (`aNNN.rs`
+        // sorts before `src/...`), so the truncate bit it out and the
+        // find-the-centre `?` misread the cap bite as "no such symbol".
+        let mut symbols = Vec::new();
+        let mut edges = Vec::new();
+        let hub = sym(
+            "src/tool/agent/shell_filter.rs",
+            "join",
+            SymbolKind::Function,
+            683,
+        );
+        for i in 0..(NEIGHBOURHOOD_NODE_CAP + 10) {
+            let caller = sym(&format!("a{i:03}.rs"), "caller", SymbolKind::Function, 1);
+            edges.push(link(&caller, &hub, EdgeKind::Calls));
+            symbols.push(caller);
+        }
+        symbols.push(hub);
+        let view = GraphView::from_parts(symbols, edges);
+
+        // List symbols the way the tab lists them — the search box and the
+        // top entry-points list. Both must surface the hub.
+        let listed: Vec<GraphSymbol> = search_in(&view, "join", None, SEARCH_MAX_LIMIT)
+            .into_iter()
+            .chain(top_in(&view, TOP_DEFAULT_LIMIT).into_iter().map(|node| node.symbol))
+            .collect();
+        assert!(
+            listed
+                .iter()
+                .any(|hit| hit.id == "src/tool/agent/shell_filter.rs::join::683"),
+            "the hub must be listed before it can be clicked"
+        );
+
+        // Clicking every listed symbol must open all three views.
+        for hit in &listed {
+            assert!(
+                neighbourhood_in(&view, &hit.id, 1).is_some(),
+                "the neighbourhood of {} must open",
+                hit.id
+            );
+            assert!(
+                context_in(&view, &hit.id).is_some(),
+                "the context of {} must open",
+                hit.id
+            );
+            assert!(
+                impact_in(&view, &hit.id).is_some(),
+                "the impact of {} must open",
+                hit.id
+            );
+        }
+    }
+
 }

@@ -32,7 +32,7 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
-use crate::codegraph::extract::{EdgeKind, Symbol, SymbolKind};
+use crate::codegraph::extract::{lang_family, EdgeKind, RefKind, Symbol, SymbolKind};
 use crate::codegraph::schema;
 use crate::error::Result;
 
@@ -86,7 +86,8 @@ pub struct FileData {
     /// Symbols defined in the file.
     pub symbols: Vec<Symbol>,
     /// Unresolved refs `(from symbol id, name, kind)` where kind is
-    /// `"call"`/`"import"` (the persisted form of `RefKind`).
+    /// `"call"`/`"method_call"`/`"import"` (the persisted form of
+    /// [`RefKind`](crate::codegraph::extract::RefKind)).
     pub refs: Vec<(String, String, String)>,
     /// Containment pairs `(parent id, child id)` — pre-resolved, stored
     /// directly as `contains` edges.
@@ -106,6 +107,12 @@ pub struct FileMeta {
     /// Whether the file has a `cg_content_meta` row (the FTS backfill
     /// check — false for files indexed before the content index existed).
     pub has_content: bool,
+    /// The extractor version that produced the file's `cg_refs` rows (the
+    /// [`schema::EXTRACTOR_VERSION`] backfill check — `None` for files
+    /// indexed before the version marker existed). A mismatch forces one
+    /// re-parse, exactly like the content backfill: it fires once per old
+    /// file, never perpetually.
+    pub extract_version: Option<i64>,
 }
 
 /// One file's fully-extracted index result, ready to apply — produced by
@@ -224,7 +231,8 @@ impl Store {
     pub fn stored_file_meta(&self) -> Result<HashMap<String, FileMeta>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.path, f.content_hash, f.mtime, \
-             (SELECT COUNT(*) FROM cg_content_meta m WHERE m.path = f.path) \
+             (SELECT COUNT(*) FROM cg_content_meta m WHERE m.path = f.path), \
+             (SELECT e.version FROM cg_extract_meta e WHERE e.path = f.path) \
              FROM cg_files f",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -234,6 +242,7 @@ impl Store {
                     content_hash: r.get(1)?,
                     mtime: r.get(2)?,
                     has_content: r.get::<_, i64>(3)? > 0,
+                    extract_version: r.get(4)?,
                 },
             ))
         })?;
@@ -316,6 +325,8 @@ impl Store {
             .execute(params![path])?;
         tx.prepare_cached("DELETE FROM cg_content_meta WHERE path = ?1")?
             .execute(params![path])?;
+        tx.prepare_cached("DELETE FROM cg_extract_meta WHERE path = ?1")?
+            .execute(params![path])?;
         // Drop edges touching any of this file's old symbols (either end) plus
         // every edge sourced in this file (its module is always one of the old
         // symbols, so the symbol-based sweep already covers these; the explicit
@@ -335,6 +346,13 @@ impl Store {
         .execute(params![path, content_hash, mtime, now])?;
         tx.prepare_cached("INSERT INTO cg_content_meta (path, content_hash) VALUES (?1, ?2)")?
             .execute(params![path, content_hash])?;
+        // The extractor version stamps every upsert (even content-only
+        // files), so the version backfill fires once per old file, never
+        // perpetually — same shape as the cg_content_meta backfill above.
+        tx.prepare_cached(
+            "INSERT OR REPLACE INTO cg_extract_meta (path, version) VALUES (?1, ?2)",
+        )?
+        .execute(params![path, schema::EXTRACTOR_VERSION])?;
         {
             let mut ins_line =
                 tx.prepare_cached("INSERT INTO cg_content (path, line, text) VALUES (?1, ?2, ?3)")?;
@@ -398,6 +416,7 @@ impl Store {
         tx.execute("DELETE FROM cg_refs WHERE file = ?1", params![path])?;
         tx.execute("DELETE FROM cg_content WHERE path = ?1", params![path])?;
         tx.execute("DELETE FROM cg_content_meta WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM cg_extract_meta WHERE path = ?1", params![path])?;
         {
             let mut del = tx.prepare("DELETE FROM cg_edges WHERE from_id = ?1 OR to_id = ?1")?;
             for id in &ids {
@@ -463,10 +482,11 @@ impl Store {
         let mut unresolved = 0;
         for (from, name, kind) in &refs {
             let file = from_file.get(from).cloned().unwrap_or_default();
-            let target = resolve(name, &file, kind == "call", &by_name);
+            let ref_kind = ref_kind_of(kind);
+            let target = resolve(name, &file, ref_kind, &by_name);
             match target {
                 Some(t) => {
-                    let ek = if kind == "call" {
+                    let ek = if matches!(ref_kind, RefKind::Call | RefKind::MethodCall) {
                         EdgeKind::Calls.as_str()
                     } else {
                         EdgeKind::Imports.as_str()
@@ -741,25 +761,50 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// The [`RefKind`] persisted in a `cg_refs.kind` row (`"call"`,
+/// `"method_call"`, `"import"` — see [`FileData::refs`]). Unknown strings
+/// read as imports, the historical fallback for rows written by an older
+/// extractor (they resolve as before until their file is re-parsed).
+fn ref_kind_of(kind: &str) -> RefKind {
+    match kind {
+        "call" => RefKind::Call,
+        "method_call" => RefKind::MethodCall,
+        _ => RefKind::Import,
+    }
+}
+
 /// Resolve one ref name against the symbol index: same-file exact match wins;
 /// otherwise a unique project-wide exact match; otherwise (calls only) a
-/// unique case-insensitive project-wide match; otherwise `None`.
+/// unique case-insensitive project-wide match; otherwise `None`. Mirrors
+/// [`extract::resolve_edges`](crate::codegraph::extract::resolve_edges) —
+/// including the two target gates (plan 0d53d659): a candidate outside the
+/// ref's language family, or a non-`Method` symbol answering a `MethodCall`
+/// ref, is no candidate at all (a bare name never guesses a target it
+/// cannot plausibly be).
 fn resolve<'a>(
     name: &str,
     file: &str,
-    is_call: bool,
+    kind: RefKind,
     by_name: &'a HashMap<String, Vec<Symbol>>,
 ) -> Option<&'a Symbol> {
     let candidates = by_name.get(name)?;
-    let mut same_file = candidates.iter().filter(|s| s.file == file);
+    let family = lang_family(file);
+    let answerable = |symbol: &Symbol| {
+        lang_family(&symbol.file) == family
+            && (kind != RefKind::MethodCall || symbol.kind == SymbolKind::Method)
+    };
+    let mut same_file = candidates
+        .iter()
+        .filter(|s| s.file == file && answerable(s));
     if let (Some(only), None) = (same_file.next(), same_file.next()) {
         return Some(only);
     }
-    if candidates.len() == 1 {
-        return candidates.first();
+    let project: Vec<&Symbol> = candidates.iter().filter(|s| answerable(s)).collect();
+    if project.len() == 1 {
+        return project.first().copied();
     }
-    if is_call {
-        let mut ci = candidates
+    if matches!(kind, RefKind::Call | RefKind::MethodCall) {
+        let mut ci = project
             .iter()
             .filter(|s| s.name.eq_ignore_ascii_case(name));
         if let (Some(only), None) = (ci.next(), ci.next()) {
@@ -1074,5 +1119,117 @@ mod tests {
         assert!(s.search_content("   ", 10).unwrap().is_empty());
         // An embedded double quote must not break the FTS query parse.
         assert_eq!(s.search_content("\"quoted\"", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn method_call_refs_never_resolve_across_languages_or_to_free_fns() {
+        // The persisted-refs half of plan 0d53d659: `cg_refs` rows carry the
+        // method-call shape as the kind string `method_call`, and
+        // `rebuild_edges` applies the resolver's two gates — same language
+        // family, and a method-call ref only ever to a Method-kind symbol
+        // (never a free fn).
+        let mut s = Store::open_in_memory().unwrap();
+        let rust_join = FileData {
+            symbols: vec![
+                Symbol {
+                    id: "m.rs::module".to_string(),
+                    name: "m.rs".to_string(),
+                    kind: SymbolKind::Module,
+                    file: "m.rs".to_string(),
+                    start_line: 1,
+                    end_line: 5,
+                },
+                sym("m.rs", "join", SymbolKind::Function, 683, 685),
+            ],
+            refs: vec![],
+            contains: vec![("m.rs::module".to_string(), "m.rs::join::683".to_string())],
+        };
+        let python_dump = FileData {
+            symbols: vec![
+                Symbol {
+                    id: "u.py::module".to_string(),
+                    name: "u.py".to_string(),
+                    kind: SymbolKind::Module,
+                    file: "u.py".to_string(),
+                    start_line: 1,
+                    end_line: 6,
+                },
+                sym("u.py", "dump", SymbolKind::Function, 2, 4),
+            ],
+            refs: vec![(
+                "u.py::dump::2".to_string(),
+                "join".to_string(),
+                "method_call".to_string(),
+            )],
+            contains: vec![("u.py::module".to_string(), "u.py::dump::2".to_string())],
+        };
+        s.upsert_file("m.rs", "h1", 100, &rust_join, "").unwrap();
+        s.upsert_file("u.py", "h2", 100, &python_dump, "").unwrap();
+        let unresolved = s.rebuild_edges().unwrap();
+        assert_eq!(unresolved, 1, "the cross-language method call stays unresolved");
+        let edges = s.all_edges().unwrap();
+        assert!(
+            !edges.iter().any(|e| e.to_id == "m.rs::join::683" && e.kind != EdgeKind::Contains),
+            "no resolved-call/import edge may target the Rust free fn"
+        );
+    }
+
+    #[test]
+    fn method_call_refs_resolve_to_same_language_methods() {
+        // The positive control: a `method_call` ref resolves to a
+        // Method-kind symbol in the same language family, as a Calls edge.
+        let mut s = Store::open_in_memory().unwrap();
+        let ts_model = FileData {
+            symbols: vec![
+                Symbol {
+                    id: "model.ts::module".to_string(),
+                    name: "model.ts".to_string(),
+                    kind: SymbolKind::Module,
+                    file: "model.ts".to_string(),
+                    start_line: 1,
+                    end_line: 5,
+                },
+                sym("model.ts", "fetch", SymbolKind::Method, 2, 4),
+            ],
+            refs: vec![],
+            contains: vec![(
+                "model.ts::module".to_string(),
+                "model.ts::fetch::2".to_string(),
+            )],
+        };
+        let ts_view = FileData {
+            symbols: vec![
+                Symbol {
+                    id: "view.ts::module".to_string(),
+                    name: "view.ts".to_string(),
+                    kind: SymbolKind::Module,
+                    file: "view.ts".to_string(),
+                    start_line: 1,
+                    end_line: 4,
+                },
+                sym("view.ts", "render", SymbolKind::Function, 2, 3),
+            ],
+            refs: vec![(
+                "view.ts::render::2".to_string(),
+                "fetch".to_string(),
+                "method_call".to_string(),
+            )],
+            contains: vec![(
+                "view.ts::module".to_string(),
+                "view.ts::render::2".to_string(),
+            )],
+        };
+        s.upsert_file("model.ts", "h1", 100, &ts_model, "").unwrap();
+        s.upsert_file("view.ts", "h2", 100, &ts_view, "").unwrap();
+        assert_eq!(s.rebuild_edges().unwrap(), 0);
+        let edges = s.all_edges().unwrap();
+        assert!(
+            edges.iter().any(|e| {
+                e.from_id == "view.ts::render::2"
+                    && e.to_id == "model.ts::fetch::2"
+                    && e.kind == EdgeKind::Calls
+            }),
+            "the method call resolves to the same-language Method"
+        );
     }
 }

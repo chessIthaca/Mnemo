@@ -102,6 +102,21 @@ impl Lang {
             .find(|(e, _)| *e == ext)
             .map(|(_, lang)| *lang)
     }
+
+    /// The resolution family of this language — the boundary the code
+    /// graph's bare-name resolver never crosses (plan 0d53d659).
+    /// Dialects that freely call each other's code share one family:
+    /// TypeScript/TSX/JavaScript (HTML script blocks extract as JS), and
+    /// C with C++ (`.h` headers parse as C even inside C++ projects).
+    /// Everything else is its own family — a Python `.join(` can never
+    /// reach a Rust `fn join`.
+    pub fn family(self) -> Lang {
+        match self {
+            Self::Ts | Self::Tsx | Self::Js | Self::Html => Self::Js,
+            Self::C | Self::Cpp => Self::C,
+            other => other,
+        }
+    }
 }
 
 /// Extensions recognized as source files for the finish gate's disk check

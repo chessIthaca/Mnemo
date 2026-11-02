@@ -7,8 +7,8 @@
  * `npm run check:no-mock` keeps passing.
  */
 
-import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
 import type { BoardPlan } from "../lib/boardState";
+import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
 import type { WorkerDeletionPreview } from "../lib/teamState";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";

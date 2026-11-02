@@ -22,6 +22,7 @@ use crate::headless::types::{
 };
 use crate::runtime::channels::ConversationExport;
 use crate::host::runtime::HostRuntime;
+use crate::model_resolver::ModelResolver as _;
 use crate::runtime::channels::{
     AgentEvent, AgentId, Approval, HostToolOutcome, PolicyAnswer, SerializableAgentEvent,
     SteerPayload, UserAnswer,
@@ -39,6 +40,13 @@ pub(crate) type PendingMap<T> = Mutex<HashMap<String, (AgentId, oneshot::Sender<
 pub(crate) struct EngineInner {
     /// The shared host core (3a.2).
     pub(crate) host: HostRuntime,
+    /// The brain's config model resolver — the same `Arc` every loop this
+    /// engine's factory builds (all of its sessions) resolves its per-request
+    /// providers through. Held here so
+    /// [`AgentSession::set_model`](AgentSession::set_model) can build a
+    /// live-switch provider + context manager through the engine's own
+    /// build path — no second resolver.
+    pub(crate) model_resolver: std::sync::Arc<crate::model_resolver::ConfigModelResolver>,
     /// Live sessions (SessionId → the agent id).
     pub(crate) sessions: Mutex<HashMap<SessionId, AgentId>>,
     /// Approval responders by request id.
@@ -235,6 +243,27 @@ pub struct AgentSession {
     pub(crate) bus: broadcast::Sender<SessionEvent>,
 }
 
+/// What [`AgentSession::set_model`](AgentSession::set_model) did with the
+/// switch. The `model` payload is the serving model id — the same string
+/// the kernel's `model_changed` event carries once the new model first
+/// serves, and the one a caller's records keep for the served model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelSwitch {
+    /// Pinned now — the new model serves the session's very next request
+    /// (the request in flight, if any, finishes on the old model).
+    NextRequest {
+        /// The serving model id of the switch target.
+        model: String,
+    },
+    /// Deferred — the new model's context window is smaller than the
+    /// current one: the kernel first compacts on the OLD model
+    /// (the pending-swap path), then the new model serves.
+    CompactsFirst {
+        /// The serving model id of the switch target.
+        model: String,
+    },
+}
+
 impl AgentSession {
     /// The session's stable id.
     pub fn id(&self) -> SessionId {
@@ -404,6 +433,131 @@ impl AgentSession {
             .iter()
             .map(|tool| tool.name().to_string())
             .collect())
+    }
+
+    /// Switch this live session's serving model — Mnemo2's live
+    /// change-model (a working worker's picker change). The request in
+    /// flight, if any, finishes on the OLD model; the session's NEXT
+    /// provider request — the next turn, or the next call of the turn in
+    /// flight — serves on the new one. The conversation is kept as-is: no
+    /// restart, the transcript intact.
+    ///
+    /// The provider + context manager are built exactly the way the
+    /// session's own spawn pin is (and the per-request forced-model arm of
+    /// the turn loop still does): the engine's shared
+    /// [`ConfigModelResolver`](crate::model_resolver::ConfigModelResolver)
+    /// at the loop's fill rate, then pinned on the agent loop with
+    /// [`set_explicit_provider`](crate::agent::AgentLoop::set_explicit_provider)
+    /// — the kernel's existing picker seam. The pin is applied immediately,
+    /// never queued behind the running turn, so it lands before the next
+    /// request.
+    ///
+    /// The served-model baseline is seeded from the PRE-switch provider
+    /// before the pin: a loop that never served is otherwise seeded at
+    /// turn entry from the ALREADY-switched provider, so a switch landing
+    /// before the session's first request (the dispatch/turn-start
+    /// window) would never emit `model_changed` when the new model first
+    /// serves. For a loop that already served the seed is a no-op — the
+    /// pin's first serve announces via the kernel's normal diff.
+    ///
+    /// The effort bookkeeping mirrors Mnemo1's picker swap
+    /// (`config_io::swap_provider_into_loop`): the switch's display effort
+    /// — the requested one, else the model's configured default chain —
+    /// is recorded in the pinned + default display slots and the stale
+    /// per-turn mirrors (model, endpoint, effort) are cleared, so the pin's
+    /// first serve reports the NEW effort: `model_changed` carries it, and
+    /// an effort-only switch on the same model still announces.
+    ///
+    /// A model whose context window is SMALLER than the current one
+    /// defers the swap (the kernel's pending-swap path): the conversation
+    /// is compacted on the OLD model first, then the new one serves —
+    /// reported as [`ModelSwitch::CompactsFirst`] so the caller can say
+    /// so. The outcome is decided by the window comparison itself (the
+    /// same rule the pin applies), never by sampling the kernel's
+    /// pending-swap slot afterwards — a running turn may consume that
+    /// slot in between and misreport the result. The `model` payload is
+    /// the serving model id — the same string the kernel's
+    /// `model_changed` event carries once the new model serves.
+    ///
+    /// Errors: `session_closed` when the session or its agent task ended;
+    /// the spawn path's spec errors (a malformed model spec — `spawn_failed`,
+    /// the same mapping
+    /// [`Engine::spawn`](crate::headless::engine::Engine::spawn) applies)
+    /// and `not_configured` when the engine's config no longer lists the
+    /// model.
+    pub async fn set_model(
+        &self,
+        model: &str,
+        reasoning_effort: Option<String>,
+    ) -> Result<ModelSwitch, EngineError> {
+        if !self.inner.sessions.lock().await.contains_key(&self.id) {
+            return Err(EngineError::session_closed(format!(
+                "session {:?} is closed",
+                self.id
+            )));
+        }
+        let model_ref = crate::headless::engine::forced_model_ref(Some(model), reasoning_effort)
+            .map_err(EngineError::spawn_failed)?
+            .ok_or_else(|| EngineError::spawn_failed("a live model switch needs a model"))?;
+        let loop_arc = self
+            .agent_loop
+            .upgrade()
+            .ok_or_else(|| EngineError::session_closed("the agent task ended"))?;
+        let (provider, context_manager) = self
+            .inner
+            .model_resolver
+            .build_turn_provider(&model_ref, loop_arc.fill_rate())
+            .ok_or_else(|| {
+                EngineError::not_configured(format!(
+                    "model '{model}' is not configured for this engine"
+                ))
+            })?;
+        // The serving model id the kernel's `model_changed` event will carry
+        // once the new model serves — the same string a caller's records
+        // keep for the served model.
+        let new_model = provider.model().to_string();
+        // The deferral rule the pin itself applies — the new window against
+        // the current one — decided HERE rather than by sampling
+        // `has_pending_swap` afterwards: a running turn may consume the
+        // deferred swap in between, which would misreport the outcome.
+        let deferred =
+            provider.capabilities().max_context < loop_arc.context_manager().max_tokens();
+        // Seed the served-model baseline from the PRE-switch provider while
+        // the loop still shows the old model: a loop that never served is
+        // otherwise seeded at turn entry from the ALREADY-switched provider,
+        // and a switch that landed before the session's first request would
+        // never emit `model_changed` when the new model first serves. For a
+        // loop that already served this is a no-op — the pin's first serve
+        // announces via the kernel's normal diff.
+        loop_arc.seed_served_effective_if_empty();
+        // The effort bookkeeping Mnemo1's swap performs: the switch's display
+        // effort — what the picker requested, or the model's configured
+        // default chain — is recorded in the pinned + default display slots
+        // and the stale per-turn mirrors (model, endpoint, effort) are
+        // cleared, so the pin's first serve reports the NEW effort
+        // (`model_changed` carries it; the baseline above captured the OLD
+        // triple, so an effort-only switch on the same model still
+        // announces). Falls back to the requested effort when the model
+        // left the config between the build and this read.
+        let display_effort = self
+            .inner
+            .model_resolver
+            .display_effort_for(&model_ref)
+            .or_else(|| model_ref.reasoning_effort.clone());
+        loop_arc.set_resolved_model(None);
+        loop_arc.set_resolved_provider(None);
+        loop_arc.set_pinned_display_effort(display_effort.clone());
+        loop_arc.set_default_display_effort(display_effort);
+        loop_arc.set_resolved_effort(None);
+        // The kernel seam: pin the pair — an immediate swap, or a deferred
+        // one when the new window is smaller (compaction on the old model
+        // first).
+        loop_arc.set_explicit_provider(provider, context_manager);
+        Ok(if deferred {
+            ModelSwitch::CompactsFirst { model: new_model }
+        } else {
+            ModelSwitch::NextRequest { model: new_model }
+        })
     }
 
     /// Read this session's active plan from its exact plans directory.
@@ -1441,5 +1595,556 @@ mod lifecycle_tests {
             session.agent.to_string(),
             "the headless SessionId (the same allocation today) stays its own wire concept"
         );
+    }
+}
+/// The live model switch (Mnemo2's change-model on a working worker): the
+/// provider + context manager are rebuilt through the engine's own resolver
+/// and pinned on the session's agent loop, the request in flight finishes
+/// on the OLD model, and the next one serves on the NEW one. These
+/// fixtures run WITHOUT an injected provider — a real config-resolved
+/// transport against a local SSE stub server — so they exercise the same
+/// provider build path a production switch uses, and record which model
+/// served every request.
+#[cfg(test)]
+mod model_tests {
+    use super::{super::engine::Engine, ModelSwitch};
+    use crate::headless::{SessionCommand, SpawnOptions, Transcript};
+    use crate::provider::Message;
+    use crate::runtime::channels::SerializableAgentEvent;
+    use std::sync::{Arc, Mutex};
+
+    /// One scripted SSE response, optionally held behind a gate so the test
+    /// can switch the model while the request is in flight.
+    struct StubTurn {
+        body: String,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    /// A one-request-per-connection SSE server: the i-th request gets the
+    /// i-th scripted turn, and every request body is recorded so the test
+    /// can assert which model served which request. The repo has no
+    /// mock-HTTP crate; like the provider tests this speaks just enough
+    /// HTTP/1.1.
+    struct SseStub {
+        addr: std::net::SocketAddr,
+        bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+        arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+    }
+
+    impl SseStub {
+        /// Start the server. The test must make exactly as many requests as
+        /// scripted turns (the accept task ends after the last one).
+        async fn start(mut turns: Vec<StubTurn>) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the stub listener");
+            let addr = listener.local_addr().expect("the stub address");
+            let (arrivals_tx, arrivals_rx) = tokio::sync::mpsc::unbounded_channel();
+            let bodies = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&bodies);
+            tokio::spawn(async move {
+                for turn in turns.drain(..) {
+                    let (mut socket, _) = listener.accept().await.expect("accept a request");
+                    // Read the head up to the body separator, then exactly
+                    // content-length body bytes.
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let head_end = loop {
+                        let mut chunk = [0u8; 4096];
+                        let read = socket.read(&mut chunk).await.expect("read the head");
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .expect("the request carries content-length");
+                    let mut body = buffer[head_end..].to_vec();
+                    while body.len() < content_length {
+                        let mut chunk = [0u8; 4096];
+                        let read = socket.read(&mut chunk).await.expect("read the body");
+                        body.extend_from_slice(&chunk[..read]);
+                    }
+                    body.truncate(content_length);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body).expect("a JSON request body");
+                    recorded.lock().expect("the request log").push(body);
+                    arrivals_tx.send(()).expect("the arrival channel");
+                    // The optional gate holds the response — a request in
+                    // flight while the test acts.
+                    if let Some(gate) = turn.gate {
+                        let _ = gate.await;
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                        turn.body.len(),
+                        turn.body
+                    );
+                    socket
+                        .write_all(reply.as_bytes())
+                        .await
+                        .expect("write the scripted reply");
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                addr,
+                bodies,
+                arrivals: arrivals_rx,
+            }
+        }
+
+        /// The endpoint `base_url` the fixture config points at.
+        fn base_url(&self) -> String {
+            format!("http://{}/v1/", self.addr)
+        }
+
+        /// Wait for the next request to arrive (still in flight while its
+        /// response is gated).
+        async fn next_arrival(&mut self) {
+            self.arrivals.recv().await.expect("a request arrives");
+        }
+
+        /// The `model` field of every request so far, in order.
+        fn models(&self) -> Vec<String> {
+            self.bodies
+                .lock()
+                .expect("the request log")
+                .iter()
+                .map(|body| {
+                    body["model"]
+                        .as_str()
+                        .expect("the request names its model")
+                        .to_string()
+                })
+                .collect()
+        }
+
+        /// A recorded request body by index.
+        fn body(&self, index: usize) -> serde_json::Value {
+            self.bodies.lock().expect("the request log")[index].clone()
+        }
+    }
+
+    /// Concatenate SSE `data:` chunks plus the `[DONE]` terminator.
+    fn sse(chunks: &[serde_json::Value]) -> String {
+        chunks
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+            .collect()
+    }
+
+    /// An SSE turn answering with `text` and ending the turn.
+    fn text_turn(text: &str) -> String {
+        sse(&[
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
+        ])
+    }
+
+    /// An SSE turn calling a tool the session does not have: the loop
+    /// records the "unknown tool" result and issues the next request — the
+    /// second provider call in the SAME turn the switch tests pin across.
+    fn unknown_tool_turn() -> String {
+        sse(&[
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"definitely_not_a_tool","arguments":"{}"}}]},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
+        ])
+    }
+
+    /// The two-model fixture config: `model-a` (big window) is what the
+    /// session spawns on, `model-b` is the switch target, its window set by
+    /// the test.
+    fn write_switch_config(config: &std::path::Path, base_url: &str, model_b_max_context: usize) {
+        std::fs::create_dir_all(config).expect("config dir");
+        std::fs::write(
+            config.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"model-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            config.join("endpoints.toml"),
+            format!(
+                "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"{base_url}\"\n\
+                 [[endpoint.models]]\nid = \"model-a\"\nmax_context = 200000\n\
+                 [[endpoint.models]]\nid = \"model-b\"\nmax_context = {model_b_max_context}\n"
+            ),
+        )
+        .expect("endpoints.toml");
+    }
+
+    /// Start the engine on the switch fixture.
+    async fn switch_engine(
+        root: &tempfile::TempDir,
+        config: &tempfile::TempDir,
+    ) -> Engine {
+        Engine::start(crate::headless::EngineOptions {
+            workspace: crate::workspace::Workspace::new(root.path()),
+            config_dir: Some(config.path().to_path_buf()),
+            permissions: crate::agent::policy::PermissionPolicy::OverridePermissions,
+            memory: crate::headless::MemoryBackend::Disabled,
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("start engine")
+    }
+
+    /// The live switch: request 1 is held in flight on model-a, the switch
+    /// pins model-b mid-turn, the held request finishes on model-a, and the
+    /// follow-up request in the SAME turn serves on model-b — with the
+    /// transcript kept (the follow-up request still carries the first
+    /// prompt and the tool-call result).
+    #[tokio::test]
+    async fn set_model_serves_the_next_request_on_the_new_model() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = SseStub::start(vec![
+            StubTurn {
+                body: unknown_tool_turn(),
+                gate: Some(gate),
+            },
+            StubTurn {
+                body: text_turn("done on the new model"),
+                gate: None,
+            },
+        ])
+        .await;
+        write_switch_config(config.path(), &stub.base_url(), 200000);
+        let engine = switch_engine(&root, &config).await;
+        let session = engine
+            .spawn(SpawnOptions {
+                name: Some("switch".into()),
+                model: Some("test/model-a".into()),
+                ..SpawnOptions::default()
+            })
+            .await
+            .expect("spawn");
+        let mut events = session.events();
+        session
+            .send(SessionCommand::Prompt {
+                text: "count the stars".into(),
+                images: vec![],
+            })
+            .await
+            .expect("prompt");
+
+        // Request 1 is in flight on the old model — hold it there.
+        stub.next_arrival().await;
+        assert_eq!(stub.models(), ["model-a"]);
+
+        // The switch applies while the request is in flight and returns at
+        // once: the turn keeps running, nothing restarts.
+        let outcome = session
+            .set_model("test/model-b", None)
+            .await
+            .expect("the live switch pins the new model");
+        assert_eq!(
+            outcome,
+            ModelSwitch::NextRequest { model: "model-b".into() }
+        );
+        release.send(()).expect("release the held response");
+
+        // The follow-up request serves on the new model; the turn ends.
+        let mut changes: Vec<String> = Vec::new();
+        while let Ok(ev) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await
+        {
+            match ev.expect("event").event {
+                SerializableAgentEvent::ModelChanged { model, .. } => changes.push(model),
+                SerializableAgentEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            stub.models(),
+            ["model-a", "model-b"],
+            "the in-flight request finished on the old model, the next one served on the new one"
+        );
+        assert_eq!(
+            changes.last().map(String::as_str),
+            Some("model-b"),
+            "the kernel announced the new model once it served: {changes:?}"
+        );
+        // The transcript survived the switch: the post-switch request still
+        // carries the original prompt and the failed tool call.
+        let follow_up = stub.body(1)["messages"].to_string();
+        assert!(
+            follow_up.contains("count the stars") && follow_up.contains("definitely_not_a_tool"),
+            "the follow-up request carries the kept transcript: {follow_up}"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// The deferred swap: switching to a model whose window is smaller than
+    /// the conversation reports [`ModelSwitch::CompactsFirst`], and the
+    /// kernel compacts on the OLD model before the new one serves — the
+    /// summarization request is the second model-a request, never an
+    /// oversized request against the smaller window.
+    #[tokio::test]
+    async fn set_model_to_a_smaller_window_compacts_on_the_old_model_first() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        // A seeded conversation far over model-b's swap threshold
+        // (48000 * SWAP_SUMMARIZE_FILL) but under model-a's own compaction
+        // threshold. Plain varied sentences — the embedded BPE tokenizer
+        // counts real tokens for them, so the size is predictable.
+        let filler = "the quick brown fox keeps counting past the lazy dog and walks on ";
+        let mut messages = Vec::new();
+        for index in 0..75 {
+            let text = filler.repeat(25);
+            messages.push(Message::user_text(format!("seed {index}: {text}")));
+            messages.push(Message::assistant_text(format!("answer {index}: {text}")));
+        }
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = SseStub::start(vec![
+            StubTurn {
+                body: unknown_tool_turn(),
+                gate: Some(gate),
+            },
+            StubTurn {
+                body: text_turn("summary of the long seed"),
+                gate: None,
+            },
+            StubTurn {
+                body: text_turn("done on the compacted new model"),
+                gate: None,
+            },
+        ])
+        .await;
+        write_switch_config(config.path(), &stub.base_url(), 48000);
+        let engine = switch_engine(&root, &config).await;
+        let session = engine
+            .spawn(SpawnOptions {
+                name: Some("deferred".into()),
+                model: Some("test/model-a".into()),
+                resume: Some(Transcript { messages }),
+                ..SpawnOptions::default()
+            })
+            .await
+            .expect("spawn");
+        let mut events = session.events();
+        session
+            .send(SessionCommand::Prompt {
+                text: "continue counting".into(),
+                images: vec![],
+            })
+            .await
+            .expect("prompt");
+        stub.next_arrival().await;
+        assert_eq!(stub.models(), ["model-a"]);
+
+        // The switch defers: the new window cannot serve the conversation
+        // as-is.
+        let outcome = session
+            .set_model("test/model-b", None)
+            .await
+            .expect("the live switch is accepted");
+        assert_eq!(
+            outcome,
+            ModelSwitch::CompactsFirst { model: "model-b".into() }
+        );
+        release.send(()).expect("release the held response");
+
+        let mut compacted = false;
+        let mut changes: Vec<String> = Vec::new();
+        while let Ok(ev) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await
+        {
+            match ev.expect("event").event {
+                SerializableAgentEvent::CompactStarted => compacted = true,
+                SerializableAgentEvent::ModelChanged { model, .. } => changes.push(model),
+                SerializableAgentEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            stub.models(),
+            ["model-a", "model-a", "model-b"],
+            "the summarization ran on the OLD model, then the new one served"
+        );
+        assert!(compacted, "the deferred swap announced the compaction");
+        assert_eq!(
+            changes.last().map(String::as_str),
+            Some("model-b"),
+            "the kernel announced the new model once it served: {changes:?}"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A switch that lands in the dispatch/turn-start window — before the
+    /// session's first request — still announces: the served-model baseline
+    /// is seeded from the PRE-switch model when the switch is applied, so
+    /// `model_changed` fires when the new model first serves. Without the
+    /// seed the baseline would be seeded at turn entry from the
+    /// already-switched provider and swallow the announcement.
+    #[tokio::test]
+    async fn set_model_before_the_first_request_still_announces() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let stub = SseStub::start(vec![StubTurn {
+            body: text_turn("done on the switched model"),
+            gate: None,
+        }])
+        .await;
+        write_switch_config(config.path(), &stub.base_url(), 200000);
+        let engine = switch_engine(&root, &config).await;
+        let session = engine
+            .spawn(SpawnOptions {
+                name: Some("pre-turn switch".into()),
+                // A ROUTING session — no forced model. With a forced model
+                // the spawn pin already seeds the baseline and the bug does
+                // not reproduce; routing is the window where the turn-entry
+                // seed falls back to the already-switched provider.
+                model: None,
+                ..SpawnOptions::default()
+            })
+            .await
+            .expect("spawn");
+
+        // The switch lands BEFORE the session's first request — the
+        // dispatch/turn-start window.
+        let outcome = session
+            .set_model("test/model-b", None)
+            .await
+            .expect("the live switch pins the new model");
+        assert_eq!(
+            outcome,
+            ModelSwitch::NextRequest { model: "model-b".into() }
+        );
+
+        let mut events = session.events();
+        session
+            .send(SessionCommand::Prompt {
+                text: "count the stars".into(),
+                images: vec![],
+            })
+            .await
+            .expect("prompt");
+
+        // The session's very first request serves on the new model AND the
+        // kernel announces it — a UI "now running on" note depends on
+        // this event.
+        let mut changes: Vec<String> = Vec::new();
+        while let Ok(ev) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await
+        {
+            match ev.expect("event").event {
+                SerializableAgentEvent::ModelChanged { model, .. } => changes.push(model),
+                SerializableAgentEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            changes.as_slice(),
+            ["model-b"],
+            "the first serve announced the new model: {changes:?}"
+        );
+        assert_eq!(stub.models(), ["model-b"]);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// An effort-only switch on the SAME model (high → low): the loop's
+    /// effort display state is part of the switch's bookkeeping, so the
+    /// follow-up request carries the new effort and `model_changed`
+    /// reports it — without the bookkeeping the wire request changes but
+    /// the display never learns, and the announcement never fires.
+    #[tokio::test]
+    async fn set_model_reports_an_effort_change_on_the_same_model() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = SseStub::start(vec![
+            StubTurn {
+                body: unknown_tool_turn(),
+                gate: Some(gate),
+            },
+            StubTurn {
+                body: text_turn("done on the low effort"),
+                gate: None,
+            },
+        ])
+        .await;
+        write_switch_config(config.path(), &stub.base_url(), 200000);
+        let engine = switch_engine(&root, &config).await;
+        let session = engine
+            .spawn(SpawnOptions {
+                name: Some("effort switch".into()),
+                model: Some("test/model-a".into()),
+                reasoning_effort: Some("high".into()),
+                ..SpawnOptions::default()
+            })
+            .await
+            .expect("spawn");
+        let mut events = session.events();
+        session
+            .send(SessionCommand::Prompt {
+                text: "count the stars".into(),
+                images: vec![],
+            })
+            .await
+            .expect("prompt");
+
+        // Request 1 is in flight on model-a with the HIGH effort — hold it.
+        stub.next_arrival().await;
+        assert_eq!(stub.models(), ["model-a"]);
+        assert_eq!(
+            stub.body(0)["reasoning_effort"].as_str(),
+            Some("high"),
+            "the in-flight request carries the spawn effort"
+        );
+
+        // Same model, new effort — a live switch that changes nothing but
+        // the effort.
+        let outcome = session
+            .set_model("test/model-a", Some("low".into()))
+            .await
+            .expect("the live switch pins the new effort");
+        assert_eq!(
+            outcome,
+            ModelSwitch::NextRequest { model: "model-a".into() }
+        );
+        release.send(()).expect("release the held response");
+
+        // The follow-up request in the SAME turn carries the NEW effort,
+        // and the kernel announces the new (model, effort) pair.
+        let mut changes: Vec<(String, Option<String>)> = Vec::new();
+        while let Ok(ev) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await
+        {
+            match ev.expect("event").event {
+                SerializableAgentEvent::ModelChanged {
+                    model,
+                    reasoning_effort,
+                    ..
+                } => changes.push((model, reasoning_effort)),
+                SerializableAgentEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            stub.body(1)["reasoning_effort"].as_str(),
+            Some("low"),
+            "the follow-up request carries the switched effort"
+        );
+        assert_eq!(
+            changes.last(),
+            Some(&("model-a".to_string(), Some("low".to_string()))),
+            "the kernel announced the new effort: {changes:?}"
+        );
+        engine.shutdown().await.expect("shutdown");
     }
 }

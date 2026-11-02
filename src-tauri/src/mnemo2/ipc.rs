@@ -892,7 +892,8 @@ pub async fn team_resume(
 }
 
 /// Move a worker to another model and reasoning effort, keeping its
-/// transcript; an idle or stopped worker comes back idle on the new model.
+/// transcript; a working worker switches at its next call, an idle or
+/// stopped one comes back idle on the new model.
 #[tauri::command]
 pub async fn team_set_model(
     state: State<'_, Mnemo2State>,

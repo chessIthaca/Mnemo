@@ -26,6 +26,7 @@ use mnemo::headless::{
     PendingInteraction, QuestionPolicy, SessionCommand, SessionEvent, SessionId, SpawnOptions,
     ToolSelection, Transcript, TurnEndPolicy,
 };
+use mnemo::headless::session::ModelSwitch;
 use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
 use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::{PermissionPolicy, SerializableAgentEvent};
@@ -3088,10 +3089,13 @@ impl TeamRuntime {
     }
 
     /// Move a worker to another model (and reasoning effort), keeping its
-    /// transcript, branch, and worktree. An idle live session is restarted
-    /// on the new model; a stopped, interrupted, or failed one is resumed on
-    /// it; a worker whose brief never reached a session is started with it.
-    /// A working worker is refused: stop or pause it first.
+    /// transcript, branch, and worktree. A WORKING worker switches live at
+    /// its next request: the call in flight finishes on the old model, the
+    /// next one serves on the new one — no stop, no restart. An audit
+    /// worker's model is never switchable. An idle live session is
+    /// restarted on the new model; a stopped, interrupted, or failed one
+    /// is resumed on it; a worker whose brief never reached a session is
+    /// started with it.
     pub async fn change_model(
         &self,
         worker_id: &str,
@@ -3108,9 +3112,60 @@ impl TeamRuntime {
         }
         self.validate_model(&model, &reasoning_effort)?;
         if self.worker_is_busy(worker_id).await {
-            return Err(format!(
-                "worker '{worker_id}' is working; pause or stop it before changing its model"
-            ));
+            if record.kind == "audit" {
+                // Audit workers' models are not user-switchable — the audit
+                // runs on the model that dispatched it.
+                return Err(format!(
+                    "worker '{worker_id}' is an audit worker; its model is not switchable"
+                ));
+            }
+            // Live switch — no stop, no restart: the provider request in
+            // flight finishes on the old model; the worker's next request
+            // serves on the new one. The kernel emits its model_changed
+            // agent event once the new model serves, and the pump re-points
+            // `model_id` from it. Moving a working worker to routing
+            // (model: None) needs the restart path below — refuse it.
+            let Some(spec) = model.clone() else {
+                return Err(format!(
+                    "worker '{worker_id}' is working; a live model switch needs a model; stop the worker to move it to routing"
+                ));
+            };
+            let switched = {
+                let live = self.live.lock().await;
+                let live = live
+                    .get(worker_id)
+                    .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+                live.admit_session_command(worker_id)?;
+                live.session
+                    .set_model(&spec, reasoning_effort.clone())
+                    .await
+            };
+            let new_model_id = match switched {
+                Ok(ModelSwitch::NextRequest { model: served })
+                | Ok(ModelSwitch::CompactsFirst { model: served }) => served,
+                Err(error) => {
+                    return Err(format!(
+                        "could not switch worker '{worker_id}' to '{spec}': {error}"
+                    ));
+                }
+            };
+            self.update_worker(worker_id, |worker| {
+                worker.model = model.clone();
+                // Never erase an already-observed id that already matches
+                // the new model: the new model's events may have been
+                // pumped before this update (the pin landed mid-turn, or
+                // the target was already serving) — an unconditional clear
+                // could leave the record without its correct id, with no
+                // later event left to repair it.
+                if worker.model_id.as_deref() != Some(new_model_id.as_str()) {
+                    worker.model_id = None;
+                }
+                worker.reasoning_effort = reasoning_effort.clone();
+                worker.tier = None;
+            })
+            .await;
+            self.persist().await?;
+            return self.worker(worker_id).await;
         }
         if self.live.lock().await.contains_key(worker_id) {
             self.stop_inner(worker_id).await?;

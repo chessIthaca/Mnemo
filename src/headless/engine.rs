@@ -868,6 +868,7 @@ async fn start_inner(
     let (bus, _) = broadcast::channel(1024);
     let inner = Arc::new(EngineInner {
         host,
+        model_resolver: brain.model_resolver.clone(),
         sessions: Mutex::new(HashMap::new()),
         pending_approvals: Mutex::new(HashMap::new()),
         pending_questions: Mutex::new(HashMap::new()),
@@ -945,7 +946,10 @@ fn parse_model_ref(spec: &str) -> Result<crate::config::ModelRef, String> {
 
 /// The spawn's forced model with its optional reasoning effort. An effort
 /// needs a model to apply to — it is refused rather than silently dropped.
-fn forced_model_ref(
+/// [`AgentSession::set_model`](crate::headless::session::AgentSession::set_model)
+/// reuses this parse, so a live model switch validates a spec exactly like
+/// a spawn-time pin.
+pub(crate) fn forced_model_ref(
     spec: Option<&str>,
     reasoning_effort: Option<String>,
 ) -> Result<Option<crate::config::ModelRef>, String> {

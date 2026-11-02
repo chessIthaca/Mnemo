@@ -22,6 +22,7 @@ use mnemo::headless::{
     AgentPlan, AgentSession, Engine, EngineOptions, EventReceiver, MemoryBackend,
     PendingInteraction, SessionCommand, SessionEvent, SessionId, SpawnOptions, Transcript,
 };
+use mnemo::laya::LayaManager;
 use mnemo::provider::LlmClient;
 use mnemo::tool::ToolResult;
 use mnemo::workspace::Workspace;
@@ -262,6 +263,14 @@ pub struct LeadRuntime {
     stores: std::sync::Mutex<Option<ProjectStores>>,
     /// The engine's startup code-index and memory passes.
     indexing: Arc<crate::mnemo2::indexing::IndexingTracker>,
+    /// The managed Laya runtime the engine attached at start (`None`
+    /// while `[general.laya]` is disabled or uninstalled, and after
+    /// [`LeadRuntime::shutdown`]). The running `laya-serve` child lives
+    /// inside this manager, so the runtime holds the Arc for the
+    /// engine's whole lifetime — dropping it would kill the child; the
+    /// explicit stop in [`LeadRuntime::shutdown`] is the primary path,
+    /// the manager's Drop is only the safety net.
+    laya: std::sync::Mutex<Option<Arc<LayaManager>>>,
 }
 
 /// The project stores the engine wired into its own agent registries. The
@@ -355,6 +364,7 @@ impl LeadRuntime {
             board: std::sync::Mutex::new(None),
             stores: std::sync::Mutex::new(None),
             indexing: crate::mnemo2::indexing::IndexingTracker::new(),
+            laya: std::sync::Mutex::new(None),
         };
         runtime.start_engine(provider).await?;
         let team = TeamRuntime::open(TeamRuntimeOptions {
@@ -478,10 +488,13 @@ impl LeadRuntime {
     /// same shared handles, same knowledge-file backing), so schemas and
     /// descriptions are the engine's own and memory writes land in
     /// `.coding/knowledge/**` through the knowledge store's own path rules.
-    /// Left out: the Laya auto-typing gate (the app wires no classifier into
-    /// the headless engine either) and the engine's agent-root note (the lead
-    /// works in the main tree). Memory tools are absent until the engine has
-    /// started; graph tools also when code indexing is off, as in the engine.
+    /// Left out: the Laya auto-typing gate (these tool instances are built
+    /// without it; the engine's OWN agent tools, by contrast, auto-type
+    /// through the classifier slot `start_engine`'s attach fills when
+    /// `[general.laya]` is enabled and installed) and the engine's
+    /// agent-root note (the lead works in the main tree). Memory tools
+    /// are absent until the engine has started; graph tools also when
+    /// code indexing is off, as in the engine.
     pub(crate) fn knowledge_tools(&self) -> Vec<Box<dyn mnemo::tool::Tool>> {
         use mnemo::tool::agent::codegraph::{
             GraphContextTool, GraphImpactTool, GraphPathTool, GraphSearchTool,
@@ -876,6 +889,13 @@ impl LeadRuntime {
         if let Some(team) = self.team.lock().await.take() {
             team.shutdown().await;
         }
+        // Stop the managed Laya sidecar BEFORE the engine drops: every
+        // classifier consumer (routing, auto-typing, triage) reads the
+        // shared slot at call time, and the manager's Drop kill is only
+        // the safety net — this explicit stop is the primary path.
+        if let Some(laya) = self.laya.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            laya.stop();
+        }
         let live = self.live.lock().await.take();
         if let Some(live) = live {
             live.abort();
@@ -968,13 +988,71 @@ impl LeadRuntime {
             self.indexing.begin_code_pass(first_run);
         }
         self.indexing.watch(engine.clone());
+        // The classifier attach is last and never gates the start: the
+        // fill is I/O-free and every failure only logs.
+        self.attach_laya(&engine).await;
         *self.engine.lock().await = Some(engine);
         Ok(())
+    }
+
+    /// Attach the managed Laya classifier to the just-started engine —
+    /// the headless twin of Mnemo1's startup attach (main.rs:78-127):
+    /// when the live `[general.laya]` config enables Laya and the
+    /// English checkpoint is already installed, the engine-backed
+    /// `Setup` fills the brain's classifier slot and parks the sidecar
+    /// start (status `Starting` until the probe answers); the workers
+    /// share the engine's brain, so this one fill covers the lead and
+    /// every worker session. A disabled or uninstalled Laya changes
+    /// nothing — the slot stays empty, a byte-identical pre-Laya
+    /// startup — and no error here ever fails the engine start. The
+    /// manager Arc is held on the runtime: dropping it would kill the
+    /// `laya-serve` child, so it must outlive this call.
+    async fn attach_laya(&self, engine: &Arc<Engine>) {
+        let setup = match mnemo::headless::Setup::open(Some(self.config_dir.clone())) {
+            Ok(setup) => setup.for_engine(engine),
+            Err(err) => {
+                eprintln!(
+                    "mnemo2: the Laya classifier could not attach — the settings \
+                     setup failed to open: {err}"
+                );
+                return;
+            }
+        };
+        if setup.attach_laya().await.is_none() {
+            return;
+        }
+        *self.laya.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::clone(setup.laya_manager()));
+        eprintln!("mnemo2: the managed Laya classifier attached to the lead engine");
+        // TODO(plan e02de747): the design (§2) spawns the startup
+        // fine-tune gate right here — `spawn_startup_finetune`
+        // (src-tauri/src/ipc/finetune.rs:585) on this manager plus the
+        // slot (`Setup::classifier_slot`), the status Arc and the live
+        // config (`Setup::live_config`). It is NOT spawned: that
+        // function hangs off main.rs's binary-only `mod ipc;` tree —
+        // this lib-compiled module (src-tauri/src/lib.rs) has no `ipc`
+        // module, so the call does not even resolve for the mnemo2
+        // binary. Lifting the gate into the lib is a crate-layout
+        // change outside this step's single-file ownership; until it
+        // lands, Mnemo2 skips the startup fine-tune (the classifier
+        // serves whatever checkpoint is installed).
     }
 
     /// The project's startup indexing status.
     pub fn indexing(&self) -> &Arc<crate::mnemo2::indexing::IndexingTracker> {
         &self.indexing
+    }
+
+    /// The managed Laya runtime this lead attached at engine start, when
+    /// `[general.laya]` was enabled and the checkpoint already installed
+    /// (`None` otherwise, and after [`LeadRuntime::shutdown`]). Rewire-style
+    /// callers must reuse THIS Arc: a fresh `for_engine` `Setup` builds its
+    /// own manager, and only this instance owns the running sidecar child.
+    pub fn laya_manager(&self) -> Option<Arc<LayaManager>> {
+        self.laya
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     async fn spawn_live(
@@ -1924,6 +2002,42 @@ mod tests {
         .expect("endpoints.toml");
     }
 
+    /// Append `[general.laya] enabled = true` to the fixture config — the
+    /// same flip the kernel seam's tests make (setup.rs's
+    /// `enable_laya_in_config`).
+    fn enable_laya_in_config(dir: &Path) {
+        let path = dir.join("config.toml");
+        let mut text = std::fs::read_to_string(&path).expect("fixture config.toml");
+        text.push_str("\n[general.laya]\nenabled = true\n");
+        std::fs::write(&path, text).expect("writing config.toml");
+    }
+
+    /// Doctor a PRETEND-installed managed runtime under `<config_dir>/laya`
+    /// — the same fake the kernel seam's tests plant (setup.rs's
+    /// `doctor_installed_laya`): exactly the two files
+    /// `is_checkpoint_installed` probes (the marker + the venv's
+    /// `laya-serve`). The fake binary is deliberately NOT a valid
+    /// executable image: even if the fire-and-forget start task the
+    /// attach parks ever runs, the child spawn fails instantly — no real
+    /// sidecar, no network.
+    fn doctor_installed_laya(dir: &Path) {
+        let base = dir.join("laya");
+        std::fs::create_dir_all(base.join("markers")).expect("markers dir");
+        std::fs::write(
+            base.join("markers")
+                .join(mnemo::laya::english_checkpoint().id),
+            b"installed",
+        )
+        .expect("marker file");
+        let serve = mnemo::laya::venv_bin(
+            &base.join("venv"),
+            std::env::consts::OS,
+            "laya-serve",
+        );
+        std::fs::create_dir_all(serve.parent().expect("venv bin dir")).expect("venv bin dir");
+        std::fs::write(&serve, b"not a real executable").expect("fake laya-serve");
+    }
+
     fn options(root: &TempDir, config: &TempDir, state: &TempDir) -> LeadRuntimeOptions {
         LeadRuntimeOptions {
             workspace_root: root.path().to_path_buf(),
@@ -2304,6 +2418,115 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), app_state.shutdown())
             .await
             .expect("shutdown with an open project and team completes");
+    }
+
+    /// Design §6 step 2's disabled pin: with no `[general.laya]` table
+    /// (the shipped default) — even with a pretend install present — the
+    /// engine start leaves the classifier slot empty and the runtime
+    /// holds no manager: a byte-identical pre-Laya startup.
+    #[tokio::test]
+    async fn laya_disabled_leaves_the_classifier_slot_empty() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        // The install alone must not attach anything — only the flag does.
+        doctor_installed_laya(config.path());
+        let runtime = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+        )
+        .await
+        .expect("the lead opens with Laya disabled");
+        let engine = runtime.engine_handle().await.expect("engine handle");
+        let setup = mnemo::headless::Setup::open(Some(config.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let slot = setup
+            .classifier_slot()
+            .expect("engine-backed: the slot handle");
+        assert!(
+            slot.read().expect("classifier slot lock").is_none(),
+            "a disabled Laya leaves the classifier slot empty"
+        );
+        assert!(
+            runtime.laya_manager().is_none(),
+            "no manager is held while Laya is disabled"
+        );
+        assert!(
+            matches!(
+                *setup
+                    .laya_manager()
+                    .status_arc()
+                    .read()
+                    .expect("classifier status lock"),
+                mnemo::memory::classifier::ClassifierStatus::Disabled
+            ),
+            "the shared status stays in its creation state"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// Design §6 step 2's attach pin: with `[general.laya]` enabled and a
+    /// pretend-installed runtime, the engine start fills the engine's live
+    /// classifier slot and the runtime holds the manager the attach
+    /// spawned through (the workers share the engine's brain, so this one
+    /// fill covers every session). `shutdown` then stops that manager
+    /// BEFORE the engine drops — the observable is the runtime no longer
+    /// holding it (the explicit stop is the primary path; the manager's
+    /// Drop is only the safety net). No real sidecar ever runs: the
+    /// fire-and-forget start task the attach parks fails instantly on the
+    /// doctored (invalid-image) binary, so by assertion time the status
+    /// reads Starting or Failed — never its creation state.
+    #[tokio::test]
+    async fn laya_enabled_and_installed_fills_the_slot_and_shutdown_stops_it() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        enable_laya_in_config(config.path());
+        doctor_installed_laya(config.path());
+        let runtime = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+        )
+        .await
+        .expect("the lead opens with Laya enabled + a doctored install");
+        let engine = runtime.engine_handle().await.expect("engine handle");
+        let setup = mnemo::headless::Setup::open(Some(config.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let slot = setup
+            .classifier_slot()
+            .expect("engine-backed: the slot handle");
+        assert!(
+            slot.read().expect("classifier slot lock").is_some(),
+            "the engine's live classifier slot is filled at start"
+        );
+        let manager = runtime
+            .laya_manager()
+            .expect("the runtime holds the manager the attach spawned through");
+        assert_eq!(
+            manager.base_dir(),
+            config.path().join("laya"),
+            "the held manager roots at the config dir's laya/"
+        );
+        assert!(
+            !matches!(
+                *setup
+                    .laya_manager()
+                    .status_arc()
+                    .read()
+                    .expect("classifier status lock"),
+                mnemo::memory::classifier::ClassifierStatus::Disabled
+            ),
+            "the attach parked the sidecar start (Starting or already Failed)"
+        );
+        runtime.shutdown().await;
+        assert!(
+            runtime.laya_manager().is_none(),
+            "shutdown stopped the managed runtime before the engine dropped"
+        );
     }
 
     #[tokio::test]

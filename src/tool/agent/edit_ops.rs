@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use similar::TextDiff;
+use similar::{DiffTag, TextDiff};
 
 use crate::agent::steering_stats::EDIT_STALE_READ_MARK;
 use crate::error::Result;
@@ -265,6 +265,7 @@ fn op_label(op: Option<&EditOp>) -> String {
     match op {
         Some(EditOp::Line(l)) => format!("'{}'", anchor_excerpt(&l.raw)),
         Some(EditOp::Anchor(a)) => format!("anchor '{}'", anchor_excerpt(&a.old_string)),
+        Some(EditOp::ReadCite(c)) => format!("'{}'", anchor_excerpt(&c.raw)),
         None => "unknown op".to_string(),
     }
 }
@@ -958,13 +959,20 @@ pub(crate) fn map_lf_region_to_original(
 }
 
 /// One op in an ops array: either the compact line-op string form
-/// (`'i101:text'`, `'d202-205'`, `'r102:x'`) or an anchor-based [`EditItem`]
+/// (`'i101:text'`, `'b5:x'`, `'d202-205'`, `'r102:x'`) or an anchor-based [`EditItem`]
 /// object. One array carries both forms, so a single field covers compact
-/// line-targeted ops and byte-exact anchor edits.
+/// line-targeted ops and byte-exact anchor edits. A read-receipt cite gets
+/// its OWN variant (plan f302cc0e) rather than riding in as a line op: its
+/// range is in the cited read's coordinates, which only the apply phase —
+/// seeing the ops that precede it — can translate and check for overlap.
 #[derive(Debug)]
 pub(crate) enum EditOp {
     Line(LineOp),
     Anchor(EditItem),
+    /// A `from_read` cite that [`resolve_read_anchors`] validated against
+    /// the pre-ops bytes; its range stays in read coordinates until
+    /// [`apply_ops`] maps it through the earlier ops.
+    ReadCite(ReadCiteOp),
 }
 
 /// The verbs of the compact line-op grammar.
@@ -1004,6 +1012,22 @@ pub(crate) struct LineOp {
     pub(crate) start: usize,
     pub(crate) span: Span,
     /// The text after the FIRST ':' — verbatim (only `r` may be empty).
+    pub(crate) payload: Option<String>,
+}
+
+/// A validated read-receipt cite (plan f302cc0e): `start`/`end` are
+/// 1-indexed inclusive lines in the CITED READ's coordinates — the file as
+/// the receipt validated it, before this call's ops ran. [`apply_ops`] maps
+/// the range through every preceding op's line shifts (a line-level diff of
+/// the pre-ops content against the running content) and refuses the array
+/// when an earlier op already changed one of the cited lines.
+#[derive(Debug)]
+pub(crate) struct ReadCiteOp {
+    /// The cite's label, echoed in error messages (`from_read <id>`).
+    pub(crate) raw: String,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    /// The replacement for `start..=end` verbatim.
     pub(crate) payload: Option<String>,
 }
 
@@ -1245,12 +1269,15 @@ pub(crate) fn validate_op_items(ops: &[EditOp]) -> Result<()> {
 }
 
 /// Resolve the read-reference ops (`from_read` anchors, backlog 3fdc605f,
-/// plan 5a21fc8f) against the CURRENT file bytes and swap each for the
-/// concrete line-op it names. Runs in the prepare phase, where the
-/// content is already in scope: the receipt validation is server-side
-/// (path match + range-within-coverage + per-line hash), so ANY drift
-/// hard-fails here with the fresh-read steering — nothing is written.
-/// Verbatim anchors and compact line ops pass through untouched.
+/// plan 5a21fc8f) against the CURRENT file bytes — the receipt validation
+/// is server-side (path match + range-within-coverage + per-line hash), so
+/// ANY drift hard-fails here with the fresh-read steering and nothing is
+/// written. Each validated cite becomes an [`EditOp::ReadCite`], which
+/// keeps its range in the CITED READ's coordinates (plan f302cc0e): the
+/// apply phase translates it through the ops that precede it in the array
+/// and refuses an in-call overlap, because the read's line numbers and the
+/// running content's diverge as soon as an earlier op changes the line
+/// count. Verbatim anchors and compact line ops pass through untouched.
 pub(crate) fn resolve_read_anchors(
     validated_path: &std::path::Path,
     content: &str,
@@ -1280,11 +1307,14 @@ pub(crate) fn resolve_read_anchors(
             )));
         }
         super::read_registry::resolve(&id, validated_path, lines[0], lines[1], content)?;
-        resolved.push(EditOp::Line(LineOp {
+        // The cite keeps its OWN coordinates (plan f302cc0e): the range is
+        // in the cited read's line numbers, so it must NOT be collapsed
+        // into a line op here — apply_ops translates it through the earlier
+        // ops' perturbations and refuses an in-call overlap.
+        resolved.push(EditOp::ReadCite(ReadCiteOp {
             raw: format!("from_read {id}"),
-            verb: LineVerb::Replace,
             start: lines[0],
-            span: Span::Through(lines[1]),
+            end: lines[1],
             payload: Some(item.new_string.clone()),
         }));
     }
@@ -1300,6 +1330,10 @@ pub(crate) fn resolve_read_anchors(
 /// first-difference pointer, per-item success notes). Line ops are matched
 /// against the content AS LEFT by the preceding ops — the same contract the
 /// anchors have, so a mixed array's line numbers reflect every earlier op.
+/// Read-receipt cites are the one exception (plan f302cc0e): their ranges
+/// are in the CITED READ's coordinates, so each is translated through the
+/// earlier ops' line shifts before it is applied, and a cite whose lines
+/// an earlier op already changed refuses the whole array.
 /// Emission artifacts are validated per op on its payload and once on the
 /// combined result's brace delta — a growth names the offending op(s) from
 /// the deficit trail (backlog 08d2125d); the diff itself is the caller's job.
@@ -1318,6 +1352,12 @@ pub(crate) fn apply_ops(
     let track = artifact_check && checks_brace_balance(path);
     let mut current = content.to_string();
     let mut notes: Vec<String> = Vec::new();
+    // Read-receipt cites ride in the CITED READ's coordinates (plan
+    // f302cc0e) — the file as the receipt validated it, before any op in
+    // this array ran — so capture the pre-ops lines once: the translation
+    // in the loop is exactly the line-level diff between these and the
+    // running content, and an untouched cite short-circuits on equality.
+    let read_lines: Vec<&str> = content.lines().collect();
     // The running brace/bracket/paren deficit after each op — the exact
     // attribution trail for a positive combined delta (backlog 08d2125d).
     let mut deficits: Vec<usize> = Vec::new();
@@ -1387,6 +1427,26 @@ pub(crate) fn apply_ops(
             EditOp::Line(line_op) => {
                 current = apply_line_op(&current, le, line_op, idx)?;
             }
+            // A read-receipt cite names lines in the CITED READ's
+            // coordinates — the content as it was before this call — while
+            // every other op works in the running coordinates (plan
+            // f302cc0e). Translate through the earlier ops' perturbations
+            // first, so the cite lands on exactly the lines it validated
+            // (a cite no earlier op disturbed is byte-identical to the
+            // pre-fix blind apply).
+            EditOp::ReadCite(cite) => {
+                let current_lines: Vec<&str> = current.lines().collect();
+                let (start, end) =
+                    translate_cite_range(&read_lines, &current_lines, cite, idx, total)?;
+                let line_op = LineOp {
+                    raw: cite.raw.clone(),
+                    verb: LineVerb::Replace,
+                    start,
+                    span: Span::Through(end),
+                    payload: cite.payload.clone(),
+                };
+                current = apply_line_op(&current, le, &line_op, idx)?;
+            }
         }
         if track {
             deficits.push(rust_brace_deficit(&current));
@@ -1408,6 +1468,15 @@ pub(crate) fn apply_ops(
                         }
                     }
                 }
+                // A cite's payload is validated exactly as the line-op
+                // form's was before it got its own variant (plan f302cc0e).
+                EditOp::ReadCite(cite) => {
+                    if let Some(payload) = cite.payload.as_deref() {
+                        if !payload.is_empty() {
+                            validate_emission_artifacts_lines(path, payload)?;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1421,6 +1490,71 @@ pub(crate) fn apply_ops(
         ));
     }
     Ok((current, notes))
+}
+
+/// Map a read-receipt cite's range from the cited read's coordinates (the
+/// bytes the receipt validated — the file BEFORE this call's ops) into the
+/// running content's coordinates (plan f302cc0e). The mapping rides a
+/// line-level diff of the pre-ops content against the running content:
+/// every line the earlier ops left untouched survives in an Equal block,
+/// so a cite whose range fits entirely inside one block lands on exactly
+/// the lines it validated, however many insert/delete/replace/anchor ops
+/// preceded it — including an earlier cite, whose replacement is itself
+/// just another perturbation.
+///
+/// A cite whose range is NOT intact refuses the whole array (atomicity):
+/// when an earlier op replaced or deleted one of its lines, or inserted
+/// new lines strictly inside the range, the contiguous block it names no
+/// longer exists contiguously. That is an overlap conflict inside THIS
+/// call's array — the receipt validated cleanly against the disk bytes,
+/// so nothing drifted — and the message steers to split the edit and
+/// re-read. Deliberately not drift-class (it carries no stale-read
+/// marker): a re-read alone cannot resolve an in-call conflict, and
+/// arming the stale-read gate would count it as content drift.
+fn translate_cite_range(
+    read_lines: &[&str],
+    current_lines: &[&str],
+    cite: &ReadCiteOp,
+    idx: usize,
+    total: usize,
+) -> Result<(usize, usize)> {
+    // The unperturbed case — no op before this cite, or the earlier ops
+    // netted back to the original bytes: the read's coordinates ARE the
+    // running coordinates, so the diff below is skipped entirely.
+    if read_lines == current_lines {
+        return Ok((cite.start, cite.end));
+    }
+    let diff = TextDiff::from_slices(read_lines, current_lines);
+    // The 1-indexed inclusive cite range as 0-based half-open bounds, for
+    // comparing against DiffOp's old/new ranges.
+    let (start0, end0) = (cite.start - 1, cite.end);
+    for op in diff.ops() {
+        if op.tag() != DiffTag::Equal {
+            continue;
+        }
+        let old = op.old_range();
+        if old.start <= start0 && end0 <= old.end {
+            let new = op.new_range();
+            return Ok((
+                new.start + (start0 - old.start) + 1,
+                new.start + (end0 - old.start),
+            ));
+        }
+    }
+    Err(crate::error::Error::InvalidInput(format!(
+        "edit {}/{}: read-receipt cite '{}' (lines [{}, {}]) cannot be applied — \
+         an earlier op in the same array already changed lines in that range \
+         (or inserted/deleted lines inside it), so the cited lines are no \
+         longer intact in the running content. Split the edit — send the cite \
+         in its own call, or move it ahead of the op that touches its lines — \
+         and re-read the file (read_files, this exact path) if you need fresh \
+         line numbers. Nothing was written.",
+        idx + 1,
+        total,
+        cite.raw,
+        cite.start,
+        cite.end
+    )))
 }
 
 /// Apply one compact line op to `content` (the running result) and return
@@ -1595,8 +1729,48 @@ mod tests {
     fn line(op: &EditOp) -> &LineOp {
         match op {
             EditOp::Line(line) => line,
+            EditOp::ReadCite(_) => panic!("expected a line op"),
             EditOp::Anchor(_) => panic!("expected a line op"),
         }
+    }
+
+    /// Plan f302cc0e: a cite's range lives in the CITED READ's coordinates,
+    /// so an earlier ANCHOR op that shifts the line count must not move the
+    /// cite's landing lines either — the translation is perturbation-
+    /// agnostic (a line-level diff of the pre-ops content against the
+    /// running result), not compact-op bookkeeping. Engine-level twin of
+    /// the file_edit end-to-end regression; no receipt registry involved —
+    /// the ops are constructed directly.
+    #[test]
+    fn read_cite_translates_through_an_earlier_anchor_op() {
+        let ops = vec![
+            EditOp::Anchor(EditItem {
+                old_string: "two".into(),
+                new_string: "TWO\nTWO-B".into(),
+                count: None,
+                fuzzy_whitespace: None,
+                from_read: None,
+                lines: None,
+            }),
+            EditOp::ReadCite(ReadCiteOp {
+                raw: "from_read rT".into(),
+                start: 8,
+                end: 9,
+                payload: Some("REPLACED".into()),
+            }),
+        ];
+        let (result, _) = apply_ops(
+            "a.txt",
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+            &ops,
+            false,
+            true,
+        )
+        .expect("the cite lands on the lines it cited");
+        assert_eq!(
+            result,
+            "one\nTWO\nTWO-B\nthree\nfour\nfive\nsix\nseven\nREPLACED\nten\n"
+        );
     }
 
     /// Backlog c19ec2ff (a) pin: an r-op whose payload carries the trailing
@@ -1654,6 +1828,7 @@ mod tests {
                 assert_eq!(item.old_string, "a");
                 assert_eq!(item.new_string, "b");
             }
+            EditOp::ReadCite(_) => panic!("expected an anchor"),
             EditOp::Line(_) => panic!("expected an anchor"),
         }
     }

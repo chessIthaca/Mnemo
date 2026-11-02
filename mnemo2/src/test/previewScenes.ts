@@ -2024,6 +2024,25 @@ export const previewScenes: PreviewScene[] = [
     },
   },
   {
+    name: "settings-project",
+    title: "Settings: Project",
+    description:
+      "The settings dialog's Project page — the page the top bar's gear opens: the open project's worker slots, lead model and merge policy, under the rail's This project / All projects groups.",
+    // Same mount pattern as settings-appearance, plus the app state the page
+    // reads from: the project is seeded open, and the dialog is asked for the
+    // Project page exactly as the gear asks for it.
+    build: missionControl,
+    mount: (target) => {
+      app.set(missionControl());
+      const restoreSettings = seedPreviewSettings();
+      const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {}, initialPage: "project" } });
+      return () => {
+        unmount(dialog);
+        restoreSettings();
+      };
+    },
+  },
+  {
     name: "mission-control-dark",
     title: "Mission control (dark)",
     description:

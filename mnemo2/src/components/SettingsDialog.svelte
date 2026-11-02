@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { createLayaTransport } from "../lib/layaSettings";
   import { createMcpTransport } from "../lib/mcpSettings";
   import { createModelSettingsTransport } from "../lib/modelSettings";
   import { createSafetyTransport } from "../lib/safetySettings";
   import { createAppearanceTransport } from "../lib/sounds";
+  import { currentProject } from "../lib/store";
   import { createSettingsTransport, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import AppearancePage from "./AppearancePage.svelte";
@@ -11,26 +13,70 @@
   import LayaPage from "./LayaPage.svelte";
   import McpPage from "./McpPage.svelte";
   import ModelsPage from "./ModelsPage.svelte";
+  import ProjectPage from "./ProjectPage.svelte";
   import SafetyPage from "./SafetyPage.svelte";
   import SavingsPage from "./SavingsPage.svelte";
   import Sheet from "./Sheet.svelte";
   import TiersPage from "./TiersPage.svelte";
 
-  let { open, onclose }: { open: boolean; onclose: () => void } = $props();
+  type Page =
+    | "project"
+    | "endpoints"
+    | "tiers"
+    | "models"
+    | "savings"
+    | "laya"
+    | "safety"
+    | "mcp"
+    | "appearance";
 
-  type Page = "endpoints" | "tiers" | "models" | "savings" | "laya" | "safety" | "mcp" | "appearance";
-  const pages: { id: Page; label: string }[] = [
-    { id: "endpoints", label: "Endpoints" },
-    { id: "tiers", label: "Tiers" },
-    { id: "models", label: "Models" },
-    { id: "savings", label: "Savings" },
-    { id: "laya", label: "Decisions" },
-    { id: "safety", label: "Safety" },
-    { id: "mcp", label: "MCP" },
-    { id: "appearance", label: "Appearance" },
+  /**
+   * The rail, in two groups: the open project's own settings first, then every
+   * page that spans the whole install. Safety and MCP keep their per-project
+   * sections inside the install-wide pages.
+   */
+  const railGroups: { label: string; pages: { id: Page; label: string }[] }[] = [
+    { label: "This project", pages: [{ id: "project", label: "Project" }] },
+    {
+      label: "All projects",
+      pages: [
+        { id: "endpoints", label: "Endpoints" },
+        { id: "tiers", label: "Tiers" },
+        { id: "models", label: "Models" },
+        { id: "savings", label: "Savings" },
+        { id: "laya", label: "Decisions" },
+        { id: "safety", label: "Safety" },
+        { id: "mcp", label: "MCP" },
+        { id: "appearance", label: "Appearance" },
+      ],
+    },
   ];
 
-  let page = $state<Page>("endpoints");
+  let {
+    open,
+    onclose,
+    /** The page to show on open; the top bar's gear asks for "project". */
+    initialPage = "endpoints",
+  }: { open: boolean; onclose: () => void; initialPage?: Page } = $props();
+
+  const hasProject = $derived($currentProject !== null);
+  /** The Project page wears the project’s name; "Project" stands in without one. */
+  const projectLabel = $derived($currentProject?.name ?? "Project");
+
+  /** The page an open request lands on — a Project request needs a project. */
+  function startPage(requested: Page): Page {
+    return requested === "project" && !hasProject ? "endpoints" : requested;
+  }
+
+  // Read once for the first paint; the effect below re-resolves it on every open.
+  let page = $state<Page>(untrack(() => startPage(initialPage)));
+
+  // Re-resolved on every open, not just at mount, so the gear always lands on
+  // the Project page while a later caller can ask for another one.
+  $effect(() => {
+    if (open) page = startPage(initialPage);
+  });
+
   let endpoints = $state<EndpointDetailDto[]>([]);
   let tiers = $state<TiersDto>({ difficult: [], average: [], simple: [] });
   let loading = $state(false);
@@ -78,12 +124,19 @@
   {:else}
     <div class="settings-shell">
       <nav class="settings-rail" aria-label="Settings pages">
-        {#each pages as entry (entry.id)}
-          <button class:active={page === entry.id} aria-current={page === entry.id ? "page" : undefined} onclick={() => (page = entry.id)}>{entry.label}</button>
+        {#each railGroups as group (group.label)}
+          <div class="rail-group">
+            <p class="rail-heading">{group.label}</p>
+            {#each group.pages as entry (entry.id)}
+              <button class:active={page === entry.id} aria-current={page === entry.id ? "page" : undefined} onclick={() => (page = entry.id)}>{entry.id === "project" ? projectLabel : entry.label}</button>
+            {/each}
+          </div>
         {/each}
       </nav>
       <section class="settings-page">
-        {#if loadError}
+        {#if page === "project"}
+          <ProjectPage />
+        {:else if loadError}
           <p class="settings-error" role="alert">{loadError}</p>
         {:else if loading}
           <p class="settings-empty">Loading…</p>
@@ -135,12 +188,14 @@
 
 <style>
   .settings-shell { display: grid; min-height: 0; flex: 1; grid-template-columns: 140px minmax(0, 1fr); }
-  .settings-rail { display: flex; flex-direction: column; gap: 2px; padding: 12px 10px; border-right: 1px solid var(--line); background: var(--canvas); }
+  .settings-rail { display: flex; flex-direction: column; gap: 12px; padding: 12px 10px; border-right: 1px solid var(--line); background: var(--canvas); overflow-y: auto; }
+  .rail-group { display: flex; flex-direction: column; gap: 2px; }
+  .rail-heading { margin: 0 0 2px; padding: 0 10px; color: var(--muted); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
   .settings-rail button { padding: 7px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-body); font-weight: 600; text-align: left; }
   .settings-rail button:hover { color: var(--ink); }
   .settings-rail button.active { background: var(--surface); box-shadow: var(--shadow-chip); color: var(--ink); }
   .settings-page { display: flex; min-width: 0; min-height: 0; flex-direction: column; }
   .settings-empty { margin: 0; padding: 28px 24px; color: var(--muted); font-size: var(--text-body); }
   .settings-error { margin: 0; padding: 20px 24px; color: var(--danger); font-size: var(--text-body); }
-  @media (max-width: 640px) { .settings-shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } .settings-rail { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--line); } }
+  @media (max-width: 640px) { .settings-shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } .settings-rail { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; } }
 </style>

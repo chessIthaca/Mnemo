@@ -80,18 +80,48 @@ describe("SettingsDialog", () => {
     app.set(fixtureState());
   });
 
-  it("is reached from the project settings sheet opened by the gear in the top bar", async () => {
+  it("opens from the gear straight onto the Project page, with no per-project sheet left", async () => {
     makeTransport();
     render(TopBar);
     expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Settings" });
+    // The gear lands on the Project page: slots, lead model, merge policy.
+    expect(within(dialog).getByLabelText("Project worker slots")).toBeTruthy();
+    expect(within(dialog).getByText("Lead model")).toBeTruthy();
+    expect(within(dialog).getByText("Guarded")).toBeTruthy();
+    // The rail files the open project under "This project", the rest under
+    // "All projects", and names the project by its own name.
+    expect(within(dialog).getByText("This project")).toBeTruthy();
+    expect(within(dialog).getByText("All projects")).toBeTruthy();
+    expect(within(dialog).getByRole("button", { name: "Mnemo" })).toBeTruthy();
     expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
-    await fireEvent.click(screen.getByRole("button", { name: "Project settings" }));
-    expect(screen.getByRole("dialog", { name: "Project settings" })).toBeTruthy();
-    await fireEvent.click(screen.getByRole("button", { name: "Open" }));
-    expect(screen.getByRole("dialog", { name: "Settings" })).toBeTruthy();
-    expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
+
     await fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull());
+  });
+
+  it("opens on Endpoints when no project is open, and the Project page says so", async () => {
+    makeTransport();
+    app.set({ ...fixtureState(), projectId: null });
+    render(SettingsDialog, { open: true, onclose: vi.fn(), initialPage: "project" });
+
+    // There is no project to configure, so the dialog falls back to Endpoints.
+    expect(await screen.findByRole("button", { name: "Edit alpha" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Endpoints" }).getAttribute("aria-current")).toBe("page");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Project" }));
+    expect(screen.getByText("Open a project to change its settings.")).toBeTruthy();
+  });
+
+  it("opens directly on the page a caller asks for", async () => {
+    makeTransport();
+    render(SettingsDialog, { open: true, onclose: vi.fn(), initialPage: "tiers" });
+
+    const tiers = await screen.findByRole("button", { name: "Tiers" });
+    expect(tiers.getAttribute("aria-current")).toBe("page");
   });
 
   it("explains settings need the desktop app outside Tauri", () => {

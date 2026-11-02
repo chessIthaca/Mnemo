@@ -17,6 +17,7 @@ import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNod
 import type { WorkerDeletionPreview } from "../lib/teamState";
 import { seedPreviewSettings } from "./previewSettings";
 import { seedPreviewLaya } from "./previewLaya";
+import { seedPreviewSafety } from "./previewSafety";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
@@ -841,6 +842,29 @@ export const previewScenes: PreviewScene[] = [
       return () => {
         unmount(dialog);
         restoreLaya();
+        restoreSettings();
+      };
+    },
+  },
+  {
+    name: "settings-safety",
+    title: "Settings: Safety",
+    description:
+      "The settings dialog's Safety page: the four approval modes with the no-prompt mode marked risky and the current one flagged, plus the open project's auto-approve rules with add, remove and Save.",
+    // Same mount pattern as settings-laya; the rail click opens the Safety
+    // page directly so the scene shows the page it names.
+    build: missionControl,
+    mount: (target) => {
+      const restoreSettings = seedPreviewSettings();
+      const restoreSafety = seedPreviewSafety();
+      const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {} } });
+      const safety = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
+        (button) => button.textContent === "Safety",
+      );
+      safety?.click();
+      return () => {
+        unmount(dialog);
+        restoreSafety();
         restoreSettings();
       };
     },

@@ -1,24 +1,27 @@
 <script lang="ts">
   import { createLayaTransport } from "../lib/layaSettings";
   import { createModelSettingsTransport } from "../lib/modelSettings";
+  import { createSafetyTransport } from "../lib/safetySettings";
   import { createSettingsTransport, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import EndpointsPage from "./EndpointsPage.svelte";
   import LayaPage from "./LayaPage.svelte";
   import ModelsPage from "./ModelsPage.svelte";
+  import SafetyPage from "./SafetyPage.svelte";
   import SavingsPage from "./SavingsPage.svelte";
   import Sheet from "./Sheet.svelte";
   import TiersPage from "./TiersPage.svelte";
 
   let { open, onclose }: { open: boolean; onclose: () => void } = $props();
 
-  type Page = "endpoints" | "tiers" | "models" | "savings" | "laya";
+  type Page = "endpoints" | "tiers" | "models" | "savings" | "laya" | "safety";
   const pages: { id: Page; label: string }[] = [
     { id: "endpoints", label: "Endpoints" },
     { id: "tiers", label: "Tiers" },
     { id: "models", label: "Models" },
     { id: "savings", label: "Savings" },
     { id: "laya", label: "Decisions" },
+    { id: "safety", label: "Safety" },
   ];
 
   let page = $state<Page>("endpoints");
@@ -29,6 +32,7 @@
   const transport = $derived(open ? createSettingsTransport() : null);
   const modelTransport = $derived(open ? createModelSettingsTransport() : null);
   const layaTransport = $derived(open ? createLayaTransport() : null);
+  const safetyTransport = $derived(open ? createSafetyTransport() : null);
 
   $effect(() => {
     const active = transport;
@@ -94,6 +98,12 @@
             <LayaPage transport={layaTransport} {endpoints} />
           {:else}
             <p class="settings-empty">Decision settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "safety"}
+          {#if safetyTransport}
+            <SafetyPage transport={safetyTransport} />
+          {:else}
+            <p class="settings-empty">Safety settings are available in the desktop app.</p>
           {/if}
         {:else}
           <TiersPage {transport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />

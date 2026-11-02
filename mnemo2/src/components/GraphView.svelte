@@ -1031,8 +1031,8 @@
   .canvas-hint { color: var(--muted); font-size: var(--text-meta); }
   .canvas-tools { position: absolute; top: 10px; right: 10px; left: 10px; z-index: 2; display: flex; gap: 6px; }
   .canvas-spacer { flex: 1; }
-  .canvas-zoom { width: 26px; height: 26px; border-radius: 7px; background: rgb(255 255 255 / 85%); }
-  .tool-chip { padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; background: rgb(255 255 255 / 85%); color: var(--ink-soft); cursor: pointer; font-size: var(--text-meta); font-weight: 600; }
+  .canvas-zoom { width: 26px; height: 26px; border-radius: 7px; background: var(--float); }
+  .tool-chip { padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--float); color: var(--ink-soft); cursor: pointer; font-size: var(--text-meta); font-weight: 600; }
   .tool-chip[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
   .graph-canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; user-select: none; }
   .graph-canvas .edge { pointer-events: none; }

@@ -163,7 +163,7 @@
   .dialog-copy { margin: 0 0 12px; color: var(--muted); font-size: var(--text-body); line-height: 1.65; }
   .deletion-list { display: grid; gap: 6px; max-height: 280px; margin: 0 0 12px; padding: 0; overflow-y: auto; list-style: none; }
   .deletion-list li { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
-  .deletion-list li[data-loss="true"] { border-color: #e3c7c2; background: #fbf3f1; }
+  .deletion-list li[data-loss="true"] { border-color: var(--danger-tint-line); background: var(--danger-tint); }
   .deletion-list li.kept { opacity: 0.75; }
   .deletion-list li.done { opacity: 0.75; }
   .deletion-list strong { color: var(--ink); font-size: var(--text-body); font-weight: 650; }
@@ -175,6 +175,6 @@
   .row-error { color: var(--danger); overflow-wrap: anywhere; }
   .loss-warning { margin: 0 0 12px; color: var(--danger); font-size: var(--text-body); line-height: 1.5; }
   .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
-  .button-danger { background: var(--danger); color: white; }
-  .button-danger:hover:not(:disabled) { background: #8a4039; }
+  .button-danger { background: var(--danger); color: var(--on-danger); }
+  .button-danger:hover:not(:disabled) { background: var(--danger-hover); }
 </style>

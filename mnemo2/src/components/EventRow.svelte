@@ -40,8 +40,8 @@
   summary::-webkit-details-marker { display: none; }
   summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
   .event-icon { display: grid; width: 22px; height: 22px; flex: 0 0 auto; place-items: center; border-radius: 7px; background: var(--surface-soft); color: var(--ink-soft); }
-  [data-tone="merge"] .event-icon { background: #e2ebdc; color: var(--accent-strong); }
-  [data-tone="review"] .event-icon { background: #ece8de; color: #6f6046; }
+  [data-tone="merge"] .event-icon { background: var(--event-merge-bg); color: var(--accent-strong); }
+  [data-tone="review"] .event-icon { background: var(--event-review-bg); color: var(--event-review-ink); }
   .event-heading { min-width: 0; overflow: hidden; color: var(--ink); font-size: var(--text-body); font-weight: 600; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
   summary:hover .event-heading { color: var(--accent-strong); }
   summary :global(.event-chevron) { flex: 0 0 auto; margin-left: auto; color: var(--muted); transition: transform 120ms ease; }

@@ -288,16 +288,16 @@
   .event-detail button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: var(--text-body); font-weight: 650; }
   .event-time { color: var(--muted); font-size: var(--text-meta); }
   .event-subject { color: var(--muted); font-weight: 500; }
-  .review-risk { display: inline-block; margin: 0 0 6px; padding: 2px 6px; border-radius: 5px; background: #f4e4e1; color: var(--danger); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0.04em; }
+  .review-risk { display: inline-block; margin: 0 0 6px; padding: 2px 6px; border-radius: 5px; background: var(--risk-bg); color: var(--danger); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0.04em; }
   .review-audit { margin: 0 0 9px; padding: 6px 9px; border-radius: 8px; background: var(--surface); color: var(--muted); font-size: var(--text-meta); line-height: 1.45; }
   .review-audit[data-audited="true"] { color: var(--accent-strong); }
   .review-audit[data-audited="false"], .review-audit[data-audited="legacy"] { color: var(--warning); }
   .lead-notice { margin: 0 0 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
   .lead-notice p { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.5; }
   .lead-notice .notice-detail { margin-top: 5px; color: var(--muted); font-size: var(--text-body); }
-  .lead-error { border-color: #e3c7c2; background: #fbf3f1; }
+  .lead-error { border-color: var(--danger-tint-line); background: var(--danger-tint); }
   .lead-error p { color: var(--danger); }
-  .lead-pending { border-color: #ddd2bd; background: #f8f4ea; }
+  .lead-pending { border-color: var(--warning-line); background: var(--warning-pending); }
   .notice-label { margin-bottom: 5px; color: var(--muted); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0.08em; }
   .notice-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
   .external-lead-bar { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 32px; border-bottom: 1px solid var(--line); background: var(--surface); color: var(--ink-soft); font-size: var(--text-body); }

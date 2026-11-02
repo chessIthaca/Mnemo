@@ -381,10 +381,10 @@
     border: 1px solid var(--line-strong);
     border-radius: 16px;
     background: var(--surface);
-    box-shadow: 0 12px 36px rgb(37 40 32 / 7%);
+    box-shadow: var(--shadow-composer);
     transition: border-color 160ms ease, box-shadow 160ms ease;
   }
-  .composer-input:focus-within { border-color: #aeb8a5; box-shadow: 0 12px 40px rgb(37 40 32 / 9%), 0 0 0 3px var(--accent-soft); }
+  .composer-input:focus-within { border-color: var(--focus-line); box-shadow: var(--shadow-composer-focus), 0 0 0 3px var(--accent-soft); }
   textarea {
     flex: 1;
     min-height: 44px;
@@ -397,7 +397,7 @@
     font-size: var(--text-body);
     line-height: 1.55;
   }
-  textarea::placeholder { color: #999c91; }
+  textarea::placeholder { color: var(--placeholder); }
   .send-button {
     display: grid;
     flex: 0 0 auto;
@@ -406,11 +406,11 @@
     place-items: center;
     border: 0;
     border-radius: 10px;
-    background: var(--ink);
-    color: white;
+    background: var(--primary-bg);
+    color: var(--primary-ink);
     cursor: pointer;
   }
-  .send-button:disabled { background: var(--surface-soft); color: #adb0a6; cursor: default; }
+  .send-button:disabled { background: var(--surface-soft); color: var(--disabled-ink); cursor: default; }
   .stop-button { display: inline-flex; width: auto; min-width: 64px; gap: 6px; padding: 0 10px; border: 1px solid var(--line); background: var(--surface-soft); color: var(--ink); font-size: var(--text-body); font-weight: 600; }
   .stop-button:hover { border-color: var(--line-strong); background: var(--line); }
   .stop-button:disabled { cursor: wait; }

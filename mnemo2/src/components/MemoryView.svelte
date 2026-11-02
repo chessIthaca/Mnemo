@@ -435,10 +435,10 @@
   .record-row.active { border-left-color: var(--accent); background: var(--accent-soft); }
   .record-top { display: flex; align-items: center; gap: 6px; }
   .badge { padding: 1px 6px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 660; letter-spacing: 0.05em; }
-  .badge[data-kind="spec"] { background: #e8eee3; color: #465b3e; }
-  .badge[data-kind="decision"] { background: #e7ecf3; color: #3f5675; }
-  .badge[data-kind="bug"] { background: #f5e7e4; color: #8d4139; }
-  .badge[data-kind="how"] { background: #f2e9da; color: #7a5626; }
+  .badge[data-kind="spec"] { background: var(--accent-soft); color: var(--accent-strong); }
+  .badge[data-kind="decision"] { background: var(--badge-decision-bg); color: var(--badge-decision-ink); }
+  .badge[data-kind="bug"] { background: var(--badge-bug-bg); color: var(--badge-bug-ink); }
+  .badge[data-kind="how"] { background: var(--warning-soft); color: var(--badge-how-ink); }
   .badge.warn { background: var(--warning-soft); color: var(--warning); }
   .record-date { margin-left: auto; color: var(--muted); font-size: var(--text-meta); }
   .record-score { color: var(--muted); font-family: var(--font-mono); font-size: var(--text-meta); }

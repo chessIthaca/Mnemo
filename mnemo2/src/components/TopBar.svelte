@@ -133,7 +133,7 @@
 </Sheet>
 
 <style>
-  .topbar { position: relative; z-index: 20; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; min-height: 64px; padding: 0 22px; border-bottom: 1px solid var(--line); background: rgb(247 247 244 / 88%); backdrop-filter: blur(18px); }
+  .topbar { position: relative; z-index: 20; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; min-height: 64px; padding: 0 22px; border-bottom: 1px solid var(--line); background: var(--overlay); backdrop-filter: blur(18px); }
   .topbar-left, .topbar-right { display: flex; align-items: center; gap: 14px; }
   .topbar-right { justify-content: flex-end; }
   .brand-mark { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); color: var(--accent-strong); font-family: var(--font-prose); font-size: var(--text-title); }
@@ -143,7 +143,7 @@
   .project-switch :global(svg) { grid-row: 1 / 3; grid-column: 2; align-self: center; color: var(--muted); }
   .primary-nav { display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
   .primary-nav button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-body); font-weight: 600; }
-  .primary-nav button.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 4px rgb(35 38 30 / 8%); }
+  .primary-nav button.active { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-nav); }
   .nav-badge { display: grid; min-width: 15px; height: 15px; place-items: center; border-radius: 8px; background: var(--warning-soft); color: var(--warning); font-size: var(--text-meta); }
   .team-stack { display: flex; align-items: center; gap: 8px; padding: 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-meta); }
   .budget-chip { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-meta); }

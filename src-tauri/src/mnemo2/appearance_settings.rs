@@ -16,9 +16,9 @@
 //! because the full config round-trips through memory.
 //!
 //! The sounds themselves are synthesized in the frontend
-//! (`mnemo2/src/lib/sounds.ts`); nothing here plays audio. The theme is read
-//! back but not written yet — the dark theme lands in step 4 of the same plan,
-//! so the page only names the stored `[ui] theme` value until then.
+//! (`mnemo2/src/lib/sounds.ts`); nothing here plays audio. The theme is the
+//! `[ui] theme` word (`light`, `dark` or `system`) the same page writes in
+//! step 4 of the plan; `mnemo2/src/lib/theme.ts` paints it.
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -69,6 +69,26 @@ pub struct AppearanceSettingsPatch {
     pub sound_input_needed: Option<bool>,
     /// New value for `[ui] sound_stopped_errors`.
     pub sound_stopped_errors: Option<bool>,
+    /// New value for `[ui] theme` (`light`, `dark` or `system`).
+    pub theme: Option<String>,
+}
+
+/// The `[ui] theme` words this app writes — the same three Mnemo1's
+/// Appearance section understands (`frontend/src/hooks/appearance.ts`).
+const THEME_WORDS: [&str; 3] = ["light", "dark", "system"];
+
+/// Normalise a requested palette word. An unknown word is a caller error, not
+/// a silent write: the page would otherwise show a choice the next launch
+/// does not paint.
+fn normalize_theme(theme: &str) -> Result<String, String> {
+    let word = theme.trim().to_ascii_lowercase();
+    if THEME_WORDS.contains(&word.as_str()) {
+        Ok(word)
+    } else {
+        Err(format!(
+            "unknown theme {theme:?}: expected \"light\", \"dark\" or \"system\""
+        ))
+    }
 }
 
 // ── Read / write ────────────────────────────────────────────────────────────
@@ -96,6 +116,9 @@ fn save_settings(
     if let Some(value) = patch.sound_stopped_errors {
         config.general.ui.sound_stopped_errors = value;
     }
+    if let Some(theme) = &patch.theme {
+        config.general.ui.theme = normalize_theme(theme)?;
+    }
     config
         .save_all(setup.config_dir())
         .map_err(|err| err.to_string())?;
@@ -114,8 +137,8 @@ pub async fn appearance_settings_get(
     read_settings(&setup)
 }
 
-/// Save the sound toggles through the app-side `[ui]` writer; returns the
-/// saved snapshot.
+/// Save the sound toggles and the theme through the app-side `[ui]` writer;
+/// returns the saved snapshot.
 #[tauri::command]
 pub async fn appearance_settings_save(
     state: State<'_, Mnemo2State>,
@@ -219,6 +242,7 @@ mod tests {
                 sound_complete: Some(false),
                 sound_input_needed: Some(false),
                 sound_stopped_errors: Some(true),
+                ..AppearanceSettingsPatch::default()
             },
         )
         .expect("save every toggle");
@@ -226,5 +250,66 @@ mod tests {
         assert!(!saved.sound_input_needed);
         assert!(saved.sound_stopped_errors);
         assert_eq!(read_settings(&setup).expect("re-read"), saved);
+    }
+
+    /// A theme save persists `[ui] theme` and leaves the sound toggles alone;
+    /// the snapshot returned is the saved state, so the page paints exactly
+    /// what the next launch paints.
+    #[test]
+    fn save_persists_the_theme_and_keeps_the_toggles() {
+        let (dir, setup) = fixture();
+        let saved = save_settings(
+            &setup,
+            &AppearanceSettingsPatch {
+                theme: Some(" Dark ".to_string()),
+                ..AppearanceSettingsPatch::default()
+            },
+        )
+        .expect("save the theme");
+        assert_eq!(saved.theme, "dark", "the word is normalised");
+        assert!(saved.sound_complete, "an omitted toggle is untouched");
+
+        let config = Config::load(dir.path()).expect("reload the config");
+        assert_eq!(config.general.ui.theme, "dark");
+        assert!(config.general.ui.sound_input_needed);
+        assert_eq!(read_settings(&setup).expect("re-read").theme, "dark");
+    }
+
+    /// An unknown theme word is rejected and nothing is written — the file keeps
+    /// the palette it had.
+    #[test]
+    fn save_rejects_an_unknown_theme() {
+        let (dir, setup) = fixture();
+        std::fs::write(dir.path().join("config.toml"), "[ui]\ntheme = \"light\"\n")
+            .expect("write config.toml");
+        let error = save_settings(
+            &setup,
+            &AppearanceSettingsPatch {
+                theme: Some("midnight".to_string()),
+                ..AppearanceSettingsPatch::default()
+            },
+        )
+        .expect_err("an unknown theme is refused");
+        assert!(error.contains("unknown theme"), "{error}");
+        let config = Config::load(dir.path()).expect("reload the config");
+        assert_eq!(config.general.ui.theme, "light", "nothing was written");
+    }
+
+    /// Every word the page offers round-trips, including `system`, which
+    /// Mnemo1's Appearance section also stores.
+    #[test]
+    fn every_theme_word_round_trips() {
+        let (_dir, setup) = fixture();
+        for word in THEME_WORDS {
+            let saved = save_settings(
+                &setup,
+                &AppearanceSettingsPatch {
+                    theme: Some(word.to_string()),
+                    ..AppearanceSettingsPatch::default()
+                },
+            )
+            .expect("save the theme");
+            assert_eq!(saved.theme, word);
+        }
     }
 }

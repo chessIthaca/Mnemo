@@ -155,9 +155,9 @@
   .ring-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .ring-track { fill: none; stroke: var(--line); stroke-width: 3; }
   .ring-fill { fill: none; stroke-width: 3; stroke-linecap: round; transition: stroke-dasharray 240ms ease; }
-  .context-chip.level-ok .ring-fill, .context-chip.level-ok .context-pct { stroke: #34d399; color: #34d399; }
-  .context-chip.level-warn .ring-fill, .context-chip.level-warn .context-pct { stroke: #fbbf24; color: #fbbf24; }
-  .context-chip.level-critical .ring-fill, .context-chip.level-critical .context-pct { stroke: #f87171; color: #f87171; }
+  .context-chip.level-ok .ring-fill, .context-chip.level-ok .context-pct { stroke: var(--level-ok); color: var(--level-ok); }
+  .context-chip.level-warn .ring-fill, .context-chip.level-warn .context-pct { stroke: var(--level-warn); color: var(--level-warn); }
+  .context-chip.level-critical .ring-fill, .context-chip.level-critical .context-pct { stroke: var(--level-critical); color: var(--level-critical); }
   .context-chip.level-unknown .ring-fill, .context-chip.level-unknown .context-pct { stroke: var(--line-strong); color: var(--line-strong); }
   .ring-pct { color: var(--ink-soft); font-variant-numeric: tabular-nums; }
   .context-tip { position: absolute; top: calc(100% + 7px); right: 0; z-index: 30; width: 228px; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 120ms ease; }

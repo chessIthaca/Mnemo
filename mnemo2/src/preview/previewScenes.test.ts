@@ -76,6 +76,9 @@ describe("preview scenes", () => {
       "settings-safety",
       "settings-mcp",
       "settings-appearance",
+      "mission-control-dark",
+      "lead-chat-dark",
+      "graph-dark",
       "lead-idle",
       "delete-sheet",
       "cost",
@@ -87,6 +90,12 @@ describe("preview scenes", () => {
     expect(previewScene("  ")?.name).toBe(defaultPreviewScene);
     expect(previewScene("worker-thread")?.name).toBe("worker-thread");
     expect(previewScene("no-such-scene")).toBeNull();
+  });
+
+  it("pins the dark palette on the dark variants only", () => {
+    const dark = previewScenes.filter((scene) => scene.theme === "dark").map((scene) => scene.name);
+    expect(dark).toEqual(["mission-control-dark", "lead-chat-dark", "graph-dark"]);
+    expect(previewScenes.filter((scene) => scene.theme === undefined).length).toBe(previewScenes.length - dark.length);
   });
 
   it("memory seeds the store with 20 records and opens the newest one", async () => {

@@ -21,6 +21,7 @@ import { seedPreviewLaya } from "./previewLaya";
 import { seedPreviewSafety } from "./previewSafety";
 import { seedPreviewMcp } from "./previewMcp";
 import { seedPreviewAppearance } from "./previewAppearance";
+import type { ThemeChoice } from "../lib/theme";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
@@ -233,6 +234,12 @@ export interface PreviewScene {
    * that mount and unmount within a run; the preview page ignores it.
    */
   mount?: (target: HTMLElement) => () => void;
+  /**
+   * The palette the scene paints before it mounts (default: the mirrored
+   * `[ui] theme`). The dark variants of the main screens set `"dark"` so the
+   * same scene can be reviewed in both themes; `?theme=` overrides it.
+   */
+  theme?: ThemeChoice;
 }
 
 /**
@@ -1607,7 +1614,7 @@ export const previewScenes: PreviewScene[] = [
     name: "settings-appearance",
     title: "Settings: Appearance & sounds",
     description:
-      "The settings dialog's Appearance page: the three [ui] notification-sound toggles, each with a Test button that plays its tone, plus the theme slot the dark theme fills in next.",
+      "The settings dialog's Appearance page: the three [ui] notification-sound toggles, each with a Test button that plays its tone, plus the Light / Dark / System theme choice that repaints the app at once.",
     // Same mount pattern as settings-mcp; the rail click opens the
     // Appearance page directly so the scene shows the page it names.
     build: missionControl,
@@ -1625,6 +1632,30 @@ export const previewScenes: PreviewScene[] = [
         restoreSettings();
       };
     },
+  },
+  {
+    name: "mission-control-dark",
+    title: "Mission control (dark)",
+    description:
+      "The mission-control scene in the dark palette: the worker list with live status rows, and the selected worker's thread on the deep-green canvas.",
+    build: missionControl,
+    theme: "dark",
+  },
+  {
+    name: "lead-chat-dark",
+    title: "Lead chat (dark)",
+    description:
+      "The lead-chat scene in the dark palette: plan, dispatch, review and merge rows, a tool row and the composer on the dark surface.",
+    build: leadChat,
+    theme: "dark",
+  },
+  {
+    name: "graph-dark",
+    title: "Code graph (dark)",
+    description:
+      "The Graph tab in the dark palette: the module map and node canvas, their edges, and the symbol inspector with the dark tokens.",
+    build: graphScene,
+    theme: "dark",
   },
   {
     name: "lead-idle",

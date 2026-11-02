@@ -138,7 +138,7 @@
   .settings-rail { display: flex; flex-direction: column; gap: 2px; padding: 12px 10px; border-right: 1px solid var(--line); background: var(--canvas); }
   .settings-rail button { padding: 7px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; font-size: var(--text-body); font-weight: 600; text-align: left; }
   .settings-rail button:hover { color: var(--ink); }
-  .settings-rail button.active { background: var(--surface); box-shadow: 0 1px 3px rgb(35 38 30 / 8%); color: var(--ink); }
+  .settings-rail button.active { background: var(--surface); box-shadow: var(--shadow-chip); color: var(--ink); }
   .settings-page { display: flex; min-width: 0; min-height: 0; flex-direction: column; }
   .settings-empty { margin: 0; padding: 28px 24px; color: var(--muted); font-size: var(--text-body); }
   .settings-error { margin: 0; padding: 20px 24px; color: var(--danger); font-size: var(--text-body); }

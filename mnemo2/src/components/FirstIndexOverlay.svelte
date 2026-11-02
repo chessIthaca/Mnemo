@@ -59,7 +59,7 @@
 {/if}
 
 <style>
-  .first-index { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; padding: 16px; background: rgb(247 247 244 / 82%); backdrop-filter: blur(3px); }
+  .first-index { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; padding: 16px; background: var(--overlay-strong); backdrop-filter: blur(3px); }
   .card { width: min(420px, 100%); padding: 22px 24px 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow); }
   .icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 10px; background: var(--accent-soft); color: var(--accent-strong); }
   h2 { margin: 14px 0 6px; font-size: var(--text-title); font-weight: 650; }

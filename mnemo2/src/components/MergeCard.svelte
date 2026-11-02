@@ -39,8 +39,8 @@
   .merge-commit code { color: var(--accent-strong); }
   .merge-stats { display: flex; flex-wrap: wrap; gap: 12px; margin: 8px 0 4px; color: var(--muted); font-size: var(--text-body); }
   .merge-stats strong { color: var(--ink); font-weight: 600; }
-  .additions { color: #4f7d48; }
-  .deletions { color: #a15b53; }
+  .additions { color: var(--stat-add); }
+  .deletions { color: var(--stat-remove); }
   .merge-meta { margin: 0; color: var(--muted); font-size: var(--text-meta); }
   .merge-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; color: var(--muted); font-size: var(--text-meta); }
   .merge-actions button { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: var(--text-body); font-weight: 650; }

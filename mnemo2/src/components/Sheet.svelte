@@ -103,7 +103,7 @@
 
 <style>
   .sheet-layer { position: fixed; inset: 0; z-index: 60; }
-  .sheet-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgb(35 38 30 / 18%); backdrop-filter: blur(2px); }
+  .sheet-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: var(--backdrop); backdrop-filter: blur(2px); }
   .sheet { position: absolute; top: 50%; left: 50%; display: flex; width: min(480px, calc(100vw - 32px)); max-height: min(640px, calc(100vh - 48px)); flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); transform: translate(-50%, -50%); }
   header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 20px 20px 12px; }
   header p { margin: 0 0 4px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.11em; }

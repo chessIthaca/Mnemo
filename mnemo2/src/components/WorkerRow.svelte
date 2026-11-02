@@ -63,9 +63,9 @@
 <style>
   .worker-row { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 66px; padding: 10px 11px; border: 1px solid transparent; border-radius: 11px; background: transparent; color: var(--ink); cursor: pointer; text-align: left; }
   .worker-row:hover { background: var(--surface-soft); }
-  .worker-row.selected { border-color: #d7ded1; background: var(--accent-soft); }
+  .worker-row.selected { border-color: var(--accent-line); background: var(--accent-soft); }
   .worker-row.compact { min-height: 56px; padding: 8px 7px; }
-  .avatar { display: grid; flex: 0 0 auto; width: 32px; height: 32px; place-items: center; border-radius: 10px; background: hsl(var(--hue) 32% 87%); color: hsl(var(--hue) 30% 32%); font-size: var(--text-meta); font-weight: 750; }
+  .avatar { display: grid; flex: 0 0 auto; width: 32px; height: 32px; place-items: center; border-radius: 10px; background: hsl(var(--hue) 32% var(--avatar-bg-lightness)); color: hsl(var(--hue) 30% var(--avatar-ink-lightness)); font-size: var(--text-meta); font-weight: 750; }
   .worker-copy { flex: 1; min-width: 0; }
   /* One status column, the same x and the same width on every row: the pill keeps
      its natural width and the line under it fills the column, truncating its label. */
@@ -76,7 +76,7 @@
   .worker-name :global(.model-badge) { max-width: 130px; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
   .row-badge { flex: 0 0 auto; padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; }
   .row-badge[data-kind="audit"] { background: var(--accent-soft); color: var(--accent-strong); }
-  .row-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
+  .row-badge[data-risk="high"] { background: var(--risk-bg); color: var(--danger); }
   .worker-plan { display: block; margin-top: 2px; overflow: hidden; color: var(--accent-strong); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
   .worker-task { display: -webkit-box; line-clamp: 3; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; color: var(--muted); font-family: var(--font-ui); font-size: var(--text-meta); }
   .worker-progress { display: block; height: 2px; margin-top: 7px; overflow: hidden; border-radius: 2px; background: var(--line); }
@@ -85,9 +85,9 @@
   .worker-live { display: block; width: 100%; min-width: 0; margin-top: 4px; white-space: nowrap; }
   .status-label { display: inline-flex; padding: 3px 6px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; white-space: nowrap; }
   .status-label[data-status="in_review"], .status-label[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }
-  .status-label[data-status="failed"] { background: #f4e4e1; color: var(--danger); }
+  .status-label[data-status="failed"] { background: var(--risk-bg); color: var(--danger); }
   .status-label[data-status="merged"] { background: var(--accent-soft); color: var(--accent-strong); }
-  .status-label[data-status="working"], .status-label[data-status="fixing"] { background: #e9edf3; color: #536c89; }
+  .status-label[data-status="working"], .status-label[data-status="fixing"] { background: var(--running-bg); color: var(--running-ink); }
   .worker-row :global(.row-chevron) { flex: 0 0 auto; color: var(--line-strong); }
   .worker-row.compact .worker-meta small, .worker-row.compact .worker-live { display: none; }
   @media (max-width: 1100px) { .worker-meta small, .worker-live { display: none; } }

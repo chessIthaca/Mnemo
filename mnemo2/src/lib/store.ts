@@ -30,6 +30,7 @@ import {
 } from "./workerThread";
 import { applyWorkerEvent, applyWorkerStatus } from "./workerActivity";
 import { leadEventSound, loadSoundToggles, notifySound, workerTransitionSound } from "./sounds";
+import { applyStoredTheme } from "./theme";
 import {
   createOpenWorkerTransport,
   openWorkerNotice,
@@ -2763,4 +2764,6 @@ export const actions = {
   setWorkerSlots,
   dismissToast,
   resetDemo,
+  /** Read the stored `[ui] theme` and paint it (see `lib/theme.ts`). */
+  initTheme: applyStoredTheme,
 };

@@ -9329,19 +9329,20 @@ mod tests {
             "a summarized switch is not an error: status={:?}",
             observed.status
         );
+        // The worker is still WORKING the turn on the new model — the
+        // informational event never fails it and never idles it (a mid-turn
+        // compaction's Compacted must not flip a live turn to Idle either).
         assert!(
-            !matches!(
+            matches!(
                 observed.status,
-                crate::mnemo2::team::WorkerStatus::Failed
+                crate::mnemo2::team::WorkerStatus::Working
             ),
-            "a summarized switch never fails the worker: status={:?} error={:?} models={:?}",
+            "the worker keeps working after the summarized switch: status={:?} error={:?} compacting={} models={:?}",
             observed.status,
             observed.error,
+            observed.compacting,
             stub.models()
         );
-        // (The new model's own compaction pass may have flipped the badge to
-        // Idle on the way — the pump's pre-existing Compacted behaviour — but
-        // the turn is live: the request on the new model is held in flight.)
 
         release_last.send(()).expect("release the final response");
         let settled = wait_for_worker_status(

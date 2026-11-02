@@ -686,8 +686,15 @@ impl AgentLoop {
             // saw 0 — the value landed after the reads and each loop-back's
             // reset() zeroed it again, so the schema block never reached a
             // live emission or trigger).
-            state.token_accounting
-                .set_tools_tokens(crate::provider::estimate_tools_tokens(&tool_schemas) as u32);
+            let schema_tokens = crate::provider::estimate_tools_tokens(&tool_schemas);
+            state.token_accounting.set_tools_tokens(schema_tokens as u32);
+            // Publish the SAME inclusive measure for the
+            // compact-before-switch decision (`AgentLoop::conversation_needs_compaction`):
+            // the real conversation plus this exact schema block. A cached
+            // token count cannot serve — it is stale after the turn's final
+            // message and 0 before a resumed session's first request.
+            self.publish_schema_tokens(schema_tokens);
+            self.publish_history(messages);
 
             // Exact incremental token count + per-role breakdown in one pass
             // (see `TokenAccounting`). Summarization resets the accounting
@@ -1672,7 +1679,7 @@ impl AgentLoop {
                 .read()
                 .expect("context_manager lock poisoned")
                 .clone();
-            if pending.context_manager.should_summarize(messages) {
+            if self.conversation_needs_compaction(&pending.context_manager, messages) {
                 // The conversation does not fit the new model's own compaction
                 // trigger — summarize using the OLD provider before completing
                 // the swap. Same measure as the pin's deferral

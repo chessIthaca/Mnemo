@@ -10686,11 +10686,12 @@ async fn set_explicit_provider_defers_when_the_conversation_exceeds_the_new_wind
         },
         crate::project::Constitution::default(),
     );
-    // The live conversation the turn loop last counted: over the new window's
-    // trigger, under the old one's.
-    agent
-        .live_token_count
-        .store(100_000, std::sync::atomic::Ordering::Relaxed);
+    // The real conversation the owning task publishes: over the new window's
+    // trigger (32K), under the old one's (100K).
+    let history: Vec<Message> = (0..40)
+        .map(|_| Message::text(Role::User, "y".repeat(4_000)))
+        .collect();
+    agent.publish_history(&history);
     let small: Arc<dyn LlmClient> = Arc::new(MockProvider {
         caps: Capabilities {
             max_context: 64_000,
@@ -10715,6 +10716,164 @@ async fn set_explicit_provider_defers_when_the_conversation_exceeds_the_new_wind
         "the pending swap carries the new window"
     );
     assert!(!agent.has_pending_swap(), "take clears the pending swap");
+}
+
+#[tokio::test]
+async fn a_resumed_transcript_too_big_for_the_new_window_compacts_first() {
+    // A session spawned with a RESUMED transcript has issued no request, so
+    // there is no live token count at all — the old decision read 0 and skipped
+    // compact-first. The rule now measures the published conversation itself
+    // plus the tool-schema overhead.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let old: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 200_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: old,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(200_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    // The resumed history — `seed_messages` publishes exactly this before the
+    // first request exists.
+    let history: Vec<Message> = (0..20)
+        .map(|i| {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            Message::text(role, "z".repeat(800))
+        })
+        .collect();
+    agent.publish_history(&history);
+    let new: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 4_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    // 4_000 × 0.5 = a 2K trigger; the 16K-char transcript is far over it.
+    agent.set_explicit_provider(new, context::ContextManager::new(4_000, 0.5));
+    assert!(
+        agent.has_pending_swap(),
+        "a resumed history too big for the new window must compact first"
+    );
+    assert_eq!(
+        agent.provider().capabilities().max_context,
+        200_000,
+        "the old provider keeps serving until the turn loop summarizes"
+    );
+}
+
+#[tokio::test]
+async fn a_switch_that_fits_swaps_at_once_with_the_full_history() {
+    // NONZERO usage below the target's own trigger: the swap lands at once — no
+    // summarization and no informational event — and the next request serves on
+    // the new model with the full history intact.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let old: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 200_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: old,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(200_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let mut messages = vec![
+        Message::text(Role::User, "first question with real content to count"),
+        Message::text(Role::Assistant, "first answer with real content to count"),
+    ];
+    agent.publish_history(&messages);
+    let new: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 64_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![
+            LlmEvent::TextDelta {
+                text: "served by the new model".to_string(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])
+    });
+    agent.set_explicit_provider(new, context::ContextManager::new(64_000, 0.5));
+    assert!(
+        !agent.has_pending_swap(),
+        "a conversation below the new window's trigger swaps at once"
+    );
+    assert_eq!(
+        agent.provider().capabilities().max_context,
+        64_000,
+        "the new provider is active immediately"
+    );
+
+    // The next request serves on the new model — full history included.
+    messages.push(Message::text(Role::User, "second question"));
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("the turn runs on the new model");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.as_text().contains("first question")),
+        "the full history is still in the conversation"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.as_text().contains("served by the new model")),
+        "the new provider served the request"
+    );
+    let mut events = Vec::new();
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ModelSwapSummarized { .. })),
+        "a fitting switch summarizes nothing — no informational event"
+    );
+    assert!(
+        !events.iter().any(|ev| matches!(ev, AgentEvent::Error { .. })),
+        "a fitting switch is not an error either"
+    );
 }
 
 #[tokio::test]
@@ -10784,9 +10943,10 @@ async fn set_explicit_provider_clears_stale_deferred_swap_on_immediate() {
     // A live conversation over the SMALLER model's trigger (64_000 × 0.5 =
     // 32K) but under the larger model's (400_000 × 0.5 = 200K): B defers, C
     // lands at once — so the stale-deferral clear is genuinely exercised.
-    agent
-        .live_token_count
-        .store(100_000, std::sync::atomic::Ordering::Relaxed);
+    let history: Vec<Message> = (0..40)
+        .map(|_| Message::text(Role::User, "y".repeat(4_000)))
+        .collect();
+    agent.publish_history(&history);
 
     // Step 1: defer a swap to a smaller-context model B.
     let small_b: Arc<dyn crate::provider::LlmClient> = Arc::new(CtxProvider {
@@ -10929,14 +11089,12 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
         messages.push(Message::text(role, msg_text.clone()));
     }
 
-    // Defer the swap: the live conversation exceeds the new model's own
-    // compaction trigger (2_000 × 0.5 = 1_000), so the pin defers for the OLD
-    // provider to summarize first. `live_token_count` is what the turn loop
-    // records at the top of every iteration; this loop has not run a turn yet,
-    // so seed the count the pin reads.
-    agent
-        .live_token_count
-        .store(2_000, std::sync::atomic::Ordering::Relaxed);
+    // Defer the swap: the inclusive count (the published conversation plus the
+    // tool-schema overhead) exceeds the new model's own compaction trigger
+    // (2_000 × 0.5 = 1_000), so the pin defers for the OLD provider to
+    // summarize first. Publishing is what the owning task does at turn
+    // boundaries — the decision never reads a cached count.
+    agent.publish_history(&messages);
     agent.set_explicit_provider(
         new_provider.clone(),
         context::ContextManager::new(2_000, 0.5),
@@ -11112,11 +11270,9 @@ async fn run_turn_model_switch_interrupt_emits_paired_compact_event() {
         messages.push(Message::text(role, msg_text.clone()));
     }
 
-    // Defer the swap: the live conversation exceeds the new model's trigger
-    // (2_000 × 0.5 = 1_000), so the pin defers before the turn runs.
-    agent
-        .live_token_count
-        .store(2_000, std::sync::atomic::Ordering::Relaxed);
+    // Defer the swap: the inclusive count (published conversation + tool-schema
+    // overhead) exceeds the new model's trigger (2_000 × 0.5 = 1_000).
+    agent.publish_history(&messages);
     agent.set_explicit_provider(
         new_provider.clone(),
         context::ContextManager::new(2_000, 0.5),
@@ -15184,12 +15340,10 @@ async fn mid_run_deferred_pick_lands_on_the_next_request() {
         &dir,
         workflow,
         Box::new(move |agent: &AgentLoop| {
-            // The pin defers on the LIVE count against the new model's own
-            // trigger (2_000 × 0.5 = 1_000), not on a window comparison: seed
-            // the count a session that had already served would carry.
-            agent
-                .live_token_count
-                .store(1_500, std::sync::atomic::Ordering::Relaxed);
+            // The pin defers on the INCLUSIVE count (conversation + tool-schema
+            // overhead) against the new model's own trigger (2_000 × 0.5 =
+            // 1_000), not on a window comparison — even a fresh, empty
+            // conversation carries the tool schemas.
             agent.set_explicit_provider(
                 swap_target.clone(),
                 context::ContextManager::new(2_000, 0.5),

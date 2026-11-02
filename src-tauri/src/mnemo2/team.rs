@@ -5316,18 +5316,26 @@ async fn pump_worker(
                     SerializableAgentEvent::Compacted { .. } => {
                         if worker.compacting {
                             worker.compacting = false;
-                            busy.store(false, Ordering::SeqCst);
-                            if !matches!(
-                                worker.status,
-                                WorkerStatus::Paused
-                                    | WorkerStatus::Interrupted
-                                    | WorkerStatus::Stopped
-                            ) {
-                                worker.status = if worker.pending.is_some() {
-                                    WorkerStatus::NeedsYou
-                                } else {
-                                    WorkerStatus::Idle
-                                };
+                            // A compaction INSIDE a live turn (a mid-run
+                            // compact-then-switch, or the new model's own
+                            // trigger right after one) must not idle the
+                            // worker: the turn continues on the new model, so
+                            // only the badge ends. Between turns (turn_active
+                            // false) the worker really is idle again.
+                            if !turn_active {
+                                busy.store(false, Ordering::SeqCst);
+                                if !matches!(
+                                    worker.status,
+                                    WorkerStatus::Paused
+                                        | WorkerStatus::Interrupted
+                                        | WorkerStatus::Stopped
+                                ) {
+                                    worker.status = if worker.pending.is_some() {
+                                        WorkerStatus::NeedsYou
+                                    } else {
+                                        WorkerStatus::Idle
+                                    };
+                                }
                             }
                             worker.error = None;
                             changed = true;

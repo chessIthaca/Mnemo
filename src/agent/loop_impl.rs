@@ -208,6 +208,22 @@ pub struct AgentLoop {
     /// own preflight/compaction is the backstop. `0` = no count recorded
     /// yet (no request has been built for this loop).
     pub(crate) live_token_count: std::sync::atomic::AtomicUsize,
+    /// The conversation its owning task last PUBLISHED — the authoritative
+    /// messages every compact-before-switch decision measures (see
+    /// [`swap_needs_compaction`](Self::swap_needs_compaction)). Published when
+    /// a transcript is seeded (a resume, BEFORE any request runs), before and
+    /// after every turn (the turn's final message counts), and at the top of
+    /// every request iteration. A bare cached COUNT cannot serve here: it is
+    /// `0` for a resumed session that has not issued a request yet and stale
+    /// after a turn's final message, so a too-big history would skip
+    /// compact-first.
+    pub(crate) live_history: Arc<std::sync::Mutex<Vec<crate::provider::Message>>>,
+    /// The tool-schema overhead (tokens) measured for the request surface of
+    /// the last publish — the second half of the inclusive count the turn
+    /// loop's summarize trigger uses. Seeded at construction from the
+    /// registry's advertised schema block, so even a resumed session's first
+    /// switch decision is measured inclusively rather than as message-only.
+    pub(crate) live_schema_tokens: std::sync::atomic::AtomicUsize,
     pub(crate) tools: Arc<ToolRegistry>,
     /// The steering counters this loop reports to (2c.4/G4): injected by
     /// the factory via `with_steering` so every loop the same factory
@@ -1065,6 +1081,19 @@ impl AgentLoop {
             )),
             compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
+            live_history: Arc::new(std::sync::Mutex::new(Vec::new())),
+            // Baseline schema overhead for a session that has not issued a
+            // request yet (a resumed transcript): the advertised surface of a
+            // normal working state. Each request iteration replaces it with the
+            // exact measured value.
+            live_schema_tokens: std::sync::atomic::AtomicUsize::new(
+                crate::provider::estimate_tools_tokens(
+                    &tools.schemas(
+                        &crate::provider::Capabilities::openai(),
+                        &crate::tool::ToolFilter::Executing,
+                    ),
+                ),
+            ),
             steering: Arc::new(crate::agent::steering_stats::SteeringStats::new()),
             permission: std::sync::RwLock::new(
                 crate::agent::policy::PermissionPolicy::ApproveViaApi {
@@ -2370,33 +2399,74 @@ impl AgentLoop {
         self.compaction_raise.reset();
     }
 
-    /// Whether the LIVE conversation is too large for `context_manager`'s
-    /// window — the shared "compact before switching" rule used by
-    /// [`set_explicit_provider`](Self::set_explicit_provider) and
-    /// [`AgentSession::set_model`](crate::headless::AgentSession::set_model).
+    /// Publish the owning task's authoritative conversation to the loop — the
+    /// messages every compact-before-switch decision measures. Called when a
+    /// transcript is seeded (a resume, before the first request), before and
+    /// after every turn, and at the top of every request iteration.
+    pub fn publish_history(&self, messages: &[crate::provider::Message]) {
+        *self
+            .live_history
+            .lock()
+            .expect("live_history lock poisoned") = messages.to_vec();
+    }
+
+    /// Publish the tool-schema overhead (tokens) measured for the current
+    /// request surface — the second half of the inclusive count the turn
+    /// loop's summarize trigger compares.
+    pub fn publish_schema_tokens(&self, tokens: usize) {
+        self.live_schema_tokens
+            .store(tokens, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// THE compact-before-switch rule, shared by all three call sites — the
+    /// pin ([`set_explicit_provider`](Self::set_explicit_provider)), the
+    /// deferred completion's summary gate in `run_turn`, and
+    /// [`AgentSession::set_model`](crate::headless::AgentSession::set_model)
+    /// (via [`swap_needs_compaction`](Self::swap_needs_compaction)): does
+    /// `messages` PLUS the tool-schema overhead reach `context_manager`'s own
+    /// compaction trigger?
     ///
-    /// The measure is the turn loop's own compaction trigger (see the
-    /// `token_count >= context_manager.effective_limit()` gate in `run_turn`)
-    /// applied to the live token count recorded at the top of the last request
-    /// iteration — messages plus tools-schema overhead, the same value the
-    /// summarize trigger compares. A count of `0` means no request has been
-    /// built yet (a fresh session, or a `/new` reset): an empty conversation
-    /// trivially fits, so this reports `false`.
+    /// This is the turn loop's trigger expression
+    /// (`count_tokens(messages) + schema_tokens >= effective_limit`) applied to
+    /// the target manager, so a switch summarizes exactly when the next request
+    /// on the new model would itself summarize. `effective_limit` carries the
+    /// raise ladder; the incoming manager is freshly built (no raise installed)
+    /// and [`set_provider`](Self::set_provider) resets the ladder on every swap
+    /// anyway, so this reads exactly the trigger the new model would apply.
+    pub fn conversation_needs_compaction(
+        &self,
+        context_manager: &super::context::ContextManager,
+        messages: &[crate::provider::Message],
+    ) -> bool {
+        let schema_tokens = self
+            .live_schema_tokens
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let messages_tokens = super::context::ContextManager::count_tokens(messages);
+        // An EMPTY conversation has nothing to summarize: compacting first would
+        // only delay the swap and burn a summarization call that cannot reduce
+        // anything (the irreducible system/schema block is measured separately
+        // below and is not the conversation's to shrink).
+        messages_tokens > 0 && messages_tokens + schema_tokens >= context_manager.effective_limit()
+    }
+
+    /// [`conversation_needs_compaction`](Self::conversation_needs_compaction)
+    /// over the LIVE conversation its task last
+    /// [`published`](Self::publish_history).
     ///
     /// A model switch compacts first ONLY when this is `true`. A new window
     /// that is merely smaller than the old one is not, by itself, a reason to
-    /// summarize a conversation that already fits: the 2027-11-02 bug
-    /// (plan 1238e0de) summarized — and reported — a switch that needed no
+    /// summarize a conversation that already fits: the 2027-11-02 bug (plan
+    /// 1238e0de) summarized — and reported — a switch that needed no
     /// summarization, which made Mnemo2 mark a healthy worker failed.
     pub fn swap_needs_compaction(&self, context_manager: &super::context::ContextManager) -> bool {
-        // `effective_limit` carries the raise ladder; the incoming manager is
-        // freshly built (no raise installed) and `set_provider` resets the
-        // ladder on every swap anyway, so this reads exactly the trigger the
-        // new model applies to its first request.
-        let live = self
-            .live_token_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        live > 0 && live >= context_manager.effective_limit()
+        // Clone out of the lock: `count_tokens` walks the whole conversation and
+        // must not hold it against the turn loop's publishes.
+        let messages = self
+            .live_history
+            .lock()
+            .expect("live_history lock poisoned")
+            .clone();
+        self.conversation_needs_compaction(context_manager, &messages)
     }
 
     /// Pin an explicit provider + context manager for THIS agent — the

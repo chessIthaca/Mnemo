@@ -265,7 +265,7 @@
   .tree { margin: 0; padding: 0; list-style: none; }
   .row { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-soft); font-family: var(--font-mono); font-size: var(--text-body); text-align: left; }
   .row:hover { background: var(--surface-soft); }
-  .row:focus-visible { outline: 2px solid var(--accent, #7d8276); outline-offset: -2px; }
+  .row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .row-path, .row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .viewer { display: flex; min-width: 0; flex-direction: column; }
   .viewer-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -275,6 +275,6 @@
   .code code { white-space: pre; }
   .files-note { margin: 10px 2px; color: var(--muted); font-size: var(--text-body); line-height: 1.6; }
   .files-note.indent { margin: 2px 0 6px 22px; }
-  .files-error { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #e3c7c0; border-radius: 8px; background: #fbf0ee; color: #8d4d46; font-size: var(--text-body); line-height: 1.5; }
+  .files-error { margin-bottom: 12px; padding: 10px 12px; border: 1px solid var(--danger-line); border-radius: 8px; background: var(--danger-soft); color: var(--danger); font-size: var(--text-body); line-height: 1.5; }
   @media (max-width: 480px) { .files-tab { padding: 14px; } }
 </style>

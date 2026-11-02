@@ -7,8 +7,11 @@
  * `npm run check:no-mock` keeps passing.
  */
 
+import { mount as svelteMount, unmount } from "svelte";
+import SettingsDialog from "../components/SettingsDialog.svelte";
 import type { BoardPlan } from "../lib/boardState";
 import type { WorkerDeletionPreview } from "../lib/teamState";
+import { seedPreviewSettings } from "./previewSettings";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedCostPreview, type CostInsights } from "../lib/cost";
@@ -205,6 +208,14 @@ export interface PreviewScene {
   description: string;
   /** Build the store state this scene renders. */
   build(): AppState;
+  /**
+   * Mount a bespoke frame instead of the app shell — for dev-only scenes
+   * that render something the store cannot express (the settings dialog
+   * opens from component-local state, not the store). `build` still
+   * applies; the scenes test uses it. The returned cleanup is for tests
+   * that mount and unmount within a run; the preview page ignores it.
+   */
+  mount?: (target: HTMLElement) => () => void;
 }
 
 /**
@@ -469,6 +480,24 @@ export const previewScenes: PreviewScene[] = [
     title: "Lead chat",
     description: "The lead conversation: plan, dispatch, review, merge, and a tool row.",
     build: leadChat,
+  },
+  {
+    name: "settings-models",
+    title: "Settings: Models and Savings",
+    description:
+      "The settings dialog's Models page (per-task, vision, code indexing, budget) and Savings page (levers, pricing) against seeded data.",
+    // The dialog opens from component-local state, so the scene mounts it
+    // directly with the preview fakes seeded; `build` keeps the app shell
+    // valid for the scenes test.
+    build: missionControl,
+    mount: (target) => {
+      const restore = seedPreviewSettings();
+      const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {} } });
+      return () => {
+        unmount(dialog);
+        restore();
+      };
+    },
   },
   {
     name: "lead-idle",

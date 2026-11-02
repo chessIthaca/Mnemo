@@ -126,8 +126,22 @@ export function createTauriSettingsTransport(bindings: SettingsTransportBindings
   };
 }
 
+/**
+ * Dev-only seam: the preview page (no Tauri host) seeds a fake transport
+ * here before mounting the settings dialog, so it renders sample data in a
+ * browser. Nothing in the shipped app calls the setter, and the browser
+ * check below still returns null when no seed is set.
+ */
+let previewTransport: SettingsTransport | null = null;
+
+/** Seed (or clear) the preview settings transport — dev preview only. */
+export function setPreviewSettingsTransport(transport: SettingsTransport | null): void {
+  previewTransport = transport;
+}
+
 /** The native settings transport, or `null` in a browser-only session. */
 export function createSettingsTransport(bindings?: SettingsTransportBindings): SettingsTransport | null {
+  if (previewTransport) return previewTransport;
   if (!bindings && !isTauriRuntime()) return null;
   return createTauriSettingsTransport(bindings ?? { invoke });
 }

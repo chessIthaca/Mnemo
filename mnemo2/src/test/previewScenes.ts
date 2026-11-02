@@ -11,9 +11,9 @@ import { mount as svelteMount, unmount } from "svelte";
 import SettingsDialog from "../components/SettingsDialog.svelte";
 import type { BoardPlan } from "../lib/boardState";
 import type { WorkerDeletionPreview } from "../lib/teamState";
+import { seedPreviewSettings } from "./previewSettings";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
-import { seedPreviewSettings } from "./previewSettings";
 
 /** The fixture worker whose thread the preview shows in full. */
 const RICH_WORKER_ID = "kai";

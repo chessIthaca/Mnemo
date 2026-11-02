@@ -51,6 +51,15 @@ describe("Mnemo2 navigation and draft preservation", () => {
     expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
   });
 
+  it("opens the Trace tab from the top bar between Cost and Graph", async () => {
+    render(App);
+
+    await fireEvent.click(screen.getByRole("button", { name: /^Trace/ }));
+
+    expect(state().route).toBe("trace");
+    expect(await screen.findByRole("region", { name: "Trace" })).toBeTruthy();
+  });
+
   it("restores an unsent text and image draft across Lead → Team → Lead", async () => {
     render(App);
     const input = await textbox();

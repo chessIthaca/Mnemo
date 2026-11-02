@@ -1,0 +1,453 @@
+import { fireEvent, render, screen } from "@testing-library/svelte";
+import { get } from "svelte/store";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import TraceView from "./TraceView.svelte";
+import { app } from "../lib/store";
+import { fixtureState } from "../test/fixtures";
+import type { TraceAttribution, TraceDetail, TraceListPage, TraceListQuery, TracePageTransport, TraceRow } from "../lib/trace";
+
+const mocks = vi.hoisted(() => ({
+  transport: null as TracePageTransport | null,
+  rows: [] as TraceRow[],
+  page: {} as Partial<TraceListPage>,
+  details: new Map<string, TraceDetail>(),
+  failList: 0,
+  queries: [] as TraceListQuery[],
+}));
+
+// TraceView builds its own transport on mount; the tests plant one instead,
+// keeping every helper in ../lib/trace real so the page is tested end to end.
+vi.mock("../lib/trace", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/trace")>();
+  return { ...original, createTracePageTransport: () => mocks.transport };
+});
+
+// jsdom ships no matchMedia; the page listens for the narrow layout switch.
+function stubMatchMedia(): void {
+  window.matchMedia = ((query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+}
+
+function attribution(overrides: Partial<TraceAttribution> = {}): TraceAttribution {
+  return {
+    actor_kind: "worker",
+    agent_id: "design-trace",
+    session_id: "session-1",
+    agent_name: "design-trace",
+    worker_id: "design-trace",
+    plan_id: "c3ba2b58",
+    plan_step: 0,
+    turn_id: "t-1",
+    purpose: "turn",
+    ...overrides,
+  };
+}
+
+/** One row, newest-first list order, priced and attributed by default. */
+function callRow(overrides: Partial<TraceRow> = {}): TraceRow {
+  return {
+    id: 1,
+    ts_ms: Date.now(),
+    model: "kimi-k3.1-pro",
+    base_url: "https://api.kimi.invalid/v1",
+    provider: "kimi",
+    http_status: 200,
+    usage: { prompt: 18_240, completion: 1_400, reasoning: 620, cached: 16_800 },
+    finish_reason: "tool_calls",
+    is_complete: true,
+    version: 3,
+    ttft_ms: 900,
+    generation_ms: 4_000,
+    reasoning_ms: 1_200,
+    connect_ms: 300,
+    tools_ms: 8_000,
+    prep_ms: 500,
+    compact_ms: null,
+    backoff_ms: null,
+    stall_ms: null,
+    error: null,
+    cancelled: false,
+    response_truncated: false,
+    response_evicted: false,
+    guard_cut: null,
+    run_id: "run-1",
+    attribution: attribution(),
+    cost_micros: 81_000,
+    priced: true,
+    retained: false,
+    ...overrides,
+  };
+}
+
+/** One full record: the row plus an SSE body, two messages and a tool call. */
+function callDetail(row: TraceRow, overrides: Partial<TraceDetail> = {}): TraceDetail {
+  return {
+    ...row,
+    request_json: {
+      messages: [
+        { role: "system", content: "You are the lead." },
+        { role: "user", content: "Fix the failing test." },
+      ],
+    },
+    response_raw: [
+      'data: {"choices":[{"delta":{"reasoning_content":"checking "}}]}',
+      'data: {"choices":[{"delta":{"content":"The answer is 42."}}]}',
+      "data: [DONE]",
+    ].join("\n"),
+    request_truncated: false,
+    raw_tool_calls: [
+      { id: "tc-1", name: "read_file", arguments: '{"path":"src/lib.rs"}', truncated: false },
+    ],
+    ...overrides,
+  };
+}
+
+function detailKey(row: TraceRow): string {
+  return `${row.run_id}:${row.id}`;
+}
+
+/** Plant the mock IPC surface the page talks to. */
+function installTransport(): void {
+  mocks.transport = {
+    list: async (query: TraceListQuery) => {
+      mocks.queries.push(query);
+      if (mocks.failList > 0) {
+        mocks.failList -= 1;
+        throw new Error("engine offline");
+      }
+      return {
+        rows: mocks.rows,
+        total: mocks.rows.length,
+        unpriced: 0,
+        has_more: false,
+        next_cursor: null,
+        capped: false,
+        ...mocks.page,
+      };
+    },
+    detail: async (runId: string, id: number) => mocks.details.get(`${runId}:${id}`) ?? null,
+    settings: async () => ({ log_bodies: false, ring_capacity: 128, journal_bytes: 0, history_bytes: 0 }),
+    setLogBodies: async (on: boolean) => ({ log_bodies: on, ring_capacity: 128, journal_bytes: 0, history_bytes: 0 }),
+    clearLive: async () => {},
+    deleteHistory: async () => ({ deleted_files: 0, bytes: 0 }),
+    exportCalls: async () => ({ path: "", count: 0, includes_bodies: false }),
+  };
+}
+
+async function flush(ms: number): Promise<void> {
+  await vi.advanceTimersByTimeAsync(ms);
+}
+
+describe("TraceView", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    stubMatchMedia();
+    window.localStorage.clear();
+    mocks.transport = null;
+    mocks.rows = [];
+    mocks.page = {};
+    mocks.details = new Map();
+    mocks.failList = 0;
+    mocks.queries = [];
+    app.set({ ...fixtureState(), route: "trace", traceEntry: null });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("explains itself outside the desktop app instead of an empty page", async () => {
+    render(TraceView);
+    expect(screen.getByText("Model-call tracing runs in the desktop app")).toBeTruthy();
+  });
+
+  it("lists every call with its actor, status, tokens and cost at a glance", async () => {
+    installTransport();
+    const leadCall = callRow({ id: 1, model: "lead-model", attribution: attribution({ actor_kind: "lead", agent_id: "lead", worker_id: null, plan_id: null, plan_step: null, turn_id: null }) });
+    const workerCall = callRow({ id: 2, ts_ms: Date.now() - 60_000, attribution: attribution({ turn_id: "t-9" }) });
+    const unpriced = callRow({
+      id: 3,
+      ts_ms: Date.now() - 90_000,
+      model: "mystery-model",
+      cost_micros: null,
+      priced: false,
+      attribution: attribution({ actor_kind: "subagent", agent_id: "helper", agent_name: "helper", worker_id: null, plan_id: null, plan_step: null, turn_id: null }),
+    });
+    mocks.rows = [leadCall, workerCall, unpriced];
+    render(TraceView);
+
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /mystery-model/ })).toBeTruthy());
+    expect(screen.getByRole("button", { name: /lead-model/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /kimi-k3.1-pro/ })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /Complete/ })).toHaveLength(3);
+    expect(screen.getByRole("button", { name: /design-trace/ })).toBeTruthy();
+    // 3 calls with tokens and a priced total, plus the unpriced marker.
+    expect(screen.getByText(/3 calls · \S+ tokens ·/)).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /92% cached/ })).toHaveLength(3);
+  });
+
+  it("sends the agent filter to the backend and restores it as a chip", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /kimi-k3.1-pro/ })).toBeTruthy());
+
+    const agentSelect = screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement;
+    await fireEvent.change(agentSelect, { target: { value: "design-trace" } });
+
+    await vi.waitFor(() => {
+      expect(mocks.queries.some((query) => query.agent === "design-trace")).toBe(true);
+    });
+    expect(screen.getByRole("button", { name: "Remove filter Agent: design-trace" })).toBeTruthy();
+  });  it("shows removable chips and a no-match state when a filter empties the list", async () => {
+    installTransport();
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByText(/0 calls ·/)).toBeTruthy());
+
+    const agentSelect = screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement;
+    await fireEvent.change(agentSelect, { target: { value: "unattributed" } });
+
+    await vi.waitFor(() => {
+      expect(mocks.queries.some((query) => query.agent === "unattributed")).toBe(true);
+    });
+    await vi.waitFor(() => expect(screen.getByText("No calls match these filters.")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Remove filter Agent: unattributed" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await vi.waitFor(() => {
+      expect(mocks.queries[mocks.queries.length - 1].agent).toBeUndefined();
+    });
+    expect(screen.queryByText("No calls match these filters.")).toBeNull();
+  });
+
+  it("debounces the search box and carries its scope", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /kimi-k3.1-pro/ })).toBeTruthy());
+
+    const search = screen.getByRole("searchbox", { name: "Search calls" }) as HTMLInputElement;
+    await fireEvent.input(search, { target: { value: "read_file" } });
+    expect(mocks.queries.some((query) => query.search === "read_file")).toBe(false);
+
+    await flush(300);
+    await vi.waitFor(() => {
+      expect(mocks.queries.some((query) => query.search === "read_file" && query.search_scope === "all")).toBe(true);
+    });
+
+    const scope = screen.getByRole("combobox", { name: "Search scope" }) as HTMLSelectElement;
+    await fireEvent.change(scope, { target: { value: "response" } });
+    await flush(0);
+    await vi.waitFor(() => {
+      expect(mocks.queries.some((query) => query.search === "read_file" && query.search_scope === "response")).toBe(true);
+    });
+  });
+
+  it("groups by day by default and by actor when the Group control says Agent", async () => {
+    installTransport();
+    const leadCall = callRow({ id: 1, model: "lead-model", attribution: attribution({ actor_kind: "lead", agent_id: "lead", worker_id: null, plan_id: null, plan_step: null, turn_id: null }) });
+    mocks.rows = [leadCall, callRow({ id: 2, ts_ms: Date.now() - 60_000, attribution: attribution({ turn_id: "t-9" }) })];
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("heading", { name: "Today" })).toBeTruthy());
+
+    const group = screen.getByRole("combobox", { name: "Group" }) as HTMLSelectElement;
+    await fireEvent.change(group, { target: { value: "agent" } });
+
+    await vi.waitFor(() => expect(screen.getByRole("heading", { name: "Lead" })).toBeTruthy());
+    expect(screen.getByRole("heading", { name: "design-trace" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Today" })).toBeNull();
+  });
+
+  it("counts new calls behind the follow pill instead of moving the list", async () => {
+    installTransport();
+    const head = callRow({ id: 1, model: "head-model", ts_ms: Date.now() - 10_000 });
+    const older = callRow({ id: 2, model: "older-model", ts_ms: Date.now() - 60_000, attribution: attribution({ turn_id: "t-9" }) });
+    const newer = callRow({ id: 3, model: "newer-model", ts_ms: Date.now() });
+    mocks.rows = [head, older];
+    mocks.details.set(detailKey(older), callDetail(older));
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /older-model/ })).toBeTruthy());
+
+    // Selecting an older call stops following.
+    await fireEvent.click(screen.getByRole("button", { name: /older-model/ }));
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy());
+    const followToggle = screen.getByRole("checkbox", { name: "Follow new calls" }) as HTMLInputElement;
+    expect(followToggle.checked).toBe(false);
+
+    // A new call arrives: the pill counts it, the list stays stable.
+    mocks.rows = [newer, head, older];
+    await flush(1_500);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "1 new call — Follow" })).toBeTruthy());
+    expect(screen.queryByRole("button", { name: /newer-model/ })).toBeNull();
+    // The selection survived.
+    expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy();
+
+    // Following again reveals the new call at the head.
+    await fireEvent.click(screen.getByRole("button", { name: "1 new call — Follow" }));
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /newer-model/ })).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "1 new call — Follow" })).toBeNull();
+  });
+
+  it("updates an in-flight row in place from the poll, never duplicating it", async () => {
+    installTransport();
+    const live = callRow({ id: 1, model: "live-model", is_complete: false, ttft_ms: null, finish_reason: null, http_status: null, usage: null, version: 1 });
+    mocks.rows = [live];
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /Waiting/ })).toBeTruthy());
+
+    const finished = callRow({ id: 1, model: "live-model", is_complete: true, version: 2 });
+    mocks.rows = [finished];
+    await flush(1_500);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /live-model/ })).toBeTruthy());
+    const rowButtons = screen.getAllByRole("button", { name: /live-model/ });
+    expect(rowButtons).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /Complete/ })).toBeTruthy();
+  });
+
+  it("opens the selected call: Overview, Context with prefix reuse, Response, Tools and Raw", async () => {
+    installTransport();
+    // Same agent, purpose and model, one turn apart: the older call is the
+    // comparable predecessor the Context tab measures against.
+    const earlier = callRow({ id: 2, ts_ms: Date.now() - 60_000, attribution: attribution({ turn_id: "t-8" }) });
+    const selected = callRow({ id: 1, ts_ms: Date.now() - 10_000, attribution: attribution({ turn_id: "t-9" }) });
+    mocks.rows = [selected, earlier];
+    mocks.details.set(detailKey(selected), callDetail(selected));
+    // The previous comparable call feeds the Context tab's prefix comparison.
+    mocks.details.set(detailKey(earlier), callDetail(earlier, {
+      request_json: {
+        messages: [
+          { role: "system", content: "You are the lead." },
+          { role: "user", content: "Review the failing test." },
+        ],
+      },
+    }));
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getAllByRole("button", { name: /kimi-k3\.1-pro/ })).toHaveLength(2));
+
+    // The list is newest first, so the first row is the call under inspection.
+    await fireEvent.click(screen.getAllByRole("button", { name: /kimi-k3\.1-pro/ })[0]);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy());
+
+    // Overview is the default tab, with the glossary a keypress away.
+    expect(screen.getByText("Who")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "What does “Estimated cost” mean?" })).toBeTruthy();
+
+    // Context compares with the previous call and reads as a message wall.
+    await fireEvent.click(screen.getByRole("button", { name: "Context (2)" }));
+    await vi.waitFor(() => expect(screen.getByText(/shares this beginning/)).toBeTruthy());
+    expect(screen.getByText("System")).toBeTruthy();
+    expect(screen.getByText("User")).toBeTruthy();
+
+    // Response splits reasoning from the answer.
+    await fireEvent.click(screen.getByRole("button", { name: "Response" }));
+    await vi.waitFor(() => expect(screen.getByText("The answer is 42.")).toBeTruthy());
+    expect(screen.getByRole("heading", { name: "Reasoning" })).toBeTruthy();
+
+    // Tools shows the delivered call with parsed JSON.
+    await fireEvent.click(screen.getByRole("button", { name: "Tools (1)" }));
+    await vi.waitFor(() => expect(screen.getByText("read_file")).toBeTruthy());
+
+    // Raw keeps the exact payloads.
+    await fireEvent.click(screen.getByRole("button", { name: "Raw" }));
+    await vi.waitFor(() => expect(screen.getByText(/"Fix the failing test\."/)).toBeTruthy());
+  });
+
+  it("keeps the last data and offers a retry when the list load fails", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    // One failure for the silent options probe, one for the page's own load.
+    mocks.failList = 2;
+    render(TraceView);
+
+    await vi.waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.getByText(/Could not read the model calls: engine offline/)).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await vi.waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(screen.getByRole("button", { name: /kimi-k3.1-pro/ })).toBeTruthy();
+  });
+
+  it("welcomes an empty log with the Open Lead action", async () => {
+    installTransport();
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByText("Model calls will appear here when the lead or a worker runs.")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Open Lead" })).toBeTruthy();
+  });
+
+  it("consumes an entry hand-over with its filters and clears it afterwards", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    app.set({ ...fixtureState(), route: "trace", traceEntry: { agent: "design-trace" } });
+    render(TraceView);
+
+    await vi.waitFor(() => {
+      expect((screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement).value).toBe("design-trace");
+    });
+    await vi.waitFor(() => expect(mocks.queries.some((query) => query.agent === "design-trace")).toBe(true));
+    expect(get(app).traceEntry).toBeNull();
+    expect(screen.getByRole("button", { name: "Remove filter Agent: design-trace" })).toBeTruthy();
+  });
+
+  it("restores the saved filters and grouping per project", async () => {
+    installTransport();
+    const leadCall = callRow({ id: 1, model: "lead-model", attribution: attribution({ actor_kind: "lead", agent_id: "lead", worker_id: null, plan_id: null, plan_step: null, turn_id: null }) });
+    const workerCall = callRow({ id: 2, ts_ms: Date.now() - 60_000, attribution: attribution({ turn_id: "t-9" }) });
+    mocks.rows = [leadCall, workerCall];
+    window.localStorage.setItem(
+      "mnemo2.trace.mnemo",
+      JSON.stringify({ grouping: "turn", agent: "design-trace", insightsOpen: true }),
+    );
+    render(TraceView);
+
+    await vi.waitFor(() =>
+      expect((screen.getByRole("combobox", { name: "Group" }) as HTMLSelectElement).value).toBe("turn"),
+    );
+    // The agent option arrives with the async probe; the select value follows it.
+    await vi.waitFor(() =>
+      expect((screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement).value).toBe("design-trace"),
+    );
+    await vi.waitFor(() => expect(screen.getByRole("region", { name: "Insights" })).toBeTruthy());
+    expect(screen.getByRole("heading", { name: /Turn t-9 — design-trace/ })).toBeTruthy();
+  });
+
+  it("notes when the backend capped the result set", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    mocks.page = { capped: true };
+    render(TraceView);
+    await vi.waitFor(() =>
+      expect(screen.getByText("Showing first 1,000 matches; narrow the time range.")).toBeTruthy(),
+    );
+  });
+
+  it("pages older calls through Load more and the cursor", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    mocks.page = { has_more: true, next_cursor: "cursor-2" };
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Load more" })).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await vi.waitFor(() => expect(mocks.queries.some((query) => query.cursor === "cursor-2")).toBe(true));
+  });
+
+  it("mounts the Insights charts over the loaded rows with the filter scope", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /kimi-k3.1-pro/ })).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole("button", { name: "Insights" }));
+    await vi.waitFor(() => expect(screen.getByRole("region", { name: "Insights" })).toBeTruthy());
+    expect(screen.getByText(/Charts for 1 filtered call · this session/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Hide charts" }));
+    await vi.waitFor(() => expect(screen.queryByRole("region", { name: "Insights" })).toBeNull());
+  });
+});

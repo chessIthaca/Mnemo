@@ -779,6 +779,11 @@ function previewTraceRow(
     response_truncated: false,
     response_evicted: false,
     guard_cut: null,
+    run_id: "preview-run",
+    attribution: null,
+    cost_micros: null,
+    priced: false,
+    retained: false,
     ...fields,
   };
 }

@@ -31,6 +31,7 @@ import {
 import { applyWorkerEvent, applyWorkerStatus } from "./workerActivity";
 import { leadEventSound, loadSoundToggles, notifySound, workerTransitionSound } from "./sounds";
 import { applyStoredTheme } from "./theme";
+import type { TraceEntry } from "./trace";
 import { logUi } from "./uiLog";
 import {
   createOpenWorkerTransport,
@@ -253,6 +254,13 @@ async function connectNativeLead(project: Project, allowConflict = false): Promi
   }
 }
 
+/**
+ * When this app instance booted, as the anchor for the Trace route's
+ * "This session" time filter — the engine starts with the app, so its ring
+ * holds nothing older.
+ */
+export const SESSION_START_MS = Date.now();
+
 export function createInitialState(): AppState {
   return {
     route: "start",
@@ -273,6 +281,8 @@ export function createInitialState(): AppState {
     workbenchWidth: 480,
     /** No saved mission-control split until the user drags or the project restores one. */
     boardWidth: null,
+    /** No Trace-route filter hand-over until an entry point plants one. */
+    traceEntry: null,
     workerPanelId: null,
     browserUrl: "about:blank",
     browserTitle: "",
@@ -1002,6 +1012,26 @@ function openMemory() {
     teamPeekOpen: false,
     workbenchOpen: false,
   }));
+}
+
+/**
+ * Open the Trace route — every model call, in detail. Optional filters carry
+ * an entry point's hand-over (a worker from mission control, a lead turn
+ * from the chat); the view consumes them once and they never enter a URL.
+ */
+function openTrace(filters?: TraceEntry) {
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "trace" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: false,
+    traceEntry: filters ?? null,
+  }));
+}
+
+/** Clear a consumed Trace hand-over so returning to the route starts unfiltered. */
+function clearTraceEntry() {
+  app.update((state) => (state.traceEntry === null ? state : { ...state, traceEntry: null }));
 }
 
 function toggleTeamPeek() {
@@ -2780,6 +2810,8 @@ export const actions = {
   openGraph,
   openPlans,
   openMemory,
+  openTrace,
+  clearTraceEntry,
   toggleTeamPeek,
   selectWorker,
   setTeamFilter,

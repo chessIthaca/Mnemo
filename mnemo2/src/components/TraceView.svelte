@@ -1,0 +1,790 @@
+<script lang="ts">
+  // Copyright (c) 2026 Carsten Hess
+  // SPDX-License-Identifier: MIT
+  // See LICENSE in the repository root.
+
+  import { onMount } from "svelte";
+  import { Search, X } from "@lucide/svelte";
+  import { actions, app, SESSION_START_MS } from "../lib/store";
+  import TraceCharts from "./TraceCharts.svelte";
+  import TraceDetailPane from "./TraceDetail.svelte";
+  import TraceList from "./TraceList.svelte";
+  import {
+    activeTraceChips,
+    createTracePageTransport,
+    DEFAULT_TRACE_FILTERS,
+    formatTokens,
+    groupTraceRows,
+    loadTracePrefs,
+    previousComparableRow,
+    saveTracePrefs,
+    traceAgentOptions,
+    traceCostLabel,
+    traceEntryFilters,
+    traceKey,
+    traceListQuery,
+    traceModelOptions,
+    TRACE_PAGE_SIZE,
+    TRACE_PURPOSE_OPTIONS,
+    TRACE_STATUS_OPTIONS,
+    TRACE_TIME_OPTIONS,
+    type TraceDetail,
+    type TraceFilters,
+    type TraceListPage,
+    type TraceListStatus,
+    type TraceRow,
+    type TraceSearchScope,
+    type TraceGrouping,
+  } from "../lib/trace";
+
+  /** How often an open page re-reads the filtered list. */
+  const POLL_MS = 1_500;
+  /** How often an in-flight selected call re-reads its detail. */
+  const DETAIL_POLL_MS = 1_000;
+  /** The search input's debounce. */
+  const SEARCH_DEBOUNCE_MS = 300;
+  const LIST_WIDTH_MIN = 300;
+  const LIST_WIDTH_MAX = 720;
+
+  function errorMessage(value: unknown): string {
+    return value instanceof Error ? value.message : String(value);
+  }
+
+  const transport = createTracePageTransport();
+
+  let filters = $state<TraceFilters>({ ...DEFAULT_TRACE_FILTERS });
+  let rows = $state<TraceRow[]>([]);
+  let observed = $state<TraceRow[]>([]);
+  let total = $state(0);
+  let unpriced = $state(0);
+  let hasMore = $state(false);
+  let nextCursor = $state<string | null>(null);
+  let capped = $state(false);
+  let listError = $state("");
+  let loadingList = $state(false);
+  let loadingMore = $state(false);
+  let loadedOnce = $state(false);
+
+  let follow = $state(true);
+  let newCount = $state(0);
+  let nowMs = $state(Date.now());
+
+  let selectedKey = $state<string | null>(null);
+  let detail = $state<TraceDetail | null>(null);
+  let detailError = $state("");
+  let detailLoading = $state(false);
+  let previousDetail = $state<TraceDetail | null>(null);
+  let previousRow = $state<TraceRow | null>(null);
+  let previousPending = $state(false);
+
+  let insightsOpen = $state(false);
+  let listWidth = $state(420);
+  let narrow = $state(false);
+  let dragging = $state(false);
+  let columns: HTMLElement | undefined = $state();
+
+  let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+  let reloadToken = 0;
+  let detailToken = 0;
+
+  const chips = $derived(activeTraceChips(filters));
+  const groups = $derived(groupTraceRows(rows, filters.grouping, nowMs));
+  const agentOptions = $derived(traceAgentOptions(observed, $app.workers));
+  const modelOptions = $derived(traceModelOptions(observed));
+  const selectedRow = $derived(
+    selectedKey === null ? null : rows.find((row) => traceKey(row) === selectedKey) ?? detail,
+  );
+  const summary = $derived(summaryLine());
+  const statusOptions: { value: "all" | TraceListStatus; label: string }[] = [
+    { value: "all", label: "All statuses" },
+    ...TRACE_STATUS_OPTIONS,
+  ];
+  const scopeOptions: { value: TraceSearchScope; label: string }[] = [
+    { value: "all", label: "All content" },
+    { value: "request", label: "Request" },
+    { value: "response", label: "Response" },
+    { value: "reasoning", label: "Reasoning" },
+    { value: "tools", label: "Tool calls" },
+    { value: "metadata", label: "Metadata" },
+  ];
+  const groupingOptions: { value: TraceGrouping; label: string }[] = [
+    { value: "time", label: "Time" },
+    { value: "agent", label: "Agent" },
+    { value: "turn", label: "Turn" },
+  ];
+
+  /** The wireframe's summary line: calls, tokens, cost. */
+  function summaryLine(): string {
+    let input = 0;
+    let output = 0;
+    let costMicros: number | null = null;
+    for (const row of rows) {
+      if (row.usage !== null) {
+        input += row.usage.prompt;
+        output += row.usage.completion;
+      }
+      if (row.cost_micros !== null) costMicros = (costMicros ?? 0) + row.cost_micros;
+    }
+    const tokens = input + output;
+    const cost = costMicros === null ? "—" : `${traceCostLabel(costMicros)}${unpriced > 0 ? "+" : ""}`;
+    return `${total.toLocaleString()} ${total === 1 ? "call" : "calls"} · ${formatTokens(tokens)} tokens · ${cost}`;
+  }
+
+  function savePrefs(): void {
+    saveTracePrefs($app.projectId, { ...filters, insightsOpen, listWidth });
+  }
+
+  /** Coalesce rapid filter changes into one reload. */
+  function scheduleReload(delay: number): void {
+    if (reloadTimer !== null) clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => {
+      reloadTimer = null;
+      void reload();
+    }, delay);
+  }
+
+  /** Update one filter, persist it, and refetch. */
+  function setFilter(key: "agent" | "model" | "status" | "purpose", value: string): void {
+    filters = { ...filters, [key]: value } as TraceFilters;
+    savePrefs();
+    scheduleReload(0);
+  }
+
+  /** The search box refetches after a quiet spell, not per keystroke. */
+  function setSearch(value: string): void {
+    filters = { ...filters, search: value };
+    savePrefs();
+    scheduleReload(SEARCH_DEBOUNCE_MS);
+  }
+
+  function setTime(value: TraceFilters["time"]): void {
+    filters = { ...filters, time: value, from_ms: filters.from_ms, to_ms: filters.to_ms };
+    savePrefs();
+    scheduleReload(0);
+  }
+
+  function setCustomFrom(value: string): void {
+    filters = { ...filters, from_ms: value === "" ? null : new Date(value).getTime() };
+    savePrefs();
+    scheduleReload(0);
+  }
+
+  function setCustomTo(value: string): void {
+    filters = { ...filters, to_ms: value === "" ? null : new Date(value).getTime() };
+    savePrefs();
+    scheduleReload(0);
+  }
+
+  function setGrouping(value: TraceGrouping): void {
+    filters = { ...filters, grouping: value };
+    savePrefs();
+  }
+
+  function clearChip(key: string): void {
+    const reset: Partial<TraceFilters> = {};
+    if (key === "agent") reset.agent = "all";
+    else if (key === "model") reset.model = "all";
+    else if (key === "status") reset.status = "all";
+    else if (key === "purpose") reset.purpose = "all";
+    else if (key === "time") {
+      reset.time = "session";
+      reset.from_ms = null;
+      reset.to_ms = null;
+    } else if (key === "search") reset.search = "";
+    else if (key === "turn_id") reset.turn_id = null;
+    filters = { ...filters, ...reset };
+    savePrefs();
+    scheduleReload(0);
+  }
+
+  function clearFilters(): void {
+    filters = { ...DEFAULT_TRACE_FILTERS, grouping: filters.grouping, selected: null };
+    savePrefs();
+    scheduleReload(0);
+  }  /** Remember rows for the Agent/Model option lists; options never shrink mid-session. */
+  function rememberRows(pageRows: TraceRow[]): void {
+    if (pageRows.length === 0) return;
+    const seen = new Set(observed.map(traceKey));
+    const additions = pageRows.filter((row) => !seen.has(traceKey(row)));
+    if (additions.length === 0) return;
+    observed = [...observed, ...additions];
+  }
+
+  /** One page of the filtered log, replacing whatever was loaded. */
+  async function reload(): Promise<void> {
+    if (transport === null) return;
+    const token = ++reloadToken;
+    loadingList = true;
+    try {
+      const page = await transport.list(
+        traceListQuery(filters, { sessionStartMs: SESSION_START_MS, nowMs: Date.now(), limit: TRACE_PAGE_SIZE }),
+      );
+      if (token !== reloadToken) return;
+      listError = "";
+      rows = page.rows;
+      total = page.total;
+      unpriced = page.unpriced;
+      hasMore = page.has_more;
+      nextCursor = page.next_cursor;
+      capped = page.capped;
+      newCount = 0;
+      nowMs = Date.now();
+      loadedOnce = true;
+      rememberRows(page.rows);
+      restoreSelection();
+    } catch (failure) {
+      if (token !== reloadToken) return;
+      listError = errorMessage(failure);
+    } finally {
+      if (token === reloadToken) loadingList = false;
+    }
+  }
+
+  /** Re-open the persisted selection once the first page has arrived. */
+  function restoreSelection(): void {
+    if (selectedKey !== null || filters.selected === null) return;
+    selectedKey = filters.selected;
+    void loadDetail(selectedKey);
+  }
+
+  /** Merge one polled page: new calls prepend while following, in-flight rows update in place. */
+  function mergePolledPage(page: TraceListPage): void {
+    nowMs = Date.now();
+    total = page.total;
+    unpriced = page.unpriced;
+    capped = page.capped || capped;
+    hasMore = page.has_more || hasMore;
+    rememberRows(page.rows);
+    const known = new Set(rows.map(traceKey));
+    const fresh: TraceRow[] = [];
+    const updated = new Map<string, TraceRow>();
+    for (const row of page.rows) {
+      const key = traceKey(row);
+      if (known.has(key)) updated.set(key, row);
+      else fresh.push(row);
+    }
+    if (updated.size === 0 && fresh.length === 0) return;
+    let next = rows.map((row) => updated.get(traceKey(row)) ?? row);
+    if (follow) next = [...fresh, ...next];
+    else newCount += fresh.length;
+    rows = next;
+  }
+
+  /**
+   * The poll: one fresh first page every 1.5s while the route is visible.
+   * A failed poll keeps the last good data and stays quiet — the retry
+   * banner is for explicit loads.
+   */
+  async function poll(): Promise<void> {
+    if (transport === null || loadingList || loadingMore) return;
+    if (document.visibilityState === "hidden") return;
+    // The token drops a poll that raced a filter change mid-flight: its
+    // rows would answer the old filters.
+    const token = reloadToken;
+    try {
+      const page = await transport.list(
+        traceListQuery(filters, { sessionStartMs: SESSION_START_MS, nowMs: Date.now(), limit: TRACE_PAGE_SIZE }),
+      );
+      if (token !== reloadToken) return;
+      mergePolledPage(page);
+    } catch {
+      // The next tick tries again.
+    }
+  }
+
+  /** Append the next page when the user asks for older calls. */
+  async function loadMore(): Promise<void> {
+    if (transport === null || nextCursor === null) return;
+    loadingMore = true;
+    try {
+      const page = await transport.list(
+        traceListQuery(filters, {
+          sessionStartMs: SESSION_START_MS,
+          nowMs: Date.now(),
+          cursor: nextCursor,
+          limit: TRACE_PAGE_SIZE,
+        }),
+      );
+      rememberRows(page.rows);
+      const known = new Set(rows.map(traceKey));
+      rows = [...rows, ...page.rows.filter((row) => !known.has(traceKey(row)))];
+      hasMore = page.has_more;
+      nextCursor = page.next_cursor;
+      total = page.total;
+      unpriced = page.unpriced;
+      capped = page.capped || capped;
+      nowMs = Date.now();
+    } catch (failure) {
+      listError = errorMessage(failure);
+    } finally {
+      loadingMore = false;
+    }
+  }
+
+  /** Open one call's detail by its durable key. `keep` leaves the current
+   *  detail on screen while a refresh is in flight, so live polls never
+   *  flash the pane empty. */
+  async function loadDetail(key: string, keep = false): Promise<void> {
+    if (transport === null) return;
+    const split = key.lastIndexOf(":");
+    const runId = key.slice(0, split);
+    const id = Number(key.slice(split + 1));
+    const token = ++detailToken;
+    detailLoading = true;
+    detailError = "";
+    if (!keep) {
+      detail = null;
+      previousDetail = null;
+      previousRow = null;
+      previousPending = false;
+    }
+    try {
+      const loaded = await transport.detail(runId, id);
+      if (token !== detailToken) return;
+      if (loaded === null) {
+        detailError = "The full record for this call is no longer available in the live log.";
+      } else {
+        detail = loaded;
+        void loadPrevious();
+      }
+    } catch (failure) {
+      if (token !== detailToken) return;
+      detailError = errorMessage(failure);
+    } finally {
+      if (token === detailToken) detailLoading = false;
+    }
+  }
+
+  /** Fetch the previous comparable call for the Context tab's prefix comparison. */
+  async function loadPrevious(): Promise<void> {
+    if (transport === null || selectedRow === null) return;
+    const previous = previousComparableRow(rows, selectedRow);
+    if (previous === null) return;
+    // The comparable call is terminal in practice; skip refetching a body
+    // the live poll has not changed under the same key.
+    if (previousDetail !== null && previousRow !== null && previousRow.run_id === previous.run_id && previousRow.version === previous.version && previousDetail.version === previous.version) {
+      return;
+    }
+    previousRow = previous;
+    previousPending = true;
+    try {
+      previousDetail = await transport.detail(previous.run_id, previous.id);
+    } catch {
+      previousDetail = null;
+    } finally {
+      previousPending = false;
+    }
+  }
+
+  /** The in-flight detail poll: 1s, and only when the row says it changed. */
+  async function pollDetail(): Promise<void> {
+    if (transport === null || selectedRow === null || detail === null) return;
+    if (document.visibilityState === "hidden") return;
+    if (selectedRow.is_complete || detailLoading) return;
+    if (selectedRow.version === detail.version) return;
+    if (selectedKey === null) return;
+    await loadDetail(selectedKey, true);
+  }
+
+  function selectRow(row: TraceRow): void {
+    const key = traceKey(row);
+    selectedKey = key;
+    // Following only while the selection stays at the head of the list.
+    follow = rows.length > 0 && traceKey(rows[0]) === key;
+    filters = { ...filters, selected: key };
+    savePrefs();
+    void loadDetail(key);
+  }
+
+  function closeDetail(): void {
+    selectedKey = null;
+    detail = null;
+    detailError = "";
+    filters = { ...filters, selected: null };
+    savePrefs();
+  }
+
+  function toggleFollow(on: boolean): void {
+    follow = on;
+    if (on) {
+      newCount = 0;
+      void reload();
+    }
+  }
+
+  function revealNewCalls(): void {
+    toggleFollow(true);
+  }
+
+  function toggleInsights(): void {
+    insightsOpen = !insightsOpen;
+    savePrefs();
+  }
+
+  /** What the Insights charts cover: the active agent and time filter. */
+  const insightsScopeLabel = $derived.by(() => {
+    const parts: string[] = [];
+    if (filters.agent !== "all") {
+      const known = agentOptions.find((option) => option.value === filters.agent)?.label ?? filters.agent;
+      parts.push(known.toLowerCase());
+    }
+    const timeLabel = TRACE_TIME_OPTIONS.find((option) => option.value === filters.time)?.label ?? "custom range";
+    parts.push(timeLabel.toLowerCase());
+    return parts.join(" · ");
+  });
+
+  /** Turn a cost-chart bucket into the page's time filter (half-open range). */
+  function applyBucket(fromMs: number, toMs: number): void {
+    filters = { ...filters, time: "custom", from_ms: fromMs, to_ms: toMs };
+    savePrefs();
+    scheduleReload(0);
+  }
+
+  // The list's drag divider: pointer drag, arrow keys, saved width.
+  function onDividerPointerDown(event: PointerEvent) {
+    dragging = true;
+    const target = event.currentTarget as HTMLElement | null;
+    target?.setPointerCapture(event.pointerId);
+  }
+
+  function onDividerPointerMove(event: PointerEvent) {
+    if (!dragging || columns === undefined) return;
+    const rect = columns.getBoundingClientRect();
+    const width = Math.round(event.clientX - rect.left);
+    listWidth = Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, width));
+  }
+
+  function onDividerPointerUp(event: PointerEvent) {
+    if (!dragging) return;
+    dragging = false;
+    const target = event.currentTarget as HTMLElement | null;
+    target?.releasePointerCapture(event.pointerId);
+    savePrefs();
+  }
+
+  function onDividerKeydown(event: KeyboardEvent) {
+    const step = event.shiftKey ? 60 : 20;
+    if (event.key === "ArrowLeft") {
+      listWidth = Math.max(LIST_WIDTH_MIN, listWidth - step);
+    } else if (event.key === "ArrowRight") {
+      listWidth = Math.min(LIST_WIDTH_MAX, listWidth + step);
+    } else return;
+    event.preventDefault();
+    savePrefs();
+  }
+
+  function toLocalInput(ms: number | null): string {
+    if (ms === null) return "";
+    const at = new Date(ms);
+    const local = new Date(at.getTime() - at.getTimezoneOffset() * 60_000);
+    return local.toISOString().slice(0, 16);
+  }
+
+  onMount(() => {
+    if (transport === null) return;
+    const prefs = loadTracePrefs($app.projectId);
+    if (prefs !== null) {
+      const restored: TraceFilters = { ...DEFAULT_TRACE_FILTERS, ...prefs };
+      filters = restored;
+      insightsOpen = prefs.insightsOpen ?? false;
+      if (typeof prefs.listWidth === "number") {
+        listWidth = Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, prefs.listWidth));
+      }
+    }
+    // An entry hand-over wins over the saved filters when one is waiting.
+    const entry = traceEntryFilters($app.traceEntry);
+    if (entry !== null) {
+      filters = { ...filters, ...entry, selected: null };
+      actions.clearTraceEntry();
+    }
+    // Options come from an unfiltered probe so the menus hold every actor.
+    void transport
+      .list({ limit: TRACE_PAGE_SIZE })
+      .then((page) => rememberRows(page.rows))
+      .catch(() => undefined);
+    void reload();
+    const pollTimer = setInterval(() => void poll(), POLL_MS);
+    const detailTimer = setInterval(() => void pollDetail(), DETAIL_POLL_MS);
+    const media = window.matchMedia("(max-width: 900px)");
+    narrow = media.matches;
+    const onMedia = () => (narrow = media.matches);
+    media.addEventListener("change", onMedia);
+    return () => {
+      clearInterval(pollTimer);
+      clearInterval(detailTimer);
+      media.removeEventListener("change", onMedia);
+      if (reloadTimer !== null) clearTimeout(reloadTimer);
+    };
+  });
+
+  // Entry points can hand the route filters while it is already open.
+  $effect(() => {
+    const entry = $app.traceEntry;
+    if (entry === null) return;
+    actions.clearTraceEntry();
+    const patch = traceEntryFilters(entry);
+    if (patch === null) return;
+    filters = { ...filters, ...patch, selected: null };
+    selectedKey = null;
+    detail = null;
+    savePrefs();
+    void reload();
+  });
+</script><section class="trace-view" aria-label="Trace">
+  <header class="trace-head">
+    <div>
+      <h1>Trace</h1>
+      <p class="head-line">Every model call in this project — the lead's and every worker's.</p>
+    </div>
+  </header>
+
+  {#if transport === null}
+    <div class="placeholder">
+      <h2>Model-call tracing runs in the desktop app</h2>
+      <p>Open this project in Mnemo2 to see every model call with its context, reasoning and cost.</p>
+    </div>
+  {:else}
+    <div class="trace-toolbar">
+      <label class="filter">
+        Agent
+        <select value={filters.agent} onchange={(event) => setFilter("agent", event.currentTarget.value)}>
+          {#each agentOptions as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
+        </select>
+      </label>
+      <label class="filter">
+        Model
+        <select value={filters.model} onchange={(event) => setFilter("model", event.currentTarget.value)}>
+          {#each modelOptions as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
+        </select>
+      </label>
+      <label class="filter">
+        Status
+        <select value={filters.status} onchange={(event) => setFilter("status", event.currentTarget.value)}>
+          {#each statusOptions as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
+        </select>
+      </label>
+      <label class="filter">
+        Time
+        <select value={filters.time} onchange={(event) => setTime(event.currentTarget.value as TraceFilters["time"])}>
+          {#each TRACE_TIME_OPTIONS as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
+        </select>
+      </label>
+      {#if filters.time === "custom"}
+        <label class="filter date">From <input type="datetime-local" value={toLocalInput(filters.from_ms)} onchange={(event) => setCustomFrom(event.currentTarget.value)} /></label>
+        <label class="filter date">To <input type="datetime-local" value={toLocalInput(filters.to_ms)} onchange={(event) => setCustomTo(event.currentTarget.value)} /></label>
+      {/if}
+      <label class="filter">
+        Purpose
+        <select value={filters.purpose} onchange={(event) => setFilter("purpose", event.currentTarget.value)}>
+          <option value="all">All purposes</option>
+          {#each TRACE_PURPOSE_OPTIONS as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
+        </select>
+      </label>
+      <div class="search-box">
+        <Search size={13} aria-hidden="true" />
+        <input
+          type="search"
+          placeholder="Search calls…"
+          aria-label="Search calls"
+          value={filters.search}
+          oninput={(event) => setSearch(event.currentTarget.value)}
+        />
+        <select
+          aria-label="Search scope"
+          value={filters.scope}
+          onchange={(event) => {
+            filters = { ...filters, scope: event.currentTarget.value as TraceSearchScope };
+            savePrefs();
+            if (filters.search.trim() !== "") scheduleReload(0);
+          }}
+        >
+          {#each scopeOptions as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
+        </select>
+      </div>
+      <label class="filter">
+        Group
+        <select value={filters.grouping} onchange={(event) => setGrouping(event.currentTarget.value as TraceGrouping)}>
+          {#each groupingOptions as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
+        </select>
+      </label>
+      <label class="follow-toggle">
+        <input type="checkbox" checked={follow} onchange={(event) => toggleFollow(event.currentTarget.checked)} />
+        Follow new calls
+      </label>
+    </div>
+
+    {#snippet listColumn()}
+      <div class="list-column">
+        {#if chips.length > 0}
+          <div class="chip-row">
+            {#each chips as chip (chip.key)}
+              <span class="chip">
+                {chip.label}
+                <button type="button" class="chip-x" aria-label={`Remove filter ${chip.label}`} onclick={() => clearChip(chip.key)}>
+                  <X size={11} aria-hidden="true" />
+                </button>
+              </span>
+            {/each}
+            <button type="button" class="chip-clear" onclick={clearFilters}>Clear filters</button>
+          </div>
+        {/if}
+
+        <p class="summary" title={unpriced > 0 ? `${unpriced} matching call${unpriced === 1 ? "" : "s"} have no configured price` : undefined}>
+          {summary}
+        </p>
+        {#if capped}
+          <p class="capped-note">Showing first 1,000 matches; narrow the time range.</p>
+        {/if}
+
+        {#if listError !== "" && rows.length === 0}
+          <div class="state-card" role="alert">
+            <p>Could not read the model calls: {listError}</p>
+            <button type="button" class="state-button" onclick={() => void reload()}>Try again</button>
+          </div>
+        {:else if loadingList && rows.length === 0}
+          <p class="loading-note">Loading model calls…</p>
+        {:else if rows.length === 0 && listError === "" && loadedOnce}
+          {#if chips.length > 0}
+            <div class="state-card">
+              <p>No calls match these filters.</p>
+            </div>
+          {:else}
+            <div class="state-card">
+              <p>Model calls will appear here when the lead or a worker runs.</p>
+              <button type="button" class="state-button" onclick={actions.openLead}>Open Lead</button>
+            </div>
+          {/if}
+        {:else}
+          {#if listError !== ""}
+            <div class="state-card soft" role="alert">
+              <p>The last refresh failed: {listError}</p>
+              <button type="button" class="state-button" onclick={() => void reload()}>Try again</button>
+            </div>
+          {/if}
+          <TraceList
+            {groups}
+            selected={selectedKey}
+            {newCount}
+            {hasMore}
+            {loadingMore}
+            {nowMs}
+            onselect={selectRow}
+            onloadmore={() => void loadMore()}
+            onfollow={revealNewCalls}
+          />
+        {/if}
+      </div>
+    {/snippet}
+
+    {#snippet detailColumn()}
+      <div class="detail-column">
+        {#if selectedKey === null}
+          <div class="placeholder soft">
+            <p>Select a call to read its full context, reasoning and cost.</p>
+          </div>
+        {:else if detail === null && detailError === ""}
+          <div class="placeholder soft">
+            <p>{detailLoading ? "Opening the call…" : "Loading…"}</p>
+          </div>
+        {:else if detail === null}
+          <div class="state-card" role="alert">
+            <p>{detailError}</p>
+            <button type="button" class="state-button" onclick={() => selectedKey !== null && void loadDetail(selectedKey, true)}>Try again</button>
+          </div>
+        {:else}
+          <TraceDetailPane
+            row={selectedRow ?? detail}
+            {detail}
+            previous={previousDetail}
+            previousRow={previousRow}
+            {previousPending}
+            {nowMs}
+            onclose={closeDetail}
+          />
+        {/if}
+      </div>
+    {/snippet}
+
+    {#if narrow}
+      {#if selectedKey !== null && detail !== null}
+        {@render detailColumn()}
+      {:else}
+        {@render listColumn()}
+      {/if}
+    {:else}
+      <div class="trace-columns" bind:this={columns} style:grid-template-columns="{listWidth}px 7px minmax(0, 1fr)">
+        {@render listColumn()}
+        <button
+          type="button"
+          class="divider"
+          aria-label="Resize the call list (drag or arrow keys)"
+          title="Drag or use arrow keys to resize the call list"
+          onpointerdown={onDividerPointerDown}
+          onpointermove={onDividerPointerMove}
+          onpointerup={onDividerPointerUp}
+          onpointercancel={onDividerPointerUp}
+          onkeydown={onDividerKeydown}
+        ></button>
+        {@render detailColumn()}
+      </div>
+    {/if}
+
+    <section class="insights">
+      <button type="button" class="insights-toggle" aria-expanded={insightsOpen} onclick={toggleInsights}>
+        {insightsOpen ? "Hide charts" : "Insights"}
+      </button>
+      {#if insightsOpen}
+        <div class="insights-body">
+          <TraceCharts rows={rows} scopeLabel={insightsScopeLabel} onbucket={applyBucket} />
+        </div>
+      {/if}
+    </section>
+  {/if}
+</section><style>
+  .trace-view { display: flex; min-height: 0; flex: 1; flex-direction: column; }
+  .trace-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; padding: 22px 26px 10px; }
+  .trace-head h1 { margin: 0; color: var(--ink); font-size: var(--text-page); font-weight: 700; }
+  .head-line { margin: 3px 0 0; color: var(--muted); font-size: var(--text-body); }
+  .placeholder { display: grid; place-content: center; gap: 6px; margin: 60px auto; max-width: 420px; padding: 22px 26px; border: 1px dashed var(--line-strong); border-radius: 14px; background: var(--surface-soft); text-align: center; }
+  .placeholder h2 { margin: 0; color: var(--ink); font-size: var(--text-title); font-weight: 650; }
+  .placeholder p, .placeholder.soft p { margin: 0; color: var(--muted); font-size: var(--text-body); line-height: 1.5; }
+  .placeholder.soft { margin: auto; }
+  .trace-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 4px 26px 12px; }
+  .filter { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--text-meta); font-weight: 600; }
+  .filter select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: var(--text-meta); cursor: pointer; }
+  .filter select:hover { border-color: var(--line-strong); }
+  .filter select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .filter input[type="datetime-local"] { padding: 4px 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: var(--text-meta); }
+  .search-box { display: inline-flex; align-items: center; gap: 6px; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); }
+  .search-box:focus-within { border-color: var(--accent); }
+  .search-box input { min-width: 160px; padding: 5px 0; border: 0; background: transparent; color: var(--ink); font-size: var(--text-meta); outline: none; }
+  .search-box select { padding: 5px 6px 5px 0; border: 0; background: transparent; color: var(--muted); font-size: var(--text-meta); cursor: pointer; }
+  .follow-toggle { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--muted); font-size: var(--text-meta); font-weight: 600; cursor: pointer; }
+  .follow-toggle input { accent-color: var(--accent-strong); }
+  .trace-columns { display: grid; min-height: 0; flex: 1; align-items: stretch; }
+  .divider { display: block; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; background: transparent; cursor: col-resize; touch-action: none; }
+  .divider::after { display: block; margin: 0 3px; height: 100%; border-left: 1px solid transparent; content: ""; }
+  .divider:hover::after, .divider:focus-visible::after { border-left-color: var(--accent); }
+  .divider:focus { outline: none; }
+  .divider:focus-visible { outline: none; }
+  .list-column { display: flex; min-width: 0; overflow: auto; flex-direction: column; padding: 0 0 14px; }
+  .detail-column { display: flex; min-width: 0; overflow: hidden; flex-direction: column; }
+  .chip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 12px 0; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 4px 3px 9px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink-soft); font-size: var(--text-meta); }
+  .chip-x { display: inline-flex; padding: 2px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); cursor: pointer; }
+  .chip-x:hover { color: var(--danger); background: var(--surface-soft); }
+  .chip-clear { padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: var(--text-meta); font-weight: 600; }
+  .chip-clear:hover { text-decoration: underline; }
+  .summary { margin: 10px 12px 4px; color: var(--muted); font-family: var(--font-mono); font-size: var(--text-meta); font-variant-numeric: tabular-nums; }
+  .capped-note { margin: 0 12px 4px; color: var(--warning); font-size: var(--text-meta); }
+  .loading-note { margin: 16px 12px; color: var(--muted); font-size: var(--text-body); }
+  .state-card { display: grid; gap: 8px; margin: 14px 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
+  .state-card.soft { border-style: dashed; }
+  .state-card p { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.5; }
+  .state-button { justify-self: start; padding: 6px 12px; border: 1px solid var(--accent); border-radius: 8px; background: var(--surface); color: var(--accent-strong); cursor: pointer; font-size: var(--text-meta); font-weight: 650; }
+  .state-button:hover { border-color: var(--accent-strong); }
+  .insights { padding: 12px 26px 20px; }
+  .insights-toggle { padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-meta); font-weight: 650; }
+  .insights-toggle:hover { border-color: var(--accent); color: var(--accent-strong); }
+  .insights-body { margin-top: 10px; }
+</style>

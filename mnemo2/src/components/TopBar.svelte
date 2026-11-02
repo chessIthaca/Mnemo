@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Brain, ChartColumn, ChevronDown, ListChecks, MessageSquare, Network, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
+  import { Activity, Brain, ChartColumn, ChevronDown, ListChecks, MessageSquare, Network, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
   import { actions, app, currentProject, needsYouCount } from "../lib/store";
   import { formatTokenCount, formatUsageCost, usageIsPartial, usageTotalTokens } from "../lib/usage";
   import AvatarStack from "./AvatarStack.svelte";
@@ -42,6 +42,7 @@
       {#if $needsYouCount > 0}<span class="nav-badge">{$needsYouCount}</span>{/if}
     </button>
     <button class:active={$app.route === "cost"} aria-pressed={$app.route === "cost"} onclick={actions.openCost}><ChartColumn size={14} /> Cost</button>
+    <button class:active={$app.route === "trace"} aria-pressed={$app.route === "trace"} onclick={() => actions.openTrace()}><Activity size={14} /> Trace</button>
     <button class:active={$app.route === "graph"} aria-pressed={$app.route === "graph"} onclick={actions.openGraph}><Network size={14} /> Graph</button>
     <button class:active={$app.route === "plans"} aria-pressed={$app.route === "plans"} onclick={actions.openPlans}><ListChecks size={14} /> Plans</button>
     <button class:active={$app.route === "memory"} aria-pressed={$app.route === "memory"} onclick={actions.openMemory}><Brain size={14} /> Memory</button>

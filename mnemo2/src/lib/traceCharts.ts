@@ -14,12 +14,76 @@
 
 import { dayLabel, formatEstimate, shortModelLabel } from "./cost";
 import { traceClock, traceStatus } from "./trace";
-import type { TraceAttribution, TraceGuardCut, TraceRow, TraceStatus, TraceUsage } from "./trace";
+import type { TraceGuardCut, TraceStatus, TraceUsage } from "./trace";
 
-// Row contract — the frozen `TraceRow`/`TraceAttribution` wire types now live in
-// `./trace` (the step C mirror); they are re-exported for this module's callers.
+// ---------------------------------------------------------------------------
+// Row contract — mirrors the frozen `TraceRow` wire type (step B/C owner)
+// ---------------------------------------------------------------------------
 
-export type { TraceAttribution, TraceRow };
+/**
+ * Who made a call. Mirrors the kernel's `TraceAttribution`.
+ *
+ * `actor_kind` and `purpose` are widened to `string` on purpose: the contract's
+ * literals are `lead | worker | subagent | system` and `turn | compaction |
+ * memory_consolidation | routing | other`, but a new kernel value must render
+ * as an unknown actor rather than break the charts.
+ */
+export interface TraceAttribution {
+  actor_kind: string;
+  agent_id: string;
+  session_id: string;
+  agent_name: string;
+  worker_id?: string | null;
+  plan_id?: string | null;
+  plan_step?: number | null;
+  turn_id?: string | null;
+  purpose: string;
+}
+
+/**
+ * One trace row as the charts consume it: `LlmRequestSummary` plus the
+ * Mnemo2-only pricing/attribution fields.
+ *
+ * The attribution and pricing fields are optional so this module also compiles
+ * against the pre-step-B row shape (and preview fixtures); a row without them
+ * reads as Unattributed/Unpriced, never as the lead or as free.
+ */
+export interface TraceRow {
+  id: number;
+  /** The capture run this row belongs to (part of the stable row key). */
+  run_id?: string;
+  /** Unix epoch milliseconds at capture time. */
+  ts_ms: number;
+  model: string;
+  base_url: string;
+  provider: string;
+  http_status: number | null;
+  usage: TraceUsage | null;
+  finish_reason: string | null;
+  /** True once the record is terminal (a finish reason or an error). */
+  is_complete: boolean;
+  /** Mutation counter; a changed value means the record grew. */
+  version: number;
+  ttft_ms: number | null;
+  generation_ms: number | null;
+  reasoning_ms: number | null;
+  connect_ms: number | null;
+  tools_ms: number | null;
+  prep_ms: number | null;
+  compact_ms: number | null;
+  backoff_ms: number | null;
+  stall_ms: number | null;
+  error: string | null;
+  cancelled: boolean;
+  response_truncated: boolean;
+  response_evicted: boolean;
+  guard_cut: TraceGuardCut | null;
+  attribution?: TraceAttribution | null;
+  cost_micros?: number | null;
+  priced?: boolean;
+  retained?: boolean;
+}
+
 /** The stable key of one row: the capture run plus the monotonic id. */
 function rowKey(row: TraceRow): string {
   return `${row.run_id ?? "run"}:${row.id}`;

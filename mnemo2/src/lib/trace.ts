@@ -166,11 +166,26 @@ export interface TraceStatus {
 }
 
 /**
+ * The status fields `traceStatus` reads. Both row shapes carry them as
+ * required: the contract's `TraceRow` and the charts' broader
+ * pre-attribution shape, whose other fields are optional. Typing the
+ * parameter at what the helper actually reads lets the charts module stay
+ * byte-identical across branches.
+ */
+export interface TraceStatusSource {
+  error: string | null;
+  cancelled: boolean;
+  is_complete: boolean;
+  http_status: number | null;
+  finish_reason: string | null;
+}
+
+/**
  * What the row's status says: a refusal keeps its HTTP status, a cancelled
  * turn reads as cancelled, an in-flight one as streaming, and a clean turn
  * shows its finish reason.
  */
-export function traceStatus(row: TraceRow): TraceStatus {
+export function traceStatus(row: TraceStatusSource): TraceStatus {
   if (row.error !== null) {
     return {
       label: row.http_status === null ? "failed" : String(row.http_status),

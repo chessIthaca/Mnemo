@@ -6,7 +6,7 @@ import { fixtureState } from "../test/fixtures";
 import SettingsDialog from "./SettingsDialog.svelte";
 import TopBar from "./TopBar.svelte";
 
-const mocks = vi.hoisted(() => ({ transport: null as unknown, modelTransport: null as unknown }));
+const mocks = vi.hoisted(() => ({ transport: null as unknown, modelTransport: null as unknown, layaTransport: null as unknown }));
 
 vi.mock("../lib/settingsEngine", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/settingsEngine")>();
@@ -16,6 +16,11 @@ vi.mock("../lib/settingsEngine", async (importOriginal) => {
 vi.mock("../lib/modelSettings", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/modelSettings")>();
   return { ...original, createModelSettingsTransport: () => mocks.modelTransport };
+});
+
+vi.mock("../lib/layaSettings", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/layaSettings")>();
+  return { ...original, createLayaTransport: () => mocks.layaTransport };
 });
 
 function endpoint(name: string, overrides: Partial<EndpointDetailDto> = {}): EndpointDetailDto {
@@ -71,6 +76,7 @@ describe("SettingsDialog", () => {
   beforeEach(() => {
     mocks.transport = null;
     mocks.modelTransport = null;
+    mocks.layaTransport = null;
     app.set(fixtureState());
   });
 
@@ -258,5 +264,52 @@ describe("SettingsDialog", () => {
     const levers = await screen.findByRole("region", { name: "Savings levers" });
     expect(within(levers).getByText("Delta reads")).toBeTruthy();
     expect((screen.getByLabelText("Model for row 1") as HTMLInputElement).value).toBe("m1");
+  });
+
+  it("shows the Decisions page beside the others, with status, switches and lanes", async () => {
+    makeTransport();
+    mocks.layaTransport = {
+      status: vi.fn(async () => ({
+        enabled: true,
+        installed: true,
+        status: "ready",
+        flags: {
+          auto_type_memories: true,
+          failure_triage: false,
+          failure_triage_knn: false,
+          auto_finetune: false,
+          steer_tool_choice: false,
+          routing: false,
+          reflex: false,
+        },
+        routing: {
+          cheap: "alpha/m1",
+          capable: "alpha/m2",
+          lane_medium: null,
+          lane_high: null,
+          escalate: null,
+          threshold: 0.8,
+          enforce: false,
+        },
+      })),
+      setup: vi.fn(async () => undefined),
+      disable: vi.fn(async () => undefined),
+      save: vi.fn(async () => undefined),
+      onLayaEvent: vi.fn(async () => () => {}),
+    };
+    await openDialog();
+    await fireEvent.click(screen.getByRole("button", { name: "Decisions" }));
+    const status = await screen.findByRole("region", { name: "Decision models (Laya)" });
+    expect(within(status).getByText("Status: Ready")).toBeTruthy();
+    expect(within(status).getByRole("button", { name: "Disable" })).toBeTruthy();
+    expect((screen.getByLabelText("Cheap lane") as HTMLInputElement).value).toBe("alpha/m1");
+    expect((screen.getByRole("checkbox", { name: /Auto-type memories/ }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("explains decision settings need the desktop app without a Laya transport", async () => {
+    makeTransport();
+    await openDialog();
+    await fireEvent.click(screen.getByRole("button", { name: "Decisions" }));
+    expect(await screen.findByText("Decision settings are available in the desktop app.")).toBeTruthy();
   });
 });

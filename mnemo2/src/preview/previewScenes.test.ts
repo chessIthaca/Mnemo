@@ -62,6 +62,7 @@ describe("preview scenes", () => {
       "worker-thread",
       "lead-chat",
       "settings-models",
+      "settings-laya",
       "lead-idle",
       "delete-sheet",
       "cost",

@@ -13,6 +13,7 @@ import type { BoardPlan } from "../lib/boardState";
 import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
 import type { WorkerDeletionPreview } from "../lib/teamState";
 import { seedPreviewSettings } from "./previewSettings";
+import { seedPreviewLaya } from "./previewLaya";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedCostPreview, type CostInsights } from "../lib/cost";
@@ -654,6 +655,29 @@ export const previewScenes: PreviewScene[] = [
       return () => {
         unmount(dialog);
         restore();
+      };
+    },
+  },
+  {
+    name: "settings-laya",
+    title: "Settings: Decisions",
+    description:
+      "The settings dialog's Decisions page: the Laya status block with Enable/Disable and install progress, the seven opt-in switches, and the routing lanes with the confidence threshold and enforce switch.",
+    // Same mount pattern as settings-models; the rail click opens the
+    // Decisions page directly so the scene shows the page it names.
+    build: missionControl,
+    mount: (target) => {
+      const restoreSettings = seedPreviewSettings();
+      const restoreLaya = seedPreviewLaya();
+      const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {} } });
+      const decisions = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
+        (button) => button.textContent === "Decisions",
+      );
+      decisions?.click();
+      return () => {
+        unmount(dialog);
+        restoreLaya();
+        restoreSettings();
       };
     },
   },

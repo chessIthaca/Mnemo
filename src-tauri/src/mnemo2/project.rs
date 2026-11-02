@@ -74,13 +74,29 @@ impl ProjectRecord {
     }
 }
 
+/// The Workbench tabs a project may persist, in strip order.
+///
+/// The Trace and Git steps append theirs here, next to these, so the stored
+/// tab and the frontend's `WorkbenchTab` union stay one decision.
+pub const WORKBENCH_TABS: [&str; 4] = ["browser", "diff", "plan", "files"];
+
+/// The narrowest workbench width that may be persisted, in CSS pixels.
+const MIN_WORKBENCH_WIDTH: u32 = 320;
+
+/// The widest workbench width that may be persisted, in CSS pixels.
+///
+/// The panel is window-relative (`window - lead`), so a wide display may
+/// legally hold a much wider panel than the old fixed 720 ceiling allowed.
+const MAX_WORKBENCH_WIDTH: u32 = 8_192;
+
 /// Workbench state restored independently for each project.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectPreferences {
     /// Whether the workbench was open.
     pub workbench_open: bool,
-    /// `browser`, `diff`, or `plan`.
+    /// `browser`, `diff`, `plan`, `files`, or a tab a later step adds to
+    /// [`WORKBENCH_TABS`].
     pub workbench_tab: String,
     /// Saved desktop width in CSS pixels.
     pub workbench_width: u32,
@@ -104,11 +120,13 @@ impl Default for ProjectPreferences {
 
 impl ProjectPreferences {
     fn validate(&self) -> Result<(), String> {
-        if !matches!(self.workbench_tab.as_str(), "browser" | "diff" | "plan") {
+        if !WORKBENCH_TABS.contains(&self.workbench_tab.as_str()) {
             return Err("invalid workbench tab in project preferences".to_string());
         }
-        if !(320..=720).contains(&self.workbench_width) {
-            return Err("workbench width must be between 320 and 720 pixels".to_string());
+        if !(MIN_WORKBENCH_WIDTH..=MAX_WORKBENCH_WIDTH).contains(&self.workbench_width) {
+            return Err(format!(
+                "workbench width must be between {MIN_WORKBENCH_WIDTH} and {MAX_WORKBENCH_WIDTH} pixels"
+            ));
         }
         if self.browser_url != "about:blank" {
             let url = tauri::Url::parse(&self.browser_url)
@@ -599,6 +617,51 @@ mod tests {
         let file = config.path().join("file");
         std::fs::write(&file, "not a directory").expect("file");
         assert!(add(Some(config.path().to_path_buf()), &file).is_err());
+    }
+
+    #[test]
+    fn preferences_accept_every_workbench_tab_and_window_relative_widths() {
+        for tab in WORKBENCH_TABS {
+            let preferences = ProjectPreferences {
+                workbench_open: true,
+                workbench_tab: tab.to_string(),
+                workbench_width: 1_024,
+                ..ProjectPreferences::default()
+            };
+            assert!(preferences.validate().is_ok(), "the '{tab}' tab must be accepted");
+        }
+        assert!(
+            WORKBENCH_TABS.contains(&"files"),
+            "the Files tab is part of the persisted set"
+        );
+        let unknown = ProjectPreferences {
+            workbench_tab: "console".to_string(),
+            ..ProjectPreferences::default()
+        };
+        assert!(unknown.validate().is_err(), "an unknown tab is still refused");
+
+        // The panel is window-relative, so widths well past the old 720 ceiling
+        // are legal; only the outer bounds are refused.
+        for width in [MIN_WORKBENCH_WIDTH, 720, 1_024, MAX_WORKBENCH_WIDTH] {
+            let preferences = ProjectPreferences {
+                workbench_width: width,
+                ..ProjectPreferences::default()
+            };
+            assert!(
+                preferences.validate().is_ok(),
+                "a {width}px panel must be accepted"
+            );
+        }
+        for width in [MIN_WORKBENCH_WIDTH - 1, MAX_WORKBENCH_WIDTH + 1] {
+            let preferences = ProjectPreferences {
+                workbench_width: width,
+                ..ProjectPreferences::default()
+            };
+            assert!(
+                preferences.validate().is_err(),
+                "a {width}px panel must be refused"
+            );
+        }
     }
 
     /// Kills and reaps a helper child on drop, so a failing assertion cannot

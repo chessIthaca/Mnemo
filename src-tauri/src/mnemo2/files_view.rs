@@ -140,27 +140,10 @@ fn sort_key(entry: &FileEntry) -> (bool, String) {
     (entry.kind != EntryKind::Dir, entry.name.to_lowercase())
 }
 
-/// Parse `git ls-tree -z` output: `<mode> <type> <sha>\t<name>` records.
-fn parse_ls_tree(raw: &str) -> Vec<(String, EntryKind)> {
-    raw.split('\0')
-        .filter(|record| !record.is_empty())
-        .filter_map(|record| {
-            let (meta, name) = record.split_once('\t')?;
-            let mut fields = meta.split(' ');
-            let _mode = fields.next()?;
-            let kind = match fields.next()? {
-                "tree" => EntryKind::Dir,
-                _ => EntryKind::File,
-            };
-            Some((name.to_string(), kind))
-        })
-        .collect()
-}
-
-/// Parse `git ls-files --others --directory -z` output into immediate children
-/// of `relative`: an entry that still holds a `/` after the listed directory is
-/// a directory, everything else is a file.
-fn parse_untracked(raw: &str, relative: &str) -> Vec<(String, EntryKind)> {
+/// Parse `git ls-files ... -z` output into the immediate children of
+/// `relative`: an entry that still holds a `/` after the listed directory is a
+/// directory, everything else is a file.
+fn parse_ls_files(raw: &str, relative: &str) -> Vec<(String, EntryKind)> {
     let prefix = if relative.is_empty() {
         String::new()
     } else {
@@ -185,53 +168,43 @@ fn parse_untracked(raw: &str, relative: &str) -> Vec<(String, EntryKind)> {
         .collect()
 }
 
-/// Ask Git for one directory's entries: tracked ones from `HEAD`, plus
-/// untracked ones that `.gitignore` does not exclude.
+/// Ask Git for one directory's entries: everything the index knows — tracked
+/// files and staged-but-uncommitted ones alike — plus untracked files that
+/// `.gitignore` does not exclude.
 ///
-/// `None` when the project is not a Git work tree (or `git` is missing), which
-/// sends the caller to a plain disk listing.
+/// Reading the index rather than `HEAD` is what makes a just-added file appear
+/// before it is committed; a staged deletion drops out with it. `None` when the
+/// project is not a Git work tree (or `git` is missing), which sends the caller
+/// to a plain disk listing.
 async fn git_entries(root: &Path, relative: &str) -> Option<BTreeMap<String, EntryKind>> {
-    let untracked_spec = if relative.is_empty() {
+    let spec = if relative.is_empty() {
         ".".to_string()
     } else {
         format!("{relative}/")
     };
-    let untracked = git(
+    let output = git(
         root,
         &[
             "ls-files",
+            "--cached",
             "--others",
             "--exclude-standard",
             "--directory",
             "-z",
             "--",
-            &untracked_spec,
+            &spec,
         ],
     )
     .await
     .ok()?;
-    if !untracked.status.success() {
+    if !output.status.success() {
         return None;
     }
-    let mut entries: BTreeMap<String, EntryKind> = BTreeMap::new();
-    for (name, kind) in parse_untracked(&String::from_utf8_lossy(&untracked.stdout), relative) {
-        entries.insert(name, kind);
-    }
-    let tracked_spec = if relative.is_empty() {
-        "HEAD".to_string()
-    } else {
-        format!("HEAD:{relative}")
-    };
-    if let Ok(tracked) = git(root, &["ls-tree", "-z", &tracked_spec]).await {
-        // An unborn `HEAD` (a project with no commit yet) simply has no
-        // tracked entries; any other failure leaves the untracked ones visible.
-        if tracked.status.success() {
-            for (name, kind) in parse_ls_tree(&String::from_utf8_lossy(&tracked.stdout)) {
-                entries.insert(name, kind);
-            }
-        }
-    }
-    Some(entries)
+    Some(
+        parse_ls_files(&String::from_utf8_lossy(&output.stdout), relative)
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// List a directory from disk when the project is not a Git work tree.
@@ -494,6 +467,35 @@ mod tests {
             let error = resolve(project.path(), refused).expect_err(refused);
             assert!(error.contains("outside the project"), "{refused}: {error}");
         }
+    }
+
+    #[tokio::test]
+    async fn lists_staged_but_uncommitted_files() {
+        let project = project();
+        let root = project.path();
+        write(root, "src/staged.rs", "fn staged() {}\n");
+        write(root, "added/new.txt", "fresh\n");
+        git_in(root, &["add", "src/staged.rs", "added/new.txt"]);
+
+        let nested = list_dir(root, Some("src")).await.expect("src listing");
+        assert!(
+            nested.entries.iter().any(|entry| entry.name == "staged.rs"),
+            "a staged file belongs to the project before it is committed: {:?}",
+            nested.entries
+        );
+
+        let listing = list_dir(root, None).await.expect("root listing");
+        let added = listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == "added")
+            .expect("a staged directory appears");
+        assert_eq!(added.kind, EntryKind::Dir);
+
+        // A staged deletion drops out even though HEAD still holds the file.
+        git_in(root, &["rm", "-q", "README.md"]);
+        let after = list_dir(root, None).await.expect("root listing after removal");
+        assert!(after.entries.iter().all(|entry| entry.name != "README.md"));
     }
 
     #[cfg(unix)]

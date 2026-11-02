@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { app } from "../lib/store";
 import type { Worker } from "../lib/types";
 import { createWorkers, fixtureState } from "../test/fixtures";
+import ActivityStatus from "./ActivityStatus.svelte";
 import WorkerRow from "./WorkerRow.svelte";
 
 const brief = [
@@ -108,5 +109,87 @@ describe("WorkerRow", () => {
     const line = container.querySelector<HTMLElement>(".worker-meta small");
     expect(line?.textContent).toContain("$1.84 · 26m");
     expect(container.querySelector(".worker-live")).toBeNull();
+  });
+
+  it("puts every row's status in one fixed-width column", () => {
+    const { container } = render(WorkerRow, { worker: worker(), onSelect: vi.fn() });
+
+    const meta = container.querySelector<HTMLElement>(".worker-meta");
+    if (!meta) throw new Error("status column missing");
+    const column = getComputedStyle(meta);
+    // A fixed basis: the column neither grows nor shrinks with its text, so the pill and
+    // the line under it start at the same x on every row.
+    expect(column.display).toBe("flex");
+    expect(column.flexDirection).toBe("column");
+    expect(column.alignItems).toBe("flex-start");
+    expect(column.flexGrow).toBe("0");
+    expect(column.flexShrink).toBe("0");
+    expect(column.flexBasis).toBe("152px");
+    expect(column.minWidth).toBe("0px");
+
+    // The pill keeps its natural width; the line under it fills the column and truncates.
+    const pill = meta.querySelector<HTMLElement>(".status-label");
+    if (!pill) throw new Error("status pill missing");
+    expect(getComputedStyle(pill).display).toBe("inline-flex");
+
+    const line = meta.querySelector<HTMLElement>("small");
+    if (!line) throw new Error("cost and elapsed line missing");
+    const lineStyle = getComputedStyle(line);
+    expect(lineStyle.width).toBe("100%");
+    expect(lineStyle.minWidth).toBe("0px");
+    expect(lineStyle.overflow).toBe("hidden");
+    expect(lineStyle.textOverflow).toBe("ellipsis");
+    expect(lineStyle.whiteSpace).toBe("nowrap");
+  });
+
+  it("truncates a long live label in the column and never the timer", () => {
+    const running = {
+      ...worker(),
+      status: "working",
+      createdAtMs: Date.now() - 18 * 60_000,
+      activity: {
+        phase: "tool",
+        toolName: "shell",
+        turnStartedAtMs: Date.now() - 72_000,
+        phaseSinceMs: Date.now() - 5_000,
+      },
+    } as Worker;
+    const { container } = render(WorkerRow, { worker: running, onSelect: vi.fn() });
+
+    const live = container.querySelector<HTMLElement>(".worker-live .thinking-status");
+    if (!live) throw new Error("live status row missing");
+    // The row opts the shared status row into truncation; the lead chat and thread do not.
+    expect(live.classList.contains("truncate")).toBe(true);
+    expect(getComputedStyle(live).minWidth).toBe("0px");
+
+    const label = live.querySelector<HTMLElement>(".thinking-label");
+    if (!label) throw new Error("live label missing");
+    const labelStyle = getComputedStyle(label);
+    expect(labelStyle.minWidth).toBe("0px");
+    expect(labelStyle.overflow).toBe("hidden");
+    expect(labelStyle.textOverflow).toBe("ellipsis");
+    expect(labelStyle.whiteSpace).toBe("nowrap");
+
+    // The timer is the part that must stay whole: `flex: none` keeps it from shrinking.
+    const timer = live.querySelector<HTMLElement>(".elapsed-time");
+    if (!timer) throw new Error("live timer missing");
+    expect(getComputedStyle(timer).flexShrink).toBe("0");
+    expect(getComputedStyle(timer).whiteSpace).toBe("nowrap");
+  });
+
+  it("leaves the shared status row untruncated where it is not a fixed column", () => {
+    const { container } = render(ActivityStatus, {
+      label: "Thinking…",
+      startedAtMs: Date.now() - 5_000,
+    });
+
+    const status = container.querySelector<HTMLElement>(".thinking-status");
+    if (!status) throw new Error("shared status row missing");
+    // Opt-in only: without the row's `truncate` the label keeps its natural width.
+    expect(status.classList.contains("truncate")).toBe(false);
+    const label = status.querySelector<HTMLElement>(".thinking-label");
+    if (!label) throw new Error("shared status label missing");
+    expect(getComputedStyle(label).textOverflow).not.toBe("ellipsis");
+    expect(getComputedStyle(label).minWidth).not.toBe("0px");
   });
 });

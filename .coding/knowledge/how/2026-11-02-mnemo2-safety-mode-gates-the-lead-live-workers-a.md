@@ -1,0 +1,6 @@
++++
+title = "Mnemo2 safety mode gates the lead live; workers always run OverridePermissions"
+created = "2026-11-02"
++++
+
+Mnemo2's `[general] safety` approval mode gates only the LEAD's engine. A settings save applies live without restart: the live `Arc<RwLock<SafetyMode>>` is seeded from config (src/host/brain.rs:916), shared with every loop the agent factory builds (src/agent/factory.rs:1182/1190), and dispatch reads it per tool call (src/agent/dispatch.rs:556); `Setup::patch_settings` writes the new value into that handle (src/headless/setup.rs:569-573), and `settings_setup` attaches the setup to the open lead's engine (src-tauri/src/mnemo2/ipc.rs:1136-1139). The `ApproveEachAction` payload passed at Mnemo2 engine start (src-tauri/src/mnemo2/runtime.rs:933-935) is only the declared initial mode — dispatch keeps reading the live handle (src/agent/policy.rs:77-82). WORKER sessions are different: they are spawned with `PermissionPolicy::OverridePermissions` (src-tauri/src/mnemo2/team.rs:2750), which skips the approval branch entirely — no ApprovalRequest is ever emitted for a worker; each would-be-gated call emits ApprovalBypassed and runs (src/agent/policy.rs:70-76, src/agent/dispatch.rs:589-612), and the project's safety rules are not consulted there either. The Settings Safety page states this explicitly rather than implying a worker gate.

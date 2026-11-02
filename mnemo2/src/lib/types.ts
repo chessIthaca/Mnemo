@@ -5,7 +5,7 @@ import type { WorkerDeletionPreview } from "./teamState";
 
 export type Route = "start" | "lead" | "team" | "cost" | "graph" | "plans";
 
-export type WorkbenchTab = "browser" | "diff" | "plan";
+export type WorkbenchTab = "browser" | "diff" | "plan" | "files";
 export type TeamFilter = "all" | "needs" | "active" | "done";
 
 export type WorkerStatus =

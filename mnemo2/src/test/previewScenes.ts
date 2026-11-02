@@ -14,6 +14,7 @@ import { seedBoardPreview } from "../lib/boardEngine";
 import type { BoardPlan } from "../lib/boardState";
 import { app } from "../lib/store";
 import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
+import { seedFilesPreview, type FileEntry } from "../lib/files";
 import type { WorkerDeletionPreview } from "../lib/teamState";
 import { seedPreviewSettings } from "./previewSettings";
 import { seedPreviewLaya } from "./previewLaya";
@@ -778,6 +779,106 @@ function plansTab(): AppState {
   return { ...baseState(), board: PREVIEW_PLANS, route: "plans" };
 }
 
+/** The tree the Files tab preview opens on, keyed by the listed directory. */
+const PREVIEW_FILES: Record<string, FileEntry[]> = {
+  "": [
+    { path: ".coding", name: ".coding", kind: "dir" },
+    { path: "mnemo2", name: "mnemo2", kind: "dir" },
+    { path: "src-tauri", name: "src-tauri", kind: "dir" },
+    { path: "src", name: "src", kind: "dir" },
+    { path: "agent.md", name: "agent.md", kind: "file" },
+    { path: "Cargo.toml", name: "Cargo.toml", kind: "file" },
+    { path: "README.md", name: "README.md", kind: "file" },
+  ],
+  "src-tauri": [
+    { path: "src-tauri/src", name: "src", kind: "dir" },
+    { path: "src-tauri/Cargo.toml", name: "Cargo.toml", kind: "file" },
+    { path: "src-tauri/tauri.conf.json", name: "tauri.conf.json", kind: "file" },
+  ],
+  "src-tauri/src": [
+    { path: "src-tauri/src/mnemo2", name: "mnemo2", kind: "dir" },
+  ],
+  "src-tauri/src/mnemo2": [
+    { path: "src-tauri/src/mnemo2/files_view.rs", name: "files_view.rs", kind: "file" },
+    { path: "src-tauri/src/mnemo2/mod.rs", name: "mod.rs", kind: "file" },
+  ],
+  mnemo2: [
+    { path: "mnemo2/src", name: "src", kind: "dir" },
+    { path: "mnemo2/package.json", name: "package.json", kind: "file" },
+  ],
+  "mnemo2/src": [
+    { path: "mnemo2/src/components", name: "components", kind: "dir" },
+    { path: "mnemo2/src/lib", name: "lib", kind: "dir" },
+    { path: "mnemo2/src/App.svelte", name: "App.svelte", kind: "file" },
+  ],
+  "mnemo2/src/lib": [{ path: "mnemo2/src/lib/files.ts", name: "files.ts", kind: "file" }],
+};
+
+/** The file the preview's viewer shows: a slice of the module it documents. */
+const PREVIEW_FILE_TEXT = [
+  "//! The Files tab: a lazy, Git-aware project tree and a read-only viewer.",
+  "",
+  "/// Resolve a project-relative path to an absolute one inside the project.",
+  "fn resolve(root: &Path, relative: &str) -> Result<PathBuf, String> {",
+  "    for component in Path::new(relative).components() {",
+  "        match component {",
+  "            Component::Normal(_) | Component::CurDir => {}",
+  "            Component::ParentDir => {",
+  "                return Err(format!(\"'{relative}' is outside the project\"));",
+  "            }",
+  "            Component::RootDir | Component::Prefix(_) => {",
+  "                return Err(\"only project-relative paths are allowed\".to_string());",
+  "            }",
+  "        }",
+  "    }",
+  "    let root = dunce::canonicalize(root)?;",
+  "    let canonical = dunce::canonicalize(root.join(relative))?;",
+  "    if !canonical.starts_with(&root) {",
+  "        return Err(format!(\"'{relative}' is outside the project\"));",
+  "    }",
+  "    Ok(canonical)",
+  "}",
+].join("\n");
+
+/** A short TypeScript sample, so the preview's viewer also shows a second grammar. */
+const PREVIEW_TS_TEXT = [
+  "/** The tree asks the backend for one directory per expand. */",
+  "export function visibleRows(",
+  "  listings: Record<string, FileEntry[]>,",
+  "  expanded: Record<string, boolean>,",
+  "): TreeRow[] {",
+  "  const rows: TreeRow[] = [];",
+  "  walk(\"\", 0, rows, listings, expanded);",
+  "  return rows;",
+  "}",
+].join("\n");
+
+/** The Files tab: the project tree, and one file opened read-only beside it. */
+function filesTab(): AppState {
+  seedFilesPreview({
+    list: async (path) => {
+      const entries = PREVIEW_FILES[path];
+      if (entries === undefined) throw new Error(`no preview listing for '${path}'`);
+      return { path, entries, truncated: false };
+    },
+    read: async (path) => {
+      const text = path.endsWith(".rs")
+        ? PREVIEW_FILE_TEXT
+        : path.endsWith(".ts")
+          ? PREVIEW_TS_TEXT
+          : "";
+      return text
+        ? { path, text, bytes: text.length, truncated: false, binary: false }
+        : { path, text: "", bytes: 0, truncated: false, binary: true };
+    },
+    find: async (query) =>
+      Object.values(PREVIEW_FILES)
+        .flat()
+        .filter((entry) => entry.path.toLowerCase().includes(query.toLowerCase())),
+  });
+  return { ...baseState(), workbenchOpen: true, workbenchTab: "files", workbenchWidth: 460 };
+}
+
 /** Every scene the preview page renders, in index order. */
 export const previewScenes: PreviewScene[] = [
   {
@@ -797,6 +898,12 @@ export const previewScenes: PreviewScene[] = [
     title: "Worker thread",
     description: "The same thread beside the lead chat, for a worker that stopped to ask.",
     build: workerThread,
+  },
+  {
+    name: "files",
+    title: "Files",
+    description: "The Files tab: the project tree, a path filter, and one file read-only with syntax highlighting.",
+    build: filesTab,
   },
   {
     name: "lead-chat",

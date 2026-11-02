@@ -50,6 +50,10 @@ pub mod graph;
 /// The native child-WebView2 Browser pane and its non-Windows fallback.
 pub mod browser;
 
+/// The Files tab: a lazy, Git-aware project tree and a read-only viewer,
+/// confined to the project root.
+pub mod files_view;
+
 /// The per-instance run file the `mnemo2-mcp` helper finds a live Mnemo2 by.
 pub mod run_file;
 
@@ -476,6 +480,9 @@ pub fn run() {
             ipc::workbench_screenshot,
             ipc::workbench_preferences,
             ipc::workbench_preferences_set,
+            files_view::files_list,
+            files_view::files_read,
+            files_view::files_find,
             browser::browser_supported,
             browser::browser_snapshot,
             browser::browser_ensure,

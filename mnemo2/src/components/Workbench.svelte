@@ -1,16 +1,18 @@
 <script lang="ts">
-  import { ArrowLeft, FileDiff, Globe, ListTree, X } from "@lucide/svelte";
+  import { ArrowLeft, FileDiff, FolderTree, Globe, ListTree, X } from "@lucide/svelte";
   import { onMount, type Component } from "svelte";
   import { actions, app } from "../lib/store";
   import type { WorkbenchTab } from "../lib/types";
   import BrowserTab from "./BrowserTab.svelte";
   import DiffTab from "./DiffTab.svelte";
+  import FilesTab from "./FilesTab.svelte";
   import PlanTab from "./PlanTab.svelte";
 
   const tabs: { id: WorkbenchTab; label: string; icon: Component }[] = [
     { id: "browser", label: "Browser", icon: Globe },
     { id: "diff", label: "Diff", icon: FileDiff },
     { id: "plan", label: "Plan", icon: ListTree },
+    { id: "files", label: "Files", icon: FolderTree },
   ];
 
   let resizing = $state(false);
@@ -77,6 +79,8 @@
       <BrowserTab obscured={resizing} />
     {:else if $app.workbenchTab === "diff"}
       <DiffTab />
+    {:else if $app.workbenchTab === "files"}
+      <FilesTab />
     {:else}
       <PlanTab scope="open" />
     {/if}

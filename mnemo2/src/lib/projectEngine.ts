@@ -17,7 +17,7 @@ export interface ProjectRecord {
 
 export interface ProjectPreferences {
   workbench_open: boolean;
-  workbench_tab: "browser" | "diff" | "plan";
+  workbench_tab: "browser" | "diff" | "plan" | "files";
   workbench_width: number;
   browser_url: string;
   diff_worker_id: string | null;

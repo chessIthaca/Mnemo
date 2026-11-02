@@ -1,6 +1,7 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { seedFilesPreview } from "../lib/files";
 import { actions, app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import Workbench from "./Workbench.svelte";
@@ -126,8 +127,32 @@ describe("Workbench", () => {
       if (original) Object.defineProperty(window, "innerWidth", original);
     }
   });
+
+  it("appends the Files tab to the strip and opens the project tree", async () => {
+    seedFilesPreview({
+      list: async (path: string) => ({
+        path,
+        entries: path === "" ? [{ path: "src", name: "src", kind: "dir" as const }] : [],
+        truncated: false,
+      }),
+      read: async (path: string) => ({ path, text: "", bytes: 0, truncated: false, binary: false }),
+      find: async () => [],
+    });
+    actions.openWorkbench("files");
+    render(Workbench);
+
+    const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
+    const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
+    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files"]);
+    expect(within(strip).getByRole("button", { name: "Files" }).getAttribute("aria-pressed")).toBe("true");
+
+    // The body switch renders the tree, which lists only the project root.
+    expect(await screen.findByRole("button", { name: "src" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Files" })).toBeTruthy();
+  });
 });
 
 afterEach(() => {
+  seedFilesPreview(null);
   vi.unstubAllGlobals();
 });

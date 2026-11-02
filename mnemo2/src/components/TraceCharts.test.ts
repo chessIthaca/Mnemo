@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { describe, expect, it, vi } from "vitest";
 import TraceCharts from "./TraceCharts.svelte";
-import type { TraceAttribution, TraceRow } from "../lib/traceCharts";
+import type { TraceAttribution, TraceRow } from "../lib/trace";
 
 const MINUTE = 60_000;
 /** 2026-11-02T14:00:00Z — a whole minute, hour, and UTC day. */

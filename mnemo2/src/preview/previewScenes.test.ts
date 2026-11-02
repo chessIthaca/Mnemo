@@ -73,7 +73,6 @@ describe("preview scenes", () => {
       "mission-control",
       "graph",
       "files",
-      "trace",
       "git",
       "worker-thread",
       "lead-chat",
@@ -91,6 +90,10 @@ describe("preview scenes", () => {
       "cost",
       "plans",
       "memory",
+      "trace",
+      "trace-empty",
+      "trace-tab",
+      "trace-tab-empty",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
     expect(previewScene("")?.name).toBe(defaultPreviewScene);

@@ -4,7 +4,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import TraceView from "./TraceView.svelte";
 import { app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
-import type { TraceAttribution, TraceDetail, TraceListPage, TraceListQuery, TracePageTransport, TraceRow } from "../lib/trace";
+import type {
+  TraceAttribution,
+  TraceDetail,
+  TraceExportRequest,
+  TraceListPage,
+  TraceListQuery,
+  TracePageTransport,
+  TraceRow,
+} from "../lib/trace";
 
 const mocks = vi.hoisted(() => ({
   transport: null as TracePageTransport | null,
@@ -13,6 +21,16 @@ const mocks = vi.hoisted(() => ({
   details: new Map<string, TraceDetail>(),
   failList: 0,
   queries: [] as TraceListQuery[],
+  /** Every export request the page sent, in order. */
+  exports: [] as TraceExportRequest[],
+  /** Every path the page asked the host to reveal. */
+  revealed: [] as string[],
+  /** Every detail key the page fetched, in order. */
+  detailKeys: [] as string[],
+  /** Body-logging switches the page set. */
+  bodies: [] as boolean[],
+  cleared: 0,
+  deletes: 0,
 }));
 
 // TraceView builds its own transport on mount; the tests plant one instead,
@@ -133,12 +151,34 @@ function installTransport(): void {
         ...mocks.page,
       };
     },
-    detail: async (runId: string, id: number) => mocks.details.get(`${runId}:${id}`) ?? null,
-    settings: async () => ({ log_bodies: false, ring_capacity: 128, journal_bytes: 0, history_bytes: 0 }),
-    setLogBodies: async (on: boolean) => ({ log_bodies: on, ring_capacity: 128, journal_bytes: 0, history_bytes: 0 }),
-    clearLive: async () => {},
-    deleteHistory: async () => ({ deleted_files: 0, bytes: 0 }),
-    exportCalls: async () => ({ path: "", count: 0, includes_bodies: false }),
+    detail: async (runId: string, id: number) => {
+      mocks.detailKeys.push(`${runId}:${id}`);
+      return mocks.details.get(`${runId}:${id}`) ?? null;
+    },
+    settings: async () => ({
+      log_bodies: mocks.bodies.length > 0 ? mocks.bodies[mocks.bodies.length - 1] : false,
+      ring_capacity: 128,
+      journal_bytes: 4096,
+      history_bytes: 51_200,
+    }),
+    setLogBodies: async (on: boolean) => {
+      mocks.bodies.push(on);
+      return { log_bodies: on, ring_capacity: 128, journal_bytes: 4096, history_bytes: 51_200 };
+    },
+    clearLive: async () => {
+      mocks.cleared += 1;
+    },
+    deleteHistory: async () => {
+      mocks.deletes += 1;
+      return { deleted_files: 2, bytes: 51_200 };
+    },
+    exportCalls: async (request: TraceExportRequest) => {
+      mocks.exports.push(request);
+      return { path: "/project/.coding/logs/trace-exports/trace-20261102-140000.jsonl", count: request.keys?.length ?? mocks.rows.length, includes_bodies: false };
+    },
+    revealExport: async (path: string) => {
+      mocks.revealed.push(path);
+    },
   };
 }
 
@@ -157,6 +197,12 @@ describe("TraceView", () => {
     mocks.details = new Map();
     mocks.failList = 0;
     mocks.queries = [];
+    mocks.exports = [];
+    mocks.detailKeys = [];
+    mocks.revealed = [];
+    mocks.bodies = [];
+    mocks.cleared = 0;
+    mocks.deletes = 0;
     app.set({ ...fixtureState(), route: "trace", traceEntry: null });
   });
 
@@ -449,5 +495,134 @@ describe("TraceView", () => {
     expect(screen.getByText(/Charts for 1 filtered call · this session/)).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Hide charts" }));
     await vi.waitFor(() => expect(screen.queryByRole("region", { name: "Insights" })).toBeNull());
+  });
+
+  it("exports the open call, shows the bundle path and reveals it on demand", async () => {
+    installTransport();
+    const row = callRow({ id: 7 });
+    mocks.rows = [row];
+    mocks.details.set(detailKey(row), callDetail(row));
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /kimi-k3.1-pro/ })).toBeTruthy());
+
+    // No call open yet: a single-call export has nothing to write.
+    expect((screen.getByRole("button", { name: "Current call" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await fireEvent.click(screen.getByRole("button", { name: /kimi-k3.1-pro/ }));
+    await vi.waitFor(() => expect(mocks.detailKeys).toContain("run-1:7"));
+
+    await fireEvent.click(screen.getByRole("button", { name: "Current call" }));
+    await vi.waitFor(() => expect(mocks.exports).toEqual([{ scope: "call", keys: ["run-1:7"] }]));
+
+    await vi.waitFor(() => expect(screen.getByText(/Exported 1 call to/)).toBeTruthy());
+    const path = "/project/.coding/logs/trace-exports/trace-20261102-140000.jsonl";
+    expect(screen.getByText(path)).toBeTruthy();
+    // The bundle carries metadata only, and the panel says so.
+    expect(screen.getByText(/metadata only, no prompt or response text/)).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Reveal" }));
+    await vi.waitFor(() => expect(mocks.revealed).toEqual([path]));
+  });
+
+  it("exports the ticked calls by their durable keys", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 11 }), callRow({ id: 12, ts_ms: Date.now() - 1_000 })];
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("checkbox", { name: "Select call 11 for export" })).toBeTruthy());
+
+    expect((screen.getByRole("button", { name: "Selected calls (0)" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await fireEvent.click(screen.getByRole("checkbox", { name: "Select call 11 for export" }));
+    await fireEvent.click(screen.getByRole("checkbox", { name: "Select call 12 for export" }));
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Selected calls (2)" })).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole("button", { name: "Selected calls (2)" }));
+    await vi.waitFor(() => expect(mocks.exports).toHaveLength(1));
+    expect(mocks.exports[0].scope).toBe("selected");
+    expect([...(mocks.exports[0].keys ?? [])].sort()).toEqual(["run-1:11", "run-1:12"]);
+  });
+
+  it("exports every call the current filters match", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 21 }), callRow({ id: 22, ts_ms: Date.now() - 2_000 })];
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /All filtered \(2\)/ })).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole("button", { name: /All filtered \(2\)/ }));
+    await vi.waitFor(() => expect(mocks.exports).toHaveLength(1));
+    expect(mocks.exports[0].scope).toBe("filtered");
+    expect(mocks.exports[0].query?.limit).toBeGreaterThan(0);
+  });
+
+  it("turns on writing full bodies to disk from the sensitive switch", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 31 })];
+    render(TraceView);
+    const name = /Save full prompts and responses to disk/;
+    await vi.waitFor(() => expect(screen.getByRole("checkbox", { name })).toBeTruthy());
+    // The switch stays disabled until the settings arrive; the note proves they did.
+    await vi.waitFor(() => expect(screen.getByText(/128 calls kept in memory/)).toBeTruthy());
+    expect((screen.getByRole("checkbox", { name }) as HTMLInputElement).checked).toBe(false);
+
+    await fireEvent.click(screen.getByRole("checkbox", { name }));
+    await vi.waitFor(() => expect(mocks.bodies).toEqual([true]));
+    await vi.waitFor(() => expect((screen.getByRole("checkbox", { name }) as HTMLInputElement).checked).toBe(true));
+  });
+
+  it("confirms before clearing the live calls and names what is dropped", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 41 })];
+    render(TraceView);
+    // The confirm card quotes the ring size, so wait for the settings first.
+    await vi.waitFor(() => expect(screen.getByText(/128 calls kept in memory/)).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole("button", { name: /Clear live calls/ }));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("alertdialog", { name: "Confirm clearing the live calls" })).toBeTruthy(),
+    );
+    const card = screen.getByRole("alertdialog", { name: "Confirm clearing the live calls" });
+    expect(card.textContent).toContain("drops the 128 calls held in memory");
+    expect(card.textContent).toContain("Retained history is not touched");
+    // Nothing is dropped before the confirmation is accepted.
+    expect(mocks.cleared).toBe(0);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Yes, clear live calls" }));
+    await vi.waitFor(() => expect(mocks.cleared).toBe(1));
+    await vi.waitFor(() =>
+      expect(screen.queryByRole("alertdialog", { name: "Confirm clearing the live calls" })).toBeNull(),
+    );
+  });
+
+  it("confirms the retained-history delete with its size and reports the outcome", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 51, retained: true })];
+    render(TraceView);
+    // The confirm card quotes the retained size, so wait for the settings first.
+    await vi.waitFor(() => expect(screen.getByText(/128 calls kept in memory/)).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole("button", { name: /Delete retained history/ }));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("alertdialog", { name: "Confirm deleting retained history" })).toBeTruthy(),
+    );
+    const card = screen.getByRole("alertdialog", { name: "Confirm deleting retained history" });
+    expect(card.textContent).toContain("50.0 KB");
+    expect(card.textContent).toContain("1 retained call in this view");
+    expect(mocks.deletes).toBe(0);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Yes, delete retained history" }));
+    await vi.waitFor(() => expect(mocks.deletes).toBe(1));
+    await vi.waitFor(() => expect(screen.getByText(/Deleted 2 retained files \(50\.0 KB\)/)).toBeTruthy());
+  });
+
+  it("opens the call an entry point handed over by its durable key", async () => {
+    installTransport();
+    const row = callRow({ id: 61, run_id: "run-9" });
+    mocks.details.set("run-9:61", callDetail(row));
+    app.set({ ...fixtureState(), route: "trace", traceEntry: { agent: "design-trace", selected: "run-9:61" } });
+    render(TraceView);
+
+    await vi.waitFor(() => expect(mocks.detailKeys).toContain("run-9:61"));
+    // The hand-over is one-shot: the route consumes it.
+    expect(get(app).traceEntry).toBeNull();
   });
 });

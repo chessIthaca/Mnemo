@@ -94,6 +94,7 @@ describe("preview scenes", () => {
       "trace-empty",
       "trace-tab",
       "trace-tab-empty",
+      "lead-tool-rows",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
     expect(previewScene("")?.name).toBe(defaultPreviewScene);

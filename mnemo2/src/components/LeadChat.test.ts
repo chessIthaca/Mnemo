@@ -261,8 +261,8 @@ describe("LeadChat", () => {
     expect(shellSummary.textContent).not.toContain("shell");
     expect(shellSummary.textContent).toContain("0:03");
     expect(shellSummary.textContent).not.toContain("now");
-    expect(screen.getByText("Reading a file").closest("summary")?.textContent).toContain("0:04");
-    expect(screen.getByText("Writing files")).toBeTruthy();
+    expect(screen.getByText("Reading README.md").closest("summary")?.textContent).toContain("0:04");
+    expect(screen.getByText("Writing README.md")).toBeTruthy();
     expect(screen.getByText("Running")).toBeTruthy();
     expect(screen.getByText("Completed")).toBeTruthy();
     expect(screen.getByText("Failed")).toBeTruthy();
@@ -274,13 +274,16 @@ describe("LeadChat", () => {
     const shellCard = screen.getByLabelText("Running a command — Running");
     expect(shellCard.querySelector("details")?.open).toBe(true);
     expect(await within(shellCard).findByText("shell")).toBeTruthy();
-    expect(shellCard.textContent).toContain('"command": "cargo test"');
+    // the command block is the body now; the raw JSON call sits behind the toggle
+    expect(shellCard.querySelector(".tool-command")?.textContent).toBe("cargo test");
     expect(within(shellCard).getByText("running tests")).toBeTruthy();
+    await fireEvent.click(within(shellCard).getByText("Show raw call"));
+    expect(await within(shellCard).findByText(/"command": "cargo test"/)).toBeTruthy();
 
-    await fireEvent.click(screen.getByText("Reading a file"));
+    await fireEvent.click(screen.getByText("Reading README.md"));
     expect(await screen.findByText("read_files")).toBeTruthy();
     expect(await screen.findByText("read 42 lines")).toBeTruthy();
-    await fireEvent.click(screen.getByText("Writing files"));
+    await fireEvent.click(screen.getByText("Writing README.md"));
     expect(await screen.findByText("write_file")).toBeTruthy();
   });
 
@@ -332,7 +335,7 @@ describe("LeadChat", () => {
       }),
     ]);
     render(LeadChat);
-    const finished = screen.getByText("Reading a file").closest("summary")!;
+    const finished = screen.getByText("Reading README.md").closest("summary")!;
     expect(finished.textContent).toContain("0:04");
     expect(finished.textContent).not.toContain("0:05");
     const running = screen.getByText("Running a command").closest("summary")!;

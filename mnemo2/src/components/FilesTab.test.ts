@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { get } from "svelte/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   seedFilesPreview,
@@ -6,6 +7,7 @@ import {
   type FileEntry,
   type FilesTransport,
 } from "../lib/files";
+import { app } from "../lib/store";
 import FilesTab from "./FilesTab.svelte";
 
 const entry = (path: string, kind: FileEntry["kind"]): FileEntry => ({
@@ -44,6 +46,7 @@ function seed(tree = TREE) {
 
 afterEach(() => {
   seedFilesPreview(null);
+  app.update((state) => ({ ...state, workbenchFile: null }));
 });
 
 describe("FilesTab", () => {
@@ -128,5 +131,28 @@ describe("FilesTab", () => {
 
     await fireEvent.click(screen.getByRole("button", { name: "Clear the path filter" }));
     expect(await screen.findByRole("button", { name: "agent.md" })).toBeTruthy();
+  });
+
+  it("opens a file the Memory tab handed over, at its line", async () => {
+    const transport = seed();
+    app.update((state) => ({ ...state, workbenchFile: { path: "src/main.rs", line: 12 } }));
+
+    render(FilesTab);
+
+    expect(await screen.findByLabelText("Contents of src/main.rs, line 12")).toBeTruthy();
+    expect(transport.read).toHaveBeenCalledWith("src/main.rs");
+    expect(screen.getByText("line 12")).toBeTruthy();
+    // Consumed once: returning to the tab must not reopen the file.
+    expect(get(app).workbenchFile).toBeNull();
+  });
+
+  it("opens a handed-over file at the top when its reference names no line", async () => {
+    seed();
+    app.update((state) => ({ ...state, workbenchFile: { path: "agent.md", line: null } }));
+
+    render(FilesTab);
+
+    expect(await screen.findByLabelText("Contents of agent.md")).toBeTruthy();
+    expect(screen.queryByText(/^line \d+$/)).toBeNull();
   });
 });

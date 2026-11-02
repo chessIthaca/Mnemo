@@ -1,9 +1,19 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { renderMarkdown } from "../lib/markdown";
+  import { repoPathTarget, splitRepoPaths, type RepoPathRef } from "../lib/repoPaths";
 
-  let { source, onOpenLink }: { source: string; onOpenLink?: (url: string) => void } = $props();
-  let container: HTMLDivElement;
+  let {
+    source,
+    onOpenLink,
+    onOpenPath,
+  }: {
+    source: string;
+    onOpenLink?: (url: string) => void;
+    /** When given, the repository paths the text names become clickable. */
+    onOpenPath?: (ref: RepoPathRef) => void;
+  } = $props();
+  let container = $state<HTMLDivElement | null>(null);
   let cachedSource = "";
   let cachedHtml = "";
   const html = $derived.by(() => {
@@ -14,10 +24,57 @@
     return cachedHtml;
   });
 
-  onMount(() => {
-    container.addEventListener("click", handleClick);
-    return () => container.removeEventListener("click", handleClick);
+  // The rendered HTML is replaced wholesale when the source changes, which
+  // takes the path buttons with it: put them back after every render.
+  $effect(() => {
+    void html;
+    decoratePaths();
   });
+
+  onMount(() => {
+    container?.addEventListener("click", handleClick);
+    return () => container?.removeEventListener("click", handleClick);
+  });
+
+  /** Replace each repository path the text names with a focusable button. */
+  function decoratePaths(): void {
+    const root = container;
+    const open = onOpenPath;
+    if (!root || !open) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentElement;
+        // Code blocks, real links and these buttons stay exactly as rendered.
+        if (!parent || parent.closest("pre, a, button, .md-path")) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const textNodes: Text[] = [];
+    while (walker.nextNode()) textNodes.push(walker.currentNode as Text);
+    for (const node of textNodes) wrapPaths(node, open);
+  }
+
+  /** Splice one text node's paths back in as buttons. */
+  function wrapPaths(node: Text, open: (ref: RepoPathRef) => void): void {
+    const segments = splitRepoPaths(node.data);
+    if (segments.every((segment) => segment.ref === null)) return;
+    const replacement = document.createDocumentFragment();
+    for (const segment of segments) {
+      const ref = segment.ref;
+      if (!ref) {
+        replacement.append(document.createTextNode(segment.text));
+        continue;
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "md-path";
+      button.title = repoPathTarget(ref);
+      button.textContent = segment.text;
+      button.addEventListener("click", () => open(ref));
+      replacement.append(button);
+    }
+    node.replaceWith(replacement);
+  }
 
   function handleClick(event: MouseEvent) {
     const origin = event.target instanceof Element ? event.target : null;
@@ -78,6 +135,9 @@
   .markdown :global(blockquote p:last-child) { margin-bottom: 0; }
   .markdown :global(hr) { margin: 24px 0; border: 0; border-top: 1px solid var(--line-strong); }
   .markdown :global(a) { color: var(--accent-strong); text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
+  .markdown :global(button.md-path) { display: inline; padding: 0; border: 0; background: transparent; color: var(--accent-strong); font: inherit; text-align: left; text-underline-offset: 3px; cursor: pointer; }
+  .markdown :global(button.md-path:hover) { text-decoration: underline; }
+  .markdown :global(button.md-path:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
   .markdown :global(strong) { font-weight: 650; }
   .markdown :global(code) {
     border-radius: 5px;

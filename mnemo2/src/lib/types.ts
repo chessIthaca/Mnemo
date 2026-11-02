@@ -7,6 +7,15 @@ import type { TraceEntry } from "./trace";
 export type Route = "start" | "lead" | "team" | "cost" | "trace" | "graph" | "plans" | "memory";
 
 export type WorkbenchTab = "browser" | "diff" | "plan" | "files" | "trace" | "git";
+
+/** One "open this file" request handed from another view to the Files tab. */
+export interface WorkbenchFileRequest {
+  /** The project-relative path to read. */
+  path: string;
+  /** The 1-based line to reveal, or null to open the file at the top. */
+  line: number | null;
+}
+
 export type TeamFilter = "all" | "needs" | "active" | "done";
 
 export type WorkerStatus =
@@ -684,4 +693,8 @@ export interface AppState {
   boardWidth: number | null;
   /** Filter hand-over planted by openTrace for the Trace route to consume. */
   traceEntry: TraceEntry | null;
+  /** Plan hand-over planted by openPlanDocument for the Plans tab to consume. */
+  planDocumentId: string | null;
+  /** File hand-over planted by openFileInWorkbench for the Files tab. */
+  workbenchFile: WorkbenchFileRequest | null;
 }

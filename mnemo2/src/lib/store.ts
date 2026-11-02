@@ -284,6 +284,10 @@ export function createInitialState(): AppState {
     boardWidth: null,
     /** No Trace-route filter hand-over until an entry point plants one. */
     traceEntry: null,
+    /** No plan hand-over until the Memory tab plants one. */
+    planDocumentId: null,
+    /** No file hand-over until the Memory tab plants one. */
+    workbenchFile: null,
     workerPanelId: null,
     browserUrl: "about:blank",
     browserTitle: "",
@@ -1033,6 +1037,46 @@ function openTrace(filters?: TraceEntry) {
 /** Clear a consumed Trace hand-over so returning to the route starts unfiltered. */
 function clearTraceEntry() {
   app.update((state) => (state.traceEntry === null ? state : { ...state, traceEntry: null }));
+}
+
+/**
+ * Open a plan document: the Memory tab's link to `.coding/plans/<id>.md`. The
+ * Plans route expands the plan, reads its document and scrolls it into view;
+ * an id the board does not hold shows a short not-found note.
+ */
+function openPlanDocument(planId: string) {
+  const id = planId.trim();
+  if (id === "") return;
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "plans" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: false,
+    planDocumentId: id,
+  }));
+}
+
+/** Clear a consumed plan hand-over so returning to the route starts collapsed. */
+function clearPlanDocument() {
+  app.update((state) => (state.planDocumentId === null ? state : { ...state, planDocumentId: null }));
+}
+
+/**
+ * Open a project file in the Workbench: the Memory tab's link to a path a
+ * record names. The Files tab reads it through its own `openPath` and reveals
+ * `line` when the reference carries one.
+ */
+function openFileInWorkbench(path: string, line: number | null = null) {
+  const target = path.trim();
+  if (target === "") return;
+  const at = line !== null && Number.isInteger(line) && line > 0 ? line : null;
+  openWorkbench("files");
+  app.update((state) => ({ ...state, workbenchFile: { path: target, line: at } }));
+}
+
+/** Clear a consumed file hand-over so returning to the tab opens the tree. */
+function clearWorkbenchFile() {
+  app.update((state) => (state.workbenchFile === null ? state : { ...state, workbenchFile: null }));
 }
 
 function toggleTeamPeek() {
@@ -2828,6 +2872,10 @@ export const actions = {
   openMemory,
   openTrace,
   clearTraceEntry,
+  openPlanDocument,
+  clearPlanDocument,
+  openFileInWorkbench,
+  clearWorkbenchFile,
   toggleTeamPeek,
   selectWorker,
   setTeamFilter,

@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import MemoryView from "./MemoryView.svelte";
+import { actions } from "../lib/store";
 import type {
   MemoryDetail,
   MemoryHit,
@@ -259,5 +260,75 @@ describe("MemoryView", () => {
 
     expect(await screen.findByText("The Memory tab is available in the desktop app.")).toBeTruthy();
     expect(screen.queryByRole("complementary", { name: "Records" })).toBeNull();
+  });
+
+  it("opens a plan record's path in the Plans tab", async () => {
+    const transport = plantedTransport();
+    transport.read = async (id) => ({ ...DETAILS[id], path: ".coding/plans/fc536488.md" });
+    mocks.transport = transport;
+    const openPlan = vi.spyOn(actions, "openPlanDocument").mockImplementation(() => {});
+    try {
+      render(MemoryView);
+      await waitFor(() => expect(reader()).toBeTruthy());
+
+      const path = await within(reader()).findByText(".coding/plans/fc536488.md");
+      const button = path.closest("button") as HTMLButtonElement;
+      expect(button.title).toBe("Open plan fc536488 in the Plans tab");
+      await fireEvent.click(button);
+
+      expect(openPlan).toHaveBeenCalledWith("fc536488");
+    } finally {
+      openPlan.mockRestore();
+    }
+  });
+
+  it("opens a record's own path in the Files tab", async () => {
+    const openFile = vi.spyOn(actions, "openFileInWorkbench").mockImplementation(() => {});
+    try {
+      render(MemoryView);
+      await waitFor(() => expect(reader()).toBeTruthy());
+
+      const path = await within(reader()).findByText(SPEC.path as string);
+      const button = path.closest("button") as HTMLButtonElement;
+      expect(button.title).toBe(`Open ${SPEC.path} in the Files tab`);
+      await fireEvent.click(button);
+
+      expect(openFile).toHaveBeenCalledWith(SPEC.path, null);
+    } finally {
+      openFile.mockRestore();
+    }
+  });
+
+  it("opens a path named in the record's text at its line", async () => {
+    const transport = plantedTransport();
+    transport.read = async (id) => ({ ...DETAILS[id], markdown: "It edits `src/agent/turn.rs:4352` first." });
+    mocks.transport = transport;
+    const openFile = vi.spyOn(actions, "openFileInWorkbench").mockImplementation(() => {});
+    try {
+      render(MemoryView);
+      await waitFor(() => expect(within(reader()).getByText(/It edits/)).toBeTruthy());
+
+      const inline = await waitFor(() => {
+        const button = reader().querySelector<HTMLButtonElement>("button.md-path");
+        expect(button).toBeTruthy();
+        return button as HTMLButtonElement;
+      });
+      expect(inline.title).toBe("Open src/agent/turn.rs at line 4352 in the Files tab");
+      await fireEvent.click(inline);
+
+      expect(openFile).toHaveBeenCalledWith("src/agent/turn.rs", 4352);
+    } finally {
+      openFile.mockRestore();
+    }
+  });
+
+  it("leaves a link that is not a path as plain text", async () => {
+    render(MemoryView);
+    await waitFor(() => expect(reader()).toBeTruthy());
+
+    const links = within(reader()).getByRole("region", { name: "Links" });
+    const entry = within(links).getByText("spec/2027-02-09-knowledge-as-files");
+
+    expect(entry.closest("button")).toBeNull();
   });
 });

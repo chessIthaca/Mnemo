@@ -17,6 +17,8 @@
     type MemoryOverview,
     type MemoryRow,
   } from "../lib/memoryView";
+  import { parseRepoPath, repoPathTarget, type RepoPathRef } from "../lib/repoPaths";
+  import { actions } from "../lib/store";
   import Markdown from "./Markdown.svelte";
 
   const transport = createMemoryTransport();
@@ -47,6 +49,12 @@
   let recallQuery = $state("");
   let recallHits = $state<MemoryHit[] | null>(null);
   let recallError = $state("");
+
+  /** Open a path a record names: a plan document, or a file in the workbench. */
+  function openRepoPath(ref: RepoPathRef): void {
+    if (ref.kind === "plan" && ref.planId !== null) actions.openPlanDocument(ref.planId);
+    else actions.openFileInWorkbench(ref.path, ref.line);
+  }
 
   /** Turn a rejected command into one readable line (errors stay inline). */
   function errorMessage(value: unknown): string {
@@ -363,20 +371,34 @@
               </p>
               <h2>{displayTitle(detail.title)}</h2>
               <p class="record-meta">
-                {#if detail.path}<code>{detail.path}</code>{/if}
+                {#if detail.path}
+                  {@const pathRef = parseRepoPath(detail.path)}
+                  {#if pathRef}
+                    <button class="path-link" title={repoPathTarget(pathRef)} onclick={() => openRepoPath(pathRef)}><code>{detail.path}</code></button>
+                  {:else}
+                    <code>{detail.path}</code>
+                  {/if}
+                {/if}
                 <span>{detail.created ?? formatRecordDate(detail.created_at)}</span>
                 <span>{detail.access_count} {detail.access_count === 1 ? "recall" : "recalls"}</span>
               </p>
             </header>
 
-            <Markdown source={detail.markdown} />
+            <Markdown source={detail.markdown} onOpenPath={openRepoPath} />
 
             {#if detail.links.length > 0}
               <section class="record-links" aria-label="Links">
                 <h3>Links</h3>
                 <ul>
                   {#each detail.links as link (link)}
-                    <li><code>{link}</code></li>
+                    {@const linkRef = parseRepoPath(link)}
+                    <li>
+                      {#if linkRef}
+                        <button class="path-link" title={repoPathTarget(linkRef)} onclick={() => openRepoPath(linkRef)}><code>{link}</code></button>
+                      {:else}
+                        <code>{link}</code>
+                      {/if}
+                    </li>
                   {/each}
                 </ul>
               </section>
@@ -479,6 +501,10 @@
   .record-links ul { margin: 0; padding: 0; list-style: none; }
   .record-links li { margin: 3px 0; }
   .record-links code { padding: 1px 5px; border-radius: 4px; background: var(--surface-soft); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .path-link { display: inline-flex; padding: 0; border: 0; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+  .path-link code { color: var(--accent-strong); }
+  .path-link:hover code { text-decoration: underline; }
+  .path-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 5px; }
   .backlink { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-body); text-align: left; cursor: pointer; }
   .backlink:hover { text-decoration: underline; }
 </style>

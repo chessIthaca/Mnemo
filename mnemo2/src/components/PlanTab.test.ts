@@ -283,4 +283,43 @@ describe("PlanTab details", () => {
 
     expect(within(card).getByText("Plan details need the desktop app.")).toBeTruthy();
   });
+
+  it("expands and scrolls to a plan handed over from the Memory tab", async () => {
+    const transport = seedDetails(async () => PLAN_DOCUMENT);
+    const scroll = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scroll,
+    });
+    try {
+      app.update((state) => ({ ...state, planDocumentId: "plan-open-0001" }));
+      render(PlanTab);
+
+      const card = openCard();
+      await waitFor(() => expect(transport.document).toHaveBeenCalledWith("plan-open-0001"));
+      expect(within(card).getByRole("button", { name: "Details" }).getAttribute("aria-expanded")).toBe(
+        "true",
+      );
+      await waitFor(() =>
+        expect(
+          within(card).getByRole("region", { name: "Open plan details" }).textContent,
+        ).toContain("Details is lazy."),
+      );
+      await waitFor(() => expect(scroll).toHaveBeenCalled());
+      // The hand-over is consumed once, so a later visit starts collapsed.
+      expect(get(app).planDocumentId).toBeNull();
+    } finally {
+      delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
+  it("notes a handed-over plan the board does not list", async () => {
+    seedDetails(async () => PLAN_DOCUMENT);
+    app.update((state) => ({ ...state, planDocumentId: "nope-1234" }));
+
+    render(PlanTab);
+
+    expect(await screen.findByText(/is not on this project's board/)).toBeTruthy();
+    expect(get(app).planDocumentId).toBeNull();
+  });
 });

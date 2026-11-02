@@ -157,7 +157,7 @@ Knowledge files live on the lead branch; a merge allows uncommitted changes ther
 - Decisions and history: `memory_search`, which finds the `SPEC:`, `DECISION:`, `BUG:` and `HOW:` records a text search cannot.
 - `Grep` and `Glob` stay for exact text in files you know, and for regexes.
 
-The Mnemo tools are deferred `mcp__plugin_mnemo_mnemo__<name>` tools: load one with `ToolSearch` (`select:mcp__plugin_mnemo_mnemo__search`) before the first call. A PreToolUse hook adds a one-line hint when a Grep or Glob looks like a symbol or a knowledge lookup; it never blocks the call.
+The Mnemo tools are deferred `mcp__plugin_mnemo_mnemo__<name>` tools: load one with `ToolSearch` (`select:mcp__plugin_mnemo_mnemo__search`) before the first call. A PreToolUse hook adds a one-line hint when a Grep or Glob, or a shell `grep`/`rg`/`git grep`/`findstr`/`Select-String` that searches files, looks like a symbol or a knowledge lookup; a shell command that only filters another command's output gets none. It never blocks the call.
 
 ## Failures and course changes
 

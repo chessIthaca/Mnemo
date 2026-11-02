@@ -51,7 +51,7 @@
         ]
       },
       {
-        "matcher": "Grep|Glob",
+        "matcher": "Grep|Glob|Bash|PowerShell",
         "hooks": [
           {
             "type": "command",

@@ -80,6 +80,7 @@ describe("preview scenes", () => {
       "settings-safety",
       "settings-mcp",
       "settings-appearance",
+      "settings-project",
       "mission-control-dark",
       "lead-chat-dark",
       "graph-dark",

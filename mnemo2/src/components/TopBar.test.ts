@@ -180,22 +180,22 @@ describe("TopBar workspace tabs", () => {
     expect(get(app).route).toBe("lead");
   });
 
-  it("opens the Cost tab from the cost chip instead of the settings sheet", async () => {
+  it("opens the Cost tab from the cost chip instead of the settings dialog", async () => {
     render(TopBar);
 
     await fireEvent.click(costButton());
 
     expect(get(app).route).toBe("cost");
-    expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
   });
 
-  it("keeps project settings on the Settings gear and install settings one step away", async () => {
+  it("opens the settings dialog from the gear, with no per-project sheet left", async () => {
     render(TopBar);
 
-    await fireEvent.click(screen.getByRole("button", { name: "Project settings" }));
-    expect(await screen.findByRole("dialog", { name: "Project settings" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open" }));
     expect(await screen.findByRole("dialog", { name: "Settings" })).toBeTruthy();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
   });
 });

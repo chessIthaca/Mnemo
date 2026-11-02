@@ -5,7 +5,6 @@
   import AvatarStack from "./AvatarStack.svelte";
   import ContextRing from "./ContextRing.svelte";
   import ExternalLeadBadge from "./ExternalLeadBadge.svelte";
-  import LeadModelPicker from "./LeadModelPicker.svelte";
   import Sheet from "./Sheet.svelte";
   import SettingsDialog from "./SettingsDialog.svelte";
 
@@ -18,24 +17,12 @@
   const usageLabel = $derived(
     `Project cost ${costLabel}${usagePartial ? ", partial estimate: some usage has no price" : ""}. Open the Cost tab.`,
   );
-  let settingsOpen = $state(false);
   let usageTipOpen = $state(false);
   let appSettingsOpen = $state(false);
 
   function handleTeam() {
     // Team always opens Mission Control directly — never the right-side peek.
     actions.openTeam();
-  }
-
-  /** Leave the project sheet for the install-wide endpoints and tiers dialog. */
-  function openAppSettings() {
-    settingsOpen = false;
-    appSettingsOpen = true;
-  }
-
-  function setSlots(event: Event) {
-    const slots = (event.currentTarget as HTMLInputElement).valueAsNumber;
-    if (Number.isFinite(slots)) actions.setWorkerSlots(slots);
   }
 </script>
 
@@ -73,7 +60,7 @@
         onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench("browser"))}
       ><PanelsTopLeft size={15} /></button>
     {/if}
-    <button class="icon-button" aria-label="Project settings" onclick={() => (settingsOpen = true)}><Settings size={15} /></button>
+    <button class="icon-button" aria-label="Settings" title="Project and install settings" onclick={() => (appSettingsOpen = true)}><Settings size={15} /></button>
     <ExternalLeadBadge />
     <ContextRing />
     <div class="usage-chip">
@@ -108,21 +95,7 @@
   </div>
 </header>
 
-<Sheet open={settingsOpen} title="Project settings" eyebrow="PER-PROJECT" onclose={() => (settingsOpen = false)}>
-  <p class="settings-copy">Worker slots persist per project. Usage is telemetry, not a spending limit.</p>
-  <div class="settings-row">
-    <div><strong>Worker slots</strong><small>Maximum concurrent workers for this project.</small></div>
-    <input aria-label="Project worker slots" type="number" min="1" max="32" step="1" value={$currentProject?.workerSlots ?? 1} onchange={setSlots} />
-  </div>
-  <div class="settings-row"><div><strong>Lead model</strong><small>Planning and review</small></div><LeadModelPicker compact /></div>
-  <div class="settings-row"><div><strong>Merge policy</strong><small>Checks and review must close on the merge-time tip; merges are serialized into this project’s working branch.</small></div><span class="settings-value settings-ok">Guarded</span></div>
-  <div class="settings-row"><div><strong>Endpoints &amp; pricing</strong><small>Configure model endpoints, prices and tier routing for this install.</small></div><button class="button button-quiet" onclick={openAppSettings}>Open</button></div>
-  <div class="settings-actions">
-    <button class="button button-primary" onclick={() => (settingsOpen = false)}>Done</button>
-  </div>
-</Sheet>
-
-<SettingsDialog open={appSettingsOpen} onclose={() => (appSettingsOpen = false)} />
+<SettingsDialog open={appSettingsOpen} initialPage="project" onclose={() => (appSettingsOpen = false)} />
 
 <Sheet open={$app.closeProjectPending} title="Close project and stop the team?" eyebrow="ACTIVE SESSIONS" onclose={actions.cancelCloseProject}>
   <p class="settings-copy">The lead and any live workers will stop. Branches, worktrees, and transcripts remain available for review.</p>
@@ -160,13 +133,6 @@
   .usage-tip dd { margin: 0; color: var(--ink); font-family: var(--font-mono); font-size: var(--text-meta); font-variant-numeric: tabular-nums; }
   .usage-note { margin: 8px 0 0; color: var(--warning); font-size: var(--text-meta); line-height: 1.45; }
   .settings-copy { margin: 0 0 16px; color: var(--muted); font-size: var(--text-body); line-height: 1.55; }
-  .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 0; border-top: 1px solid var(--line); }
-  .settings-row strong, .settings-row small { display: block; }
-  .settings-row strong { font-size: var(--text-body); font-weight: 650; }
-  .settings-row small { max-width: 300px; margin-top: 3px; color: var(--muted); font-size: var(--text-meta); line-height: 1.45; }
-  .settings-row input { width: 54px; padding: 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font-size: var(--text-body); text-align: center; }
-  .settings-value { flex: 0 0 auto; padding: 4px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); }
-  .settings-ok { color: var(--accent-strong); }
   .settings-actions { display: flex; justify-content: space-between; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
   @media (max-width: 760px) { .topbar { grid-template-columns: 1fr auto; padding: 0 14px; } .primary-nav { position: fixed; right: 14px; bottom: 14px; left: 14px; z-index: 40; justify-content: center; box-shadow: var(--shadow); } .primary-nav button { flex: 1; justify-content: center; } .team-stack { display: none; } }
 </style>

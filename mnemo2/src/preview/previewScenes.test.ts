@@ -70,6 +70,7 @@ describe("preview scenes", () => {
       "mission-control",
       "graph",
       "files",
+      "trace",
       "worker-thread",
       "lead-chat",
       "settings-models",

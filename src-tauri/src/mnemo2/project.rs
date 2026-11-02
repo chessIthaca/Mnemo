@@ -78,7 +78,7 @@ impl ProjectRecord {
 ///
 /// The Trace and Git steps append theirs here, next to these, so the stored
 /// tab and the frontend's `WorkbenchTab` union stay one decision.
-pub const WORKBENCH_TABS: [&str; 4] = ["browser", "diff", "plan", "files"];
+pub const WORKBENCH_TABS: [&str; 5] = ["browser", "diff", "plan", "files", "trace"];
 
 /// The narrowest workbench width that may be persisted, in CSS pixels.
 const MIN_WORKBENCH_WIDTH: u32 = 320;
@@ -633,6 +633,10 @@ mod tests {
         assert!(
             WORKBENCH_TABS.contains(&"files"),
             "the Files tab is part of the persisted set"
+        );
+        assert!(
+            WORKBENCH_TABS.contains(&"trace"),
+            "the Trace tab is part of the persisted set"
         );
         let unknown = ProjectPreferences {
             workbench_tab: "console".to_string(),

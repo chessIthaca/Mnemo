@@ -26,6 +26,7 @@ import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } f
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedFilesPreview, type FileEntry } from "../lib/files";
+import { seedTracePreview, type TraceDetail, type TraceRow } from "../lib/trace";
 import { seedCostPreview, type CostInsights } from "../lib/cost";
 import {
   LIST_PAGE_SIZE,
@@ -741,6 +742,217 @@ function filesTab(): AppState {
         .filter((entry) => entry.path.toLowerCase().includes(query.toLowerCase())),
   });
   return { ...baseState(), workbenchOpen: true, workbenchTab: "files", workbenchWidth: 460 };
+}
+
+/** A request row as the trace log's list returns it, with the fields the tab reads. */
+function previewTraceRow(
+  fields: Partial<TraceRow> & { id: number; ts_ms: number; model: string },
+): TraceRow {
+  return {
+    base_url: "https://api.example.invalid/v1",
+    provider: "example",
+    http_status: null,
+    usage: null,
+    finish_reason: null,
+    is_complete: true,
+    version: 2,
+    ttft_ms: null,
+    generation_ms: null,
+    reasoning_ms: null,
+    connect_ms: null,
+    tools_ms: null,
+    prep_ms: null,
+    compact_ms: null,
+    backoff_ms: null,
+    stall_ms: null,
+    error: null,
+    cancelled: false,
+    response_truncated: false,
+    response_evicted: false,
+    guard_cut: null,
+    ...fields,
+  };
+}
+
+/** The tool declarations every preview request carries. */
+const PREVIEW_TRACE_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read a file inside the worktree.",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "apply_patch",
+      description: "Apply a unified diff inside the worktree.",
+      parameters: {
+        type: "object",
+        properties: { patch: { type: "string" } },
+        required: ["patch"],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+/** The refusal the trace exists to explain: a strict schema the endpoint rejected. */
+const PREVIEW_TRACE_STRICT_REQUEST = {
+  model: "worker-model",
+  stream: true,
+  temperature: 0,
+  messages: [
+    {
+      role: "system",
+      content:
+        "You are Mnemo2's implementation worker. Work only inside your worktree, run the checks the lead names, and commit on your branch.",
+    },
+    {
+      role: "user",
+      content:
+        "The worker-thread component test still fails on the tool rows. Fix it, run the checks and commit.",
+    },
+  ],
+  tools: PREVIEW_TRACE_TOOLS,
+  response_format: {
+    type: "json_schema",
+    json_schema: {
+      name: "turn",
+      strict: true,
+      schema: {
+        type: "object",
+        properties: { summary: { type: "string" } },
+        required: ["summary"],
+      },
+    },
+  },
+};
+
+const PREVIEW_TRACE_STRICT_RESPONSE = JSON.stringify(
+  {
+    error: {
+      message:
+        "Invalid schema for response_format 'turn': In context=(), 'additionalProperties' is required to be supplied and to be false.",
+      type: "invalid_request_error",
+      param: "response_format",
+      code: null,
+    },
+  },
+  null,
+  2,
+);
+
+/** The rows, oldest first, exactly as the log's ring returns them. */
+const PREVIEW_TRACE_ROWS: TraceRow[] = [
+  previewTraceRow({
+    id: 101,
+    ts_ms: NOW_MS - 5 * 60_000,
+    model: "lead-model",
+    provider: "primary",
+    base_url: "https://api.example.invalid/v1",
+    http_status: 200,
+    usage: { prompt: 18_420, completion: 640, reasoning: 0, cached: 12_288 },
+    finish_reason: "tool_calls",
+    ttft_ms: 640,
+    generation_ms: 3_400,
+  }),
+  previewTraceRow({
+    id: 102,
+    ts_ms: NOW_MS - 3 * 60_000,
+    model: "worker-model",
+    provider: "primary",
+    base_url: "https://api.example.invalid/v1",
+    http_status: 200,
+    usage: { prompt: 9_120, completion: 220, reasoning: 0, cached: 8_192 },
+    finish_reason: "stop",
+    ttft_ms: 410,
+    generation_ms: 1_800,
+  }),
+  previewTraceRow({
+    id: 103,
+    ts_ms: NOW_MS - 90_000,
+    model: "worker-model",
+    provider: "primary",
+    base_url: "https://api.example.invalid/v1",
+    http_status: 400,
+    usage: null,
+    finish_reason: null,
+    ttft_ms: 120,
+    generation_ms: 120,
+    error:
+      "Invalid schema for response_format 'turn': In context=(), 'additionalProperties' is required to be supplied and to be false.",
+  }),
+  previewTraceRow({
+    id: 104,
+    ts_ms: NOW_MS - 8_000,
+    model: "lead-model",
+    provider: "primary",
+    base_url: "https://api.example.invalid/v1",
+    usage: { prompt: 12_040, completion: 120, reasoning: 0, cached: 8_192 },
+    is_complete: false,
+    version: 3,
+    ttft_ms: 520,
+    generation_ms: 1_200,
+  }),
+];
+
+/** One row in full: the exact body POSTed and the raw response. */
+const PREVIEW_TRACE_DETAILS: Record<number, TraceDetail> = Object.fromEntries(
+  PREVIEW_TRACE_ROWS.map((row) => {
+    const refused = row.id === 103;
+    const streaming = row.id === 104;
+    const request = refused
+      ? PREVIEW_TRACE_STRICT_REQUEST
+      : {
+          model: row.model,
+          stream: true,
+          temperature: 0,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are Mnemo2's lead. Dispatch workers, review their branches, and keep the plan's steps honest.",
+            },
+            {
+              role: "user",
+              content: "Two workers are running. Keep the trace clean and report the strict-mode refusal.",
+            },
+          ],
+          tools: PREVIEW_TRACE_TOOLS,
+        };
+    return [
+      row.id,
+      {
+        ...row,
+        request_json: request,
+        response_raw: refused
+          ? PREVIEW_TRACE_STRICT_RESPONSE
+          : streaming
+            ? 'data: {"choices":[{"delta":{"content":"The refusal is in the row"}}]}\n\ndata: {"choices":[{"delta":{"content":" above."}}]}\n'
+            : 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n',
+        request_truncated: false,
+        raw_tool_calls: null,
+      } satisfies TraceDetail,
+    ];
+  }),
+);
+
+/** The Trace tab: the shared request log, with the strict-mode refusal in it. */
+function traceTab(): AppState {
+  seedTracePreview({
+    list: async () => ({ requests: PREVIEW_TRACE_ROWS, capacity: 32 }),
+    detail: async (id) => PREVIEW_TRACE_DETAILS[id] ?? null,
+    clear: async () => undefined,
+  });
+  return { ...baseState(), workbenchOpen: true, workbenchTab: "trace", workbenchWidth: 460 };
 }
 
 /** The same thread, on a worker that stopped to ask: the needs-you banner shows. */
@@ -1617,6 +1829,13 @@ export const previewScenes: PreviewScene[] = [
     title: "Files",
     description: "The Files tab: the project tree, a path filter, and one file read-only with syntax highlighting.",
     build: filesTab,
+  },
+  {
+    name: "trace",
+    title: "Trace",
+    description:
+      "The Trace tab: the shared request log — lead and worker rows, tokens and durations, and one refused strict-mode request.",
+    build: traceTab,
   },
   {
     name: "worker-thread",

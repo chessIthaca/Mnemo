@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { seedFilesPreview } from "../lib/files";
+import { seedTracePreview, type TraceRow } from "../lib/trace";
 import { actions, app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import Workbench from "./Workbench.svelte";
@@ -143,16 +144,65 @@ describe("Workbench", () => {
 
     const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
     const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
-    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files"]);
+    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Trace"]);
     expect(within(strip).getByRole("button", { name: "Files" }).getAttribute("aria-pressed")).toBe("true");
 
     // The body switch renders the tree, which lists only the project root.
     expect(await screen.findByRole("button", { name: "src" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Files" })).toBeTruthy();
   });
+
+  it("appends the Trace tab to the strip and lists the shared request log", async () => {
+    const row: TraceRow = {
+      id: 7,
+      ts_ms: 0,
+      model: "worker-model",
+      base_url: "https://api.example.invalid/v1",
+      provider: "primary",
+      http_status: 400,
+      usage: null,
+      finish_reason: null,
+      is_complete: true,
+      version: 2,
+      ttft_ms: 120,
+      generation_ms: 120,
+      reasoning_ms: null,
+      connect_ms: null,
+      tools_ms: null,
+      prep_ms: null,
+      compact_ms: null,
+      backoff_ms: null,
+      stall_ms: null,
+      error: "unexpected keyword 'strict' in tool schema",
+      cancelled: false,
+      response_truncated: false,
+      response_evicted: false,
+      guard_cut: null,
+    };
+    seedTracePreview({
+      list: async () => ({ requests: [row], capacity: 32 }),
+      detail: async () => null,
+      clear: async () => undefined,
+    });
+    actions.openWorkbench("trace");
+    render(Workbench);
+
+    const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
+    const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
+    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Trace"]);
+    expect(within(strip).getByRole("button", { name: "Trace" }).getAttribute("aria-pressed")).toBe("true");
+
+    // The body switch renders the log: one row for the refused worker request.
+    // Workers share the lead's engine, so the tab says whose requests these are.
+    expect(screen.getByRole("heading", { name: "Trace" })).toBeTruthy();
+    expect(screen.getByText(/the lead's turns and every worker's/)).toBeTruthy();
+    const request = await screen.findByRole("button", { name: "Request 7: worker-model" });
+    expect(request.textContent).toContain("400");
+  });
 });
 
 afterEach(() => {
   seedFilesPreview(null);
+  seedTracePreview(null);
   vi.unstubAllGlobals();
 });

@@ -62,6 +62,11 @@ pub mod browser;
 /// confined to the project root.
 pub mod files_view;
 
+/// The Trace tab: the engine's shared LLM request log (list, one detail,
+/// clear). One log per engine, so the lead's and every worker's requests
+/// are in it together.
+pub mod trace_view;
+
 /// The per-instance run file the `mnemo2-mcp` helper finds a live Mnemo2 by.
 pub mod run_file;
 
@@ -527,6 +532,9 @@ pub fn run() {
             files_view::files_list,
             files_view::files_read,
             files_view::files_find,
+            trace_view::trace_list,
+            trace_view::trace_detail,
+            trace_view::trace_clear,
             browser::browser_supported,
             browser::browser_snapshot,
             browser::browser_ensure,

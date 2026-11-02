@@ -30,9 +30,6 @@
   --danger: #a24f47;
   --shadow-soft: 0 12px 34px rgb(37 40 32 / 5%);
   --shadow: 0 22px 60px rgb(37 40 32 / 12%);
-  /* Error surfaces: the red tint behind a failed read (see .files-error). */
-  --danger-soft: #fbf0ee;
-  --danger-line: #e3c7c0;
 }
 
 * { box-sizing: border-box; }

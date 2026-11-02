@@ -59,8 +59,8 @@ describe("preview scenes", () => {
     expect(scenes.map((scene) => scene.name)).toEqual([
       "mission-control",
       "graph",
-      "worker-thread",
       "files",
+      "worker-thread",
       "lead-chat",
       "settings-models",
       "settings-laya",

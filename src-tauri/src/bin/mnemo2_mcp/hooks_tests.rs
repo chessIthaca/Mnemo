@@ -531,6 +531,66 @@ fn the_hint_stays_silent_outside_a_registered_project_without_touching_the_netwo
     assert!(server.requests().is_empty());
 }
 
+#[test]
+fn shell_grep_for_an_identifier_gets_the_code_hint() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    // A shell search that reads files earns the same hint a Grep call does, and
+    // says that the command it rides on still runs.
+    for (tool, command, query) in [
+        (
+            "Bash",
+            "grep -rn settle_held_manager_core src-tauri/src",
+            "settle_held_manager_core",
+        ),
+        ("Bash", "cd src && rg -n LayaManager", "LayaManager"),
+        ("Bash", "git grep -n TeamManager -- src", "TeamManager"),
+        (
+            "PowerShell",
+            "Select-String -Pattern LayaManager -Path src\\*.rs",
+            "LayaManager",
+        ),
+    ] {
+        let context = hint_context(&sandbox, tool, json!({ "command": command }))
+            .unwrap_or_else(|| panic!("no hint for {command}"));
+        assert!(
+            context.contains(&format!(r#"graph_search {{"query": "{query}"}}"#)),
+            "{command}: {context}"
+        );
+        assert!(context.contains("The shell command still runs"), "{command}: {context}");
+    }
+    // A shell search for a typed title asks about project history instead.
+    let context = hint_context(&sandbox, "Bash", json!({ "command": r#"rg "DECISION: laya""# }))
+        .expect("a memory hint");
+    assert!(context.contains(r#"memory_search {"query": "laya"}"#), "{context}");
+    assert!(!context.contains("graph_search"), "{context}");
+}
+
+#[test]
+fn a_shell_command_that_only_filters_output_gets_no_hint() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let env = sandbox.env();
+    for (tool, command) in [
+        // A pipe feeds grep another command's output: that is a filter, not a
+        // file search, however the search looks.
+        ("Bash", "cargo test 2>&1 | grep FAILED"),
+        ("Bash", "git log --oneline | grep fix"),
+        ("PowerShell", "Get-Content notes.md | Select-String -Pattern LayaManager"),
+        // A regex and a plain word are exactly what grep is for.
+        ("Bash", r#"grep -rn "^fn\s+\w+" src"#),
+        ("Bash", "grep -rn cache src"),
+        // grep with neither a recursive flag nor a path reads stdin.
+        ("Bash", "grep -n LayaManager"),
+        // Not a search at all.
+        ("Bash", "ls -la"),
+        ("Bash", ""),
+    ] {
+        let stdin = search_input(&sandbox, tool, json!({ "command": command }));
+        assert!(hint(&env, &stdin).is_none(), "{command}");
+    }
+}
+
 // ---- wait ------------------------------------------------------------------
 
 #[test]

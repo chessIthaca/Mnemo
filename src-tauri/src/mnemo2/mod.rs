@@ -52,6 +52,10 @@ pub mod mcp_server;
 /// Compact model names for external worker displays.
 pub mod model_label;
 
+/// The Graph tab's code-graph commands (status, search, neighbourhood,
+/// impact, entry points, context).
+pub mod graph;
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
 /// also exposes `__TAURI_INTERNALS__`.
@@ -455,6 +459,13 @@ pub fn run() {
             browser::browser_overlay,
             browser::browser_close,
             browser::browser_open_external,
+            graph::graph_status,
+            graph::graph_refresh,
+            graph::graph_search,
+            graph::graph_neighbourhood,
+            graph::graph_impact,
+            graph::graph_top,
+            graph::graph_context,
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to build the Mnemo2 desktop host")

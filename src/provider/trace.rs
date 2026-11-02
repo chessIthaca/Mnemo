@@ -116,7 +116,7 @@ pub const DEFAULT_TRACE_REQUEST_CAP_BYTES: usize = 256 * 1024;
 
 /// Token usage for one request — the fields of [`crate::provider::LlmEvent::Usage`]
 /// that matter for cost/cache analysis.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmUsage {
     /// Input (prompt) tokens.
     pub prompt: u32,
@@ -180,7 +180,7 @@ pub enum TracePurpose {
 /// any retry, streaming, or ring eviction can reorder things. Snapshotted
 /// per request (never read back from live state), so a deleted Team
 /// worker record can never rewrite history.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraceAttribution {
     /// The coarse actor class.
     pub actor_kind: TraceActorKind,
@@ -393,7 +393,7 @@ const MAX_RAW_TOOL_CALLS: usize = 32;
 /// generation-vs-harness discrimination tap — comparing these against the
 /// executed/normalized args separates model-emission decay from
 /// harness-layer mutation).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawToolCallRecord {
     /// The tool-call id assigned by the model.
     pub id: String,
@@ -408,7 +408,7 @@ pub struct RawToolCallRecord {
 
 /// One recorded request/response pair. Serialized verbatim as the "detail"
 /// wire type (see [`LlmRequestDetail`]).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequestRecord {
     /// Monotonic id — ids increase with request order (the id space is global
     /// across all agents/providers, so `id - 1` is the previous request
@@ -539,7 +539,7 @@ pub struct LlmRequestRecord {
 /// early. Lets the Trace tab and `traces.jsonl` distinguish guard cuts
 /// from natural stops and empty completions — the discriminator behind
 /// the 2026-12-31 empty-output stall diagnosis.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GuardCutDetails {
     /// The stop sequence that matched (a configured stop or a model-family
     /// boundary tag).
@@ -568,7 +568,7 @@ pub type LlmRequestDetail = LlmRequestRecord;
 /// The lightweight list-row wire type: everything the trace list needs to
 /// render one row, without the request/response JSON payloads (which can be
 /// hundreds of KB each and are fetched on demand via `get`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequestSummary {
     /// Monotonic id — ids increase with request order.
     pub id: u64,

@@ -28,6 +28,9 @@ pub mod lock_holders;
 /// Durable per-project usage and cost accounting.
 pub mod usage;
 
+/// Mnemo2's one model-pricing rule (Cost, team telemetry, and Trace share it).
+pub mod pricing;
+
 /// The Cost tab's spend and savings insight commands.
 pub mod insights;
 
@@ -545,7 +548,12 @@ pub fn run() {
             files_view::files_find,
             trace_view::trace_list,
             trace_view::trace_detail,
-            trace_view::trace_clear,
+            trace_view::trace_settings,
+            trace_view::trace_set_log_bodies,
+            trace_view::trace_clear_live,
+            trace_view::trace_delete_history,
+            trace_view::trace_export,
+            trace_view::trace_reveal_export,
             git_view::git_overview,
             git_view::git_move_main,
             browser::browser_supported,

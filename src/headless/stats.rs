@@ -223,9 +223,38 @@ impl TraceApi {
     pub fn get(&self, id: u64) -> Option<LlmRequestDetail> {
         self.log.get(id)
     }
-
     /// Drop all recorded requests. Ids keep counting up — no reuse.
     pub fn clear(&self) {
         self.log.clear()
+    }
+
+    /// The log's run id — the prefix of the durable `run_id:id` key. A new
+    /// engine start (process restart, or a re-`start`) mints a new run.
+    pub fn run_id(&self) -> String {
+        self.log.run_id().to_string()
+    }
+
+    /// Raise (or lower) the in-memory ring capacity. Mnemo2 sets 128 (the
+    /// default ring is 32); the metadata journal covers older history.
+    pub fn set_ring_capacity(&self, capacity: usize) {
+        self.log.set_ring_capacity(capacity)
+    }
+
+    /// The current ring capacity in records.
+    pub fn ring_capacity(&self) -> usize {
+        self.log.ring_capacity()
+    }
+
+    /// Whether request/response bodies are mirrored to the on-disk trace
+    /// log (`traces.jsonl` + `traces-history.jsonl`). Off by default —
+    /// bodies may contain sensitive content.
+    pub fn logging_enabled(&self) -> bool {
+        self.log.logging_enabled()
+    }
+
+    /// Toggle on-disk body mirroring (secrets stay redacted; failed
+    /// requests are always mirrored redacted).
+    pub fn set_logging_enabled(&self, on: bool) {
+        self.log.set_logging_enabled(on)
     }
 }

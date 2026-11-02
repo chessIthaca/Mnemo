@@ -29,6 +29,7 @@ use mnemo::headless::{
 use mnemo::headless::session::ModelSwitch;
 use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
 use mnemo::tool::{SafetyLevel, ToolResult};
+use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::{PermissionPolicy, SerializableAgentEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,7 +40,8 @@ use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::lock_holders;
 use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewEvidence, ReviewRecord};
 use crate::mnemo2::runtime::{LeadModel, LeadRuntime};
-use crate::mnemo2::usage::{event_session, usage_model_key, ProjectUsage, ProjectUsageView};
+use crate::mnemo2::pricing::usage_model_key;
+use crate::mnemo2::usage::{event_session, ProjectUsage, ProjectUsageView};
 
 /// The Tauri event channel emitted by the team runtime.
 pub const TEAM_EVENT_CHANNEL: &str = "mnemo2://team-event";
@@ -2664,12 +2666,12 @@ impl TeamRuntime {
         self.persist().await?;
         let session = match self
             .spawn_worker_session(
-                record.name.clone(),
                 record.model.clone(),
                 record.reasoning_effort.clone(),
                 record.worktree.clone(),
                 Some(record.transcript.clone()),
                 record.kind.as_str(),
+                Self::worker_trace_identity(&record),
             )
             .await
         {
@@ -2740,15 +2742,39 @@ impl TeamRuntime {
         self.worker(&id).await
     }
 
+    /// The trace identity for one worker (plan c3ba2b58 step B): built from
+    /// its record at spawn, so every model call the worker makes is
+    /// attributed to this worker, its plan, and its step. The agent and
+    /// session ids are filled in by the spawn path; the plan step converts
+    /// from the record's 0-based step to the plan's 1-based numbering.
+    fn worker_trace_identity(record: &WorkerRecord) -> TraceIdentity {
+        TraceIdentity {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: String::new(),
+            session_id: String::new(),
+            agent_name: record.name.clone(),
+            worker_id: Some(record.id.clone()),
+            plan_id: record.plan_id.clone(),
+            plan_step: record.plan_step.map(|step| step as u32 + 1),
+        }
+    }
+
+    /// Open one live worker session on this team's engine (the brief's
+    /// spawn path): the guardrails match the worker `kind`, the worktree is
+    /// bound to the session, and the trace identity attributes every model
+    /// call to this worker (plan c3ba2b58 step B). The session's display
+    /// name is the trace identity's `agent_name` — both are the worker
+    /// record's name at every call site.
     pub(crate) async fn spawn_worker_session(
         &self,
-        name: String,
         model: Option<String>,
         reasoning_effort: Option<String>,
         worktree: PathBuf,
         resume: Option<Transcript>,
         kind: &str,
+        trace_identity: TraceIdentity,
     ) -> Result<AgentSession, String> {
+        let name = trace_identity.agent_name.clone();
         self.engine
             .spawn(SpawnOptions {
                 name: Some(name),
@@ -2762,9 +2788,10 @@ impl TeamRuntime {
                 host_tools: self.worker_host_tools(),
                 external_policy: None,
                 guardrails: Some(guardrails_for(kind)),
-                // Plan c3ba2b58 step B wires the worker's trace identity
-                // (worker id + plan step) here; `None` until then.
-                trace_identity: None,
+                // Plan c3ba2b58 step B: the worker's trace identity, built
+                // from its record — every model call the worker makes is
+                // attributed to this worker, its plan, and its step.
+                trace_identity: Some(trace_identity),
             })
             .await
             .map_err(|err| format!("could not spawn the worker session: {err}"))
@@ -3041,12 +3068,12 @@ impl TeamRuntime {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session = self
             .spawn_worker_session(
-                record.name.clone(),
                 record.model.clone(),
                 record.reasoning_effort.clone(),
                 record.worktree.clone(),
                 Some(record.transcript.clone()),
                 record.kind.as_str(),
+                Self::worker_trace_identity(&record),
             )
             .await?;
         let session_id = session.id();
@@ -7003,12 +7030,12 @@ models = [\"scripted-a\"]
     async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
         let session = team
             .spawn_worker_session(
-                worker.name.clone(),
                 None,
                 None,
                 worker.worktree.clone(),
                 None,
                 "implementation",
+                TeamRuntime::worker_trace_identity(worker),
             )
             .await
             .expect("spawn worker session");
@@ -7093,12 +7120,12 @@ models = [\"scripted-a\"]
         for worker in [&dangling, &fragment] {
             let session = team
                 .spawn_worker_session(
-                    worker.name.clone(),
                     None,
                     None,
                     worker.worktree.clone(),
                     None,
                     "implementation",
+                    TeamRuntime::worker_trace_identity(worker),
                 )
                 .await
                 .expect("open a worktree-bound session and its code graph");
@@ -7587,12 +7614,12 @@ models = [\"scripted-a\"]
         let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
         let session = team
             .spawn_worker_session(
-                worker.name.clone(),
                 None,
                 None,
                 worker.worktree.clone(),
                 None,
                 "implementation",
+                TeamRuntime::worker_trace_identity(&worker),
             )
             .await
             .expect("open a worktree-bound session and its code graph");

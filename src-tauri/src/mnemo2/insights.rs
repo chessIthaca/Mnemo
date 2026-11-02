@@ -31,7 +31,8 @@ use mnemo::memory::{DayBreakdown, ProjectStats, SavingsStats};
 
 use crate::mnemo2::ipc::Mnemo2State;
 use crate::mnemo2::runtime::LeadRuntime;
-use crate::mnemo2::usage::{cost_micros, resolve_rates, ModelRates, ProjectUsage};
+use crate::mnemo2::pricing::{cost_micros, resolve_rates, ModelRates};
+use crate::mnemo2::usage::ProjectUsage;
 
 /// One model's usage and estimated spend in the Cost tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -26,7 +26,13 @@ Verification: `cargo test --lib tool::agent::shell` then `cargo test --lib`, and
 - Ordinary commands (cargo test, npm run check, git) behave and stream exactly as before.
 
 ## Steps
-- [ ] 1. **Bound the reader join and kill the process tree** — `src/tool/agent/shell.rs` (and `Cargo.toml` for the `windows-sys` JobObjects feature): bounded post-exit reader join with a note, Job Object (Windows) / process group (Unix) so the whole tree dies when the call ends or times out; regression test `background_child_holding_the_pipes_does_not_hang_the_call` plus a test that a timed-out command's grandchild is killed.
+- [x] 1. **Bound the reader join and kill the process tree** — `src/tool/agent/shell.rs` (and `Cargo.toml` for the `windows-sys` JobObjects feature): bounded post-exit reader join with a note, Job Object (Windows) / process group (Unix) so the whole tree dies when the call ends or times out; regression test `background_child_holding_the_pipes_does_not_hang_the_call` plus a test that a timed-out command's grandchild is killed.
 
 ## Bug
 A worker shell command that leaves a process running (e.g. `npx vite` started with `&`/Start-Process, or any dev server) never returns: the worker hangs for 50-90+ minutes, and the server outlives the worker and blocks its worktree from being removed.
+
+## Regression test
+background_child_holding_the_pipes_does_not_hang_the_call
+
+## Progress
+- 2026-11-02 step 1 done: step 1 merged: shellTree80 (shellTree80) on glm-5.3, merge commit 80bc825f; review: Shell tool bounds the post-exit reader join to 3 s with a graceful stop and a note, and owns the whole process tree via a KILL_ON_JOB_CLOSE Job Object (Windows) / process group kill (Unix) dropped on every exit path.

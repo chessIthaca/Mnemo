@@ -303,6 +303,14 @@
       "closed_at_ms": null,
       "report_path": null,
       "abandon_reason": null
+    },
+    {
+      "id": "102372f7",
+      "status": "closed",
+      "created_at_ms": 1793610098010,
+      "closed_at_ms": 1793611608767,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-102372f7-20261102-092648.md",
+      "abandon_reason": null
     }
   ]
 }

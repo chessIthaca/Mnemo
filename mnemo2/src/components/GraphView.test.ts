@@ -6,6 +6,7 @@ import {
   type GraphImpactSymbol,
   type GraphNeighbourhood,
   type GraphNode,
+  type GraphOverviewNode,
   type GraphStatus,
   type GraphSymbol,
   type GraphTransport,
@@ -102,6 +103,55 @@ function makeTransport(overrides: Partial<GraphTransport> = {}): GraphTransport 
     neighbourhood: vi.fn(async (symbolId: string, depth = 1) => neighbourhoods[symbolId] ?? neighbourhoods[ENGINE.id] ?? null as never),
     impact: vi.fn(async (symbolId: string) => impacts[symbolId] ?? []),
     top: vi.fn(async () => [ENGINE, RUN_TURN_NODE, { ...SAVE, degree: 6 }]),
+    overview: vi.fn(async (level = 2, limit = 60) => {
+      const modules: GraphOverviewNode[] = [
+        {
+          id: "src/agent",
+          label: "agent",
+          kind: null,
+          file: "src/agent",
+          line: 0,
+          symbols: 12,
+          degree: 4,
+          top: [RUN_TURN_NODE, { ...SAVE, degree: 6 }],
+        },
+        {
+          id: "src/memory",
+          label: "memory",
+          kind: null,
+          file: "src/memory",
+          line: 0,
+          symbols: 7,
+          degree: 3,
+          top: [{ ...SAVE, degree: 6 }],
+        },
+      ];
+      const nodes: GraphOverviewNode[] =
+        level === 0
+          ? [ENGINE, RUN_TURN_NODE].map((symbol) => ({
+              id: symbol.id,
+              label: symbol.name,
+              kind: symbol.kind,
+              file: symbol.file,
+              line: symbol.line,
+              symbols: 1,
+              degree: symbol.degree,
+              top: [],
+            }))
+          : modules;
+      const drawn = new Set(nodes.slice(0, limit).map((node) => node.id));
+      return {
+        level,
+        nodes: nodes.slice(0, limit),
+        edges: [{ from: "src/agent", to: "src/memory", kind: "calls", count: 4 }].filter(
+          (edge) => drawn.has(edge.from) && drawn.has(edge.to),
+        ),
+        total_nodes: nodes.length,
+        truncated: false,
+        total_symbols: 12840,
+        sampled_symbols: 300,
+      };
+    }),
     context: vi.fn(async (symbolId: string) => contexts[symbolId] ?? contexts[ENGINE.id] ?? null as never),
   };
   const transport = { ...base, ...overrides } as GraphTransport;
@@ -255,11 +305,14 @@ describe("GraphView", () => {
     await renderFocused();
     const canvas = screen.getByRole("img", { name: "Neighbourhood of Engine::stats" });
     const group = canvas.querySelector("g");
-    expect(group?.getAttribute("transform")).toBe("translate(0 0) scale(1)");
+    const fitted = group?.getAttribute("transform") ?? "";
+    const zoomOf = () => Number(/scale\(([\d.]+)\)/.exec(group?.getAttribute("transform") ?? "")?.[1]);
+    // Opening a view fits it to the canvas rather than showing an empty box.
+    expect(zoomOf()).toBeGreaterThan(0);
     await fireEvent.wheel(canvas, { deltaY: -100 });
-    expect(group?.getAttribute("transform")).toContain("scale(1.15");
+    expect(zoomOf()).toBeGreaterThan(1);
     await fireEvent.click(screen.getByRole("button", { name: "Reset view" }));
-    expect(group?.getAttribute("transform")).toBe("translate(0 0) scale(1)");
+    expect(group?.getAttribute("transform")).toBe(fitted);
   });
 
   it("drags a node without refocusing it", async () => {
@@ -282,5 +335,62 @@ describe("GraphView", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await screen.findByText("Indexing…");
     expect(transport.refresh).toHaveBeenCalledTimes(1);
+  });
+  it("opens on the whole-graph overview with nothing selected", async () => {
+    const transport = makeTransport();
+    render(GraphView);
+    await screen.findByText("Most connected");
+    const canvas = await screen.findByRole("img", { name: "Code graph overview" });
+    expect(transport.overview).toHaveBeenCalledWith(2, 60);
+    expect(within(canvas).getByRole("button", { name: "Open module agent" })).toBeTruthy();
+    expect(within(canvas).getByRole("button", { name: "Open module memory" })).toBeTruthy();
+    // The old empty canvas is gone: the graph is on screen from the start.
+    expect(screen.queryByText(/Pick a symbol on the left/)).toBeNull();
+    expect(screen.getByText(/Overview of the 300 most-connected symbols of 12,840/)).toBeTruthy();
+  });
+
+  it("draws compact nodes and 10px labels at any view size", async () => {
+    await renderFocused();
+    const canvas = screen.getByRole("img", { name: "Neighbourhood of Engine::stats" });
+    const circles = canvas.querySelectorAll("circle");
+    expect(circles.length).toBeGreaterThan(1);
+    for (const circle of circles) {
+      const radius = Number(circle.getAttribute("r"));
+      expect(radius).toBeGreaterThanOrEqual(3);
+      expect(radius).toBeLessThanOrEqual(7);
+    }
+    const labels = canvas.querySelectorAll("text");
+    expect(labels.length).toBeGreaterThan(0);
+    for (const label of labels) {
+      expect(label.getAttribute("style")).toContain("font-size: 10px");
+    }
+  });
+
+  it("toggles between modules and the top symbols", async () => {
+    const transport = makeTransport();
+    render(GraphView);
+    await screen.findByText("Most connected");
+    await screen.findByRole("img", { name: "Code graph overview" });
+    await fireEvent.click(screen.getByRole("button", { name: "Top symbols" }));
+    const canvas = await screen.findByRole("img", { name: "Code graph overview" });
+    expect(transport.overview).toHaveBeenLastCalledWith(0, 40);
+    expect(within(canvas).getByRole("button", { name: "Focus run_turn" })).toBeTruthy();
+  });
+
+  it("drills into a module and returns to the whole graph", async () => {
+    const transport = makeTransport();
+    render(GraphView);
+    await screen.findByText("Most connected");
+    const overview = await screen.findByRole("img", { name: "Code graph overview" });
+    await fireEvent.click(within(overview).getByRole("button", { name: "Open module agent" }));
+    const drilled = await screen.findByRole("img", { name: "Symbols in agent" });
+    expect(within(drilled).getByRole("button", { name: "Focus run_turn" })).toBeTruthy();
+    expect(screen.getByText("Symbols")).toBeTruthy();
+    // A symbol in the ring focuses through the ordinary neighbourhood path.
+    await fireEvent.click(within(drilled).getByRole("button", { name: "Focus run_turn" }));
+    await screen.findByRole("img", { name: "Neighbourhood of run_turn" });
+    expect(transport.neighbourhood).toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole("button", { name: "Whole graph" }));
+    await screen.findByRole("img", { name: "Code graph overview" });
   });
 });

@@ -52,6 +52,15 @@ describe("preview scenes", () => {
     expect(transport).not.toBeNull();
     expect(await transport?.status()).toMatchObject({ available: true, indexing: false });
     expect((await transport?.top(3))?.length).toBe(3);
+    // The scene opens on a whole-graph module map, not an empty canvas.
+    const overview = await transport?.overview(2, 60);
+    expect(overview?.level).toBe(2);
+    expect(overview?.nodes.length).toBeGreaterThanOrEqual(30);
+    expect(overview?.edges.length).toBeGreaterThan(20);
+    expect(overview?.nodes.every((node) => node.kind === null)).toBe(true);
+    const symbols = await transport?.overview(0, 40);
+    expect(symbols?.level).toBe(0);
+    expect(symbols?.nodes.every((node) => node.kind !== null)).toBe(true);
   });
 
   it("resolves the default scene for an empty parameter and null for an unknown one", () => {

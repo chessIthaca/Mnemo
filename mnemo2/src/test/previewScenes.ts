@@ -340,6 +340,118 @@ const SAMPLE_EDGES: GraphEdge[] = [
   { from: "src/codegraph/extract.rs::extract::1", to: "src/codegraph/extract.rs::EdgeKind::31", kind: "contains" },
 ];
 
+/**
+ * The sample repository's directory modules (overview level 2) with their
+ * symbol counts — a plausible spread over this project's packages and the
+ * neighbours a monorepo of this shape carries, so the Graph scene opens on a
+ * whole-graph map instead of an empty canvas.
+ */
+const SAMPLE_MODULES = [
+  ["src/agent", 142],
+  ["src/app", 38],
+  ["src/browser", 61],
+  ["src/codegraph", 168],
+  ["src/config", 44],
+  ["src/headless", 96],
+  ["src/host", 72],
+  ["src/mcp", 88],
+  ["src/memory", 154],
+  ["src/project", 66],
+  ["src/provider", 94],
+  ["src/runtime", 31],
+  ["src/safety_rules", 22],
+  ["src/tool", 181],
+  ["src/bin", 18],
+  ["src/daemon", 27],
+  ["src/export", 34],
+  ["src/index", 57],
+  ["src/plugin", 41],
+  ["src/telemetry", 29],
+  ["mnemo2/src", 212],
+  ["mnemo2/plugin", 24],
+  ["mnemo2/scripts", 9],
+  ["mnemo2/claude-desktop-mod", 16],
+  ["src-tauri/src", 74],
+  ["src-tauri/tests", 21],
+  ["frontend/src", 48],
+  ["frontend/bench", 12],
+  ["tests/integration", 57],
+  ["tests/e2e", 33],
+  ["examples", 19],
+  ["docs", 12],
+  ["scripts", 26],
+  ["vendor", 14],
+  ["assets", 7],
+  ["benches", 15],
+  ["tools", 23],
+  [".coding/skills", 11],
+  ["migrations", 8],
+  ["ops", 13],
+] as const;
+
+/** Aggregated symbol edges between those modules: `[from, to, kind, count]`. */
+const SAMPLE_MODULE_EDGES = [
+  ["src/agent", "src/headless", "calls", 41],
+  ["src/agent", "src/provider", "calls", 33],
+  ["src/agent", "src/memory", "imports", 18],
+  ["src/agent", "src/tool", "calls", 27],
+  ["src/app", "src/agent", "calls", 22],
+  ["src/app", "src/config", "imports", 14],
+  ["src/app", "src/runtime", "calls", 9],
+  ["src/tool", "src/codegraph", "calls", 24],
+  ["src/tool", "src/memory", "calls", 19],
+  ["src/tool", "src/project", "imports", 11],
+  ["src/mcp", "src/tool", "calls", 37],
+  ["src/mcp", "src/codegraph", "calls", 21],
+  ["src/mcp", "src/headless", "imports", 12],
+  ["src/headless", "src/memory", "calls", 29],
+  ["src/headless", "src/provider", "calls", 34],
+  ["src/headless", "src/codegraph", "calls", 16],
+  ["src/headless", "src/config", "imports", 10],
+  ["src/memory", "src/project", "imports", 15],
+  ["src/memory", "src/codegraph", "contains", 8],
+  ["src/codegraph", "src/memory", "imports", 12],
+  ["src/codegraph", "src/project", "imports", 9],
+  ["src/provider", "src/config", "imports", 7],
+  ["src/project", "src/config", "imports", 6],
+  ["src/host", "src/mcp", "calls", 18],
+  ["src/host", "src/agent", "calls", 14],
+  ["src/browser", "src/tool", "calls", 11],
+  ["src/browser", "src/host", "imports", 6],
+  ["src/daemon", "src/host", "calls", 12],
+  ["src/daemon", "src/runtime", "calls", 7],
+  ["src/plugin", "src/tool", "calls", 9],
+  ["src/plugin", "src/config", "imports", 5],
+  ["src/index", "src/codegraph", "calls", 14],
+  ["src/index", "src/memory", "calls", 10],
+  ["src/export", "src/codegraph", "imports", 8],
+  ["src/telemetry", "src/provider", "calls", 6],
+  ["src/safety_rules", "src/tool", "contains", 4],
+  ["src/bin", "src/app", "calls", 8],
+  ["src-tauri/src", "src/agent", "calls", 23],
+  ["src-tauri/src", "src/host", "calls", 17],
+  ["src-tauri/src", "src/mcp", "calls", 21],
+  ["src-tauri/src", "src/codegraph", "imports", 13],
+  ["mnemo2/src", "src-tauri/src", "imports", 6],
+  ["mnemo2/src", "src/mcp", "calls", 9],
+  ["frontend/src", "mnemo2/src", "imports", 4],
+  ["tests/integration", "src/headless", "calls", 11],
+  ["tests/integration", "src/codegraph", "calls", 7],
+  ["tests/e2e", "mnemo2/src", "calls", 5],
+  ["scripts", "src/tool", "calls", 3],
+  ["docs", "src/agent", "imports", 2],
+  ["mnemo2/claude-desktop-mod", "mnemo2/src", "calls", 4],
+  ["vendor", "src/codegraph", "contains", 3],
+  ["benches", "src/codegraph", "calls", 6],
+] as const;
+
+/** The directory module a sample file belongs to, at overview level 2. */
+function sampleModuleOf(file: string): string {
+  const parts = file.split("/");
+  return parts.length > 2 ? `${parts[0]}/${parts[1]}` : parts[0];
+}
+
+
 const SAMPLE_SYMBOL_BY_ID = new Map(SAMPLE_SYMBOLS.map((symbol) => [symbol.id, symbol]));
 
 const toSymbol = ({ id, name, kind, file, line }: SampleSymbol): GraphSymbol => ({ id, name, kind, file, line });
@@ -423,6 +535,67 @@ function sampleGraphTransport(): GraphTransport {
       return rows.sort((a, b) => a.distance - b.distance || a.name.localeCompare(b.name));
     },
     top: async (limit = 20) => [...SAMPLE_SYMBOLS].sort((a, b) => b.degree - a.degree).slice(0, limit),
+    overview: async (level = 2, limit = 60) => {
+      if (level === 0) {
+        const nodes = [...SAMPLE_SYMBOLS]
+          .sort((a, b) => b.degree - a.degree || a.id.localeCompare(b.id))
+          .slice(0, limit)
+          .map((symbol) => ({
+            id: symbol.id,
+            label: symbol.name,
+            kind: symbol.kind,
+            file: symbol.file,
+            line: symbol.line,
+            symbols: 1,
+            degree: symbol.degree,
+            top: [],
+          }));
+        const drawn = new Set(nodes.map((node) => node.id));
+        return {
+          level,
+          nodes,
+          edges: SAMPLE_EDGES.filter((edge) => drawn.has(edge.from) && drawn.has(edge.to)).map(
+            (edge) => ({ from: edge.from, to: edge.to, kind: edge.kind, count: 1 }),
+          ),
+          total_nodes: SAMPLE_SYMBOLS.length,
+          truncated: nodes.length < SAMPLE_SYMBOLS.length,
+          total_symbols: 12840,
+          sampled_symbols: SAMPLE_SYMBOLS.length,
+        };
+      }
+      const weight = new Map<string, number>();
+      for (const [from, to, , count] of SAMPLE_MODULE_EDGES) {
+        weight.set(from, (weight.get(from) ?? 0) + count);
+        weight.set(to, (weight.get(to) ?? 0) + count);
+      }
+      const modules = SAMPLE_MODULES.map(([id, symbols]) => ({
+        id,
+        label: id.slice(id.lastIndexOf("/") + 1),
+        kind: null,
+        file: id,
+        line: 0,
+        symbols,
+        degree: weight.get(id) ?? 0,
+        top: SAMPLE_SYMBOLS.filter((symbol) => sampleModuleOf(symbol.file) === id)
+          .sort((a, b) => b.degree - a.degree || a.id.localeCompare(b.id))
+          .slice(0, 12)
+          .map((symbol) => ({ ...toSymbol(symbol), degree: symbol.degree })),
+      }));
+      modules.sort((a, b) => b.symbols - a.symbols || b.degree - a.degree || a.id.localeCompare(b.id));
+      const nodes = modules.slice(0, limit);
+      const drawn = new Set(nodes.map((node) => node.id));
+      return {
+        level,
+        nodes,
+        edges: SAMPLE_MODULE_EDGES.filter(([from, to]) => drawn.has(from) && drawn.has(to)).map(
+          ([from, to, kind, count]) => ({ from, to, kind, count }),
+        ),
+        total_nodes: SAMPLE_MODULES.length,
+        truncated: nodes.length < SAMPLE_MODULES.length,
+        total_symbols: 12840,
+        sampled_symbols: 300,
+      };
+    },
     context: async (symbolId) => {
       const center = SAMPLE_SYMBOL_BY_ID.get(symbolId);
       if (!center) throw new Error(`unknown symbol ${symbolId}`);

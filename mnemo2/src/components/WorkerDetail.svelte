@@ -142,7 +142,7 @@
               {:else}
                 <span
                   class="model-locked"
-                  title={audit ? "An audit worker's model is not user-switchable" : "Pause or stop the worker to change its model"}
+                  title={audit ? "An audit worker's model is not user-switchable" : "This worker's task is over, so its model cannot change"}
                 ><ModelBadge model={worker.model} /></span>
               {/if}
             </span>

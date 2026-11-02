@@ -7,11 +7,11 @@
  * `npm run check:no-mock` keeps passing.
  */
 
+import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
 import type { BoardPlan } from "../lib/boardState";
 import type { WorkerDeletionPreview } from "../lib/teamState";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
-import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
 
 /** The fixture worker whose thread the preview shows in full. */
 const RICH_WORKER_ID = "kai";
@@ -279,91 +279,6 @@ function missionControl(): AppState {
   };
 }
 
-/** The same thread, on a worker that stopped to ask: the needs-you banner shows. */
-function workerThread(): AppState {
-  return {
-    ...baseState({
-      status: "needs_you",
-      needsYou: true,
-      summary: "The thread renders as Markdown — the component test still fails on the tool rows. Which way do you want them?",
-      lastActivity: "just now",
-      createdAtMs: NOW_MS - 18 * 60_000,
-      activity: liveActivity("waiting", 75_000),
-    }),
-    route: "lead",
-    selectedWorkerId: RICH_WORKER_ID,
-    workerPanelId: RICH_WORKER_ID,
-    workbenchOpen: false,
-    workerDeletion: null,
-  };
-}
-
-/** The lead chat: a brief, a plan, a dispatch, a review note, a merge, a tool row. */
-function leadChat(): AppState {
-  const state = baseState();
-  const extra: LeadEntry[] = [
-    {
-      id: "preview-lead-tool-row",
-      kind: "tool",
-      time: "09:58",
-      toolCallId: "call-preview-team-status",
-      toolName: "team_status",
-      arguments: JSON.stringify({ worker_id: RICH_WORKER_ID }),
-      liveOutput: "",
-      result: { success: true, output: "Kai · working · 7 turns · 0 open findings" },
-    },
-    {
-      id: "preview-lead-closing",
-      kind: "message",
-      author: "lead",
-      time: "10:01",
-      body: [
-        "## Where the team stands",
-        "",
-        "Ana's review is closed and Ren's merge is in. Kai is re-running a component test.",
-        "",
-        "- **Done:** shell, review evidence, delete-old sheet",
-        "- **Running:** thread Markdown, tool-row cards",
-        "",
-        "```bash",
-        "npm run check:mnemo2",
-        "npx vitest run",
-        "```",
-      ].join("\n"),
-    },
-  ];
-  return {
-    ...state,
-    route: "lead",
-    leadEntries: [...state.leadEntries, ...extra],
-    selectedWorkerId: null,
-    workerPanelId: null,
-    workbenchOpen: false,
-    workerDeletion: null,
-  };
-}
-
-/** The lead chat with an idle Claude Code lead: the top bar shows the badge. */
-function leadIdle(): AppState {
-  return {
-    ...leadChat(),
-    externalLead: {
-      attached: false,
-      root: "C:/Mnemo",
-      sinceMs: null,
-      idleSinceMs: NOW_MS - 12 * 60_000,
-    },
-  };
-}
-
-/** The delete-old sheet, opened over mission control, with one superseded worker. */
-function deleteSheet(): AppState {
-  return {
-    ...missionControl(),
-    workerDeletion: { previews: [SUPERSEDED_PREVIEW], busy: false },
-  };
-}
-
 /** One symbol of the sample code graph; `degree` is its global link count. */
 interface SampleSymbol extends GraphSymbol {
   degree: number;
@@ -512,6 +427,91 @@ function graphScene(): AppState {
     workerPanelId: null,
     workbenchOpen: false,
     workerDeletion: null,
+  };
+}
+
+/** The same thread, on a worker that stopped to ask: the needs-you banner shows. */
+function workerThread(): AppState {
+  return {
+    ...baseState({
+      status: "needs_you",
+      needsYou: true,
+      summary: "The thread renders as Markdown — the component test still fails on the tool rows. Which way do you want them?",
+      lastActivity: "just now",
+      createdAtMs: NOW_MS - 18 * 60_000,
+      activity: liveActivity("waiting", 75_000),
+    }),
+    route: "lead",
+    selectedWorkerId: RICH_WORKER_ID,
+    workerPanelId: RICH_WORKER_ID,
+    workbenchOpen: false,
+    workerDeletion: null,
+  };
+}
+
+/** The lead chat: a brief, a plan, a dispatch, a review note, a merge, a tool row. */
+function leadChat(): AppState {
+  const state = baseState();
+  const extra: LeadEntry[] = [
+    {
+      id: "preview-lead-tool-row",
+      kind: "tool",
+      time: "09:58",
+      toolCallId: "call-preview-team-status",
+      toolName: "team_status",
+      arguments: JSON.stringify({ worker_id: RICH_WORKER_ID }),
+      liveOutput: "",
+      result: { success: true, output: "Kai · working · 7 turns · 0 open findings" },
+    },
+    {
+      id: "preview-lead-closing",
+      kind: "message",
+      author: "lead",
+      time: "10:01",
+      body: [
+        "## Where the team stands",
+        "",
+        "Ana's review is closed and Ren's merge is in. Kai is re-running a component test.",
+        "",
+        "- **Done:** shell, review evidence, delete-old sheet",
+        "- **Running:** thread Markdown, tool-row cards",
+        "",
+        "```bash",
+        "npm run check:mnemo2",
+        "npx vitest run",
+        "```",
+      ].join("\n"),
+    },
+  ];
+  return {
+    ...state,
+    route: "lead",
+    leadEntries: [...state.leadEntries, ...extra],
+    selectedWorkerId: null,
+    workerPanelId: null,
+    workbenchOpen: false,
+    workerDeletion: null,
+  };
+}
+
+/** The lead chat with an idle Claude Code lead: the top bar shows the badge. */
+function leadIdle(): AppState {
+  return {
+    ...leadChat(),
+    externalLead: {
+      attached: false,
+      root: "C:/Mnemo",
+      sinceMs: null,
+      idleSinceMs: NOW_MS - 12 * 60_000,
+    },
+  };
+}
+
+/** The delete-old sheet, opened over mission control, with one superseded worker. */
+function deleteSheet(): AppState {
+  return {
+    ...missionControl(),
+    workerDeletion: { previews: [SUPERSEDED_PREVIEW], busy: false },
   };
 }
 

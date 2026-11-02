@@ -40,6 +40,10 @@ pub mod project;
 /// Read-only worker diffs and screenshot artifacts for the workbench.
 pub mod workbench;
 
+/// The Graph tab's code-graph commands (status, search, neighbourhood,
+/// impact, entry points, context).
+pub mod graph;
+
 /// The native child-WebView2 Browser pane and its non-Windows fallback.
 pub mod browser;
 
@@ -51,10 +55,6 @@ pub mod mcp_server;
 
 /// Compact model names for external worker displays.
 pub mod model_label;
-
-/// The Graph tab's code-graph commands (status, search, neighbourhood,
-/// impact, entry points, context).
-pub mod graph;
 
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
@@ -393,6 +393,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             mnemo2_host_ping,
+            graph::graph_status,
+            graph::graph_refresh,
+            graph::graph_search,
+            graph::graph_neighbourhood,
+            graph::graph_impact,
+            graph::graph_top,
+            graph::graph_context,
             ipc::mnemo2_startup_project,
             ipc::external_lead_status,
             ipc::external_open_failed,
@@ -459,13 +466,6 @@ pub fn run() {
             browser::browser_overlay,
             browser::browser_close,
             browser::browser_open_external,
-            graph::graph_status,
-            graph::graph_refresh,
-            graph::graph_search,
-            graph::graph_neighbourhood,
-            graph::graph_impact,
-            graph::graph_top,
-            graph::graph_context,
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to build the Mnemo2 desktop host")

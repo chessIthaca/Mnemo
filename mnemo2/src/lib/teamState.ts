@@ -215,6 +215,20 @@ export function deletionPreviewFromWire(raw: WorkerDeletionPreview): WorkerDelet
   };
 }
 
+/** One worker's outcome of a completed deletion batch (`team_delete`). */
+export interface WorkerDeletionResult {
+  worker_id: string;
+  name: string;
+  /** Null exactly when the worker was deleted. */
+  error: string | null;
+}
+
+/** `team_delete`'s return: per-worker results plus the team snapshot. */
+export interface TeamDeleteOutcome {
+  results: WorkerDeletionResult[];
+  snapshot: TeamSnapshot;
+}
+
 export interface TeamSnapshot {
   workers: TeamWorkerRecord[];
   slots: number;

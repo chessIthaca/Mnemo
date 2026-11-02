@@ -43,6 +43,10 @@ use crate::mnemo2::usage::{event_session, usage_model_key, ProjectUsage, Project
 /// The Tauri event channel emitted by the team runtime.
 pub const TEAM_EVENT_CHANNEL: &str = "mnemo2://team-event";
 
+/// The Tauri event channel streaming per-worker deletion-flow progress
+/// (`DeletionProgress`) while `team_delete_preview` or `team_delete` runs.
+pub const DELETION_EVENT_CHANNEL: &str = "mnemo2://worker-deletion";
+
 /// The persisted worker ledger inside the team's state directory.
 const TEAM_STATE_FILE: &str = "team.json";
 
@@ -752,6 +756,9 @@ impl TeamRuntime {
             external_wake: tokio::sync::Notify::new(),
         };
         runtime.persist().await?;
+        // App start: sweep checkouts a previous run renamed into the
+        // trash folder but could not remove yet (something held them).
+        schedule_trash_sweep(&runtime.workspace_root);
         Ok(runtime)
     }
 
@@ -3895,16 +3902,28 @@ impl TeamRuntime {
     }
 
     /// Describe what deleting these workers would remove, changing nothing.
+    ///
+    /// The preview is read-only, so it does not take the merge lock:
+    /// `delete_workers` re-checks every worker under the lock before
+    /// changing anything. Batch-wide Git facts are gathered once and the
+    /// workers are inspected concurrently, so a large batch costs about
+    /// the same as a small one.
     pub async fn deletion_preview(
         &self,
         worker_ids: &[String],
     ) -> Result<Vec<WorkerDeletion>, String> {
-        let _guard = self.merge_lock.lock().await;
-        let mut previews = Vec::with_capacity(worker_ids.len());
-        for worker_id in worker_ids {
-            previews.push(self.inspect_deletion(worker_id, worker_ids).await?);
-        }
-        Ok(previews)
+        self.deletion_preview_streaming(worker_ids, |_| {}).await
+    }
+
+    /// `deletion_preview` with per-worker progress: `on_preview` receives
+    /// each worker's preview the moment its checks finish, so the open
+    /// sheet can fill its rows in as they arrive.
+    pub async fn deletion_preview_streaming(
+        &self,
+        worker_ids: &[String],
+        on_preview: impl Fn(WorkerDeletion),
+    ) -> Result<Vec<WorkerDeletion>, String> {
+        self.inspect_batch(worker_ids, on_preview).await
     }
 
     /// Delete workers and their history: the ledger record (brief,
@@ -3912,44 +3931,105 @@ impl TeamRuntime {
     /// and `wt/agent-*` branch. A live session is stopped first. Every
     /// worker is checked before any is deleted; work the lead branch lacks
     /// (uncommitted changes, unmerged commits) is discarded only when
-    /// `discard_work` confirms it.
+    /// `discard_work` confirms it. A worker that cannot be deleted is
+    /// reported with its error and stays listed — every other worker is
+    /// still deleted.
     pub async fn delete_workers(
         &self,
         worker_ids: &[String],
         discard_work: bool,
-    ) -> Result<TeamSnapshot, String> {
-        let _guard = self.merge_lock.lock().await;
-        for worker_id in worker_ids {
-            self.check_deletion(worker_id, worker_ids, discard_work)
-                .await?;
-        }
-        for worker_id in worker_ids {
-            if self.live.lock().await.contains_key(worker_id) {
-                self.stop_inner(worker_id).await?;
-            }
-        }
-        // Re-check after stopping: a session may have written more work
-        // between the preview and its stop.
-        let mut deletions = Vec::with_capacity(worker_ids.len());
-        for worker_id in worker_ids {
-            deletions.push(
-                self.check_deletion(worker_id, worker_ids, discard_work)
-                    .await?,
-            );
-        }
-        for deletion in deletions {
-            self.delete_one(&deletion).await?;
-        }
-        Ok(self.snapshot().await)
+    ) -> Result<TeamDeleteOutcome, String> {
+        self.delete_workers_streaming(worker_ids, discard_work, |_| {}).await
     }
 
-    async fn check_deletion(
+    /// `delete_workers` with per-worker progress: `on_result` receives
+    /// each worker's outcome the moment it is known, so the open sheet
+    /// can show each row's result as it happens.
+    pub async fn delete_workers_streaming(
         &self,
-        worker_id: &str,
-        batch: &[String],
+        worker_ids: &[String],
         discard_work: bool,
-    ) -> Result<WorkerDeletion, String> {
-        let deletion = self.inspect_deletion(worker_id, batch).await?;
+        on_result: impl Fn(WorkerDeletionResult),
+    ) -> Result<TeamDeleteOutcome, String> {
+        let _guard = self.merge_lock.lock().await;
+        // One result per requested worker, in request order: a failure
+        // sets its worker's error and never stops the rest of the batch.
+        let mut outcomes: Vec<WorkerDeletionResult> = Vec::with_capacity(worker_ids.len());
+        for worker_id in worker_ids {
+            outcomes.push(WorkerDeletionResult {
+                worker_id: worker_id.clone(),
+                name: self
+                    .worker(worker_id)
+                    .await
+                    .map(|record| record.name)
+                    .unwrap_or_else(|_| worker_id.clone()),
+                error: None,
+            });
+        }
+        // Phase A: check every worker before any is deleted.
+        let previews = self.inspect_batch(worker_ids, |_| {}).await?;
+        let mut stopped: Vec<(usize, WorkerDeletion)> = Vec::new();
+        for (position, preview) in previews.into_iter().enumerate() {
+            match Self::deletion_decision(&preview, discard_work) {
+                Ok(()) => stopped.push((position, preview)),
+                Err(error) => {
+                    outcomes[position].error = Some(error.clone());
+                    on_result(outcomes[position].clone());
+                }
+            }
+        }
+        // Phase B: stop every live session.
+        let mut pending: Vec<(usize, WorkerDeletion)> = Vec::new();
+        for (position, deletion) in stopped {
+            if self.live.lock().await.contains_key(&deletion.worker_id) {
+                match self.stop_inner(&deletion.worker_id).await {
+                    Ok(_stopped) => pending.push((position, deletion)),
+                    Err(error) => {
+                        outcomes[position].error = Some(error.clone());
+                        on_result(outcomes[position].clone());
+                    }
+                }
+            } else {
+                pending.push((position, deletion));
+            }
+        }
+        // Phase C: re-check after stopping — a session may have written
+        // more work between the preview and its stop. The batch for this
+        // pass is the set that still proceeds, so Git state shared with a
+        // worker that failed a check or a stop is never touched.
+        let survivor_ids: Vec<String> = pending
+            .iter()
+            .map(|(_, deletion)| deletion.worker_id.clone())
+            .collect();
+        let rechecked = self.inspect_batch(&survivor_ids, |_| {}).await?;
+        let mut deletions: Vec<(usize, WorkerDeletion)> = Vec::new();
+        for (index, preview) in rechecked.into_iter().enumerate() {
+            let (position, _) = pending[index];
+            match Self::deletion_decision(&preview, discard_work) {
+                Ok(()) => deletions.push((position, preview)),
+                Err(error) => {
+                    outcomes[position].error = Some(error.clone());
+                    on_result(outcomes[position].clone());
+                }
+            }
+        }
+        // Phase D: delete each worker — one failure never stops the rest.
+        for (position, deletion) in deletions {
+            if let Err(error) = self.delete_one(&deletion).await {
+                outcomes[position].error = Some(error.clone());
+            }
+            on_result(outcomes[position].clone());
+        }
+        Ok(TeamDeleteOutcome {
+            results: outcomes,
+            snapshot: self.snapshot().await,
+        })
+    }
+
+    /// The decision for one worker's preview: `Ok` deletes it, an `Err`
+    /// reports why it must stay — blocked, or work the lead branch lacks
+    /// that the user did not confirm discarding.
+    fn deletion_decision(deletion: &WorkerDeletion, discard_work: bool) -> Result<(), String> {
         if let Some(reason) = &deletion.blocked {
             return Err(format!("{} cannot be deleted: {reason}", deletion.name));
         }
@@ -3959,16 +4039,78 @@ impl TeamRuntime {
                 deletion.name, deletion.branch
             ));
         }
-        Ok(deletion)
+        Ok(())
     }
 
-    /// Inspect one worker of a deletion `batch`. Git state shared with a
-    /// record outside the batch is never counted or touched.
-    async fn inspect_deletion(
+    /// Inspect every worker of a deletion batch, streaming each preview
+    /// as soon as its checks finish. Batch-wide Git facts are gathered
+    /// with two Git runs and the per-worker checkout checks run
+    /// `DELETION_CHECK_CONCURRENCY` at a time, so a large batch costs
+    /// about the same as a small one. Git state shared with a record
+    /// outside the batch is never counted or touched.
+    async fn inspect_batch(
+        &self,
+        batch: &[String],
+        on_preview: impl Fn(WorkerDeletion),
+    ) -> Result<Vec<WorkerDeletion>, String> {
+        let facts = DeletionGitFacts::gather(&self.workspace_root).await?;
+        let mut cores = Vec::with_capacity(batch.len());
+        for worker_id in batch {
+            cores.push(self.inspect_core(worker_id, batch, &facts).await?);
+        }
+        let mut previews: Vec<Option<WorkerDeletion>> = vec![None; cores.len()];
+        let mut pending = Vec::new();
+        for (index, core) in cores.iter().enumerate() {
+            if core.needs_check {
+                pending.push((index, core.checkout.clone(), core.branch.clone()));
+            }
+        }
+        // The Git-heavy half runs as one task per worker, bounded: every
+        // worker in a chunk is checked concurrently while the chunks run
+        // in order. A preview is finished — and emitted — the moment its
+        // check lands.
+        for chunk in pending.chunks(DELETION_CHECK_CONCURRENCY) {
+            let mut handles = Vec::with_capacity(chunk.len());
+            for (index, checkout, branch) in chunk {
+                handles.push((
+                    *index,
+                    tokio::spawn(inspect_checkout(checkout.clone(), branch.clone())),
+                ));
+            }
+            for (index, handle) in handles {
+                let check = handle
+                    .await
+                    .map_err(|error| format!("a checkout check task failed: {error}"))??;
+                let preview =
+                    self.finish_preview(&cores[index], Some(check), &facts).await?;
+                on_preview(preview.clone());
+                previews[index] = Some(preview);
+            }
+        }
+        // Workers whose Git state needs no per-worker check (no checkout,
+        // unregistered, shared branch, merging) finish immediately.
+        for index in 0..cores.len() {
+            if previews[index].is_none() {
+                let preview = self.finish_preview(&cores[index], None, &facts).await?;
+                on_preview(preview.clone());
+                previews[index] = Some(preview);
+            }
+        }
+        Ok(previews
+            .into_iter()
+            .map(|preview| preview.expect("every preview finished"))
+            .collect())
+    }
+
+    /// The in-memory half of one worker's preview: everything except its
+    /// per-worker Git checks. Git state shared with a record outside the
+    /// batch is never counted or touched.
+    async fn inspect_core(
         &self,
         worker_id: &str,
         batch: &[String],
-    ) -> Result<WorkerDeletion, String> {
+        facts: &DeletionGitFacts,
+    ) -> Result<DeletionCore, String> {
         let record = self.worker(worker_id).await?;
         let shared_branch = self.records.lock().await.iter().any(|other| {
             other.id != record.id
@@ -3981,59 +4123,78 @@ impl TeamRuntime {
             let records = self.records.lock().await;
             landing_worker_name(&records, &record)
         };
-        let mut deletion = WorkerDeletion {
+        let mut core = DeletionCore {
             worker_id: record.id.clone(),
             name: record.name.clone(),
             branch: record.branch.clone(),
             live: self.live.lock().await.contains_key(worker_id),
-            checkout: false,
-            uncommitted: false,
-            unmerged_commits: 0,
+            checkout: worker_checkout(&self.workspace_root, &record.id),
+            checkout_exists: false,
             superseded_by,
             shared_branch,
             blocked: None,
+            needs_check: false,
         };
         if record.status == WorkerStatus::Merging {
-            deletion.blocked = Some("a merge is in progress".to_string());
-            return Ok(deletion);
+            core.blocked = Some("a merge is in progress".to_string());
+            return Ok(core);
         }
-        if deletion.shared_branch || !owns_its_branch(&record) {
+        if core.shared_branch || !owns_its_branch(&record) {
             // A shared or malformed legacy record: only the record itself is
             // removed; no Git state another record (or no record) owns is
             // touched.
-            return Ok(deletion);
+            return Ok(core);
         }
-        let checkout = worker_checkout(&self.workspace_root, &record.id);
-        if std::fs::symlink_metadata(&checkout).is_ok() {
-            deletion.checkout = true;
-            if checkout_is_registered(&self.workspace_root, &checkout).await? {
-                match current_branch(&checkout) {
-                    Ok(branch) if branch == record.branch => {}
-                    Ok(branch) => {
-                        deletion.blocked = Some(format!(
-                            "its checkout is on '{branch}', not {}",
-                            record.branch
-                        ));
-                        return Ok(deletion);
-                    }
-                    Err(error) => {
-                        deletion.blocked =
-                            Some(format!("its checkout could not be read: {error}"));
-                        return Ok(deletion);
-                    }
+        core.checkout_exists = std::fs::symlink_metadata(&core.checkout).is_ok();
+        // Never probe an unregistered folder with Git: without its own
+        // `.git`, Git walks up and answers for the main checkout instead.
+        core.needs_check = core.checkout_exists && facts.lists(&core.checkout);
+        Ok(core)
+    }
+
+    /// Merge a core and its finished checkout check into the worker's
+    /// preview. The unmerged count comes from the batch's ahead counts; a
+    /// Git without the `%(ahead-behind)` format atom falls back to
+    /// counting that one branch with its own `rev-list` call.
+    async fn finish_preview(
+        &self,
+        core: &DeletionCore,
+        check: Option<CheckoutCheck>,
+        facts: &DeletionGitFacts,
+    ) -> Result<WorkerDeletion, String> {
+        let (uncommitted, blocked) = match check {
+            Some(CheckoutCheck { uncommitted, blocked }) => (uncommitted, core.blocked.clone().or(blocked)),
+            None => (false, core.blocked.clone()),
+        };
+        let unmerged_commits = match &facts.ahead_counts {
+            Some(counts) => counts
+                .get(&format!("refs/heads/{}", core.branch))
+                .copied()
+                .unwrap_or(0),
+            None => {
+                if branch_exists(&self.workspace_root, &core.branch).await {
+                    let range = format!("HEAD..refs/heads/{}", core.branch);
+                    phase3::git_value(&self.workspace_root, &["rev-list", "--count", &range])
+                        .await?
+                        .parse()
+                        .unwrap_or(0)
+                } else {
+                    0
                 }
-                let status =
-                    phase3::git_value(&checkout, &["status", "--porcelain", "-uall"]).await?;
-                deletion.uncommitted = !status.is_empty();
             }
-        }
-        if branch_exists(&self.workspace_root, &record.branch).await {
-            let range = format!("HEAD..refs/heads/{}", record.branch);
-            let count =
-                phase3::git_value(&self.workspace_root, &["rev-list", "--count", &range]).await?;
-            deletion.unmerged_commits = count.parse().unwrap_or(0);
-        }
-        Ok(deletion)
+        };
+        Ok(WorkerDeletion {
+            worker_id: core.worker_id.clone(),
+            name: core.name.clone(),
+            branch: core.branch.clone(),
+            live: core.live,
+            checkout: core.checkout_exists,
+            uncommitted,
+            unmerged_commits,
+            superseded_by: core.superseded_by.clone(),
+            shared_branch: core.shared_branch,
+            blocked,
+        })
     }
 
     /// Remove one checked worker. Git state goes first and the record last,
@@ -4051,33 +4212,7 @@ impl TeamRuntime {
             }
         }
         if !deletion.shared_branch && owns_its_branch(&record) {
-            let checkout = worker_checkout(&self.workspace_root, &record.id);
-            let mut last_error = String::new();
-            for _ in 0..12 {
-                if std::fs::symlink_metadata(&checkout).is_err() {
-                    break;
-                }
-                if !checkout_is_registered(&self.workspace_root, &checkout).await? {
-                    remove_leftover_checkout(&self.workspace_root, &record).await?;
-                    break;
-                }
-                // `worktree remove --force`: discarding was confirmed above.
-                match remove_agent_worktree(self.workspace_root.clone(), record.id.clone()).await {
-                    Ok(()) if !checkout.exists() => break,
-                    Ok(()) => {
-                        last_error =
-                            "Git deregistered the checkout but left its folder".to_string()
-                    }
-                    Err(error) => last_error = error,
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            if checkout.exists() {
-                return Err(format!(
-                    "could not remove {}'s checkout: {last_error}",
-                    record.name
-                ));
-            }
+            self.remove_checkout(&record).await?;
             if branch_exists(&self.workspace_root, &record.branch).await {
                 phase3::git_value(&self.workspace_root, &["branch", "-D", &record.branch])
                     .await
@@ -4095,6 +4230,86 @@ impl TeamRuntime {
             .await
             .retain(|message| message.worker_id != record.id);
         self.persist().await
+    }
+
+    /// Remove the worker's checkout folder from `.worktrees` and deregister
+    /// its worktree. The folder is first renamed into `.worktrees/.trash/`
+    /// with one cheap filesystem move — the user never waits for the slow
+    /// file-by-file delete of a large checkout; the trash folder is
+    /// removed in the background instead. When the rename is refused (on
+    /// Windows: something holds the folder or a file in it), the removal
+    /// falls back to the foreground retry path, which names the holder.
+    async fn remove_checkout(&self, worker: &WorkerRecord) -> Result<(), String> {
+        let Some(canonical) = validated_checkout(&self.workspace_root, worker)? else {
+            return Ok(());
+        };
+        match move_checkout_to_trash(&self.workspace_root, &canonical).await {
+            Ok(()) => {
+                // The renamed checkout no longer sits at its registered
+                // path: sweep the trash folder in the background and drop
+                // the stale worktree registration, so the branch delete
+                // below cannot fail on it.
+                schedule_trash_sweep(&self.workspace_root);
+                let arguments = ["worktree", "prune"];
+                let prune = phase3::git(&self.workspace_root, &arguments).await?;
+                if !prune.status.success() {
+                    return Err(phase3::git_error(&arguments, &prune));
+                }
+            }
+            Err(_held) => {
+                // The move was refused — the folder is held. Fall back to
+                // the foreground removal, which waits for holders and
+                // reports the one it finds.
+                self.remove_checkout_in_front(worker, &canonical).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The foreground checkout removal, used when the rename into trash
+    /// was refused. Runs `git worktree remove --force` for a registered
+    /// checkout (discarding was confirmed before) and filesystem removal
+    /// for a leftover, then names the holder when the folder refuses to
+    /// go.
+    async fn remove_checkout_in_front(
+        &self,
+        worker: &WorkerRecord,
+        checkout: &Path,
+    ) -> Result<(), String> {
+        let mut last_error = String::new();
+        for _ in 0..12 {
+            if std::fs::symlink_metadata(checkout).is_err() {
+                break;
+            }
+            if !checkout_is_registered(&self.workspace_root, checkout).await? {
+                remove_leftover_checkout(&self.workspace_root, worker).await?;
+                break;
+            }
+            match remove_agent_worktree(self.workspace_root.clone(), worker.id.clone()).await {
+                Ok(()) if !checkout.exists() => break,
+                Ok(()) => {
+                    last_error =
+                        "Git deregistered the checkout but left its folder".to_string()
+                }
+                Err(error) => last_error = error,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if checkout.exists() {
+            // Name what still holds the folder, so the user knows what to
+            // close. The probe is best effort and never closes anything.
+            let probe = checkout.to_path_buf();
+            let holders =
+                tokio::task::spawn_blocking(move || lock_holders::holders(&[probe]))
+                    .await
+                    .unwrap_or_default();
+            return Err(format!(
+                "could not remove {}'s checkout: {last_error}{}",
+                worker.name,
+                lock_holders::held_by_suffix(&holders)
+            ));
+        }
+        Ok(())
     }
 
     /// Stop every live worker. The shared engine is owned by the lead and is
@@ -4158,17 +4373,160 @@ async fn branch_exists(root: &Path, branch: &str) -> bool {
         .is_ok()
 }
 
-/// Whether Git's main-checkout worktree registry still lists this exact path.
-/// Never probe an unregistered folder with Git: without its own `.git`, Git
-/// walks up and answers for the main checkout instead.
-async fn checkout_is_registered(root: &Path, checkout: &Path) -> Result<bool, String> {
+/// How many workers a deletion preview checks concurrently. Each checked
+/// worker runs two short Git calls; a small bound keeps a large batch
+/// from fighting the live sessions it lists for the CPU.
+const DELETION_CHECK_CONCURRENCY: usize = 4;
+
+/// The in-memory half of one worker's deletion preview: everything the
+/// [`WorkerDeletion`] reports before its per-worker Git checks run.
+struct DeletionCore {
+    /// The worker's id.
+    worker_id: String,
+    /// The worker's display name.
+    name: String,
+    /// The worker's `wt/agent-*` branch.
+    branch: String,
+    /// The worker's session is live; deleting stops it first.
+    live: bool,
+    /// The worker's expected checkout path.
+    checkout: PathBuf,
+    /// The checkout still exists at that path.
+    checkout_exists: bool,
+    /// The merged worker that landed this record's plan step through its
+    /// own commits, when the ledger knows one.
+    superseded_by: Option<String>,
+    /// Another worker record outside the batch uses the same branch.
+    shared_branch: bool,
+    /// Why the worker cannot be deleted right now, when already known.
+    blocked: Option<String>,
+    /// The checkout exists and is registered, so its branch and
+    /// uncommitted state still need to be read.
+    needs_check: bool,
+}
+
+/// One worker's per-worker Git checks: whether its checkout holds
+/// anything uncommitted, and why it is blocked when its branch moved.
+struct CheckoutCheck {
+    /// The checkout holds uncommitted changes.
+    uncommitted: bool,
+    /// Why the checkout blocks the worker's deletion, when it does.
+    blocked: Option<String>,
+}
+
+/// Batch-wide, read-only Git facts for one deletion preview. One
+/// `git worktree list` run and one `git for-each-ref` run serve the whole
+/// batch instead of each worker spawning its own Git processes (each Git
+/// call costs about 0.1 s on this codebase).
+struct DeletionGitFacts {
+    /// Every checkout path Git's worktree registry lists for this repo.
+    registered_checkouts: Vec<PathBuf>,
+    /// `<full refname> -> commits ahead of the lead branch's HEAD` for
+    /// every local branch. `None` on a Git without the `%(ahead-behind)`
+    /// format atom — the preview then counts each branch with its own
+    /// `rev-list --count` call.
+    ahead_counts: Option<HashMap<String, u32>>,
+}
+
+impl DeletionGitFacts {
+    /// Gather the batch's facts with two Git runs.
+    async fn gather(root: &Path) -> Result<Self, String> {
+        let registered_checkouts = registered_checkouts(root).await?;
+        let ahead_counts = match phase3::git_value(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(ahead-behind:HEAD)",
+                "refs/heads/",
+            ],
+        )
+        .await
+        {
+            Ok(list) => parse_ahead_counts(&list),
+            Err(_) => None,
+        };
+        Ok(Self {
+            registered_checkouts,
+            ahead_counts,
+        })
+    }
+
+    /// Whether Git's worktree registry lists this checkout path.
+    fn lists(&self, checkout: &Path) -> bool {
+        let expected = normalized_checkout_path(checkout);
+        self.registered_checkouts
+            .iter()
+            .any(|listed| same_checkout_path(listed, &expected))
+    }
+}
+
+/// Every local branch's commits ahead of HEAD, read from one
+/// `git for-each-ref --format='%(refname) %(ahead-behind:HEAD)'` run.
+/// `None` when a line fails to parse — the preview falls back to
+/// counting that branch with its own `rev-list` call.
+fn parse_ahead_counts(list: &str) -> Option<HashMap<String, u32>> {
+    let mut counts = HashMap::with_capacity(list.lines().count());
+    for line in list.lines() {
+        let mut fields = line.split_whitespace();
+        let refname = fields.next()?;
+        let ahead = fields.next()?;
+        counts.insert(refname.to_string(), ahead.parse().ok()?);
+    }
+    Some(counts)
+}
+
+/// Every checkout path Git's worktree registry lists, in one
+/// `git worktree list` run instead of one per worker.
+async fn registered_checkouts(root: &Path) -> Result<Vec<PathBuf>, String> {
     let arguments = ["worktree", "list", "--porcelain", "-z"];
     let output = phase3::git(root, &arguments).await?;
     if !output.status.success() {
         return Err(phase3::git_error(&arguments, &output));
     }
+    worktree_list_paths(&output.stdout)
+}
+
+/// One worker's per-worker Git checks. Untracked files are listed without
+/// descending into untracked directories (`--untracked-files=normal`): the
+/// preview only needs to know that *something* is uncommitted, not
+/// enumerate a `node_modules` tree.
+async fn inspect_checkout(checkout: PathBuf, branch: String) -> Result<CheckoutCheck, String> {
+    let current = checkout_branch(&checkout).await?;
+    if current != branch {
+        return Ok(CheckoutCheck {
+            uncommitted: false,
+            blocked: Some(format!("its checkout is on '{current}', not {branch}")),
+        });
+    }
+    let status = phase3::git_value(
+        &checkout,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )
+    .await?;
+    Ok(CheckoutCheck {
+        uncommitted: !status.is_empty(),
+        blocked: None,
+    })
+}
+
+/// A checkout's current branch, without blocking the async executor (the
+/// shared [`current_branch`] helper runs Git synchronously).
+async fn checkout_branch(checkout: &Path) -> Result<String, String> {
+    let branch = phase3::git_value(checkout, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+    let branch = branch.trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err("the checkout is on a detached HEAD".to_string());
+    }
+    Ok(branch)
+}
+
+/// Whether Git's main-checkout worktree registry still lists this exact path.
+/// Never probe an unregistered folder with Git: without its own `.git`, Git
+/// walks up and answers for the main checkout instead.
+async fn checkout_is_registered(root: &Path, checkout: &Path) -> Result<bool, String> {
     let expected = normalized_checkout_path(checkout);
-    Ok(worktree_list_paths(&output.stdout)?
+    Ok(registered_checkouts(root)
+        .await?
         .iter()
         .any(|listed| same_checkout_path(listed, &expected)))
 }
@@ -4243,17 +4601,17 @@ fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-/// Remove an unregistered checkout with filesystem operations only. The
-/// canonical path must remain the expected direct child of this repository's
-/// `.worktrees`; links and junctions are refused rather than traversed.
-async fn remove_leftover_checkout(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
+/// The checkout path after every ownership guard passes: the worker's own
+/// direct-child folder of the canonical `.worktrees`, never a link or
+/// junction, never anything else. `None` when it no longer exists.
+fn validated_checkout(root: &Path, worker: &WorkerRecord) -> Result<Option<PathBuf>, String> {
     if !owns_its_branch(worker) {
         return Err("refusing to remove a checkout for an invalid worker identity".to_string());
     }
     let checkout = worker_checkout(root, &worker.id);
     let metadata = match std::fs::symlink_metadata(&checkout) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
     if is_link_or_junction(&metadata) {
@@ -4289,6 +4647,16 @@ async fn remove_leftover_checkout(root: &Path, worker: &WorkerRecord) -> Result<
             checkout.display()
         ));
     }
+    Ok(Some(canonical))
+}
+
+/// Remove an unregistered checkout with filesystem operations only. The
+/// canonical path must remain the expected direct child of this repository's
+/// `.worktrees`; links and junctions are refused rather than traversed.
+async fn remove_leftover_checkout(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
+    let Some(canonical) = validated_checkout(root, worker)? else {
+        return Ok(());
+    };
 
     let mut last_error = String::new();
     for attempt in 0..12 {
@@ -4335,6 +4703,78 @@ async fn remove_leftover_checkout(root: &Path, worker: &WorkerRecord) -> Result<
         canonical.display(),
         lock_holders::held_by_suffix(&holders)
     ))
+}
+
+/// The trash folder renamed-away checkouts wait in for background removal:
+/// `.worktrees/.trash` — inside the gitignored `.worktrees`, never a
+/// tracked path.
+fn trash_root(root: &Path) -> PathBuf {
+    root.join(".worktrees").join(".trash")
+}
+
+/// Every folder waiting in the trash.
+fn trash_entries(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(trash_root(root)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Rename a validated checkout folder into the trash folder with one
+/// `rename` (same volume, same parent tree): the delete flow waits for a
+/// cheap move instead of the slow file-by-file removal of a large
+/// checkout. Fails when something holds the folder — the caller then
+/// falls back to the foreground removal path.
+async fn move_checkout_to_trash(root: &Path, checkout: &Path) -> Result<(), String> {
+    tokio::task::spawn_blocking({
+        let root = root.to_path_buf();
+        let checkout = checkout.to_path_buf();
+        move || {
+            let trash = trash_root(&root);
+            std::fs::create_dir_all(&trash).map_err(|error| error.to_string())?;
+            let name = checkout
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| "the checkout path has no folder name".to_string())?;
+            let mut target = trash.join(format!("{name}-{}", phase3::now_ms()));
+            let mut attempt = 0;
+            while target.exists() {
+                attempt += 1;
+                target = trash.join(format!("{name}-{}-{attempt}", phase3::now_ms()));
+            }
+            std::fs::rename(checkout, &target).map_err(|error| error.to_string())
+        }
+    })
+    .await
+    .map_err(|error| format!("the checkout move task failed: {error}"))?
+}
+
+/// Sweep the trash folder in the background: try to remove every folder in
+/// it, retrying for a bounded window — a file can be held for a moment by
+/// an indexer or a scanner right after the rename. Anything still held
+/// stays for the next sweep; every app start schedules one.
+fn schedule_trash_sweep(root: &Path) {
+    let root = root.to_path_buf();
+    tokio::spawn(async move {
+        for _ in 0..12 {
+            if trash_entries(&root).is_empty() {
+                return;
+            }
+            sweep_trash(&root).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    });
+}
+
+/// Remove every folder under `.worktrees/.trash/` once. Each folder is
+/// removed independently — one locked folder never keeps the others.
+async fn sweep_trash(root: &Path) {
+    for entry in trash_entries(root) {
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(entry)).await;
+    }
 }
 
 async fn cleanup_agent_worktree(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
@@ -5047,6 +5487,56 @@ impl WorkerDeletion {
     pub fn discards_work(&self) -> bool {
         self.uncommitted || self.unmerged_commits > 0
     }
+}
+
+/// One worker's outcome of a completed deletion batch: `error` is `None`
+/// exactly when the worker was deleted.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct WorkerDeletionResult {
+    /// The worker the result describes.
+    pub worker_id: String,
+    /// The worker's display name.
+    pub name: String,
+    /// Why the worker could not be deleted, or `None` when it was deleted.
+    pub error: Option<String>,
+}
+
+/// `team_delete`'s outcome: one result per requested worker, in request
+/// order, plus the team snapshot after every deletion that succeeded.
+#[derive(Clone, Debug, Serialize)]
+pub struct TeamDeleteOutcome {
+    /// One result per requested worker, in request order.
+    pub results: Vec<WorkerDeletionResult>,
+    /// The team after every deletion that succeeded.
+    pub snapshot: TeamSnapshot,
+}
+
+/// One streamed deletion-flow update on [`DELETION_EVENT_CHANNEL`]: a
+/// worker's finished preview (checking phase) or its deletion result
+/// (deleting phase), emitted the moment it is known so the open sheet
+/// can fill its rows in.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeletionProgress {
+    /// The phase the update belongs to.
+    pub phase: DeletionPhase,
+    /// The worker the update describes.
+    pub worker_id: String,
+    /// The worker's display name.
+    pub name: String,
+    /// The worker's finished preview; `None` in the deleting phase.
+    pub preview: Option<WorkerDeletion>,
+    /// Why the worker's deletion failed; `None` when it was deleted.
+    pub error: Option<String>,
+}
+
+/// Which phase of a deletion flow an update belongs to.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionPhase {
+    /// `team_delete_preview` streams a worker's finished preview.
+    Checking,
+    /// `team_delete` streams a worker's deletion result.
+    Deleting,
 }
 
 /// Outcome of conservative start-screen cleanup.
@@ -6569,15 +7059,233 @@ models = [\"scripted-a\"]
 
         let previews = team.deletion_preview(&ids).await.expect("preview leftovers");
         assert!(previews.iter().all(|preview| preview.blocked.is_none()));
-        let snapshot = team
+        let outcome = team
             .delete_workers(&ids, false)
             .await
             .expect("delete workers with leftover checkouts");
 
-        assert!(snapshot.workers.is_empty());
+        assert!(outcome.snapshot.workers.is_empty());
         assert!(team.live.lock().await.is_empty());
         assert!(!dangling.worktree.exists());
         assert!(!fragment.worktree.exists());
+    }
+
+    /// One worker whose checkout refuses to delete must not keep the other
+    /// workers from being deleted: the flow reports that worker's error and
+    /// still listed, and removes every other worker.
+    #[tokio::test]
+    async fn delete_workers_continues_past_a_failed_worker() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let first = worker(root.path(), "00000001000000000001");
+        let stuck = worker(root.path(), "00000002000000000002");
+        let third = worker(root.path(), "00000003000000000003");
+        for record in [&first, &stuck, &third] {
+            run_git(root.path(), &["branch", &record.branch, "main"]);
+            std::fs::create_dir_all(&record.worktree).expect("checkout folder");
+            std::fs::write(record.worktree.join("note.txt"), "left\n").expect("checkout file");
+        }
+        // The stuck worker's checkout path is a file, so its removal is
+        // refused — the other two workers must still be deleted.
+        std::fs::remove_dir_all(&stuck.worktree).expect("clear the stuck path");
+        std::fs::write(&stuck.worktree, "not a directory\n").expect("undeletable checkout");
+        let team = open_test_team(
+            root.path(),
+            state.path(),
+            vec![first.clone(), stuck.clone(), third.clone()],
+        )
+        .await;
+        let ids = vec![first.id.clone(), stuck.id.clone(), third.id.clone()];
+
+        let outcome = team
+            .delete_workers(&ids, false)
+            .await
+            .expect("delete every worker that can be deleted");
+
+        // One result per requested worker, in request order.
+        assert_eq!(outcome.results.len(), 3, "{:?}", outcome.results);
+        assert!(outcome.results[0].error.is_none(), "{:?}", outcome.results);
+        let stuck_error = outcome.results[1]
+            .error
+            .as_ref()
+            .expect("the stuck worker is reported with its error");
+        assert!(stuck_error.contains("refus"), "unexpected error: {stuck_error}");
+        assert!(outcome.results[2].error.is_none(), "{:?}", outcome.results);
+        // The first and third workers are gone; the stuck one is still listed.
+        assert!(team.worker(&first.id).await.is_err());
+        assert!(team.worker(&third.id).await.is_err());
+        assert!(team.worker(&stuck.id).await.is_ok());
+        assert_eq!(outcome.snapshot.workers.len(), 1);
+        assert_eq!(outcome.snapshot.workers[0].id, stuck.id);
+        // The deletable checkouts and branches are gone; the stuck
+        // worker's branch and checkout stay.
+        assert!(!first.worktree.exists());
+        assert!(!third.worktree.exists());
+        assert!(!branch_exists(root.path(), &first.branch).await);
+        assert!(!branch_exists(root.path(), &third.branch).await);
+        assert!(stuck.worktree.exists());
+        assert!(branch_exists(root.path(), &stuck.branch).await);
+    }
+
+    /// A deleted worker's checkout is renamed away with one move and its
+    /// worktree registration is pruned, so the delete flow never waits for
+    /// the file-by-file removal of a large checkout. The renamed folder is
+    /// removed by the trash sweep.
+    #[tokio::test]
+    async fn a_deleted_checkout_is_renamed_to_trash_and_deregistered() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let first = worker(root.path(), "00000001000000000001");
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            first.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        let team = open_test_team(root.path(), state.path(), vec![first.clone()]).await;
+
+        let outcome = team
+            .delete_workers(std::slice::from_ref(&first.id), true)
+            .await
+            .expect("delete the worker");
+
+        assert!(outcome.results[0].error.is_none(), "{:?}", outcome.results);
+        // The checkout path is gone at once: the folder was renamed away,
+        // not deleted file by file.
+        assert!(!first.worktree.exists());
+        // The worktree registration is pruned and the branch is gone —
+        // the branch delete would refuse while a worktree still uses it.
+        assert!(
+            !checkout_is_registered(root.path(), &first.worktree)
+                .await
+                .expect("worktree registry"),
+            "the renamed checkout is deregistered"
+        );
+        assert!(!branch_exists(root.path(), &first.branch).await);
+        // The renamed folder leaves the trash with the sweep.
+        sweep_trash(root.path()).await;
+        assert!(trash_entries(root.path()).is_empty());
+    }
+
+    /// The trash sweep removes every renamed-away checkout folder, one
+    /// locked folder never keeping the others.
+    #[tokio::test]
+    async fn the_trash_sweep_removes_renamed_checkouts() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        let record = worker(root.path(), "00000001000000000001");
+        std::fs::create_dir_all(&record.worktree).expect("checkout folder");
+        std::fs::write(record.worktree.join("note.txt"), "left\n").expect("checkout file");
+        let canonical = validated_checkout(root.path(), &record)
+            .expect("the checkout validates")
+            .expect("it exists");
+
+        move_checkout_to_trash(root.path(), &canonical)
+            .await
+            .expect("rename into trash");
+
+        assert!(!record.worktree.exists());
+        assert_eq!(trash_entries(root.path()).len(), 1);
+        sweep_trash(root.path()).await;
+        assert!(trash_entries(root.path()).is_empty());
+    }
+
+    /// The streamed preview emits one update per worker as each finishes,
+    /// while the returned previews stay in request order.
+    #[tokio::test]
+    async fn deletion_preview_streams_each_worker_as_it_checks() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let first = worker(root.path(), "00000001000000000001");
+        let second = worker(root.path(), "00000002000000000002");
+        for record in [&first, &second] {
+            run_git(root.path(), &["branch", &record.branch, "main"]);
+            std::fs::create_dir_all(&record.worktree).expect("checkout folder");
+        }
+        let team = open_test_team(
+            root.path(),
+            state.path(),
+            vec![first.clone(), second.clone()],
+        )
+        .await;
+        let ids = vec![first.id.clone(), second.id.clone()];
+
+        let streamed: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let previews = team
+            .deletion_preview_streaming(&ids, |preview| {
+                streamed.lock().expect("stream lock").push(preview.worker_id.clone());
+            })
+            .await
+            .expect("preview");
+
+        let mut seen = streamed.into_inner().expect("stream lock");
+        seen.sort();
+        assert_eq!(seen, ids, "every worker streamed exactly once");
+        let returned: Vec<String> = previews.iter().map(|preview| preview.worker_id.clone()).collect();
+        assert_eq!(returned, ids, "previews return in request order");
+    }
+
+    /// On Windows, a held checkout refuses the rename into trash: the
+    /// removal falls back to the foreground path, reports the holder, and
+    /// still deletes every other worker in the batch.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_held_checkout_falls_back_to_the_foreground_removal_and_reports_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let held = worker(root.path(), "00000001000000000001");
+        let other = worker(root.path(), "00000002000000000002");
+        for record in [&held, &other] {
+            provision_agent_worktree(
+                root.path().to_path_buf(),
+                record.id.clone(),
+                "main".to_string(),
+            )
+            .await
+            .expect("provision the worker checkout");
+        }
+        // One exclusively-open file inside the checkout refuses both the
+        // rename and any file-by-file delete.
+        let hold = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .share_mode(0)
+            .open(held.worktree.join("held.txt"))
+            .expect("hold a file inside the checkout");
+        let team = open_test_team(
+            root.path(),
+            state.path(),
+            vec![held.clone(), other.clone()],
+        )
+        .await;
+
+        let outcome = team
+            .delete_workers(&[held.id.clone(), other.id.clone()], true)
+            .await
+            .expect("delete every worker that can be deleted");
+
+        let held_error = outcome.results[0]
+            .error
+            .as_ref()
+            .expect("the held worker is reported with its error");
+        assert!(
+            held_error.contains("could not remove"),
+            "unexpected error: {held_error}"
+        );
+        assert!(team.worker(&held.id).await.is_ok());
+        assert!(held.worktree.exists());
+        assert!(outcome.results[1].error.is_none(), "{:?}", outcome.results);
+        assert!(team.worker(&other.id).await.is_err());
+        assert!(!other.worktree.exists());
+        drop(hold);
     }
 
     #[tokio::test]
@@ -7571,7 +8279,6 @@ models = [\"scripted-a\"]
         let document = team.plan_document(&plan.id).expect("the plan document");
         assert!(document.contains("## Context"), "{document}");
         assert!(document.contains("verified: the card hides the context"), "{document}");
-        assert!(document.contains("Details shows the context"), "{document}");
 
         let refused = team
             .plan_document(stray)

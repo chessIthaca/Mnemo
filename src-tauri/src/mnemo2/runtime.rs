@@ -7921,8 +7921,8 @@ mod tests {
             !preview[0].discards_work(),
             "nothing beyond the lead branch: {preview:?}"
         );
-        let snapshot = team.delete_workers(&ids, false).await.expect("delete");
-        assert!(snapshot.workers.iter().all(|record| record.id != worker.id));
+        let outcome = team.delete_workers(&ids, false).await.expect("delete");
+        assert!(outcome.snapshot.workers.iter().all(|record| record.id != worker.id));
         assert!(team.worker(&worker.id).await.is_err());
         assert!(!worker.worktree.exists(), "the checkout is removed");
         assert!(
@@ -7966,18 +7966,30 @@ mod tests {
         let preview = team.deletion_preview(&ids).await.expect("preview");
         assert_eq!(preview[0].unmerged_commits, 1, "{preview:?}");
         assert!(preview[0].uncommitted, "{preview:?}");
-        let refused = team
+        // Without confirmation the worker is not deleted — its per-worker
+        // result reports why, and the outcome still reports it listed.
+        let outcome = team
             .delete_workers(&ids, false)
             .await
-            .expect_err("unmerged work is not discarded silently");
+            .expect("the batch reports the refused worker instead of failing");
+        let refused = outcome.results[0]
+            .error
+            .as_ref()
+            .expect("the unconfirmed worker is refused");
         assert!(refused.contains("confirm discarding"), "{refused}");
         assert!(team.worker(&worker.id).await.is_ok(), "nothing was deleted");
         assert!(worker.worktree.exists());
         assert!(branch_exists(root.path(), &worker.branch));
 
-        team.delete_workers(&ids, true)
+        let confirmed = team
+            .delete_workers(&ids, true)
             .await
             .expect("confirmed delete");
+        assert!(
+            confirmed.results[0].error.is_none(),
+            "{:?}",
+            confirmed.results
+        );
         assert!(team.worker(&worker.id).await.is_err());
         assert!(!worker.worktree.exists());
         assert!(!branch_exists(root.path(), &worker.branch));

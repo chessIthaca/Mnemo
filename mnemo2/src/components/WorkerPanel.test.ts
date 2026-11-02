@@ -144,11 +144,14 @@ function makeTeamTransport(records: TeamWorkerRecord[]): TeamTransport & { emit:
         superseded_by: null,
       })),
     ),
-    deleteWorkers: vi.fn(async () => ({
-      workers: current,
-      slots: 3,
-      active: 1,
-      usage: emptyProjectUsageView(),
+    deleteWorkers: vi.fn(async (ids: string[]) => ({
+      results: ids.map((id) => ({ worker_id: id, name: "Worker", error: null })),
+      snapshot: {
+        workers: current,
+        slots: 3,
+        active: 1,
+        usage: emptyProjectUsageView(),
+      },
     })),
     messages: vi.fn(async () => []),
     onEvent: vi.fn(async (listener: (event: TeamEvent) => void) => {

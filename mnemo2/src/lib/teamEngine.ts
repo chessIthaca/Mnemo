@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { isTauriRuntime } from "./runtime";
 import type {
+  TeamDeleteOutcome,
   TeamEvent,
   TeamFinding,
   TeamMessage,
@@ -14,6 +15,26 @@ import type {
 /** The channel emitted by the native team runtime. */
 export const TEAM_EVENT_CHANNEL = "mnemo2://team-event";
 
+/** The channel streaming per-worker deletion progress. */
+export const DELETION_EVENT_CHANNEL = "mnemo2://worker-deletion";
+
+/** Which phase of a deletion flow a streamed update belongs to. */
+export type WorkerDeletionPhase = "checking" | "deleting";
+
+/**
+ * One streamed per-worker update of a deletion flow
+ * (`mnemo2://worker-deletion`), emitted the moment it is known so the
+ * open sheet can fill its rows in.
+ */
+export interface WorkerDeletionProgress {
+  phase: WorkerDeletionPhase;
+  worker_id: string;
+  name: string;
+  /** The worker's finished preview; null in the deleting phase. */
+  preview: WorkerDeletionPreview | null;
+  /** Why this worker's deletion failed; null when it was deleted. */
+  error: string | null;
+}
 export interface TeamTransportBindings {
   invoke: typeof invoke;
   listen: typeof listen;
@@ -71,9 +92,15 @@ export interface TeamTransport {
   stopAll(): Promise<void>;
   setSlots(slots: number): Promise<TeamSnapshot>;
   deletePreview(workerIds: string[]): Promise<WorkerDeletionPreview[]>;
-  deleteWorkers(workerIds: string[], discardWork: boolean): Promise<TeamSnapshot>;
+  deleteWorkers(workerIds: string[], discardWork: boolean): Promise<TeamDeleteOutcome>;
   messages(): Promise<TeamMessage[]>;
   onEvent(handler: (event: TeamEvent) => void): Promise<UnlistenFn>;
+  /**
+   * Streamed per-worker deletion progress; optional so hosts and mocks
+   * predating the channel keep working (rows then fill in when the
+   * preview result resolves).
+   */
+  onDeletionEvent?(handler: (event: WorkerDeletionProgress) => void): Promise<UnlistenFn>;
 }
 
 /** Build the native team transport from real Tauri bindings. */
@@ -146,10 +173,14 @@ export function createTauriTeamTransport(
     deletePreview: (workerIds) =>
       bindings.invoke<WorkerDeletionPreview[]>("team_delete_preview", { workerIds }),
     deleteWorkers: (workerIds, discardWork) =>
-      bindings.invoke<TeamSnapshot>("team_delete", { workerIds, discardWork }),
+      bindings.invoke<TeamDeleteOutcome>("team_delete", { workerIds, discardWork }),
     messages: () => bindings.invoke<TeamMessage[]>("team_messages"),
     onEvent: (handler) =>
       bindings.listen<TeamEvent>(TEAM_EVENT_CHANNEL, (event) =>
+        handler(event.payload),
+      ),
+    onDeletionEvent: (handler) =>
+      bindings.listen<WorkerDeletionProgress>(DELETION_EVENT_CHANNEL, (event) =>
         handler(event.payload),
       ),
   };

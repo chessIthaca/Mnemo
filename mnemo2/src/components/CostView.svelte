@@ -124,8 +124,8 @@
                   <p class="lever-explain">{lever.explanation}</p>
                 </div>
                 <div class="lever-numbers">
-                  <p class="lever-tokens">{lever.tokensLabel} tokens · {lever.eventsLabel}</p>
-                  <p class="lever-cost">{lever.costLabel}</p>
+                  <p class="lever-tokens" class:readded={lever.readded}>{lever.metaLabel}</p>
+                  {#if lever.costLabel !== ""}<p class="lever-cost">{lever.costLabel}</p>{/if}
                 </div>
               </li>
             {/each}
@@ -282,6 +282,7 @@
   .lever-numbers { display: grid; gap: 2px; justify-items: end; text-align: right; }
   .lever-numbers p { margin: 0; font-size: var(--text-body); font-variant-numeric: tabular-nums; }
   .lever-tokens { color: var(--ink-soft); }
+  .lever-tokens.readded { color: var(--muted); }
 
   .cache-row { display: flex; align-items: center; gap: 14px; }
   .cache-hit { margin: 0; font-family: var(--font-prose); font-size: var(--text-title); font-weight: 620; }

@@ -295,12 +295,14 @@ export interface CostLeverRow {
   label: string;
   /** A one-line explanation of the lever. */
   explanation: string;
-  /** "40 events", for scale behind the token count. */
-  eventsLabel: string;
-  /** Tokens saved, signed and formatted. */
-  tokensLabel: string;
-  /** The estimated dollars cell: "≈ $0.18" or "—". */
+  /** The whole meta cell: "1,200,000 tokens · 40 events", or
+   * "+120,000 tokens re-added · 6 events" for a cost row. */
+  metaLabel: string;
+  /** The estimated dollars cell: "≈ $0.18" or "—" without a price. A lever
+   * that re-added tokens is a cost, not a saving: it shows no dollars at all. */
   costLabel: string;
+  /** Whether the lever re-added tokens (a cost, not a saving). */
+  readded: boolean;
 }
 
 /** One merged day column shared by both bar charts. */
@@ -388,14 +390,24 @@ function modelRows(models: ModelCost[]): CostModelRow[] {
 function leverRows(levers: SavingsLever[]): CostLeverRow[] {
   return [...levers]
     .sort((a, b) => b.tokens_saved - a.tokens_saved)
-    .map((lever) => ({
-      kind: lever.kind,
-      label: leverLabel(lever.kind),
-      explanation: leverExplanation(lever.kind),
-      eventsLabel: `${formatTokenCount(lever.events)} ${lever.events === 1 ? "event" : "events"}`,
-      tokensLabel: formatSignedTokens(lever.tokens_saved),
-      costLabel: formatEstimate(lever.estimated_saved_micros),
-    }));
+    .map((lever) => {
+      const eventsLabel = `${formatTokenCount(lever.events)} ${lever.events === 1 ? "event" : "events"}`;
+      // A net-negative lever (an expansion re-adding tokens) is a cost, not a
+      // saving: the backend prices it at $0 (insights.rs clamps at
+      // `tokens.max(0)`), so the row shows the tokens it re-added and no dollar
+      // figure — dollars next to a minus would read as a saving either way.
+      const readded = lever.tokens_saved < 0;
+      return {
+        kind: lever.kind,
+        label: leverLabel(lever.kind),
+        explanation: leverExplanation(lever.kind),
+        metaLabel: readded
+          ? `+${formatSignedTokens(-lever.tokens_saved)} tokens re-added · ${eventsLabel}`
+          : `${formatSignedTokens(lever.tokens_saved)} tokens · ${eventsLabel}`,
+        costLabel: readded ? "" : formatEstimate(lever.estimated_saved_micros),
+        readded,
+      };
+    });
 }
 
 /** Merge the spend and savings day series into one aligned column set. */

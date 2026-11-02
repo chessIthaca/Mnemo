@@ -421,7 +421,7 @@ function previewCostInsights(): CostInsights {
     },
     savings: {
       tokens_saved: 8_946_000,
-      estimated_saved_micros: 2_420_000,
+      estimated_saved_micros: 2_380_000,
       levers: [
         { kind: "delta_read", events: 1_240, tokens_saved: 4_180_000, estimated_saved_micros: 1_090_000 },
         { kind: "skeleton", events: 862, tokens_saved: 1_910_000, estimated_saved_micros: 505_000 },
@@ -431,7 +431,7 @@ function previewCostInsights(): CostInsights {
         { kind: "outline", events: 102, tokens_saved: 246_000, estimated_saved_micros: 65_000 },
         { kind: "truncation", events: 61, tokens_saved: 150_000, estimated_saved_micros: 39_000 },
         { kind: "compaction_checkpoint", events: 9, tokens_saved: 0, estimated_saved_micros: 0 },
-        { kind: "archive_expand", events: 6, tokens_saved: -120_000, estimated_saved_micros: 40_000 },
+        { kind: "archive_expand", events: 6, tokens_saved: -120_000, estimated_saved_micros: 0 },
       ],
       cache: {
         prompt_tokens: 12_400_000,

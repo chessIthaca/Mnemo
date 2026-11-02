@@ -55,10 +55,10 @@ const cost = (overrides: Partial<CostReport> = {}): CostReport => ({
 
 const savings = (overrides: Partial<SavingsReport> = {}): SavingsReport => ({
   tokens_saved: 1_160_000,
-  estimated_saved_micros: 200_000,
+  estimated_saved_micros: 180_000,
   levers: [
     { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000 },
-    { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: 20_000 },
+    { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: 0 },
   ],
   cache: { prompt_tokens: 2_000_000, cached_tokens: 1_540_000, hit_rate: 0.77, estimated_saved_micros: 120_000 },
   per_day: [
@@ -140,19 +140,45 @@ describe("costViewModel", () => {
     expect(view.unpricedLabel).toBe("qwen3:32b");
   });
 
-  it("gives every lever a friendly name, an explanation and a signed count", () => {
+  it("gives every lever a friendly name, an explanation and a dollar figure", () => {
     const view = costViewModel(cost(), savings());
     expect(view.levers[0]).toMatchObject({
       kind: "delta_read",
       label: "Delta reads",
-      tokensLabel: "1,200,000",
-      eventsLabel: "40 events",
+      metaLabel: "1,200,000 tokens · 40 events",
       costLabel: "≈ $0.18",
     });
-    // The negative expansion sinks to the bottom but keeps its minus sign.
-    expect(view.levers[1]).toMatchObject({ kind: "archive_expand", tokensLabel: "-40,000" });
     expect(view.savingsTokensLabel).toBe("1,160,000");
-    expect(view.savingsCostLabel).toBe("≈ $0.20");
+    expect(view.savingsCostLabel).toBe("≈ $0.18");
+  });
+
+  it("renders a net-negative lever as a cost row with no dollar figure", () => {
+    const view = costViewModel(cost(), savings());
+    // The expansion sinks to the bottom and shows the tokens it re-added.
+    expect(view.levers[1]).toMatchObject({
+      kind: "archive_expand",
+      readded: true,
+      metaLabel: "+40,000 tokens re-added · 2 events",
+      costLabel: "",
+    });
+  });
+
+  it("never shows dollars on a negative lever, even when the wire carries them", () => {
+    // The backend prices negative savings at $0 (insights.rs clamps at
+    // `tokens.max(0)`); a wire claiming dollars anyway is ignored — the row
+    // stays a cost, not a saving.
+    const inconsistent = savings({
+      levers: [
+        { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000 },
+        { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: 20_000 },
+      ],
+    });
+    const view = costViewModel(cost(), inconsistent);
+    expect(view.levers[1]).toMatchObject({
+      readded: true,
+      metaLabel: "+40,000 tokens re-added · 2 events",
+      costLabel: "",
+    });
   });
 
   it("reports the prompt cache hit rate and its dollars", () => {

@@ -95,6 +95,15 @@
   {#each worker.messages as entry (entry.id)}
     {#if entry.kind === "tool"}
       <div class="thread-tool"><ToolActivity {entry} /></div>
+    {:else if entry.kind === "error"}
+      {#if entry.retrying}
+        <div class="thread-error-note" role="status">Provider error, retrying: {entry.body}</div>
+      {:else}
+        <div class="thread-error" role="alert">
+          <span>WORKER ERROR</span>
+          <p>{entry.body}</p>
+        </div>
+      {/if}
     {:else}
       <div class="thread-message" class:from-lead={entry.from === "lead"} class:from-harness={entry.from === "harness"}>
         <span>{entry.from === "lead" ? "LEAD" : entry.from === "harness" ? "HARNESS NOTE" : worker.name.toUpperCase()} · {entry.time}</span>
@@ -110,6 +119,13 @@
         pulse={worker.activity.phase !== "waiting"}
       />
     </div>
+  {/if}
+  {#if worker.status === "failed" && worker.error}
+    <article class="thread-error thread-failure" role="alert">
+      <span>WORKER FAILED</span>
+      <p>{worker.error}</p>
+      <p class="failure-detail">The lead can resume this worker on another model.</p>
+    </article>
   {/if}
 {/snippet}
 
@@ -150,6 +166,11 @@
   .thread-message.from-harness .thread-message-body { border: 1px dashed var(--line-strong); background: transparent; color: var(--muted); }
   .thread-message + .thread-message, .thread-tool + .thread-message { margin-top: 12px; }
   .thread-tool { min-width: 0; margin: 4px 0; }
+  .thread-error { margin-top: 12px; padding: 12px 14px; border: 1px solid var(--danger-tint-line); border-radius: 12px; background: var(--danger-tint); }
+  .thread-error > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: var(--text-meta); font-weight: 650; letter-spacing: 0.08em; }
+  .thread-error p { margin: 0; color: var(--danger); font-size: var(--text-body); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .thread-error .failure-detail { margin-top: 5px; color: var(--muted); font-size: var(--text-body); }
+  .thread-error-note { margin-top: 12px; padding: 8px 10px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--muted); font-size: var(--text-body); }
   .thread-activity { margin-top: 12px; }
   .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
   .screenshot-links > span { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }

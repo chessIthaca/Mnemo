@@ -167,8 +167,19 @@ export interface WorkerMessage {
   time: string;
 }
 
-/** One item of a worker's thread: a Markdown message or a tool activity. */
-export type WorkerThreadEntry = WorkerMessage | Extract<LeadEntry, { kind: "tool" }>;
+/** A provider or runtime error in a worker's live stream, shown in its thread. */
+export interface WorkerErrorEntry {
+  id: string;
+  kind: "error";
+  time: string;
+  /** The provider's or runtime's error text. */
+  body: string;
+  /** True while the worker retries the request: a muted note that clears once the stream resumes. */
+  retrying: boolean;
+}
+
+/** One item of a worker's thread: a Markdown message, a tool activity, or a live error. */
+export type WorkerThreadEntry = WorkerMessage | WorkerErrorEntry | Extract<LeadEntry, { kind: "tool" }>;
 
 export interface DiffStats {
   files: number;
@@ -217,6 +228,8 @@ export interface Worker {
   task: string;
   summary: string;
   status: WorkerStatus;
+  /** The failure text from the worker's record, shown when it failed; null otherwise. */
+  error: string | null;
   model: string;
   /** The `endpoint/model` spec the worker was given; null = the configured default. */
   modelSpec?: string | null;

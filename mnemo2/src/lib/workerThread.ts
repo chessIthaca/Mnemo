@@ -149,10 +149,30 @@ function updateTool(live: WorkerLive, match: (entry: ToolEntry) => boolean, upda
   return { ...live, entries };
 }
 
+/** The error text a provider or runtime failure reported, with the lead's wording. */
+function errorTextOf(payload: Record<string, unknown>): string {
+  if (typeof payload.error === "string" && payload.error) return payload.error;
+  if (typeof payload.message === "string" && payload.message) return payload.message;
+  return "The worker stopped with an error.";
+}
+
+/** Drop the transient retrying-error note: with the stream resumed it no longer applies. */
+function dropRetryNotes(live: WorkerLive): WorkerLive {
+  if (!live.entries.some((entry) => entry.kind === "error" && entry.retrying)) return live;
+  return {
+    ...live,
+    entries: live.entries.filter((entry) => !(entry.kind === "error" && entry.retrying)),
+  };
+}
+
 /** Fold one worker event into its live thread tail. */
 export function applyWorkerLiveEvent(live: WorkerLive, event: TeamEvent): WorkerLive {
   const payload = event.event?.event as Record<string, unknown> | undefined;
   if (!payload) return live;
+  // A retrying provider error holds a transient note at the thread's end; any
+  // other event — streamed text, a tool, the turn ending — means the stream
+  // resumed, so the note goes away before the event itself is folded in.
+  if (payload.kind !== "error") live = dropRetryNotes(live);
   switch (payload.kind) {
     case "started":
     case "finished":
@@ -257,6 +277,29 @@ export function applyWorkerLiveEvent(live: WorkerLive, event: TeamEvent): Worker
           result: normalizeToolResult(payload.result),
         }),
       );
+    }
+    case "error": {
+      const retrying = payload.retrying === true;
+      // A newer provider error replaces the transient retrying note — the
+      // thread never holds two notes at once.
+      const base = dropRetryNotes(live);
+      return {
+        ...base,
+        sequence: base.sequence + 1,
+        // Retrying keeps the half-written message open so resumed text
+        // continues it; a final error closes the stream for good.
+        streamingId: retrying ? live.streamingId : null,
+        entries: [
+          ...base.entries,
+          {
+            id: `live-error-${event.worker_id}-${event.generation}-${base.sequence}`,
+            kind: "error",
+            time: "now",
+            body: errorTextOf(payload),
+            retrying,
+          },
+        ],
+      };
     }
     default:
       return live;

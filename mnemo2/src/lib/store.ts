@@ -2293,6 +2293,7 @@ function workerFromRecord(
     hue: (index * 47 + 12) % 360,
     task: record.brief,
     summary: record.error ?? "",
+    error: record.error ?? null,
     status,
     model: record.model_id ?? record.model ?? "",
     modelSpec: record.model,

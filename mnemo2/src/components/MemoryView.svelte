@@ -1,0 +1,484 @@
+<script lang="ts">
+  import { onDestroy } from "svelte";
+  import { Brain, Search } from "@lucide/svelte";
+  import {
+    createMemoryTransport,
+    displayTitle,
+    embedderLabel,
+    formatRecordDate,
+    formatScore,
+    kindLabel,
+    isHit,
+    KIND_CHIPS,
+    LIST_PAGE_SIZE,
+    mergePage,
+    type MemoryDetail,
+    type MemoryHit,
+    type MemoryOverview,
+    type MemoryRow,
+  } from "../lib/memoryView";
+  import Markdown from "./Markdown.svelte";
+
+  const transport = createMemoryTransport();
+
+  /** How long typing settles before a search runs. */
+  const SEARCH_DEBOUNCE_MS = 200;
+  /** How many hits the search box asks for. */
+  const SEARCH_LIMIT = 40;
+  /** How many recall-test rows the Diagnostics box asks for. */
+  const RECALL_LIMIT = 8;
+
+  let rows = $state<MemoryRow[]>([]);
+  let offset = $state(0);
+  let hasMore = $state(false);
+  let kind = $state("all");
+  let loadingList = $state(false);
+  let listError = $state("");
+
+  let query = $state("");
+  let hits = $state<MemoryHit[] | null>(null);
+  let searchError = $state("");
+
+  let detail = $state<MemoryDetail | null>(null);
+  let detailError = $state("");
+
+  let overview = $state<MemoryOverview | null>(null);
+  let overviewError = $state("");
+  let recallQuery = $state("");
+  let recallHits = $state<MemoryHit[] | null>(null);
+  let recallError = $state("");
+
+  /** Turn a rejected command into one readable line (errors stay inline). */
+  function errorMessage(value: unknown): string {
+    if (typeof value === "string") return value;
+    return value instanceof Error ? value.message : "Reading the project's memory failed.";
+  }
+
+  /** One record in the reader, or the error that kept it out. */
+  async function selectRecord(id: string): Promise<void> {
+    if (!transport) return;
+    try {
+      detail = await transport.read(id);
+      detailError = "";
+    } catch (failure) {
+      detailError = errorMessage(failure);
+    }
+  }
+
+  /** The list's first page (reset) or its next page (append). */
+  async function loadList(reset: boolean): Promise<void> {
+    if (!transport) return;
+    loadingList = true;
+    try {
+      const page = await transport.list({
+        kind,
+        offset: reset ? 0 : offset,
+        limit: LIST_PAGE_SIZE,
+      });
+      rows = reset ? page.rows : mergePage(rows, page);
+      offset = page.offset + page.rows.length;
+      hasMore = page.has_more;
+      listError = "";
+      // Never open on an empty reading pane: the newest record is the one the
+      // tab is about, and it is what a reviewer wants to see first.
+      if (reset && page.rows.length > 0) void selectRecord(page.rows[0].id);
+      if (reset) detail = reset && page.rows.length === 0 ? null : detail;
+    } catch (failure) {
+      listError = errorMessage(failure);
+    } finally {
+      loadingList = false;
+    }
+  }
+
+  /** Swap the type filter and start the list over at page one. */
+  function selectKind(value: string): void {
+    if (kind === value) return;
+    kind = value;
+    hits = null;
+    query = "";
+    searchError = "";
+    void loadList(true);
+  }
+
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Run the text search (immediately on Enter, debounced while typing). */
+  async function runSearch(): Promise<void> {
+    if (!transport) return;
+    const text = query.trim();
+    if (text === "") {
+      hits = null;
+      searchError = "";
+      return;
+    }
+    try {
+      hits = await transport.search(text, SEARCH_LIMIT);
+      searchError = "";
+    } catch (failure) {
+      searchError = errorMessage(failure);
+    }
+  }
+
+  function onSearchInput(): void {
+    clearTimeout(searchTimer);
+    if (query.trim() === "") {
+      hits = null;
+      searchError = "";
+      return;
+    }
+    searchTimer = setTimeout(() => void runSearch(), SEARCH_DEBOUNCE_MS);
+  }
+
+  function onSearchSubmit(event: SubmitEvent): void {
+    event.preventDefault();
+    clearTimeout(searchTimer);
+    void runSearch();
+  }
+
+  /** The Diagnostics card: embedder, counts, index bookkeeping. */
+  async function loadOverview(): Promise<void> {
+    if (!transport) return;
+    try {
+      overview = await transport.overview();
+      overviewError = "";
+    } catch (failure) {
+      overviewError = errorMessage(failure);
+    }
+  }
+
+  /** The Diagnostics recall test — the store's own ranking, best first. */
+  async function runRecall(): Promise<void> {
+    if (!transport) return;
+    const text = recallQuery.trim();
+    if (text === "") return;
+    try {
+      recallHits = await transport.recallTest(text, RECALL_LIMIT);
+      recallError = "";
+    } catch (failure) {
+      recallError = errorMessage(failure);
+    }
+  }
+
+  // The tab mounts only while its route is active, so this first read is the
+  // tab-open load; no poll — knowledge changes when the agent or the user
+  // writes a record, not on a clock.
+  $effect(() => {
+    if (!transport) return;
+    void loadList(true);
+    void loadOverview();
+  });
+
+  onDestroy(() => clearTimeout(searchTimer));
+
+  /** The rows the list renders: search hits when a query ran, else the page. */
+  const listed = $derived(hits ?? rows);
+  const listIsSearch = $derived(hits !== null);
+</script>
+
+<section class="memory-view" aria-label="Memory">
+  <header class="memory-header">
+    <h1>Memory</h1>
+    <p>The project's knowledge records and memories, newest first. Read-only.</p>
+  </header>
+
+  {#if transport === null}
+    <div class="memory-placeholder">
+      <Brain size={22} />
+      <p>The Memory tab is available in the desktop app.</p>
+    </div>
+  {:else}
+    <div class="memory-body">
+      <aside class="memory-side" aria-label="Records">
+        <form class="list-search" role="search" onsubmit={onSearchSubmit}>
+          <Search size={13} />
+          <input
+            type="search"
+            placeholder="Search records"
+            aria-label="Search records"
+            bind:value={query}
+            oninput={onSearchInput}
+          />
+        </form>
+
+        <div class="chip-row" role="group" aria-label="Record type">
+          {#each KIND_CHIPS as chip (chip.value)}
+            <button
+              class="chip"
+              class:active={kind === chip.value}
+              aria-pressed={kind === chip.value}
+              onclick={() => selectKind(chip.value)}
+            >{chip.label}</button>
+          {/each}
+        </div>
+
+        <p class="list-status" role="status">
+          {#if listIsSearch}
+            {listed.length} matching {listed.length === 1 ? "record" : "records"}
+          {:else}
+            {rows.length}{hasMore ? "+" : ""} {rows.length === 1 ? "record" : "records"}
+          {/if}
+        </p>
+
+        {#if listError !== ""}
+          <p class="list-error" role="alert">{listError}</p>
+        {/if}
+        {#if searchError !== ""}
+          <p class="list-error" role="alert">{searchError}</p>
+        {/if}
+
+        <div class="list-scroll">
+          {#if listed.length === 0 && !loadingList}
+            <p class="list-empty">
+              {listIsSearch ? "No record matches that text." : "No record matches this filter."}
+            </p>
+          {/if}
+          <ul class="record-list">
+            {#each listed as row (row.id)}
+              <li>
+                <button
+                  class="record-row"
+                  class:active={detail?.id === row.id}
+                  aria-current={detail?.id === row.id ? "true" : undefined}
+                  onclick={() => void selectRecord(row.id)}
+                >
+                  <span class="record-top">
+                    <span class="badge" data-kind={row.kind}>{kindLabel(row.kind)}</span>
+                    <span class="record-date">{formatRecordDate(row.created_at)}</span>
+                    {#if isHit(row)}<span class="record-score">{formatScore(row.score)}</span>{/if}
+                  </span>
+                  <span class="record-title">{displayTitle(row.title)}</span>
+                  <span class="record-preview">{row.preview}</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+          {#if !listIsSearch && hasMore}
+            <button class="load-more" disabled={loadingList} onclick={() => void loadList(false)}>
+              {loadingList ? "Loading …" : "Load more"}
+            </button>
+          {/if}
+        </div>
+
+        <details class="diagnostics">
+          <summary>Diagnostics</summary>
+          <div class="diagnostics-body">
+            {#if overviewError !== ""}
+              <p class="list-error" role="alert">{overviewError}</p>
+            {:else if overview === null}
+              <p class="diag-quiet">Reading the memory store …</p>
+            {:else if !overview.available}
+              <p class="diag-quiet">{overview.reason}</p>
+            {:else}
+              <dl class="diag-grid">
+                <dt>Embedder</dt>
+                <dd>{overview.model_id} · {overview.dim} dims · {embedderLabel(overview.embedder)}</dd>
+                <dt>Configured</dt>
+                <dd>{overview.configured_model ?? "hash (built-in)"}</dd>
+                <dt>Vectors</dt>
+                <dd>
+                  {#if overview.fingerprints.length === 0}
+                    none stored yet
+                  {:else}
+                    {#each overview.fingerprints as fingerprint (`${fingerprint.model}:${fingerprint.dim}`)}
+                      {fingerprint.model} · {fingerprint.dim}
+                    {/each}
+                    {#if !overview.fingerprint_matches}<span class="diag-warn">model changed — re-embeds at the next start</span>{/if}
+                  {/if}
+                </dd>
+                <dt>Tiers</dt>
+                <dd>
+                  {overview.counts.working} working · {overview.counts.episodic} episodic ·
+                  {overview.counts.semantic} semantic · {overview.counts.procedural} procedural
+                </dd>
+                <dt>Index</dt>
+                <dd>
+                  {#if overview.index}
+                    {overview.index.authored_count} authored · {overview.index.derived_count} derived ·
+                    built {formatRecordDate(overview.index.last_built_at)}
+                  {:else}
+                    not built yet
+                  {/if}
+                </dd>
+              </dl>
+
+              <form
+                class="recall-box"
+                onsubmit={(event) => {
+                  event.preventDefault();
+                  void runRecall();
+                }}
+              >
+                <label for="recall-query">Recall test</label>
+                <div class="recall-input">
+                  <input id="recall-query" type="search" placeholder="Ask the store" bind:value={recallQuery} />
+                  <button class="button button-quiet" type="submit" disabled={recallQuery.trim() === ""}>Recall</button>
+                </div>
+              </form>
+              {#if recallError !== ""}
+                <p class="list-error" role="alert">{recallError}</p>
+              {:else if recallHits !== null}
+                {#if recallHits.length === 0}
+                  <p class="diag-quiet">Nothing matched.</p>
+                {:else}
+                  <ol class="recall-list">
+                    {#each recallHits as hit (hit.id)}
+                      <li>
+                        <button class="recall-hit" onclick={() => void selectRecord(hit.id)}>
+                          <span class="badge" data-kind={hit.kind}>{kindLabel(hit.kind)}</span>
+                          <span class="recall-title">{displayTitle(hit.title)}</span>
+                          <span class="record-score">{formatScore(hit.score)}</span>
+                        </button>
+                      </li>
+                    {/each}
+                  </ol>
+                {/if}
+              {/if}
+            {/if}
+          </div>
+        </details>
+      </aside>
+
+      <div class="memory-reader">
+        {#if detailError !== ""}
+          <div class="memory-placeholder">
+            <p role="alert">{detailError}</p>
+          </div>
+        {:else if detail === null}
+          <div class="memory-placeholder">
+            <Brain size={22} />
+            <p>Pick a record to read it.</p>
+          </div>
+        {:else}
+          <article class="record" aria-label="Record">
+            <header class="record-head">
+              <p class="record-kicker">
+                <span class="badge" data-kind={detail.kind}>{kindLabel(detail.kind)}</span>
+                <span class="record-tier">{detail.tier}</span>
+                {#if detail.status === "superseded"}
+                  <span class="badge warn">SUPERSEDED</span>
+                {/if}
+                {#if detail.quarantined}
+                  <span class="badge warn" title={detail.quarantined}>QUARANTINED</span>
+                {/if}
+              </p>
+              <h2>{displayTitle(detail.title)}</h2>
+              <p class="record-meta">
+                {#if detail.path}<code>{detail.path}</code>{/if}
+                <span>{detail.created ?? formatRecordDate(detail.created_at)}</span>
+                <span>{detail.access_count} {detail.access_count === 1 ? "recall" : "recalls"}</span>
+              </p>
+            </header>
+
+            <Markdown source={detail.markdown} />
+
+            {#if detail.links.length > 0}
+              <section class="record-links" aria-label="Links">
+                <h3>Links</h3>
+                <ul>
+                  {#each detail.links as link (link)}
+                    <li><code>{link}</code></li>
+                  {/each}
+                </ul>
+              </section>
+            {/if}
+
+            {#if detail.backlinks.length > 0}
+              <section class="record-links" aria-label="Backlinks">
+                <h3>Backlinks</h3>
+                <ul>
+                  {#each detail.backlinks as back (back.id)}
+                    <li>
+                      <button class="backlink" onclick={() => void selectRecord(back.id)}>
+                        <span class="badge" data-kind={back.kind}>{kindLabel(back.kind)}</span>
+                        {displayTitle(back.title)}
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
+              </section>
+            {/if}
+          </article>
+        {/if}
+      </div>
+    </div>
+  {/if}
+</section>
+
+<style>
+  .memory-view { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; background: var(--canvas); }
+  .memory-header { padding: 18px 24px 12px; }
+  .memory-header h1 { margin: 0; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; letter-spacing: -0.03em; }
+  .memory-header p { margin: 6px 0 0; color: var(--muted); font-size: var(--text-body); }
+
+  .memory-placeholder { display: grid; flex: 1; place-content: center; justify-items: center; gap: 10px; color: var(--muted); }
+  .memory-placeholder p { margin: 0; font-size: var(--text-body); }
+
+  .memory-body { display: grid; flex: 1; min-height: 0; grid-template-columns: 340px minmax(0, 1fr); border-top: 1px solid var(--line); }
+  .memory-side { display: flex; min-height: 0; flex-direction: column; border-right: 1px solid var(--line); background: var(--surface); }
+
+  .list-search { display: flex; align-items: center; gap: 7px; margin: 12px 12px 0; padding: 6px 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--canvas); color: var(--muted); }
+  .list-search input { width: 100%; min-width: 0; border: 0; outline: none; background: transparent; color: var(--ink); font-size: var(--text-body); }
+
+  .chip-row { display: flex; flex-wrap: wrap; gap: 5px; padding: 10px 12px 0; }
+  .chip { padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 620; text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer; }
+  .chip:hover { border-color: var(--line-strong); color: var(--ink); }
+  .chip.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+
+  .list-status { margin: 10px 12px 0; color: var(--muted); font-size: var(--text-meta); text-transform: uppercase; letter-spacing: 0.05em; }
+  .list-error { margin: 8px 12px 0; color: var(--danger); font-size: var(--text-body); }
+  .list-empty { margin: 10px 12px; color: var(--muted); font-size: var(--text-body); }
+
+  .list-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 0 12px; }
+  .record-list { margin: 0; padding: 0; list-style: none; }
+  .record-row { display: flex; width: 100%; flex-direction: column; gap: 3px; padding: 9px 12px; border: 0; border-left: 2px solid transparent; background: transparent; text-align: left; cursor: pointer; }
+  .record-row:hover { background: var(--surface-soft); }
+  .record-row.active { border-left-color: var(--accent); background: var(--accent-soft); }
+  .record-top { display: flex; align-items: center; gap: 6px; }
+  .badge { padding: 1px 6px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 660; letter-spacing: 0.05em; }
+  .badge[data-kind="spec"] { background: #e8eee3; color: #465b3e; }
+  .badge[data-kind="decision"] { background: #e7ecf3; color: #3f5675; }
+  .badge[data-kind="bug"] { background: #f5e7e4; color: #8d4139; }
+  .badge[data-kind="how"] { background: #f2e9da; color: #7a5626; }
+  .badge.warn { background: var(--warning-soft); color: var(--warning); }
+  .record-date { margin-left: auto; color: var(--muted); font-size: var(--text-meta); }
+  .record-score { color: var(--muted); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .record-title { overflow: hidden; color: var(--ink); font-size: var(--text-body); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+  .record-preview { display: -webkit-box; overflow: hidden; color: var(--ink-soft); font-size: var(--text-meta); line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
+  .load-more { display: block; margin: 10px auto 0; padding: 6px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--ink-soft); font-size: var(--text-body); cursor: pointer; }
+  .load-more:hover { border-color: var(--line-strong); color: var(--ink); }
+
+  .diagnostics { border-top: 1px solid var(--line); background: var(--canvas); }
+  .diagnostics summary { padding: 9px 12px; color: var(--ink-soft); font-size: var(--text-meta); font-weight: 660; text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; }
+  .diagnostics-body { max-height: 40vh; overflow-y: auto; padding: 0 12px 12px; }
+  .diag-grid { display: grid; margin: 0; gap: 4px 8px; grid-template-columns: 74px minmax(0, 1fr); font-size: var(--text-meta); }
+  .diag-grid dt { color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .diag-grid dd { margin: 0; color: var(--ink-soft); overflow-wrap: anywhere; }
+  .diag-quiet { margin: 0 0 8px; color: var(--muted); font-size: var(--text-meta); }
+  .diag-warn { color: var(--warning); }
+  .recall-box { margin-top: 12px; }
+  .recall-box label { display: block; margin-bottom: 4px; color: var(--muted); font-size: var(--text-meta); text-transform: uppercase; letter-spacing: 0.04em; }
+  .recall-input { display: flex; gap: 6px; }
+  .recall-input input { min-width: 0; flex: 1; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: var(--text-body); }
+  .recall-input .button { min-height: 28px; padding: 4px 10px; font-size: var(--text-meta); }
+  .recall-list { margin: 8px 0 0; padding: 0 0 0 18px; }
+  .recall-hit { display: flex; width: 100%; align-items: center; gap: 6px; padding: 3px 0; border: 0; background: transparent; color: var(--ink); font-size: var(--text-meta); text-align: left; cursor: pointer; }
+  .recall-hit:hover .recall-title { text-decoration: underline; }
+  .recall-title { overflow: hidden; flex: 1; text-overflow: ellipsis; white-space: nowrap; }
+
+  .memory-reader { min-width: 0; overflow-y: auto; background: var(--surface); }
+  .record { max-width: 760px; padding: 22px 30px 40px; }
+  .record-head { padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .record-kicker { display: flex; align-items: center; gap: 8px; margin: 0; }
+  .record-tier { color: var(--muted); font-size: var(--text-meta); text-transform: uppercase; letter-spacing: 0.05em; }
+  .record-head h2 { margin: 8px 0 6px; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; letter-spacing: -0.02em; }
+  .record-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0; color: var(--muted); font-size: var(--text-meta); }
+  .record-meta code { padding: 1px 5px; border-radius: 4px; background: var(--surface-soft); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .record :global(.markdown) { font-size: var(--text-body); }
+  .record-links { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .record-links h3 { margin: 0 0 6px; color: var(--muted); font-size: var(--text-meta); font-weight: 660; text-transform: uppercase; letter-spacing: 0.05em; }
+  .record-links ul { margin: 0; padding: 0; list-style: none; }
+  .record-links li { margin: 3px 0; }
+  .record-links code { padding: 1px 5px; border-radius: 4px; background: var(--surface-soft); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .backlink { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-body); text-align: left; cursor: pointer; }
+  .backlink:hover { text-decoration: underline; }
+</style>

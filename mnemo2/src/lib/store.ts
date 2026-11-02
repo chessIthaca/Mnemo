@@ -960,6 +960,16 @@ function openPlans() {
   }));
 }
 
+/** Show the project's knowledge records and memories; needs an open project. */
+function openMemory() {
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "memory" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: false,
+  }));
+}
+
 function toggleTeamPeek() {
   app.update((state) => ({ ...state, teamPeekOpen: !state.teamPeekOpen }));
 }
@@ -2489,6 +2499,7 @@ export const actions = {
   openCost,
   openGraph,
   openPlans,
+  openMemory,
   toggleTeamPeek,
   selectWorker,
   setTeamFilter,

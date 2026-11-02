@@ -6,6 +6,7 @@
   import GraphView from "./components/GraphView.svelte";
   import FirstIndexOverlay from "./components/FirstIndexOverlay.svelte";
   import LeadChat from "./components/LeadChat.svelte";
+  import MemoryView from "./components/MemoryView.svelte";
   import PlansView from "./components/PlansView.svelte";
   import StartScreen from "./components/StartScreen.svelte";
   import TeamPeek from "./components/TeamPeek.svelte";
@@ -45,6 +46,8 @@
         <CostView />
       {:else if $app.route === "plans"}
         <PlansView />
+      {:else if $app.route === "memory"}
+        <MemoryView />
       {:else}
         <GraphView />
       {/if}

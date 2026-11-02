@@ -69,6 +69,11 @@ pub mod model_label;
 /// progress, optimizer levers, per-model pricing and budget caps.
 pub mod model_settings;
 
+/// The Memory tab's read-only command surface: the project's knowledge
+/// records and memories, one record's Markdown with its backlinks, and the
+/// Diagnostics card (embedder status, per-tier counts, recall test).
+pub mod memory_view;
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
 /// also exposes `__TAURI_INTERNALS__`.
@@ -489,6 +494,12 @@ pub fn run() {
             browser::browser_open_external,
             insights::insights_cost,
             insights::insights_savings,
+            memory_view::memory_list,
+            memory_view::memory_search,
+            memory_view::memory_read,
+            memory_view::memory_backlinks,
+            memory_view::memory_overview,
+            memory_view::memory_recall_test,
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to build the Mnemo2 desktop host")

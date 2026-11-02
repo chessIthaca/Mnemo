@@ -20,12 +20,15 @@ export const EMBEDDING_KEYWORD_ID = "hash";
 
 // ── Wire shapes (the `model_settings_get` snapshot) ──────────────���───────────
 
-/** The five per-task `[models]` overrides, each `"endpoint/model"` or null. */
+/**
+ * The one `[models]` slot Mnemo2's Models page owns: the compaction model
+ * (`"endpoint/model"`, or null for the agent's own model).
+ *
+ * Mnemo1's per-task slots (planning, executing, bug fixing, reviewing) stay
+ * in the shared `config.toml` for Mnemo1; Mnemo2's lead and workers run on
+ * tier models, so the page never reads or writes them.
+ */
 export interface TaskModels {
-  planning: string | null;
-  executing: string | null;
-  bug_fixing: string | null;
-  reviewing: string | null;
   summarize: string | null;
 }
 
@@ -102,22 +105,6 @@ export interface EmbedderEvent {
 }
 
 // ── View-model metadata ──────────────────────────────────────────────────────
-
-/** One per-task model slot the Models page edits. */
-export interface TaskSlot {
-  key: keyof TaskModels;
-  label: string;
-  blurb: string;
-}
-
-/** The five task slots, in display order. */
-export const TASK_SLOTS: readonly TaskSlot[] = [
-  { key: "planning", label: "Planning", blurb: "Writes the plan before any work starts." },
-  { key: "executing", label: "Executing", blurb: "Carries out the steps of a plan." },
-  { key: "bug_fixing", label: "Bug fixing", blurb: "The lane that fixes a failed check." },
-  { key: "reviewing", label: "Reviewing", blurb: "The reviewer that inspects a worker's branch." },
-  { key: "summarize", label: "Summarize", blurb: "Compacts the conversation when the context fills." },
-];
 
 /** One optimizer lever: a switch with a one-line explanation. */
 export interface OptimizerLever {

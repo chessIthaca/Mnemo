@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Download } from "@lucide/svelte";
-  import { EMBEDDING_KEYWORD_ID, EMBEDDING_STATUS_META, budgetDraft, budgetWire, isValidModelRef, modelRefOptions, TASK_SLOTS, type BudgetDraft, type EmbeddingSection, type ModelSettingsTransport, type TaskModels } from "../lib/modelSettings";
+  import { EMBEDDING_KEYWORD_ID, EMBEDDING_STATUS_META, budgetDraft, budgetWire, isValidModelRef, modelRefOptions, type BudgetDraft, type EmbeddingSection, type ModelSettingsTransport, type TaskModels } from "../lib/modelSettings";
   import type { EndpointDetailDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
 
@@ -24,7 +24,7 @@
   let embedder = $state<EmbeddingSection | null>(null);
   let loadError = $state("");
 
-  let tasks = $state({ draft: emptyTasks(), original: emptyTasks(), saving: false, error: "", saved: false });
+  let compaction = $state({ draft: emptyCompaction(), original: emptyCompaction(), saving: false, error: "", saved: false });
   let vision = $state({ draft: "", original: "", saving: false, error: "", saved: false });
   let index = $state({ draft: "", original: "", saving: false, error: "", saved: false });
   let budget = $state({ draft: emptyBudget(), original: emptyBudget(), saving: false, error: "", saved: false });
@@ -33,8 +33,8 @@
   let installProgress = $state<{ label: string; fraction: number } | null>(null);
   let installError = $state("");
 
-  function emptyTasks(): TaskModels {
-    return { planning: null, executing: null, bug_fixing: null, reviewing: null, summarize: null };
+  function emptyCompaction(): TaskModels {
+    return { summarize: null };
   }
 
   function emptyBudget(): BudgetDraft {
@@ -42,7 +42,7 @@
   }
 
   const options = $derived(modelRefOptions(endpoints));
-  const tasksDirty = $derived(different(tasks.draft, tasks.original));
+  const compactionDirty = $derived(different(compaction.draft, compaction.original));
   const visionDirty = $derived(vision.draft !== vision.original);
   const indexDirty = $derived(index.draft !== index.original);
   const budgetDirty = $derived(different(budget.draft, budget.original));
@@ -63,8 +63,8 @@
       .then((settings) => {
         if (cancelled) return;
         embedder = settings.embedding;
-        tasks.draft = { ...settings.task_models };
-        tasks.original = { ...settings.task_models };
+        compaction.draft = { ...settings.task_models };
+        compaction.original = { ...settings.task_models };
         vision.draft = settings.vision_model ?? "";
         vision.original = settings.vision_model ?? "";
         index.draft = settings.embedding.selected;
@@ -122,23 +122,15 @@
     }
   }
 
-  async function saveTasks(): Promise<void> {
-    const value: TaskModels = {
-      planning: tasks.draft.planning?.trim() || null,
-      executing: tasks.draft.executing?.trim() || null,
-      bug_fixing: tasks.draft.bug_fixing?.trim() || null,
-      reviewing: tasks.draft.reviewing?.trim() || null,
-      summarize: tasks.draft.summarize?.trim() || null,
-    };
-    const invalid = (Object.keys(value) as (keyof TaskModels)[]).find((key) => value[key] !== null && !isValidModelRef(value[key]!));
-    if (invalid) {
-      const slot = TASK_SLOTS.find((entry) => entry.key === invalid)!;
-      tasks.error = `${slot.label} model must be "endpoint/model"`;
+  async function saveCompaction(): Promise<void> {
+    const value: TaskModels = { summarize: compaction.draft.summarize?.trim() || null };
+    if (value.summarize !== null && !isValidModelRef(value.summarize)) {
+      compaction.error = 'Compaction model must be "endpoint/model"';
       return;
     }
-    await persist(tasks, "models", value, () => {
-      tasks.draft = { ...value };
-      tasks.original = { ...value };
+    await persist(compaction, "models", value, () => {
+      compaction.draft = { ...value };
+      compaction.original = { ...value };
     });
   }
 
@@ -199,10 +191,10 @@
     }
   }
 
-  function discardTasks(): void {
-    tasks.draft = { ...tasks.original };
-    tasks.error = "";
-    tasks.saved = false;
+  function discardCompaction(): void {
+    compaction.draft = { ...compaction.original };
+    compaction.error = "";
+    compaction.saved = false;
   }
 
   function discardVision(): void {
@@ -232,50 +224,45 @@
 
 <div class="models-page">
   <div class="models-scroll">
+    <p class="page-note">
+      Mnemo1's per-task models (planning, executing, bug fixing, reviewing) stay in the shared config.toml; Mnemo2 doesn't use them.
+    </p>
     {#if loadError}
       <p class="load-error" role="alert">{loadError}</p>
     {:else if embedder === null}
       <p class="load-note">Loading…</p>
     {:else}
-      <section class="group" aria-label="Models for each kind of work">
+      <section class="group" aria-label="Compaction">
         <header>
-          <h3>Models for each kind of work</h3>
+          <h3>Compaction model</h3>
           <p class="micro">
-            Overrides the tier model for one kind of work, as "endpoint/model". Empty fields follow the tier the lead picks.
+            Summarizes the conversation when the context fills; empty = the agent's own model.
           </p>
         </header>
-        {#each TASK_SLOTS as slot (slot.key)}
-          <div class="slot-row">
-            <div class="slot-heading">
-              <label for={`slot-${slot.key}`}>{slot.label}</label>
-              <span class="micro">{slot.blurb}</span>
-            </div>
-            <div class="slot-input">
-              <input
-                id={`slot-${slot.key}`}
-                list="models-page-refs"
-                bind:value={tasks.draft[slot.key]}
-                placeholder="endpoint/model"
-                spellcheck="false"
-              />
-              <button
-                class="button button-quiet"
-                aria-label={`Use the default for ${slot.label}`}
-                disabled={tasks.draft[slot.key] === null || tasks.draft[slot.key] === ""}
-                onclick={() => (tasks.draft[slot.key] = "")}
-              >
-                Default
-              </button>
-            </div>
-          </div>
-        {/each}
+        <div class="slot-input">
+          <input
+            list="models-page-refs"
+            aria-label="Compaction model"
+            bind:value={compaction.draft.summarize}
+            placeholder="endpoint/model"
+            spellcheck="false"
+          />
+          <button
+            class="button button-quiet"
+            aria-label="Use the default for the compaction model"
+            disabled={compaction.draft.summarize === null || compaction.draft.summarize === ""}
+            onclick={() => (compaction.draft.summarize = "")}
+          >
+            Default
+          </button>
+        </div>
         <div class="section-actions">
-          {#if tasks.error}<p class="section-error" role="alert">{tasks.error}</p>{/if}
-          {#if tasks.saved && !tasksDirty}<p class="section-note">Applies after reopening the project.</p>{/if}
+          {#if compaction.error}<p class="section-error" role="alert">{compaction.error}</p>{/if}
+          {#if compaction.saved && !compactionDirty}<p class="section-note">Applies after reopening the project.</p>{/if}
           <div class="section-buttons">
-            <button class="button button-quiet" disabled={tasks.saving || !tasksDirty} onclick={discardTasks}>Discard</button>
-            <button class="button button-primary" disabled={tasks.saving || !tasksDirty} onclick={saveTasks}>
-              {tasks.saving ? "Saving…" : "Save models"}
+            <button class="button button-quiet" disabled={compaction.saving || !compactionDirty} onclick={discardCompaction}>Discard</button>
+            <button class="button button-primary" disabled={compaction.saving || !compactionDirty} onclick={saveCompaction}>
+              {compaction.saving ? "Saving…" : "Save compaction model"}
             </button>
           </div>
         </div>
@@ -406,6 +393,7 @@
   .models-scroll { display: grid; flex: 1; align-content: start; gap: 18px; padding: 18px 24px; overflow-y: auto; }
   .load-error { margin: 0; padding: 18px 24px; color: var(--danger); font-size: var(--text-body); overflow-wrap: anywhere; }
   .load-note { margin: 0; padding: 18px 24px; color: var(--muted); font-size: var(--text-body); }
+  .page-note { margin: 0; color: var(--muted); font-size: var(--text-meta); line-height: 1.55; }
 
   .group {
     display: grid;
@@ -419,9 +407,6 @@
   .group h3 { margin: 0; font-size: var(--text-title); font-weight: 650; }
   .micro { margin: 0; color: var(--muted); font-size: var(--text-body); line-height: 1.55; }
 
-  .slot-row { display: grid; gap: 6px; }
-  .slot-heading { display: flex; align-items: baseline; gap: 8px; }
-  .slot-heading label { font-size: var(--text-body); font-weight: 620; }
   .slot-input { display: flex; gap: 8px; }
   .slot-input input { flex: 1; min-width: 0; padding: 7px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); font-size: var(--text-body); }
   .slot-input .button { flex-shrink: 0; min-height: 32px; padding: 5px 10px; }

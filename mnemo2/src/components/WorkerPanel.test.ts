@@ -490,6 +490,7 @@ describe("WorkerPanel", () => {
     expect(state().workerPanelId).toBe("kai");
 
     // The panel shows the failure banner: the error and the three ways out.
+    // The thread itself stays clean — its compact failure block is skipped.
     const panel = container.querySelector(".worker-panel") as HTMLElement;
     expect(within(panel).getByText("cargo test failed: 2 errors")).toBeTruthy();
     expect(within(panel).getByRole("button", { name: "Continue" })).toBeTruthy();

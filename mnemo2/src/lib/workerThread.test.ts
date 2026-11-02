@@ -42,12 +42,14 @@ function record(messages: TeamWorkerRecord["transcript"]["messages"]): TeamWorke
   } as TeamWorkerRecord;
 }
 
-/** A compact view of a thread: who said what, or which tool ran. */
+/** A compact view of a thread: who said what, which tool ran, or what failed. */
 function shape(entries: WorkerThreadEntry[]): string[] {
   return entries.map((entry) =>
     entry.kind === "tool"
       ? `tool:${entry.toolName}:${entry.result === null ? "running" : entry.result.success ? "ok" : "failed"}`
-      : `${entry.from}:${entry.body}`,
+      : entry.kind === "error"
+        ? `error${entry.retrying ? "-retrying" : ""}:${entry.body}`
+        : `${entry.from}:${entry.body}`,
   );
 }
 
@@ -178,5 +180,42 @@ describe("worker thread", () => {
     const first = live.entries.find((entry) => entry.kind === "tool" && entry.toolCallId === "c1");
     expect(first?.kind === "tool" && first.startedAtMs).toBe(2_000);
     expect(first?.kind === "tool" && first.endedAtMs).toBe(4_000);
+  });
+
+  it("holds one retrying-error note: newer errors replace it and resumed text clears it", () => {
+    let live = emptyWorkerLive(1, 0);
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "Halfway " }));
+    live = applyWorkerLiveEvent(live, event("error", { error: "429: usage limit", retrying: true }));
+
+    // The half-written message stays open: a successful retry continues it.
+    expect(live.streamingId).not.toBeNull();
+    expect(shape(live.entries)).toEqual(["worker:Halfway ", "error-retrying:429: usage limit"]);
+
+    // A newer provider error replaces the note — never two notes at once.
+    live = applyWorkerLiveEvent(live, event("error", { message: "still over the session limit", retrying: true }));
+    expect(shape(live.entries)).toEqual(["worker:Halfway ", "error-retrying:still over the session limit"]);
+
+    // Streaming resumes: the note is gone and the message continues.
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "through." }));
+    expect(shape(live.entries)).toEqual(["worker:Halfway through."]);
+  });
+
+  it("turns a final error into a lasting thread entry that closes the stream", () => {
+    let live = emptyWorkerLive(1, 0);
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "Halfway" }));
+    live = applyWorkerLiveEvent(live, event("error", { error: "429: you have reached your session usage limit", retrying: true }));
+    live = applyWorkerLiveEvent(live, event("error", { error: "429: retries exhausted", retrying: false }));
+
+    expect(shape(live.entries)).toEqual(["worker:Halfway", "error:429: retries exhausted"]);
+    expect(live.streamingId).toBeNull();
+
+    // The final entry is not transient: a later lifecycle event keeps it.
+    live = applyWorkerLiveEvent(live, event("finished"));
+    expect(shape(live.entries)).toEqual(["worker:Halfway", "error:429: retries exhausted"]);
+  });
+
+  it("falls back to the generic stop error when the event carries no text", () => {
+    const live = applyWorkerLiveEvent(emptyWorkerLive(1, 0), event("error", { retrying: false }));
+    expect(shape(live.entries)).toEqual(["error:The worker stopped with an error."]);
   });
 });

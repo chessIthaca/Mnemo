@@ -54,6 +54,7 @@ function makeWorker(input: WorkerInput): Worker {
     task,
     summary,
     status,
+    error: null,
     model: "glm-5.3-flash",
     branch: `wt/agent-${id}`,
     worktree: `.worktrees/agent-${id}`,

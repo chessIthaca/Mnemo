@@ -460,6 +460,14 @@ impl AgentSession {
     /// serves. For a loop that already served the seed is a no-op — the
     /// pin's first serve announces via the kernel's normal diff.
     ///
+    /// The effort bookkeeping mirrors Mnemo1's picker swap
+    /// (`config_io::swap_provider_into_loop`): the switch's display effort
+    /// — the requested one, else the model's configured default chain —
+    /// is recorded in the pinned + default display slots and the stale
+    /// per-turn mirrors (model, endpoint, effort) are cleared, so the pin's
+    /// first serve reports the NEW effort: `model_changed` carries it, and
+    /// an effort-only switch on the same model still announces.
+    ///
     /// A model whose context window is SMALLER than the current one
     /// defers the swap (the kernel's pending-swap path): the conversation
     /// is compacted on the OLD model first, then the new one serves —
@@ -522,6 +530,25 @@ impl AgentSession {
         // loop that already served this is a no-op — the pin's first serve
         // announces via the kernel's normal diff.
         loop_arc.seed_served_effective_if_empty();
+        // The effort bookkeeping Mnemo1's swap performs: the switch's display
+        // effort — what the picker requested, or the model's configured
+        // default chain — is recorded in the pinned + default display slots
+        // and the stale per-turn mirrors (model, endpoint, effort) are
+        // cleared, so the pin's first serve reports the NEW effort
+        // (`model_changed` carries it; the baseline above captured the OLD
+        // triple, so an effort-only switch on the same model still
+        // announces). Falls back to the requested effort when the model
+        // left the config between the build and this read.
+        let display_effort = self
+            .inner
+            .model_resolver
+            .display_effort_for(&model_ref)
+            .or_else(|| model_ref.reasoning_effort.clone());
+        loop_arc.set_resolved_model(None);
+        loop_arc.set_resolved_provider(None);
+        loop_arc.set_pinned_display_effort(display_effort.clone());
+        loop_arc.set_default_display_effort(display_effort);
+        loop_arc.set_resolved_effort(None);
         // The kernel seam: pin the pair — an immediate swap, or a deferred
         // one when the new window is smaller (compaction on the old model
         // first).
@@ -1976,6 +2003,97 @@ mod model_tests {
             "the first serve announced the new model: {changes:?}"
         );
         assert_eq!(stub.models(), ["model-b"]);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// An effort-only switch on the SAME model (high → low): the loop's
+    /// effort display state is part of the switch's bookkeeping, so the
+    /// follow-up request carries the new effort and `model_changed`
+    /// reports it — without the bookkeeping the wire request changes but
+    /// the display never learns, and the announcement never fires.
+    #[tokio::test]
+    async fn set_model_reports_an_effort_change_on_the_same_model() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = SseStub::start(vec![
+            StubTurn {
+                body: unknown_tool_turn(),
+                gate: Some(gate),
+            },
+            StubTurn {
+                body: text_turn("done on the low effort"),
+                gate: None,
+            },
+        ])
+        .await;
+        write_switch_config(config.path(), &stub.base_url(), 200000);
+        let engine = switch_engine(&root, &config).await;
+        let session = engine
+            .spawn(SpawnOptions {
+                name: Some("effort switch".into()),
+                model: Some("test/model-a".into()),
+                reasoning_effort: Some("high".into()),
+                ..SpawnOptions::default()
+            })
+            .await
+            .expect("spawn");
+        let mut events = session.events();
+        session
+            .send(SessionCommand::Prompt {
+                text: "count the stars".into(),
+                images: vec![],
+            })
+            .await
+            .expect("prompt");
+
+        // Request 1 is in flight on model-a with the HIGH effort — hold it.
+        stub.next_arrival().await;
+        assert_eq!(stub.models(), ["model-a"]);
+        assert_eq!(
+            stub.body(0)["reasoning_effort"].as_str(),
+            Some("high"),
+            "the in-flight request carries the spawn effort"
+        );
+
+        // Same model, new effort — a live switch that changes nothing but
+        // the effort.
+        let outcome = session
+            .set_model("test/model-a", Some("low".into()))
+            .await
+            .expect("the live switch pins the new effort");
+        assert_eq!(
+            outcome,
+            ModelSwitch::NextRequest { model: "model-a".into() }
+        );
+        release.send(()).expect("release the held response");
+
+        // The follow-up request in the SAME turn carries the NEW effort,
+        // and the kernel announces the new (model, effort) pair.
+        let mut changes: Vec<(String, Option<String>)> = Vec::new();
+        while let Ok(ev) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await
+        {
+            match ev.expect("event").event {
+                SerializableAgentEvent::ModelChanged {
+                    model,
+                    reasoning_effort,
+                    ..
+                } => changes.push((model, reasoning_effort)),
+                SerializableAgentEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            stub.body(1)["reasoning_effort"].as_str(),
+            Some("low"),
+            "the follow-up request carries the switched effort"
+        );
+        assert_eq!(
+            changes.last(),
+            Some(&("model-a".to_string(), Some("low".to_string()))),
+            "the kernel announced the new effort: {changes:?}"
+        );
         engine.shutdown().await.expect("shutdown");
     }
 }

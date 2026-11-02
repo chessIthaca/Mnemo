@@ -3,8 +3,10 @@
   import { createMcpTransport } from "../lib/mcpSettings";
   import { createModelSettingsTransport } from "../lib/modelSettings";
   import { createSafetyTransport } from "../lib/safetySettings";
+  import { createAppearanceTransport } from "../lib/sounds";
   import { createSettingsTransport, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
+  import AppearancePage from "./AppearancePage.svelte";
   import EndpointsPage from "./EndpointsPage.svelte";
   import LayaPage from "./LayaPage.svelte";
   import McpPage from "./McpPage.svelte";
@@ -16,7 +18,7 @@
 
   let { open, onclose }: { open: boolean; onclose: () => void } = $props();
 
-  type Page = "endpoints" | "tiers" | "models" | "savings" | "laya" | "safety" | "mcp";
+  type Page = "endpoints" | "tiers" | "models" | "savings" | "laya" | "safety" | "mcp" | "appearance";
   const pages: { id: Page; label: string }[] = [
     { id: "endpoints", label: "Endpoints" },
     { id: "tiers", label: "Tiers" },
@@ -25,6 +27,7 @@
     { id: "laya", label: "Decisions" },
     { id: "safety", label: "Safety" },
     { id: "mcp", label: "MCP" },
+    { id: "appearance", label: "Appearance" },
   ];
 
   let page = $state<Page>("endpoints");
@@ -37,6 +40,7 @@
   const layaTransport = $derived(open ? createLayaTransport() : null);
   const safetyTransport = $derived(open ? createSafetyTransport() : null);
   const mcpTransport = $derived(open ? createMcpTransport() : null);
+  const appearanceTransport = $derived(open ? createAppearanceTransport() : null);
 
   $effect(() => {
     const active = transport;
@@ -114,6 +118,12 @@
             <McpPage transport={mcpTransport} />
           {:else}
             <p class="settings-empty">MCP server settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "appearance"}
+          {#if appearanceTransport}
+            <AppearancePage transport={appearanceTransport} />
+          {:else}
+            <p class="settings-empty">Sound and theme settings are available in the desktop app.</p>
           {/if}
         {:else}
           <TiersPage {transport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />

@@ -76,6 +76,11 @@ pub mod safety_settings;
 /// servers page (plan f1bd54e5).
 pub mod mcp_settings;
 
+/// The Appearance & sounds settings commands (the three `[ui] sound_*`
+/// toggles and the stored theme) — the backend of the Settings dialog's
+/// Appearance page (plan f1bd54e5).
+pub mod appearance_settings;
+
 /// The local endpoint for an external lead (Claude Code over MCP).
 pub mod mcp_server;
 
@@ -451,6 +456,8 @@ pub fn run() {
             mcp_settings::mcp_settings_get,
             mcp_settings::mcp_settings_save,
             mcp_settings::mcp_settings_test,
+            appearance_settings::appearance_settings_get,
+            appearance_settings::appearance_settings_save,
             ipc::lead_snapshot,
             ipc::indexing_snapshot,
             ipc::lead_prompt,

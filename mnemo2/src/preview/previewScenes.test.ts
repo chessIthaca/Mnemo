@@ -75,6 +75,7 @@ describe("preview scenes", () => {
       "settings-laya",
       "settings-safety",
       "settings-mcp",
+      "settings-appearance",
       "lead-idle",
       "delete-sheet",
       "cost",

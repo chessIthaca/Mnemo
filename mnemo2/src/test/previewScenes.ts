@@ -20,6 +20,7 @@ import { seedPreviewSettings } from "./previewSettings";
 import { seedPreviewLaya } from "./previewLaya";
 import { seedPreviewSafety } from "./previewSafety";
 import { seedPreviewMcp } from "./previewMcp";
+import { seedPreviewAppearance } from "./previewAppearance";
 import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
@@ -1587,6 +1588,29 @@ export const previewScenes: PreviewScene[] = [
       return () => {
         unmount(dialog);
         restoreMcp();
+        restoreSettings();
+      };
+    },
+  },
+  {
+    name: "settings-appearance",
+    title: "Settings: Appearance & sounds",
+    description:
+      "The settings dialog's Appearance page: the three [ui] notification-sound toggles, each with a Test button that plays its tone, plus the theme slot the dark theme fills in next.",
+    // Same mount pattern as settings-mcp; the rail click opens the
+    // Appearance page directly so the scene shows the page it names.
+    build: missionControl,
+    mount: (target) => {
+      const restoreSettings = seedPreviewSettings();
+      const restoreAppearance = seedPreviewAppearance();
+      const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {} } });
+      const appearance = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
+        (button) => button.textContent === "Appearance",
+      );
+      appearance?.click();
+      return () => {
+        unmount(dialog);
+        restoreAppearance();
         restoreSettings();
       };
     },

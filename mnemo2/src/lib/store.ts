@@ -1777,28 +1777,6 @@ function steerWorker(workerId: string) {
   );
 }
 
-/** Dispatch on a board plan step (1-based); false when the host refused it. */
-async function dispatchWorker(
-  brief: string,
-  planId: string,
-  step: number,
-  model?: string | null,
-  reasoningEffort?: string | null,
-): Promise<boolean> {
-  const transport = requireTeam();
-  if (!transport) return false;
-  const task = brief.trim();
-  if (!task || !planId) return false;
-  try {
-    await transport.dispatch(task, planId, step, model ?? null, null, reasoningEffort ?? null);
-  } catch (error) {
-    noteTeamError(error);
-    return false;
-  }
-  await syncTeam();
-  return true;
-}
-
 function stopWorker(workerId: string) {
   const transport = requireTeam();
   if (!transport) return;
@@ -2818,7 +2796,6 @@ export const actions = {
   answerLead,
   setLeadModel,
   retryLead,
-  dispatchWorker,
   replyWorker,
   steerWorker,
   stopWorker,

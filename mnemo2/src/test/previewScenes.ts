@@ -60,7 +60,7 @@ function liveActivity(phase: WorkerActivity["phase"], agoMs: number, toolName: s
   };
 }
 
-/** The open plan the dispatch bar shows above the worker list. */
+/** The open plan on the sample board (and the plan id a sample lead entry names). */
 const PREVIEW_PLAN: BoardPlan = {
   id: "plan-preview-thread",
   title: "Render the worker thread as Markdown",

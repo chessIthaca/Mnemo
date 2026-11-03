@@ -27,6 +27,7 @@ const SEVEN_KEYS: LayaFlagKey[] = [
 
 const LANES: RoutingLanes = {
   cheap: "ep/tiny",
+  routine: "ep/big",
   capable: "ep/big",
   lane_medium: null,
   lane_high: "ep/org/model-id",
@@ -81,6 +82,7 @@ describe("layaSettings", () => {
       capable: "ep/big",
       lane_medium: "",
       lane_high: "ep/org/model-id",
+      routine: "ep/big",
       escalate: "",
       threshold: "0.8",
       enforce: false,
@@ -92,6 +94,7 @@ describe("layaSettings", () => {
     expect(parsed.error).toBeUndefined();
     expect(parsed.value).toEqual({
       cheap: { endpoint: "ep", model: "tiny" },
+      routine: { endpoint: "ep", model: "big" },
       capable: { endpoint: "ep", model: "big" },
       lane_medium: null,
       lane_high: { endpoint: "ep", model: "org/model-id" },
@@ -124,8 +127,15 @@ describe("layaSettings", () => {
     }
   });
 
-  it("lists the five routing lanes in display order", () => {
-    expect(ROUTING_LANES.map((lane) => lane.key)).toEqual(["cheap", "capable", "lane_medium", "lane_high", "escalate"]);
+  it("lists the six routing lanes in display order", () => {
+    expect(ROUTING_LANES.map((lane) => lane.key)).toEqual([
+      "cheap",
+      "routine",
+      "capable",
+      "lane_medium",
+      "lane_high",
+      "escalate",
+    ]);
     for (const lane of ROUTING_LANES) expect(lane.blurb.trim()).not.toBe("");
   });
 });

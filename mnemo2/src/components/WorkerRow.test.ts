@@ -192,4 +192,44 @@ describe("WorkerRow", () => {
     expect(getComputedStyle(label).textOverflow).not.toBe("ellipsis");
     expect(getComputedStyle(label).minWidth).not.toBe("0px");
   });
+  it("shows the dispatch routing chip and the live nudge chip", () => {
+    const routed: Worker = {
+      ...worker(),
+      tier: "average",
+      routing: {
+        laya_tier: "average",
+        confidence: 0.62,
+        cleared: true,
+        lead_tier: null,
+        routed_by: "laya",
+        ran_tier: "average",
+        nudged: "difficult",
+      },
+    };
+    const { container } = render(WorkerRow, { worker: routed, onSelect: vi.fn() });
+    expect(screen.getByText("Laya: average 0.62")).toBeTruthy();
+    expect(screen.getByText("Laya suggests difficult — stuck")).toBeTruthy();
+    expect(container.querySelectorAll(".route-chip")).toHaveLength(2);
+  });
+
+  it("clears the nudge chip once the worker finished, keeping the routing chip", () => {
+    const routed: Worker = {
+      ...worker(),
+      status: "merged",
+      tier: "average",
+      routing: {
+        laya_tier: "average",
+        confidence: 0.62,
+        cleared: true,
+        lead_tier: null,
+        routed_by: "laya",
+        ran_tier: "average",
+        nudged: "difficult",
+      },
+    };
+    const { container } = render(WorkerRow, { worker: routed, onSelect: vi.fn() });
+    expect(screen.queryByText(/Laya suggests/)).toBeNull();
+    expect(screen.getByText("Laya: average 0.62")).toBeTruthy();
+    expect(container.querySelectorAll(".route-chip")).toHaveLength(1);
+  });
 });

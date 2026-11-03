@@ -52,21 +52,27 @@
 //! whatever a closed race left behind. A static is never dropped; an
 //! unheld orphan never is either.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use mnemo::agent::route_question::OfferedLabels;
 use mnemo::config::general::LayaConfig;
 use mnemo::config::settings_dto::{RoutingConfigDto, SettingsSaveDto};
 use mnemo::config::{Config, ModelRef};
 use mnemo::headless::{EventReceiver, RecvError, Setup, SetupEvent};
 use mnemo::laya::{LayaManager, english_checkpoint};
-use mnemo::memory::classifier::ClassifierStatus;
+use mnemo::memory::classifier::{Classifier, ClassifierStatus};
 
+use crate::mnemo2::dispatch_routing;
 use crate::mnemo2::ipc::{settings_refresh, settings_setup, Mnemo2State};
+use crate::mnemo2::route_eval;
 use crate::mnemo2::runtime::LeadRuntime;
+use crate::mnemo2::team::TeamRuntime;
 
 /// The Tauri event channel `laya_setup` streams its install progress on:
 /// a [`SetupEvent`] payload — `Progress` events (fractions) while the
@@ -563,7 +569,298 @@ pub async fn save_laya_settings(
     let (setup, runtime) = settings_setup(&state).await?;
     save_laya_settings_core(&setup, flags, routing).await?;
     settings_refresh(runtime).await
-}// ── Tests ───────────────────────────────────────────────────────────────────
+}
+
+// Mnemo2 dispatch routing (plan 2ba2168a, design §4.9/§4.10)
+
+/// The Laya page's Mnemo2 routing snapshot: the global `mnemo2.toml`
+/// `[routing]` table, the log summary and the last eval record.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingSettingsWire {
+    /// The `[routing]` table (`RoutingSettings::default()` when absent).
+    pub settings: dispatch_routing::RoutingSettings,
+    /// Counts over `dispatch_routing.jsonl`.
+    pub summary: RoutingLogSummary,
+    /// The last eval's suggestion (`route_eval.json`), when one ran.
+    pub eval: Option<route_eval::EvalRecord>,
+}
+
+/// The `[routing]` table, the log summary and the eval record, read from
+/// disk.
+#[tauri::command]
+pub async fn routing_settings_status(
+    state: State<'_, Mnemo2State>,
+) -> Result<RoutingSettingsWire, String> {
+    let (setup, _) = settings_setup(&state).await?;
+    Ok(routing_settings_wire(setup.config_dir()))
+}
+
+/// Persist the `[routing]` table to `mnemo2.toml` (every other table
+/// preserved) and push it into an open team, so the next dispatch sees the
+/// new mode without a restart. Returns the fresh snapshot.
+#[tauri::command]
+pub async fn save_routing_settings(
+    state: State<'_, Mnemo2State>,
+    settings: dispatch_routing::RoutingSettings,
+) -> Result<RoutingSettingsWire, String> {
+    let (setup, runtime) = settings_setup(&state).await?;
+    let team = match runtime {
+        Some(runtime) => runtime.team_handle().await.ok(),
+        None => None,
+    };
+    apply_routing_settings(setup.config_dir(), &settings, team.as_deref())?;
+    Ok(routing_settings_wire(setup.config_dir()))
+}
+
+/// The command's core: write the `[routing]` table, then reload a live team's
+/// copy so the next dispatch acts on it (review R1). The Laya page's Save and
+/// the eval's Apply both land here; with no team open there is nothing to
+/// reload and the next `TeamRuntime::open` reads the file itself.
+pub fn apply_routing_settings(
+    config_dir: &Path,
+    settings: &dispatch_routing::RoutingSettings,
+    team: Option<&TeamRuntime>,
+) -> Result<(), String> {
+    dispatch_routing::save_routing_settings(config_dir, settings)?;
+    if let Some(team) = team {
+        team.reload_routing_settings();
+    }
+    Ok(())
+}
+
+/// The dispatch routing log summarised for the page.
+#[tauri::command]
+pub fn routing_log_summary() -> RoutingLogSummary {
+    routing_log_summary_read()
+}
+
+/// Assemble the page's routing snapshot from `config_dir`.
+pub fn routing_settings_wire(config_dir: &Path) -> RoutingSettingsWire {
+    RoutingSettingsWire {
+        settings: dispatch_routing::load_routing_settings(config_dir),
+        summary: routing_log_summary_read(),
+        eval: route_eval::load_eval_record(),
+    }
+}
+
+/// The dispatch routing log summarised for the Laya page: how many decisions
+/// each mode made, how often Laya agreed with the lead, how accurate each was
+/// against the derived outcome labels, and how the overrides and nudges went
+/// (design §4.8/§4.10).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct RoutingLogSummary {
+    /// Decisions (`route` rows) per mode, keyed `off`/`shadow`/`suggest`/`auto`.
+    pub decisions_by_mode: BTreeMap<String, usize>,
+    /// Share of routed workers whose final tier matched the lead's tier —
+    /// Laya versus the lead, the agreement a mode change rides on.
+    pub agreement_rate: Option<f64>,
+    /// Share of Laya-routed workers whose final tier matched the derived
+    /// outcome label.
+    pub laya_accuracy: Option<f64>,
+    /// Share of lead-tier workers whose final tier matched the derived
+    /// outcome label.
+    pub lead_accuracy: Option<f64>,
+    /// Workers with a derived outcome label.
+    pub labelled: usize,
+    /// Reroutes per source (`lead` / `user`).
+    pub overrides_by_source: BTreeMap<String, usize>,
+    /// Nudge rows emitted.
+    pub nudges: usize,
+    /// Nudges a later reroute row recorded as acted on (`nudged: true`).
+    pub nudges_acted_on: usize,
+    /// The day of the last eval (`route_eval.json`), when one ran.
+    pub eval_date: Option<String>,
+}
+
+/// The mode's key in [`RoutingLogSummary::decisions_by_mode`] — the log's own
+/// spelling.
+fn mode_key(mode: dispatch_routing::RoutingMode) -> &'static str {
+    match mode {
+        dispatch_routing::RoutingMode::Off => "off",
+        dispatch_routing::RoutingMode::Shadow => "shadow",
+        dispatch_routing::RoutingMode::Suggest => "suggest",
+        dispatch_routing::RoutingMode::Auto => "auto",
+    }
+}
+
+/// Read every row of the dispatch routing log. A missing log is no rows; an
+/// unparseable line is skipped (the log is append-only and may be torn).
+fn read_dispatch_rows() -> Vec<dispatch_routing::DispatchRoutingRow> {
+    let Ok(text) = std::fs::read_to_string(dispatch_routing::dispatch_routing_log_path())
+    else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Read and summarise the log, stamping the last eval's date.
+pub fn routing_log_summary_read() -> RoutingLogSummary {
+    let mut summary = summarize_rows(&read_dispatch_rows());
+    summary.eval_date = route_eval::load_eval_record().map(|record| record.date);
+    summary
+}
+
+/// The counting behind [`routing_log_summary_read`] — pure, so the tests feed
+/// it fixture rows.
+pub fn summarize_rows(rows: &[dispatch_routing::DispatchRoutingRow]) -> RoutingLogSummary {
+    use dispatch_routing::DispatchRoutingRow as Row;
+
+    let mut summary = RoutingLogSummary::default();
+    let mut laya_tier: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut lead_tier: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut routed: BTreeSet<&str> = BTreeSet::new();
+    let mut nudged: BTreeSet<&str> = BTreeSet::new();
+    let mut acted: BTreeSet<&str> = BTreeSet::new();
+
+    for row in rows {
+        match row {
+            Row::Route { mode, tier, cleared, lead_tier: lead, worker_id, .. } => {
+                *summary
+                    .decisions_by_mode
+                    .entry(mode_key(*mode).to_string())
+                    .or_default() += 1;
+                if *cleared {
+                    if let Some(tier) = tier {
+                        laya_tier.insert(worker_id.as_str(), tier.as_str());
+                        routed.insert(worker_id.as_str());
+                    }
+                }
+                if let Some(lead) = lead {
+                    lead_tier.insert(worker_id.as_str(), lead.as_str());
+                }
+            }
+            Row::LeadReroute { worker_id, nudged: was_nudged, .. } => {
+                *summary
+                    .overrides_by_source
+                    .entry("lead".to_string())
+                    .or_default() += 1;
+                if *was_nudged {
+                    acted.insert(worker_id.as_str());
+                }
+            }
+            Row::UserReroute { worker_id, nudged: was_nudged, .. } => {
+                *summary
+                    .overrides_by_source
+                    .entry("user".to_string())
+                    .or_default() += 1;
+                if *was_nudged {
+                    acted.insert(worker_id.as_str());
+                }
+            }
+            Row::Nudge { worker_id, .. } => {
+                summary.nudges += 1;
+                nudged.insert(worker_id.as_str());
+            }
+            Row::LeadOverride { .. } | Row::NudgeIgnored { .. } | Row::Outcome { .. } => {}
+        }
+    }
+    summary.nudges_acted_on = nudged.intersection(&acted).count();
+
+    let mut agreed = 0;
+    let mut compared = 0;
+    for worker in &routed {
+        if let (Some(laya), Some(lead)) = (laya_tier.get(worker), lead_tier.get(worker)) {
+            compared += 1;
+            if laya == lead {
+                agreed += 1;
+            }
+        }
+    }
+    summary.agreement_rate = (compared > 0).then(|| agreed as f64 / compared as f64);
+
+    let mut laya_right = 0;
+    let mut laya_labelled = 0;
+    let mut lead_right = 0;
+    let mut lead_labelled = 0;
+    for row in rows {
+        let Row::Outcome { worker_id, final_tier, label: Some(label), .. } = row else {
+            continue;
+        };
+        summary.labelled += 1;
+        let worker = worker_id.as_str();
+        if routed.contains(worker) {
+            laya_labelled += 1;
+            if final_tier == label {
+                laya_right += 1;
+            }
+        } else if lead_tier.contains_key(worker) {
+            lead_labelled += 1;
+            if final_tier == label {
+                lead_right += 1;
+            }
+        }
+    }
+    summary.laya_accuracy =
+        (laya_labelled > 0).then(|| laya_right as f64 / laya_labelled as f64);
+    summary.lead_accuracy =
+        (lead_labelled > 0).then(|| lead_right as f64 / lead_labelled as f64);
+    summary
+}
+
+/// The Laya page's eval result: both label-count runs and the record written
+/// to `route_eval.json`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingEvalWire {
+    /// The three-label run.
+    pub three: route_eval::EvalReport,
+    /// The two-label run.
+    pub two: route_eval::EvalReport,
+    /// The record written to `route_eval.json`.
+    pub record: route_eval::EvalRecord,
+}
+
+/// Run the routing eval against the open lead's attached Laya: the hand set
+/// under three labels and again under two, one prompt at a time; writes
+/// `route_eval.json` and returns both reports. It never applies a threshold —
+/// the page's Apply button saves the suggestion through
+/// [`save_routing_settings`].
+#[tauri::command]
+pub async fn run_routing_eval(
+    state: State<'_, Mnemo2State>,
+) -> Result<RoutingEvalWire, String> {
+    let (setup, runtime) = settings_setup(&state).await?;
+    if runtime.is_none() {
+        return Err("open a lead first: the eval asks the lead's attached Laya".to_string());
+    }
+    let classifier = attached_classifier(&setup)?;
+    let (three, two) = routing_eval_reports(classifier.as_ref()).await?;
+    let record = route_eval::eval_record(&three, &two);
+    route_eval::save_eval_record(&record)?;
+    Ok(RoutingEvalWire { three, two, record })
+}
+
+/// The lead engine's live classifier, or a clear error naming what is
+/// missing.
+fn attached_classifier(setup: &Setup) -> Result<Arc<dyn Classifier>, String> {
+    let missing = || "Laya is not attached: enable it on this page first".to_string();
+    let slot = setup.classifier_slot().ok_or_else(missing)?;
+    let classifier = slot
+        .read()
+        .expect("classifier slot lock poisoned")
+        .clone();
+    classifier.ok_or_else(missing)
+}
+
+/// Both corpus passes, sequentially, with no file writes — the command adds
+/// the record; the tests drive this with a stub classifier and never touch
+/// the network.
+pub async fn routing_eval_reports(
+    classifier: &dyn Classifier,
+) -> Result<(route_eval::EvalReport, route_eval::EvalReport), String> {
+    let cases = route_eval::parse_hand_set(route_eval::HAND_SET_JSONL)?;
+    let three_offered = OfferedLabels { trivial: true, routine: true, hard: true };
+    let two_offered = OfferedLabels { trivial: true, routine: false, hard: true };
+    let three_scores = route_eval::classify_corpus(classifier, three_offered, &cases).await;
+    let two_scores = route_eval::classify_corpus(classifier, two_offered, &cases).await;
+    Ok((
+        route_eval::report(&three_scores, three_offered),
+        route_eval::report(&two_scores, two_offered),
+    ))
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
 //
 // The network legs (uv, venv, the checkpoint download) are NEVER exercised
 // here — the discipline the kernel seam's and the runtime's tests follow
@@ -790,6 +1087,11 @@ simple = ["ep1/exec-model"]
                 reasoning_effort: None,
             })),
             capable: None,
+            routine: Some(Some(ModelRefDto {
+                endpoint: "ep1".into(),
+                model: "small".into(),
+                reasoning_effort: None,
+            })),
             lane_medium: Some(Some(ModelRefDto {
                 endpoint: "ep1".into(),
                 model: "mid".into(),
@@ -798,6 +1100,7 @@ simple = ["ep1/exec-model"]
             lane_high: Some(None),
             escalate: None,
             threshold: Some(0.9),
+            first_prompt_min_confidence: Some(Some(0.55)),
             enforce: Some(false),
         };
         save_laya_settings_core(&setup, Some(flags), Some(routing))
@@ -816,6 +1119,12 @@ simple = ["ep1/exec-model"]
         assert!(laya.reflex);
         let routing = &config.general.general.routing;
         assert_eq!(routing.cheap.as_ref().expect("cheap set").model, "other-model");
+        assert_eq!(
+            routing.routine.as_ref().expect("routine set").model,
+            "small",
+            "the first-prompt routine target round-trips through the sanctioned save"
+        );
+        assert_eq!(routing.first_prompt_min_confidence, Some(0.55));
         assert_eq!(routing.capable.as_ref().expect("capable kept").model, "big");
         assert_eq!(routing.lane_medium.as_ref().expect("lane_medium set").model, "mid");
         assert!(routing.lane_high.is_none(), "Some(None) clears the slot");
@@ -1047,5 +1356,202 @@ simple = ["ep1/exec-model"]
             Arc::ptr_eq(still.as_ref().expect("hold kept"), &replacement),
             "the newer hold survives the old pipeline's settlement"
         );
+    }
+
+    fn route_row(
+        worker: &str,
+        mode: dispatch_routing::RoutingMode,
+        tier: Option<&str>,
+        cleared: bool,
+        lead: Option<&str>,
+    ) -> dispatch_routing::DispatchRoutingRow {
+        dispatch_routing::DispatchRoutingRow::Route {
+            ts: 1,
+            worker_id: worker.to_string(),
+            plan_id: "p".to_string(),
+            step: 1,
+            mode,
+            label: String::new(),
+            tier: tier.map(str::to_string),
+            confidence: 0.6,
+            probabilities: BTreeMap::new(),
+            threshold: 0.475,
+            cleared,
+            lead_tier: lead.map(str::to_string),
+            ran_tier: tier.map(str::to_string),
+            ran_model: None,
+            text_sha256: String::new(),
+            text: "text".to_string(),
+            skip: None,
+        }
+    }
+
+    fn outcome_row(
+        worker: &str,
+        final_tier: &str,
+        label: Option<&str>,
+    ) -> dispatch_routing::DispatchRoutingRow {
+        dispatch_routing::DispatchRoutingRow::Outcome {
+            ts: 2,
+            worker_id: worker.to_string(),
+            plan_id: "p".to_string(),
+            step: 1,
+            status: "merged".to_string(),
+            final_tier: final_tier.to_string(),
+            models_used: vec![],
+            review_rounds: 1,
+            fix_rounds: 0,
+            findings: 0,
+            findings_high: 0,
+            audits: 0,
+            cost_micros: 0,
+            label: label.map(str::to_string),
+        }
+    }
+
+    fn reroute_row(
+        worker: &str,
+        lead: bool,
+        nudged: bool,
+    ) -> dispatch_routing::DispatchRoutingRow {
+        if lead {
+            dispatch_routing::DispatchRoutingRow::LeadReroute {
+                ts: 3,
+                worker_id: worker.to_string(),
+                plan_id: "p".to_string(),
+                step: 1,
+                from_tier: "average".to_string(),
+                to_tier: "difficult".to_string(),
+                from_model: None,
+                to_model: None,
+                status: "running".to_string(),
+                review_rounds: 0,
+                fix_rounds: 0,
+                nudged,
+            }
+        } else {
+            dispatch_routing::DispatchRoutingRow::UserReroute {
+                ts: 3,
+                worker_id: worker.to_string(),
+                plan_id: "p".to_string(),
+                step: 1,
+                from_tier: "average".to_string(),
+                to_tier: "simple".to_string(),
+                from_model: None,
+                to_model: None,
+                status: "running".to_string(),
+                review_rounds: 0,
+                fix_rounds: 0,
+                nudged,
+            }
+        }
+    }
+
+    fn nudge_row(worker: &str) -> dispatch_routing::DispatchRoutingRow {
+        dispatch_routing::DispatchRoutingRow::Nudge {
+            ts: 4,
+            worker_id: worker.to_string(),
+            plan_id: "p".to_string(),
+            step: 1,
+            reason: "strikes".to_string(),
+            from_tier: "average".to_string(),
+            to_tier: "difficult".to_string(),
+            detail: "stuck".to_string(),
+        }
+    }
+
+    #[test]
+    fn summary_counts_agreement_and_accuracy() {
+        use dispatch_routing::RoutingMode;
+
+        let rows = vec![
+            // Two shadow decisions with a lead tier, one of each kind.
+            route_row("w1", RoutingMode::Shadow, Some("average"), true, Some("average")),
+            route_row("w2", RoutingMode::Shadow, Some("simple"), true, Some("average")),
+            // An off-mode decision: Laya cleared nothing, the lead ran.
+            route_row("w3", RoutingMode::Off, None, false, Some("difficult")),
+            // A suggest decision with no lead tier: routed, not compared.
+            route_row("w4", RoutingMode::Suggest, Some("difficult"), true, None),
+            reroute_row("w1", true, true),
+            reroute_row("w2", false, false),
+            nudge_row("w1"),
+            nudge_row("w2"),
+            outcome_row("w1", "average", Some("average")),
+            outcome_row("w2", "average", Some("difficult")),
+            outcome_row("w3", "difficult", Some("difficult")),
+            outcome_row("w4", "simple", Some("average")),
+        ];
+
+        let summary = summarize_rows(&rows);
+        assert_eq!(
+            summary.decisions_by_mode.get("shadow"),
+            Some(&2),
+            "{:?}",
+            summary.decisions_by_mode
+        );
+        assert_eq!(summary.decisions_by_mode.get("off"), Some(&1));
+        assert_eq!(summary.decisions_by_mode.get("suggest"), Some(&1));
+        // Laya versus the lead: w1 agrees, w2 does not, w4 has no lead tier.
+        assert_eq!(summary.agreement_rate, Some(0.5));
+        // Accuracy against the derived labels, per routing source.
+        assert!((summary.laya_accuracy.expect("laya accuracy") - 1.0 / 3.0).abs() < 1e-12);
+        assert_eq!(summary.lead_accuracy, Some(1.0));
+        assert_eq!(summary.labelled, 4);
+        assert_eq!(summary.overrides_by_source.get("lead"), Some(&1));
+        assert_eq!(summary.overrides_by_source.get("user"), Some(&1));
+        assert_eq!(summary.nudges, 2);
+        assert_eq!(summary.nudges_acted_on, 1);
+        assert_eq!(summary.eval_date, None);
+    }
+
+    /// A classifier that answers each hand-set text with the label the
+    /// fixture records for it (`routine` for the vague ones), at confidence
+    /// 0.9 — enough to drive both eval passes with no network.
+    struct StubClassifier {
+        expected: BTreeMap<String, Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Classifier for StubClassifier {
+        async fn classify(
+            &self,
+            state: &str,
+            _question: &mnemo::memory::classifier::Question,
+        ) -> Option<mnemo::memory::classifier::Answer> {
+            let label = self
+                .expected
+                .get(state)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| "routine".to_string());
+            Some(mnemo::memory::classifier::Answer::Choice {
+                label,
+                confidence: 0.9,
+                probabilities: BTreeMap::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_eval_reports_with_a_stub_classifier() {
+        let cases = route_eval::parse_hand_set(route_eval::HAND_SET_JSONL).expect("hand set");
+        let expected: BTreeMap<String, Option<String>> = cases
+            .iter()
+            .map(|case| (case.text.clone(), case.expected.clone()))
+            .collect();
+        let stub = StubClassifier { expected };
+
+        let (three, two) = routing_eval_reports(&stub).await.expect("reports");
+        assert_eq!(three.labels, 3);
+        assert_eq!(two.labels, 2);
+        assert_eq!(three.table.len(), 23);
+        assert_eq!(two.table.len(), 23);
+        // Every case clears the gate at 0.9: the 45 labelled ones are right,
+        // the three vague ones are false routes and so are the misses.
+        assert_eq!(three.table[0].routed, 48);
+        assert!((three.table[0].accuracy - 45.0 / 48.0).abs() < 1e-12);
+        assert_eq!(three.misses.len(), 3);
+        assert!((three.suggested.expect("a suggested gate") - 0.25).abs() < 1e-9);
+        assert!(two.suggested.is_some());
     }
 }

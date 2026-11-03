@@ -27,6 +27,10 @@ pub mod team;
 /// `.coding/design/mnemo2-laya-routing.md` §4.2–§4.8).
 pub mod dispatch_routing;
 
+/// The routing eval's core (corpora, threshold table, `route_eval.json`) —
+/// shared by the `mnemo2_route_eval` CLI and the Laya page's Run-eval button.
+pub mod route_eval;
+
 /// Best-effort naming of the processes holding a worker checkout's files.
 pub mod lock_holders;
 
@@ -475,6 +479,10 @@ pub fn run() {
             ipc::external_open_failed,
             ipc::lead_open,
             laya_settings::laya_status,
+            laya_settings::routing_settings_status,
+            laya_settings::save_routing_settings,
+            laya_settings::routing_log_summary,
+            laya_settings::run_routing_eval,
             laya_settings::laya_setup,
             laya_settings::laya_disable,
             laya_settings::save_laya_settings,

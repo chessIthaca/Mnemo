@@ -8,6 +8,7 @@ import type {
   ReviewEvidence,
   ReviewRisk,
   WorkerKind,
+  WorkerRouting,
 } from "./types";
 import { messageText } from "./leadState";
 
@@ -145,6 +146,8 @@ export interface TeamWorkerRecord {
   audit_target?: string | null;
   /** Set on audit workers: the exact implementation tip the audit inspected. */
   audit_tip?: string | null;
+  /** The one dispatch-time routing decision, when the dispatch recorded one. */
+  routing?: WorkerRouting | null;
   /**
    * Every message this worker received, oldest first: sender, delivery form,
    * text, time. Absent in ledgers saved before senders were recorded.
@@ -291,6 +294,7 @@ export interface TeamWorkerView {
   reviewRisk: ReviewRisk;
   auditTarget: string | null;
   auditTip: string | null;
+  routing: WorkerRouting | null;
 }
 
 export interface TeamViewState {
@@ -527,6 +531,7 @@ function toView(record: TeamWorkerRecord): TeamWorkerView {
     reviewRisk: reviewRiskFrom(record.review_risk),
     auditTarget: record.audit_target ?? null,
     auditTip: record.audit_tip ?? null,
+    routing: record.routing ?? null,
   };
 }
 

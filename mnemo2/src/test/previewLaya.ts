@@ -1,9 +1,11 @@
 import {
   setPreviewLayaTransport,
+  type DispatchRoutingSettings,
   type LayaEvent,
   type LayaStatus,
   type LayaTransport,
   type RoutingPatch,
+  type RoutingStatusWire,
 } from "../lib/layaSettings";
 
 /**
@@ -30,6 +32,7 @@ const READY: LayaStatus = {
   },
   routing: {
     cheap: "openrouter/glm-4.6-flash",
+    routine: "openrouter/glm-4.6-flash",
     capable: "openrouter/gpt-5.2",
     lane_medium: "openrouter/glm-5.3-flash",
     lane_high: "openrouter/gpt-5.2",
@@ -48,8 +51,39 @@ function createPreviewLayaTransport(): LayaTransport {
   };
   const lane = (ref: { endpoint: string; model: string } | null): string | null =>
     ref ? `${ref.endpoint}/${ref.model}` : null;
+  let routingStatus: RoutingStatusWire = {
+    settings: {
+      mode: "off",
+      min_confidence_3: 0.475,
+      min_confidence_2: 0.6,
+      fallback_tier: "average",
+      nudges: true,
+      min_words: 20,
+      effort: {},
+    },
+    summary: {
+      decisions_by_mode: {},
+      agreement_rate: null,
+      laya_accuracy: null,
+      lead_accuracy: null,
+      labelled: 0,
+      overrides_by_source: {},
+      nudges: 0,
+      nudges_acted_on: 0,
+      eval_date: null,
+    },
+    eval: null,
+  };
   return {
     status: async () => structuredClone(status),
+    routingStatus: async () => structuredClone(routingStatus),
+    saveRoutingSettings: async (settings: DispatchRoutingSettings) => {
+      routingStatus = { ...routingStatus, settings: structuredClone(settings) };
+      return structuredClone(routingStatus);
+    },
+    runRoutingEval: async () => {
+      throw new Error("the routing eval needs the desktop app: it asks the lead's attached Laya");
+    },
     setup: async () => {
       status.status = "installing";
       const events: [number, LayaEvent][] = [
@@ -78,6 +112,7 @@ function createPreviewLayaTransport(): LayaTransport {
           ...status,
           routing: {
             cheap: lane(patch.cheap),
+            routine: lane(patch.routine),
             capable: lane(patch.capable),
             lane_medium: lane(patch.lane_medium),
             lane_high: lane(patch.lane_high),

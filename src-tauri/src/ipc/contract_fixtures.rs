@@ -266,11 +266,13 @@ fn dto_fixtures_match_serde() {
             optimizer: OptimizerConfig::default(),
             routing: RoutingWire {
                 cheap: None,
+                routine: None,
                 capable: None,
                 lane_medium: None,
                 lane_high: None,
                 escalate: None,
                 threshold: 0.80,
+                first_prompt_min_confidence: None,
                 enforce: false,
             },
             budget: BudgetWire {

@@ -103,6 +103,11 @@ pub struct RoutingConfigDto {
     /// The model a confidently-TRIVIAL task routes to.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub cheap: Option<Option<ModelRefDto>>,
+    /// The model a confidently-ROUTINE first prompt routes to — the middle
+    /// rung of the shared three-label question (plan 2ba2168a, design §4.3).
+    /// Same double-Option semantics as the other targets.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub routine: Option<Option<ModelRefDto>>,
     /// The model a confidently-ARCHITECTURAL task routes to.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub capable: Option<Option<ModelRefDto>>,
@@ -118,9 +123,15 @@ pub struct RoutingConfigDto {
     /// The model the escalate rung routes to. Same semantics.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub escalate: Option<Option<ModelRefDto>>,
-    /// The calibrated-probability gate (`0.0..=1.0`; validated).
+    /// The calibrated-probability gate (`0.0..=1.0`; validated) for the
+    /// step-lane ladder.
     #[serde(default)]
     pub threshold: Option<f64>,
+    /// The first-prompt gate (`0.0..=1.0`; validated). Outer `None` keeps the
+    /// stored value; an explicit `null` clears it back to the kernel's
+    /// calibrated default for the offered label count (design §4.4).
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub first_prompt_min_confidence: Option<Option<f64>>,
     /// Whether a confident decision actually switches the turn's model.
     #[serde(default)]
     pub enforce: Option<bool>,
@@ -632,6 +643,13 @@ pub fn validate_and_apply_settings_patch(
                 ));
             }
         }
+        if let Some(Some(gate)) = routing.first_prompt_min_confidence {
+            if !(0.0..=1.0).contains(&gate) {
+                return Err(format!(
+                    "first-prompt gate must be between 0.0 and 1.0 (got {gate})"
+                ));
+            }
+        }
         let check = |m: &ModelRefDto| -> Result<(), String> {
             let ep = m.endpoint.trim();
             if ep.is_empty() {
@@ -647,7 +665,7 @@ pub fn validate_and_apply_settings_patch(
             }
             Ok(())
         };
-        for field in [&routing.cheap, &routing.capable] {
+        for field in [&routing.cheap, &routing.routine, &routing.capable] {
             if let Some(Some(m)) = field {
                 check(m)?;
             }
@@ -858,6 +876,9 @@ pub fn validate_and_apply_settings_patch(
         if let Some(cheap) = &routing.cheap {
             general.general.routing.cheap = cheap.as_ref().map(to_ref);
         }
+        if let Some(routine) = &routing.routine {
+            general.general.routing.routine = routine.as_ref().map(to_ref);
+        }
         if let Some(capable) = &routing.capable {
             general.general.routing.capable = capable.as_ref().map(to_ref);
         }
@@ -872,6 +893,9 @@ pub fn validate_and_apply_settings_patch(
         }
         if let Some(threshold) = routing.threshold {
             general.general.routing.threshold = threshold;
+        }
+        if let Some(gate) = routing.first_prompt_min_confidence {
+            general.general.routing.first_prompt_min_confidence = gate;
         }
         if let Some(enforce) = routing.enforce {
             general.general.routing.enforce = enforce;
@@ -1408,6 +1432,11 @@ mod tests {
                     model: "big".into(),
                     reasoning_effort: None,
                 })),
+                routine: Some(Some(ModelRefDto {
+                    endpoint: "ep".into(),
+                    model: "small".into(),
+                    reasoning_effort: None,
+                })),
                 lane_medium: Some(Some(ModelRefDto {
                     endpoint: "ep".into(),
                     model: "mid".into(),
@@ -1420,6 +1449,7 @@ mod tests {
                     reasoning_effort: None,
                 })),
                 threshold: Some(0.9),
+                first_prompt_min_confidence: Some(Some(0.55)),
                 enforce: Some(true),
             }),
             ..Default::default()
@@ -1462,12 +1492,29 @@ mod tests {
         );
         assert!(next.general.general.routing.lane_high.is_none());
 
+        assert_eq!(
+            next.general
+                .general
+                .routing
+                .routine
+                .as_ref()
+                .expect("routine set")
+                .model,
+            "small"
+        );
+        assert_eq!(
+            next.general.general.routing.first_prompt_min_confidence,
+            Some(0.55)
+        );
+
         // Clear: Some(None) empties the slot; fields absent from the patch
         // keep their stored values.
         let patch = SettingsSaveDto {
             routing: Some(RoutingConfigDto {
                 cheap: Some(None),
                 escalate: Some(None),
+                routine: Some(None),
+                first_prompt_min_confidence: Some(None),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1475,6 +1522,13 @@ mod tests {
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(next.general.general.routing.cheap.is_none());
         assert!(next.general.general.routing.escalate.is_none());
+        assert!(next.general.general.routing.routine.is_none());
+        assert!(next
+            .general
+            .general
+            .routing
+            .first_prompt_min_confidence
+            .is_none());
         assert!(next.general.general.routing.lane_medium.is_some());
         assert!(next.general.general.routing.lane_high.is_none());
         assert!(next.general.general.routing.capable.is_some());
@@ -1501,6 +1555,17 @@ mod tests {
             };
             let err = validate_and_apply_settings_patch(&current, &patch).unwrap_err();
             assert!(err.contains("routing threshold"), "got: {err}");
+        }
+        for bad in [-0.1_f64, 1.5_f64] {
+            let patch = SettingsSaveDto {
+                routing: Some(RoutingConfigDto {
+                    first_prompt_min_confidence: Some(Some(bad)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = validate_and_apply_settings_patch(&current, &patch).unwrap_err();
+            assert!(err.contains("first-prompt gate"), "got: {err}");
         }
     }
 

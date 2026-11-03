@@ -126,7 +126,7 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain(
       "Switch the model on a confident decision",
     );
-    expect(classifierSource).toContain("Confidence gate");
+    expect(classifierSource).toContain("Step-lane gate");
     expect(classifierSource).toContain("Trivial tasks");
     expect(classifierSource).toContain("Architectural tasks");
     // The target pickers reuse the Models section's endpoint/model/effort
@@ -216,11 +216,13 @@ describe("serializeClassifier", () => {
     routing: false,
     routingEnforce: false,
     routingCheap: null,
+    routingRoutine: null,
     routingCapable: null,
     routingLaneMedium: null,
     routingLaneHigh: null,
     routingEscalate: null,
     routingThreshold: 0.8,
+    routingFirstPromptMinConfidence: null,
     budgetEnabled: false,
     budgetMaxTokensPerPlan: 0,
     budgetMaxEscalationsPerPlan: 1,
@@ -308,11 +310,13 @@ describe("serializeClassifier", () => {
       routing: false,
       routingEnforce: false,
       routingCheap: null,
+      routingRoutine: null,
       routingCapable: null,
       routingLaneMedium: null,
       routingLaneHigh: null,
       routingEscalate: null,
       routingThreshold: 0.8,
+      routingFirstPromptMinConfidence: null,
       budgetEnabled: false,
       budgetMaxTokensPerPlan: 0,
       budgetMaxEscalationsPerPlan: 1,
@@ -377,5 +381,43 @@ describe("routing block guards its two unsafe edits (review L3/L4)", () => {
       'disabled={status !== "ready" && !routingEnforce}',
     );
     expect(classifierSource).toContain("switching it back off always works");
+  });
+});
+
+describe("the shared three-label question (plan 2ba2168a, design step 7)", () => {
+  it("carries the routine lane through the draft and the saved patch", () => {
+    // The routine rung is the shared question's middle label: its picker sits
+    // beside cheap and capable, the read side loads it into the draft, and the
+    // save sends the snake_case name with the null-clears contract.
+    expect(classifierSource).toContain("Routine tasks");
+    expect(classifierSource).toContain("onChange={(v) => setRoutingRoutine(v)}");
+    expect(classifierSource).toContain(
+      "routingRoutine: routingWire?.routine ?? null",
+    );
+    expect(classifierSource).toContain("routine: routingRoutine,");
+    expect(tauriSource).toContain("routine: ModelRefConfig | null;");
+    expect(tauriSource).toContain("routine?: ModelRefConfig | null;");
+  });
+
+  it("round-trips the first-prompt gate and shows the calibrated default when unset", () => {
+    // Unset means "the kernel's calibrated default" — the field shows it and
+    // the save sends null, so the backend falls back to 0.475 / 0.60.
+    expect(classifierSource).toContain("First-prompt gate");
+    expect(classifierSource).toContain("calibrated default 0.475");
+    expect(classifierSource).toContain(
+      "routingFirstPromptMinConfidence: routingWire?.first_prompt_min_confidence ?? null",
+    );
+    expect(classifierSource).toContain(
+      "first_prompt_min_confidence: routingFirstPromptMinConfidence,",
+    );
+    expect(tauriSource).toContain("first_prompt_min_confidence: number | null;");
+    expect(tauriSource).toContain("first_prompt_min_confidence?: number | null;");
+  });
+
+  it("says routing happens once, then only suggests, and relabels the step-lane gate", () => {
+    expect(classifierSource).toContain(
+      "Routes the first prompt of a session once; afterwards Laya only",
+    );
+    expect(classifierSource).toContain("Step-lane gate");
   });
 });

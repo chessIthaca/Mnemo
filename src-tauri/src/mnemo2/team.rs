@@ -335,7 +335,7 @@ pub struct WorkerRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
     /// The dispatch-time Laya decision, absent for legacy and unrouted workers.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<WorkerRouting>,
 }
 
@@ -1049,24 +1049,26 @@ impl TeamRuntime {
             } else if enabled.offered().count() < 2 {
                 (None, Some("one_tier"))
             } else if let Some(classifier) = classifier {
-                let _permit = self
-                    .routing_permit
-                    .acquire()
-                    .await
-                    .map_err(|_| "Laya routing is closed".to_string())?;
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    classify_dispatch(
-                        classifier.as_ref(),
-                        classified_text.as_deref().unwrap_or(""),
-                        enabled,
-                        &settings,
-                    ),
-                )
-                .await
-                {
-                    Ok(decision) => (decision, None),
-                    Err(_) => (None, Some("offline")),
+                let attempt = async {
+                    let _permit = self
+                        .routing_permit
+                        .acquire()
+                        .await
+                        .map_err(|_| "Laya routing is closed".to_string())?;
+                    Ok::<Option<DispatchRoutingDecision>, String>(
+                        classify_dispatch(
+                            classifier.as_ref(),
+                            classified_text.as_deref().unwrap_or(""),
+                            enabled,
+                            &settings,
+                        )
+                        .await,
+                    )
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(3), attempt).await {
+                    Ok(Ok(Some(decision))) => (Some(decision), None),
+                    Ok(Ok(None)) | Err(_) => (None, Some("offline")),
+                    Ok(Err(error)) => return Err(error),
                 }
             } else {
                 (None, Some("offline"))
@@ -1095,9 +1097,11 @@ impl TeamRuntime {
                 )
             });
             (None, None)
-        } else {
+        } else if settings.mode == RoutingMode::Auto {
             let tier = settings.fallback_tier.clone();
             (self.lead_model_choice(Some(&tier), None)?, Some(tier))
+        } else {
+            (self.lead_model_choice(None, None)?, None)
         };
         let routed_by = if has_explicit_choice {
             if cleared_tier.is_some() && cleared_tier != chosen_tier.as_deref() {
@@ -2488,18 +2492,51 @@ impl TeamRuntime {
         &self,
         request: DispatchRequest,
     ) -> Result<(WorkerRecord, bool), String> {
-        let result = self.dispatch_locked(request).await;
+        let routed = self.prepare_dispatch_routing(&request).await?;
+        let result = self.dispatch_locked(request, routed).await;
         if matches!(result, Ok((_, false))) {
             self.signal_board_changed();
         }
         result
     }
 
+    async fn prepare_dispatch_routing(
+        &self,
+        request: &DispatchRequest,
+    ) -> Result<Option<RoutedDispatch>, String> {
+        if !request.dispatch_routing {
+            return Ok(None);
+        }
+        if let Some(worker_id) = request.worker_id.as_deref() {
+            let records = self.records.lock().await;
+            if records.iter().any(|worker| worker.id == worker_id) {
+                return Ok(None);
+            }
+        }
+        let plan = request
+            .plan
+            .as_ref()
+            .ok_or_else(|| "dispatch routing requires a board plan step".to_string())?;
+        let board = self
+            .board()
+            .ok_or_else(|| "the plan board is not available".to_string())?;
+        let step_text = board
+            .get(&plan.plan_id)?
+            .steps
+            .get(plan.step)
+            .ok_or_else(|| format!("plan {} has no step {}", plan.plan_id, plan.step + 1))?
+            .text
+            .clone();
+        self.route_implementation_dispatch(request, &step_text, &request.brief)
+            .await
+            .map(Some)
+    }
+
     async fn dispatch_locked(
         &self,
         request: DispatchRequest,
+        routed: Option<RoutedDispatch>,
     ) -> Result<(WorkerRecord, bool), String> {
-        let routing_request = request.clone();
         let DispatchRequest {
             brief,
             tier,
@@ -2595,38 +2632,23 @@ impl TeamRuntime {
             }
         }
         // The plan board refuses before any record, branch, or worktree exists.
-        let (opening, step_text) = match &plan {
+        let opening = match &plan {
             Some(plan) => {
                 let board = self
                     .board()
                     .ok_or_else(|| "the plan board is not available".to_string())?;
-                let board_plan = board.get(&plan.plan_id)?;
-                let step_text = board_plan
-                    .steps
-                    .get(plan.step)
-                    .ok_or_else(|| format!("plan {} has no step {}", plan.plan_id, plan.step + 1))?
-                    .text
-                    .clone();
                 let header = board.brief_for(&plan.plan_id, plan.step + 1)?;
                 // Steps of this plan with an open task, other than this one:
                 // parallel work, which needs contracts for shared files.
                 let in_flight = self.in_flight_steps(&plan.plan_id, plan.step).await;
                 board.contract_gate(&plan.plan_id, plan.step, &in_flight)?;
-                (
-                    Some(format!("{}\n---\n\n{brief}", header.trim_end())),
-                    Some(step_text),
-                )
+                Some(format!("{}\n---\n\n{brief}", header.trim_end()))
             }
-            None => (None, None),
+            None => None,
         };
         let (model, reasoning_effort, tier, routing) = if dispatch_routing {
-            let routed = self
-                .route_implementation_dispatch(
-                    &routing_request,
-                    step_text.as_deref().unwrap_or(""),
-                    &brief,
-                )
-                .await?;
+            let routed = routed
+                .ok_or_else(|| "dispatch routing was not prepared".to_string())?;
             (
                 routed.model,
                 routed.reasoning_effort,
@@ -6444,7 +6466,6 @@ fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
         "status": worker.status,
         "kind": worker.kind,
         "tier": worker.tier,
-        "routing": worker.routing,
         "model": model,
         "plan_id": worker.plan_id,
         "plan_step": worker.plan_step,
@@ -6457,6 +6478,9 @@ fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
         "cost_micros": worker.cost_micros,
         "last_activity_ms": worker.last_activity_ms,
     });
+    if let Some(routing) = &worker.routing {
+        view["routing"] = json!(routing);
+    }
     if let Some(review) = &worker.review {
         view["review"] = json!({
             "summary": review.summary,
@@ -9764,6 +9788,142 @@ models = [\"scripted-a\", \"scripted-b\"]
                 .expect("required fields");
             assert_eq!(required_fields.contains(&json!("tier")), required, "{mode:?}");
         }
+    }
+
+
+    #[tokio::test]
+    async fn suggest_auto_refuses_when_laya_returns_no_answer() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            None,
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "Laya is not running; pass a tier");
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn classification_happens_outside_merge_lock() {
+        let fixture = std::sync::Arc::new(
+            routing_fixture(
+                crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+                true,
+            )
+            .await,
+        );
+        let merge_guard = fixture.team.merge_lock.lock().await;
+        let dispatch_fixture = std::sync::Arc::clone(&fixture);
+        let dispatch = tokio::spawn(async move {
+            dispatch_fixture.dispatch(Some("average"), None).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while fixture.classifier.calls() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("classification runs while merge_lock is held elsewhere");
+        assert!(!dispatch.is_finished(), "dispatch still waits for merge_lock");
+        drop(merge_guard);
+        let result = dispatch.await.expect("dispatch task");
+        assert!(result.success, "{}", result.output);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permit_wait_counts_toward_laya_timeout() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        let _permit = fixture.team.routing_permit.acquire().await.expect("permit");
+        let request = DispatchRequest {
+            brief: "Use the complete step specification to choose this worker's model tier".into(),
+            tier: None,
+            dispatch_routing: true,
+            model: None,
+            reasoning_effort: None,
+            worker_id: Some("permitwait".into()),
+            plan: Some(PlanRef {
+                plan_id: fixture.plan_id.clone(),
+                step: 0,
+            }),
+            review_risk: None,
+            read_back: false,
+        };
+        let routed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture.team.route_implementation_dispatch(
+                &request,
+                "Implement the requested routing behavior in src-tauri/src/mnemo2/team.rs and verify it with focused regression tests",
+                &request.brief,
+            ),
+        )
+        .await
+        .expect("the permit wait is inside Laya's 3 s timeout")
+        .expect("routing decision");
+        assert_eq!(routed.tier.as_deref(), Some("average"));
+        assert_eq!(fixture.classifier.calls(), 0);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shadow_without_tiers_keeps_the_default_model() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        assert_eq!(fixture.classifier.calls(), 0);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn team_status_omits_routing_when_none() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            None,
+            false,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        let compact = team_status_answer(&fixture.team, json!({})).await;
+        assert!(compact["result"][0].get("routing").is_none());
+        let detailed = team_status_answer(&fixture.team, json!({"detail": true})).await;
+        assert!(detailed["result"][0].get("routing").is_none());
+        fixture.team.shutdown().await;
     }
 
 }

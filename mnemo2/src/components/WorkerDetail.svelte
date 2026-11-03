@@ -49,6 +49,11 @@
   const workflow = $derived(deriveTaskWorkflow(worker));
   const mergeEligibility = $derived(canMerge(worker));
   const audit = $derived(isAuditWorker(worker));
+  /** An audit that delivered its report is over: it cannot be steered,
+   * compacted, resumed or messaged — the lead adjudicates the report. */
+  const auditFinished = $derived(
+    audit && (worker.reportDelivered === true || worker.status === "completed"),
+  );
   const highRisk = $derived(worker.reviewRisk === "high");
   const models = $derived($app.leadRuntime.models);
   /** The model the worker was given: its spec, else the configured default. */
@@ -162,11 +167,11 @@
           title="Every model call this worker made, in the Trace page"
           onclick={() => actions.openTrace({ agent: worker.id })}
         >Model calls</button>
-        <button class="toolbar-button" type="button" aria-label="Steer" title="Steer worker" disabled={worker.status === "cancelled"} onclick={() => actions.steerWorker(worker.id)}>Steer</button>
-        <button class="toolbar-button" type="button" aria-label="Compact" title="Compact worker context" disabled={worker.compacting || !["completed", "idle", "needs_you", "paused", "stopped", "interrupted", "failed"].includes(worker.status)} onclick={() => actions.compactWorker(worker.id)}>Compact</button>
+        {#if !auditFinished}<button class="toolbar-button" type="button" aria-label="Steer" title="Steer worker" disabled={worker.status === "cancelled"} onclick={() => actions.steerWorker(worker.id)}>Steer</button>{/if}
+        {#if !auditFinished}<button class="toolbar-button" type="button" aria-label="Compact" title="Compact worker context" disabled={worker.compacting || !["completed", "idle", "needs_you", "paused", "stopped", "interrupted", "failed"].includes(worker.status)} onclick={() => actions.compactWorker(worker.id)}>Compact</button>{/if}
         {#if worker.status === "working" || worker.status === "dispatching"}
           <button class="toolbar-button" type="button" aria-label="Pause" title="Pause worker" onclick={() => actions.pauseWorker(worker.id)}><Pause size={10} /> Pause</button>
-        {:else if worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted"}
+        {:else if !auditFinished && (worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted" || (audit && worker.status === "failed"))}
           <button class="toolbar-button" type="button" aria-label="Resume" title="Resume worker" onclick={() => actions.resumeWorker(worker.id)}><Play size={10} /> Resume</button>
         {/if}
         <button class="toolbar-button" type="button" aria-label="Stop" title="Stop worker" disabled={["stopped", "merging", "merged", "cancelled"].includes(worker.status)} onclick={() => actions.stopWorker(worker.id)}><Square size={10} /> Stop</button>
@@ -204,6 +209,9 @@
         <p class="audit-scope">
           Read-only audit{#if worker.auditTarget} of <code>{worker.auditTarget}</code>{/if}{#if worker.auditTip} at <code>{worker.auditTip}</code>{/if} · no plan step, no merge
         </p>
+        {#if auditFinished}
+          <p class="audit-scope">Audit finished; its report is with the lead.</p>
+        {/if}
       {:else}
         <TaskWorkflow {workflow} onselect={selectWorkflowStep} />
       {/if}

@@ -2426,6 +2426,7 @@ function workerFromRecord(
     reviewRisk: reviewRiskFrom(record.review_risk),
     auditTarget: record.audit_target ?? undefined,
     auditTip: record.audit_tip ?? undefined,
+    reportDelivered: record.report_delivered === true,
     routing: record.routing ?? null,
     planId: record.plan_id ?? null,
     planStep: record.plan_step ?? null,

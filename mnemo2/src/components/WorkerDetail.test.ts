@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/sve
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { app } from "../lib/store";
 import type { Worker } from "../lib/types";
-import { createWorkers, fixtureState } from "../test/fixtures";
+import { createAuditWorker, createWorkers, fixtureState } from "../test/fixtures";
 import WorkerDetail from "./WorkerDetail.svelte";
 
 const longBrief = [
@@ -190,5 +190,29 @@ describe("worker thread model-switch note", () => {
       "Model changed to deep by you; it takes effect on the next call",
       "Now running on fast",
     ]);
+  });
+});
+
+describe("WorkerDetail finished audit", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  it("hides Resume, Compact and Steer for a finished audit and points the lead at its report", () => {
+    const audit = createAuditWorker();
+    render(WorkerDetail, { worker: audit });
+
+    expect(screen.getByText("Audit finished; its report is with the lead.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Steer" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Compact" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    // Delete stays: the lead can still clean the finished audit up.
+    expect(screen.getByRole("button", { name: "Delete Ada" })).toBeTruthy();
+  });
+
+  it("keeps Resume for an audit that failed before reporting", () => {
+    const audit: Worker = { ...createAuditWorker(), status: "failed", reportDelivered: false };
+    render(WorkerDetail, { worker: audit });
+
+    expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();
+    expect(screen.queryByText("Audit finished; its report is with the lead.")).toBeNull();
   });
 });

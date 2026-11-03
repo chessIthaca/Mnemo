@@ -48,7 +48,7 @@ Rules:
 
 ## Briefs
 
-The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. The design belongs in the step text, written as a spec as the `mnemo-plan` skill describes, because the brief is not saved in the plan: a resumed, compacted or model-switched worker loses it. If you notice while writing a brief that the step lacks signatures, rules or test names, add them to the plan first, with `plan_update` `add_steps` or `decision`. Your `brief` then carries only what is specific to this dispatch:
+The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. The design belongs in the step text, written as a spec as the `mnemo-plan` skill describes, because the brief is not saved in the plan: a later worker on the same step never sees it. If you notice while writing a brief that the step lacks signatures, rules or test names, add them to the plan first, with `plan_update` `add_steps` or `decision`. Your `brief` then carries only what is specific to this dispatch:
 
 - the goal of this task in one or two sentences;
 - the files it owns, and the files it must not touch because another step owns them;
@@ -56,6 +56,8 @@ The worker automatically receives the plan (title, goal, context, decisions, int
 - the exact verification commands to run (build, tests, lint);
 - constraints and traps you know about;
 - "commit on your branch, report the commit and the checks you ran, and message the lead if you are blocked".
+
+Pass `read_back: true` to `team_dispatch` for a large or subtle spec. The worker then first sends you its questions, or "No questions.", and waits. Answer by amending the plan (`plan_update` `decision` or `add_steps`) and then `team_message` the worker, so the answer is durable.
 
 Give whole, self-contained implementation tasks. Never send read-only, content-only or "send me the file text" briefs.
 

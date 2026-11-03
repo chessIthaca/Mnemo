@@ -216,6 +216,10 @@ pub struct WorkerRecord {
     /// Whether the initial brief was accepted by a live session.
     #[serde(default)]
     pub brief_sent: bool,
+    /// The worker's first turn is a read-back: it reports questions about
+    /// its spec and waits for the lead before changing files.
+    #[serde(default)]
+    pub read_back: bool,
     /// A real compaction command is running in this session.
     #[serde(default)]
     pub compacting: bool,
@@ -296,10 +300,22 @@ pub struct WorkerRecord {
     pub tier: Option<String>,
 }
 
-impl WorkerRecord {
-    /// The first message the worker's session receives.
-    fn first_message(&self) -> &str {
-        self.opening_prompt.as_deref().unwrap_or(&self.brief)
+/// The opening prompt of a worker that implements its pinned task straight
+/// away.
+pub(crate) const KICKOFF: &str = "Your task is pinned in your instructions under \"Your task (pinned)\": the plan, your step's spec and the lead's brief. Implement it exactly as specified. If the spec contradicts the code or leaves a decision open, message the lead (message_parent) before guessing.";
+
+/// The opening prompt of a read-back worker: it reads its pinned task and the
+/// files it names, asks its questions, and changes nothing until the lead
+/// answers.
+pub(crate) const READ_BACK_KICKOFF: &str = "Your task is pinned in your instructions under \"Your task (pinned)\". Before changing any file, read the spec and every file it names. Then send the lead one message (message_parent) listing each ambiguity, contradiction with the code, or decision the spec leaves open, numbered, with file and line, or exactly \"No questions.\" Then stop and wait. Start implementing only after the lead replies.";
+
+/// The first user message a worker's session receives: the short kickoff that
+/// points at the task pinned in the system head.
+fn kickoff_message(record: &WorkerRecord) -> &'static str {
+    if record.read_back {
+        READ_BACK_KICKOFF
+    } else {
+        KICKOFF
     }
 }
 
@@ -323,6 +339,45 @@ pub enum BoardSignal {
 struct PlanRef {
     plan_id: String,
     step: usize,
+}
+
+/// One dispatch request's knobs, threaded through the dispatch path together.
+#[derive(Clone, Debug)]
+struct DispatchRequest {
+    /// The lead's task-specific instructions.
+    brief: String,
+    /// The exact model spec, when the lead chose one.
+    model: Option<String>,
+    /// The chosen reasoning effort, when the lead chose one.
+    reasoning_effort: Option<String>,
+    /// The stable worker id, when the lead named one.
+    worker_id: Option<String>,
+    /// The plan step the task belongs to, when it is on the board.
+    plan: Option<PlanRef>,
+    /// The lead-assigned review risk.
+    review_risk: Option<String>,
+    /// Whether the first turn reads the spec back and asks questions.
+    read_back: bool,
+}
+
+/// The inputs one live worker session needs: where and on what it runs, its
+/// transcript to resume from, its trace identity, and the task pinned into
+/// its system head.
+pub(crate) struct WorkerSessionSpec {
+    /// The exact model spec, when the lead chose one.
+    pub(crate) model: Option<String>,
+    /// The chosen reasoning effort, when the lead chose one.
+    pub(crate) reasoning_effort: Option<String>,
+    /// The checkout the session is bound to.
+    pub(crate) worktree: PathBuf,
+    /// The saved transcript to resume from.
+    pub(crate) resume: Option<Transcript>,
+    /// `implementation` or `audit`, selecting the guardrails.
+    pub(crate) kind: String,
+    /// The trace identity every model call is attributed to.
+    pub(crate) trace_identity: TraceIdentity,
+    /// The task rendered into the system head for the session's whole life.
+    pub(crate) pinned_task: Option<String>,
 }
 
 /// A worker on a board step, as the Plan tab shows it.
@@ -1571,7 +1626,7 @@ impl TeamRuntime {
             HostToolSpec {
                 name: "team_dispatch".to_string(),
                 description: "Delegate one implementation task through TeamManager to a full executor worker, under a step of a plan on the plan board (plan first: plan_create, then dispatch with its plan_id and 1-based step). The worker receives the plan and its step automatically, so your brief is only the task-specific instructions. A step is checked off when one of its tasks merges and none is still open. Workers run in their own worktree and branch with file_edit, file_write, shell, git, and tests, and have no token or cost budget: give them whole, self-contained implementation tasks (code, tests, verification, commit), never read-only, content-only, or 'send me the file text' briefs. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. Mark shared contracts, persistence, concurrency, security, or large/cross-cutting work with review_risk='high'; high-risk dispatch requires that plan to declare observable acceptance scenarios (plan_create acceptance_scenarios or plan_update add_acceptance_scenarios). The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"review_risk":{"type":"string","enum":["standard","high"],"description":"Lead-assigned review risk; high risk requires observable acceptance scenarios on this plan and an independent audit before merge."}},"required":dispatch_required}),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"read_back":{"type":"boolean","description":"Optional. When true, the worker's first turn only reads its spec and the files it names, then messages the lead with numbered questions (ambiguities, contradictions with the code, open decisions) or exactly 'No questions.', and waits for the lead's reply before changing files. Use it for large or subtle specs."}},"required":dispatch_required}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -1742,6 +1797,10 @@ impl TeamRuntime {
                 .get("review_risk")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let read_back = args
+                .get("read_back")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
             model = match self.lead_model_choice(tier.as_deref(), model) {
                 Ok(Some(model)) => Some(model),
@@ -1771,6 +1830,7 @@ impl TeamRuntime {
                     reasoning_effort,
                     Some(worker_id.to_string()),
                     review_risk,
+                    read_back,
                     plan_id,
                     step,
                 )
@@ -1999,6 +2059,7 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         worker_id: Option<String>,
         review_risk: Option<String>,
+        read_back: bool,
         plan_id: &str,
         step: usize,
     ) -> Result<(WorkerRecord, bool), String> {
@@ -2013,14 +2074,15 @@ impl TeamRuntime {
             plan_id: plan_id.to_string(),
             step: step - 1,
         };
-        self.dispatch_request(
+        self.dispatch_request(DispatchRequest {
             brief,
             model,
             reasoning_effort,
             worker_id,
-            Some(plan),
+            plan: Some(plan),
             review_risk,
-        )
+            read_back,
+        })
         .await
     }
 
@@ -2042,14 +2104,15 @@ impl TeamRuntime {
         worker_id: Option<String>,
         review_risk: Option<String>,
     ) -> Result<WorkerRecord, String> {
-        self.dispatch_request(
+        self.dispatch_request(DispatchRequest {
             brief,
             model,
-            None,
+            reasoning_effort: None,
             worker_id,
-            None,
+            plan: None,
             review_risk,
-        )
+            read_back: false,
+        })
         .await
         .map(|(worker, _)| worker)
     }
@@ -2062,37 +2125,24 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         worker_id: Option<String>,
     ) -> Result<WorkerRecord, String> {
-        self.dispatch_request(
+        self.dispatch_request(DispatchRequest {
             brief,
             model,
             reasoning_effort,
             worker_id,
-            None,
-            None,
-        )
-            .await
-            .map(|(worker, _)| worker)
+            plan: None,
+            review_risk: None,
+            read_back: false,
+        })
+        .await
+        .map(|(worker, _)| worker)
     }
 
     async fn dispatch_request(
         &self,
-        brief: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        worker_id: Option<String>,
-        plan: Option<PlanRef>,
-        review_risk: Option<String>,
+        request: DispatchRequest,
     ) -> Result<(WorkerRecord, bool), String> {
-        let result = self
-            .dispatch_locked(
-                brief,
-                model,
-                reasoning_effort,
-                worker_id,
-                plan,
-                review_risk,
-            )
-            .await;
+        let result = self.dispatch_locked(request).await;
         if matches!(result, Ok((_, false))) {
             self.signal_board_changed();
         }
@@ -2101,13 +2151,17 @@ impl TeamRuntime {
 
     async fn dispatch_locked(
         &self,
-        brief: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        worker_id: Option<String>,
-        plan: Option<PlanRef>,
-        review_risk: Option<String>,
+        request: DispatchRequest,
     ) -> Result<(WorkerRecord, bool), String> {
+        let DispatchRequest {
+            brief,
+            model,
+            reasoning_effort,
+            worker_id,
+            plan,
+            review_risk,
+            read_back,
+        } = request;
         let _guard = self.merge_lock.lock().await;
         if brief.trim().is_empty() {
             return Err("the worker brief is empty".to_string());
@@ -2141,13 +2195,14 @@ impl TeamRuntime {
                 if existing.brief != brief
                     || existing.model != model
                     || existing.reasoning_effort != reasoning_effort
+                    || existing.read_back != read_back
                     || plan.as_ref().is_some_and(|plan| {
                         existing.plan_id.as_deref() != Some(plan.plan_id.as_str())
                             || existing.plan_step != Some(plan.step)
                     })
                 {
                     return Err(format!(
-                        "worker '{id}' already exists with a different brief, model, reasoning effort, or plan step; use team_status instead of guessing a new ID (to move it to another model, use team_resume with `tier` or `model`)"
+                        "worker '{id}' already exists with a different brief, model, reasoning effort, read_back, or plan step; use team_status instead of guessing a new ID (to move it to another model, use team_resume with `tier` or `model`)"
                     ));
                 }
                 if existing.branch != agent_branch(id) {
@@ -2210,7 +2265,7 @@ impl TeamRuntime {
             return Err(format!("all {slots} worker slots are busy"));
         }
         let placed = plan.as_ref().map(|plan| (plan.plan_id.clone(), plan.step));
-        let result = self
+        let provisioned = self
             .provision_worker(
                 brief,
                 opening,
@@ -2221,6 +2276,18 @@ impl TeamRuntime {
                 plan,
             )
             .await;
+        // Provisioning leaves the worker stopped; the read-back flag lands on
+        // the stored record before its session starts, so the opening kickoff
+        // matches the record the session was started from.
+        let result = match provisioned {
+            Ok(record) => {
+                self.update_worker(&record.id, |worker| worker.read_back = read_back)
+                    .await;
+                self.start_worker(WorkerRecord { read_back, ..record })
+                    .await
+            }
+            Err(err) => Err(err),
+        };
         if result.is_ok() {
             if let Some((plan_id, step)) = &placed {
                 // Parallel work: the seams between the steps need a final
@@ -2240,7 +2307,6 @@ impl TeamRuntime {
         }
         result.map(|worker| (worker, false))
     }
-
 
     /// Dispatch one fresh read-only independent audit of an implementation
     /// worker's current branch/tip.
@@ -2399,6 +2465,7 @@ impl TeamRuntime {
             used_tokens: 0,
             max_tokens: 0,
             brief_sent: false,
+            read_back: false,
             compacting: false,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -2592,6 +2659,7 @@ impl TeamRuntime {
             used_tokens: 0,
             max_tokens: 0,
             brief_sent: false,
+            read_back: false,
             compacting: false,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -2644,7 +2712,7 @@ impl TeamRuntime {
                 }
             });
         }
-        self.start_worker(record).await
+        Ok(record)
     }
 
     async fn start_worker(&self, record: WorkerRecord) -> Result<WorkerRecord, String> {
@@ -2665,14 +2733,20 @@ impl TeamRuntime {
         .await;
         self.persist().await?;
         let session = match self
-            .spawn_worker_session(
-                record.model.clone(),
-                record.reasoning_effort.clone(),
-                record.worktree.clone(),
-                Some(record.transcript.clone()),
-                record.kind.as_str(),
-                Self::worker_trace_identity(&record),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: record.model.clone(),
+                reasoning_effort: record.reasoning_effort.clone(),
+                worktree: record.worktree.clone(),
+                resume: Some(record.transcript.clone()),
+                kind: record.kind.clone(),
+                trace_identity: Self::worker_trace_identity(&record),
+                pinned_task: Some(
+                    record
+                        .opening_prompt
+                        .clone()
+                        .unwrap_or_else(|| record.brief.clone()),
+                ),
+            })
             .await
         {
             Ok(session) => session,
@@ -2704,7 +2778,7 @@ impl TeamRuntime {
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {
-                text: record.first_message().to_string(),
+                text: kickoff_message(&record).to_string(),
                 images: Vec::new(),
             })
             .await
@@ -2712,7 +2786,7 @@ impl TeamRuntime {
             pump.abort();
             let _ = session.close().await;
             let error = format!(
-                "could not send the brief to worker '{id}': {err}; retry with the same worker ID"
+                "could not send the opening prompt to worker '{id}': {err}; retry with the same worker ID"
             );
             self.fail_worker(&id, error.clone()).await;
             return Err(error);
@@ -2767,13 +2841,17 @@ impl TeamRuntime {
     /// record's name at every call site.
     pub(crate) async fn spawn_worker_session(
         &self,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        worktree: PathBuf,
-        resume: Option<Transcript>,
-        kind: &str,
-        trace_identity: TraceIdentity,
+        spec: WorkerSessionSpec,
     ) -> Result<AgentSession, String> {
+        let WorkerSessionSpec {
+            model,
+            reasoning_effort,
+            worktree,
+            resume,
+            kind,
+            trace_identity,
+            pinned_task,
+        } = spec;
         let name = trace_identity.agent_name.clone();
         self.engine
             .spawn(SpawnOptions {
@@ -2787,14 +2865,16 @@ impl TeamRuntime {
                 limits: None,
                 host_tools: self.worker_host_tools(),
                 external_policy: None,
-                guardrails: Some(guardrails_for(kind)),
+                guardrails: Some(guardrails_for(&kind)),
                 // Plan c3ba2b58 step B: the worker's trace identity, built
                 // from its record — every model call the worker makes is
                 // attributed to this worker, its plan, and its step.
                 trace_identity: Some(trace_identity),
-                // Plan 40eef714 step 1: unset until step 2 pins the
-                // worker's task here.
-                pinned_task: None,
+                // Plan 40eef714 step 2: the worker's whole task — the plan,
+                // its step spec, and the lead's brief — pinned into the
+                // system head so compaction and model switches never
+                // summarize it away.
+                pinned_task,
             })
             .await
             .map_err(|err| format!("could not spawn the worker session: {err}"))
@@ -3011,7 +3091,7 @@ impl TeamRuntime {
                     } else if worker.transcript.messages.is_empty() && worker.brief_sent {
                         worker.transcript = Transcript {
                             messages: vec![mnemo::provider::Message::user_text(
-                                worker.first_message().to_string(),
+                                kickoff_message(worker).to_string(),
                             )],
                         };
                     }
@@ -3070,14 +3150,20 @@ impl TeamRuntime {
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session = self
-            .spawn_worker_session(
-                record.model.clone(),
-                record.reasoning_effort.clone(),
-                record.worktree.clone(),
-                Some(record.transcript.clone()),
-                record.kind.as_str(),
-                Self::worker_trace_identity(&record),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: record.model.clone(),
+                reasoning_effort: record.reasoning_effort.clone(),
+                worktree: record.worktree.clone(),
+                resume: Some(record.transcript.clone()),
+                kind: record.kind.clone(),
+                trace_identity: Self::worker_trace_identity(&record),
+                pinned_task: Some(
+                    record
+                        .opening_prompt
+                        .clone()
+                        .unwrap_or_else(|| record.brief.clone()),
+                ),
+            })
             .await?;
         let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(false));
@@ -6962,6 +7048,7 @@ mod tests {
             used_tokens: 0,
             max_tokens: 0,
             brief_sent: true,
+            read_back: false,
             compacting: false,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -7051,14 +7138,15 @@ models = [\"scripted-a\"]
 
     async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
         let session = team
-            .spawn_worker_session(
-                None,
-                None,
-                worker.worktree.clone(),
-                None,
-                "implementation",
-                TeamRuntime::worker_trace_identity(worker),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: worker.worktree.clone(),
+                resume: None,
+                kind: "implementation".to_string(),
+                trace_identity: TeamRuntime::worker_trace_identity(worker),
+                pinned_task: None,
+            })
             .await
             .expect("spawn worker session");
         team.live.lock().await.insert(
@@ -7141,14 +7229,15 @@ models = [\"scripted-a\"]
         .await;
         for worker in [&dangling, &fragment] {
             let session = team
-                .spawn_worker_session(
-                    None,
-                    None,
-                    worker.worktree.clone(),
-                    None,
-                    "implementation",
-                    TeamRuntime::worker_trace_identity(worker),
-                )
+                .spawn_worker_session(WorkerSessionSpec {
+                    model: None,
+                    reasoning_effort: None,
+                    worktree: worker.worktree.clone(),
+                    resume: None,
+                    kind: "implementation".to_string(),
+                    trace_identity: TeamRuntime::worker_trace_identity(worker),
+                    pinned_task: None,
+                })
                 .await
                 .expect("open a worktree-bound session and its code graph");
             assert!(worker.worktree.join(".coding/codegraph.db").is_file());
@@ -7635,14 +7724,15 @@ models = [\"scripted-a\"]
         });
         let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
         let session = team
-            .spawn_worker_session(
-                None,
-                None,
-                worker.worktree.clone(),
-                None,
-                "implementation",
-                TeamRuntime::worker_trace_identity(&worker),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: worker.worktree.clone(),
+                resume: None,
+                kind: "implementation".to_string(),
+                trace_identity: TeamRuntime::worker_trace_identity(&worker),
+                pinned_task: None,
+            })
             .await
             .expect("open a worktree-bound session and its code graph");
         assert!(worker.worktree.join(".coding/codegraph.db").is_file());
@@ -8391,6 +8481,73 @@ models = [\"scripted-a\"]
             .plan_document(stray)
             .expect_err("an id no board row names is refused");
         assert!(refused.contains(stray), "{refused}");
+        team.shutdown().await;
+    }
+
+    /// The lead's `team_dispatch` schema offers a read-back first turn for
+    /// large or subtle specs, as a boolean opt-in.
+    #[tokio::test]
+    async fn team_dispatch_schema_offers_read_back() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+        let dispatch = team
+            .lead_host_tools()
+            .into_iter()
+            .find(|tool| tool.name == "team_dispatch")
+            .expect("team_dispatch");
+        let read_back = &dispatch.parameters["properties"]["read_back"];
+        assert_eq!(read_back["type"], json!("boolean"), "{read_back}");
+        let description = read_back["description"]
+            .as_str()
+            .expect("a read_back description");
+        assert!(description.contains("No questions."), "{description}");
+        assert!(description.contains("waits for the lead's reply"), "{description}");
+        team.shutdown().await;
+    }
+
+    /// Idempotent re-dispatch compares `read_back` like the brief: the same
+    /// worker id with a different value is refused rather than silently
+    /// re-pinned.
+    #[tokio::test]
+    async fn redispatch_with_a_different_read_back_is_refused() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut existing = worker(root.path(), "00000001000000000001");
+        existing.brief = "BRIEF-91x".to_string();
+        let team = open_test_team(root.path(), state.path(), vec![existing.clone()]).await;
+
+        let (reused, fresh) = team
+            .dispatch_request(DispatchRequest {
+                brief: "BRIEF-91x".to_string(),
+                model: None,
+                reasoning_effort: None,
+                worker_id: Some(existing.id.clone()),
+                plan: None,
+                review_risk: None,
+                read_back: false,
+            })
+            .await
+            .expect("the identical re-dispatch reuses the worker");
+        assert!(fresh, "the identical re-dispatch is a reuse");
+        assert_eq!(reused.id, existing.id);
+
+        let refused = team
+            .dispatch_request(DispatchRequest {
+                brief: "BRIEF-91x".to_string(),
+                model: None,
+                reasoning_effort: None,
+                worker_id: Some(existing.id.clone()),
+                plan: None,
+                review_risk: None,
+                read_back: true,
+            })
+            .await
+            .expect_err("a different read_back is refused");
+        assert!(refused.contains("read_back"), "{refused}");
         team.shutdown().await;
     }
 }

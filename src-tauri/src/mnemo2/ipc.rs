@@ -853,6 +853,9 @@ pub async fn team_dispatch(
             reasoning_effort,
             worker_id,
             review_risk,
+            // The Control Room form has no read-back switch; the lead's
+            // `team_dispatch` tool is the read-back surface.
+            false,
             &plan_id,
             step,
         )

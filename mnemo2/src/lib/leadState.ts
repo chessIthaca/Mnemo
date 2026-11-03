@@ -740,7 +740,12 @@ export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
     case "compact_started":
       return { ...state, leadRuntime: { ...runtime, compacting: true } };
 
-    case "compacted": {
+    case "compacted":
+    case "model_swap_summarized": {
+      // A completed compact-then-switch is the paired end of `compact_started`
+      // (the deferred-swap path emits no `compacted`), so the badge clears here
+      // exactly as it does on "compacted". Informational — the lead keeps
+      // running, so busy/status are untouched.
       const usedTokens = typeof inner.after === "number" ? inner.after : runtime.usedTokens;
       return { ...state, leadRuntime: { ...runtime, compacting: false, usedTokens } };
     }

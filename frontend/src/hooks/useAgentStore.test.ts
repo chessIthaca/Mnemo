@@ -1362,6 +1362,29 @@ describe("agent event reducers (table-driven)", () => {
     }
   });
 
+  it("model_swap_summarized: an informational note, never a failure (bug 2026-11-02)", () => {
+    // The deferred compact-then-switch completed: the OLD model summarized the
+    // conversation, then the swap landed. The notice keeps the same words the
+    // pre-fix ERROR carried, but as a neutral transcript note — the turn
+    // continues on the new model, so the agent must stay running and unfailed
+    // (reduceError would have set failed: true and stopped it).
+    useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "started" } });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "model_swap_summarized", model: "glm-5.3" },
+    });
+    const a = agent(ID);
+    const last = a.transcript[a.transcript.length - 1];
+    expect(last).toMatchObject({
+      kind: "assistant",
+      text: "Switched to 'glm-5.3' (summarized for smaller context)",
+    });
+    expect(a.failed).toBe(false);
+    expect(a.running).toBe(true);
+    // Nothing to retry — no error entry in the activity log either.
+    expect(a.activityLog.some((e) => e.kind === "error")).toBe(false);
+  });
+
   it("model_changed: updates agentModels for the agent", () => {
     useAgentStore.getState().handleAgentEvent({
       agent_id: ID,

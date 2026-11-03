@@ -309,6 +309,12 @@ pub(crate) fn render_event(event: &SerializableAgentEvent) -> Rendered {
                 _ => Rendered::Lines(vec![format!("— model changed: {model}")]),
             }
         }
+        // A completed compact-then-switch: the OLD model summarized so the
+        // conversation fits the new, smaller window. Informational — the swap
+        // succeeded and the turn continues (bug 2026-11-02, plan 1238e0de).
+        SerializableAgentEvent::ModelSwapSummarized { model } => Rendered::Lines(vec![format!(
+            "— summarized the conversation for smaller context, now on: {model}"
+        )]),
         SerializableAgentEvent::MemoryRecalled { hits } => {
             let parts: Vec<String> = hits
                 .iter()

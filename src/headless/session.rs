@@ -516,12 +516,15 @@ impl AgentSession {
         // once the new model serves — the same string a caller's records
         // keep for the served model.
         let new_model = provider.model().to_string();
-        // The deferral rule the pin itself applies — the new window against
-        // the current one — decided HERE rather than by sampling
-        // `has_pending_swap` afterwards: a running turn may consume the
-        // deferred swap in between, which would misreport the outcome.
-        let deferred =
-            provider.capabilities().max_context < loop_arc.context_manager().max_tokens();
+        // The deferral rule the pin itself applies — the LIVE conversation
+        // against the NEW model's own compaction trigger
+        // (`AgentLoop::swap_needs_compaction`), decided HERE rather than by
+        // sampling `has_pending_swap` afterwards: a running turn may consume
+        // the deferred swap in between, which would misreport the outcome. A
+        // merely smaller window no longer defers: a conversation that fits the
+        // new model swaps on the next request, with no summarization (bug
+        // 2027-11-02, plan 1238e0de).
+        let deferred = loop_arc.swap_needs_compaction(&context_manager);
         // Seed the served-model baseline from the PRE-switch provider while
         // the loop still shows the old model: a loop that never served is
         // otherwise seeded at turn entry from the ALREADY-switched provider,

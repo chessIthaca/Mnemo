@@ -3628,11 +3628,14 @@ mod tests {
             forwarder.contains("SerializableAgentEvent::CompactStarted => {"),
             "the forwarder must track compaction starts"
         );
+        // The compact-then-switch completion is the ONLY paired end the deferred
+        // swap path emits (it emits no Compacted), so it must resolve the wait
+        // exactly like Compacted — otherwise the Run-All wait stays stale.
         assert!(
             forwarder.contains(
-                "SerializableAgentEvent::Compacted { .. }\n                    if compact_in_flight.remove(&agent_id) =>"
+                "SerializableAgentEvent::Compacted { .. }\n                | SerializableAgentEvent::ModelSwapSummarized { .. }\n                    if compact_in_flight.remove(&agent_id) =>"
             ),
-            "the forwarder must resolve the wait on Compacted"
+            "the forwarder must resolve the wait on Compacted AND on the informational compact-then-switch completion"
         );
         assert!(
             forwarder.contains("compact_signal"),

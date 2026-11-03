@@ -220,6 +220,11 @@ impl AgentTask {
     /// :693-695: the provider prefix-cache byte-for-byte contract).
     pub(crate) fn seed_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        // A resumed transcript is the conversation BEFORE any request exists —
+        // publish it so a model switch landing before the first request still
+        // measures the real history instead of an empty/zero count (a
+        // too-big history must compact first).
+        self.agent_loop.publish_message_tokens(&self.messages);
     }
 
     /// Build the user-message content for a text + images payload —
@@ -619,7 +624,14 @@ impl AgentTask {
         // "retries exhausted" for a skip.
         let mut skip_triage: Option<FailureClass> = None;
         loop {
-            match self
+            // Publish the real conversation BEFORE the turn (a switch landing
+            // between turns must see the true history, including messages
+            // pushed by suggestions, steers and between-turns compaction) and
+            // again AFTER it (the turn's final message is part of it) — the
+            // compact-before-switch decision never runs off a stale or zero
+            // count.
+            self.agent_loop.publish_message_tokens(&self.messages);
+            let result = self
                 .agent_loop
                 .run_turn(
                     &mut self.messages,
@@ -628,8 +640,9 @@ impl AgentTask {
                     cmd_rx,
                     self.session_id.as_deref(),
                 )
-                .await
-            {
+                .await;
+            self.agent_loop.publish_message_tokens(&self.messages);
+            match result {
                 Ok(outcome) => {
                     if let Some(pending) = pending_triage.take() {
                         failure_triage::resolve_failure(
@@ -1474,6 +1487,11 @@ impl AgentTask {
                 }
             }
         }
+        // Publish the FINAL count: after the survival digest and every
+        // re-injected buffered prompt (images included) are appended, so a
+        // switch landing right after /compact decides on the conversation that
+        // really exists — not on the bare summary.
+        self.agent_loop.publish_message_tokens(&self.messages);
         // Emit the new context usage so the UI's ctx bar updates.
         let used = crate::agent::context::ContextManager::count_tokens(&self.messages) as u32;
         let max = context_manager.max_tokens() as u32;
@@ -1560,6 +1578,8 @@ impl AgentTask {
     /// by `/new`.
     async fn clear_context(&mut self, fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>) {
         self.messages.clear();
+        // /new: the conversation a switch measures is now empty.
+        self.agent_loop.publish_message_tokens(&self.messages);
         // A fresh session must not inherit the previous one's temporary raise
         // (backlog 11513ee5) — the ladder is session state, and /new starts a
         // new session.
@@ -7831,6 +7851,147 @@ mod tests {
         // Drain the fanin channel so nothing blocks.
         while let Ok((_id, _event)) = fanin_rx.try_recv() {}
         drop(cmd_tx);
+    }
+
+    // Audit follow-up: the switch decision must measure the conversation a
+    // compaction LEFT BEHIND — the survival digest and every re-injected
+    // buffered prompt (images included) — not the bare summary. The publish used
+    // to run right after `self.messages = summarized`, before those appends.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_switch_after_a_compaction_measures_the_final_conversation() {
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let stream_entered = Arc::new(tokio::sync::Notify::new());
+        let (stream_gate_tx, stream_gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                AgentLoopConfig {
+                    provider: Arc::new(GatedMockProvider {
+                        caps: Capabilities::openai(),
+                        stream_entered: Arc::clone(&stream_entered),
+                        stream_gate: std::sync::Mutex::new(Some(stream_gate_rx)),
+                    }),
+                    tools: Arc::new(ToolRegistry::new()),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
+                    sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
+                    safety_mode: SafetyMode::Autonomous,
+                    context_manager: ContextManager::new(128_000, 0.5),
+                    memory: None,
+                    vision: None,
+                },
+                crate::project::Constitution::default(),
+            )
+            .with_agent_id(1),
+        );
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let mut task = AgentTask::new(1, "test".into(), agent_loop);
+        for i in 0..10 {
+            task.messages
+                .push(Message::user_text(format!("old message {i}")));
+        }
+        let handle = tokio::spawn(async move {
+            let outcome = task.compact_context(&fanin_tx, &mut cmd_rx).await;
+            (task, outcome)
+        });
+        stream_entered.notified().await;
+        // A big prompt lands while the summary stream is gated: it is buffered
+        // and appended AFTER the rewrite.
+        cmd_tx
+            .send(AgentCommand::Prompt {
+                text: format!("follow-up context {}", "detail ".repeat(8_000)),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let _ = stream_gate_tx.send(());
+        let (task, outcome) = handle.await.unwrap();
+        assert!(
+            matches!(outcome, CompactOutcome::Completed),
+            "the mock summarization must complete"
+        );
+        assert!(
+            task.messages
+                .iter()
+                .any(|m| m.content.as_text().contains("follow-up context")),
+            "the buffered prompt must be part of the final conversation"
+        );
+        // Target: an 8K window → a 4K trigger. The bare post-summary
+        // conversation is far below it; the final one (summary + the ~14K-token
+        // prompt) is far above — so only a publish at the FINAL count defers.
+        let small: Arc<dyn LlmClient> = Arc::new(MockProvider {
+            caps: Capabilities {
+                max_context: 8_000,
+                ..Capabilities::openai()
+            },
+        });
+        task.agent_loop
+            .set_explicit_provider(small, ContextManager::new(8_000, 0.5));
+        assert!(
+            task.agent_loop.has_pending_swap(),
+            "the final conversation is over the new window's trigger — it must compact first"
+        );
+        while let Ok((_id, _event)) = fanin_rx.try_recv() {}
+        drop(cmd_tx);
+    }
+
+    // Audit follow-up: the PRODUCTION resume path (`AgentTask::seed_messages`)
+    // must publish the transcript itself, so a switch landing before the first
+    // request sees a too-big history instead of a count of 0.
+    #[tokio::test]
+    async fn a_seeded_transcript_compacts_before_the_switch() {
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                AgentLoopConfig {
+                    provider: Arc::new(MockProvider {
+                        caps: Capabilities::openai(),
+                    }),
+                    tools: Arc::new(ToolRegistry::new()),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
+                    sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
+                    safety_mode: SafetyMode::Autonomous,
+                    context_manager: ContextManager::new(200_000, 0.5),
+                    memory: None,
+                    vision: None,
+                },
+                crate::project::Constitution::default(),
+            )
+            .with_agent_id(1),
+        );
+        let mut task = AgentTask::new(1, "test".into(), agent_loop);
+        let history: Vec<Message> = (0..20)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                Message::text(role, "z".repeat(800))
+            })
+            .collect();
+        // The ONLY publish is the one `seed_messages` performs.
+        task.seed_messages(history);
+        // Target: a 4K window → a 2K trigger; the 16K-char transcript is far
+        // over it, and no request has ever run.
+        let small: Arc<dyn LlmClient> = Arc::new(MockProvider {
+            caps: Capabilities {
+                max_context: 4_000,
+                ..Capabilities::openai()
+            },
+        });
+        task.agent_loop
+            .set_explicit_provider(small, ContextManager::new(4_000, 0.5));
+        assert!(
+            task.agent_loop.has_pending_swap(),
+            "a transcript seeded through the production resume path must compact before the switch"
+        );
     }
 
     #[tokio::test]

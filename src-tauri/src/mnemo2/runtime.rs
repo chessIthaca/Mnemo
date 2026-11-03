@@ -1599,6 +1599,11 @@ async fn pump_events(
                 }
                 false
             }
+            // A deferred compact-then-switch completed on the lead's own
+            // session: informational — the turn continues on the new model, so
+            // the lead stays busy and no error is recorded (bug 2026-11-02,
+            // plan 1238e0de: this used to arrive as an `Error`).
+            SerializableAgentEvent::ModelSwapSummarized { .. } => false,
             SerializableAgentEvent::ModelChanged { model: changed, .. } => {
                 // The engine's bus is engine-wide: only OUR session's
                 // model change may re-point the lead's observed model
@@ -8972,6 +8977,20 @@ mod tests {
         ])
     }
 
+    /// An SSE turn calling the worker's `message_parent` host tool — a
+    /// SUCCESSFUL tool interaction (the team answers it), so each iteration
+    /// grows the conversation by a call + a result without tripping the
+    /// consecutive-tool-error cap that ends a turn after three failures.
+    fn stub_message_parent_turn(index: usize) -> String {
+        let arguments = format!("{{\"text\":\"progress {index}\"}}");
+        stub_sse(&[
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("call_{index}"),"type":"function","function":{"name":"message_parent","arguments":arguments}}]},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
+        ])
+    }
+
     /// The two-model fixture config over a stub server: `model-a` (the
     /// worker's first model) and `model-b` (the switch target).
     fn write_stub_config(dir: &Path, addr: std::net::SocketAddr) {
@@ -8985,6 +9004,31 @@ mod tests {
             dir.join("endpoints.toml"),
             format!(
                 "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://{addr}/v1/\"\nmodels = [\"model-a\", \"model-b\"]\n"
+            ),
+        )
+        .expect("endpoints.toml");
+    }
+
+    /// [`write_stub_config`] with EXPLICIT per-model windows — the
+    /// compact-then-switch regression needs a switch target (`model-b`) whose
+    /// window genuinely cannot hold the worker's conversation, so the deferred
+    /// summarize-then-swap path runs for real.
+    fn write_stub_config_windows(
+        dir: &Path,
+        addr: std::net::SocketAddr,
+        model_a_max_context: usize,
+        model_b_max_context: usize,
+    ) {
+        std::fs::create_dir_all(dir).expect("config dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"model-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            format!(
+                "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://{addr}/v1/\"\n\n[[endpoint.models]]\nid = \"model-a\"\nmax_context = {model_a_max_context}\n\n[[endpoint.models]]\nid = \"model-b\"\nmax_context = {model_b_max_context}\n"
             ),
         )
         .expect("endpoints.toml");
@@ -9004,6 +9048,43 @@ mod tests {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_stub_config(config.path(), addr);
+        let lead = LeadRuntime::open_inner(options(root, config, state), None)
+            .await
+            .expect("lead opens");
+        let team =
+            crate::mnemo2::team::TeamRuntime::open(crate::mnemo2::team::TeamRuntimeOptions {
+                engine: lead.engine_handle().await.expect("engine"),
+                workspace_root: root.path().to_path_buf(),
+                state_dir: state.path().to_path_buf(),
+                slots: Some(slots),
+                models: lead.models(),
+                pricing: Vec::new(),
+            })
+            .await
+            .expect("team opens");
+        team.attach_board(lead.board_handle().expect("the lead's plan board"));
+        (lead, team)
+    }
+
+    /// [`open_stub_team`] over [`write_stub_config_windows`]: the worker's
+    /// first model gets a large window, the switch target a small one.
+    async fn open_stub_team_with_windows(
+        root: &TempDir,
+        config: &TempDir,
+        state: &TempDir,
+        addr: std::net::SocketAddr,
+        slots: usize,
+        model_a_max_context: usize,
+        model_b_max_context: usize,
+    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_stub_config_windows(
+            config.path(),
+            addr,
+            model_a_max_context,
+            model_b_max_context,
+        );
         let lead = LeadRuntime::open_inner(options(root, config, state), None)
             .await
             .expect("lead opens");
@@ -9101,6 +9182,183 @@ mod tests {
         assert!(
             ledger.contains("test/model-b"),
             "the switch persisted: {ledger}"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// Regression (bug 2026-11-02, plan 1238e0de): switching a WORKING worker
+    /// to a model whose window cannot hold the conversation summarizes on the
+    /// OLD model and then completes the swap. That completion is INFORMATION,
+    /// never an error: the worker keeps working, records NO error, and its next
+    /// request serves on the new model. Before the fix the kernel emitted
+    /// `Error { retrying: false }` for the completed swap and the pump failed
+    /// the worker for a switch that had actually succeeded.
+    #[tokio::test]
+    async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        // model-a 200K (trigger 100K) holds the conversation; model-b 32K
+        // (trigger 16K) cannot, so the switch defers and the OLD model
+        // summarizes first.
+        let (release1, gate1) = tokio::sync::oneshot::channel();
+        let (release4, gate4) = tokio::sync::oneshot::channel();
+        let (release_last, gate_last) = tokio::sync::oneshot::channel();
+        let mut turns = vec![StubTurn {
+            body: stub_message_parent_turn(1),
+            gate: Some(gate1),
+        }];
+        // Three more SUCCESSFUL tool turns grow the conversation past
+        // keep_recent, so the pre-swap summary actually rewrites it (the
+        // oversized brief is summarized away instead of surviving into the new
+        // window). A successful call never trips the consecutive-error cap.
+        for index in 2..=3 {
+            turns.push(StubTurn {
+                body: stub_message_parent_turn(index),
+                gate: None,
+            });
+        }
+        turns.push(StubTurn {
+            body: stub_message_parent_turn(4),
+            gate: Some(gate4),
+        });
+        // The deferred swap's summarization call, served by the OLD model.
+        turns.push(StubTurn {
+            body: stub_text_turn("Summary of the earlier work."),
+            gate: None,
+        });
+        // The post-swap request, held so the record is inspected while the
+        // worker is genuinely working on the new model.
+        turns.push(StubTurn {
+            body: stub_text_turn("done on the new model"),
+            gate: Some(gate_last),
+        });
+        let mut stub = StubServer::start(turns).await;
+        let (lead, team) =
+            open_stub_team_with_windows(&root, &config, &state, stub.addr, 1, 200_000, 32_000)
+                .await;
+
+        // ~120K chars ≈ 30K tokens of brief: over model-b's 16K trigger.
+        let brief = format!(
+            "implement the counting feature. Context: {}",
+            "context detail ".repeat(8_000)
+        );
+        let worker = team
+            .dispatch_with_id(
+                brief,
+                Some("test/model-a".into()),
+                Some("worker0001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.generation, 1);
+
+        // Request 1 arrives on model-a; release it so the tool loop runs on
+        // through request 4, which stays in flight (the worker is busy).
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("request 1 arrives");
+        release1.send(()).expect("release request 1");
+        for request in 2..=4 {
+            tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+                .await
+                .unwrap_or_else(|_| panic!("request {request} arrives"));
+        }
+        assert_eq!(
+            stub.models(),
+            vec!["model-a".to_string(); 4],
+            "the tool loop ran on the old model"
+        );
+
+        // The switch lands while the worker is working: the conversation
+        // exceeds model-b's trigger, so it DEFERS — no restart, still Working.
+        let switched = team
+            .change_model("worker0001", Some("test/model-b".into()), None)
+            .await
+            .expect("the deferred switch is accepted");
+        assert_eq!(switched.generation, 1, "no stop/resume");
+        assert!(
+            matches!(switched.status, crate::mnemo2::team::WorkerStatus::Working),
+            "the worker keeps working through the deferred switch: {switched:?}"
+        );
+
+        // Release request 4: when the deferred swap decided the conversation
+        // needs one, the turn loop first sends a summarization request to the
+        // OLD model; either way the next request then serves the NEW model and
+        // is held (the test's last stub turn) so the record can be inspected
+        // while the worker is genuinely working on the new model.
+        release4.send(()).expect("release request 4");
+        for _ in 0..2 {
+            if stub.models().last().map(String::as_str) == Some("model-b") {
+                break;
+            }
+            tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+                .await
+                .expect("a request arrives after the switch");
+        }
+        assert_eq!(
+            stub.models().last().map(String::as_str),
+            Some("model-b"),
+            "the next request serves on the new model (models={:?})",
+            stub.models()
+        );
+
+        // The regression: the completed swap is informational. Poll until the
+        // pump folded it (the badge the CompactStarted raised is cleared), then
+        // assert the record never went Failed and carries no error.
+        let mut observed = team.worker("worker0001").await.expect("worker record");
+        for _ in 0..250 {
+            if !observed.compacting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            observed = team.worker("worker0001").await.expect("worker record");
+        }
+        assert!(
+            !observed.compacting,
+            "the compacting badge ended with the swap: status={:?} error={:?} compacting={} models={:?}",
+            observed.status,
+            observed.error,
+            observed.compacting,
+            stub.models()
+        );
+        assert_eq!(
+            observed.error, None,
+            "a summarized switch is not an error: status={:?}",
+            observed.status
+        );
+        // The worker is still WORKING the turn on the new model — the
+        // informational event never fails it and never idles it (a mid-turn
+        // compaction's Compacted must not flip a live turn to Idle either).
+        assert!(
+            matches!(
+                observed.status,
+                crate::mnemo2::team::WorkerStatus::Working
+            ),
+            "the worker keeps working after the summarized switch: status={:?} error={:?} compacting={} models={:?}",
+            observed.status,
+            observed.error,
+            observed.compacting,
+            stub.models()
+        );
+
+        release_last.send(()).expect("release the final response");
+        let settled = wait_for_worker_status(
+            &team,
+            "worker0001",
+            crate::mnemo2::team::WorkerStatus::Completed,
+        )
+        .await;
+        assert_eq!(
+            settled.error, None,
+            "the turn completed cleanly: status={:?}",
+            settled.status
+        );
+        assert_eq!(
+            settled.generation, 1,
+            "the live switch never restarted the session"
         );
         team.shutdown().await;
         lead.shutdown().await;

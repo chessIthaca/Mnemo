@@ -90,10 +90,12 @@ impl SessionState {
 }
 
 /// The agent loop. Drives a conversation turn.
-/// A deferred provider swap: stored when the user switches to a model with a
-/// smaller context window than the current one. The turn loop completes the
-/// swap after summarizing (if needed) using the OLD provider, so the
-/// conversation fits the new (smaller) window.
+/// A deferred provider swap: stored when the user switches to a model whose
+/// context manager cannot hold the LIVE conversation (see
+/// [`AgentLoop::swap_needs_compaction`]). The turn loop completes the swap
+/// after summarizing with the OLD provider, so the conversation fits the new
+/// window. A switch whose conversation already fits swaps at once — no
+/// `PendingSwap`, no summarization.
 pub struct PendingSwap {
     /// The new provider to swap to.
     pub provider: Arc<dyn LlmClient>,
@@ -206,6 +208,22 @@ pub struct AgentLoop {
     /// own preflight/compaction is the backstop. `0` = no count recorded
     /// yet (no request has been built for this loop).
     pub(crate) live_token_count: std::sync::atomic::AtomicUsize,
+    /// The token count of the conversation its owning task last PUBLISHED —
+    /// what every compact-before-switch decision measures (see
+    /// [`swap_needs_compaction`](Self::swap_needs_compaction)). Published when
+    /// a transcript is seeded (a resume, BEFORE any request runs), before and
+    /// after every turn (the turn's final message counts), and at the top of
+    /// every request iteration — the points where a bare request-iteration
+    /// count would be `0` (a resumed session that has not issued a request)
+    /// or stale (after a turn's final message). Only the COUNT is kept: the
+    /// conversation itself is never copied into the loop.
+    pub(crate) live_message_tokens: std::sync::atomic::AtomicUsize,
+    /// The tool-schema overhead (tokens) measured for the request surface of
+    /// the last publish — the second half of the inclusive count the turn
+    /// loop's summarize trigger uses. Seeded at construction from the
+    /// registry's advertised schema block, so even a resumed session's first
+    /// switch decision is measured inclusively rather than as message-only.
+    pub(crate) live_schema_tokens: std::sync::atomic::AtomicUsize,
     pub(crate) tools: Arc<ToolRegistry>,
     /// The steering counters this loop reports to (2c.4/G4): injected by
     /// the factory via `with_steering` so every loop the same factory
@@ -1063,6 +1081,19 @@ impl AgentLoop {
             )),
             compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
+            live_message_tokens: std::sync::atomic::AtomicUsize::new(0),
+            // Baseline schema overhead for a session that has not issued a
+            // request yet (a resumed transcript): the advertised surface of a
+            // normal working state. Each request iteration replaces it with the
+            // exact measured value.
+            live_schema_tokens: std::sync::atomic::AtomicUsize::new(
+                crate::provider::estimate_tools_tokens(
+                    &tools.schemas(
+                        &crate::provider::Capabilities::openai(),
+                        &crate::tool::ToolFilter::Executing,
+                    ),
+                ),
+            ),
             steering: Arc::new(crate::agent::steering_stats::SteeringStats::new()),
             permission: std::sync::RwLock::new(
                 crate::agent::policy::PermissionPolicy::ApproveViaApi {
@@ -2368,6 +2399,92 @@ impl AgentLoop {
         self.compaction_raise.reset();
     }
 
+    /// Publish the conversation's token COUNT to the loop — the measure every
+    /// compact-before-switch decision uses. The conversation itself is never
+    /// copied into the loop (it carries base64 images and this runs on every
+    /// request iteration): [`ContextManager::count_tokens`] is computed right
+    /// here, at publish time, and only the resulting number is kept.
+    ///
+    /// Called when a transcript is seeded (a resume, before the first
+    /// request), before and after every turn, and at the top of every request
+    /// iteration — the points where a request-iteration count is `0` (a resumed
+    /// session that has not issued a request) or stale (after a turn's final
+    /// message).
+    pub fn publish_message_tokens(&self, messages: &[crate::provider::Message]) {
+        self.live_message_tokens.store(
+            super::context::ContextManager::count_tokens(messages),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Publish the tool-schema overhead (tokens) measured for the current
+    /// request surface — the second half of the inclusive count the turn
+    /// loop's summarize trigger compares.
+    pub fn publish_schema_tokens(&self, tokens: usize) {
+        self.live_schema_tokens
+            .store(tokens, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// THE compact-before-switch rule, shared by all three call sites — the pin
+    /// ([`set_explicit_provider`](Self::set_explicit_provider)), the deferred
+    /// completion's summary gate in `run_turn`, and
+    /// [`AgentSession::set_model`](crate::headless::AgentSession::set_model)
+    /// (via [`swap_needs_compaction`](Self::swap_needs_compaction)) — given the
+    /// conversation's token count: do those tokens PLUS the tool-schema
+    /// overhead reach `context_manager`'s own compaction trigger?
+    ///
+    /// This is the turn loop's trigger expression
+    /// (`message_tokens + schema_tokens >= effective_limit`) applied to the
+    /// target manager, so a switch summarizes exactly when the next request on
+    /// the new model would itself summarize. `effective_limit` carries the raise
+    /// ladder; the incoming manager is freshly built (no raise installed) and
+    /// [`set_provider`](Self::set_provider) resets the ladder on every swap
+    /// anyway, so this reads exactly the trigger the new model would apply.
+    fn tokens_need_compaction(
+        &self,
+        message_tokens: usize,
+        context_manager: &super::context::ContextManager,
+    ) -> bool {
+        let schema_tokens = self
+            .live_schema_tokens
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // An EMPTY conversation has nothing to summarize: compacting first would
+        // only delay the swap and burn a summarization call that cannot reduce
+        // anything (the irreducible system/schema block is measured separately
+        // below and is not the conversation's to shrink).
+        message_tokens > 0 && message_tokens + schema_tokens >= context_manager.effective_limit()
+    }
+
+    /// [`tokens_need_compaction`](Self::tokens_need_compaction) over an explicit
+    /// conversation — the deferred completion's summary gate, which holds the
+    /// real `messages` and must count them inclusively (tool overhead too).
+    pub fn conversation_needs_compaction(
+        &self,
+        context_manager: &super::context::ContextManager,
+        messages: &[crate::provider::Message],
+    ) -> bool {
+        self.tokens_need_compaction(
+            super::context::ContextManager::count_tokens(messages),
+            context_manager,
+        )
+    }
+
+    /// [`tokens_need_compaction`](Self::tokens_need_compaction) over the count
+    /// its task last [`published`](Self::publish_message_tokens).
+    ///
+    /// A model switch compacts first ONLY when this is `true`. A new window
+    /// that is merely smaller than the old one is not, by itself, a reason to
+    /// summarize a conversation that already fits: the 2027-11-02 bug (plan
+    /// 1238e0de) summarized — and reported — a switch that needed no
+    /// summarization, which made Mnemo2 mark a healthy worker failed.
+    pub fn swap_needs_compaction(&self, context_manager: &super::context::ContextManager) -> bool {
+        self.tokens_need_compaction(
+            self.live_message_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            context_manager,
+        )
+    }
+
     /// Pin an explicit provider + context manager for THIS agent — the
     /// per-agent model picker's live switch (`set_model` with an
     /// `agent_id`). Also swaps the default slot (like [`set_provider`]) so
@@ -2386,11 +2503,16 @@ impl AgentLoop {
     /// [`set_provider`]) — an explicit per-agent choice is not silently
     /// undone.
     ///
-    /// **Deferral:** when the new provider's `max_context` is SMALLER than the
-    /// current one, the swap is deferred — stored in [`pending_swap`](Self::pending_swap)
-    /// — so the turn loop can summarize the conversation using the OLD provider
-    /// before completing the swap. This prevents a too-large conversation from
-    /// being sent to a smaller-context model (which would fail with a 400/502).
+    /// **Deferral:** when the LIVE conversation exceeds what the new
+    /// context manager allows ([`swap_needs_compaction`](Self::swap_needs_compaction)
+    /// — the turn loop's own compaction trigger measured on the new model),
+    /// the swap is deferred — stored in [`pending_swap`](Self::pending_swap)
+    /// — so the turn loop can summarize the conversation using the OLD
+    /// provider before completing the swap. This prevents a too-large
+    /// conversation from being sent to a smaller-context model (which would
+    /// fail with a 400/502). A new window that is merely smaller is NOT
+    /// enough: when the conversation fits, the swap lands immediately and
+    /// nothing is summarized (2027-11-02 bug, plan 1238e0de).
     /// The turn loop completes it via [`take_pending_swap`](Self::take_pending_swap)
     /// both at the top of `run_turn` and at the top of every loop iteration —
     /// a deferred pick made mid-run therefore lands before the next request of
@@ -2409,15 +2531,13 @@ impl AgentLoop {
             .pinned_state
             .lock()
             .expect("pinned_state lock poisoned") = None;
-        let current_max = self
-            .context_manager
-            .read()
-            .expect("context_manager lock poisoned")
-            .max_tokens();
-        let new_max = provider.capabilities().max_context;
-        if new_max < current_max {
-            // Smaller context — defer the swap so the turn loop can summarize
-            // using the OLD provider first.
+        if self.swap_needs_compaction(&context_manager) {
+            // The live conversation exceeds what the NEW model's context
+            // manager allows — defer the swap so the turn loop can summarize
+            // using the OLD provider first. A merely smaller window is NOT
+            // enough (2027-11-02 bug, plan 1238e0de): a conversation that
+            // already fits the new model swaps at once, with no
+            // summarization and no informational event.
             *self
                 .pending_swap
                 .lock()
@@ -2442,9 +2562,11 @@ impl AgentLoop {
     }
 
     /// Whether a deferred provider swap is pending (set by
-    /// [`set_explicit_provider`](Self::set_explicit_provider) when the new
-    /// model has a smaller context window). Checked by the IPC layer so it can
-    /// emit a user-facing note instead of `ModelChanged`.
+    /// [`set_explicit_provider`](Self::set_explicit_provider) when the live
+    /// conversation exceeds what the new model's context manager allows —
+    /// [`swap_needs_compaction`](Self::swap_needs_compaction); a smaller window
+    /// alone no longer defers). Checked by the IPC layer so it can
+    /// report the switch as pending instead of immediately serving.
     pub fn has_pending_swap(&self) -> bool {
         self.pending_swap
             .lock()

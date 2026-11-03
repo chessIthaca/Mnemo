@@ -5316,18 +5316,26 @@ async fn pump_worker(
                     SerializableAgentEvent::Compacted { .. } => {
                         if worker.compacting {
                             worker.compacting = false;
-                            busy.store(false, Ordering::SeqCst);
-                            if !matches!(
-                                worker.status,
-                                WorkerStatus::Paused
-                                    | WorkerStatus::Interrupted
-                                    | WorkerStatus::Stopped
-                            ) {
-                                worker.status = if worker.pending.is_some() {
-                                    WorkerStatus::NeedsYou
-                                } else {
-                                    WorkerStatus::Idle
-                                };
+                            // A compaction INSIDE a live turn (a mid-run
+                            // compact-then-switch, or the new model's own
+                            // trigger right after one) must not idle the
+                            // worker: the turn continues on the new model, so
+                            // only the badge ends. Between turns (turn_active
+                            // false) the worker really is idle again.
+                            if !turn_active {
+                                busy.store(false, Ordering::SeqCst);
+                                if !matches!(
+                                    worker.status,
+                                    WorkerStatus::Paused
+                                        | WorkerStatus::Interrupted
+                                        | WorkerStatus::Stopped
+                                ) {
+                                    worker.status = if worker.pending.is_some() {
+                                        WorkerStatus::NeedsYou
+                                    } else {
+                                        WorkerStatus::Idle
+                                    };
+                                }
                             }
                             worker.error = None;
                             changed = true;
@@ -5412,6 +5420,17 @@ async fn pump_worker(
                             worker.status = WorkerStatus::NeedsYou;
                         }
                         terminal = true;
+                    }
+                    // The deferred compact-then-switch COMPLETED: the worker
+                    // summarized and now runs on the new model. Informational
+                    // — the turn continues, so status stays Working, busy
+                    // stays set, and no error is recorded (bug 2026-11-02:
+                    // this used to arrive as an `Error`, which failed a
+                    // perfectly healthy worker). This path emits
+                    // CompactStarted but no Compacted, so the badge ends here.
+                    SerializableAgentEvent::ModelSwapSummarized { .. } => {
+                        changed |= worker.compacting;
+                        worker.compacting = false;
                     }
                     SerializableAgentEvent::Error { error, retrying } => {
                         if !retrying {

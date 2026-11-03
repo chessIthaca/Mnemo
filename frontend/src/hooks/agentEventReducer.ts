@@ -1320,6 +1320,28 @@ export const reduceModelChanged =
   });
 
 /**
+ * model_swap_summarized: a DEFERRED model switch completed — the OLD model
+ * summarized the conversation so it fits the new, smaller window (the model
+ * picker's compact-then-switch path). Informational: the swap SUCCEEDED and
+ * the turn continues on the new model, so this is a neutral transcript note
+ * in the same words the pre-fix error carried — never an `error` entry, which
+ * would mark the agent failed and stop it (bug 2026-11-02, plan 1238e0de).
+ * `running`/`failed` are untouched, and nothing is appended to the activity
+ * log: there is nothing to retry.
+ */
+export const reduceModelSwapSummarized: Reducer<Ev<"model_swap_summarized">> = (
+  agent,
+  event,
+) => {
+  const next = { ...agent };
+  pushTranscriptEntry(next, {
+    kind: "assistant",
+    text: `Switched to '${event.model}' (summarized for smaller context)`,
+  });
+  return { agent: next };
+};
+
+/**
  * memory_recalled: the per-turn auto-recall injected memories into the
  * agent's prompt. Rendered as a read-only `memory` transcript entry so
  * memory/self-learning usage is visible in the agent window (user request
@@ -1583,6 +1605,7 @@ export function applyAgentEvent(
     case "prompt_dispatched": result = reducePromptDispatched(agent, event); break;
     case "skill_started": result = reduceSkillStarted(agent, event); break;
     case "model_changed": result = reduceModelChanged(agentId)(agent, event); break;
+    case "model_swap_summarized": result = reduceModelSwapSummarized(agent, event); break;
     case "memory_recalled": result = reduceMemoryRecalled(agent, event); break;
     case "finished": result = reduceFinished(agent, event); break;
     case "parked": result = reduceParked(agent, event); break;

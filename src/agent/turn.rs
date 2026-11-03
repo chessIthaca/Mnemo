@@ -75,14 +75,6 @@ pub(crate) struct StatsRow {
     pub purpose: Option<String>,
 }
 
-/// Fill-rate threshold for the pre-swap summarization: summarize with the
-/// OLD provider when the conversation exceeds this fraction of the NEW
-/// (smaller) context window. Tied to the ContextManager fill-rate policy
-/// (the same concept `effective_summarize_at` applies), but tighter — a
-/// provider swap is a one-shot window shrink, and the regular trigger only
-/// re-fires on the next turn, too late for the smaller window.
-const SWAP_SUMMARIZE_FILL: f64 = 0.8;
-
 /// Keep-recent message count for the pre-swap summarization — the same
 /// keep-recent count as the regular auto-compaction path's normal tier (the
 /// preflight hard-ceiling tier uses 3).
@@ -694,8 +686,15 @@ impl AgentLoop {
             // saw 0 — the value landed after the reads and each loop-back's
             // reset() zeroed it again, so the schema block never reached a
             // live emission or trigger).
-            state.token_accounting
-                .set_tools_tokens(crate::provider::estimate_tools_tokens(&tool_schemas) as u32);
+            let schema_tokens = crate::provider::estimate_tools_tokens(&tool_schemas);
+            state.token_accounting.set_tools_tokens(schema_tokens as u32);
+            // Publish the SAME inclusive measure for the
+            // compact-before-switch decision (`AgentLoop::conversation_needs_compaction`):
+            // the real conversation plus this exact schema block. A cached
+            // token count cannot serve — it is stale after the turn's final
+            // message and 0 before a resumed session's first request.
+            self.publish_schema_tokens(schema_tokens);
+            self.publish_message_tokens(messages);
 
             // Exact incremental token count + per-role breakdown in one pass
             // (see `TokenAccounting`). Summarization resets the accounting
@@ -1680,11 +1679,13 @@ impl AgentLoop {
                 .read()
                 .expect("context_manager lock poisoned")
                 .clone();
-            let new_max = pending.provider.capabilities().max_context;
-            let token_count = context::ContextManager::count_tokens(messages);
-            if token_count > (new_max as f64 * SWAP_SUMMARIZE_FILL) as usize {
-                // Conversation is too large for the new (smaller) window —
-                // summarize using the OLD provider before completing the swap.
+            if self.conversation_needs_compaction(&pending.context_manager, messages) {
+                // The conversation does not fit the new model's own compaction
+                // trigger — summarize using the OLD provider before completing
+                // the swap. Same measure as the pin's deferral
+                // (`AgentLoop::swap_needs_compaction`) and the turn loop's
+                // regular trigger; a switch whose conversation fits swaps
+                // silently (2027-11-02 bug, plan 1238e0de).
                 let _ = fanin_tx
                     .send((
                         agent_id,
@@ -1861,6 +1862,12 @@ impl AgentLoop {
                         }
                     }
                 }
+                // Publish the FINAL count of the deferred rewrite: the summary,
+                // the digest and every re-injected buffered command are the
+                // conversation the post-swap requests carry — a switch landing
+                // before them must measure that, not the pre-compaction count
+                // published at the top of the loop.
+                self.publish_message_tokens(messages);
                 if let Some(stop) = stop_reason {
                     // Interrupt/Cancel during summarization — emit a paired
                     // end event for the CompactStarted above (mirrors the main
@@ -1901,18 +1908,22 @@ impl AgentLoop {
                 .write()
                 .expect("explicit_provider lock poisoned") =
                 Some((pending.provider, pending.context_manager));
-            let _ = fanin_tx
-                .send((
-                    agent_id,
-                    AgentEvent::Error {
-                        error: format!(
-                            "Switched to '{}' (summarized for smaller context)",
-                            pending.model
-                        ),
-                        retrying: false,
-                    },
-                ))
-                .await;
+            // Informational, never `AgentEvent::Error` (bug 2026-11-02, plan
+            // 1238e0de): the swap SUCCEEDED and the turn continues on the new
+            // model, so a consumer that treats a final error as a terminal
+            // failure (Mnemo2's worker pump) must not see one. Emitted only
+            // when the conversation was actually rewritten — a deferred swap
+            // whose conversation turned out to fit swaps silently.
+            if rewrote {
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::ModelSwapSummarized {
+                            model: pending.model,
+                        },
+                    ))
+                    .await;
+            }
         }
         PendingSwapOutcome {
             rewrote,
@@ -3284,6 +3295,12 @@ impl AgentLoop {
                 }
             }
         }
+        // Publish the FINAL count of the IN-TURN rewrite: the summary, the
+        // survival digest and every re-injected buffered command are the
+        // conversation that exists now. Without this, a switch landing on the
+        // request that follows would measure the stale pre-compaction count
+        // published at the top of the loop and needlessly defer.
+        self.publish_message_tokens(messages);
         // Summarization (and any re-injected suggestions) changed the
         // messages, so the pre-summary accounting is stale — reset and
         // recompute once for an accurate ContextUsage event.

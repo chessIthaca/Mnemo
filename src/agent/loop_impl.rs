@@ -86,6 +86,24 @@ impl RouteSessionState {
     }
 }
 
+/// Everything needed to publish a claimed nudge synchronously while the
+/// route-state lock is still held. Owned so a detached drift task can carry it.
+pub(crate) struct NudgeNotice {
+    /// Agent receiving the notice and owning the log row.
+    pub(crate) agent_id: crate::runtime::AgentId,
+    /// `drift`, `tool_failures`, or `repeat_failure`.
+    pub(crate) reason: &'static str,
+    /// Human-readable model suggestion.
+    pub(crate) text: String,
+    /// Session log destination, when a routing gate is attached.
+    pub(crate) log_path: Option<std::path::PathBuf>,
+    /// Bounded event channel; publication uses `try_send`, never `.await`.
+    pub(crate) fanin_tx: tokio::sync::mpsc::Sender<(
+        crate::runtime::AgentId,
+        crate::runtime::AgentEvent,
+    )>,
+}
+
 /// Per-session state extracted from [`AgentLoop`] (A2: reduce the loop's field
 /// count). Holds the memory session id + the prompt-token cache heuristic.
 /// Both are behind `Mutex` so they can be mutated through a `&AgentLoop`.
@@ -1589,12 +1607,9 @@ impl AgentLoop {
         state.nudge_to_label = None;
     }
 
-    /// Claim the one nudge for `to_label`. When `expected_epoch` is supplied,
-    /// the epoch and settled state are validated in the SAME critical section
-    /// as the claim; a manual pick or Clear therefore cannot be followed by a
-    /// stale detached nudge. No lock is held across an await.
-    pub(crate) fn claim_nudge(
-        session: &Arc<std::sync::Mutex<RouteSessionState>>,
+    /// Validate and claim a nudge while the caller holds `route_session`.
+    fn claim_nudge_locked(
+        state: &mut RouteSessionState,
         to_label: &str,
         expected_epoch: Option<u64>,
     ) -> bool {
@@ -1604,11 +1619,7 @@ impl AgentLoop {
             super::route_question::LABEL_HARD,
         ]
         .contains(&to_label)
-        {
-            return false;
-        }
-        let mut state = session.lock().expect("route-session lock poisoned");
-        if !matches!(state.route_once, RouteOnce::Settled { .. })
+            || !matches!(state.route_once, RouteOnce::Settled { .. })
             || expected_epoch.is_some_and(|epoch| epoch != state.epoch)
             || state.nudge_sent
         {
@@ -1616,6 +1627,66 @@ impl AgentLoop {
         }
         state.nudge_sent = true;
         state.nudge_to_label = Some(to_label.to_string());
+        true
+    }
+
+    /// Test-only bare claim used to race the state linearization point without
+    /// constructing a notice. Production nudges use `claim_and_publish_nudge`.
+    #[cfg(test)]
+    pub(crate) fn claim_nudge(
+        session: &Arc<std::sync::Mutex<RouteSessionState>>,
+        to_label: &str,
+        expected_epoch: Option<u64>,
+    ) -> bool {
+        let mut state = session.lock().expect("route-session lock poisoned");
+        Self::claim_nudge_locked(&mut state, to_label, expected_epoch)
+    }
+
+    /// Claim and publish in ONE critical section: the row is appended
+    /// synchronously and the notice enters the bounded channel with `try_send`
+    /// before Clear can consume the claim. No lock is held across an await.
+    pub(crate) fn claim_and_publish_nudge(
+        session: &Arc<std::sync::Mutex<RouteSessionState>>,
+        to_label: &str,
+        expected_epoch: Option<u64>,
+        publication: NudgeNotice,
+    ) -> bool {
+        let mut state = session.lock().expect("route-session lock poisoned");
+        if !Self::claim_nudge_locked(&mut state, to_label, expected_epoch) {
+            return false;
+        }
+        let NudgeNotice {
+            agent_id,
+            reason,
+            text,
+            log_path,
+            fanin_tx,
+        } = publication;
+        if let Some(path) = log_path {
+            model_routing::append_row(
+                &path,
+                &model_routing::SessionRoutingRow::Nudge {
+                    ts: model_routing::now_millis(),
+                    agent_id: agent_id.to_string(),
+                    reason: reason.to_string(),
+                    to_label: to_label.to_string(),
+                },
+            );
+        }
+        let dropped = fanin_tx
+            .try_send((
+                agent_id,
+                crate::runtime::AgentEvent::RoutingNotice {
+                    kind: "nudge".to_string(),
+                    text,
+                },
+            ))
+            .err();
+        if cfg!(debug_assertions) {
+            if let Some(error) = dropped {
+                eprintln!("DEBUG: routing nudge dropped for agent {agent_id}: {error}");
+            }
+        }
         true
     }
 
@@ -1638,7 +1709,6 @@ impl AgentLoop {
             );
         }
     }
-
 
     /// Attach the compound-reflex handle (the Laya classifier's compound
     /// decision layer, `[general.laya] reflex`; backlog a8495cc1) -- the

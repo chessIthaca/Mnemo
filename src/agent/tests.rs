@@ -17045,6 +17045,73 @@ async fn resumed_session_is_never_routed() {
 }
 
 #[tokio::test]
+async fn claimed_nudge_is_published_before_clear_can_run() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let session_path = gate.session_log_path().to_path_buf();
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    assert_eq!(
+        run_routing_turn(&agent, "implement this routine change").await.text,
+        "from-default"
+    );
+    let (_, epoch) = agent.route_once_with_epoch();
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(8);
+    assert!(AgentLoop::claim_and_publish_nudge(
+        &agent.route_session,
+        crate::agent::route_question::LABEL_HARD,
+        Some(epoch),
+        crate::agent::loop_impl::NudgeNotice {
+            agent_id: 1,
+            reason: "drift",
+            text: "this got harder; consider capable-model".into(),
+            log_path: Some(session_path.clone()),
+            fanin_tx: fanin_tx.clone(),
+        },
+    ));
+
+    // Publication is complete before Clear is even called: the nudge is the
+    // first event, and its row precedes Clear's nudge_ignored row.
+    let (_, event) = fanin_rx.recv().await.expect("published nudge");
+    assert!(matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    ));
+    let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent.clone());
+    task.clear_context(&fanin_tx).await;
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )), "no nudge may arrive during or after Clear: {events:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(fanin_rx.try_recv().is_err(), "nothing arrives after Clear returns");
+
+    let rows = read_session_routing_log(&session_path);
+    let nudge = rows
+        .iter()
+        .position(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. }))
+        .expect("nudge row");
+    let ignored = rows
+        .iter()
+        .position(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
+        .expect("nudge_ignored row");
+    assert!(nudge < ignored, "nudge must be durable before Clear's ignored row: {rows:?}");
+}
+
+#[tokio::test]
 async fn clear_makes_the_next_prompt_routable() {
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("routing.jsonl");

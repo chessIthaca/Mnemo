@@ -1524,7 +1524,6 @@ impl AgentLoop {
         let session_log_path = gate.session_log_path().to_path_buf();
         let route_session = Arc::clone(&self.route_session);
         let fanin_tx = fanin_tx.clone();
-        let agent = agent_id.to_string();
         tokio::spawn(async move {
             let Some(decision) = model_routing::classify_task_text(
                 classifier.as_ref(),
@@ -1556,34 +1555,20 @@ impl AgentLoop {
             let Some(model_ref) = resolver.resolve_routed(target, context) else {
                 return;
             };
-            // Validate the settled state and epoch and claim the nudge in one
-            // critical section. A manual pick or Clear therefore cannot be
-            // followed by this stale task's notice.
-            if !AgentLoop::claim_nudge(
+            // Claim, append, and enqueue while holding the route-state lock;
+            // no stale task can publish after Clear consumes the session.
+            let _ = AgentLoop::claim_and_publish_nudge(
                 &route_session,
                 &decision.label,
                 Some(settled_epoch),
-            ) {
-                return;
-            }
-            model_routing::append_row(
-                &session_log_path,
-                &model_routing::SessionRoutingRow::Nudge {
-                    ts: model_routing::now_millis(),
-                    agent_id: agent,
-                    reason: "drift".to_string(),
-                    to_label: decision.label,
+                super::loop_impl::NudgeNotice {
+                    agent_id,
+                    reason: "drift",
+                    text: format!("this got harder; consider {}", model_ref.model),
+                    log_path: Some(session_log_path),
+                    fanin_tx,
                 },
             );
-            let _ = fanin_tx
-                .send((
-                    agent_id,
-                    AgentEvent::RoutingNotice {
-                        kind: "nudge".to_string(),
-                        text: format!("this got harder; consider {}", model_ref.model),
-                    },
-                ))
-                .await;
         });
     }
 
@@ -2959,42 +2944,32 @@ impl AgentLoop {
                                 Some(target) => self.resolve_routed_model(target).await,
                                 None => None,
                             } {
-                                if AgentLoop::claim_nudge(
+                                let reason = if repeated {
+                                    "repeat_failure"
+                                } else {
+                                    "tool_failures"
+                                };
+                                let text = if repeated {
+                                    format!("going in circles; consider {}", model_ref.model)
+                                } else {
+                                    format!("tools keep failing; consider {}", model_ref.model)
+                                };
+                                let log_path = self
+                                    .routing
+                                    .as_ref()
+                                    .map(|gate| gate.session_log_path().to_path_buf());
+                                let _ = AgentLoop::claim_and_publish_nudge(
                                     &self.route_session,
                                     to_label,
                                     Some(route_epoch),
-                                ) {
-                                    let reason = if repeated {
-                                        "repeat_failure"
-                                    } else {
-                                        "tool_failures"
-                                    };
-                                    let text = if repeated {
-                                        format!("going in circles; consider {}", model_ref.model)
-                                    } else {
-                                        format!("tools keep failing; consider {}", model_ref.model)
-                                    };
-                                    if let Some(gate) = self.routing.as_ref() {
-                                        model_routing::append_row(
-                                            gate.session_log_path(),
-                                            &model_routing::SessionRoutingRow::Nudge {
-                                                ts: model_routing::now_millis(),
-                                                agent_id: agent_id.to_string(),
-                                                reason: reason.to_string(),
-                                                to_label: to_label.to_string(),
-                                            },
-                                        );
-                                    }
-                                    let _ = fanin_tx
-                                        .send((
-                                            agent_id,
-                                            AgentEvent::RoutingNotice {
-                                                kind: "nudge".to_string(),
-                                                text,
-                                            },
-                                        ))
-                                        .await;
-                                }
+                                    super::loop_impl::NudgeNotice {
+                                        agent_id,
+                                        reason,
+                                        text,
+                                        log_path,
+                                        fanin_tx: fanin_tx.clone(),
+                                    },
+                                );
                             }
                         }
                     }

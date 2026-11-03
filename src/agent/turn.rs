@@ -1367,29 +1367,37 @@ impl AgentLoop {
                         } else if let Some((provider, context_manager)) =
                             resolver.build_turn_provider(&model_ref, self.fill_rate)
                         {
-                            let spec = format!("{}/{}", model_ref.endpoint, model_ref.model);
-                            let effort = resolver.display_effort_for(&model_ref);
-                            let endpoint = Some(model_ref.endpoint.clone());
-                            self.pin_routed_provider(provider, context_manager);
-                            // The route itself announces the change. Seed the
-                            // served-effective deduper so the first request
-                            // does not emit a second identical ModelChanged.
-                            self.note_served_effective(
-                                &model_ref.model,
-                                endpoint.as_deref(),
-                                effort.as_deref(),
-                            );
-                            model_changed = Some(AgentEvent::ModelChanged {
-                                model: model_ref.model.clone(),
-                                provider: endpoint,
-                                reasoning_effort: effort,
-                            });
-                            notice = Some(format!(
-                                "Laya → {} ({:.2})",
-                                model_ref.model, decision.confidence
-                            ));
-                            enforced_model = Some(spec);
-                            skip = None;
+                            if self.swap_needs_compaction(&context_manager) {
+                                // First-prompt routing never defers: a pending
+                                // routed swap could reinstall Laya's model after
+                                // a later manual pick. Keep the session model.
+                                skip = Some("needs_compaction");
+                            } else {
+                                let spec =
+                                    format!("{}/{}", model_ref.endpoint, model_ref.model);
+                                let effort = resolver.display_effort_for(&model_ref);
+                                let endpoint = Some(model_ref.endpoint.clone());
+                                self.pin_routed_provider(provider, context_manager);
+                                // The route itself announces the change. Seed the
+                                // served-effective deduper so the first request
+                                // does not emit a second identical ModelChanged.
+                                self.note_served_effective(
+                                    &model_ref.model,
+                                    endpoint.as_deref(),
+                                    effort.as_deref(),
+                                );
+                                model_changed = Some(AgentEvent::ModelChanged {
+                                    model: model_ref.model.clone(),
+                                    provider: endpoint,
+                                    reasoning_effort: effort,
+                                });
+                                notice = Some(format!(
+                                    "Laya → {} ({:.2})",
+                                    model_ref.model, decision.confidence
+                                ));
+                                enforced_model = Some(spec);
+                                skip = None;
+                            }
                         } else {
                             skip = Some("no_target");
                         }
@@ -1427,7 +1435,7 @@ impl AgentLoop {
 
         let agent = agent_id.to_string();
         let turn_id = model_routing::new_turn_id(&agent);
-        let selected_spec = if superseded {
+        let selected_spec = if superseded || skip == Some("needs_compaction") {
             None
         } else {
             resolved

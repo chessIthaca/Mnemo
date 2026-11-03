@@ -285,7 +285,7 @@ pub enum SessionRoutingRow {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         /// Why no switch happened (`below_gate` / `unknown_label` / `shadow` /
-        /// `kept` / `no_target` / `superseded`).
+        /// `kept` / `no_target` / `needs_compaction` / `superseded`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skip: Option<String>,
     },

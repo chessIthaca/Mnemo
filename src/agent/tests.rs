@@ -16296,6 +16296,46 @@ impl crate::model_resolver::ModelResolver for FallbackRoutingResolver {
     }
 }
 
+/// A routing resolver whose routed target advertises a tiny context window.
+/// Exercises the first-prompt "needs compaction" refusal, which must never
+/// create a deferred routed swap.
+struct SmallWindowRoutingResolver {
+    inner: RoutingStubResolver,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for SmallWindowRoutingResolver {
+    fn resolve(
+        &self,
+        _context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        self.inner.resolve_routed(target, context)
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.inner.routing_policy()
+    }
+
+    fn build_turn_provider(
+        &self,
+        model_ref: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            routed_provider(&model_ref.model, "from-small-window"),
+            context::ContextManager::new(1_000, 0.5),
+        ))
+    }
+}
+
 /// A model ref on the stub endpoint the routing tests configure.
 fn stub_model_ref(model: &str) -> crate::config::ModelRef {
     crate::config::ModelRef {
@@ -16894,6 +16934,75 @@ async fn first_prompt_routes_once_and_pins_the_model() {
 }
 
 #[tokio::test]
+async fn routed_target_needing_compaction_is_not_applied() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls, log_path.clone());
+    let resolver = Arc::new(SmallWindowRoutingResolver {
+        inner: RoutingStubResolver {
+            policy: Some(session_routing_policy(true)),
+            cheap: Some(stub_model_ref("cheap-model")),
+            capable: Some(stub_model_ref("capable-model")),
+            routed_provider: None,
+        },
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    let mut messages = Vec::new();
+    for index in 0..20 {
+        messages.push(Message::user_text(format!(
+            "history {index}: {}",
+            "lorem ipsum dolor sit amet ".repeat(20)
+        )));
+        messages.push(Message::assistant_text("acknowledged"));
+    }
+    messages.push(Message::user_text("design the routing architecture"));
+    agent.publish_message_tokens(&messages);
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("turn completes");
+
+    assert_eq!(outcome.text, "from-default", "no under-window route is applied");
+    assert_eq!(agent.current_model_spec(), "default-model");
+    assert!(
+        !agent.has_pending_swap(),
+        "first-prompt routing never creates a deferred swap"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Settled { model: None, .. }
+    ));
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelChanged { model, .. } if model == "capable-model"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "routed"
+    )));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Route {
+            skip: Some(skip),
+            model: None,
+            enforced: false,
+            ..
+        } if skip == "needs_compaction"
+    )), "{rows:?}");
+}
+
+#[tokio::test]
 async fn later_turns_never_switch() {
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("routing.jsonl");
@@ -17445,6 +17554,84 @@ async fn engine_swap_model_counts_as_manual() {
         AgentEvent::ModelChanged { model, .. } if model == "capable-model"
     )));
     engine.shutdown().await.expect("engine shutdown");
+}
+
+#[tokio::test]
+async fn skip_turn_routing_session_model_change_writes_no_session_row() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    agent.set_skip_turn_routing(true);
+
+    agent.set_explicit_provider(
+        routed_provider("human-model", "from-human"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "serve this short prompt").await.text,
+        "from-human",
+        "the external provider change must still take effect"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Pending
+    ));
+    assert!(
+        !session_log_path(&log_path).exists(),
+        "a skip-turn-routing session writes no Mnemo1 session rows"
+    );
+}
+
+#[tokio::test]
+async fn subagent_model_change_writes_no_session_row() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    agent.set_is_subagent(true);
+
+    agent.set_explicit_provider(
+        routed_provider("human-model", "from-human"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "serve this short prompt").await.text,
+        "from-human",
+        "the external provider change must still take effect"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Pending
+    ));
+    assert!(
+        !session_log_path(&log_path).exists(),
+        "a subagent writes no Mnemo1 session rows"
+    );
 }
 
 #[tokio::test]

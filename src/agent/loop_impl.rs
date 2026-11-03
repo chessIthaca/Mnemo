@@ -1450,13 +1450,17 @@ impl AgentLoop {
     }
 
     /// Whether the live `[general.laya] routing` opt-in currently exposes a
-    /// first-prompt policy. IPC uses this to keep routing-off manual picks
-    /// byte-identical (no reroute row and no route-state transition).
+    /// first-prompt policy FOR THIS LOOP. Subagents and sessions that opted out
+    /// of turn routing (Mnemo2 leads/workers route at dispatch) must not write
+    /// Mnemo1 session rows from an external model change.
     pub fn session_routing_enabled(&self) -> bool {
-        self.model_resolver
-            .as_ref()
-            .and_then(|resolver| resolver.routing_policy())
-            .is_some()
+        !self.is_subagent()
+            && !self.skip_turn_routing()
+            && self
+                .model_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.routing_policy())
+                .is_some()
     }
 
     /// Transition to manual in one critical section. With `only_if_active`, an
@@ -3023,6 +3027,25 @@ impl AgentLoop {
             .pinned_state
             .lock()
             .expect("pinned_state lock poisoned") = None;
+        if routed {
+            // First-prompt routing NEVER defers: a pending routed swap could
+            // complete after a later manual pick and reinstall Laya's model.
+            debug_assert!(
+                !self.swap_needs_compaction(&context_manager),
+                "pin_routed_provider must not be called when compaction is needed"
+            );
+            self.set_provider_internal(provider.clone(), context_manager.clone());
+            *self
+                .pending_swap
+                .lock()
+                .expect("pending_swap lock poisoned") = None;
+            *self
+                .explicit_provider
+                .write()
+                .expect("explicit_provider lock poisoned") =
+                Some((provider, context_manager));
+            return;
+        }
         if self.swap_needs_compaction(&context_manager) {
             *self
                 .pending_swap
@@ -3054,7 +3077,6 @@ impl AgentLoop {
     ) {
         self.set_explicit_provider_internal(provider, context_manager, true);
     }
-
 
     /// Whether a deferred provider swap is pending (set by
     /// [`set_explicit_provider`](Self::set_explicit_provider) when the live

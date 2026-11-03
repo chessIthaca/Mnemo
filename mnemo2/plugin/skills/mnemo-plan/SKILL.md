@@ -39,7 +39,7 @@ The board also refuses a plan that is too thin to resume from.
 
 Mnemo exists so that cheap models do the implementing. A cheap model follows instructions well but cannot fill design gaps, so the design has to be in the plan. A step that names only the outcome ("add a loading state", "fix the cite bug") leaves the worker to design it, and the result comes back for several review rounds. Write every step so a worker can implement it without making a design decision:
 
-- **Files and symbols.** Every file the step changes, and in each the functions, types or components to add or change, with their signatures (parameters, return type, error type). Mark new code as new, for example "new: `fn conversation_needs_compaction(&self, cm: &ContextManager, messages: &[Message]) -> bool` in `src/agent/loop_impl.rs`". The board only rejects unlabelled claims that a symbol already exists; a labelled design is fine.
+- **Files and symbols.** Every file the step changes, and in each the functions, types or components to add or change, with their signatures (parameters, return type, error type). Mark new code as new, for example "new: `fn conversation_needs_compaction(&self, cm: &ContextManager, messages: &[Message]) -> bool` in `src/agent/loop_impl.rs`". Name things exactly even before they exist; a precise design is the point.
 - **Data shapes.** New fields, structs, events or wire types with their exact names and types, and who reads and writes them.
 - **Behaviour rules.** The rules the code must follow, as a list, including the edge cases: empty input, zero, a resumed session, concurrency, a failure halfway, what must stay unchanged.
 - **Order of edits.** When the order matters (a test first, a type before its users, a migration before code), say it.
@@ -47,9 +47,11 @@ Mnemo exists so that cheap models do the implementing. A cheap model follows ins
 - **Done checklist.** The commands to run and the observable result that means the step is finished.
 - **Don't touch.** Files that other steps or parallel plans own.
 
-In practice a step is 150 to 400 words. Put everything specific to the step in the step text, not only in the dispatch `brief`: the brief is not saved in the plan, so a worker that is resumed, compacted or switched to another model loses it.
+You, the lead, write these specs yourself. Read the code they touch, so the names, signatures and line anchors are real. Prefer long specs with every detail needed to implement faithfully over short ones. There is no length to stay under. Put everything specific to the step in the step text, not only in the dispatch `brief`: the brief is not saved in the plan, so a worker that is resumed, compacted or switched to another model loses it.
 
-When you cannot write the spec because the design is not settled yet (an unclear approach, a performance question, an unfamiliar subsystem), make the first step a design step on the `difficult` tier. It writes the spec into a design document, or returns it for `plan_update` `add_steps`. Dispatch the implementation steps only after that.
+First plan, then implement: write every step's spec before the first dispatch, not step by step as workers finish.
+
+Only for really complicated work, where you cannot write the spec without substantial research (an unfamiliar subsystem, a performance question, several viable designs), may the first step be a spec-writing step on the `difficult` tier. It returns the specs, which you review and put into the plan, before any implementation step is dispatched.
 
 ### Acceptance and verification
 

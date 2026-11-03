@@ -1464,6 +1464,25 @@ impl AgentLoop {
         previous
     }
 
+    /// Record a human pick and append its reroute row through the SAME kernel
+    /// path used by IPC and tests. Routing-off picks remain byte-identical:
+    /// no state transition and no row. The previously routed model is returned.
+    pub fn record_manual_model_choice(&self, to: &str) -> Option<String> {
+        if !self.session_routing_enabled() {
+            return None;
+        }
+        let nudged = self.routing_nudged();
+        let from = self.note_manual_model_choice(to);
+        self.append_session_routing_row(&model_routing::SessionRoutingRow::Reroute {
+            ts: model_routing::now_millis(),
+            agent_id: self.agent_id().unwrap_or(0).to_string(),
+            from: from.clone(),
+            to: to.to_string(),
+            nudged,
+        });
+        from
+    }
+
     /// Whether a routing nudge is currently awaiting a human response.
     pub fn routing_nudged(&self) -> bool {
         self.route_session
@@ -1541,16 +1560,30 @@ impl AgentLoop {
         true
     }
 
-    /// The target of the outstanding nudge, used by `/clear` and `/new`.
-    pub(crate) fn nudge_target(&self) -> Option<String> {
-        let state = self
-            .route_session
-            .lock()
-            .expect("route-session lock poisoned");
-        if state.nudge_sent {
-            state.nudge_to_label.clone()
-        } else {
-            None
+    /// Log an outstanding nudge as ignored and consume it atomically. Clear
+    /// and session termination share this one helper, so clear-then-end (or a
+    /// repeated termination cleanup) can never append a duplicate row.
+    pub(crate) fn log_nudge_ignored(&self, agent_id: crate::runtime::AgentId) {
+        let to_label = {
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            if !state.nudge_sent {
+                None
+            } else {
+                state.nudge_sent = false;
+                state.nudge_to_label.take()
+            }
+        };
+        if let Some(to_label) = to_label {
+            self.append_session_routing_row(
+                &model_routing::SessionRoutingRow::NudgeIgnored {
+                    ts: model_routing::now_millis(),
+                    agent_id: agent_id.to_string(),
+                    to_label,
+                },
+            );
         }
     }
 

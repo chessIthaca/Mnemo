@@ -566,24 +566,25 @@ pub async fn engine_status(state: State<'_, IpcState>) -> Result<EngineStats, Ip
         .map_err(|e| IpcError::msg(format!("{e:#}")))
 }
 
-/// Record one human model pick in the route-once lifecycle and its training
-/// log. The caller has already established that the model spec changed, so an
-/// effort-only rebuild never reaches this helper.
+/// Select the loops whose model spec really changes AND which have session
+/// routing enabled. The generic tuple form keeps this policy pure and cheap to
+/// unit-test: `(loop handle, current model spec, routing enabled)`.
+fn loops_to_reroute<T>(
+    candidates: impl IntoIterator<Item = (T, String, bool)>,
+    new_spec: &str,
+) -> Vec<T> {
+    candidates
+        .into_iter()
+        .filter(|(_, current_spec, routing_enabled)| {
+            *routing_enabled && current_spec != new_spec
+        })
+        .map(|(agent_loop, _, _)| agent_loop)
+        .collect()
+}
+
+/// Record a human model pick through the kernel's shared reroute-row helper.
 fn note_session_reroute(agent_loop: &mnemo::agent::AgentLoop, to: &str) {
-    if !agent_loop.session_routing_enabled() {
-        return;
-    }
-    let nudged = agent_loop.routing_nudged();
-    let from = agent_loop.note_manual_model_choice(to);
-    agent_loop.append_session_routing_row(
-        &mnemo::agent::model_routing::SessionRoutingRow::Reroute {
-            ts: mnemo::agent::model_routing::now_millis(),
-            agent_id: agent_loop.agent_id().unwrap_or(0).to_string(),
-            from,
-            to: to.to_string(),
-            nudged,
-        },
-    );
+    let _ = agent_loop.record_manual_model_choice(to);
 }
 
 /// Switch the active model (or reasoning effort) at runtime — per agent.
@@ -673,9 +674,18 @@ pub async fn set_model(
         // new model to the UI for that agent only.
         Some(id) => {
             let target_loop = state.runtime.agent_loops.lock().await.get(&id).cloned();
-            let model_changed = target_loop
-                .as_ref()
-                .is_some_and(|agent_loop| agent_loop.current_model_spec() != spec);
+            let reroute_loop = target_loop.as_ref().and_then(|agent_loop| {
+                loops_to_reroute(
+                    [(
+                        agent_loop.clone(),
+                        agent_loop.current_model_spec(),
+                        agent_loop.session_routing_enabled(),
+                    )],
+                    &spec,
+                )
+                .into_iter()
+                .next()
+            });
             match crate::ipc::config_io::swap_provider_into_loop(
                 &state.runtime.agent_loops,
                 id,
@@ -729,24 +739,27 @@ pub async fn set_model(
                     );
                 }
             }
-            if model_changed {
-                if let Some(agent_loop) = target_loop {
-                    note_session_reroute(agent_loop.as_ref(), &spec);
-                }
+            if let Some(agent_loop) = reroute_loop {
+                note_session_reroute(agent_loop.as_ref(), &spec);
             }
         }
         // Legacy global switch: factory + every live agent loop (the console
         // REPL and any pre-per-agent callers).
         None => {
-            let changed_loops: Vec<_> = state
-                .runtime
-                .agent_loops
-                .lock()
-                .await
-                .values()
-                .filter(|agent_loop| agent_loop.current_model_spec() != spec)
-                .cloned()
-                .collect();
+            let changed_loops = {
+                let agent_loops = state.runtime.agent_loops.lock().await;
+                let candidates = agent_loops
+                    .values()
+                    .map(|agent_loop| {
+                        (
+                            agent_loop.clone(),
+                            agent_loop.current_model_spec(),
+                            agent_loop.session_routing_enabled(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                loops_to_reroute(candidates, &spec)
+            };
             let _ = crate::ipc::config_io::swap_live_provider(
                 &state,
                 &app,
@@ -1051,6 +1064,33 @@ pub async fn get_session_list(state: State<'_, IpcState>) -> Result<serde_json::
 #[cfg(test)]
 mod tests {
     use crate::ipc::contract_fixtures::normalize_lf;
+
+    use super::loops_to_reroute;
+
+    #[test]
+    fn loops_to_reroute_keeps_changed_routing_enabled_loops() {
+        let candidates = vec![
+            (1, "endpoint/old-a".to_string(), true),
+            (2, "endpoint/old-b".to_string(), true),
+        ];
+        assert_eq!(loops_to_reroute(candidates, "endpoint/new"), vec![1, 2]);
+    }
+
+    #[test]
+    fn loops_to_reroute_skips_effort_only_calls() {
+        let candidates = vec![(1, "endpoint/same".to_string(), true)];
+        let selected = loops_to_reroute(candidates, "endpoint/same");
+        assert!(selected.is_empty(), "an unchanged spec is effort-only");
+    }
+
+    #[test]
+    fn loops_to_reroute_skips_routing_off_loops() {
+        let candidates = vec![
+            (1, "endpoint/old".to_string(), false),
+            (2, "endpoint/old".to_string(), true),
+        ];
+        assert_eq!(loops_to_reroute(candidates, "endpoint/new"), vec![2]);
+    }
     /// Regression (run-all dispatches the next backlog item into the main
     /// agent during steering, 2026-08-31): `send_suggestion` must halt an
     /// active run-all BEFORE sending the steer command. Without the halt, the

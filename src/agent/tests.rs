@@ -15997,6 +15997,104 @@ impl Classifier for BlockingRoutingClassifier {
     }
 }
 
+/// First answer is routine; the later drift answer blocks before returning
+/// hard, allowing a manual pick to invalidate that detached check.
+struct StaleDriftClassifier {
+    calls: std::sync::Mutex<u32>,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait::async_trait]
+impl Classifier for StaleDriftClassifier {
+    async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+        let call = {
+            let mut calls = self.calls.lock().expect("stale-drift calls lock poisoned");
+            *calls += 1;
+            *calls
+        };
+        if call > 1 {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .expect("stale-drift entered lock poisoned")
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            let release = self
+                .release
+                .lock()
+                .expect("stale-drift release lock poisoned")
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+        Some(Answer::Choice {
+            label: if call == 1 { "routine" } else { "hard" }.to_string(),
+            confidence: 0.95,
+            probabilities: std::collections::BTreeMap::new(),
+        })
+    }
+}
+
+/// Resolver that blocks only the capable target used by a tool-strike nudge.
+/// The routine first-prompt probe stays immediate, so the test can Clear while
+/// the strike path is resolving its post-snapshot target.
+struct BlockingCapableResolver {
+    inner: RoutingStubResolver,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl crate::model_resolver::ModelResolver for BlockingCapableResolver {
+    fn resolve(
+        &self,
+        _context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        if target == model_routing::RouteTarget::Capable {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .expect("blocking-resolver entered lock poisoned")
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            let release = self
+                .release
+                .lock()
+                .expect("blocking-resolver release lock poisoned")
+                .take();
+            if let Some(release) = release {
+                let _ = release.recv();
+            }
+        }
+        self.inner.resolve_routed(target, context)
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.inner.routing_policy()
+    }
+
+    fn build_turn_provider(
+        &self,
+        model_ref: &crate::config::ModelRef,
+        fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        self.inner.build_turn_provider(model_ref, fill_rate)
+    }
+}
+
 /// A classifier with a scripted sequence of answers and an optional per-answer
 /// delay. The delay makes the background drift check observably outlive the
 /// provider turn without a network or a real classifier.
@@ -16898,16 +16996,9 @@ async fn manual_pick_turns_routing_off_and_logs_a_reroute() {
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
     assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-cheap-model");
-    let from = agent.note_manual_model_choice("stub/manual-model");
+    let from = agent.record_manual_model_choice("stub/manual-model");
     assert_eq!(from.as_deref(), Some("stub/cheap-model"));
     assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }));
-    model_routing::append_row(&session_path, &model_routing::SessionRoutingRow::Reroute {
-        ts: model_routing::now_millis(),
-        agent_id: agent.agent_id().unwrap_or(0).to_string(),
-        from,
-        to: "stub/manual-model".into(),
-        nudged: false,
-    });
     let rows = read_session_routing_log(&session_path);
     assert!(rows.iter().any(|row| matches!(row,
         model_routing::SessionRoutingRow::Reroute { from: Some(from), to, nudged: false, .. }
@@ -16987,6 +17078,72 @@ async fn manual_pick_during_first_classification_wins() {
     )));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_drift_nudge_is_dropped_after_manual_pick() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(StaleDriftClassifier {
+        calls: std::sync::Mutex::new(0),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    assert_eq!(
+        run_routing_turn(&agent, "implement this routine change").await.text,
+        "from-default"
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("now design the concurrent protocol")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the drift classifier started");
+    turn.await.expect("provider turn joins");
+    let _ = drain_routing_events(&mut fanin_rx);
+
+    agent.note_manual_model_choice("stub/manual-model");
+    release_tx.send(()).expect("release the stale drift answer");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )), "a stale drift answer must not nudge after the manual pick: {events:?}");
+    assert!(!agent.routing_nudged());
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(!rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Nudge { reason, .. } if reason == "drift"
+    )));
+}
+
 #[tokio::test]
 async fn three_failing_tool_calls_nudge_once() {
     let dir = tempdir().unwrap();
@@ -17019,6 +17176,77 @@ async fn three_failing_tool_calls_nudge_once() {
     assert!(nudges[0].contains("tools keep failing") && nudges[0].contains("capable-model"));
     let rows = read_session_routing_log(&session_log_path(&log_path));
     assert_eq!(rows.iter().filter(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. })).count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_strike_nudge_is_dropped_after_clear() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let resolver = Arc::new(BlockingCapableResolver {
+        inner: RoutingStubResolver {
+            policy: Some(session_routing_policy(true)),
+            cheap: Some(stub_model_ref("cheap-model")),
+            capable: Some(stub_model_ref("capable-model")),
+            routed_provider: None,
+        },
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let mut rounds = Vec::new();
+    for index in 0..3u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart {
+                index,
+                id: format!("stale-strike-{index}"),
+                name: format!("missing_tool_{index}"),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index,
+                fragment: "{}".into(),
+            },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let agent = Arc::new(routing_agent(dir.path(), provider, resolver, gate));
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("exercise the failing tools")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx
+        .await
+        .expect("strike target resolution started after its Settled/epoch snapshot");
+
+    let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent.clone());
+    let (clear_tx, _clear_rx) = mpsc::channel(8);
+    task.clear_context(&clear_tx).await;
+    release_tx.send(()).expect("release stale strike resolution");
+    turn.await.expect("turn joins after Clear");
+
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )), "the pre-Clear strike must not claim a nudge in the new epoch: {events:?}");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Pending
+    ));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(!rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Nudge { .. }
+    )));
 }
 
 #[tokio::test]
@@ -17054,6 +17282,96 @@ async fn drift_nudges_once_in_the_background() {
     assert_eq!(agent.current_model_spec(), "default-model", "a drift nudge never switches");
     assert_eq!(run_routing_turn(&agent, "a third full prompt").await.text, "from-default");
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2, "the one nudge suppresses later drift calls");
+}
+
+/// Build a settled session with a real three-failure tool nudge outstanding.
+async fn agent_with_tool_nudge(
+    dir: &std::path::Path,
+) -> (Arc<AgentLoop>, std::path::PathBuf) {
+    let log_path = dir.join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let mut rounds = Vec::new();
+    for index in 0..3u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart {
+                index,
+                id: format!("end-nudge-{index}"),
+                name: format!("missing_tool_{index}"),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index,
+                fragment: "{}".into(),
+            },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let agent = Arc::new(routing_agent(dir, provider, resolver, gate));
+    let (_outcome, mut rx) = run_routing_turn_observed(&agent, "exercise the failing tools").await;
+    assert!(drain_routing_events(&mut rx).iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )));
+    assert!(agent.routing_nudged());
+    (agent, session_log_path(&log_path))
+}
+
+#[tokio::test]
+async fn nudge_ignored_is_logged_when_a_nudged_session_ends() {
+    let dir = tempdir().unwrap();
+    let (agent, session_path) = agent_with_tool_nudge(dir.path()).await;
+    let task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent);
+    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    drop(cmd_tx);
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    task.run(cmd_rx, fanin_tx).await;
+    let rows = read_session_routing_log(&session_path);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
+            .count(),
+        1,
+        "session termination records the ignored nudge exactly once: {rows:?}"
+    );
+    assert!(rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::NudgeIgnored { agent_id, to_label, .. }
+            if agent_id == "1" && to_label == "hard"
+    )));
+}
+
+#[tokio::test]
+async fn nudge_ignored_is_logged_once_for_clear_then_end() {
+    let dir = tempdir().unwrap();
+    let (agent, session_path) = agent_with_tool_nudge(dir.path()).await;
+    let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent);
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    task.clear_context(&fanin_tx).await;
+    assert_eq!(
+        read_session_routing_log(&session_path)
+            .iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
+            .count(),
+        1
+    );
+    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    drop(cmd_tx);
+    task.run(cmd_rx, fanin_tx).await;
+    let rows = read_session_routing_log(&session_path);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
+            .count(),
+        1,
+        "Clear consumes the outstanding nudge, so termination adds no duplicate: {rows:?}"
+    );
 }
 
 #[tokio::test]

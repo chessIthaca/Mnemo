@@ -1133,6 +1133,9 @@ impl AgentTask {
         // inbox-closed exit and the Cancel break above (there is no separate
         // Cancel-path spawn), so working-tier events are compressed + pruned
         // whenever a session ends.
+        // A nudge left unanswered when this session terminates is calibration
+        // data too. The shared consume-and-log helper dedups Clear-then-end.
+        self.agent_loop.log_nudge_ignored(self.id);
         self.spawn_consolidation().await;
         let id = self.id;
         // Release the loop (including a worktree's open codegraph SQLite
@@ -1585,17 +1588,7 @@ impl AgentTask {
         &mut self,
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
     ) {
-        if self.agent_loop.routing_nudged() {
-            if let Some(to_label) = self.agent_loop.nudge_target() {
-                self.agent_loop.append_session_routing_row(
-                    &crate::agent::model_routing::SessionRoutingRow::NudgeIgnored {
-                        ts: crate::agent::model_routing::now_millis(),
-                        agent_id: self.id.to_string(),
-                        to_label,
-                    },
-                );
-            }
-        }
+        self.agent_loop.log_nudge_ignored(self.id);
         self.agent_loop.reset_route_once();
         self.messages.clear();
         // /new: the conversation a switch measures is now empty.

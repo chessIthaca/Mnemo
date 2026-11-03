@@ -11,6 +11,7 @@ import type {
   MemoryRow,
   MemoryTransport,
 } from "../lib/memoryView";
+import { ENGINE_STARTING } from "../lib/memoryView";
 
 const mocks = vi.hoisted(() => ({
   transport: null as MemoryTransport | null,
@@ -330,5 +331,68 @@ describe("MemoryView", () => {
     const entry = within(links).getByText("spec/2027-02-09-knowledge-as-files");
 
     expect(entry.closest("button")).toBeNull();
+  });
+
+  // Plan d49ea4a6: the tab used to be blank while its first page was on the way.
+  it("shows a spinner with what it waits for instead of a blank list", async () => {
+    const transport = plantedTransport();
+    let release: (page: MemoryListPage) => void = () => {};
+    transport.list = () =>
+      new Promise<MemoryListPage>((resolve) => {
+        release = resolve;
+      });
+    mocks.transport = transport;
+    render(MemoryView);
+
+    // The pane keeps its "0 records" status line; the wait is the spinner block.
+    const spinner = await waitFor(() => {
+      const block = listPane().querySelector(".memory-loading");
+      expect(block).toBeTruthy();
+      return block as HTMLElement;
+    });
+    expect(within(spinner).getByText("Loading the project's memory…")).toBeTruthy();
+    expect(listPane().querySelector(".spin")).toBeTruthy();
+    expect(within(listPane()).queryByText("No record matches this filter.")).toBeNull();
+
+    release({ rows: ROWS, offset: 0, has_more: false });
+    await waitFor(() => expect(listPane().querySelectorAll("button.record-row")).toHaveLength(3));
+    expect(listPane().querySelector(".memory-loading")).toBeNull();
+  });
+
+  it("says it is waiting for the project engine to start, then loads once it does", async () => {
+    const transport = plantedTransport();
+    const answers = transport.list.bind(transport);
+    let attempts = 0;
+    transport.list = async (query) => {
+      attempts += 1;
+      if (attempts <= 2) throw ENGINE_STARTING;
+      return answers(query);
+    };
+    mocks.transport = transport;
+    render(MemoryView);
+
+    expect(await within(listPane()).findByText("Waiting for the project engine to start…")).toBeTruthy();
+    expect(within(listPane()).queryByText("No record matches this filter.")).toBeNull();
+
+    await waitFor(() => expect(listPane().querySelectorAll("button.record-row")).toHaveLength(3));
+    expect(attempts).toBeGreaterThanOrEqual(3);
+    expect(within(listPane()).queryByText("Waiting for the project engine to start…")).toBeNull();
+  });
+
+  it("shows the elapsed counter only after a wait passes a second", async () => {
+    const transport = plantedTransport();
+    transport.list = () => new Promise<MemoryListPage>(() => {});
+    mocks.transport = transport;
+    render(MemoryView);
+
+    const spinner = await waitFor(() => {
+      const block = listPane().querySelector(".memory-loading");
+      expect(block).toBeTruthy();
+      return block as HTMLElement;
+    });
+    expect(spinner.querySelector(".elapsed-time")).toBeNull();
+    await waitFor(() => expect(spinner.querySelector(".elapsed-time")).toBeTruthy(), {
+      timeout: 2500,
+    });
   });
 });

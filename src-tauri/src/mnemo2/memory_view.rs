@@ -37,6 +37,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::Serialize;
 use tauri::State;
@@ -306,13 +307,36 @@ impl MemoryOverviewView {
     }
 }
 
+/// The error that says the project engine is still starting: a project open is
+/// in flight, so the runtime (and its memory store) is not installed yet.
+///
+/// This is a WAIT, not a failure: the tab keeps its spinner up and retries —
+/// `mnemo2/src/lib/memoryView.ts` exports the same string as `ENGINE_STARTING`
+/// and matches it, so the two must stay identical.
+pub const ENGINE_STARTING: &str = "the project engine is still starting";
+
 /// The open project's engine, or a clear "nothing is open" error.
 async fn engine(state: &Mnemo2State) -> Result<Arc<Engine>, String> {
-    let lead = state
-        .open_lead()
-        .await
-        .ok_or_else(|| "Mnemo2 has no open project; open one first".to_string())?;
-    lead.engine_handle().await
+    let started = Instant::now();
+    let lead = match state.open_lead().await {
+        Some(lead) => lead,
+        // A project open is in flight: the runtime lands with the engine, so
+        // until then there is no store to read. Say so distinctly (not
+        // "nothing is open") — the tab then waits instead of erroring.
+        None if state.is_opening() => return Err(ENGINE_STARTING.to_string()),
+        None => return Err("Mnemo2 has no open project; open one first".to_string()),
+    };
+    let engine = lead.engine_handle().await?;
+    // The first memory command after an app start carries the project-open
+    // wait (plan d49ea4a6): timed at debug level so a slow start can be told
+    // from a slow query. The store itself answers the first page in
+    // milliseconds (measured on this repository's 224 MB memory.db).
+    log::debug!(
+        "memory_view: the project engine answered in {} ms (opening={})",
+        started.elapsed().as_millis(),
+        state.is_opening()
+    );
+    Ok(engine)
 }
 
 /// The memory store behind an engine, or a clear "memory is off" error.
@@ -414,10 +438,16 @@ async fn list_page(
     if let Some(record_type) = group.record_type() {
         filter = filter.record_type(record_type);
     }
+    let query_started = Instant::now();
     let scanned = store
         .list_filtered(&filter)
         .await
         .map_err(|error| format!("could not list the project's memory: {error}"))?;
+    log::debug!(
+        "memory_view: list_filtered scanned {} row(s) in {} ms (offset={offset}, limit={limit})",
+        scanned.len(),
+        query_started.elapsed().as_millis()
+    );
     let scan_truncated = scanned.len() >= scan;
     let kept: Vec<Memory> = scanned
         .into_iter()
@@ -479,6 +509,7 @@ async fn recall_hits(api: &MemoryApi, query: &str, limit: usize) -> Result<Vec<M
 
 /// The Diagnostics card, from a live API handle.
 async fn overview_from(api: &MemoryApi) -> MemoryOverviewView {
+    let started = Instant::now();
     let overview = match api.overview().await {
         Ok(overview) => overview,
         Err(error) => {
@@ -487,7 +518,7 @@ async fn overview_from(api: &MemoryApi) -> MemoryOverviewView {
             ))
         }
     };
-    MemoryOverviewView {
+    let card = MemoryOverviewView {
         available: true,
         reason: String::new(),
         model_id: overview.model_id,
@@ -507,7 +538,14 @@ async fn overview_from(api: &MemoryApi) -> MemoryOverviewView {
         // than blanking the whole card.
         index: api.index_status().await.ok(),
         embedder: overview.status,
-    }
+    };
+    // The card's slowest read is the stored-fingerprint scan (a DISTINCT over
+    // the whole table); timed so a regression shows up as a number.
+    log::debug!(
+        "memory_view: the overview answered in {} ms",
+        started.elapsed().as_millis()
+    );
+    card
 }
 
 /// The Diagnostics card for an engine — or the "memory is off" shape.
@@ -1116,5 +1154,33 @@ See [[spec/2026-01-01-typed-records]].",
         assert_eq!(preview.chars().count(), PREVIEW_CHARS + 1);
         assert!(preview.ends_with('…'));
         assert_eq!(preview_of(&"y".repeat(PREVIEW_CHARS)), "y".repeat(PREVIEW_CHARS));
+    }
+
+    /// Plan d49ea4a6: a memory command during a project open says the engine is
+    /// still starting, so the tab waits instead of showing an empty list. The
+    /// store cannot answer before the runtime lands with its engine.
+    #[tokio::test]
+    async fn a_project_open_in_flight_reports_the_engine_starting() {
+        let state = Mnemo2State::default();
+        assert_eq!(
+            engine(&state).await.err(),
+            Some("Mnemo2 has no open project; open one first".to_string()),
+            "with nothing opening the message is the old one, exactly"
+        );
+        let opening = state.begin_opening();
+        assert_eq!(engine(&state).await.err().as_deref(), Some(ENGINE_STARTING));
+        drop(opening);
+        assert_eq!(
+            engine(&state).await.err(),
+            Some("Mnemo2 has no open project; open one first".to_string()),
+            "the flag clears with the open, so the wait can never stick"
+        );
+    }
+
+    #[test]
+    fn the_engine_starting_error_is_the_string_the_tab_matches() {
+        // mnemo2/src/lib/memoryView.ts matches this exact text; changing one
+        // side without the other turns a wait into an error message.
+        assert_eq!(ENGINE_STARTING, "the project engine is still starting");
     }
 }

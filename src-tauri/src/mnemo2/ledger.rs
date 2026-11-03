@@ -123,6 +123,52 @@ pub(crate) fn plan_review(workers: &[WorkerRecord], plan_id: &str, plan_title: &
     }
 }
 
+/// The effort table: per task, the models it ran on and the review, fix, and
+/// audit rounds it needed. Audit workers are reviewers, not tasks, so they get
+/// no row; the counters read zero for a ledger written before they existed.
+fn render_effort(out: &mut String, tasks: &[&WorkerRecord]) {
+    out.push_str("\n## Effort\n\n");
+    out.push_str("| Task | Step | Models | Review rounds | Fix rounds | Findings (high) | Audits |\n");
+    out.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
+    let (mut reviews, mut fixes, mut audits, mut counted) = (0u32, 0u32, 0u32, 0usize);
+    for task in tasks.iter().filter(|task| task.kind != "audit") {
+        counted += 1;
+        reviews += task.review_rounds;
+        fixes += task.fix_rounds;
+        audits += task.audits;
+        let step = task
+            .plan_step
+            .map_or_else(|| "-".to_string(), |step| (step + 1).to_string());
+        let models = if task.models_used.is_empty() {
+            task.model_id
+                .as_deref()
+                .or(task.model.as_deref())
+                .unwrap_or("default model")
+                .to_string()
+        } else {
+            task.models_used.join(" → ")
+        };
+        let high = task
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == "high")
+            .count();
+        let _ = writeln!(
+            out,
+            "| `{}` | {step} | {models} | {} | {} | {} ({high}) | {} |",
+            task.id,
+            task.review_rounds,
+            task.fix_rounds,
+            task.findings.len(),
+            task.audits
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nTotal: {reviews} review rounds, {fixes} fix rounds, {audits} audits across {counted} tasks."
+    );
+}
+
 fn render_report(tasks: &[&WorkerRecord], plan_id: &str, plan_title: &str) -> String {
     let mut out = String::from("## Verdict: PASS\n");
     let _ = write!(out, "\n# Team review: {plan_title}\n\nPlan `{plan_id}`.\n");
@@ -160,6 +206,8 @@ fn render_report(tasks: &[&WorkerRecord], plan_id: &str, plan_title: &str) -> St
         }
         out.push('\n');
     }
+
+    render_effort(&mut out, tasks);
 
     let unmerged: Vec<&&WorkerRecord> = tasks.iter().filter(|t| !merged(t)).collect();
     if !unmerged.is_empty() {
@@ -464,6 +512,92 @@ mod tests {
         assert!(report.contains("## Not merged"), "{report}");
         assert!(report.contains("`w2`") && report.contains("stopped by the lead"), "{report}");
         assert!(!report.contains("`w3`"), "{report}");
+    }
+
+    #[test]
+    fn review_report_lists_effort_per_task() {
+        let mut first = worker("w1", "merged", Some("p1"), Some(0));
+        first.merge = Some(merge_record());
+        first.review_rounds = 2;
+        first.fix_rounds = 1;
+        first.audits = 1;
+        first.models_used = vec!["test/scripted-a".into(), "test/scripted-b".into()];
+        first.findings = vec![finding("F1", "fixed")];
+        let mut second = worker("w2", "merged", Some("p1"), Some(1));
+        second.merge = Some(merge_record());
+        second.review_rounds = 1;
+        // An audit worker is a reviewer, never a task: it gets no effort row
+        // even when it is stamped with the plan.
+        let mut audit = worker("r1", "merged", Some("p1"), None);
+        audit.kind = "audit".to_string();
+        audit.audit_target = Some("w1".to_string());
+        audit.review_rounds = 9;
+        audit.fix_rounds = 9;
+        audit.audits = 9;
+        audit.models_used = vec!["test/scripted-z".into()];
+        let PlanReview::Ready { report } = plan_review(&[first, second, audit], "p1", "Ship it")
+        else {
+            panic!("closed work is ready");
+        };
+        assert!(report.contains("\n## Effort\n"), "{report}");
+        assert!(
+            report.contains(
+                "| Task | Step | Models | Review rounds | Fix rounds | Findings (high) | Audits |"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("| `w1` | 1 | test/scripted-a → test/scripted-b | 2 | 1 | 1 (1) | 1 |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| `w2` | 2 | test/scripted-a | 1 | 0 | 0 (0) | 0 |"),
+            "{report}"
+        );
+        assert!(!report.contains("| `r1` |"), "{report}");
+        assert!(!report.contains("scripted-z"), "{report}");
+        assert!(
+            report.contains("Total: 3 review rounds, 1 fix rounds, 1 audits across 2 tasks."),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn old_records_without_counters_render_zero_effort() {
+        let legacy: WorkerRecord = serde_json::from_value(json!({
+            "id": "old1",
+            "name": "Worker old1",
+            "brief": "task",
+            "model": "test/scripted-a",
+            "branch": "wt/agent-old1",
+            "worktree": "",
+            "status": "merged",
+            "generation": 1,
+            "transcript": { "messages": [] },
+            "pending": null,
+            "used_tokens": 0,
+            "max_tokens": 0,
+            "checks": [],
+            "error": null,
+            "plan_id": "p1",
+            "plan_step": 0,
+        }))
+        .expect("a record written before the effort counters existed");
+        assert_eq!(legacy.review_rounds, 0);
+        assert_eq!(legacy.fix_rounds, 0);
+        assert_eq!(legacy.audits, 0);
+        assert!(legacy.models_used.is_empty());
+        let PlanReview::Ready { report } = plan_review(&[legacy], "p1", "T") else {
+            panic!("a merged task is closed");
+        };
+        assert!(
+            report.contains("| `old1` | 1 | test/scripted-a | 0 | 0 | 0 (0) | 0 |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Total: 0 review rounds, 0 fix rounds, 0 audits across 1 tasks."),
+            "{report}"
+        );
     }
 
     #[test]

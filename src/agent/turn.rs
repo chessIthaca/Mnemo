@@ -1263,29 +1263,43 @@ impl AgentLoop {
             .map(|m| m.content.as_text())
             .unwrap_or_default();
 
-        match self.route_once() {
+        let (route_state, classification_epoch) = self.route_once_with_epoch();
+        match route_state {
             super::loop_impl::RouteOnce::Off { .. } => return None,
             super::loop_impl::RouteOnce::Settled { label, .. } => {
-                self.spawn_drift_check(text, label, policy, agent_id, fanin_tx)
-                    .await;
+                self.spawn_drift_check(
+                    text,
+                    label,
+                    policy,
+                    agent_id,
+                    fanin_tx,
+                    classification_epoch,
+                )
+                .await;
                 return None;
             }
             super::loop_impl::RouteOnce::Pending => {}
         }
 
         if text.split_whitespace().count() < 3 {
-            *self.route_once.lock().expect("route-once lock poisoned") =
-                super::loop_impl::RouteOnce::Off { reason: "too_short" };
+            self.route_session
+                .lock()
+                .expect("route-session lock poisoned")
+                .route_once = super::loop_impl::RouteOnce::Off { reason: "too_short" };
             return None;
         }
         let Some(gate) = self.routing.as_ref() else {
-            *self.route_once.lock().expect("route-once lock poisoned") =
-                super::loop_impl::RouteOnce::Off { reason: "offline" };
+            self.route_session
+                .lock()
+                .expect("route-session lock poisoned")
+                .route_once = super::loop_impl::RouteOnce::Off { reason: "offline" };
             return None;
         };
         let Some(classifier) = gate.classifier() else {
-            *self.route_once.lock().expect("route-once lock poisoned") =
-                super::loop_impl::RouteOnce::Off { reason: "offline" };
+            self.route_session
+                .lock()
+                .expect("route-session lock poisoned")
+                .route_once = super::loop_impl::RouteOnce::Off { reason: "offline" };
             return None;
         };
         let log_path = gate.log_path().to_path_buf();
@@ -1298,8 +1312,15 @@ impl AgentLoop {
         )
         .await
         else {
-            *self.route_once.lock().expect("route-once lock poisoned") =
-                super::loop_impl::RouteOnce::Off { reason: "offline" };
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            if state.epoch == classification_epoch
+                && matches!(state.route_once, super::loop_impl::RouteOnce::Pending)
+            {
+                state.route_once = super::loop_impl::RouteOnce::Off { reason: "offline" };
+            }
             return None;
         };
 
@@ -1309,6 +1330,7 @@ impl AgentLoop {
             None => None,
         };
         let mut enforced_model = None;
+        let mut model_changed = None;
         let mut notice = None;
         let mut skip = if decision.confidence < policy.first_prompt_min_confidence {
             Some("below_gate")
@@ -1317,63 +1339,76 @@ impl AgentLoop {
         } else {
             None
         };
+        let mut superseded = false;
 
-        if let Some(target) = decision.target {
-            if let Some(model_ref) = resolved.clone() {
-                if shadow {
-                    skip = Some("shadow");
-                    notice = Some(format!(
-                        "Laya would pick {} ({:.2})",
-                        model_ref.model, decision.confidence
-                    ));
-                } else if let Some((provider, context_manager)) =
-                    resolver.build_turn_provider(&model_ref, self.fill_rate)
-                {
-                    let spec = format!("{}/{}", model_ref.endpoint, model_ref.model);
-                    let effort = resolver.display_effort_for(&model_ref);
-                    let endpoint = Some(model_ref.endpoint.clone());
-                    self.set_explicit_provider(provider, context_manager);
-                    // The route itself announces the change. Seed the served-
-                    // effective deduper so the first request does not emit a
-                    // second identical ModelChanged after this notice.
-                    self.note_served_effective(
-                        &model_ref.model,
-                        endpoint.as_deref(),
-                        effort.as_deref(),
-                    );
-                    let _ = fanin_tx
-                        .send((
-                            agent_id,
-                            AgentEvent::ModelChanged {
+        {
+            // F1: the classifier and target-resolution awaits are over. Commit
+            // the provider pin AND Settled only if this is still the same
+            // Pending session. Both are synchronous under this one lock; the
+            // event sends happen after releasing it, so no guard crosses await.
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            if state.epoch != classification_epoch
+                || !matches!(state.route_once, super::loop_impl::RouteOnce::Pending)
+            {
+                superseded = true;
+                skip = Some("superseded");
+            } else {
+                if decision.target.is_some() {
+                    if let Some(model_ref) = resolved.clone() {
+                        if shadow {
+                            skip = Some("shadow");
+                            notice = Some(format!(
+                                "Laya would pick {} ({:.2})",
+                                model_ref.model, decision.confidence
+                            ));
+                        } else if let Some((provider, context_manager)) =
+                            resolver.build_turn_provider(&model_ref, self.fill_rate)
+                        {
+                            let spec = format!("{}/{}", model_ref.endpoint, model_ref.model);
+                            let effort = resolver.display_effort_for(&model_ref);
+                            let endpoint = Some(model_ref.endpoint.clone());
+                            self.set_explicit_provider(provider, context_manager);
+                            // The route itself announces the change. Seed the
+                            // served-effective deduper so the first request
+                            // does not emit a second identical ModelChanged.
+                            self.note_served_effective(
+                                &model_ref.model,
+                                endpoint.as_deref(),
+                                effort.as_deref(),
+                            );
+                            model_changed = Some(AgentEvent::ModelChanged {
                                 model: model_ref.model.clone(),
                                 provider: endpoint,
                                 reasoning_effort: effort,
-                            },
-                        ))
-                        .await;
-                    notice = Some(format!(
-                        "Laya → {} ({:.2})",
-                        model_ref.model, decision.confidence
-                    ));
-                    enforced_model = Some(spec);
-                    skip = None;
-                } else {
-                    skip = Some("no_target");
+                            });
+                            notice = Some(format!(
+                                "Laya → {} ({:.2})",
+                                model_ref.model, decision.confidence
+                            ));
+                            enforced_model = Some(spec);
+                            skip = None;
+                        } else {
+                            skip = Some("no_target");
+                        }
+                    } else {
+                        skip = Some("no_target");
+                    }
                 }
-                // `target` is intentionally consumed only by the first-prompt
-                // pin above. TurnRoute.target stays None below.
-                let _ = target;
-            } else {
-                skip = Some("no_target");
+
+                state.route_once = super::loop_impl::RouteOnce::Settled {
+                    label: Some(decision.label.clone()),
+                    confidence: Some(decision.confidence),
+                    model: enforced_model.clone(),
+                };
             }
         }
 
-        *self.route_once.lock().expect("route-once lock poisoned") =
-            super::loop_impl::RouteOnce::Settled {
-                label: Some(decision.label.clone()),
-                confidence: Some(decision.confidence),
-                model: enforced_model.clone(),
-            };
+        if let Some(event) = model_changed {
+            let _ = fanin_tx.send((agent_id, event)).await;
+        }
         if let Some(text) = notice {
             let _ = fanin_tx
                 .send((
@@ -1388,9 +1423,13 @@ impl AgentLoop {
 
         let agent = agent_id.to_string();
         let turn_id = model_routing::new_turn_id(&agent);
-        let selected_spec = resolved
-            .as_ref()
-            .map(|m| format!("{}/{}", m.endpoint, m.model));
+        let selected_spec = if superseded {
+            None
+        } else {
+            resolved
+                .as_ref()
+                .map(|m| format!("{}/{}", m.endpoint, m.model))
+        };
         model_routing::append_row(
             &log_path,
             &model_routing::RouteDecisionRow {
@@ -1448,11 +1487,14 @@ impl AgentLoop {
         policy: model_routing::RoutingPolicy,
         agent_id: AgentId,
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+        settled_epoch: u64,
     ) {
         if text.split_whitespace().count() < 3
             || self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned")
                 .nudge_sent
-                .load(std::sync::atomic::Ordering::SeqCst)
         {
             return;
         }
@@ -1476,10 +1518,7 @@ impl AgentLoop {
             is_subagent: false,
         };
         let session_log_path = gate.session_log_path().to_path_buf();
-        let nudge_sent = Arc::clone(&self.nudge_sent);
-        let nudge_to_label = Arc::clone(&self.nudge_to_label);
-        let route_epoch = Arc::clone(&self.route_epoch);
-        let epoch = route_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let route_session = Arc::clone(&self.route_session);
         let fanin_tx = fanin_tx.clone();
         let agent = agent_id.to_string();
         tokio::spawn(async move {
@@ -1513,13 +1552,14 @@ impl AgentLoop {
             let Some(model_ref) = resolver.resolve_routed(target, context) else {
                 return;
             };
-            // A manual pick or Clear increments the epoch and stores false via
-            // this same Arc. The epoch prevents an old task from re-claiming
-            // that fresh false; the CAS guarantees one notice otherwise.
-            if route_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
-                return;
-            }
-            if !AgentLoop::claim_nudge(&nudge_sent, &nudge_to_label, &decision.label) {
+            // Validate the settled state and epoch and claim the nudge in one
+            // critical section. A manual pick or Clear therefore cannot be
+            // followed by this stale task's notice.
+            if !AgentLoop::claim_nudge(
+                &route_session,
+                &decision.label,
+                Some(settled_epoch),
+            ) {
                 return;
             }
             model_routing::append_row(
@@ -2883,7 +2923,8 @@ impl AgentLoop {
                     (trigger, repeated)
                 };
                 if trigger {
-                    let settled_label = match self.route_once() {
+                    let (route_state, route_epoch) = self.route_once_with_epoch();
+                    let settled_label = match route_state {
                         super::loop_impl::RouteOnce::Settled {
                             label: Some(label),
                             ..
@@ -2914,7 +2955,11 @@ impl AgentLoop {
                                 Some(target) => self.resolve_routed_model(target).await,
                                 None => None,
                             } {
-                                if self.try_claim_nudge(to_label) {
+                                if AgentLoop::claim_nudge(
+                                    &self.route_session,
+                                    to_label,
+                                    Some(route_epoch),
+                                ) {
                                     let reason = if repeated {
                                         "repeat_failure"
                                     } else {

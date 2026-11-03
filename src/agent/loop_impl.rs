@@ -59,6 +59,33 @@ pub enum RouteOnce {
     },
 }
 
+/// All route-once lifecycle fields whose transitions must be atomic with a
+/// manual pick, Clear, or a first-classification commit. One std mutex protects
+/// the complete state; detached drift tasks clone only its `Arc` and lock for
+/// the final nudge claim, never across an await.
+#[derive(Debug)]
+pub(crate) struct RouteSessionState {
+    /// The first-prompt lifecycle.
+    pub(crate) route_once: RouteOnce,
+    /// Invalidates classification/drift answers from an earlier incarnation.
+    pub(crate) epoch: u64,
+    /// Whether the one permitted post-route suggestion has been emitted.
+    pub(crate) nudge_sent: bool,
+    /// The outstanding nudge's target, retained for `nudge_ignored`.
+    pub(crate) nudge_to_label: Option<String>,
+}
+
+impl RouteSessionState {
+    fn new() -> Self {
+        Self {
+            route_once: RouteOnce::Pending,
+            epoch: 0,
+            nudge_sent: false,
+            nudge_to_label: None,
+        }
+    }
+}
+
 /// Per-session state extracted from [`AgentLoop`] (A2: reduce the loop's field
 /// count). Holds the memory session id + the prompt-token cache heuristic.
 /// Both are behind `Mutex` so they can be mutated through a `&AgentLoop`.
@@ -645,19 +672,12 @@ pub struct AgentLoop {
     /// rows are written for them (Mnemo2 routes once at dispatch instead).
     /// `false` = the per-turn gate (Mnemo1, unchanged).
     pub(crate) skip_turn_routing: std::sync::atomic::AtomicBool,
-    /// Mnemo1's first-prompt route; independent of the per-iteration lane arm.
-    pub(crate) route_once: std::sync::Mutex<RouteOnce>,
-    /// Whether the one permitted post-route suggestion has been emitted.
-    pub(crate) nudge_sent: Arc<std::sync::atomic::AtomicBool>,
-    /// Invalidates an in-flight drift check when a human picks or `/clear` runs.
-    pub(crate) route_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Mnemo1's route lifecycle, epoch, and nudge claim under ONE lock.
+    pub(crate) route_session: Arc<std::sync::Mutex<RouteSessionState>>,
     /// Consecutive failed-or-repeated tool calls behind a stuck nudge.
     pub(crate) strikes: std::sync::Mutex<super::route_question::Strikes>,
     /// The previous signature, used only to choose the stuck-nudge wording.
     pub(crate) last_route_tool_signature: std::sync::Mutex<Option<String>>,
-    /// Atomic target encoding (`0` none, `1` trivial, `2` routine, `3` hard),
-    /// shared with a detached drift task without cloning a session mutex.
-    pub(crate) nudge_to_label: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -1212,12 +1232,9 @@ impl AgentLoop {
             // session out (`set_skip_turn_routing`) — every constructor
             // starts with the per-turn gate in force.
             skip_turn_routing: std::sync::atomic::AtomicBool::new(false),
-            route_once: std::sync::Mutex::new(RouteOnce::Pending),
-            nudge_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            route_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            route_session: Arc::new(std::sync::Mutex::new(RouteSessionState::new())),
             strikes: std::sync::Mutex::new(super::route_question::Strikes::new(3)),
             last_route_tool_signature: std::sync::Mutex::new(None),
-            nudge_to_label: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -1397,10 +1414,16 @@ impl AgentLoop {
 
     /// Return a snapshot of this session's first-prompt routing state.
     pub fn route_once(&self) -> RouteOnce {
-        self.route_once
+        self.route_once_with_epoch().0
+    }
+
+    /// Snapshot the lifecycle and its epoch from the same critical section.
+    pub(crate) fn route_once_with_epoch(&self) -> (RouteOnce, u64) {
+        let state = self
+            .route_session
             .lock()
-            .expect("route-once lock poisoned")
-            .clone()
+            .expect("route-session lock poisoned");
+        (state.route_once.clone(), state.epoch)
     }
 
     /// Whether the live `[general.laya] routing` opt-in currently exposes a
@@ -1415,33 +1438,38 @@ impl AgentLoop {
 
     /// Record a human model pick. Routing stops for this session, any pending
     /// nudge is cleared, and the previously Laya-routed model is returned for
-    /// the reroute log row.
+    /// the reroute log row. State, epoch, and nudge change in ONE critical
+    /// section so an in-flight classifier cannot commit behind this pick.
     pub fn note_manual_model_choice(&self, _to: &str) -> Option<String> {
         let previous = {
-            let mut state = self.route_once.lock().expect("route-once lock poisoned");
-            let previous = match &*state {
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            let previous = match &state.route_once {
                 RouteOnce::Settled { model, .. } => model.clone(),
                 _ => None,
             };
-            *state = RouteOnce::Off { reason: "manual" };
+            state.route_once = RouteOnce::Off { reason: "manual" };
+            state.epoch = state.epoch.wrapping_add(1);
+            state.nudge_sent = false;
+            state.nudge_to_label = None;
             previous
         };
-        self.route_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.nudge_sent
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.strikes.lock().expect("route strikes lock poisoned").reset();
         *self
             .last_route_tool_signature
             .lock()
             .expect("last tool signature lock poisoned") = None;
-        self.nudge_to_label.store(0, std::sync::atomic::Ordering::SeqCst);
         previous
     }
 
     /// Whether a routing nudge is currently awaiting a human response.
     pub fn routing_nudged(&self) -> bool {
-        self.nudge_sent.load(std::sync::atomic::Ordering::SeqCst)
+        self.route_session
+            .lock()
+            .expect("route-session lock poisoned")
+            .nudge_sent
     }
 
     /// Append one route-once event to this loop's redirected session log.
@@ -1454,68 +1482,78 @@ impl AgentLoop {
 
     /// Restore the initial state after `/clear` or `/new`.
     pub(crate) fn reset_route_once(&self) {
-        *self.route_once.lock().expect("route-once lock poisoned") = RouteOnce::Pending;
-        self.route_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.nudge_sent
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            state.route_once = RouteOnce::Pending;
+            state.epoch = state.epoch.wrapping_add(1);
+            state.nudge_sent = false;
+            state.nudge_to_label = None;
+        }
         self.strikes.lock().expect("route strikes lock poisoned").reset();
         *self
             .last_route_tool_signature
             .lock()
             .expect("last tool signature lock poisoned") = None;
-        self.nudge_to_label.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Mark a resumed session as ineligible for first-prompt routing.
     pub(crate) fn mark_route_once_resumed(&self) {
-        *self.route_once.lock().expect("route-once lock poisoned") =
-            RouteOnce::Off { reason: "resumed" };
+        let mut state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        state.route_once = RouteOnce::Off { reason: "resumed" };
+        state.epoch = state.epoch.wrapping_add(1);
+        state.nudge_sent = false;
+        state.nudge_to_label = None;
     }
 
-    /// Claim the session's one nudge, retaining its target for the clear log.
-    pub(crate) fn try_claim_nudge(&self, to_label: &str) -> bool {
-        Self::claim_nudge(&self.nudge_sent, &self.nudge_to_label, to_label)
-    }
-
-    /// CAS helper shared by the synchronous tool-strike path and the detached
-    /// drift task. The target is recorded only by the winning claimer.
+    /// Claim the one nudge for `to_label`. When `expected_epoch` is supplied,
+    /// the epoch and settled state are validated in the SAME critical section
+    /// as the claim; a manual pick or Clear therefore cannot be followed by a
+    /// stale detached nudge. No lock is held across an await.
     pub(crate) fn claim_nudge(
-        sent: &std::sync::atomic::AtomicBool,
-        target: &std::sync::atomic::AtomicU8,
+        session: &Arc<std::sync::Mutex<RouteSessionState>>,
         to_label: &str,
+        expected_epoch: Option<u64>,
     ) -> bool {
-        let code = match to_label {
-            super::route_question::LABEL_TRIVIAL => 1,
-            super::route_question::LABEL_ROUTINE => 2,
-            super::route_question::LABEL_HARD => 3,
-            _ => return false,
-        };
-        if sent
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
+        if ![
+            super::route_question::LABEL_TRIVIAL,
+            super::route_question::LABEL_ROUTINE,
+            super::route_question::LABEL_HARD,
+        ]
+        .contains(&to_label)
         {
             return false;
         }
-        target.store(code, std::sync::atomic::Ordering::SeqCst);
+        let mut state = session.lock().expect("route-session lock poisoned");
+        if !matches!(state.route_once, RouteOnce::Settled { .. })
+            || expected_epoch.is_some_and(|epoch| epoch != state.epoch)
+            || state.nudge_sent
+        {
+            return false;
+        }
+        state.nudge_sent = true;
+        state.nudge_to_label = Some(to_label.to_string());
         true
     }
 
     /// The target of the outstanding nudge, used by `/clear` and `/new`.
     pub(crate) fn nudge_target(&self) -> Option<String> {
-        let label = match self.nudge_to_label.load(std::sync::atomic::Ordering::SeqCst) {
-            1 => super::route_question::LABEL_TRIVIAL,
-            2 => super::route_question::LABEL_ROUTINE,
-            3 => super::route_question::LABEL_HARD,
-            _ => return None,
-        };
-        Some(label.to_string())
+        let state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        if state.nudge_sent {
+            state.nudge_to_label.clone()
+        } else {
+            None
+        }
     }
+
 
     /// Attach the compound-reflex handle (the Laya classifier's compound
     /// decision layer, `[general.laya] reflex`; backlog a8495cc1) -- the

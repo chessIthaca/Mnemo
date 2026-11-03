@@ -77,6 +77,9 @@ pub async fn spawn_agent(
             // Plan c3ba2b58 step A: Mnemo1 spawns pass no trace identity —
             // records stay unattributed, exactly today's behavior.
             trace_identity: None,
+            // Plan 40eef714 step 1: Mnemo1 spawns pass no pinned task —
+            // the head bytes stay unchanged, exactly today's behavior.
+            pinned_task: None,
         },
     )
     .await?;
@@ -223,6 +226,9 @@ pub(crate) async fn spawn_run_all_agent(
             // Plan c3ba2b58 step A: Mnemo1 spawns pass no trace identity —
             // records stay unattributed, exactly today's behavior.
             trace_identity: None,
+            // Plan 40eef714 step 1: Mnemo1 spawns pass no pinned task —
+            // the head bytes stay unchanged, exactly today's behavior.
+            pinned_task: None,
         },
     )
     .await
@@ -334,6 +340,9 @@ impl ParentAwareSpawner for IpcSpawner {
                 // spawn path inherits the parent's, and an unattributed
                 // Mnemo1 parent stays unattributed (today's behavior).
                 trace_identity: None,
+                // Plan 40eef714 step 1: subagents never pin a task, and
+                // never inherit the parent's.
+                pinned_task: None,
             },
         )
     .await?;

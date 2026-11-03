@@ -599,6 +599,10 @@ fn main() {
                                 // passes no trace identity — records stay
                                 // unattributed, exactly today's behavior.
                                 trace_identity: None,
+                                // Plan 40eef714 step 1: Mnemo1's main agent
+                                // passes no pinned task — the head bytes stay
+                                // unchanged, exactly today's behavior.
+                                pinned_task: None,
                             },
                         )
                         .await

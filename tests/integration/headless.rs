@@ -122,6 +122,10 @@ fn public_types_serde_roundtrip() {
             plan_id: Some("plan-9".into()),
             plan_step: Some(2),
         }),
+        // Plan 40eef714 step 1: a representative pinned task — the
+        // session's assignment riding the system head. The field's None
+        // form round-trips via the default above.
+        pinned_task: Some("do the thing, verbatim".into()),
     });
 
     // 3c/G6 tier 3 (D5): the answer wire — the Gate/Deny form, the

@@ -1149,6 +1149,7 @@ mod lifecycle_tests {
                 limits: None,
                 host_tools: Vec::new(),
                 trace_identity: None,
+                pinned_task: None,
             },
         )
         .await
@@ -1227,6 +1228,7 @@ mod lifecycle_tests {
             limits: None,
             host_tools: Vec::new(),
             trace_identity: None,
+            pinned_task: None,
         };
         let (child, _) = crate::host::runtime::spawn_agent_shared(
             make_host(),
@@ -2148,6 +2150,77 @@ mod model_tests {
             Some(&("model-a".to_string(), Some("low".to_string()))),
             "the kernel announced the new effort: {changes:?}"
         );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Plan 40eef714 step 1: a session spawned with a pinned task sends it
+    /// in the system message (the stable head of the first request), and
+    /// the user message stays the plain prompt — the task never rides a
+    /// conversation message.
+    #[tokio::test]
+    async fn spawn_with_pinned_task_sends_it_in_the_system_message() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let stub = SseStub::start(vec![StubTurn {
+            body: text_turn("done"),
+            gate: None,
+        }])
+        .await;
+        write_switch_config(config.path(), &stub.base_url(), 200000);
+        let engine = switch_engine(&root, &config).await;
+        let session = engine
+            .spawn(SpawnOptions {
+                name: Some("pinned".into()),
+                model: Some("test/model-a".into()),
+                pinned_task: Some("PINNED-ABC".into()),
+                ..SpawnOptions::default()
+            })
+            .await
+            .expect("spawn");
+        let mut events = session.events();
+        session
+            .send(SessionCommand::Prompt {
+                text: "go".into(),
+                images: vec![],
+            })
+            .await
+            .expect("prompt");
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                    .await
+                    .expect("the event stream stays live")
+                    .expect("an event")
+                    .event;
+            if let SerializableAgentEvent::Finished { .. } = event {
+                break;
+            }
+        }
+        let body = stub.body(0);
+        let messages = body["messages"]
+            .as_array()
+            .expect("the request's messages");
+        assert_eq!(
+            messages[0]["role"], "system",
+            "the pinned task rides the leading system message"
+        );
+        let head = messages[0]["content"]
+            .as_str()
+            .expect("the head content");
+        assert!(
+            head.contains("## Your task (pinned)"),
+            "the pinned block rides the system head: {head}"
+        );
+        assert!(
+            head.contains("PINNED-ABC"),
+            "the pinned task is verbatim in the system head: {head}"
+        );
+        for message in &messages[1..] {
+            assert!(
+                !message["content"].to_string().contains("PINNED-ABC"),
+                "the pinned task must not ride any conversation message: {message}"
+            );
+        }
         engine.shutdown().await.expect("shutdown");
     }
 }

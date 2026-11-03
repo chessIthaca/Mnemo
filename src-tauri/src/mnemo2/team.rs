@@ -409,6 +409,8 @@ struct RoutedDispatch {
     tier: Option<String>,
     reasoning_effort: Option<String>,
     routing: Option<WorkerRouting>,
+    rows: Vec<DispatchRoutingRow>,
+    error: Option<String>,
 }
 
 /// One dispatch request's knobs, threaded through the dispatch path together.
@@ -1029,6 +1031,8 @@ impl TeamRuntime {
                 tier: request.tier.clone(),
                 reasoning_effort: request.reasoning_effort.clone(),
                 routing: None,
+                rows: Vec::new(),
+                error: None,
             });
         }
 
@@ -1099,7 +1103,11 @@ impl TeamRuntime {
             (None, None)
         } else if settings.mode == RoutingMode::Auto {
             let tier = settings.fallback_tier.clone();
-            (self.lead_model_choice(Some(&tier), None)?, Some(tier))
+            if self.tier_models(&tier).is_empty() {
+                (self.lead_model_choice(None, None)?, None)
+            } else {
+                (self.lead_model_choice(Some(&tier), None)?, Some(tier))
+            }
         } else {
             (self.lead_model_choice(None, None)?, None)
         };
@@ -1174,10 +1182,10 @@ impl TeamRuntime {
             text: classified_text.unwrap_or_default(),
             skip: skip.map(str::to_string),
         };
-        self.append_dispatch_routing_row(&row);
+        let mut rows = vec![row];
         if routed_by == "lead_override" {
             if let Some(laya_tier) = routing.laya_tier.clone() {
-                self.append_dispatch_routing_row(&DispatchRoutingRow::LeadOverride {
+                rows.push(DispatchRoutingRow::LeadOverride {
                     ts,
                     worker_id: request.worker_id.clone().unwrap_or_default(),
                     plan_id: request
@@ -1192,14 +1200,13 @@ impl TeamRuntime {
                 });
             }
         }
-        if let Some(error) = refusal {
-            return Err(error);
-        }
         Ok(RoutedDispatch {
             model: chosen_model,
             tier: chosen_tier,
             reasoning_effort,
             routing: Some(routing),
+            rows,
+            error: refusal,
         })
     }
 
@@ -2646,18 +2653,27 @@ impl TeamRuntime {
             }
             None => None,
         };
-        let (model, reasoning_effort, tier, routing) = if dispatch_routing {
-            let routed = routed
-                .ok_or_else(|| "dispatch routing was not prepared".to_string())?;
-            (
-                routed.model,
-                routed.reasoning_effort,
-                routed.tier,
-                routed.routing,
-            )
-        } else {
-            (model, reasoning_effort, tier, None)
-        };
+        let (model, reasoning_effort, tier, routing, routing_rows, routing_error) =
+            if dispatch_routing {
+                let routed = routed
+                    .ok_or_else(|| "dispatch routing was not prepared".to_string())?;
+                (
+                    routed.model,
+                    routed.reasoning_effort,
+                    routed.tier,
+                    routed.routing,
+                    routed.rows,
+                    routed.error,
+                )
+            } else {
+                (model, reasoning_effort, tier, None, Vec::new(), None)
+            };
+        if let Some(error) = routing_error {
+            for row in &routing_rows {
+                self.append_dispatch_routing_row(row);
+            }
+            return Err(error);
+        }
         self.validate_model(&model, &reasoning_effort)?;
         if let Some(id) = worker_id.as_deref() {
             let branch = agent_branch(id);
@@ -2677,6 +2693,9 @@ impl TeamRuntime {
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));
+        }
+        for row in &routing_rows {
+            self.append_dispatch_routing_row(row);
         }
         let placed = plan.as_ref().map(|plan| (plan.plan_id.clone(), plan.step));
         let provisioned = self
@@ -9879,7 +9898,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(routed.tier.as_deref(), Some("average"));
         assert_eq!(fixture.classifier.calls(), 0);
         assert!(matches!(
-            fixture.rows().as_slice(),
+            routed.rows.as_slice(),
             [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
                 skip: Some(reason),
                 ..
@@ -9923,6 +9942,65 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(compact["result"][0].get("routing").is_none());
         let detailed = team_status_answer(&fixture.team, json!({"detail": true})).await;
         assert!(detailed["result"][0].get("routing").is_none());
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn auto_fallback_without_that_tier_uses_the_default_model() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            true,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto {
+                simple: vec!["test/scripted-model".into()],
+                average: Vec::new(),
+                difficult: vec!["test/scripted-model".into()],
+            },
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        assert_eq!(worker.routing.expect("routing").routed_by, "lead");
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ran_tier: None,
+                ..
+            }] if reason == "gate"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn racing_duplicate_dispatch_logs_one_route_row() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let (first, second) = tokio::join!(
+            fixture.dispatch(Some("average"), None),
+            fixture.dispatch(Some("average"), None)
+        );
+        assert!(first.success, "{}", first.output);
+        assert!(second.success, "{}", second.output);
+        assert_eq!(fixture.classifier.calls(), 2);
+        assert_eq!(fixture.rows().len(), 1, "exactly one Route row is committed");
         fixture.team.shutdown().await;
     }
 

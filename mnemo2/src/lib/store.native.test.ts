@@ -344,4 +344,43 @@ describe("native lead store path", () => {
     expect(harness.transport.open).not.toHaveBeenCalled();
     expect(harness.transport.onEvent).not.toHaveBeenCalled();
   });
+
+  it("applies a backlog from a hidden window in one update, complete and in order", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+
+    const descriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
+    let visibility: DocumentVisibilityState = "hidden";
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
+    let updates = 0;
+    const unsubscribe = app.subscribe(() => {
+      updates += 1;
+    });
+    updates = 0;
+    try {
+      const chunks = Array.from({ length: 400 }, (_, index) => `${index},`);
+      for (const [index, text] of chunks.entries()) {
+        harness.emit({ generation: 1, event: { agent: 1, event: { kind: "text_delta", text } } });
+        harness.emit({
+          generation: 1,
+          event: { agent: 1, event: { kind: "context_usage", used: index * 1000, max: 1_000_000 } },
+        });
+      }
+      // Hidden: nothing reaches the UI, so nothing replays later either.
+      expect(updates).toBe(0);
+      expect(get(app).leadRuntime.usedTokens).toBe(0);
+
+      visibility = "visible";
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(updates).toBe(1);
+      expect(get(app).leadEntries.at(-1)).toMatchObject({ author: "lead", body: chunks.join("") });
+      expect(get(app).leadRuntime.usedTokens).toBe(399_000);
+    } finally {
+      unsubscribe();
+      if (descriptor) Object.defineProperty(document, "visibilityState", descriptor);
+      else delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
 });

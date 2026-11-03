@@ -2,6 +2,7 @@ import { derived, get, writable } from "svelte/store";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
 import { createProjectTransport, type ProjectPreferences, type ProjectRecord, type ProjectTransport } from "./projectEngine";
 import { probeMnemo2Host } from "./runtime";
+import { createStreamCoalescer } from "./streamCoalescer";
 import {
   createTeamTransport,
   type TeamTransport,
@@ -175,6 +176,7 @@ async function refreshNativeLead(token: number): Promise<void> {
   try {
     const snapshot = await transport.snapshot();
     if (token === leadSessionToken) {
+      leadStream.flush();
       app.update((state) => applyLeadSnapshot(state, snapshot));
     }
   } catch (error) {
@@ -187,23 +189,44 @@ async function refreshNativeLead(token: number): Promise<void> {
   }
 }
 
+/**
+ * Lead events pass through a coalescer: while the window paints they apply one
+ * by one, but a backlog from a hidden or throttled window lands in one update
+ * (see streamCoalescer.ts). Flush it before any other write to lead state so
+ * queued events never apply on top of a newer snapshot.
+ */
+const leadStream = createStreamCoalescer<{ token: number; event: LeadEvent }>(applyNativeLeadEvents);
+
 function handleNativeLeadEvent(token: number, event: LeadEvent): void {
   if (token !== leadSessionToken) return;
-  app.update((state) => applyLeadEvent(state, event));
+  leadStream.push({ token, event });
+}
+
+function applyNativeLeadEvents(items: { token: number; event: LeadEvent }[]): void {
+  const token = leadSessionToken;
+  const events = items.filter((item) => item.token === token).map((item) => item.event);
+  if (events.length === 0) return;
+  app.update((state) => events.reduce(applyLeadEvent, state));
   // The lead's own turn-finished / needs-you / stopped-with-errors events ring
   // the matching notification sound (gated by the [ui] toggles, per-sound
   // debounce, more urgent sounds always through).
   const runtime = get(app).leadRuntime;
-  if (runtime.mode === "native" && runtime.generation === event.generation) {
-    const sound = leadEventSound(event.event?.event);
-    if (sound) notifySound(sound);
+  let affectsUsage = false;
+  let needsSnapshot = false;
+  for (const event of events) {
+    if (runtime.mode === "native" && runtime.generation === event.generation) {
+      const sound = leadEventSound(event.event?.event);
+      if (sound) notifySound(sound);
+    }
+    affectsUsage ||= leadEventAffectsUsage(event);
+    needsSnapshot ||= leadEventNeedsSnapshot(event);
   }
-  if (leadEventAffectsUsage(event)) {
+  if (affectsUsage) {
     // The durable per-project accumulator changed; re-read the team snapshot
     // (debounced and project-guarded) so the header cost follows the lead too.
     scheduleTeamSync();
   }
-  if (leadEventNeedsSnapshot(event)) {
+  if (needsSnapshot) {
     setTimeout(() => {
       if (token === leadSessionToken) void refreshNativeLead(token);
     }, 25);
@@ -241,6 +264,7 @@ async function connectNativeLead(project: Project, allowConflict = false): Promi
       ...(allowConflict ? { allowInstanceConflict: true } : {}),
     });
     if (token !== leadSessionToken) return;
+    leadStream.flush();
     app.update((state) => applyLeadSnapshot(state, snapshot));
   } catch (error) {
     if (token !== leadSessionToken) return;
@@ -1538,6 +1562,8 @@ async function sendNativeLeadMessage(message: string, images: string[]): Promise
   const transport = leadTransport;
   if (!transport) return false;
   const token = leadSessionToken;
+  // The optimistic entry goes after every event the host already sent.
+  leadStream.flush();
   const before = get(app).leadRuntime;
   // A submission on a busy turn steers the running turn instead of starting
   // a new one: the elapsed clock and the streaming entry must survive.
@@ -1803,6 +1829,7 @@ function setLeadModel(spec: string, reasoningEffort: string | null = null) {
     .setModel(spec, reasoningEffort)
     .then((snapshot) => {
       if (token === leadSessionToken) {
+        leadStream.flush();
         app.update((current) => applyLeadSnapshot(current, snapshot));
       }
     })
@@ -2540,11 +2567,47 @@ function streamWorkerActivity(event: TeamEvent): void {
   if (next === current) return;
   if (next) workerActivity.set(workerId, next);
   else workerActivity.delete(workerId);
+  workerStream.push({ token: teamToken, workerId, thread: false });
+}
+
+/**
+ * A worker whose activity or open thread changed in the maps above. The store
+ * write is coalesced (see streamCoalescer.ts): a batch re-reads the maps, so
+ * it carries the newest state and can never undo a later team sync.
+ */
+interface WorkerStreamMark {
+  token: number;
+  workerId: string;
+  thread: boolean;
+}
+
+const workerStream = createStreamCoalescer<WorkerStreamMark>(applyWorkerStreamMarks);
+
+function applyWorkerStreamMarks(marks: WorkerStreamMark[]): void {
+  const threads = new Set<string>();
+  const activities = new Set<string>();
+  for (const mark of marks) {
+    if (mark.token !== teamToken) continue;
+    (mark.thread ? threads : activities).add(mark.workerId);
+  }
+  const composed = new Map<string, Worker["messages"]>();
+  for (const workerId of threads) {
+    const thread = composeThread(workerId);
+    if (thread) composed.set(workerId, thread);
+  }
+  if (activities.size === 0 && composed.size === 0) return;
   app.update((state) => ({
     ...state,
-    workers: state.workers.map((worker) =>
-      worker.id === workerId ? { ...worker, activity: next } : worker,
-    ),
+    workers: state.workers.map((worker) => {
+      const activity = activities.has(worker.id);
+      const thread = composed.get(worker.id);
+      if (!activity && !thread) return worker;
+      return {
+        ...worker,
+        ...(activity ? { activity: workerActivity.get(worker.id) ?? null } : {}),
+        ...(thread ? { messages: thread } : {}),
+      };
+    }),
   }));
 }
 
@@ -2561,14 +2624,7 @@ function streamWorkerEvent(event: TeamEvent): void {
   if (next === live && workerLive.get(event.worker_id) === live) return;
   workerLive.set(event.worker_id, next);
   if (event.generation !== saved.generation) return;
-  const thread = composeThread(event.worker_id);
-  if (!thread) return;
-  app.update((state) => ({
-    ...state,
-    workers: state.workers.map((worker) =>
-      worker.id === event.worker_id ? { ...worker, messages: thread } : worker,
-    ),
-  }));
+  workerStream.push({ token: teamToken, workerId: event.worker_id, thread: true });
 }
 
 /** Refetch the plan board; failures keep the last board (it is only a view). */

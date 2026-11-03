@@ -206,4 +206,35 @@ describe("worker live activity in the store", () => {
       expect(get(app).workers[0].activity).toBeNull();
     }
   });
+
+  it("applies a worker backlog from a hidden window in one update, complete and in order", async () => {
+    const harness = makeTransport(nativeWorker());
+    await openTeam(harness.transport);
+
+    const descriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
+    let visibility: DocumentVisibilityState = "hidden";
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
+    let updates = 0;
+    const unsubscribe = app.subscribe(() => {
+      updates += 1;
+    });
+    updates = 0;
+    try {
+      harness.emit(stream("started"));
+      const chunks = Array.from({ length: 300 }, (_, index) => `${index},`);
+      for (const text of chunks) harness.emit(stream("text_delta", { text }));
+      expect(updates).toBe(0);
+
+      visibility = "visible";
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(updates).toBe(1);
+      const worker = get(app).workers[0];
+      expect(worker.activity?.phase).toBe("writing");
+      expect(worker.messages.at(-1)).toMatchObject({ body: chunks.join("") });
+    } finally {
+      unsubscribe();
+      if (descriptor) Object.defineProperty(document, "visibilityState", descriptor);
+      else delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
 });

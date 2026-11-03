@@ -566,47 +566,6 @@ pub async fn engine_status(state: State<'_, IpcState>) -> Result<EngineStats, Ip
         .map_err(|e| IpcError::msg(format!("{e:#}")))
 }
 
-/// Select the loops whose model spec really changes AND which have session
-/// routing enabled. The generic tuple form keeps this policy pure and cheap to
-/// unit-test: `(loop handle, current model spec, routing enabled)`.
-fn loops_to_reroute<T>(
-    candidates: impl IntoIterator<Item = (T, String, bool)>,
-    new_spec: &str,
-) -> Vec<T> {
-    candidates
-        .into_iter()
-        .filter(|(_, current_spec, routing_enabled)| {
-            *routing_enabled && current_spec != new_spec
-        })
-        .map(|(agent_loop, _, _)| agent_loop)
-        .collect()
-}
-
-/// Commit the manual route-state transition BEFORE the provider pin. The two
-/// injected operations make the production ordering directly testable; `pin`
-/// always runs, including effort-only and routing-off selections.
-async fn mark_manual_before_pin<T, Mark, MarkFuture, Pin, PinFuture>(
-    selected: Option<T>,
-    mark: Mark,
-    pin: Pin,
-) -> PinFuture::Output
-where
-    Mark: FnOnce(T) -> MarkFuture,
-    MarkFuture: std::future::Future<Output = ()>,
-    Pin: FnOnce() -> PinFuture,
-    PinFuture: std::future::Future,
-{
-    if let Some(selected) = selected {
-        mark(selected).await;
-    }
-    pin().await
-}
-
-/// Record a human model pick through the kernel's shared reroute-row helper.
-fn note_session_reroute(agent_loop: &mnemo::agent::AgentLoop, to: &str) {
-    let _ = agent_loop.record_manual_model_choice(to);
-}
-
 /// Switch the active model (or reasoning effort) at runtime — per agent.
 ///
 /// Models are agent-specific (user decision 2026-08-22): the GUI model picker
@@ -686,48 +645,21 @@ pub async fn set_model(
 
     // Rebuild the context manager from the new provider's max context.
     let context_manager = factory.context_manager_for(provider.as_ref());
-    let spec = format!("{endpoint_name}/{model}");
 
     match agent_id {
         // Per-agent switch: models are agent-specific — swap ONLY the target
         // agent's loop (the factory + other agents are untouched) and push the
         // new model to the UI for that agent only.
         Some(id) => {
-            let target_loop = state.runtime.agent_loops.lock().await.get(&id).cloned();
-            let reroute_loop = target_loop.as_ref().and_then(|agent_loop| {
-                loops_to_reroute(
-                    [(
-                        agent_loop.clone(),
-                        agent_loop.current_model_spec(),
-                        agent_loop.session_routing_enabled(),
-                    )],
-                    &spec,
-                )
-                .into_iter()
-                .next()
-            });
-            let pin_effort = display_effort.clone();
-            let outcome = mark_manual_before_pin(
-                reroute_loop,
-                |agent_loop| {
-                    let spec = spec.clone();
-                    async move {
-                        note_session_reroute(agent_loop.as_ref(), &spec);
-                    }
-                },
-                move || async move {
-                    crate::ipc::config_io::swap_provider_into_loop(
-                        &state.runtime.agent_loops,
-                        id,
-                        provider,
-                        context_manager,
-                        Some(pin_effort),
-                    )
-                    .await
-                },
+            match crate::ipc::config_io::swap_provider_into_loop(
+                &state.runtime.agent_loops,
+                id,
+                provider,
+                context_manager,
+                Some(display_effort.clone()),
             )
-            .await;
-            match outcome {
+            .await
+            {
                 crate::ipc::config_io::SwapOutcome::NotFound => {
                     return Err(format!("no agent loop for agent {id}").into());
                 }
@@ -776,43 +708,13 @@ pub async fn set_model(
         // Legacy global switch: factory + every live agent loop (the console
         // REPL and any pre-per-agent callers).
         None => {
-            let changed_loops = {
-                let agent_loops = state.runtime.agent_loops.lock().await;
-                let candidates = agent_loops
-                    .values()
-                    .map(|agent_loop| {
-                        (
-                            agent_loop.clone(),
-                            agent_loop.current_model_spec(),
-                            agent_loop.session_routing_enabled(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                loops_to_reroute(candidates, &spec)
-            };
-            let pin_model = model.clone();
-            let pin_effort = display_effort.clone();
-            mark_manual_before_pin(
-                Some(changed_loops),
-                |agent_loops| {
-                    let spec = spec.clone();
-                    async move {
-                        for agent_loop in agent_loops {
-                            note_session_reroute(agent_loop.as_ref(), &spec);
-                        }
-                    }
-                },
-                move || async move {
-                    let _ = crate::ipc::config_io::swap_live_provider(
-                        &state,
-                        &app,
-                        provider,
-                        context_manager,
-                        pin_model,
-                        Some(pin_effort),
-                    )
-                    .await;
-                },
+            let _ = crate::ipc::config_io::swap_live_provider(
+                &state,
+                &app,
+                provider,
+                context_manager,
+                model.clone(),
+                Some(display_effort.clone()),
             )
             .await;
             eprintln!("switched model to '{model}' (provider {kind_label})");
@@ -1108,54 +1010,6 @@ pub async fn get_session_list(state: State<'_, IpcState>) -> Result<serde_json::
 mod tests {
     use crate::ipc::contract_fixtures::normalize_lf;
 
-    use super::{loops_to_reroute, mark_manual_before_pin};
-
-    #[tokio::test]
-    async fn set_model_marks_manual_before_pinning() {
-        let selected = loops_to_reroute(
-            vec![("loop", "endpoint/old".to_string(), true)],
-            "endpoint/new",
-        )
-        .into_iter()
-        .next();
-        let order = std::cell::RefCell::new(Vec::new());
-        mark_manual_before_pin(
-            selected,
-            |_agent_loop| async {
-                order.borrow_mut().push("manual");
-            },
-            || async {
-                order.borrow_mut().push("pin");
-            },
-        )
-        .await;
-        assert_eq!(order.into_inner(), vec!["manual", "pin"]);
-    }
-
-    #[test]
-    fn loops_to_reroute_keeps_changed_routing_enabled_loops() {
-        let candidates = vec![
-            (1, "endpoint/old-a".to_string(), true),
-            (2, "endpoint/old-b".to_string(), true),
-        ];
-        assert_eq!(loops_to_reroute(candidates, "endpoint/new"), vec![1, 2]);
-    }
-
-    #[test]
-    fn loops_to_reroute_skips_effort_only_calls() {
-        let candidates = vec![(1, "endpoint/same".to_string(), true)];
-        let selected = loops_to_reroute(candidates, "endpoint/same");
-        assert!(selected.is_empty(), "an unchanged spec is effort-only");
-    }
-
-    #[test]
-    fn loops_to_reroute_skips_routing_off_loops() {
-        let candidates = vec![
-            (1, "endpoint/old".to_string(), false),
-            (2, "endpoint/old".to_string(), true),
-        ];
-        assert_eq!(loops_to_reroute(candidates, "endpoint/new"), vec![2]);
-    }
     /// Regression (run-all dispatches the next backlog item into the main
     /// agent during steering, 2026-08-31): `send_suggestion` must halt an
     /// active run-all BEFORE sending the steer command. Without the halt, the

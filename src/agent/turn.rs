@@ -1370,7 +1370,7 @@ impl AgentLoop {
                             let spec = format!("{}/{}", model_ref.endpoint, model_ref.model);
                             let effort = resolver.display_effort_for(&model_ref);
                             let endpoint = Some(model_ref.endpoint.clone());
-                            self.set_explicit_provider(provider, context_manager);
+                            self.pin_routed_provider(provider, context_manager);
                             // The route itself announces the change. Seed the
                             // served-effective deduper so the first request
                             // does not emit a second identical ModelChanged.
@@ -2161,7 +2161,7 @@ impl AgentLoop {
                             },
                         ))
                         .await;
-                    self.set_provider(pending.provider.clone(), pending.context_manager.clone());
+                    self.set_provider_internal(pending.provider.clone(), pending.context_manager.clone());
                     *self
                         .explicit_provider
                         .write()
@@ -2179,7 +2179,7 @@ impl AgentLoop {
                 }
             }
             // Complete the deferred swap.
-            self.set_provider(pending.provider.clone(), pending.context_manager.clone());
+            self.set_provider_internal(pending.provider.clone(), pending.context_manager.clone());
             *self
                 .explicit_provider
                 .write()

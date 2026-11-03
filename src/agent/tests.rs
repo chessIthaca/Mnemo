@@ -16179,6 +16179,7 @@ struct RoutedProvider {
     model: String,
     text: String,
     caps: Capabilities,
+    endpoint: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -16191,6 +16192,9 @@ impl LlmClient for RoutedProvider {
     }
     fn model(&self) -> &str {
         &self.model
+    }
+    fn provider_name(&self) -> &str {
+        self.endpoint.as_deref().unwrap_or("")
     }
     async fn complete(
         &self,
@@ -16215,7 +16219,81 @@ fn routed_provider(model: &str, text: &str) -> Arc<dyn LlmClient> {
         model: model.to_string(),
         text: text.to_string(),
         caps: Capabilities::openai(),
+        endpoint: None,
     })
+}
+
+/// A routed provider with a real endpoint identity for 429-fallback tests.
+fn endpoint_routed_provider(
+    endpoint: &str,
+    model: &str,
+    text: &str,
+) -> Arc<dyn LlmClient> {
+    Arc::new(RoutedProvider {
+        model: model.to_string(),
+        text: text.to_string(),
+        caps: Capabilities::openai(),
+        endpoint: Some(endpoint.to_string()),
+    })
+}
+
+/// A routing resolver with an alternate endpoint for the capable model. The
+/// fallback itself is internal and must never be mistaken for a human pick.
+struct FallbackRoutingResolver {
+    inner: RoutingStubResolver,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for FallbackRoutingResolver {
+    fn resolve(
+        &self,
+        _context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        self.inner.resolve_routed(target, context)
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.inner.routing_policy()
+    }
+
+    fn build_turn_provider(
+        &self,
+        model_ref: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            endpoint_routed_provider(
+                &model_ref.endpoint,
+                &model_ref.model,
+                &format!("from-{}", model_ref.endpoint),
+            ),
+            context::ContextManager::new(128_000, 0.5),
+        ))
+    }
+
+    fn find_alternate_endpoint(
+        &self,
+        model_id: &str,
+        exclude_endpoint: &str,
+    ) -> Option<crate::config::ModelRef> {
+        if model_id == "capable-model" && exclude_endpoint == "stub" {
+            Some(crate::config::ModelRef {
+                endpoint: "alternate".into(),
+                model: "capable-model".into(),
+                reasoning_effort: None,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// A model ref on the stub endpoint the routing tests configure.
@@ -17168,6 +17246,221 @@ async fn manual_mark_before_human_pin_wins() {
             model_routing::SessionRoutingRow::Route { skip: Some(skip), .. }
                 if skip == "superseded"
         )));
+}
+
+#[tokio::test]
+async fn global_set_provider_after_routing_serves_the_human_model() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "design the routing architecture").await.text,
+        "from-capable-model"
+    );
+
+    // This is the GLOBAL set_model / Engine::swap_model surface: plain
+    // set_provider, not the per-agent explicit-pin picker.
+    agent.set_provider(
+        routed_provider("human-model", "from-human"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "serve the next full prompt").await.text,
+        "from-human",
+        "the external default swap clears Laya's explicit routed pin"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::Reroute { .. }))
+            .count(),
+        1,
+        "the kernel records exactly one reroute for the external pick: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn engine_swap_model_counts_as_manual() {
+    let dir = tempdir().unwrap();
+    let engine_config = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(BlockingRoutingClassifier {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    let engine = crate::headless::Engine::builder(crate::headless::EngineOptions {
+        workspace: crate::workspace::Workspace::new(dir.path()),
+        config_dir: Some(engine_config.path().to_path_buf()),
+        permissions: crate::agent::policy::PermissionPolicy::OverridePermissions,
+        memory: crate::headless::MemoryBackend::Disabled,
+        index_codegraph: false,
+        require_git: false,
+        auto_install_embedder: false,
+    })
+    .provider(routed_provider("engine-default", "engine-default"))
+    .start()
+    .await
+    .expect("start headless engine");
+    engine
+        .host()
+        .agent_loops
+        .lock()
+        .await
+        .insert(42, agent.clone());
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("design the routing architecture")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the gated first classification started");
+    let switched = engine
+        .swap_model(routed_provider("human-model", "from-human"), None)
+        .await;
+    assert!(switched.contains(&42));
+    release_tx.send(()).expect("release the classifier after the engine swap");
+    let outcome = turn.await.expect("turn joins");
+    assert_eq!(outcome.text, "from-human");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    assert!(read_session_routing_log(&session_log_path(&log_path))
+        .iter()
+        .any(|row| matches!(
+            row,
+            model_routing::SessionRoutingRow::Route { skip: Some(skip), .. }
+                if skip == "superseded"
+        )));
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelChanged { model, .. } if model == "capable-model"
+    )));
+    engine.shutdown().await.expect("engine shutdown");
+}
+
+#[tokio::test]
+async fn same_spec_or_effort_only_change_is_not_manual() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "design the routing architecture").await.text,
+        "from-capable-model"
+    );
+    agent.set_provider(
+        routed_provider("capable-model", "from-same-default"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    agent.set_explicit_provider(
+        routed_provider("capable-model", "from-same-pin"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "serve the next full prompt").await.text,
+        "from-same-pin"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Settled { .. }
+    ));
+    assert!(!read_session_routing_log(&session_log_path(&log_path))
+        .iter()
+        .any(|row| matches!(row, model_routing::SessionRoutingRow::Reroute { .. })));
+}
+
+#[tokio::test]
+async fn internal_429_fallback_is_not_a_manual_pick() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(FallbackRoutingResolver {
+        inner: RoutingStubResolver {
+            policy: Some(session_routing_policy(true)),
+            cheap: Some(stub_model_ref("cheap-model")),
+            capable: Some(stub_model_ref("capable-model")),
+            routed_provider: None,
+        },
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "design the routing architecture").await.text,
+        "from-stub"
+    );
+    let info = agent.try_429_fallback().expect("alternate endpoint");
+    assert_eq!(info.to_endpoint, "alternate");
+    let (provider, _context_manager) = agent
+        .resolve_turn_provider(None)
+        .await
+        .expect("routed provider after fallback");
+    assert_eq!(provider.provider_name(), "alternate");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Settled { .. }
+    ));
+    assert!(!read_session_routing_log(&session_log_path(&log_path))
+        .iter()
+        .any(|row| matches!(row, model_routing::SessionRoutingRow::Reroute { .. })));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

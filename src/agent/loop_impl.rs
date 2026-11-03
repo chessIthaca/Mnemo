@@ -451,6 +451,10 @@ pub struct AgentLoop {
     /// not silently undo an explicit per-agent choice) — but see
     /// [`pinned_state`](Self::pinned_state) for where it yields.
     pub(crate) explicit_provider: ExplicitProvider,
+    /// Whether `explicit_provider` / `pending_swap` belongs to Laya rather
+    /// than the human picker. External provider changes clear ONLY this pin;
+    /// a human pin keeps its historical global-swap dormancy semantics.
+    routed_pin: std::sync::Mutex<bool>,
     /// The workflow state the picker pin was first SERVED in — the pin's
     /// scope. Lazily stamped by [`resolve_turn_provider`](Self::resolve_turn_provider)
     /// (the pin exists the moment the picker acts; the state is recorded at
@@ -1192,6 +1196,7 @@ impl AgentLoop {
             fill_rate: 0.5,
             forced_model: std::sync::Mutex::new(None),
             explicit_provider: Arc::new(RwLock::new(None)),
+            routed_pin: std::sync::Mutex::new(false),
             pinned_state: std::sync::Mutex::new(None),
             fallback_endpoints: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_swap: Arc::new(std::sync::Mutex::new(None)),
@@ -1436,15 +1441,26 @@ impl AgentLoop {
             .is_some()
     }
 
-    /// Transition to manual in one critical section, returning the previously
-    /// Laya-routed model and whether a nudge was outstanding. Strike counters
-    /// are reset after releasing the route-state lock.
-    fn transition_to_manual(&self) -> (Option<String>, bool) {
+    /// Transition to manual in one critical section. With `only_if_active`, an
+    /// already Off/ended session is left untouched and returns `None`, which
+    /// prevents duplicate reroutes when two external surfaces race.
+    fn transition_to_manual_inner(
+        &self,
+        only_if_active: bool,
+    ) -> Option<(Option<String>, bool)> {
         let (previous, nudged) = {
             let mut state = self
                 .route_session
                 .lock()
                 .expect("route-session lock poisoned");
+            if only_if_active
+                && !matches!(
+                    state.route_once,
+                    RouteOnce::Pending | RouteOnce::Settled { .. }
+                )
+            {
+                return None;
+            }
             let previous = match &state.route_once {
                 RouteOnce::Settled { model, .. } => model.clone(),
                 _ => None,
@@ -1461,7 +1477,12 @@ impl AgentLoop {
             .last_route_tool_signature
             .lock()
             .expect("last tool signature lock poisoned") = None;
-        (previous, nudged)
+        Some((previous, nudged))
+    }
+
+    fn transition_to_manual(&self) -> (Option<String>, bool) {
+        self.transition_to_manual_inner(false)
+            .unwrap_or((None, false))
     }
 
     /// Record a human model pick without appending a reroute row. Used by the
@@ -1471,14 +1492,15 @@ impl AgentLoop {
     }
 
     /// Mark a human pick and append its reroute row through the SAME kernel
-    /// path used by IPC and tests. Routing-off picks remain byte-identical.
-    /// Returns `(previously routed model, nudge was outstanding)`; both are
-    /// captured in the SAME critical section that installs Off and bumps epoch.
+    /// path used by IPC and tests. Routing-off or already-final picks remain
+    /// byte-identical. Returns `(previously routed model, nudge outstanding)`.
     pub fn record_manual_model_choice(&self, to: &str) -> (Option<String>, bool) {
         if !self.session_routing_enabled() {
             return (None, false);
         }
-        let (from, nudged) = self.transition_to_manual();
+        let Some((from, nudged)) = self.transition_to_manual_inner(true) else {
+            return (None, false);
+        };
         self.append_session_routing_row(&model_routing::SessionRoutingRow::Reroute {
             ts: model_routing::now_millis(),
             agent_id: self.agent_id().unwrap_or(0).to_string(),
@@ -1488,6 +1510,7 @@ impl AgentLoop {
         });
         (from, nudged)
     }
+
 
     /// Whether a routing nudge is currently awaiting a human response.
     pub fn routing_nudged(&self) -> bool {
@@ -2152,7 +2175,9 @@ impl AgentLoop {
     ///    `[models.planning]` etc.), while in any OTHER state it holds only
     ///    until a configured `[models.*]` model takes over (2026-12-20) —
     ///    with nothing configured for the new state the pin keeps serving.
-    ///    The pin is never deleted by a swap; it goes dormant instead.
+    ///    A human pin is never deleted by a global swap; it goes dormant.
+    ///    Laya's routed pin is the exception: an external provider change
+    ///    clears it in `note_external_model_change` so the human model serves.
     /// 3. **Forced model** — when [`forced_model`](Self::forced_model) is set
     ///    (a `spawn_agent` call passed a `model` argument), it's used
     ///    directly — the subagent/state resolution chain is skipped.
@@ -2711,8 +2736,65 @@ impl AgentLoop {
     /// [`set_explicit_provider`] for where it yields to a configured
     /// `[models.*]` slot on a workflow-state change. Plain `set_provider`
     /// remains the *default* slot swap (factory rebuilds, global console
-    /// switches) and never pins anything.
+    /// switches) and never creates a pin; it clears Laya's prior routed pin so
+    /// the external default can serve.
     pub fn set_provider(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+    ) {
+        let new_spec = Self::provider_spec(provider.as_ref());
+        let _ = self.note_external_model_change(&new_spec);
+        self.set_provider_internal(provider, context_manager);
+    }
+
+    fn provider_spec(provider: &dyn LlmClient) -> String {
+        if provider.provider_name().is_empty() {
+            provider.model().to_string()
+        } else {
+            format!("{}/{}", provider.provider_name(), provider.model())
+        }
+    }
+
+    /// External provider changes are human model choices only when routing is
+    /// active and the spec actually changes. The reroute is recorded BEFORE
+    /// the new provider is installed; every such change also clears Laya's
+    /// explicit pin so the external model can really serve.
+    fn note_external_model_change(&self, new_spec: &str) -> (Option<String>, bool) {
+        let outcome = if self.current_model_spec() != new_spec && self.session_routing_enabled() {
+            self.record_manual_model_choice(new_spec)
+        } else {
+            (None, false)
+        };
+        self.clear_routed_pin();
+        outcome
+    }
+
+    fn clear_routed_pin(&self) {
+        let routed = std::mem::take(
+            &mut *self
+                .routed_pin
+                .lock()
+                .expect("routed-pin lock poisoned"),
+        );
+        if routed {
+            *self
+                .explicit_provider
+                .write()
+                .expect("explicit_provider lock poisoned") = None;
+            *self
+                .pinned_state
+                .lock()
+                .expect("pinned_state lock poisoned") = None;
+            *self
+                .pending_swap
+                .lock()
+                .expect("pending_swap lock poisoned") = None;
+        }
+    }
+
+    /// Internal default-provider swap: never a human routing decision.
+    pub(crate) fn set_provider_internal(
         &self,
         provider: Arc<dyn LlmClient>,
         context_manager: super::context::ContextManager,
@@ -2723,11 +2805,9 @@ impl AgentLoop {
             .write()
             .expect("context_manager lock poisoned") = context_manager
             .with_compaction_raise(Arc::clone(&self.compaction_raise));
-        // A different model means a different window and a different
-        // trigger — the ladder restarts at 1.0 (it is recomputed against the
-        // new window's cap on the next failed compaction).
         self.compaction_raise.reset();
     }
+
 
     /// Publish the conversation's token COUNT to the loop — the measure every
     /// compact-before-switch decision uses. The conversation itself is never
@@ -2852,22 +2932,28 @@ impl AgentLoop {
         provider: Arc<dyn LlmClient>,
         context_manager: super::context::ContextManager,
     ) {
-        // A fresh pick discards the old stamp: the new pin is re-stamped
-        // with the state of its first serve (see `pinned_state`). Placed at
-        // the top so it covers both the immediate path and the deferred
-        // path — the deferred swap completes by writing `explicit_provider`
-        // directly in `run_turn` (same pick), and its first serve re-stamps.
+        let new_spec = Self::provider_spec(provider.as_ref());
+        let _ = self.note_external_model_change(&new_spec);
+        self.set_explicit_provider_internal(provider, context_manager, false);
+    }
+
+    /// Install an explicit pin without treating it as an external model pick.
+    /// `routed` distinguishes Laya's clearable pin from the human picker's.
+    fn set_explicit_provider_internal(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+        routed: bool,
+    ) {
+        *self
+            .routed_pin
+            .lock()
+            .expect("routed-pin lock poisoned") = routed;
         *self
             .pinned_state
             .lock()
             .expect("pinned_state lock poisoned") = None;
         if self.swap_needs_compaction(&context_manager) {
-            // The live conversation exceeds what the NEW model's context
-            // manager allows — defer the swap so the turn loop can summarize
-            // using the OLD provider first. A merely smaller window is NOT
-            // enough (2027-11-02 bug, plan 1238e0de): a conversation that
-            // already fits the new model swaps at once, with no
-            // summarization and no informational event.
             *self
                 .pending_swap
                 .lock()
@@ -2878,9 +2964,7 @@ impl AgentLoop {
             });
             return;
         }
-        self.set_provider(provider.clone(), context_manager.clone());
-        // Clear any stale deferred swap — a later immediate swap must not be
-        // overridden by a previously-deferred one the user superseded.
+        self.set_provider_internal(provider.clone(), context_manager.clone());
         *self
             .pending_swap
             .lock()
@@ -2890,6 +2974,17 @@ impl AgentLoop {
             .write()
             .expect("explicit_provider lock poisoned") = Some((provider, context_manager));
     }
+
+    /// The ONLY provider-pin path used by Laya's first-prompt commit. It must
+    /// not count as an external manual choice or emit a reroute row.
+    pub(crate) fn pin_routed_provider(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+    ) {
+        self.set_explicit_provider_internal(provider, context_manager, true);
+    }
+
 
     /// Whether a deferred provider swap is pending (set by
     /// [`set_explicit_provider`](Self::set_explicit_provider) when the live

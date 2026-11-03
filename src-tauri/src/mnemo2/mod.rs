@@ -22,6 +22,11 @@ pub mod indexing;
 /// The real worker team runtime.
 pub mod team;
 
+/// Laya's dispatch-time routing decision: the classified text, the shared
+/// gate, and the dispatch routing log's rows (design
+/// `.coding/design/mnemo2-laya-routing.md` §4.2–§4.8).
+pub mod dispatch_routing;
+
 /// Best-effort naming of the processes holding a worker checkout's files.
 pub mod lock_holders;
 

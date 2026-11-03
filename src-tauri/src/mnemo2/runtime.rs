@@ -374,10 +374,19 @@ impl LeadRuntime {
             trace_support: std::sync::Mutex::new(None),
         };
         runtime.start_engine(provider).await?;
+        let engine = runtime.engine_handle().await?;
+        let classifier = mnemo::headless::Setup::open(Some(runtime.config_dir.clone()))
+            .map_err(|error| format!("open the lead settings: {error}"))?
+            .for_engine(&engine)
+            .classifier_slot();
         let team = TeamRuntime::open(TeamRuntimeOptions {
-            engine: runtime.engine_handle().await?,
+            engine,
             workspace_root: runtime.workspace_root.clone(),
             state_dir: runtime.state_dir.clone(),
+            config_dir: runtime.config_dir.clone(),
+            classifier,
+            routing_log_path: cfg!(test)
+                .then(|| runtime.state_dir.join("dispatch_routing.jsonl")),
             slots: None,
             models: runtime.models(),
             pricing: runtime.pricing()?,
@@ -1918,6 +1927,9 @@ mod trace_tests {
             engine: engine.clone(),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: Vec::new(),
             pricing: Vec::new(),
@@ -2361,6 +2373,9 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
                 slots: Some(slots),
                 models: lead.models(),
                 pricing,
@@ -2391,6 +2406,9 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
                 slots: Some(slots),
                 models: lead.models(),
                 pricing: Vec::new(),
@@ -2568,17 +2586,17 @@ mod tests {
             .await
             .expect("start the engine"),
         );
-        let mut team = TeamRuntime::open_with_config_dir(
-            TeamRuntimeOptions {
-                engine,
-                workspace_root: root.path().to_path_buf(),
-                state_dir: state.path().to_path_buf(),
-                slots: Some(1),
-                models: Vec::new(),
-                pricing: Vec::new(),
-            },
-            config.path(),
-        )
+        let mut team = TeamRuntime::open(TeamRuntimeOptions {
+            engine,
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            config_dir: config.path().to_path_buf(),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+            slots: Some(1),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
         .await
         .expect("open the team runtime");
         team.set_catalog(
@@ -2934,6 +2952,48 @@ mod tests {
             runtime.laya_manager().is_none(),
             "shutdown stopped the managed runtime before the engine dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn production_lead_open_wires_the_live_classifier_slot() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        enable_laya_in_config(config.path());
+        doctor_installed_laya(config.path());
+        crate::mnemo2::dispatch_routing::save_routing_settings(
+            config.path(),
+            &crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+        )
+        .expect("save the lead's Mnemo2 routing settings");
+        let runtime = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+        )
+        .await
+        .expect("open the lead through the production team path");
+        let engine = runtime.engine_handle().await.expect("engine handle");
+        let setup = mnemo::headless::Setup::open(Some(config.path().to_path_buf()))
+            .expect("open setup")
+            .for_engine(&engine);
+        let engine_slot = setup
+            .classifier_slot()
+            .expect("engine-backed classifier slot");
+        let team = runtime.team_handle().await.expect("production team");
+        let team_slot = team
+            .classifier_slot_for_test()
+            .expect("the team shares the live classifier slot");
+        assert!(Arc::ptr_eq(&engine_slot, &team_slot));
+        assert_eq!(
+            team.routing_settings_for_test().mode,
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            "mnemo2.toml is loaded from the lead's config directory"
+        );
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
@@ -3918,6 +3978,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4015,6 +4078,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4458,6 +4524,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4509,6 +4578,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(5),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4563,6 +4635,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4601,6 +4676,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4618,6 +4696,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4657,6 +4738,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4777,6 +4861,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -5184,6 +5271,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -5242,6 +5332,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -5324,6 +5417,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -5372,6 +5468,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: {
                 let mut models = lead.models();
@@ -5545,6 +5644,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -5682,6 +5784,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -6726,6 +6831,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -8297,6 +8405,9 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
                 slots: None,
                 models: lead.models(),
                 pricing: Vec::new(),
@@ -9227,6 +9338,9 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
                 slots: Some(slots),
                 models: lead.models(),
                 pricing: Vec::new(),
@@ -9264,6 +9378,9 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
                 slots: Some(slots),
                 models: lead.models(),
                 pricing: Vec::new(),

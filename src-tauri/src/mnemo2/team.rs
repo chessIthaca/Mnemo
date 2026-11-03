@@ -45,7 +45,7 @@ use crate::mnemo2::dispatch_routing::{
 use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::lock_holders;
 use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewEvidence, ReviewRecord};
-use crate::mnemo2::runtime::{LeadModel, LeadRuntime};
+use crate::mnemo2::runtime::LeadModel;
 use crate::mnemo2::pricing::usage_model_key;
 use crate::mnemo2::usage::{event_session, ProjectUsage, ProjectUsageView};
 
@@ -558,6 +558,12 @@ pub struct TeamRuntimeOptions {
     pub workspace_root: PathBuf,
     /// Mnemo2's app-owned state directory (the `team.json` ledger).
     pub state_dir: PathBuf,
+    /// The lead's config directory, which holds Mnemo2's `mnemo2.toml`.
+    pub config_dir: PathBuf,
+    /// The engine's live Laya classifier slot, shared with every session.
+    pub classifier: Option<ClassifierSlot>,
+    /// Test-only routing-log override; production uses the global training log.
+    pub routing_log_path: Option<PathBuf>,
     /// Explicit cap override; `None` restores the saved cap or the default.
     pub slots: Option<usize>,
     /// The configured model inventory: explicit worker models (and their
@@ -849,18 +855,7 @@ impl TeamRuntime {
 
     /// Open the team ledger, recover interrupted workers, and prepare to spawn.
     pub async fn open(options: TeamRuntimeOptions) -> Result<Self, String> {
-        #[cfg(test)]
-        let config_dir = options.state_dir.join("config");
-        #[cfg(not(test))]
-        let config_dir = mnemo::config::resolve_config_dir(None);
-        Self::open_with_config_dir(options, &config_dir).await
-    }
-
-    /// Open with the lead's config directory, which also holds `mnemo2.toml`.
-    pub(crate) async fn open_with_config_dir(
-        options: TeamRuntimeOptions,
-        config_dir: &std::path::Path,
-    ) -> Result<Self, String> {
+        let config_dir = options.config_dir.clone();
         let persistence = TeamPersistence::new(&options.state_dir);
         let persisted = persistence.load()?;
         let slots = options
@@ -879,10 +874,9 @@ impl TeamRuntime {
         }
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (signals, _) = broadcast::channel(EVENT_BUFFER);
-        #[cfg(test)]
-        let routing_log_path = options.state_dir.join("dispatch_routing.jsonl");
-        #[cfg(not(test))]
-        let routing_log_path = crate::mnemo2::dispatch_routing::dispatch_routing_log_path();
+        let routing_log_path = options.routing_log_path.clone().unwrap_or_else(
+            crate::mnemo2::dispatch_routing::dispatch_routing_log_path,
+        );
         let runtime = Self {
             engine: options.engine,
             workspace_root: options.workspace_root,
@@ -898,9 +892,9 @@ impl TeamRuntime {
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
-            config_dir: config_dir.to_path_buf(),
-            routing: std::sync::RwLock::new(load_routing_settings(config_dir)),
-            classifier: None,
+            config_dir: config_dir.clone(),
+            routing: std::sync::RwLock::new(load_routing_settings(&config_dir)),
+            classifier: options.classifier,
             routing_permit: tokio::sync::Semaphore::new(1),
             routing_log_path,
             models: std::sync::RwLock::new(options.models),
@@ -918,29 +912,6 @@ impl TeamRuntime {
         // trash folder but could not remove yet (something held them).
         schedule_trash_sweep(&runtime.workspace_root);
         Ok(runtime)
-    }
-
-    /// Open the team on the lead's shared engine.
-    pub async fn from_lead(lead: &LeadRuntime, state_dir: PathBuf) -> Result<Self, String> {
-        let engine = lead.engine_handle().await?;
-        let setup = mnemo::headless::Setup::open(Some(lead.config_dir().to_path_buf()))
-            .map_err(|error| format!("open the lead settings: {error}"))?;
-        let classifier = setup.for_engine(&engine).classifier_slot();
-        let mut team = Self::open_with_config_dir(
-            TeamRuntimeOptions {
-                engine,
-                workspace_root: lead.workspace_root().to_path_buf(),
-                state_dir,
-                slots: None,
-                models: lead.models(),
-                pricing: lead.pricing()?,
-            },
-            lead.config_dir(),
-        )
-        .await?;
-        team.classifier = classifier;
-        team.set_tiers(lead.tiers());
-        Ok(team)
     }
 
     /// Replace the model tiers new dispatches resolve against.
@@ -1316,6 +1287,21 @@ impl TeamRuntime {
     #[cfg(test)]
     pub(crate) fn set_classifier_for_test(&mut self, classifier: ClassifierSlot) {
         self.classifier = Some(classifier);
+    }
+
+    /// Inspect the classifier handle installed at open in integration tests.
+    #[cfg(test)]
+    pub(crate) fn classifier_slot_for_test(&self) -> Option<ClassifierSlot> {
+        self.classifier.clone()
+    }
+
+    /// Inspect the routing settings loaded at open in integration tests.
+    #[cfg(test)]
+    pub(crate) fn routing_settings_for_test(&self) -> RoutingSettings {
+        self.routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Share the lead's one plan board with the team.
@@ -7635,17 +7621,17 @@ models = [\"scripted-a\", \"scripted-b\"]
         })
         .await
         .expect("start the test engine");
-        TeamRuntime::open_with_config_dir(
-            TeamRuntimeOptions {
-                engine: Arc::new(engine),
-                workspace_root: root.to_path_buf(),
-                state_dir: state.to_path_buf(),
-                slots: Some(2),
-                models: Vec::new(),
-                pricing: Vec::new(),
-            },
-            config,
-        )
+        TeamRuntime::open(TeamRuntimeOptions {
+            engine: Arc::new(engine),
+            workspace_root: root.to_path_buf(),
+            state_dir: state.to_path_buf(),
+            config_dir: config.to_path_buf(),
+            classifier: None,
+            routing_log_path: Some(state.join("dispatch_routing.jsonl")),
+            slots: Some(2),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
         .await
         .expect("open the test team")
     }

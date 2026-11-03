@@ -10,6 +10,7 @@ function snapshot(overrides: Partial<AppearanceSettings> = {}): AppearanceSettin
     sound_input_needed: true,
     sound_stopped_errors: true,
     theme: "light",
+    close_behavior: "auto",
     ...overrides,
   };
 }
@@ -77,5 +78,29 @@ describe("AppearancePage theme", () => {
     await waitFor(() => expect(made.save).toHaveBeenCalledWith({ theme: "system" }));
     // jsdom has no matchMedia, so `system` resolves to light here.
     expect(document.documentElement.dataset.theme).toBe("light");
+  });
+});
+
+describe("AppearancePage close behaviour", () => {
+  it("renders the three options with the stored choice checked", async () => {
+    await page({ close_behavior: "tray" });
+    expect(
+      (screen.getByRole("radio", { name: /Automatic/ }) as HTMLInputElement).checked,
+    ).toBe(false);
+    expect(
+      (screen.getByRole("radio", { name: "Hide to the tray" }) as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("radio", { name: "Quit Mnemo2" }) as HTMLInputElement).checked,
+    ).toBe(false);
+  });
+
+  it("saves choosing Quit Mnemo2 as close_behavior quit", async () => {
+    const made = await page();
+    await fireEvent.click(screen.getByRole("radio", { name: "Quit Mnemo2" }));
+
+    await waitFor(() => expect(made.save).toHaveBeenCalledWith({ close_behavior: "quit" }));
+    expect(made.stored().close_behavior).toBe("quit");
+    await screen.findByText("Saved. The next close obeys it — no restart.");
   });
 });

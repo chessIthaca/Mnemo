@@ -58,6 +58,7 @@ function snapshot(theme: string): AppearanceSettings {
     sound_input_needed: true,
     sound_stopped_errors: true,
     theme,
+    close_behavior: "auto",
   };
 }
 

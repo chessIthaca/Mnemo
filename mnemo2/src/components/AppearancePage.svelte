@@ -6,6 +6,7 @@
     type AppearancePatch,
     type AppearanceSettings,
     type AppearanceTransport,
+    type CloseBehavior,
     type SoundKind,
     type SoundToggles,
   } from "../lib/sounds";
@@ -14,8 +15,9 @@
 
   /**
    * The Appearance page: the three `[ui]` notification-sound toggles, each
-   * with a Test button that plays it, and the `[ui] theme` choice (Light /
-   * Dark / System, painted by `lib/theme.ts`).
+   * with a Test button that plays it, the `[ui] theme` choice (Light /
+   * Dark / System, painted by `lib/theme.ts`), and the `[window] close`
+   * choice (today's automatic rule, always hide to the tray, or quit).
    *
    * A toggle saves immediately through `appearance_settings_save` and pushes
    * the accepted snapshot into the sound module's live cache, so the very
@@ -24,7 +26,8 @@
    * and deliberately ignores the toggle, so a muted sound can still be
    * auditioned. A theme click paints at once, before the save returns, so the
    * whole app changes under the pointer; a failed save paints the old palette
-   * back.
+   * back. A close choice saves the same way, and the stored word takes
+   * effect on the very next window close — no restart.
    */
   let { transport }: { transport: AppearanceTransport } = $props();
 
@@ -35,11 +38,13 @@
   let saving = $state<keyof SoundToggles | null>(null);
   /** The theme word currently saving, or null when the page is idle. */
   let themeSaving = $state<ThemeChoice | null>(null);
+  /** The close behaviour currently saving, or null when the page is idle. */
+  let closeSaving = $state<CloseBehavior | null>(null);
   let saveError = $state("");
   /** The quiet "Saved." note after a successful save, empty when idle. */
   let savedNote = $state("");
   /** Which group owns `saveError` / `savedNote` — the last one acted on. */
-  let noteScope = $state<"sounds" | "theme" | null>(null);
+  let noteScope = $state<"sounds" | "theme" | "close" | null>(null);
 
   $effect(() => {
     let cancelled = false;
@@ -103,6 +108,37 @@
       saveError = errorText(error);
     } finally {
       themeSaving = null;
+    }
+  }
+
+  /** The "When I close the window" choices, in the order the page shows. */
+  const CLOSE_ROWS: ReadonlyArray<{ label: string; value: CloseBehavior }> = [
+    {
+      label: "Automatic — hide to the tray when Claude Code started Mnemo2, otherwise quit",
+      value: "auto",
+    },
+    { label: "Hide to the tray", value: "tray" },
+    { label: "Quit Mnemo2", value: "quit" },
+  ];
+
+  /** Choose what closing the window does: save it through the same command. */
+  async function chooseClose(choice: CloseBehavior): Promise<void> {
+    if (!settings) return;
+    const previous = settings.close_behavior;
+    settings = { ...settings, close_behavior: choice };
+    closeSaving = choice;
+    saveError = "";
+    savedNote = "";
+    noteScope = "close";
+    try {
+      const accepted = await transport.save({ close_behavior: choice });
+      settings = accepted;
+      savedNote = "Saved. The next close obeys it — no restart.";
+    } catch (error) {
+      settings = { ...settings, close_behavior: previous };
+      saveError = errorText(error);
+    } finally {
+      closeSaving = null;
     }
   }
 
@@ -191,6 +227,42 @@
             {#if saveError}
               <p class="section-error" role="alert">{saveError}</p>
             {:else if themeSaving !== null}
+              <p class="section-note">Saving…</p>
+            {:else if savedNote}
+              <p class="section-note">{savedNote}</p>
+            {/if}
+          {/if}
+        </div>
+      </section>
+
+      <section class="group" aria-label="When I close the window">
+        <header>
+          <h3>When I close the window</h3>
+          <p class="micro">What the window's close button does.</p>
+        </header>
+        <div class="theme-list" role="radiogroup" aria-label="When I close the window">
+          {#each CLOSE_ROWS as row (row.value)}
+            <label class="theme-row">
+              <input
+                type="radio"
+                name="close-window"
+                value={row.value}
+                checked={settings.close_behavior === row.value}
+                disabled={closeSaving !== null}
+                onchange={() => chooseClose(row.value)}
+              />
+              <span class="sound-text">
+                <strong>{row.label}</strong>
+              </span>
+            </label>
+          {/each}
+        </div>
+        <p class="micro">Mnemo2 keeps running in the tray while hidden; use Quit in the tray menu to exit.</p>
+        <div class="section-actions">
+          {#if noteScope === "close"}
+            {#if saveError}
+              <p class="section-error" role="alert">{saveError}</p>
+            {:else if closeSaving !== null}
               <p class="section-note">Saving…</p>
             {:else if savedNote}
               <p class="section-note">{savedNote}</p>

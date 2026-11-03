@@ -1646,19 +1646,20 @@ impl AgentLoop {
         Self::claim_nudge_locked(&mut state, to_label, expected_epoch)
     }
 
-    /// Claim and publish in ONE critical section: the row is appended
-    /// synchronously and the notice enters the bounded channel with `try_send`
-    /// before Clear can consume the claim. No lock is held across an await.
-    pub(crate) fn claim_and_publish_nudge(
+    /// Claim and publish a nudge without ever consuming it unobservably.
+    ///
+    /// Capacity is reserved BEFORE the critical section, so a full channel
+    /// waits instead of dropping the notice; a CLOSED channel publishes
+    /// nothing, so the nudge is left unclaimed for a later attempt. Once the
+    /// permit is held, the claim, the synchronous row append and the
+    /// infallible `Permit::send` all happen inside one critical section — no
+    /// await is ever held under the route-state lock.
+    pub(crate) async fn claim_and_publish_nudge(
         session: &Arc<std::sync::Mutex<RouteSessionState>>,
         to_label: &str,
         expected_epoch: Option<u64>,
         publication: NudgeNotice,
     ) -> bool {
-        let mut state = session.lock().expect("route-session lock poisoned");
-        if !Self::claim_nudge_locked(&mut state, to_label, expected_epoch) {
-            return false;
-        }
         let NudgeNotice {
             agent_id,
             reason,
@@ -1666,6 +1667,17 @@ impl AgentLoop {
             log_path,
             fanin_tx,
         } = publication;
+        // Reserve capacity OUTSIDE the lock. A full channel therefore WAITS
+        // instead of silencing the one nudge the session may ever send; a
+        // CLOSED channel returns early so nothing is claimed or logged.
+        let Ok(permit) = fanin_tx.reserve().await else {
+            return false;
+        };
+        let mut state = session.lock().expect("route-session lock poisoned");
+        if !Self::claim_nudge_locked(&mut state, to_label, expected_epoch) {
+            drop(permit);
+            return false;
+        }
         if let Some(path) = log_path {
             model_routing::append_row(
                 &path,
@@ -1677,20 +1689,15 @@ impl AgentLoop {
                 },
             );
         }
-        let dropped = fanin_tx
-            .try_send((
-                agent_id,
-                crate::runtime::AgentEvent::RoutingNotice {
-                    kind: "nudge".to_string(),
-                    text,
-                },
-            ))
-            .err();
-        if cfg!(debug_assertions) {
-            if let Some(error) = dropped {
-                eprintln!("DEBUG: routing nudge dropped for agent {agent_id}: {error}");
-            }
-        }
+        // The reserved permit cannot fail, so the claim just taken is always
+        // observable. `send` is synchronous: no await under the lock.
+        permit.send((
+            agent_id,
+            crate::runtime::AgentEvent::RoutingNotice {
+                kind: "nudge".to_string(),
+                text,
+            },
+        ));
         true
     }
 

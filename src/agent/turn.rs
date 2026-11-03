@@ -1563,8 +1563,9 @@ impl AgentLoop {
             let Some(model_ref) = resolver.resolve_routed(target, context) else {
                 return;
             };
-            // Claim, append, and enqueue while holding the route-state lock;
-            // no stale task can publish after Clear consumes the session.
+            // Reserve channel capacity first, then claim + append + send under
+            // one lock; no stale task can publish after Clear, and a full
+            // channel never swallows the one nudge.
             let _ = AgentLoop::claim_and_publish_nudge(
                 &route_session,
                 &decision.label,
@@ -1576,7 +1577,8 @@ impl AgentLoop {
                     log_path: Some(session_log_path),
                     fanin_tx,
                 },
-            );
+            )
+            .await;
         });
     }
 
@@ -2977,7 +2979,8 @@ impl AgentLoop {
                                         log_path,
                                         fanin_tx: fanin_tx.clone(),
                                     },
-                                );
+                                )
+                                .await;
                             }
                         }
                     }

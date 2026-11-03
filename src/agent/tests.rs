@@ -16485,6 +16485,34 @@ fn session_log_path(routing_log: &std::path::Path) -> std::path::PathBuf {
     routing_log.with_file_name("session_routing.jsonl")
 }
 
+/// Build a session settled on a routine first prompt with NO nudge yet, plus
+/// its redirected session-routing log.
+async fn settled_route_agent(
+    dir: &std::path::Path,
+) -> (Arc<AgentLoop>, std::path::PathBuf) {
+    let log_path = dir.join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let session_path = gate.session_log_path().to_path_buf();
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir,
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    assert_eq!(
+        run_routing_turn(&agent, "implement this routine change").await.text,
+        "from-default"
+    );
+    (agent, session_path)
+}
+
 fn read_session_routing_log(path: &std::path::Path) -> Vec<model_routing::SessionRoutingRow> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -17178,18 +17206,21 @@ async fn claimed_nudge_is_published_before_clear_can_run() {
     );
     let (_, epoch) = agent.route_once_with_epoch();
     let (fanin_tx, mut fanin_rx) = mpsc::channel(8);
-    assert!(AgentLoop::claim_and_publish_nudge(
-        &agent.route_session,
-        crate::agent::route_question::LABEL_HARD,
-        Some(epoch),
-        crate::agent::loop_impl::NudgeNotice {
-            agent_id: 1,
-            reason: "drift",
-            text: "this got harder; consider capable-model".into(),
-            log_path: Some(session_path.clone()),
-            fanin_tx: fanin_tx.clone(),
-        },
-    ));
+    assert!(
+        AgentLoop::claim_and_publish_nudge(
+            &agent.route_session,
+            crate::agent::route_question::LABEL_HARD,
+            Some(epoch),
+            crate::agent::loop_impl::NudgeNotice {
+                agent_id: 1,
+                reason: "drift",
+                text: "this got harder; consider capable-model".into(),
+                log_path: Some(session_path.clone()),
+                fanin_tx: fanin_tx.clone(),
+            },
+        )
+        .await
+    );
 
     // Publication is complete before Clear is even called: the nudge is the
     // first event, and its row precedes Clear's nudge_ignored row.
@@ -17218,6 +17249,98 @@ async fn claimed_nudge_is_published_before_clear_can_run() {
         .position(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
         .expect("nudge_ignored row");
     assert!(nudge < ignored, "nudge must be durable before Clear's ignored row: {rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_event_channel_never_consumes_the_nudge_silently() {
+    let dir = tempdir().unwrap();
+    let (agent, session_path) = settled_route_agent(dir.path()).await;
+    let (_, epoch) = agent.route_once_with_epoch();
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(1);
+    fanin_tx
+        .try_send((1, AgentEvent::Started))
+        .expect("pre-fill the capacity-1 channel");
+
+    let claim_agent = agent.clone();
+    let claim_tx = fanin_tx.clone();
+    let path = session_path.clone();
+    let claim = tokio::spawn(async move {
+        AgentLoop::claim_and_publish_nudge(
+            &claim_agent.route_session,
+            crate::agent::route_question::LABEL_HARD,
+            Some(epoch),
+            crate::agent::loop_impl::NudgeNotice {
+                agent_id: 1,
+                reason: "drift",
+                text: "this got harder; consider capable-model".into(),
+                log_path: Some(path),
+                fanin_tx: claim_tx,
+            },
+        )
+        .await
+    });
+
+    // While no capacity exists the nudge stays UNCLAIMED and unlogged.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !agent.routing_nudged(),
+        "a full channel must not consume the one nudge"
+    );
+    assert!(!read_session_routing_log(&session_path)
+        .iter()
+        .any(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. })));
+
+    // Draining one slot lets the reserved permit publish exactly once.
+    let (_, prefill) = fanin_rx.recv().await.expect("the pre-filled event");
+    assert!(matches!(prefill, AgentEvent::Started));
+    assert!(claim.await.expect("claim task joins"));
+    let (_, event) = fanin_rx.recv().await.expect("the published nudge");
+    assert!(matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    ));
+    assert!(agent.routing_nudged());
+    let nudge_rows = |rows: &Vec<model_routing::SessionRoutingRow>| {
+        rows.iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. }))
+            .count()
+    };
+    assert_eq!(nudge_rows(&read_session_routing_log(&session_path)), 1);
+
+    // A CLOSED channel can never publish, so that attempt claims nothing.
+    {
+        let mut state = agent.route_session.lock().expect("route-session lock");
+        let epoch = state.epoch + 1;
+        state.epoch = epoch;
+        state.route_once = crate::agent::loop_impl::RouteOnce::Settled {
+            label: Some("routine".into()),
+            confidence: Some(0.95),
+            model: None,
+        };
+        state.nudge_sent = false;
+        state.nudge_to_label = None;
+    }
+    let (_, closed_epoch) = agent.route_once_with_epoch();
+    let (closed_tx, closed_rx) = mpsc::channel(4);
+    drop(closed_rx);
+    assert!(
+        !AgentLoop::claim_and_publish_nudge(
+            &agent.route_session,
+            crate::agent::route_question::LABEL_HARD,
+            Some(closed_epoch),
+            crate::agent::loop_impl::NudgeNotice {
+                agent_id: 1,
+                reason: "drift",
+                text: "closed channel".into(),
+                log_path: Some(session_path.clone()),
+                fanin_tx: closed_tx,
+            },
+        )
+        .await,
+        "a closed channel cannot publish, so the nudge is not consumed"
+    );
+    assert!(!agent.routing_nudged());
+    assert_eq!(nudge_rows(&read_session_routing_log(&session_path)), 1);
 }
 
 #[tokio::test]

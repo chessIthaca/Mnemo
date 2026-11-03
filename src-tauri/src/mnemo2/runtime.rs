@@ -2648,7 +2648,9 @@ mod tests {
             )
             .await;
         assert!(dispatched.success, "{}", dispatched.output);
-        assert!(dispatched.output.contains("Laya would pick difficult (0.71)."));
+        assert!(dispatched.output.contains(
+            "Laya: difficult (0.71) — you chose average; logged as an override."
+        ));
         tokio::time::timeout(std::time::Duration::from_secs(10), server.next_arrival())
             .await
             .expect("the worker's first request arrives");

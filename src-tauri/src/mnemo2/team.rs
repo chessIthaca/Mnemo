@@ -1091,7 +1091,7 @@ impl TeamRuntime {
             (model, tier)
         } else if let Some(tier) = cleared_tier {
             (self.lead_model_choice(Some(tier), None)?, Some(tier.to_string()))
-        } else if settings.mode == RoutingMode::Suggest {
+        } else if settings.mode == RoutingMode::Suggest && requested_tier == Some("auto") {
             refusal = Some(if skip_reason == Some("offline") {
                 "Laya is not running; pass a tier".to_string()
             } else {
@@ -1143,12 +1143,7 @@ impl TeamRuntime {
         };
         let plan_id = request.plan.as_ref().map(|plan| plan.plan_id.clone());
         let step = request.plan.as_ref().map(|plan| plan.step + 1);
-        let skip = skip_reason.or_else(|| {
-            decision
-                .as_ref()
-                .filter(|decision| !decision.cleared)
-                .map(|_| "gate")
-        });
+        let skip = skip_reason;
         use sha2::Digest as _;
         let text_sha256 = sha2::Sha256::digest(
             classified_text.as_deref().unwrap_or("").as_bytes(),
@@ -1266,10 +1261,12 @@ impl TeamRuntime {
                 .join(", ");
             lines.push(format!("{tier} - {purpose}: {list}"));
         }
-        if matches!(
-            self.routing.read().unwrap_or_else(|e| e.into_inner()).mode,
-            RoutingMode::Suggest | RoutingMode::Auto
-        ) {
+        if !lines.is_empty()
+            && matches!(
+                self.routing.read().unwrap_or_else(|e| e.into_inner()).mode,
+                RoutingMode::Suggest | RoutingMode::Auto
+            )
+        {
             lines.push("auto - let Laya choose from the step spec".into());
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
@@ -1930,6 +1927,9 @@ impl TeamRuntime {
         };
         let mut model = json!({"type": "string", "description": model_description});
         let tier_description = match (&guidance, routing_mode) {
+            (Some(text), RoutingMode::Off) => format!(
+                "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\n{text}"
+            ),
             (Some(text), RoutingMode::Auto) => format!(
                 "Optional: choose the cheapest tier that fits the step, or auto to let Laya choose; the worker runs on that tier's first model.\n{text}"
             ),
@@ -6592,15 +6592,6 @@ fn dispatch_routing_line(mode: RoutingMode, routing: Option<&WorkerRouting>) -> 
         return None;
     }
     let confidence = routing.confidence;
-    if mode == RoutingMode::Shadow {
-        return Some(match (routing.laya_tier.as_deref(), confidence, routing.cleared) {
-            (Some(tier), Some(confidence), true) => {
-                format!("Laya would pick {tier} ({confidence:.2}).")
-            }
-            (_, Some(confidence), _) => format!("Laya: unsure ({confidence:.2})."),
-            _ => "Laya: offline.".to_string(),
-        });
-    }
     if routing.routed_by == "lead_override" {
         return Some(format!(
             "Laya: {} ({:.2}) — you chose {}; logged as an override.",
@@ -6615,6 +6606,15 @@ fn dispatch_routing_line(mode: RoutingMode, routing: Option<&WorkerRouting>) -> 
             routing.laya_tier.as_deref().unwrap_or("unknown"),
             confidence.unwrap_or(0.0)
         ));
+    }
+    if mode == RoutingMode::Shadow {
+        return Some(match (routing.laya_tier.as_deref(), confidence, routing.cleared) {
+            (Some(tier), Some(confidence), true) => {
+                format!("Laya would pick {tier} ({confidence:.2}).")
+            }
+            (_, Some(confidence), _) => format!("Laya: unsure ({confidence:.2})."),
+            _ => "Laya: offline.".to_string(),
+        });
     }
     if !routing.cleared {
         return Some(match confidence {
@@ -9571,10 +9571,10 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(matches!(
             fixture.rows().as_slice(),
             [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
-                skip: Some(reason),
+                skip: None,
                 ran_tier: None,
                 ..
-            }] if reason == "gate"
+            }]
         ));
         fixture.team.shutdown().await;
     }
@@ -9618,10 +9618,10 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(matches!(
             fixture.rows().as_slice(),
             [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
-                skip: Some(reason),
+                skip: None,
                 ran_tier: Some(ran),
                 ..
-            }] if reason == "gate" && ran == "average"
+            }] if ran == "average"
         ));
         fixture.team.shutdown().await;
     }
@@ -9973,10 +9973,10 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(matches!(
             fixture.rows().as_slice(),
             [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
-                skip: Some(reason),
+                skip: None,
                 ran_tier: None,
                 ..
-            }] if reason == "gate"
+            }]
         ));
         fixture.team.shutdown().await;
     }
@@ -10044,6 +10044,148 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(!fixture.log_path().exists());
         std::fs::rename(parked, git).expect("restore git metadata");
         fixture.team.shutdown().await;
+    }
+
+
+    #[test]
+    fn dispatch_routing_line_truth_table() {
+        let routing = WorkerRouting {
+            laya_tier: Some("difficult".into()),
+            confidence: Some(0.71),
+            cleared: true,
+            lead_tier: Some("average".into()),
+            routed_by: "lead_override".into(),
+            nudged: None,
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            Some("Laya: difficult (0.71) — you chose average; logged as an override.")
+        );
+        let routing = WorkerRouting {
+            laya_tier: Some("average".into()),
+            confidence: Some(0.62),
+            lead_tier: Some("average".into()),
+            routed_by: "lead".into(),
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            Some("Laya would pick average (0.62).")
+        );
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Suggest, Some(&routing)).as_deref(),
+            Some("Laya: average (0.62) — matches your tier.")
+        );
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Off, Some(&routing)),
+            None
+        );
+        let routing = WorkerRouting {
+            routed_by: "laya".into(),
+            lead_tier: None,
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
+            Some("Laya: routed to average (0.62).")
+        );
+        let routing = WorkerRouting {
+            confidence: Some(0.41),
+            cleared: false,
+            routed_by: "lead".into(),
+            lead_tier: Some("average".into()),
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
+            Some("Laya: unsure (0.41).")
+        );
+        let routing = WorkerRouting {
+            laya_tier: None,
+            confidence: None,
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            Some("Laya: offline.")
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_non_auto_without_tiers_uses_default_model() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            None,
+            false,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gated_answer_has_no_skip_reason() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(None, None).await.success);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                cleared: false,
+                confidence,
+                ..
+            }] if (*confidence - 0.41).abs() < f64::EPSILON
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_schema_is_unchanged() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto {
+                simple: vec!["test/scripted-model".into()],
+                average: vec!["test/scripted-model".into()],
+                difficult: vec!["test/scripted-model".into()],
+            },
+            Vec::new(),
+        );
+        let tools = team.lead_host_tools();
+        let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+        let expected_description = format!(
+            "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\n{}",
+            team.tier_guidance().expect("tier guidance")
+        );
+        assert_eq!(
+            dispatch.parameters["properties"]["tier"]["description"],
+            json!(expected_description)
+        );
+        assert_eq!(
+            dispatch.parameters["properties"]["tier"]["enum"],
+            json!(["difficult", "average", "simple"])
+        );
+        assert!(dispatch.parameters["required"]
+            .as_array()
+            .expect("required fields")
+            .contains(&json!("tier")));
     }
 
 }

@@ -2517,6 +2517,137 @@ mod tests {
         worker
     }
 
+
+    struct DispatchRoutingClassifier;
+
+    #[async_trait::async_trait]
+    impl mnemo::memory::Classifier for DispatchRoutingClassifier {
+        async fn classify(
+            &self,
+            _state: &str,
+            _question: &mnemo::memory::Question,
+        ) -> Option<mnemo::memory::Answer> {
+            Some(mnemo::memory::Answer::Choice {
+                label: mnemo::agent::route_question::LABEL_HARD.into(),
+                confidence: 0.71,
+                probabilities: std::collections::BTreeMap::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routing_survives_a_real_worker_start() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        crate::mnemo2::dispatch_routing::save_routing_settings(
+            config.path(),
+            &crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+        )
+        .expect("save shadow routing mode");
+        let mut server = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("routing worker started"),
+            gate: None,
+        }])
+        .await;
+        write_stub_config(config.path(), server.addr);
+        let engine = std::sync::Arc::new(
+            Engine::start(EngineOptions {
+                workspace: mnemo::workspace::Workspace::new(root.path()),
+                config_dir: Some(config.path().to_path_buf()),
+                permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+                memory: mnemo::headless::MemoryBackend::Disabled,
+                index_codegraph: false,
+                require_git: true,
+                auto_install_embedder: false,
+            })
+            .await
+            .expect("start the engine"),
+        );
+        let mut team = TeamRuntime::open_with_config_dir(
+            TeamRuntimeOptions {
+                engine,
+                workspace_root: root.path().to_path_buf(),
+                state_dir: state.path().to_path_buf(),
+                slots: Some(1),
+                models: Vec::new(),
+                pricing: Vec::new(),
+            },
+            config.path(),
+        )
+        .await
+        .expect("open the team runtime");
+        team.set_catalog(
+            vec![LeadModel {
+                endpoint: "test".into(),
+                model: "model-a".into(),
+                spec: "test/model-a".into(),
+                is_default: true,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            mnemo::headless::TiersDto {
+                simple: vec!["test/model-a".into()],
+                average: vec!["test/model-a".into()],
+                difficult: vec!["test/model-a".into()],
+            },
+            Vec::new(),
+        );
+        let classifier: std::sync::Arc<dyn mnemo::memory::Classifier> =
+            std::sync::Arc::new(DispatchRoutingClassifier);
+        team.set_classifier_for_test(std::sync::Arc::new(std::sync::RwLock::new(Some(
+            classifier,
+        ))));
+        let board = std::sync::Arc::new(mnemo::app::plan_board::PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        ));
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Real dispatch routing".into(),
+                goal: "Verify routing metadata survives an actual worker session start".into(),
+                context: "The stub server must receive the first request from the routed worker.".into(),
+                steps: vec!["Implement the complete routing behavior in src-tauri/src/mnemo2/team.rs and verify the result with focused tests".into()],
+                ..mnemo::app::plan_board::PlanDraft::default()
+            })
+            .expect("create plan");
+        team.attach_board(board);
+
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "routingworker",
+                    "plan_id": plan.id,
+                    "step": 1,
+                    "brief": "Implement the assigned step and report the checks that were run.",
+                    "tier": "average",
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        assert!(dispatched.output.contains("Laya would pick difficult (0.71)."));
+        tokio::time::timeout(std::time::Duration::from_secs(10), server.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        let status = team.handle_lead_host_tool("team_status", serde_json::json!({})).await;
+        assert!(status.success, "{}", status.output);
+        let status: serde_json::Value = serde_json::from_str(&status.output).expect("status JSON");
+        let workers = status["result"].as_array().expect("workers");
+        let worker = workers
+            .iter()
+            .find(|worker| worker["id"] == "routingworker")
+            .expect("routing worker status");
+        assert_eq!(worker["routing"]["laya_tier"], "difficult");
+        assert_eq!(worker["routing"]["routed_by"], "lead_override");
+        team.shutdown().await;
+
+    }
+
     fn drain_notices(
         receiver: &mut broadcast::Receiver<crate::mnemo2::team::BoardSignal>,
     ) -> Vec<String> {

@@ -344,6 +344,7 @@ export type SerializableAgentEvent =
    * bug 2026-11-02, plan 1238e0de).
    */
   | { kind: "model_swap_summarized"; model: string }
+  | { kind: "routing_notice"; routing_kind: string; text: string }
   | { kind: "memory_recalled"; hits: { tier: string; title: string }[] }
   | {
       kind: "user_question";

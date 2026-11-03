@@ -409,6 +409,7 @@ impl ModelResolver for ConfigModelResolver {
         let routing = &config.general.general.routing;
         let target_ref = match target {
             RouteTarget::Cheap => routing.cheap.as_ref(),
+            RouteTarget::Routine => routing.routine.as_ref(),
             RouteTarget::Capable => routing.capable.as_ref(),
             // The escalation-lane rungs (backlog ad56c7bd): each has its own
             // USER-CHOSEN target, and an unset or dangling one falls through
@@ -433,9 +434,18 @@ impl ModelResolver for ConfigModelResolver {
             return None;
         }
         let routing = &config.general.general.routing;
+        let offered = crate::agent::route_question::OfferedLabels {
+            trivial: routing.cheap.is_some(),
+            routine: true,
+            hard: routing.capable.is_some(),
+        };
         Some(RoutingPolicy {
             threshold: routing.threshold,
             enforce: routing.enforce,
+            offered,
+            first_prompt_min_confidence: routing
+                .first_prompt_min_confidence
+                .unwrap_or_else(|| crate::agent::route_question::default_min_confidence(offered.count())),
         })
     }
 
@@ -643,6 +653,11 @@ mod tests {
     fn routed_targets_resolve_when_configured() {
         let r = resolver(config_with_routing(RoutingConfig {
             cheap: Some(cheap_ref()),
+            routine: Some(ModelRef {
+                endpoint: "openai".into(),
+                model: "routine-model".into(),
+                reasoning_effort: None,
+            }),
             capable: Some(capable_ref()),
             ..RoutingConfig::default()
         }));
@@ -653,6 +668,10 @@ mod tests {
         assert_eq!(cheap.endpoint, "deepseek");
         assert_eq!(cheap.model, "deepseek-v4-flash");
         assert_eq!(cheap.reasoning_effort.as_deref(), Some("minimal"));
+        let routine = r
+            .resolve_routed(RouteTarget::Routine, ctx.clone())
+            .expect("routine target");
+        assert_eq!(routine.model, "routine-model");
         let capable = r
             .resolve_routed(RouteTarget::Capable, ctx.clone())
             .expect("capable target");
@@ -784,6 +803,13 @@ mod tests {
             Some(RoutingPolicy {
                 threshold: 0.9,
                 enforce: true,
+                offered: crate::agent::route_question::OfferedLabels {
+                    trivial: false,
+                    routine: true,
+                    hard: false,
+                },
+                first_prompt_min_confidence:
+                    crate::agent::route_question::default_min_confidence(1),
             })
         );
     }
@@ -869,11 +895,13 @@ mod tests {
         let mut routed_config = config_with_endpoints(models());
         routed_config.general.general.routing = RoutingConfig {
             cheap: Some(cheap_ref()),
+            routine: None,
             capable: Some(capable_ref()),
             lane_medium: None,
             lane_high: None,
             escalate: None,
             threshold: 0.9,
+            first_prompt_min_confidence: None,
             enforce: true,
         };
         let routed = resolver(routed_config);

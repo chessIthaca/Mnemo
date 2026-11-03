@@ -440,6 +440,14 @@ pub enum AgentEvent {
     ModelSwapSummarized {
         model: String,
     },
+    /// Laya's once-per-session route or post-route suggestion. Informational
+    /// only: it never represents an automatic post-first-prompt switch.
+    RoutingNotice {
+        /// `routed` or `nudge`.
+        kind: String,
+        /// Human-readable model and confidence / reason.
+        text: String,
+    },
     /// The per-turn AUTO-RECALL just injected memories into the agent's
     /// prompt — emitted once per FRESH recall that returned hits (not on
     /// cache reuse or empty results), so the frontend can show that the
@@ -858,6 +866,15 @@ pub enum SerializableAgentEvent {
     ModelSwapSummarized {
         model: String,
     },
+    /// The serializable [`AgentEvent::RoutingNotice`] twin. `routing_kind`
+    /// avoids colliding with serde's `kind` event tag on the wire.
+    RoutingNotice {
+        /// `routed` or `nudge`.
+        #[serde(rename = "routing_kind")]
+        kind: String,
+        /// Human-readable informational notice.
+        text: String,
+    },
     /// The per-turn auto-recall injected memories into the prompt. See
     /// [`AgentEvent::MemoryRecalled`]. Display-only.
     MemoryRecalled {
@@ -1215,6 +1232,13 @@ impl AgentEvent {
             },
             AgentEvent::ModelSwapSummarized { model } => SerializedEvent {
                 event: SerializableAgentEvent::ModelSwapSummarized { model },
+                approval_sender: None,
+                question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
+            },
+            AgentEvent::RoutingNotice { kind, text } => SerializedEvent {
+                event: SerializableAgentEvent::RoutingNotice { kind, text },
                 approval_sender: None,
                 question_sender: None,
                 host_tool_sender: None,

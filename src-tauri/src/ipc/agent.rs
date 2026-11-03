@@ -566,6 +566,26 @@ pub async fn engine_status(state: State<'_, IpcState>) -> Result<EngineStats, Ip
         .map_err(|e| IpcError::msg(format!("{e:#}")))
 }
 
+/// Record one human model pick in the route-once lifecycle and its training
+/// log. The caller has already established that the model spec changed, so an
+/// effort-only rebuild never reaches this helper.
+fn note_session_reroute(agent_loop: &mnemo::agent::AgentLoop, to: &str) {
+    if !agent_loop.session_routing_enabled() {
+        return;
+    }
+    let nudged = agent_loop.routing_nudged();
+    let from = agent_loop.note_manual_model_choice(to);
+    agent_loop.append_session_routing_row(
+        &mnemo::agent::model_routing::SessionRoutingRow::Reroute {
+            ts: mnemo::agent::model_routing::now_millis(),
+            agent_id: agent_loop.agent_id().unwrap_or(0).to_string(),
+            from,
+            to: to.to_string(),
+            nudged,
+        },
+    );
+}
+
 /// Switch the active model (or reasoning effort) at runtime — per agent.
 ///
 /// Models are agent-specific (user decision 2026-08-22): the GUI model picker
@@ -645,12 +665,17 @@ pub async fn set_model(
 
     // Rebuild the context manager from the new provider's max context.
     let context_manager = factory.context_manager_for(provider.as_ref());
+    let spec = format!("{endpoint_name}/{model}");
 
     match agent_id {
         // Per-agent switch: models are agent-specific — swap ONLY the target
         // agent's loop (the factory + other agents are untouched) and push the
         // new model to the UI for that agent only.
         Some(id) => {
+            let target_loop = state.runtime.agent_loops.lock().await.get(&id).cloned();
+            let model_changed = target_loop
+                .as_ref()
+                .is_some_and(|agent_loop| agent_loop.current_model_spec() != spec);
             match crate::ipc::config_io::swap_provider_into_loop(
                 &state.runtime.agent_loops,
                 id,
@@ -704,10 +729,24 @@ pub async fn set_model(
                     );
                 }
             }
+            if model_changed {
+                if let Some(agent_loop) = target_loop {
+                    note_session_reroute(agent_loop.as_ref(), &spec);
+                }
+            }
         }
         // Legacy global switch: factory + every live agent loop (the console
         // REPL and any pre-per-agent callers).
         None => {
+            let changed_loops: Vec<_> = state
+                .runtime
+                .agent_loops
+                .lock()
+                .await
+                .values()
+                .filter(|agent_loop| agent_loop.current_model_spec() != spec)
+                .cloned()
+                .collect();
             let _ = crate::ipc::config_io::swap_live_provider(
                 &state,
                 &app,
@@ -717,6 +756,9 @@ pub async fn set_model(
                 Some(display_effort.clone()),
             )
             .await;
+            for agent_loop in changed_loops {
+                note_session_reroute(agent_loop.as_ref(), &spec);
+            }
             eprintln!("switched model to '{model}' (provider {kind_label})");
         }
     }

@@ -1611,6 +1611,8 @@ async fn pump_events(
             // the lead stays busy and no error is recorded (bug 2026-11-02,
             // plan 1238e0de: this used to arrive as an `Error`).
             SerializableAgentEvent::ModelSwapSummarized { .. } => false,
+            // Mnemo1-only informational notice; the lead pump ignores it.
+            SerializableAgentEvent::RoutingNotice { .. } => false,
             SerializableAgentEvent::ModelChanged { model: changed, .. } => {
                 // The engine's bus is engine-wide: only OUR session's
                 // model change may re-point the lead's observed model

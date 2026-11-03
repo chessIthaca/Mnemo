@@ -107,17 +107,16 @@ pub(crate) const CORRECTION_SCHEMA_CAP: usize = 1536;
 /// query lookup so the correction never hijacks the recall query.
 pub(crate) const HARNESS_CORRECTION_PREFIX: &str = "[harness tool-call correction";
 
-/// The pre-prompt routing state for one `run_turn` call (backlog 091e694d):
-/// the target an enforced classification selected, plus the counters its
-/// outcome row needs.
+/// The pre-prompt routing state for one classified `run_turn` call (backlog
+/// 091e694d): the counters its outcome row needs. `target` is reserved for the
+/// legacy per-iteration arm and is always `None` for route-once.
 ///
 /// `Drop` writes the outcome row, so every exit path of `run_turn` lands it:
 /// a normal return, any of the early returns, and a `?` unwind alike. The
 /// write is best-effort (a log failure never affects a turn).
 pub(crate) struct TurnRoute {
-    /// The target an ENFORCED decision selected -- read by every iteration's
-    /// provider resolution. `None` in shadow mode, below the confidence
-    /// threshold, or for a label the question never offered.
+    /// Legacy per-iteration arm. First-prompt routing installs the picker's
+    /// state-scoped pin instead and ALWAYS leaves this `None`.
     target: Option<model_routing::RouteTarget>,
     /// Joins the decision row this turn already wrote.
     turn_id: String,
@@ -462,7 +461,7 @@ impl AgentLoop {
         // re-classifying per iteration would thrash models mid-turn. The
         // decision lives in `state.route`; each iteration's provider
         // resolution reads its target.
-        state.route = self.route_turn_start(messages, agent_id).await;
+        state.route = self.route_turn_start(messages, agent_id, fanin_tx).await;
         // The budget layer's turn identity (backlog a25a5323): minted once
         // per turn, stamped on every spend row this turn writes.
         state.spend_turn_id = Some(model_routing::new_turn_id(&agent_id.to_string()));
@@ -1226,67 +1225,172 @@ impl AgentLoop {
         }
     }
 
-    /// Classify this turn's task text for pre-prompt routing (backlog
-    /// 091e694d) and return the turn's routing state.
+    /// Classify a session's first prompt, or schedule its later drift nudge
+    /// (backlog 091e694d), and return the classified turn's outcome state.
     ///
-    /// Runs ONCE per turn, before the first request is built. All gates must
+    /// Runs before the first request is built. All gates must
     /// hold: the loop carries a routing gate with a live classifier in the
     /// shared slot, the `[general.laya] routing` opt-in is on (the resolver's
     /// live policy), and the conversation has a user message to classify. The
     /// decision row is written here; the outcome row is written by the
     /// returned state's `Drop`.
     ///
-    /// `None` -- no classification, no row -- when any gate is off or the
-    /// classifier gives no usable answer. Never fails or blocks a turn: the
-    /// classifier call answers `None` on every failure path and the log write
-    /// is best-effort.
-    async fn route_turn_start(&self, messages: &[Message], agent_id: AgentId) -> Option<TurnRoute> {
-        // Never classify a spawned agent's turn: subagents, reviewers and
-        // compaction calls are not routed, and a spawned task text is not a
-        // user turn — the corpus stays user-task text. The resolver's own
-        // guard would refuse the model switch anyway; this keeps the LOG clean
-        // too (no decision/outcome rows for spawned turns).
-        if self.is_subagent() {
-            return None;
-        }
-        // Plan 2ba2168a step 1: a session opted out at spawn (Mnemo2
-        // workers and leads) is never classified here — Laya routes it
-        // once at dispatch instead — so its turns write no
-        // decision/outcome rows either.
-        if self
-            .skip_turn_routing
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// `None` -- no new first-prompt row -- when routing is settled/off, any
+    /// gate is off, or the classifier gives no usable answer. The classifier
+    /// call answers `None` on every failure path and the log write is
+    /// best-effort.
+    async fn route_turn_start(
+        &self,
+        messages: &[Message],
+        agent_id: AgentId,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+    ) -> Option<TurnRoute> {
+        // Spawned sessions and Mnemo2 workers/leads never enter Mnemo1's
+        // session router. In particular they write no routing.jsonl rows.
+        if self.is_subagent()
+            || self
+                .skip_turn_routing
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             return None;
         }
-        let policy = self.model_resolver.as_ref()?.routing_policy()?;
-        let gate = self.routing.as_ref()?;
-        let classifier = gate.classifier()?;
-        let log_path = gate.log_path().to_path_buf();
+        let resolver = Arc::clone(self.model_resolver.as_ref()?);
+        let policy = resolver.routing_policy()?;
         let text = messages
             .iter()
             .rev()
             .find(|m| m.role == Role::User)
-            .map(|m| m.content.as_text())?;
-        let decision =
-            model_routing::classify_task_text(classifier.as_ref(), &text, policy.threshold).await?;
-        let shadow = !policy.enforce;
-        // Shadow mode never selects a target: the decision is logged, the
-        // model is untouched. Enforce mode resolves the target NOW so the
-        // decision row can name the model this turn is routed onto; the
-        // per-iteration arm re-resolves (and re-guards) with the same
-        // resolver call, so a context change mid-turn still wins.
-        let routed = match (shadow, decision.target) {
-            (false, Some(target)) => self.resolve_routed_model(target).await,
-            _ => None,
+            .map(|m| m.content.as_text())
+            .unwrap_or_default();
+
+        match self.route_once() {
+            super::loop_impl::RouteOnce::Off { .. } => return None,
+            super::loop_impl::RouteOnce::Settled { label, .. } => {
+                self.spawn_drift_check(text, label, policy, agent_id, fanin_tx)
+                    .await;
+                return None;
+            }
+            super::loop_impl::RouteOnce::Pending => {}
+        }
+
+        if text.split_whitespace().count() < 3 {
+            *self.route_once.lock().expect("route-once lock poisoned") =
+                super::loop_impl::RouteOnce::Off { reason: "too_short" };
+            return None;
+        }
+        let Some(gate) = self.routing.as_ref() else {
+            *self.route_once.lock().expect("route-once lock poisoned") =
+                super::loop_impl::RouteOnce::Off { reason: "offline" };
+            return None;
         };
-        // Memoize the MISS (review L2): a target that does not resolve at turn
-        // start is not armed at all, so a Settings save mid-turn cannot route
-        // the remaining iterations onto a model the decision row already
-        // recorded as not applying (`enforced: false, model: None`).
-        let arm_target = if routed.is_some() { decision.target } else { None };
+        let Some(classifier) = gate.classifier() else {
+            *self.route_once.lock().expect("route-once lock poisoned") =
+                super::loop_impl::RouteOnce::Off { reason: "offline" };
+            return None;
+        };
+        let log_path = gate.log_path().to_path_buf();
+        let session_log_path = gate.session_log_path().to_path_buf();
+        let Some(decision) = model_routing::classify_task_text(
+            classifier.as_ref(),
+            &text,
+            policy.offered,
+            policy.first_prompt_min_confidence,
+        )
+        .await
+        else {
+            *self.route_once.lock().expect("route-once lock poisoned") =
+                super::loop_impl::RouteOnce::Off { reason: "offline" };
+            return None;
+        };
+
+        let shadow = !policy.enforce;
+        let resolved = match decision.target {
+            Some(target) => self.resolve_routed_model(target).await,
+            None => None,
+        };
+        let mut enforced_model = None;
+        let mut notice = None;
+        let mut skip = if decision.confidence < policy.first_prompt_min_confidence {
+            Some("below_gate")
+        } else if decision.target.is_none() {
+            Some("unknown_label")
+        } else {
+            None
+        };
+
+        if let Some(target) = decision.target {
+            if let Some(model_ref) = resolved.clone() {
+                if shadow {
+                    skip = Some("shadow");
+                    notice = Some(format!(
+                        "Laya would pick {} ({:.2})",
+                        model_ref.model, decision.confidence
+                    ));
+                } else if let Some((provider, context_manager)) =
+                    resolver.build_turn_provider(&model_ref, self.fill_rate)
+                {
+                    let spec = format!("{}/{}", model_ref.endpoint, model_ref.model);
+                    let effort = resolver.display_effort_for(&model_ref);
+                    let endpoint = Some(model_ref.endpoint.clone());
+                    self.set_explicit_provider(provider, context_manager);
+                    // The route itself announces the change. Seed the served-
+                    // effective deduper so the first request does not emit a
+                    // second identical ModelChanged after this notice.
+                    self.note_served_effective(
+                        &model_ref.model,
+                        endpoint.as_deref(),
+                        effort.as_deref(),
+                    );
+                    let _ = fanin_tx
+                        .send((
+                            agent_id,
+                            AgentEvent::ModelChanged {
+                                model: model_ref.model.clone(),
+                                provider: endpoint,
+                                reasoning_effort: effort,
+                            },
+                        ))
+                        .await;
+                    notice = Some(format!(
+                        "Laya → {} ({:.2})",
+                        model_ref.model, decision.confidence
+                    ));
+                    enforced_model = Some(spec);
+                    skip = None;
+                } else {
+                    skip = Some("no_target");
+                }
+                // `target` is intentionally consumed only by the first-prompt
+                // pin above. TurnRoute.target stays None below.
+                let _ = target;
+            } else {
+                skip = Some("no_target");
+            }
+        }
+
+        *self.route_once.lock().expect("route-once lock poisoned") =
+            super::loop_impl::RouteOnce::Settled {
+                label: Some(decision.label.clone()),
+                confidence: Some(decision.confidence),
+                model: enforced_model.clone(),
+            };
+        if let Some(text) = notice {
+            let _ = fanin_tx
+                .send((
+                    agent_id,
+                    AgentEvent::RoutingNotice {
+                        kind: "routed".to_string(),
+                        text,
+                    },
+                ))
+                .await;
+        }
+
         let agent = agent_id.to_string();
         let turn_id = model_routing::new_turn_id(&agent);
+        let selected_spec = resolved
+            .as_ref()
+            .map(|m| format!("{}/{}", m.endpoint, m.model));
         model_routing::append_row(
             &log_path,
             &model_routing::RouteDecisionRow {
@@ -1296,20 +1400,34 @@ impl AgentLoop {
                 shadow,
                 label: decision.label.clone(),
                 confidence: decision.confidence,
-                threshold: policy.threshold,
+                threshold: policy.first_prompt_min_confidence,
                 target: decision.target.map(|t| t.label().to_string()),
                 lane: None,
                 step_index: None,
-                enforced: routed.is_some(),
-                model: routed
-                    .as_ref()
-                    .map(|m| format!("{}/{}", m.endpoint, m.model)),
+                enforced: enforced_model.is_some(),
+                model: selected_spec.clone(),
                 task_text: model_routing::cap_task_text(&text),
                 probabilities: decision.probabilities.clone(),
             },
         );
+        model_routing::append_row(
+            &session_log_path,
+            &model_routing::SessionRoutingRow::Route {
+                ts: model_routing::now_millis(),
+                agent_id: agent.clone(),
+                label: decision.label.clone(),
+                confidence: decision.confidence,
+                threshold: policy.first_prompt_min_confidence,
+                cleared: decision.target.is_some(),
+                enforced: enforced_model.is_some(),
+                model: selected_spec,
+                skip: skip.map(str::to_string),
+            },
+        );
         Some(TurnRoute {
-            target: arm_target,
+            // Route-once installs a state-scoped picker pin above. Never arm
+            // the legacy per-iteration routed branch for a first prompt.
+            target: None,
             turn_id,
             agent_id: agent,
             iterations: 0,
@@ -1318,6 +1436,111 @@ impl AgentLoop {
             failure: None,
             log_path,
         })
+    }
+
+    /// Spawn the one-shot background drift check for an already settled
+    /// session. The task owns only snapshots and atomics — never the loop or
+    /// its RouteOnce mutex — so the provider turn finishes without waiting.
+    async fn spawn_drift_check(
+        &self,
+        text: String,
+        settled_label: Option<String>,
+        policy: model_routing::RoutingPolicy,
+        agent_id: AgentId,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+    ) {
+        if text.split_whitespace().count() < 3
+            || self
+                .nudge_sent
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some(settled_label) = settled_label else {
+            return;
+        };
+        if super::route_question::label_above(&settled_label, policy.offered).is_none() {
+            return;
+        }
+        let Some(gate) = self.routing.as_ref() else {
+            return;
+        };
+        let Some(classifier) = gate.classifier() else {
+            return;
+        };
+        let Some(resolver) = self.model_resolver.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let context = crate::model_resolver::ModelContext {
+            route: self.policy().route().await,
+            is_subagent: false,
+        };
+        let session_log_path = gate.session_log_path().to_path_buf();
+        let nudge_sent = Arc::clone(&self.nudge_sent);
+        let nudge_to_label = Arc::clone(&self.nudge_to_label);
+        let route_epoch = Arc::clone(&self.route_epoch);
+        let epoch = route_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let fanin_tx = fanin_tx.clone();
+        let agent = agent_id.to_string();
+        tokio::spawn(async move {
+            let Some(decision) = model_routing::classify_task_text(
+                classifier.as_ref(),
+                &text,
+                policy.offered,
+                policy.first_prompt_min_confidence,
+            )
+            .await
+            else {
+                return;
+            };
+            let Some(target) = decision.target else {
+                return;
+            };
+            // Any offered higher label counts, not merely the immediately next
+            // rung (trivial → hard must work when routine is offered too).
+            let mut cursor = settled_label.as_str();
+            let mut harder = false;
+            while let Some(next) = super::route_question::label_above(cursor, policy.offered) {
+                if next == decision.label {
+                    harder = true;
+                    break;
+                }
+                cursor = next;
+            }
+            if !harder {
+                return;
+            }
+            let Some(model_ref) = resolver.resolve_routed(target, context) else {
+                return;
+            };
+            // A manual pick or Clear increments the epoch and stores false via
+            // this same Arc. The epoch prevents an old task from re-claiming
+            // that fresh false; the CAS guarantees one notice otherwise.
+            if route_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                return;
+            }
+            if !AgentLoop::claim_nudge(&nudge_sent, &nudge_to_label, &decision.label) {
+                return;
+            }
+            model_routing::append_row(
+                &session_log_path,
+                &model_routing::SessionRoutingRow::Nudge {
+                    ts: model_routing::now_millis(),
+                    agent_id: agent,
+                    reason: "drift".to_string(),
+                    to_label: decision.label,
+                },
+            );
+            let _ = fanin_tx
+                .send((
+                    agent_id,
+                    AgentEvent::RoutingNotice {
+                        kind: "nudge".to_string(),
+                        text: format!("this got harder; consider {}", model_ref.model),
+                    },
+                ))
+                .await;
+        });
     }
 
     /// Resolve a routing target against the CURRENT workflow context (backlog
@@ -2633,6 +2856,101 @@ impl AgentLoop {
                 ..Message::tool_result(tc.id.clone(), tc.name.clone(), feed_content)
             };
             messages.push(tool_message);
+
+            // Route-once stuck signal (main Mnemo1 session only): three
+            // consecutive failed-or-repeated calls may produce ONE suggestion.
+            // They never arm a provider switch. The separate previous signature
+            // only selects the wording; Strikes owns the exactly-once streak.
+            if !self.is_subagent() {
+                let signature =
+                    super::route_question::call_signature(
+                        &tc.name,
+                        &serde_json::from_str(&tc.arguments)
+                            .unwrap_or_else(|_| serde_json::Value::String(tc.arguments.clone())),
+                    );
+                let (trigger, repeated) = {
+                    let mut previous = self
+                        .last_route_tool_signature
+                        .lock()
+                        .expect("last tool signature lock poisoned");
+                    let repeated = previous.as_deref() == Some(signature.as_str());
+                    let trigger = self
+                        .strikes
+                        .lock()
+                        .expect("route strikes lock poisoned")
+                        .observe(signature.clone(), !result.success);
+                    *previous = Some(signature);
+                    (trigger, repeated)
+                };
+                if trigger {
+                    let settled_label = match self.route_once() {
+                        super::loop_impl::RouteOnce::Settled {
+                            label: Some(label),
+                            ..
+                        } => Some(label),
+                        _ => None,
+                    };
+                    let policy = self
+                        .model_resolver
+                        .as_ref()
+                        .and_then(|resolver| resolver.routing_policy());
+                    if let (Some(settled), Some(policy)) = (settled_label, policy) {
+                        if let Some(to_label) =
+                            super::route_question::label_above(&settled, policy.offered)
+                        {
+                            let target = match to_label {
+                                super::route_question::LABEL_TRIVIAL => {
+                                    Some(model_routing::RouteTarget::Cheap)
+                                }
+                                super::route_question::LABEL_ROUTINE => {
+                                    Some(model_routing::RouteTarget::Routine)
+                                }
+                                super::route_question::LABEL_HARD => {
+                                    Some(model_routing::RouteTarget::Capable)
+                                }
+                                _ => None,
+                            };
+                            if let Some(model_ref) = match target {
+                                Some(target) => self.resolve_routed_model(target).await,
+                                None => None,
+                            } {
+                                if self.try_claim_nudge(to_label) {
+                                    let reason = if repeated {
+                                        "repeat_failure"
+                                    } else {
+                                        "tool_failures"
+                                    };
+                                    let text = if repeated {
+                                        format!("going in circles; consider {}", model_ref.model)
+                                    } else {
+                                        format!("tools keep failing; consider {}", model_ref.model)
+                                    };
+                                    if let Some(gate) = self.routing.as_ref() {
+                                        model_routing::append_row(
+                                            gate.session_log_path(),
+                                            &model_routing::SessionRoutingRow::Nudge {
+                                                ts: model_routing::now_millis(),
+                                                agent_id: agent_id.to_string(),
+                                                reason: reason.to_string(),
+                                                to_label: to_label.to_string(),
+                                            },
+                                        );
+                                    }
+                                    let _ = fanin_tx
+                                        .send((
+                                            agent_id,
+                                            AgentEvent::RoutingNotice {
+                                                kind: "nudge".to_string(),
+                                                text,
+                                            },
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             let _ = fanin_tx
                 .send((

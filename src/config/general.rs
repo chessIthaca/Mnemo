@@ -400,6 +400,10 @@ pub struct RoutingConfig {
     /// The endpoint + model a confidently-TRIVIAL task routes to (a small,
     /// local, mechanical change). `None` (the default) keeps today's model.
     pub cheap: Option<ModelRef>,
+    /// Where a confidently routine first prompt routes; `None` keeps the
+    /// session's model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routine: Option<ModelRef>,
     /// The endpoint + model a confidently-ARCHITECTURAL task routes to
     /// (design-level work: a new feature, cross-module refactor, a new
     /// dependency, a data-model or concurrency change). `None` keeps today's.
@@ -420,8 +424,14 @@ pub struct RoutingConfig {
     /// `confidence >= threshold`. Defaults to `0.80`, the same gate the
     /// other Laya consumers use; a below-threshold answer keeps today's
     /// model, so a too-high threshold is simply inert. Omitted while default.
+    /// Used by the step-lane ladder; first-prompt routing uses
+    /// [`first_prompt_min_confidence`](Self::first_prompt_min_confidence).
     #[serde(skip_serializing_if = "routing_threshold_is_default")]
     pub threshold: f64,
+    /// The first-prompt gate; `None` uses the kernel's calibrated default for
+    /// the offered label count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_prompt_min_confidence: Option<f64>,
     /// Whether a confident decision actually switches the turn's model.
     /// `false` (the default) = shadow: classify + log only, model unchanged.
     /// Flipping this is the post-fine-tune step: a config edit, never a code
@@ -434,11 +444,13 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             cheap: None,
+            routine: None,
             capable: None,
             lane_medium: None,
             lane_high: None,
             escalate: None,
             threshold: default_routing_threshold(),
+            first_prompt_min_confidence: None,
             enforce: false,
         }
     }
@@ -452,10 +464,12 @@ impl RoutingConfig {
     fn is_default(&self) -> bool {
         self.cheap.is_none()
             && self.capable.is_none()
+            && self.routine.is_none()
             && self.lane_medium.is_none()
             && self.lane_high.is_none()
             && self.escalate.is_none()
             && routing_threshold_is_default(&self.threshold)
+            && self.first_prompt_min_confidence.is_none()
             && !self.enforce
     }
 }

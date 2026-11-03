@@ -38,6 +38,27 @@ pub(crate) type ExplicitProvider =
 pub(crate) type ServedEffective =
     std::sync::Mutex<Option<(String, Option<String>, Option<String>)>>;
 
+/// The once-per-session first-prompt routing lifecycle.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteOnce {
+    /// No classifiable first prompt has been handled yet.
+    Pending,
+    /// The first prompt was classified; later prompts may only nudge.
+    Settled {
+        /// Laya's answer, when it returned a choice.
+        label: Option<String>,
+        /// The calibrated confidence of that answer.
+        confidence: Option<f64>,
+        /// The model spec installed by an enforced route, if any.
+        model: Option<String>,
+    },
+    /// Routing is permanently off for this session incarnation.
+    Off {
+        /// `too_short`, `offline`, `resumed`, or `manual`.
+        reason: &'static str,
+    },
+}
+
 /// Per-session state extracted from [`AgentLoop`] (A2: reduce the loop's field
 /// count). Holds the memory session id + the prompt-token cache heuristic.
 /// Both are behind `Mutex` so they can be mutated through a `&AgentLoop`.
@@ -624,6 +645,19 @@ pub struct AgentLoop {
     /// rows are written for them (Mnemo2 routes once at dispatch instead).
     /// `false` = the per-turn gate (Mnemo1, unchanged).
     pub(crate) skip_turn_routing: std::sync::atomic::AtomicBool,
+    /// Mnemo1's first-prompt route; independent of the per-iteration lane arm.
+    pub(crate) route_once: std::sync::Mutex<RouteOnce>,
+    /// Whether the one permitted post-route suggestion has been emitted.
+    pub(crate) nudge_sent: Arc<std::sync::atomic::AtomicBool>,
+    /// Invalidates an in-flight drift check when a human picks or `/clear` runs.
+    pub(crate) route_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Consecutive failed-or-repeated tool calls behind a stuck nudge.
+    pub(crate) strikes: std::sync::Mutex<super::route_question::Strikes>,
+    /// The previous signature, used only to choose the stuck-nudge wording.
+    pub(crate) last_route_tool_signature: std::sync::Mutex<Option<String>>,
+    /// Atomic target encoding (`0` none, `1` trivial, `2` routine, `3` hard),
+    /// shared with a detached drift task without cloning a session mutex.
+    pub(crate) nudge_to_label: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -1178,6 +1212,12 @@ impl AgentLoop {
             // session out (`set_skip_turn_routing`) — every constructor
             // starts with the per-turn gate in force.
             skip_turn_routing: std::sync::atomic::AtomicBool::new(false),
+            route_once: std::sync::Mutex::new(RouteOnce::Pending),
+            nudge_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            route_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            strikes: std::sync::Mutex::new(super::route_question::Strikes::new(3)),
+            last_route_tool_signature: std::sync::Mutex::new(None),
+            nudge_to_label: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -1353,6 +1393,128 @@ impl AgentLoop {
     pub fn with_routing_gate(mut self, gate: model_routing::RoutingGate) -> Self {
         self.routing = Some(gate);
         self
+    }
+
+    /// Return a snapshot of this session's first-prompt routing state.
+    pub fn route_once(&self) -> RouteOnce {
+        self.route_once
+            .lock()
+            .expect("route-once lock poisoned")
+            .clone()
+    }
+
+    /// Whether the live `[general.laya] routing` opt-in currently exposes a
+    /// first-prompt policy. IPC uses this to keep routing-off manual picks
+    /// byte-identical (no reroute row and no route-state transition).
+    pub fn session_routing_enabled(&self) -> bool {
+        self.model_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.routing_policy())
+            .is_some()
+    }
+
+    /// Record a human model pick. Routing stops for this session, any pending
+    /// nudge is cleared, and the previously Laya-routed model is returned for
+    /// the reroute log row.
+    pub fn note_manual_model_choice(&self, _to: &str) -> Option<String> {
+        let previous = {
+            let mut state = self.route_once.lock().expect("route-once lock poisoned");
+            let previous = match &*state {
+                RouteOnce::Settled { model, .. } => model.clone(),
+                _ => None,
+            };
+            *state = RouteOnce::Off { reason: "manual" };
+            previous
+        };
+        self.route_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.nudge_sent
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.strikes.lock().expect("route strikes lock poisoned").reset();
+        *self
+            .last_route_tool_signature
+            .lock()
+            .expect("last tool signature lock poisoned") = None;
+        self.nudge_to_label.store(0, std::sync::atomic::Ordering::SeqCst);
+        previous
+    }
+
+    /// Whether a routing nudge is currently awaiting a human response.
+    pub fn routing_nudged(&self) -> bool {
+        self.nudge_sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Append one route-once event to this loop's redirected session log.
+    /// Logging is best-effort and never changes the model pick.
+    pub fn append_session_routing_row(&self, row: &model_routing::SessionRoutingRow) {
+        if let Some(gate) = &self.routing {
+            model_routing::append_row(gate.session_log_path(), row);
+        }
+    }
+
+    /// Restore the initial state after `/clear` or `/new`.
+    pub(crate) fn reset_route_once(&self) {
+        *self.route_once.lock().expect("route-once lock poisoned") = RouteOnce::Pending;
+        self.route_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.nudge_sent
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.strikes.lock().expect("route strikes lock poisoned").reset();
+        *self
+            .last_route_tool_signature
+            .lock()
+            .expect("last tool signature lock poisoned") = None;
+        self.nudge_to_label.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Mark a resumed session as ineligible for first-prompt routing.
+    pub(crate) fn mark_route_once_resumed(&self) {
+        *self.route_once.lock().expect("route-once lock poisoned") =
+            RouteOnce::Off { reason: "resumed" };
+    }
+
+    /// Claim the session's one nudge, retaining its target for the clear log.
+    pub(crate) fn try_claim_nudge(&self, to_label: &str) -> bool {
+        Self::claim_nudge(&self.nudge_sent, &self.nudge_to_label, to_label)
+    }
+
+    /// CAS helper shared by the synchronous tool-strike path and the detached
+    /// drift task. The target is recorded only by the winning claimer.
+    pub(crate) fn claim_nudge(
+        sent: &std::sync::atomic::AtomicBool,
+        target: &std::sync::atomic::AtomicU8,
+        to_label: &str,
+    ) -> bool {
+        let code = match to_label {
+            super::route_question::LABEL_TRIVIAL => 1,
+            super::route_question::LABEL_ROUTINE => 2,
+            super::route_question::LABEL_HARD => 3,
+            _ => return false,
+        };
+        if sent
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        target.store(code, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// The target of the outstanding nudge, used by `/clear` and `/new`.
+    pub(crate) fn nudge_target(&self) -> Option<String> {
+        let label = match self.nudge_to_label.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => super::route_question::LABEL_TRIVIAL,
+            2 => super::route_question::LABEL_ROUTINE,
+            3 => super::route_question::LABEL_HARD,
+            _ => return None,
+        };
+        Some(label.to_string())
     }
 
     /// Attach the compound-reflex handle (the Laya classifier's compound
@@ -2400,6 +2562,17 @@ impl AgentLoop {
             .read()
             .expect("provider lock poisoned")
             .clone()
+    }
+
+    /// The live provider's `endpoint/model` spec (or its bare model for test
+    /// doubles without an endpoint name).
+    pub fn current_model_spec(&self) -> String {
+        let provider = self.provider();
+        if provider.provider_name().is_empty() {
+            provider.model().to_string()
+        } else {
+            format!("{}/{}", provider.provider_name(), provider.model())
+        }
     }
 
     /// A handle to the context manager, for manual compaction (`/compact`).

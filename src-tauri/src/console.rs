@@ -315,6 +315,9 @@ pub(crate) fn render_event(event: &SerializableAgentEvent) -> Rendered {
         SerializableAgentEvent::ModelSwapSummarized { model } => Rendered::Lines(vec![format!(
             "— summarized the conversation for smaller context, now on: {model}"
         )]),
+        SerializableAgentEvent::RoutingNotice { text, .. } => {
+            Rendered::Lines(vec![format!("— Laya: {text}")])
+        }
         SerializableAgentEvent::MemoryRecalled { hits } => {
             let parts: Vec<String> = hits
                 .iter()

@@ -6278,6 +6278,9 @@ async fn pump_worker(
                         changed |= worker.compacting;
                         worker.compacting = false;
                     }
+                    // Mnemo2 routes at dispatch; a Mnemo1-only session notice
+                    // cannot alter worker status, busy, or compaction state.
+                    SerializableAgentEvent::RoutingNotice { .. } => {}
                     SerializableAgentEvent::Error { error, retrying } => {
                         if !retrying {
                             turn_active = false;

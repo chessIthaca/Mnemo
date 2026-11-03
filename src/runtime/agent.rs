@@ -219,6 +219,11 @@ impl AgentTask {
     /// the seeded history is the first request's prefix (§5.9.5
     /// :693-695: the provider prefix-cache byte-for-byte contract).
     pub(crate) fn seed_messages(&mut self, messages: Vec<Message>) {
+        if !messages.is_empty() {
+            // A restored transcript already had its first prompt in the prior
+            // process. Never classify a later message as a fresh first prompt.
+            self.agent_loop.mark_route_once_resumed();
+        }
         self.messages = messages;
         // A resumed transcript is the conversation BEFORE any request exists —
         // publish it so a model switch landing before the first request still
@@ -1128,6 +1133,10 @@ impl AgentTask {
         // inbox-closed exit and the Cancel break above (there is no separate
         // Cancel-path spawn), so working-tier events are compressed + pruned
         // whenever a session ends.
+        // A nudge left unanswered when this session terminates is calibration
+        // data too. The shared consume-and-log helper dedups Clear-then-end.
+        let outstanding = self.agent_loop.end_route_session();
+        self.agent_loop.log_nudge_ignored(self.id, outstanding);
         self.spawn_consolidation().await;
         let id = self.id;
         // Release the loop (including a worktree's open codegraph SQLite
@@ -1576,7 +1585,12 @@ impl AgentTask {
     /// Clear the conversation history entirely — a fresh start. Emits a
     /// `ContextUsage` event with `used: 0` so the UI's ctx bar resets. Backed
     /// by `/new`.
-    async fn clear_context(&mut self, fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>) {
+    pub(crate) async fn clear_context(
+        &mut self,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+    ) {
+        let outstanding = self.agent_loop.clear_route_session();
+        self.agent_loop.log_nudge_ignored(self.id, outstanding);
         self.messages.clear();
         // /new: the conversation a switch measures is now empty.
         self.agent_loop.publish_message_tokens(&self.messages);

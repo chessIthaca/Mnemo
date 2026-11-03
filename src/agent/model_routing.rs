@@ -5,18 +5,19 @@
 //! Pre-prompt model routing: the Laya classifier's task-complexity decision
 //! layer (backlog 091e694d, item 2 of the Laya chain).
 //!
-//! At the start of a main-agent user turn the task text is classified as
-//! `trivial` (a small, local, mechanical change) or `architectural`
-//! (design-level work) with a calibrated choice question
-//! ([`routing_question`]). The decision is gated three ways:
+//! On a main-agent session's first classifiable prompt the task text is
+//! classified as `trivial`, `routine`, or `hard` with the shared calibrated
+//! choice question ([`super::route_question::route_question`]). The decision is
+//! gated three ways:
 //!
 //! 1. The [`LayaConfig::routing`](crate::config::LayaConfig::routing) opt-in
 //!    must be on and a classifier installed.
-//! 2. The answer must clear the configured confidence gate
-//!    ([`threshold`](crate::config::RoutingConfig::threshold), default
-//!    `0.80`) with a label the question actually offered.
+//! 2. The answer must clear the first-prompt confidence gate
+//!    ([`first_prompt_min_confidence`](crate::config::RoutingConfig::first_prompt_min_confidence),
+//!    or the kernel default for the offered label count) with a known label.
 //! 3. A target must be configured for that label
 //!    ([`cheap`](crate::config::RoutingConfig::cheap) /
+//!    [`routine`](crate::config::RoutingConfig::routine) /
 //!    [`capable`](crate::config::RoutingConfig::capable)) and resolve to a
 //!    live endpoint.
 //!
@@ -27,7 +28,7 @@
 //!
 //! # The routing log
 //!
-//! Every classified turn writes two JSONL rows to [`routing_log_path`]
+//! Every classified first prompt writes two JSONL rows to [`routing_log_path`]
 //! (`~/.mnemo/laya/training/routing.jsonl`): a [`RouteDecisionRow`] when the
 //! turn starts (task text, label, confidence, threshold, the selected target
 //! and whether it was enforced) and a [`RouteOutcomeRow`] when it ends
@@ -48,16 +49,9 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::memory::classifier::{Answer, Classifier, Question};
+use crate::memory::classifier::{Answer, Classifier};
 
 use super::failure_triage::training_log_dir;
-
-/// The label the routing question expects for a small, local, mechanical
-/// task.
-pub const ROUTING_LABEL_TRIVIAL: &str = "trivial";
-
-/// The label the routing question expects for design-level work.
-pub const ROUTING_LABEL_ARCHITECTURAL: &str = "architectural";
 
 /// Maximum chars of the task text handed to the classifier and stored in the
 /// routing log.
@@ -72,7 +66,10 @@ pub const ROUTING_TEXT_MAX_CHARS: usize = 2000;
 pub enum RouteTarget {
     /// A confidently-TRIVIAL task: run on the configured `cheap` model.
     Cheap,
-    /// A confidently-ARCHITECTURAL task: run on the configured `capable`
+    /// A confidently routine first prompt: run on the configured `routine`
+    /// model, or keep the session's model when no target is configured.
+    Routine,
+    /// A confidently hard first prompt: run on the configured `capable`
     /// model.
     Capable,
     /// A medium-complexity plan step (reflex rung `medium`): run on the
@@ -87,46 +84,17 @@ pub enum RouteTarget {
 }
 
 impl RouteTarget {
-    /// The wire/log label (`"cheap"` / `"capable"` / `"medium"` / `"high"` /
+    /// The wire/log label (`"cheap"` / `"routine"` / `"capable"` / `"medium"` / `"high"` /
     /// `"escalate"`).
     pub fn label(self) -> &'static str {
         match self {
             Self::Cheap => "cheap",
+            Self::Routine => "routine",
             Self::Capable => "capable",
             Self::Medium => "medium",
             Self::High => "high",
             Self::Escalate => "escalate",
         }
-    }
-}
-
-/// The pre-prompt routing question: one calibrated choice between
-/// [`ROUTING_LABEL_TRIVIAL`] and [`ROUTING_LABEL_ARCHITECTURAL`].
-///
-/// The labels are rendered verbatim by Laya, so they are plain class names
-/// (never boolean-ish words the checkpoints can follow instead of the
-/// descriptions).
-pub fn routing_question() -> Question {
-    let mut criteria = BTreeMap::new();
-    criteria.insert(
-        ROUTING_LABEL_TRIVIAL.to_string(),
-        "A small, local, mechanical change: a typo, a rename, a version bump, a one-line \
-         fix, or a doc tweak. Well understood, confined to one file or a couple of lines, \
-         and needing no design decisions."
-            .to_string(),
-    );
-    criteria.insert(
-        ROUTING_LABEL_ARCHITECTURAL.to_string(),
-        "Design-level work: a new feature, a cross-module refactor, a new dependency, a \
-         data-model or concurrency change, or anything that needs multi-step planning and \
-         review."
-            .to_string(),
-    );
-    Question::Choice {
-        instructions: "Classify the coding task the user is asking the agent to perform. \
-                       Pick the ONE label that best describes the work the task requires."
-            .to_string(),
-        criteria,
     }
 }
 
@@ -149,8 +117,8 @@ pub struct RoutingDecision {
     pub target: Option<RouteTarget>,
 }
 
-/// Classify one turn's task text (capped at [`ROUTING_TEXT_MAX_CHARS`]) as
-/// trivial vs architectural.
+/// Classify one session's first prompt (capped at
+/// [`ROUTING_TEXT_MAX_CHARS`]) with the shared three-label question.
 ///
 /// `None` = no usable answer (disabled backend, timeout, malformed response,
 /// or a non-choice answer -- all treated as "no answer", mirroring the
@@ -161,20 +129,23 @@ pub struct RoutingDecision {
 pub async fn classify_task_text(
     classifier: &dyn Classifier,
     text: &str,
+    offered: super::route_question::OfferedLabels,
     threshold: f64,
 ) -> Option<RoutingDecision> {
     let capped = cap_task_text(text);
+    let question = super::route_question::route_question(offered)?;
     let Answer::Choice {
         label,
         confidence,
         probabilities,
-    } = classifier.classify(&capped, &routing_question()).await?
+    } = classifier.classify(&capped, &question).await?
     else {
         return None;
     };
     let target = match label.as_str() {
-        ROUTING_LABEL_TRIVIAL if confidence >= threshold => Some(RouteTarget::Cheap),
-        ROUTING_LABEL_ARCHITECTURAL if confidence >= threshold => Some(RouteTarget::Capable),
+        super::route_question::LABEL_TRIVIAL if confidence >= threshold => Some(RouteTarget::Cheap),
+        super::route_question::LABEL_ROUTINE if confidence >= threshold => Some(RouteTarget::Routine),
+        super::route_question::LABEL_HARD if confidence >= threshold => Some(RouteTarget::Capable),
         _ => None,
     };
     Some(RoutingDecision {
@@ -285,6 +256,75 @@ pub fn routing_log_path() -> PathBuf {
     training_log_dir().join("routing.jsonl")
 }
 
+/// The once-per-session routing log, beside the legacy per-turn log.
+pub fn session_routing_log_path() -> PathBuf {
+    training_log_dir().join("session_routing.jsonl")
+}
+
+/// Append-only calibration events for Mnemo1's route-once lifecycle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum SessionRoutingRow {
+    /// The first classifiable prompt's answer and the action taken.
+    Route {
+        /// Unix milliseconds.
+        ts: u64,
+        /// The routed agent.
+        agent_id: String,
+        /// Laya's verbatim label.
+        label: String,
+        /// Laya's calibrated confidence.
+        confidence: f64,
+        /// The first-prompt gate.
+        threshold: f64,
+        /// Whether the label cleared the gate.
+        cleared: bool,
+        /// Whether the session's provider was actually replaced.
+        enforced: bool,
+        /// The selected `endpoint/model`, including a shadow-only pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Why no switch happened (`below_gate` / `unknown_label` / `shadow` /
+        /// `kept` / `no_target` / `needs_compaction` / `superseded`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skip: Option<String>,
+    },
+    /// A one-per-session suggestion after drift or tool failures.
+    Nudge {
+        /// Unix milliseconds.
+        ts: u64,
+        /// The nudged agent.
+        agent_id: String,
+        /// `drift`, `tool_failures`, or `repeat_failure`.
+        reason: String,
+        /// The higher label whose configured model is suggested.
+        to_label: String,
+    },
+    /// A human model pick, which ends routing for this session.
+    Reroute {
+        /// Unix milliseconds.
+        ts: u64,
+        /// The manually rerouted agent.
+        agent_id: String,
+        /// The previously routed model, or null when Laya had not switched it.
+        #[serde(default)]
+        from: Option<String>,
+        /// The human's model spec.
+        to: String,
+        /// Whether a nudge preceded the pick.
+        nudged: bool,
+    },
+    /// The session was cleared after a nudge without a manual pick.
+    NudgeIgnored {
+        /// Unix milliseconds.
+        ts: u64,
+        /// The agent whose nudge was ignored.
+        agent_id: String,
+        /// The label suggested by the ignored nudge.
+        to_label: String,
+    },
+}
+
 /// A unique-enough id joining one turn's decision and outcome rows
 /// (`<unix-millis>-<agent_id>`).
 pub fn new_turn_id(agent_id: &str) -> String {
@@ -336,6 +376,8 @@ pub struct RoutingGate {
     /// [`routing_log_path`]; tests point it at a temp file, so a suite run
     /// never touches the real training corpus.
     log_path: PathBuf,
+    /// The sibling route-once corpus, redirected with the legacy log in tests.
+    session_log_path: PathBuf,
 }
 
 impl RoutingGate {
@@ -345,12 +387,14 @@ impl RoutingGate {
         Self {
             classifier,
             log_path: routing_log_path(),
+            session_log_path: session_routing_log_path(),
         }
     }
 
     /// Redirect this gate's routing log to `path` (tests; the app keeps the
     /// default). Replaces [`new`](Self::new)'s default path.
     pub fn with_log_path(mut self, path: PathBuf) -> Self {
+        self.session_log_path = path.with_file_name("session_routing.jsonl");
         self.log_path = path;
         self
     }
@@ -358,6 +402,11 @@ impl RoutingGate {
     /// The routing log this gate appends to.
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    /// The route-once session log this gate and its IPC callers append to.
+    pub fn session_log_path(&self) -> &Path {
+        &self.session_log_path
     }
 
     /// The classifier installed in the shared slot right now (`None` while
@@ -374,11 +423,16 @@ impl RoutingGate {
 /// The live routing policy, read from `[general.routing]` per turn.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RoutingPolicy {
-    /// The calibrated-probability gate a classification must clear to route.
+    /// The legacy step-lane gate; first-prompt routing uses
+    /// `first_prompt_min_confidence` instead.
     pub threshold: f64,
     /// Whether a confident decision switches the model (`false` = shadow:
     /// classify + log only, model untouched).
     pub enforce: bool,
+    /// Labels offered to the shared question after unset targets fold away.
+    pub offered: super::route_question::OfferedLabels,
+    /// The calibrated first-prompt gate for `offered.count()`.
+    pub first_prompt_min_confidence: f64,
 }
 
 #[cfg(test)]
@@ -387,6 +441,8 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    use crate::memory::classifier::Question;
 
     use async_trait::async_trait;
 
@@ -397,6 +453,7 @@ mod tests {
         answer: Option<Answer>,
         calls: Arc<AtomicUsize>,
         seen: Arc<Mutex<String>>,
+        question: Arc<Mutex<Option<Question>>>,
     }
 
     impl StubClassifier {
@@ -405,16 +462,26 @@ mod tests {
                 answer,
                 calls: Arc::new(AtomicUsize::new(0)),
                 seen: Arc::new(Mutex::new(String::new())),
+                question: Arc::new(Mutex::new(None)),
             }
         }
     }
 
     #[async_trait]
     impl Classifier for StubClassifier {
-        async fn classify(&self, state: &str, _question: &Question) -> Option<Answer> {
+        async fn classify(&self, state: &str, question: &Question) -> Option<Answer> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             *self.seen.lock().expect("seen lock") = state.to_string();
+            *self.question.lock().expect("question lock") = Some(question.clone());
             self.answer.clone()
+        }
+    }
+
+    fn all_offered() -> crate::agent::route_question::OfferedLabels {
+        crate::agent::route_question::OfferedLabels {
+            trivial: true,
+            routine: true,
+            hard: true,
         }
     }
 
@@ -426,80 +493,74 @@ mod tests {
         })
     }
 
-    #[test]
-    fn routing_question_offers_both_labels_with_descriptions() {
-        let Question::Choice {
-            instructions,
-            criteria,
-        } = routing_question()
-        else {
-            panic!("routing_question must be a choice question");
+    #[tokio::test]
+    async fn classify_task_text_uses_the_shared_question() {
+        let offered = crate::agent::route_question::OfferedLabels {
+            trivial: true,
+            routine: true,
+            hard: true,
         };
-        assert!(!instructions.is_empty());
-        let labels: Vec<_> = criteria.keys().cloned().collect();
-        assert_eq!(
-            labels,
-            vec![
-                ROUTING_LABEL_ARCHITECTURAL.to_string(),
-                ROUTING_LABEL_TRIVIAL.to_string()
-            ]
-        );
-        for description in criteria.values() {
-            assert!(!description.is_empty());
-        }
+        let stub = StubClassifier::new(choice("hard", 0.91));
+        let decision = classify_task_text(&stub, "design a storage engine", offered, 0.475)
+            .await
+            .expect("decision");
+        assert_eq!(decision.target, Some(RouteTarget::Capable));
+        let actual = stub.question.lock().expect("question lock").clone();
+        let expected = crate::agent::route_question::route_question(offered);
+        assert_eq!(actual, expected, "Mnemo1 asks the kernel question byte-for-byte");
     }
 
     #[tokio::test]
     async fn confident_answers_pick_their_target() {
-        let trivial = StubClassifier::new(choice(ROUTING_LABEL_TRIVIAL, 0.9));
-        let decision = classify_task_text(&trivial, "bump the version", 0.80)
+        let trivial = StubClassifier::new(choice(crate::agent::route_question::LABEL_TRIVIAL, 0.9));
+        let decision = classify_task_text(&trivial, "bump the version", all_offered(), 0.80)
             .await
             .expect("decision");
-        assert_eq!(decision.label, ROUTING_LABEL_TRIVIAL);
+        assert_eq!(decision.label, crate::agent::route_question::LABEL_TRIVIAL);
         assert!((decision.confidence - 0.9).abs() < 1e-9);
         assert_eq!(decision.target, Some(RouteTarget::Cheap));
 
-        let architectural = StubClassifier::new(choice(ROUTING_LABEL_ARCHITECTURAL, 0.95));
-        let decision = classify_task_text(&architectural, "add a new feature", 0.80)
+        let architectural = StubClassifier::new(choice(crate::agent::route_question::LABEL_HARD, 0.95));
+        let decision = classify_task_text(&architectural, "add a new feature", all_offered(), 0.80)
             .await
             .expect("decision");
-        assert_eq!(decision.label, ROUTING_LABEL_ARCHITECTURAL);
+        assert_eq!(decision.label, crate::agent::route_question::LABEL_HARD);
         assert_eq!(decision.target, Some(RouteTarget::Capable));
     }
 
     #[tokio::test]
     async fn threshold_is_inclusive_and_below_keeps_no_target() {
-        let at = StubClassifier::new(choice(ROUTING_LABEL_TRIVIAL, 0.80));
-        let decision = classify_task_text(&at, "typo", 0.80).await.expect("decision");
+        let at = StubClassifier::new(choice(crate::agent::route_question::LABEL_TRIVIAL, 0.80));
+        let decision = classify_task_text(&at, "typo", all_offered(), 0.80).await.expect("decision");
         assert_eq!(decision.target, Some(RouteTarget::Cheap));
 
-        let below = StubClassifier::new(choice(ROUTING_LABEL_TRIVIAL, 0.79));
-        let decision = classify_task_text(&below, "typo", 0.80)
+        let below = StubClassifier::new(choice(crate::agent::route_question::LABEL_TRIVIAL, 0.79));
+        let decision = classify_task_text(&below, "typo", all_offered(), 0.80)
             .await
             .expect("decision");
         assert_eq!(decision.target, None);
         // The answer still rides the log: a below-threshold pick is the
         // calibration signal the corpus exists to collect.
-        assert_eq!(decision.label, ROUTING_LABEL_TRIVIAL);
+        assert_eq!(decision.label, crate::agent::route_question::LABEL_TRIVIAL);
         assert!((decision.confidence - 0.79).abs() < 1e-9);
     }
 
     #[tokio::test]
     async fn no_answer_and_non_choice_answers_yield_none() {
         let none = StubClassifier::new(None);
-        assert!(classify_task_text(&none, "typo", 0.80).await.is_none());
+        assert!(classify_task_text(&none, "typo", all_offered(), 0.80).await.is_none());
 
         let scored = StubClassifier::new(Some(Answer::Score {
             value: 1.0,
             confidence: 0.99,
         }));
-        assert!(classify_task_text(&scored, "typo", 0.80).await.is_none());
+        assert!(classify_task_text(&scored, "typo", all_offered(), 0.80).await.is_none());
     }
 
     #[tokio::test]
     async fn unknown_label_records_the_answer_but_picks_no_target() {
         let odd = StubClassifier::new(choice("medium", 0.99));
-        let decision = classify_task_text(&odd, "something", 0.80)
+        let decision = classify_task_text(&odd, "something", all_offered(), 0.80)
             .await
             .expect("decision");
         assert_eq!(decision.label, "medium");
@@ -508,9 +569,9 @@ mod tests {
 
     #[tokio::test]
     async fn task_text_is_capped_before_the_classifier_sees_it() {
-        let stub = StubClassifier::new(choice(ROUTING_LABEL_TRIVIAL, 0.9));
+        let stub = StubClassifier::new(choice(crate::agent::route_question::LABEL_TRIVIAL, 0.9));
         let long = "x".repeat(ROUTING_TEXT_MAX_CHARS + 500);
-        classify_task_text(&stub, &long, 0.80).await.expect("decision");
+        classify_task_text(&stub, &long, all_offered(), 0.80).await.expect("decision");
         let seen = stub.seen.lock().expect("seen lock").clone();
         assert_eq!(seen.chars().count(), ROUTING_TEXT_MAX_CHARS);
         assert_eq!(stub.calls.load(Ordering::Relaxed), 1);
@@ -521,14 +582,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("routing.jsonl");
         let mut probabilities = BTreeMap::new();
-        probabilities.insert(ROUTING_LABEL_TRIVIAL.to_string(), 0.93);
-        probabilities.insert(ROUTING_LABEL_ARCHITECTURAL.to_string(), 0.07);
+        probabilities.insert(crate::agent::route_question::LABEL_TRIVIAL.to_string(), 0.93);
+        probabilities.insert(crate::agent::route_question::LABEL_HARD.to_string(), 0.07);
         let decision = RouteDecisionRow {
             ts: 1_700_000_000_000,
             turn_id: "1700000000000-main".into(),
             agent_id: "main".into(),
             shadow: true,
-            label: ROUTING_LABEL_TRIVIAL.into(),
+            label: crate::agent::route_question::LABEL_TRIVIAL.into(),
             confidence: 0.93,
             threshold: 0.80,
             target: Some(RouteTarget::Cheap.label().to_string()),
@@ -570,6 +631,7 @@ mod tests {
         assert_eq!(RouteTarget::High.label(), "high");
         assert_eq!(RouteTarget::Escalate.label(), "escalate");
         assert_eq!(RouteTarget::Cheap.label(), "cheap");
+        assert_eq!(RouteTarget::Routine.label(), "routine");
         assert_eq!(RouteTarget::Capable.label(), "capable");
     }
 

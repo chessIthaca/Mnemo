@@ -1341,6 +1341,15 @@ export const reduceModelSwapSummarized: Reducer<Ev<"model_swap_summarized">> = (
   return { agent: next };
 };
 
+/** routing_notice: Laya's route or one-shot suggestion is informational
+ *  transcript output. Like a completed model-swap summary it changes no busy,
+ *  failed, or compacting/phase state. */
+export const reduceRoutingNotice: Reducer<Ev<"routing_notice">> = (agent, event) => {
+  const next = { ...agent };
+  pushTranscriptEntry(next, { kind: "assistant", text: event.text });
+  return { agent: next };
+};
+
 /**
  * memory_recalled: the per-turn auto-recall injected memories into the
  * agent's prompt. Rendered as a read-only `memory` transcript entry so
@@ -1606,6 +1615,7 @@ export function applyAgentEvent(
     case "skill_started": result = reduceSkillStarted(agent, event); break;
     case "model_changed": result = reduceModelChanged(agentId)(agent, event); break;
     case "model_swap_summarized": result = reduceModelSwapSummarized(agent, event); break;
+      case "routing_notice": result = reduceRoutingNotice(agent, event); break;
     case "memory_recalled": result = reduceMemoryRecalled(agent, event); break;
     case "finished": result = reduceFinished(agent, event); break;
     case "parked": result = reduceParked(agent, event); break;

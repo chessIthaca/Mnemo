@@ -38,6 +38,72 @@ pub(crate) type ExplicitProvider =
 pub(crate) type ServedEffective =
     std::sync::Mutex<Option<(String, Option<String>, Option<String>)>>;
 
+/// The once-per-session first-prompt routing lifecycle.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteOnce {
+    /// No classifiable first prompt has been handled yet.
+    Pending,
+    /// The first prompt was classified; later prompts may only nudge.
+    Settled {
+        /// Laya's answer, when it returned a choice.
+        label: Option<String>,
+        /// The calibrated confidence of that answer.
+        confidence: Option<f64>,
+        /// The model spec installed by an enforced route, if any.
+        model: Option<String>,
+    },
+    /// Routing is permanently off for this session incarnation.
+    Off {
+        /// `too_short`, `offline`, `resumed`, `manual`, or `ended`.
+        reason: &'static str,
+    },
+}
+
+/// All route-once lifecycle fields whose transitions must be atomic with a
+/// manual pick, Clear, or a first-classification commit. One std mutex protects
+/// the complete state; detached drift tasks clone only its `Arc` and lock for
+/// the final nudge claim, never across an await.
+#[derive(Debug)]
+pub(crate) struct RouteSessionState {
+    /// The first-prompt lifecycle.
+    pub(crate) route_once: RouteOnce,
+    /// Invalidates classification/drift answers from an earlier incarnation.
+    pub(crate) epoch: u64,
+    /// Whether the one permitted post-route suggestion has been emitted.
+    pub(crate) nudge_sent: bool,
+    /// The outstanding nudge's target, retained for `nudge_ignored`.
+    pub(crate) nudge_to_label: Option<String>,
+}
+
+impl RouteSessionState {
+    fn new() -> Self {
+        Self {
+            route_once: RouteOnce::Pending,
+            epoch: 0,
+            nudge_sent: false,
+            nudge_to_label: None,
+        }
+    }
+}
+
+/// Everything needed to publish a claimed nudge synchronously while the
+/// route-state lock is still held. Owned so a detached drift task can carry it.
+pub(crate) struct NudgeNotice {
+    /// Agent receiving the notice and owning the log row.
+    pub(crate) agent_id: crate::runtime::AgentId,
+    /// `drift`, `tool_failures`, or `repeat_failure`.
+    pub(crate) reason: &'static str,
+    /// Human-readable model suggestion.
+    pub(crate) text: String,
+    /// Session log destination, when a routing gate is attached.
+    pub(crate) log_path: Option<std::path::PathBuf>,
+    /// Bounded event channel; publication uses `try_send`, never `.await`.
+    pub(crate) fanin_tx: tokio::sync::mpsc::Sender<(
+        crate::runtime::AgentId,
+        crate::runtime::AgentEvent,
+    )>,
+}
+
 /// Per-session state extracted from [`AgentLoop`] (A2: reduce the loop's field
 /// count). Holds the memory session id + the prompt-token cache heuristic.
 /// Both are behind `Mutex` so they can be mutated through a `&AgentLoop`.
@@ -403,6 +469,10 @@ pub struct AgentLoop {
     /// not silently undo an explicit per-agent choice) — but see
     /// [`pinned_state`](Self::pinned_state) for where it yields.
     pub(crate) explicit_provider: ExplicitProvider,
+    /// Whether `explicit_provider` / `pending_swap` belongs to Laya rather
+    /// than the human picker. External provider changes clear ONLY this pin;
+    /// a human pin keeps its historical global-swap dormancy semantics.
+    routed_pin: std::sync::Mutex<bool>,
     /// The workflow state the picker pin was first SERVED in — the pin's
     /// scope. Lazily stamped by [`resolve_turn_provider`](Self::resolve_turn_provider)
     /// (the pin exists the moment the picker acts; the state is recorded at
@@ -624,6 +694,12 @@ pub struct AgentLoop {
     /// rows are written for them (Mnemo2 routes once at dispatch instead).
     /// `false` = the per-turn gate (Mnemo1, unchanged).
     pub(crate) skip_turn_routing: std::sync::atomic::AtomicBool,
+    /// Mnemo1's route lifecycle, epoch, and nudge claim under ONE lock.
+    pub(crate) route_session: Arc<std::sync::Mutex<RouteSessionState>>,
+    /// Consecutive failed-or-repeated tool calls behind a stuck nudge.
+    pub(crate) strikes: std::sync::Mutex<super::route_question::Strikes>,
+    /// The previous signature, used only to choose the stuck-nudge wording.
+    pub(crate) last_route_tool_signature: std::sync::Mutex<Option<String>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -1138,6 +1214,7 @@ impl AgentLoop {
             fill_rate: 0.5,
             forced_model: std::sync::Mutex::new(None),
             explicit_provider: Arc::new(RwLock::new(None)),
+            routed_pin: std::sync::Mutex::new(false),
             pinned_state: std::sync::Mutex::new(None),
             fallback_endpoints: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_swap: Arc::new(std::sync::Mutex::new(None)),
@@ -1178,6 +1255,9 @@ impl AgentLoop {
             // session out (`set_skip_turn_routing`) — every constructor
             // starts with the per-turn gate in force.
             skip_turn_routing: std::sync::atomic::AtomicBool::new(false),
+            route_session: Arc::new(std::sync::Mutex::new(RouteSessionState::new())),
+            strikes: std::sync::Mutex::new(super::route_question::Strikes::new(3)),
+            last_route_tool_signature: std::sync::Mutex::new(None),
         }
     }
 
@@ -1353,6 +1433,292 @@ impl AgentLoop {
     pub fn with_routing_gate(mut self, gate: model_routing::RoutingGate) -> Self {
         self.routing = Some(gate);
         self
+    }
+
+    /// Return a snapshot of this session's first-prompt routing state.
+    pub fn route_once(&self) -> RouteOnce {
+        self.route_once_with_epoch().0
+    }
+
+    /// Snapshot the lifecycle and its epoch from the same critical section.
+    pub(crate) fn route_once_with_epoch(&self) -> (RouteOnce, u64) {
+        let state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        (state.route_once.clone(), state.epoch)
+    }
+
+    /// Whether the live `[general.laya] routing` opt-in currently exposes a
+    /// first-prompt policy FOR THIS LOOP. Subagents and sessions that opted out
+    /// of turn routing (Mnemo2 leads/workers route at dispatch) must not write
+    /// Mnemo1 session rows from an external model change.
+    pub fn session_routing_enabled(&self) -> bool {
+        !self.is_subagent()
+            && !self.skip_turn_routing()
+            && self
+                .model_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.routing_policy())
+                .is_some()
+    }
+
+    /// Transition to manual in one critical section. With `only_if_active`, an
+    /// already Off/ended session is left untouched and returns `None`, which
+    /// prevents duplicate reroutes when two external surfaces race.
+    fn transition_to_manual_inner(
+        &self,
+        only_if_active: bool,
+    ) -> Option<(Option<String>, bool)> {
+        let (previous, nudged) = {
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            if only_if_active
+                && !matches!(
+                    state.route_once,
+                    RouteOnce::Pending | RouteOnce::Settled { .. }
+                )
+            {
+                return None;
+            }
+            let previous = match &state.route_once {
+                RouteOnce::Settled { model, .. } => model.clone(),
+                _ => None,
+            };
+            let nudged = state.nudge_sent;
+            state.route_once = RouteOnce::Off { reason: "manual" };
+            state.epoch = state.epoch.wrapping_add(1);
+            state.nudge_sent = false;
+            state.nudge_to_label = None;
+            (previous, nudged)
+        };
+        self.strikes.lock().expect("route strikes lock poisoned").reset();
+        *self
+            .last_route_tool_signature
+            .lock()
+            .expect("last tool signature lock poisoned") = None;
+        Some((previous, nudged))
+    }
+
+    fn transition_to_manual(&self) -> (Option<String>, bool) {
+        self.transition_to_manual_inner(false)
+            .unwrap_or((None, false))
+    }
+
+    /// Record a human model pick without appending a reroute row. Used by the
+    /// race tests and by callers that only need the previous routed model.
+    pub fn note_manual_model_choice(&self, _to: &str) -> Option<String> {
+        self.transition_to_manual().0
+    }
+
+    /// Mark a human pick and append its reroute row through the SAME kernel
+    /// path used by IPC and tests. Routing-off or already-final picks remain
+    /// byte-identical. Returns `(previously routed model, nudge outstanding)`.
+    pub fn record_manual_model_choice(&self, to: &str) -> (Option<String>, bool) {
+        if !self.session_routing_enabled() {
+            return (None, false);
+        }
+        let Some((from, nudged)) = self.transition_to_manual_inner(true) else {
+            return (None, false);
+        };
+        self.append_session_routing_row(&model_routing::SessionRoutingRow::Reroute {
+            ts: model_routing::now_millis(),
+            agent_id: self.agent_id().unwrap_or(0).to_string(),
+            from: from.clone(),
+            to: to.to_string(),
+            nudged,
+        });
+        (from, nudged)
+    }
+
+
+    /// Whether a routing nudge is currently awaiting a human response.
+    pub fn routing_nudged(&self) -> bool {
+        self.route_session
+            .lock()
+            .expect("route-session lock poisoned")
+            .nudge_sent
+    }
+
+    /// Append one route-once event to this loop's redirected session log.
+    /// Logging is best-effort and never changes the model pick.
+    pub fn append_session_routing_row(&self, row: &model_routing::SessionRoutingRow) {
+        if let Some(gate) = &self.routing {
+            model_routing::append_row(gate.session_log_path(), row);
+        }
+    }
+
+    /// Atomically return any outstanding nudge and restore the initial route
+    /// state. A drift claim either wins first and is returned for logging, or
+    /// loses to the epoch/Pending transition and can never be lost between two
+    /// separate locks.
+    pub(crate) fn clear_route_session(&self) -> Option<String> {
+        let outstanding = {
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            let outstanding = if state.nudge_sent {
+                state.nudge_to_label.take()
+            } else {
+                state.nudge_to_label = None;
+                None
+            };
+            state.route_once = RouteOnce::Pending;
+            state.epoch = state.epoch.wrapping_add(1);
+            state.nudge_sent = false;
+            outstanding
+        };
+        self.strikes.lock().expect("route strikes lock poisoned").reset();
+        *self
+            .last_route_tool_signature
+            .lock()
+            .expect("last tool signature lock poisoned") = None;
+        outstanding
+    }
+
+    /// Atomically invalidate all in-flight drift work and return any nudge
+    /// still outstanding at session termination. Off prevents a new claim;
+    /// the epoch bump rejects a task that snapshotted the old Settled state.
+    pub(crate) fn end_route_session(&self) -> Option<String> {
+        let mut state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        let outstanding = if state.nudge_sent {
+            state.nudge_to_label.take()
+        } else {
+            state.nudge_to_label = None;
+            None
+        };
+        state.route_once = RouteOnce::Off { reason: "ended" };
+        state.epoch = state.epoch.wrapping_add(1);
+        state.nudge_sent = false;
+        outstanding
+    }
+
+    /// Mark a resumed session as ineligible for first-prompt routing.
+    pub(crate) fn mark_route_once_resumed(&self) {
+        let mut state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        state.route_once = RouteOnce::Off { reason: "resumed" };
+        state.epoch = state.epoch.wrapping_add(1);
+        state.nudge_sent = false;
+        state.nudge_to_label = None;
+    }
+
+    /// Validate and claim a nudge while the caller holds `route_session`.
+    fn claim_nudge_locked(
+        state: &mut RouteSessionState,
+        to_label: &str,
+        expected_epoch: Option<u64>,
+    ) -> bool {
+        if ![
+            super::route_question::LABEL_TRIVIAL,
+            super::route_question::LABEL_ROUTINE,
+            super::route_question::LABEL_HARD,
+        ]
+        .contains(&to_label)
+            || !matches!(state.route_once, RouteOnce::Settled { .. })
+            || expected_epoch.is_some_and(|epoch| epoch != state.epoch)
+            || state.nudge_sent
+        {
+            return false;
+        }
+        state.nudge_sent = true;
+        state.nudge_to_label = Some(to_label.to_string());
+        true
+    }
+
+    /// Test-only bare claim used to race the state linearization point without
+    /// constructing a notice. Production nudges use `claim_and_publish_nudge`.
+    #[cfg(test)]
+    pub(crate) fn claim_nudge(
+        session: &Arc<std::sync::Mutex<RouteSessionState>>,
+        to_label: &str,
+        expected_epoch: Option<u64>,
+    ) -> bool {
+        let mut state = session.lock().expect("route-session lock poisoned");
+        Self::claim_nudge_locked(&mut state, to_label, expected_epoch)
+    }
+
+    /// Claim and publish a nudge without ever consuming it unobservably.
+    ///
+    /// Capacity is reserved BEFORE the critical section, so a full channel
+    /// waits instead of dropping the notice; a CLOSED channel publishes
+    /// nothing, so the nudge is left unclaimed for a later attempt. Once the
+    /// permit is held, the claim, the synchronous row append and the
+    /// infallible `Permit::send` all happen inside one critical section — no
+    /// await is ever held under the route-state lock.
+    pub(crate) async fn claim_and_publish_nudge(
+        session: &Arc<std::sync::Mutex<RouteSessionState>>,
+        to_label: &str,
+        expected_epoch: Option<u64>,
+        publication: NudgeNotice,
+    ) -> bool {
+        let NudgeNotice {
+            agent_id,
+            reason,
+            text,
+            log_path,
+            fanin_tx,
+        } = publication;
+        // Reserve capacity OUTSIDE the lock. A full channel therefore WAITS
+        // instead of silencing the one nudge the session may ever send; a
+        // CLOSED channel returns early so nothing is claimed or logged.
+        let Ok(permit) = fanin_tx.reserve().await else {
+            return false;
+        };
+        let mut state = session.lock().expect("route-session lock poisoned");
+        if !Self::claim_nudge_locked(&mut state, to_label, expected_epoch) {
+            drop(permit);
+            return false;
+        }
+        if let Some(path) = log_path {
+            model_routing::append_row(
+                &path,
+                &model_routing::SessionRoutingRow::Nudge {
+                    ts: model_routing::now_millis(),
+                    agent_id: agent_id.to_string(),
+                    reason: reason.to_string(),
+                    to_label: to_label.to_string(),
+                },
+            );
+        }
+        // The reserved permit cannot fail, so the claim just taken is always
+        // observable. `send` is synchronous: no await under the lock.
+        permit.send((
+            agent_id,
+            crate::runtime::AgentEvent::RoutingNotice {
+                kind: "nudge".to_string(),
+                text,
+            },
+        ));
+        true
+    }
+
+    /// Append the nudge returned by [`clear_route_session`](Self::clear_route_session)
+    /// or [`end_route_session`](Self::end_route_session). Those methods consume
+    /// the outstanding claim atomically, so this shared row helper is called at
+    /// most once for clear-then-end and repeated termination cleanup alike.
+    pub(crate) fn log_nudge_ignored(
+        &self,
+        agent_id: crate::runtime::AgentId,
+        outstanding: Option<String>,
+    ) {
+        if let Some(to_label) = outstanding {
+            self.append_session_routing_row(
+                &model_routing::SessionRoutingRow::NudgeIgnored {
+                    ts: model_routing::now_millis(),
+                    agent_id: agent_id.to_string(),
+                    to_label,
+                },
+            );
+        }
     }
 
     /// Attach the compound-reflex handle (the Laya classifier's compound
@@ -1890,7 +2256,9 @@ impl AgentLoop {
     ///    `[models.planning]` etc.), while in any OTHER state it holds only
     ///    until a configured `[models.*]` model takes over (2026-12-20) —
     ///    with nothing configured for the new state the pin keeps serving.
-    ///    The pin is never deleted by a swap; it goes dormant instead.
+    ///    A human pin is never deleted by a global swap; it goes dormant.
+    ///    Laya's routed pin is the exception: an external provider change
+    ///    clears it in `note_external_model_change` so the human model serves.
     /// 3. **Forced model** — when [`forced_model`](Self::forced_model) is set
     ///    (a `spawn_agent` call passed a `model` argument), it's used
     ///    directly — the subagent/state resolution chain is skipped.
@@ -2402,6 +2770,17 @@ impl AgentLoop {
             .clone()
     }
 
+    /// The live provider's `endpoint/model` spec (or its bare model for test
+    /// doubles without an endpoint name).
+    pub fn current_model_spec(&self) -> String {
+        let provider = self.provider();
+        if provider.provider_name().is_empty() {
+            provider.model().to_string()
+        } else {
+            format!("{}/{}", provider.provider_name(), provider.model())
+        }
+    }
+
     /// A handle to the context manager, for manual compaction (`/compact`).
     /// Clones the `ContextManager` (cheap — two `usize`s) so the caller can
     /// call `summarize_with_interrupt` without holding the lock. The clone
@@ -2438,8 +2817,65 @@ impl AgentLoop {
     /// [`set_explicit_provider`] for where it yields to a configured
     /// `[models.*]` slot on a workflow-state change. Plain `set_provider`
     /// remains the *default* slot swap (factory rebuilds, global console
-    /// switches) and never pins anything.
+    /// switches) and never creates a pin; it clears Laya's prior routed pin so
+    /// the external default can serve.
     pub fn set_provider(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+    ) {
+        let new_spec = Self::provider_spec(provider.as_ref());
+        let _ = self.note_external_model_change(&new_spec);
+        self.set_provider_internal(provider, context_manager);
+    }
+
+    fn provider_spec(provider: &dyn LlmClient) -> String {
+        if provider.provider_name().is_empty() {
+            provider.model().to_string()
+        } else {
+            format!("{}/{}", provider.provider_name(), provider.model())
+        }
+    }
+
+    /// External provider changes are human model choices only when routing is
+    /// active and the spec actually changes. The reroute is recorded BEFORE
+    /// the new provider is installed; every such change also clears Laya's
+    /// explicit pin so the external model can really serve.
+    fn note_external_model_change(&self, new_spec: &str) -> (Option<String>, bool) {
+        let outcome = if self.current_model_spec() != new_spec && self.session_routing_enabled() {
+            self.record_manual_model_choice(new_spec)
+        } else {
+            (None, false)
+        };
+        self.clear_routed_pin();
+        outcome
+    }
+
+    fn clear_routed_pin(&self) {
+        let routed = std::mem::take(
+            &mut *self
+                .routed_pin
+                .lock()
+                .expect("routed-pin lock poisoned"),
+        );
+        if routed {
+            *self
+                .explicit_provider
+                .write()
+                .expect("explicit_provider lock poisoned") = None;
+            *self
+                .pinned_state
+                .lock()
+                .expect("pinned_state lock poisoned") = None;
+            *self
+                .pending_swap
+                .lock()
+                .expect("pending_swap lock poisoned") = None;
+        }
+    }
+
+    /// Internal default-provider swap: never a human routing decision.
+    pub(crate) fn set_provider_internal(
         &self,
         provider: Arc<dyn LlmClient>,
         context_manager: super::context::ContextManager,
@@ -2450,11 +2886,9 @@ impl AgentLoop {
             .write()
             .expect("context_manager lock poisoned") = context_manager
             .with_compaction_raise(Arc::clone(&self.compaction_raise));
-        // A different model means a different window and a different
-        // trigger — the ladder restarts at 1.0 (it is recomputed against the
-        // new window's cap on the next failed compaction).
         self.compaction_raise.reset();
     }
+
 
     /// Publish the conversation's token COUNT to the loop — the measure every
     /// compact-before-switch decision uses. The conversation itself is never
@@ -2579,22 +3013,47 @@ impl AgentLoop {
         provider: Arc<dyn LlmClient>,
         context_manager: super::context::ContextManager,
     ) {
-        // A fresh pick discards the old stamp: the new pin is re-stamped
-        // with the state of its first serve (see `pinned_state`). Placed at
-        // the top so it covers both the immediate path and the deferred
-        // path — the deferred swap completes by writing `explicit_provider`
-        // directly in `run_turn` (same pick), and its first serve re-stamps.
+        let new_spec = Self::provider_spec(provider.as_ref());
+        let _ = self.note_external_model_change(&new_spec);
+        self.set_explicit_provider_internal(provider, context_manager, false);
+    }
+
+    /// Install an explicit pin without treating it as an external model pick.
+    /// `routed` distinguishes Laya's clearable pin from the human picker's.
+    fn set_explicit_provider_internal(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+        routed: bool,
+    ) {
+        *self
+            .routed_pin
+            .lock()
+            .expect("routed-pin lock poisoned") = routed;
         *self
             .pinned_state
             .lock()
             .expect("pinned_state lock poisoned") = None;
+        if routed {
+            // First-prompt routing NEVER defers: a pending routed swap could
+            // complete after a later manual pick and reinstall Laya's model.
+            debug_assert!(
+                !self.swap_needs_compaction(&context_manager),
+                "pin_routed_provider must not be called when compaction is needed"
+            );
+            self.set_provider_internal(provider.clone(), context_manager.clone());
+            *self
+                .pending_swap
+                .lock()
+                .expect("pending_swap lock poisoned") = None;
+            *self
+                .explicit_provider
+                .write()
+                .expect("explicit_provider lock poisoned") =
+                Some((provider, context_manager));
+            return;
+        }
         if self.swap_needs_compaction(&context_manager) {
-            // The live conversation exceeds what the NEW model's context
-            // manager allows — defer the swap so the turn loop can summarize
-            // using the OLD provider first. A merely smaller window is NOT
-            // enough (2027-11-02 bug, plan 1238e0de): a conversation that
-            // already fits the new model swaps at once, with no
-            // summarization and no informational event.
             *self
                 .pending_swap
                 .lock()
@@ -2605,9 +3064,7 @@ impl AgentLoop {
             });
             return;
         }
-        self.set_provider(provider.clone(), context_manager.clone());
-        // Clear any stale deferred swap — a later immediate swap must not be
-        // overridden by a previously-deferred one the user superseded.
+        self.set_provider_internal(provider.clone(), context_manager.clone());
         *self
             .pending_swap
             .lock()
@@ -2616,6 +3073,16 @@ impl AgentLoop {
             .explicit_provider
             .write()
             .expect("explicit_provider lock poisoned") = Some((provider, context_manager));
+    }
+
+    /// The ONLY provider-pin path used by Laya's first-prompt commit. It must
+    /// not count as an external manual choice or emit a reroute row.
+    pub(crate) fn pin_routed_provider(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+    ) {
+        self.set_explicit_provider_internal(provider, context_manager, true);
     }
 
     /// Whether a deferred provider swap is pending (set by

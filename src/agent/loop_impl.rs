@@ -1436,12 +1436,11 @@ impl AgentLoop {
             .is_some()
     }
 
-    /// Record a human model pick. Routing stops for this session, any pending
-    /// nudge is cleared, and the previously Laya-routed model is returned for
-    /// the reroute log row. State, epoch, and nudge change in ONE critical
-    /// section so an in-flight classifier cannot commit behind this pick.
-    pub fn note_manual_model_choice(&self, _to: &str) -> Option<String> {
-        let previous = {
+    /// Transition to manual in one critical section, returning the previously
+    /// Laya-routed model and whether a nudge was outstanding. Strike counters
+    /// are reset after releasing the route-state lock.
+    fn transition_to_manual(&self) -> (Option<String>, bool) {
+        let (previous, nudged) = {
             let mut state = self
                 .route_session
                 .lock()
@@ -1450,29 +1449,36 @@ impl AgentLoop {
                 RouteOnce::Settled { model, .. } => model.clone(),
                 _ => None,
             };
+            let nudged = state.nudge_sent;
             state.route_once = RouteOnce::Off { reason: "manual" };
             state.epoch = state.epoch.wrapping_add(1);
             state.nudge_sent = false;
             state.nudge_to_label = None;
-            previous
+            (previous, nudged)
         };
         self.strikes.lock().expect("route strikes lock poisoned").reset();
         *self
             .last_route_tool_signature
             .lock()
             .expect("last tool signature lock poisoned") = None;
-        previous
+        (previous, nudged)
     }
 
-    /// Record a human pick and append its reroute row through the SAME kernel
-    /// path used by IPC and tests. Routing-off picks remain byte-identical:
-    /// no state transition and no row. The previously routed model is returned.
-    pub fn record_manual_model_choice(&self, to: &str) -> Option<String> {
+    /// Record a human model pick without appending a reroute row. Used by the
+    /// race tests and by callers that only need the previous routed model.
+    pub fn note_manual_model_choice(&self, _to: &str) -> Option<String> {
+        self.transition_to_manual().0
+    }
+
+    /// Mark a human pick and append its reroute row through the SAME kernel
+    /// path used by IPC and tests. Routing-off picks remain byte-identical.
+    /// Returns `(previously routed model, nudge was outstanding)`; both are
+    /// captured in the SAME critical section that installs Off and bumps epoch.
+    pub fn record_manual_model_choice(&self, to: &str) -> (Option<String>, bool) {
         if !self.session_routing_enabled() {
-            return None;
+            return (None, false);
         }
-        let nudged = self.routing_nudged();
-        let from = self.note_manual_model_choice(to);
+        let (from, nudged) = self.transition_to_manual();
         self.append_session_routing_row(&model_routing::SessionRoutingRow::Reroute {
             ts: model_routing::now_millis(),
             agent_id: self.agent_id().unwrap_or(0).to_string(),
@@ -1480,7 +1486,7 @@ impl AgentLoop {
             to: to.to_string(),
             nudged,
         });
-        from
+        (from, nudged)
     }
 
     /// Whether a routing nudge is currently awaiting a human response.

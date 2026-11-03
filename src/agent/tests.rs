@@ -16996,8 +16996,9 @@ async fn manual_pick_turns_routing_off_and_logs_a_reroute() {
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
     assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-cheap-model");
-    let from = agent.record_manual_model_choice("stub/manual-model");
+    let (from, nudged) = agent.record_manual_model_choice("stub/manual-model");
     assert_eq!(from.as_deref(), Some("stub/cheap-model"));
+    assert!(!nudged);
     assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }));
     let rows = read_session_routing_log(&session_path);
     assert!(rows.iter().any(|row| matches!(row,
@@ -17076,6 +17077,79 @@ async fn manual_pick_during_first_classification_wins() {
         model_routing::SessionRoutingRow::Route { skip: Some(skip), .. }
             if skip == "superseded"
     )));
+}
+
+#[tokio::test]
+async fn manual_mark_before_human_pin_wins() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(BlockingRoutingClassifier {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("design the routing architecture")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the first classifier call started");
+
+    // Production H1 order: Off{manual}/epoch is committed FIRST. Only then is
+    // the classifier released, and the human pin installed before the test
+    // yields back to the turn on this current-thread runtime.
+    let _ = agent.record_manual_model_choice("stub/manual-model");
+    release_tx.send(()).expect("release the classifier after the manual mark");
+    agent.set_explicit_provider(
+        routed_provider("manual-model", "from-manual"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    let outcome = turn.await.expect("turn task joins");
+
+    assert_eq!(outcome.text, "from-manual");
+    assert_eq!(agent.current_model_spec(), "manual-model");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelChanged { model, .. } if model == "capable-model"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "routed"
+    )));
+    assert!(read_session_routing_log(&session_log_path(&log_path))
+        .iter()
+        .any(|row| matches!(
+            row,
+            model_routing::SessionRoutingRow::Route { skip: Some(skip), .. }
+                if skip == "superseded"
+        )));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

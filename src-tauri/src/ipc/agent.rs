@@ -582,6 +582,26 @@ fn loops_to_reroute<T>(
         .collect()
 }
 
+/// Commit the manual route-state transition BEFORE the provider pin. The two
+/// injected operations make the production ordering directly testable; `pin`
+/// always runs, including effort-only and routing-off selections.
+async fn mark_manual_before_pin<T, Mark, MarkFuture, Pin, PinFuture>(
+    selected: Option<T>,
+    mark: Mark,
+    pin: Pin,
+) -> PinFuture::Output
+where
+    Mark: FnOnce(T) -> MarkFuture,
+    MarkFuture: std::future::Future<Output = ()>,
+    Pin: FnOnce() -> PinFuture,
+    PinFuture: std::future::Future,
+{
+    if let Some(selected) = selected {
+        mark(selected).await;
+    }
+    pin().await
+}
+
 /// Record a human model pick through the kernel's shared reroute-row helper.
 fn note_session_reroute(agent_loop: &mnemo::agent::AgentLoop, to: &str) {
     let _ = agent_loop.record_manual_model_choice(to);
@@ -686,15 +706,28 @@ pub async fn set_model(
                 .into_iter()
                 .next()
             });
-            match crate::ipc::config_io::swap_provider_into_loop(
-                &state.runtime.agent_loops,
-                id,
-                provider,
-                context_manager,
-                Some(display_effort.clone()),
+            let pin_effort = display_effort.clone();
+            let outcome = mark_manual_before_pin(
+                reroute_loop,
+                |agent_loop| {
+                    let spec = spec.clone();
+                    async move {
+                        note_session_reroute(agent_loop.as_ref(), &spec);
+                    }
+                },
+                move || async move {
+                    crate::ipc::config_io::swap_provider_into_loop(
+                        &state.runtime.agent_loops,
+                        id,
+                        provider,
+                        context_manager,
+                        Some(pin_effort),
+                    )
+                    .await
+                },
             )
-            .await
-            {
+            .await;
+            match outcome {
                 crate::ipc::config_io::SwapOutcome::NotFound => {
                     return Err(format!("no agent loop for agent {id}").into());
                 }
@@ -739,9 +772,6 @@ pub async fn set_model(
                     );
                 }
             }
-            if let Some(agent_loop) = reroute_loop {
-                note_session_reroute(agent_loop.as_ref(), &spec);
-            }
         }
         // Legacy global switch: factory + every live agent loop (the console
         // REPL and any pre-per-agent callers).
@@ -760,18 +790,31 @@ pub async fn set_model(
                     .collect::<Vec<_>>();
                 loops_to_reroute(candidates, &spec)
             };
-            let _ = crate::ipc::config_io::swap_live_provider(
-                &state,
-                &app,
-                provider,
-                context_manager,
-                model.clone(),
-                Some(display_effort.clone()),
+            let pin_model = model.clone();
+            let pin_effort = display_effort.clone();
+            mark_manual_before_pin(
+                Some(changed_loops),
+                |agent_loops| {
+                    let spec = spec.clone();
+                    async move {
+                        for agent_loop in agent_loops {
+                            note_session_reroute(agent_loop.as_ref(), &spec);
+                        }
+                    }
+                },
+                move || async move {
+                    let _ = crate::ipc::config_io::swap_live_provider(
+                        &state,
+                        &app,
+                        provider,
+                        context_manager,
+                        pin_model,
+                        Some(pin_effort),
+                    )
+                    .await;
+                },
             )
             .await;
-            for agent_loop in changed_loops {
-                note_session_reroute(agent_loop.as_ref(), &spec);
-            }
             eprintln!("switched model to '{model}' (provider {kind_label})");
         }
     }
@@ -1065,7 +1108,29 @@ pub async fn get_session_list(state: State<'_, IpcState>) -> Result<serde_json::
 mod tests {
     use crate::ipc::contract_fixtures::normalize_lf;
 
-    use super::loops_to_reroute;
+    use super::{loops_to_reroute, mark_manual_before_pin};
+
+    #[tokio::test]
+    async fn set_model_marks_manual_before_pinning() {
+        let selected = loops_to_reroute(
+            vec![("loop", "endpoint/old".to_string(), true)],
+            "endpoint/new",
+        )
+        .into_iter()
+        .next();
+        let order = std::cell::RefCell::new(Vec::new());
+        mark_manual_before_pin(
+            selected,
+            |_agent_loop| async {
+                order.borrow_mut().push("manual");
+            },
+            || async {
+                order.borrow_mut().push("pin");
+            },
+        )
+        .await;
+        assert_eq!(order.into_inner(), vec!["manual", "pin"]);
+    }
 
     #[test]
     fn loops_to_reroute_keeps_changed_routing_enabled_loops() {

@@ -282,6 +282,19 @@ pub struct WorkerRecord {
     /// Finding currently routed to the tracked fixer.
     #[serde(default)]
     pub fixer_finding_id: Option<String>,
+    /// Review rounds: `team_review` calls recorded on this worker.
+    #[serde(default)]
+    pub review_rounds: u32,
+    /// Fix rounds: `route_fix` and `review_fix` applications on this worker.
+    #[serde(default)]
+    pub fix_rounds: u32,
+    /// Independent audits dispatched against this worker.
+    #[serde(default)]
+    pub audits: u32,
+    /// The model specs this worker's sessions ran on, in order, with no
+    /// consecutive duplicates.
+    #[serde(default)]
+    pub models_used: Vec<String>,
     /// Successful local merge and optional revert.
     #[serde(default)]
     pub merge: Option<MergeRecord>,
@@ -316,6 +329,30 @@ fn kickoff_message(record: &WorkerRecord) -> &'static str {
         READ_BACK_KICKOFF
     } else {
         KICKOFF
+    }
+}
+
+/// The model a worker's session actually runs on: the lead's chosen spec, else
+/// the id the live session resolved, else the routing default.
+fn session_model_spec(worker: &WorkerRecord) -> &str {
+    worker
+        .model
+        .as_deref()
+        .filter(|spec| !spec.trim().is_empty())
+        .or_else(|| {
+            worker
+                .model_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+        })
+        .unwrap_or("default")
+}
+
+/// Record the model a worker's session actually runs on, in order of use and
+/// without consecutive duplicates: a resume on the same model adds nothing.
+fn note_model(worker: &mut WorkerRecord, spec: &str) {
+    if worker.models_used.last().map(String::as_str) != Some(spec) {
+        worker.models_used.push(spec.to_string());
     }
 }
 
@@ -2483,6 +2520,10 @@ impl TeamRuntime {
             audit_target: Some(worker_id.to_string()),
             audit_tip: Some(tip),
             reasoning_effort,
+            review_rounds: 0,
+            fix_rounds: 0,
+            audits: 0,
+            models_used: Vec::new(),
             findings: Vec::new(),
             review: None,
             fixer_finding_id: None,
@@ -2493,9 +2534,13 @@ impl TeamRuntime {
             plan_step: None,
             tier: None,
         };
-        self.start_audit_worker(record, base_tip)
-            .await
-            .map(|worker| (worker, false))
+        let audit = self.start_audit_worker(record, base_tip).await?;
+        // One audit per audit worker: retrying the same reviewer at the same
+        // tip reuses its record, so it is not a new round.
+        self.update_worker(worker_id, |worker| worker.audits += 1)
+            .await;
+        self.persist().await?;
+        Ok((audit, false))
     }
 
     /// Provision and start one audit worker record (the audit counterpart of
@@ -2674,6 +2719,10 @@ impl TeamRuntime {
             checks: Vec::new(),
             review_risk,
             review: None,
+            review_rounds: 0,
+            fix_rounds: 0,
+            audits: 0,
+            models_used: Vec::new(),
 
             kind: "implementation".to_string(),
             audit_target: None,
@@ -2729,6 +2778,8 @@ impl TeamRuntime {
             worker.pending = None;
             worker.error = None;
             worker.compacting = false;
+            let model = session_model_spec(worker).to_string();
+            note_model(worker, &model);
         })
         .await;
         self.persist().await?;
@@ -3198,6 +3249,8 @@ impl TeamRuntime {
             worker.pending = None;
             worker.error = None;
             worker.compacting = false;
+            let model = session_model_spec(worker).to_string();
+            note_model(worker, &model);
         })
         .await;
         self.persist().await?;
@@ -3278,6 +3331,8 @@ impl TeamRuntime {
                 }
                 worker.reasoning_effort = reasoning_effort.clone();
                 worker.tier = None;
+                let model = session_model_spec(worker).to_string();
+                note_model(worker, &model);
             })
             .await;
             self.persist().await?;
@@ -3291,6 +3346,8 @@ impl TeamRuntime {
             worker.model_id = None;
             worker.reasoning_effort = reasoning_effort.clone();
             worker.tier = None;
+            let model = session_model_spec(worker).to_string();
+            note_model(worker, &model);
         })
         .await;
         self.persist().await?;
@@ -3460,6 +3517,7 @@ impl TeamRuntime {
                 evidence: Some(evidence),
             });
             worker.findings = findings;
+            worker.review_rounds += 1;
             worker.fixer_finding_id = None;
             worker.error = None;
         })
@@ -3640,6 +3698,7 @@ impl TeamRuntime {
                 finding.justification = None;
             }
             worker.checks.clear();
+            worker.fix_rounds += 1;
             worker.review = None;
             worker.fixer_finding_id = None;
             worker.error = None;
@@ -3685,6 +3744,7 @@ impl TeamRuntime {
             worker.status = WorkerStatus::Fixing;
             worker.fixer_finding_id = Some(finding_id.to_string());
             worker.checks.clear();
+            worker.fix_rounds += 1;
             worker.review = None;
         })
         .await;
@@ -7067,6 +7127,10 @@ mod tests {
             audit_tip: None,
             findings: Vec::new(),
             review: None,
+            review_rounds: 0,
+            fix_rounds: 0,
+            audits: 0,
+            models_used: Vec::new(),
             fixer_finding_id: None,
             merge: None,
             error: None,
@@ -7102,7 +7166,7 @@ mod tests {
 name = \"test\"
 kind = \"local\"
 base_url = \"http://127.0.0.1:9/v1/\"
-models = [\"scripted-a\"]
+models = [\"scripted-a\", \"scripted-b\"]
 ",
         )
         .expect("endpoints.toml");
@@ -8548,6 +8612,190 @@ models = [\"scripted-a\"]
             .await
             .expect_err("a different read_back is refused");
         assert!(refused.contains("read_back"), "{refused}");
+        team.shutdown().await;
+    }
+
+    /// An open high finding for the round counters.
+    fn open_finding(id: &str) -> Finding {
+        Finding {
+            id: id.to_string(),
+            severity: "high".to_string(),
+            title: "the unchecked path".to_string(),
+            detail: "the whole finding detail".to_string(),
+            file: "src/a.rs".to_string(),
+            line: 7,
+            status: "open".to_string(),
+            fix_commit: None,
+            evidence: None,
+            justification: None,
+        }
+    }
+
+    /// One configured model in the team's catalog, so `change_model` accepts
+    /// the spec the test endpoint also serves.
+    fn lead_model(model: &str) -> LeadModel {
+        LeadModel {
+            endpoint: "test".to_string(),
+            model: model.to_string(),
+            spec: format!("test/{model}"),
+            is_default: model == "scripted-a",
+            reasoning_efforts: Vec::new(),
+            default_effort: None,
+        }
+    }
+
+    /// Every review of a worker is a review round, and a finding routed back
+    /// to it is a fix round (plan 40eef714 step 4).
+    #[tokio::test]
+    async fn review_and_fix_rounds_are_counted() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let record = worker(root.path(), "rounds000001");
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        let team = open_test_team(root.path(), state.path(), vec![record.clone()]).await;
+
+        let first = team
+            .review(
+                &record.id,
+                "first pass".into(),
+                vec![open_finding("finding1")],
+                evidence(),
+            )
+            .await
+            .expect("record the first review");
+        assert_eq!(first.review_rounds, 1, "{first:?}");
+        assert_eq!(first.fix_rounds, 0, "{first:?}");
+
+        let routed = team
+            .route_fix(&record.id, "finding1")
+            .await
+            .expect("route the finding back to the worker");
+        assert_eq!(routed.review_rounds, 1, "{routed:?}");
+        assert_eq!(routed.fix_rounds, 1, "{routed:?}");
+
+        // The test endpoint cannot serve the fixer turn; freeze the session and
+        // review the still-open finding again: that is review round two.
+        team.stop_inner(&record.id).await.expect("stop the worker");
+        let second = team
+            .review(
+                &record.id,
+                "second pass".into(),
+                vec![open_finding("finding1")],
+                evidence(),
+            )
+            .await
+            .expect("record the second review");
+        assert_eq!(second.review_rounds, 2, "{second:?}");
+        assert_eq!(second.fix_rounds, 1, "{second:?}");
+        team.shutdown().await;
+    }
+
+    /// An independent audit is counted on the worker it audits, never on the
+    /// audit worker itself (plan 40eef714 step 4).
+    #[tokio::test]
+    async fn audit_dispatch_counts_on_the_target() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let plans_dir = root.path().join(".coding/plans");
+        std::fs::create_dir_all(&plans_dir).expect("plans dir");
+        let board = PlanBoard::new(&plans_dir, root.path().join(".coding/reviews"));
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Audited plan".into(),
+                goal: "Count the audits".into(),
+                context: "verified: src-tauri/src/mnemo2/team.rs records the audit round.".into(),
+                steps: vec!["**Count** the audits in src-tauri/src/mnemo2/team.rs".into()],
+                acceptance: vec!["The audited worker records the audit".into()],
+                ..Default::default()
+            })
+            .expect("create the plan");
+        let mut record = worker(root.path(), "audited00001");
+        record.plan_id = Some(plan.id.clone());
+        record.plan_step = Some(0);
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        let team = open_test_team(root.path(), state.path(), vec![record.clone()]).await;
+        team.attach_board(Arc::new(board));
+
+        let (audit, reused) = team
+            .audit_dispatch(&record.id, "auditworker1", None, None, None)
+            .await
+            .expect("dispatch the audit");
+        assert!(!reused, "a fresh audit is not a reuse");
+        assert_eq!(audit.kind, "audit", "{audit:?}");
+        assert_eq!(audit.audits, 0, "the count lands on the target: {audit:?}");
+        let target = team.worker(&record.id).await.expect("the audited worker");
+        assert_eq!(target.audits, 1, "{target:?}");
+        team.shutdown().await;
+    }
+
+    /// A model switch appends the new spec once: `models_used` is the order the
+    /// worker ran in, without consecutive duplicates (plan 40eef714 step 4).
+    #[tokio::test]
+    async fn model_switch_appends_models_used() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        team.set_catalog(
+            vec![lead_model("scripted-a"), lead_model("scripted-b")],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+
+        let dispatched = team
+            .dispatch_with_id(
+                "implement the counting feature".into(),
+                Some("test/scripted-a".into()),
+                Some("models00001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker on model A");
+        assert_eq!(
+            dispatched.models_used,
+            vec!["test/scripted-a".to_string()],
+            "{dispatched:?}"
+        );
+
+        let switched = team
+            .change_model("models00001", Some("test/scripted-b".into()), None)
+            .await
+            .expect("switch the worker to model B");
+        assert_eq!(
+            switched.models_used,
+            vec![
+                "test/scripted-a".to_string(),
+                "test/scripted-b".to_string()
+            ],
+            "{switched:?}"
+        );
+
+        let again = team
+            .change_model("models00001", Some("test/scripted-b".into()), None)
+            .await
+            .expect("switch to model B again");
+        assert_eq!(
+            again.models_used,
+            vec![
+                "test/scripted-a".to_string(),
+                "test/scripted-b".to_string()
+            ],
+            "a repeated model adds nothing: {again:?}"
+        );
         team.shutdown().await;
     }
 }

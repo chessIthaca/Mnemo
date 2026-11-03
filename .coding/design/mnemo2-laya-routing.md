@@ -541,10 +541,13 @@ value in settings.
 
 ### 4.9 Configuration
 
-Mnemo2-only settings stay out of the shared config that Mnemo1 reads. They go
-into a new `[routing]` table in Mnemo2's settings (the store used by
-model_settings.rs / laya_settings.rs; step 3 decides the exact file after
-reading it):
+Mnemo2-only settings stay out of the shared config that Mnemo1 reads.
+model_settings.rs and laya_settings.rs both write the shared `config.toml`,
+and there is no Mnemo2-only store, so this is decided (plan 2ba2168a,
+2026-11-03): a new global file `<config_dir>/mnemo2.toml` holds a `[routing]`
+table. It is read and written by `load_routing_settings` and
+`save_routing_settings` in dispatch_routing.rs. A missing file means the
+defaults, and saving keeps any other tables.
 
 ```toml
 [routing]

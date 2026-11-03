@@ -4534,6 +4534,159 @@ async fn pinned_task_survives_compaction() {
 }
 
 #[tokio::test]
+async fn pinned_task_survives_compaction_after_the_head_is_installed() {
+    // Review F2 (plan 40eef714 step 1): the sibling test above compacts
+    // on the FIRST turn — before any request has installed the head into
+    // the persistent history — so a production bug that fed messages[0]
+    // to the summarizer would go uncaught there. Here the head is
+    // already installed: turn 1 completes (its request build inserts
+    // the pinned head as messages[0]), the history then grows past the
+    // threshold, and turn 2 auto-compacts a history whose messages[0]
+    // IS the head. Assertions: no request carries the pinned task
+    // outside its own system head (the summary prompt is built from the
+    // conversation, never from messages[0]), and the post-compaction
+    // request's messages[0] carries the task byte-for-byte.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![
+        // Turn 1's response — its request build installs the head.
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // The summarizer's call on turn 2...
+        vec![
+            LlmEvent::TextDelta {
+                text: "summary of the conversation".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // ...then turn 2's main request after the summary replaced the
+        // history.
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let task = "TASK-7f3 do the thing — verbatim through a later compaction";
+    agent.set_pinned_task(Some(task.into()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    // Turn 1: a small exchange — its request build installs the pinned
+    // head as messages[0] of the PERSISTENT history, so the compaction
+    // below runs on a history that starts with the head.
+    let mut messages = vec![Message::user_text("go")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages[0].role, Role::System,
+        "turn 1's request build installed the head in the history"
+    );
+    assert!(
+        messages[0].content.as_text().contains(task),
+        "the installed head carries the pinned task"
+    );
+
+    // The conversation grows: one ~400KB message (≈ 80K tokens — past
+    // the 64K summarize threshold, under the 96K hard ceiling) followed
+    // by a small recent tail. Eleven messages in total, so the
+    // summarizer has something to summarize (it early-returns when
+    // len <= keep_recent + 1) and the big message lands INSIDE the
+    // summarized range, not in the keep-recent window.
+    messages.push(Message::user_text(format!(
+        "BIG-FILLER {}",
+        "word ".repeat(80_000)
+    )));
+    messages.push(Message::assistant_text("done"));
+    for i in 0..3 {
+        messages.push(Message::user_text(format!("turn {i}")));
+        messages.push(Message::assistant_text(format!("ack {i}")));
+    }
+    // Turn 2: auto-compaction runs BEFORE the main request — on the
+    // head-installed history.
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let requests = recorder.requests.lock().expect("the request capture");
+    assert_eq!(
+        requests.len(),
+        3,
+        "turn 1's request, the summarizer's request, then turn 2's main request"
+    );
+    // Proof the middle request is the summarizer's, and that its
+    // summarize region was real: the big conversation message was fed
+    // to it.
+    assert!(
+        requests[1]
+            .iter()
+            .any(|m| m.content.as_text().contains("BIG-FILLER")),
+        "the summarizer's request carries the summarized conversation"
+    );
+    // F2's core: the pinned task may ride a request's SYSTEM head, but
+    // no non-system message may carry it — the summary prompt is a user
+    // message built from the conversation (messages[1..cut]); if
+    // production fed it messages[0] (the installed head), the task
+    // would appear here and its survival would depend on the summary
+    // echoing it back.
+    for (i, request) in requests.iter().enumerate() {
+        for message in request {
+            if message.role == Role::System {
+                continue;
+            }
+            assert!(
+                !message.content.as_text().contains("TASK-7f3"),
+                "request {i} carries the pinned task outside its system head: {message:?}"
+            );
+        }
+    }
+    // The post-compaction main request still leads with the head, and
+    // the head carries the full pinned task byte-for-byte.
+    assert_eq!(
+        requests[2][0].role, Role::System,
+        "the compacted request still leads with the head"
+    );
+    let head = requests[2][0].content.as_text();
+    assert!(
+        head.contains(task),
+        "the pinned task survives the later compaction verbatim in messages[0]"
+    );
+}
+
+#[tokio::test]
 async fn blank_pinned_task_leaves_the_head_unchanged() {
     // A whitespace-only pinned task is None (stored as unset), and with
     // no pinned task the head bytes are exactly as before — the pinned

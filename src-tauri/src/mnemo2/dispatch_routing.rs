@@ -32,7 +32,7 @@
 //! dispatch, and the rest of the module is calibration and training data.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -223,6 +223,7 @@ pub async fn classify_dispatch(
 /// per-label-count gates, the auto-mode fallback tier, the nudge switch, the
 /// minimum word count and the optional per-tier default effort.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RoutingSettings {
     /// What dispatch does with Laya's answer (default [`RoutingMode::Off`]).
     pub mode: RoutingMode,
@@ -255,6 +256,81 @@ impl Default for RoutingSettings {
             effort: BTreeMap::new(),
         }
     }
+}
+
+/// Mnemo2's own settings file, kept separate from Mnemo1's `config.toml`.
+pub fn routing_settings_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("mnemo2.toml")
+}
+
+/// Load `[routing]` from Mnemo2's settings, defaulting leniently when the file
+/// or table is absent or invalid.
+pub fn load_routing_settings(config_dir: &Path) -> RoutingSettings {
+    let path = routing_settings_path(config_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            log::warn!(
+                "using default Mnemo2 routing settings; cannot read {}: {error}",
+                path.display()
+            );
+            return RoutingSettings::default();
+        }
+    };
+    let document = match toml::from_str::<toml::Value>(&text) {
+        Ok(document) => document,
+        Err(error) => {
+            log::warn!(
+                "using default Mnemo2 routing settings; invalid {}: {error}",
+                path.display()
+            );
+            return RoutingSettings::default();
+        }
+    };
+    let Some(value) = document.get("routing").cloned() else {
+        return RoutingSettings::default();
+    };
+    match value.try_into() {
+        Ok(settings) => settings,
+        Err(error) => {
+            log::warn!(
+                "using default Mnemo2 routing settings; invalid [routing] in {}: {error}",
+                path.display()
+            );
+            RoutingSettings::default()
+        }
+    }
+}
+
+/// Save `[routing]` without disturbing any other table in `mnemo2.toml`.
+pub fn save_routing_settings(
+    config_dir: &Path,
+    settings: &RoutingSettings,
+) -> Result<(), String> {
+    let path = routing_settings_path(config_dir);
+    let mut document = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => toml::from_str::<toml::Value>(&text)
+            .map_err(|error| format!("invalid {}: {error}", path.display()))?,
+        Ok(_) => toml::Value::Table(toml::map::Map::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::map::Map::new())
+        }
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let table = document
+        .as_table_mut()
+        .ok_or_else(|| format!("{} must contain a TOML table", path.display()))?;
+    let encoded = toml::to_string_pretty(settings)
+        .map_err(|error| format!("cannot serialize Mnemo2 routing settings: {error}"))?;
+    let routing = toml::from_str::<toml::Value>(&encoded)
+        .map_err(|error| format!("cannot encode Mnemo2 routing settings: {error}"))?;
+    table.insert("routing".into(), routing);
+    let encoded = toml::to_string_pretty(&document)
+        .map_err(|error| format!("cannot serialize {}: {error}", path.display()))?;
+    std::fs::create_dir_all(config_dir)
+        .map_err(|error| format!("cannot create {}: {error}", config_dir.display()))?;
+    std::fs::write(&path, encoded)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 /// What dispatch does with Laya's answer.
@@ -340,8 +416,10 @@ pub enum DispatchRoutingRow {
         step: usize,
         /// The tier Laya cleared on (`None` when it cleared nothing).
         laya_tier: Option<String>,
-        /// The tier the lead chose.
+        /// The tier the lead's model actually ran on.
         lead_tier: String,
+        /// The requested tier, when it differed from the ran tier.
+        requested_tier: Option<String>,
         /// The confidence of the overridden answer.
         confidence: f64,
     },
@@ -466,6 +544,21 @@ pub enum DispatchRoutingRow {
         /// worker that did not merge.
         label: Option<String>,
     },
+}
+
+impl DispatchRoutingRow {
+    /// Replace the envelope's worker id with the provisioned worker's real id.
+    pub(crate) fn with_worker_id(&mut self, id: &str) {
+        match self {
+            Self::Route { worker_id, .. }
+            | Self::LeadOverride { worker_id, .. }
+            | Self::LeadReroute { worker_id, .. }
+            | Self::UserReroute { worker_id, .. }
+            | Self::Nudge { worker_id, .. }
+            | Self::NudgeIgnored { worker_id, .. }
+            | Self::Outcome { worker_id, .. } => *worker_id = id.to_string(),
+        }
+    }
 }
 
 /// The dispatch routing log's file:
@@ -608,6 +701,55 @@ mod tests {
 
     fn all_enabled() -> EnabledTiers {
         enabled(true, true, true)
+    }
+
+    #[test]
+    fn missing_mnemo2_toml_gives_defaults() {
+        let config = tempfile::tempdir().expect("config dir");
+        assert_eq!(
+            load_routing_settings(config.path()),
+            RoutingSettings::default()
+        );
+        assert!(!routing_settings_path(config.path()).exists());
+    }
+
+    #[test]
+    fn routing_settings_round_trip_and_keep_other_tables() {
+        let config = tempfile::tempdir().expect("config dir");
+        let path = routing_settings_path(config.path());
+        assert_eq!(path, config.path().join("mnemo2.toml"));
+        std::fs::write(&path, "[ui]\ncompact = true\n").expect("existing settings");
+        let settings = RoutingSettings {
+            mode: RoutingMode::Auto,
+            min_confidence_3: 0.51,
+            fallback_tier: "simple".into(),
+            effort: BTreeMap::from([("simple".into(), "low".into())]),
+            ..RoutingSettings::default()
+        };
+        save_routing_settings(config.path(), &settings).expect("save routing settings");
+        assert_eq!(load_routing_settings(config.path()), settings);
+        let saved: toml::Value = toml::from_str(
+            &std::fs::read_to_string(path).expect("read saved settings"),
+        )
+        .expect("valid TOML");
+        assert_eq!(saved["ui"]["compact"], toml::Value::Boolean(true));
+    }
+
+    #[test]
+    fn partial_routing_table_fills_defaults() {
+        let config = tempfile::tempdir().expect("config dir");
+        std::fs::write(
+            routing_settings_path(config.path()),
+            "[routing]\nmode = \"shadow\"\n",
+        )
+        .expect("partial settings");
+        assert_eq!(
+            load_routing_settings(config.path()),
+            RoutingSettings {
+                mode: RoutingMode::Shadow,
+                ..RoutingSettings::default()
+            }
+        );
     }
 
     #[test]
@@ -857,6 +999,7 @@ mod tests {
                 step: 4,
                 laya_tier: Some("average".into()),
                 lead_tier: "difficult".into(),
+                requested_tier: None,
                 confidence: 0.62,
             },
             reroute_row(),

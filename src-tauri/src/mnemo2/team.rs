@@ -28,6 +28,7 @@ use mnemo::headless::{
 };
 use mnemo::headless::session::ModelSwitch;
 use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
+use mnemo::memory::classifier::ClassifierSlot;
 use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::{PermissionPolicy, SerializableAgentEvent};
@@ -36,10 +37,15 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::mnemo2::dispatch_routing::{
+    classify_dispatch, load_routing_settings, routing_text, threshold_for,
+    DispatchRoutingDecision, DispatchRoutingRow, EnabledTiers, RoutingMode,
+    RoutingSettings,
+};
 use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::lock_holders;
 use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewEvidence, ReviewRecord};
-use crate::mnemo2::runtime::{LeadModel, LeadRuntime};
+use crate::mnemo2::runtime::LeadModel;
 use crate::mnemo2::pricing::usage_model_key;
 use crate::mnemo2::usage::{event_session, ProjectUsage, ProjectUsageView};
 
@@ -169,6 +175,23 @@ pub struct InboxEntry {
     pub text: String,
     /// Unix epoch milliseconds when Mnemo2 accepted the message.
     pub at_ms: u128,
+}
+
+/// The one dispatch-time routing decision persisted with a worker.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerRouting {
+    /// The tier Laya selected, when it returned a known label.
+    pub laya_tier: Option<String>,
+    /// Laya's confidence, when it answered.
+    pub confidence: Option<f64>,
+    /// Whether the answer cleared the configured gate.
+    pub cleared: bool,
+    /// The explicit or fallback tier supplied by the lead, when one was used.
+    pub lead_tier: Option<String>,
+    /// Who selected the running tier: `lead`, `laya`, or `lead_override`.
+    pub routed_by: String,
+    /// The one nudge sent for this worker, if any.
+    pub nudged: Option<String>,
 }
 
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
@@ -311,6 +334,9 @@ pub struct WorkerRecord {
     /// when it dispatched by tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// The dispatch-time Laya decision, absent for legacy and unrouted workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<WorkerRouting>,
 }
 
 /// The opening prompt of a worker that implements its pinned task straight
@@ -378,11 +404,32 @@ struct PlanRef {
     step: usize,
 }
 
+struct RoutedDispatch {
+    model: Option<String>,
+    tier: Option<String>,
+    reasoning_effort: Option<String>,
+    routing: Option<WorkerRouting>,
+    rows: Vec<DispatchRoutingRow>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchSource {
+    LeadTool,
+    Ipc,
+}
+
 /// One dispatch request's knobs, threaded through the dispatch path together.
 #[derive(Clone, Debug)]
 struct DispatchRequest {
     /// The lead's task-specific instructions.
     brief: String,
+    /// The requested tier, including `auto` where the mode offers it.
+    tier: Option<String>,
+    /// Whether this implementation dispatch uses dispatch-time routing.
+    dispatch_routing: bool,
+    /// Which public entry point supplied the dispatch.
+    source: DispatchSource,
     /// The exact model spec, when the lead chose one.
     model: Option<String>,
     /// The chosen reasoning effort, when the lead chose one.
@@ -521,6 +568,12 @@ pub struct TeamRuntimeOptions {
     pub workspace_root: PathBuf,
     /// Mnemo2's app-owned state directory (the `team.json` ledger).
     pub state_dir: PathBuf,
+    /// The lead's config directory, which holds Mnemo2's `mnemo2.toml`.
+    pub config_dir: PathBuf,
+    /// The engine's live Laya classifier slot, shared with every session.
+    pub classifier: Option<ClassifierSlot>,
+    /// Test-only routing-log override; production uses the global training log.
+    pub routing_log_path: Option<PathBuf>,
     /// Explicit cap override; `None` restores the saved cap or the default.
     pub slots: Option<usize>,
     /// The configured model inventory: explicit worker models (and their
@@ -754,6 +807,11 @@ pub struct TeamRuntime {
     lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
+    config_dir: PathBuf,
+    routing: std::sync::RwLock<RoutingSettings>,
+    classifier: Option<ClassifierSlot>,
+    routing_permit: tokio::sync::Semaphore,
+    routing_log_path: PathBuf,
     models: std::sync::RwLock<Vec<LeadModel>>,
     tiers: std::sync::RwLock<mnemo::headless::TiersDto>,
     persistence: TeamPersistence,
@@ -807,6 +865,7 @@ impl TeamRuntime {
 
     /// Open the team ledger, recover interrupted workers, and prepare to spawn.
     pub async fn open(options: TeamRuntimeOptions) -> Result<Self, String> {
+        let config_dir = options.config_dir.clone();
         let persistence = TeamPersistence::new(&options.state_dir);
         let persisted = persistence.load()?;
         let slots = options
@@ -825,6 +884,9 @@ impl TeamRuntime {
         }
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (signals, _) = broadcast::channel(EVENT_BUFFER);
+        let routing_log_path = options.routing_log_path.clone().unwrap_or_else(
+            crate::mnemo2::dispatch_routing::dispatch_routing_log_path,
+        );
         let runtime = Self {
             engine: options.engine,
             workspace_root: options.workspace_root,
@@ -840,6 +902,11 @@ impl TeamRuntime {
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
+            config_dir: config_dir.clone(),
+            routing: std::sync::RwLock::new(load_routing_settings(&config_dir)),
+            classifier: options.classifier,
+            routing_permit: tokio::sync::Semaphore::new(1),
+            routing_log_path,
             models: std::sync::RwLock::new(options.models),
             tiers: std::sync::RwLock::new(mnemo::headless::TiersDto::default()),
             persistence,
@@ -857,20 +924,6 @@ impl TeamRuntime {
         Ok(runtime)
     }
 
-    /// Open the team on the lead's shared engine.
-    pub async fn from_lead(lead: &LeadRuntime, state_dir: PathBuf) -> Result<Self, String> {
-        Self::open(TeamRuntimeOptions {
-            engine: lead.engine_handle().await?,
-            workspace_root: lead.workspace_root().to_path_buf(),
-            state_dir,
-            slots: None,
-            models: lead.models(),
-            pricing: lead.pricing()?,
-        })
-        .await
-        .inspect(|team| team.set_tiers(lead.tiers()))
-    }
-
     /// Replace the model tiers new dispatches resolve against.
     pub fn set_tiers(&self, tiers: mnemo::headless::TiersDto) {
         *self.tiers.write().unwrap_or_else(|e| e.into_inner()) = tiers;
@@ -885,6 +938,8 @@ impl TeamRuntime {
     ) {
         *self.models.write().unwrap_or_else(|e| e.into_inner()) = models;
         self.set_tiers(tiers);
+        *self.routing.write().unwrap_or_else(|e| e.into_inner()) =
+            load_routing_settings(&self.config_dir);
         *self.pricing.write().expect("pricing lock poisoned") = pricing;
     }
 
@@ -955,6 +1010,247 @@ impl TeamRuntime {
         }
     }
 
+    async fn route_implementation_dispatch(
+        &self,
+        request: &DispatchRequest,
+        step_text: &str,
+        brief: &str,
+    ) -> Result<RoutedDispatch, String> {
+        let settings = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let requested_tier = request.tier.as_deref();
+        if requested_tier == Some("auto") && matches!(settings.mode, RoutingMode::Off | RoutingMode::Shadow) {
+            return Err("tier auto needs routing mode suggest or auto (Settings > Decisions)".into());
+        }
+        if requested_tier.is_none()
+            && request.model.is_none()
+            && settings.mode != RoutingMode::Auto
+            && request.source == DispatchSource::LeadTool
+        {
+            if let Some(required) = self.tier_required() {
+                return Err(required);
+            }
+        }
+        if settings.mode == RoutingMode::Off {
+            return Ok(RoutedDispatch {
+                model: self.lead_model_choice(requested_tier, request.model.clone())?,
+                tier: request.tier.clone(),
+                reasoning_effort: request.reasoning_effort.clone(),
+                routing: None,
+                rows: Vec::new(),
+                error: None,
+            });
+        }
+
+        let explicit_tier = requested_tier.filter(|tier| *tier != "auto");
+        let has_explicit_choice = explicit_tier.is_some() || request.model.is_some();
+        let enabled = self.enabled_routing_tiers();
+        let classified_text = routing_text(step_text, brief).filter(|text| {
+            text.split_whitespace().count() >= settings.min_words
+        });
+        let classifier = self.classifier.as_ref().and_then(|slot| {
+            slot.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        let (decision, skip_reason): (Option<DispatchRoutingDecision>, Option<&'static str>) =
+            if classified_text.is_none() {
+                (None, Some("too_short"))
+            } else if enabled.offered().count() < 2 {
+                (None, Some("one_tier"))
+            } else if let Some(classifier) = classifier {
+                let attempt = async {
+                    let _permit = self
+                        .routing_permit
+                        .acquire()
+                        .await
+                        .map_err(|_| "Laya routing is closed".to_string())?;
+                    Ok::<Option<DispatchRoutingDecision>, String>(
+                        classify_dispatch(
+                            classifier.as_ref(),
+                            classified_text.as_deref().unwrap_or(""),
+                            enabled,
+                            &settings,
+                        )
+                        .await,
+                    )
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(3), attempt).await {
+                    Ok(Ok(Some(decision))) => (Some(decision), None),
+                    Ok(Ok(None)) | Err(_) => (None, Some("offline")),
+                    Ok(Err(error)) => return Err(error),
+                }
+            } else {
+                (None, Some("offline"))
+            };
+        let cleared_tier = decision
+            .as_ref()
+            .filter(|decision| decision.cleared)
+            .and_then(|decision| decision.tier);
+
+        let mut refusal = None;
+        let (chosen_model, chosen_tier) = if has_explicit_choice {
+            let model = self.lead_model_choice(explicit_tier, request.model.clone())?;
+            let tier = if request.model.is_some() {
+                self.tier_for_model(model.as_deref())
+            } else {
+                explicit_tier.map(str::to_string)
+            };
+            (model, tier)
+        } else if let Some(tier) = cleared_tier.filter(|_| {
+            settings.mode == RoutingMode::Auto
+                || (settings.mode == RoutingMode::Suggest && requested_tier == Some("auto"))
+        }) {
+            (self.lead_model_choice(Some(tier), None)?, Some(tier.to_string()))
+        } else if settings.mode == RoutingMode::Suggest && requested_tier == Some("auto") {
+            refusal = Some(if skip_reason == Some("offline") {
+                "Laya is not running; pass a tier".to_string()
+            } else {
+                format!(
+                    "Laya is unsure ({:.2}); pass a tier",
+                    decision.as_ref().map_or(0.0, |decision| decision.confidence)
+                )
+            });
+            (None, None)
+        } else if settings.mode == RoutingMode::Auto {
+            let tier = settings.fallback_tier.clone();
+            if self.tier_models(&tier).is_empty() {
+                (self.lead_model_choice(None, None)?, None)
+            } else {
+                (self.lead_model_choice(Some(&tier), None)?, Some(tier))
+            }
+        } else {
+            (self.lead_model_choice(None, None)?, None)
+        };
+        let routed_by = if has_explicit_choice {
+            if cleared_tier.is_some() && cleared_tier != chosen_tier.as_deref() {
+                "lead_override"
+            } else {
+                "lead"
+            }
+        } else if cleared_tier.is_some()
+            && refusal.is_none()
+            && (settings.mode == RoutingMode::Auto
+                || (settings.mode == RoutingMode::Suggest && requested_tier == Some("auto")))
+        {
+            "laya"
+        } else {
+            "lead"
+        };
+        let reasoning_effort = request.reasoning_effort.clone().or_else(|| {
+            chosen_tier
+                .as_ref()
+                .and_then(|tier| settings.effort.get(tier))
+                .cloned()
+        });
+        let routing = WorkerRouting {
+            laya_tier: decision
+                .as_ref()
+                .and_then(|decision| decision.tier)
+                .map(str::to_string),
+            confidence: decision.as_ref().map(|decision| decision.confidence),
+            cleared: decision.as_ref().is_some_and(|decision| decision.cleared),
+            lead_tier: (routed_by != "laya")
+                .then(|| {
+                    explicit_tier
+                        .map(str::to_string)
+                        .or_else(|| chosen_tier.clone())
+                })
+                .flatten(),
+            routed_by: routed_by.to_string(),
+            nudged: None,
+        };
+        let plan_id = request.plan.as_ref().map(|plan| plan.plan_id.clone());
+        let step = request.plan.as_ref().map(|plan| plan.step + 1);
+        let skip = skip_reason;
+        use sha2::Digest as _;
+        let text_sha256 = sha2::Sha256::digest(
+            classified_text.as_deref().unwrap_or("").as_bytes(),
+        )
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+        let ts = unix_ms();
+        let row = DispatchRoutingRow::Route {
+            ts,
+            worker_id: request.worker_id.clone().unwrap_or_default(),
+            plan_id: plan_id.unwrap_or_default(),
+            step: step.unwrap_or_default(),
+            mode: settings.mode,
+            text_sha256,
+            label: decision
+                .as_ref()
+                .map(|decision| decision.label.clone())
+                .unwrap_or_default(),
+            confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
+            probabilities: decision
+                .as_ref()
+                .map(|decision| decision.probabilities.clone())
+                .unwrap_or_default(),
+            tier: routing.laya_tier.clone(),
+            threshold: threshold_for(enabled.offered().count(), &settings),
+            cleared: routing.cleared,
+            lead_tier: explicit_tier.map(str::to_string),
+            ran_tier: refusal.is_none().then(|| chosen_tier.clone()).flatten(),
+            ran_model: refusal.is_none().then(|| chosen_model.clone()).flatten(),
+            text: classified_text.unwrap_or_default(),
+            skip: skip.map(str::to_string),
+        };
+        let mut rows = vec![row];
+        if routed_by == "lead_override" {
+            if let Some(laya_tier) = routing.laya_tier.clone() {
+                rows.push(DispatchRoutingRow::LeadOverride {
+                    ts,
+                    worker_id: request.worker_id.clone().unwrap_or_default(),
+                    plan_id: request
+                        .plan
+                        .as_ref()
+                        .map(|plan| plan.plan_id.clone())
+                        .unwrap_or_default(),
+                    step: request.plan.as_ref().map_or(0, |plan| plan.step + 1),
+                    laya_tier: Some(laya_tier),
+                    lead_tier: chosen_tier.clone().unwrap_or_else(|| "custom".into()),
+                    requested_tier: explicit_tier.map(str::to_string).filter(|requested| {
+                        Some(requested.as_str()) != chosen_tier.as_deref()
+                    }),
+                    confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
+                });
+            }
+        }
+        Ok(RoutedDispatch {
+            model: chosen_model,
+            tier: chosen_tier,
+            reasoning_effort,
+            routing: Some(routing),
+            rows,
+            error: refusal,
+        })
+    }
+
+    fn tier_for_model(&self, model: Option<&str>) -> Option<String> {
+        let model = model?;
+        TIER_PURPOSES
+            .iter()
+            .map(|(tier, _)| *tier)
+            .find(|tier| self.tier_models(tier).iter().any(|candidate| candidate.spec == model))
+            .map(str::to_string)
+    }
+
+    fn enabled_routing_tiers(&self) -> EnabledTiers {
+        EnabledTiers {
+            simple: !self.tier_models("simple").is_empty(),
+            average: !self.tier_models("average").is_empty(),
+            difficult: !self.tier_models("difficult").is_empty(),
+        }
+    }
+
+    fn append_dispatch_routing_row(&self, row: &DispatchRoutingRow) {
+        mnemo::agent::model_routing::append_row(&self.routing_log_path, row);
+    }
+
     /// The refusal for a dispatch with no tier while tiers are configured.
     fn tier_required(&self) -> Option<String> {
         self.tier_guidance().map(|guidance| {
@@ -990,6 +1286,14 @@ impl TeamRuntime {
                 .join(", ");
             lines.push(format!("{tier} - {purpose}: {list}"));
         }
+        if !lines.is_empty()
+            && matches!(
+                self.routing.read().unwrap_or_else(|e| e.into_inner()).mode,
+                RoutingMode::Suggest | RoutingMode::Auto
+            )
+        {
+            lines.push("auto - let Laya choose from the step spec".into());
+        }
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
@@ -1010,6 +1314,27 @@ impl TeamRuntime {
 
     fn notify_lead(&self, key: String, text: String) {
         let _ = self.signals.send(BoardSignal::Notice { key, text });
+    }
+
+    /// Install a stub classifier for runtime integration tests.
+    #[cfg(test)]
+    pub(crate) fn set_classifier_for_test(&mut self, classifier: ClassifierSlot) {
+        self.classifier = Some(classifier);
+    }
+
+    /// Inspect the classifier handle installed at open in integration tests.
+    #[cfg(test)]
+    pub(crate) fn classifier_slot_for_test(&self) -> Option<ClassifierSlot> {
+        self.classifier.clone()
+    }
+
+    /// Inspect the routing settings loaded at open in integration tests.
+    #[cfg(test)]
+    pub(crate) fn routing_settings_for_test(&self) -> RoutingSettings {
+        self.routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Share the lead's one plan board with the team.
@@ -1615,21 +1940,36 @@ impl TeamRuntime {
         } else {
             self.current_models()
         };
+        let routing_mode = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .mode;
         let model_description = if guidance.is_some() {
             "A specific model from the tiers, only when the tier's first model does not fit; it overrides `tier`. Prefer `tier`; models outside the tiers are refused."
         } else {
             "The exact endpoint/model spec this worker runs on. Choose it per task: a strong reasoning model for design-heavy, cross-cutting, or debugging work; a fast, inexpensive model for mechanical edits, boilerplate, or test scaffolding. Omit to use the configured default."
         };
         let mut model = json!({"type": "string", "description": model_description});
-        let tier_description = match &guidance {
-            Some(text) => format!(
+        let tier_description = match (&guidance, routing_mode) {
+            (Some(text), RoutingMode::Off) => format!(
                 "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\n{text}"
             ),
-            None => "The model tier. No tiers are configured (Settings > Tiers), so omit it and the default model is used.".to_string(),
+            (Some(text), RoutingMode::Auto) => format!(
+                "Optional: choose the cheapest tier that fits the step, or auto to let Laya choose; the worker runs on that tier's first model.\n{text}"
+            ),
+            (Some(text), _) => format!(
+                "Required: choose the cheapest tier that fits the step, or auto where offered; the worker runs on that tier's first model.\n{text}"
+            ),
+            (None, _) => "The model tier. No tiers are configured (Settings > Tiers), so omit it and the default model is used.".to_string(),
         };
+        let mut tier_names = TIER_PURPOSES.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        if matches!(routing_mode, RoutingMode::Suggest | RoutingMode::Auto) {
+            tier_names.push("auto");
+        }
         let tier = json!({
             "type": "string",
-            "enum": TIER_PURPOSES.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            "enum": tier_names,
             "description": tier_description,
         });
         let specs: Vec<&str> = lead_models
@@ -1656,7 +1996,7 @@ impl TeamRuntime {
             reasoning_effort["enum"] = json!(efforts);
         }
         let mut dispatch_required = vec!["worker_id", "plan_id", "step", "brief"];
-        if guidance.is_some() {
+        if guidance.is_some() && routing_mode != RoutingMode::Auto {
             dispatch_required.push("tier");
         }
         vec![
@@ -1826,7 +2166,7 @@ impl TeamRuntime {
                     "team_dispatch requires 'brief' and a caller-chosen stable 'worker_id'",
                 );
             };
-            let mut model = args
+            let model = args
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_string);
@@ -1839,14 +2179,6 @@ impl TeamRuntime {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
-            model = match self.lead_model_choice(tier.as_deref(), model) {
-                Ok(Some(model)) => Some(model),
-                Ok(None) => match self.tier_required() {
-                    Some(required) => return ToolResult::error(required),
-                    None => None,
-                },
-                Err(err) => return ToolResult::error(err),
-            };
             let reasoning_effort = args
                 .get("reasoning_effort")
                 .and_then(Value::as_str)
@@ -1854,33 +2186,41 @@ impl TeamRuntime {
             let plan_id = args
                 .get("plan_id")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .trim();
             let step = args
                 .get("step")
                 .and_then(Value::as_u64)
                 .and_then(|step| usize::try_from(step).ok())
                 .unwrap_or(0);
+            if plan_id.is_empty() || step < 1 {
+                return ToolResult::error(
+                    "team_dispatch requires 'plan_id' (a board plan id) and 'step' (a 1-based integer). Create the plan first with plan_create.",
+                );
+            }
+            let mode = self
+                .routing
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .mode;
             let result = self
-                .dispatch_on_plan(
-                    brief.to_string(),
+                .dispatch_request(DispatchRequest {
+                    brief: brief.to_string(),
+                    tier,
+                    dispatch_routing: true,
+                    source: DispatchSource::LeadTool,
                     model,
                     reasoning_effort,
-                    Some(worker_id.to_string()),
+                    worker_id: Some(worker_id.to_string()),
+                    plan: Some(PlanRef {
+                        plan_id: plan_id.to_string(),
+                        step: step - 1,
+                    }),
                     review_risk,
                     read_back,
-                    plan_id,
-                    step,
-                )
+                })
                 .await;
-            let result = match (result, tier) {
-                (Ok((mut worker, reused)), Some(tier)) => {
-                    self.record_tier(worker_id, &tier).await;
-                    worker.tier = Some(tier);
-                    Ok((worker, reused))
-                }
-                (result, _) => result,
-            };
-            return dispatch_result(result, "team_dispatch");
+            return dispatch_result(result, "team_dispatch", mode);
         }
         if name == "team_audit_dispatch" {
             let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
@@ -1913,7 +2253,7 @@ impl TeamRuntime {
                     brief,
                 )
                 .await;
-            return dispatch_result(result, "team_audit_dispatch");
+            return dispatch_result(result, "team_audit_dispatch", RoutingMode::Off);
         }
         if name == "team_status" {
             let plan_id = args
@@ -2113,6 +2453,9 @@ impl TeamRuntime {
         };
         self.dispatch_request(DispatchRequest {
             brief,
+            tier: None,
+            dispatch_routing: true,
+            source: DispatchSource::Ipc,
             model,
             reasoning_effort,
             worker_id,
@@ -2143,6 +2486,9 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         self.dispatch_request(DispatchRequest {
             brief,
+            tier: None,
+            dispatch_routing: false,
+            source: DispatchSource::Ipc,
             model,
             reasoning_effort: None,
             worker_id,
@@ -2164,6 +2510,9 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         self.dispatch_request(DispatchRequest {
             brief,
+            tier: None,
+            dispatch_routing: false,
+            source: DispatchSource::Ipc,
             model,
             reasoning_effort,
             worker_id,
@@ -2179,19 +2528,56 @@ impl TeamRuntime {
         &self,
         request: DispatchRequest,
     ) -> Result<(WorkerRecord, bool), String> {
-        let result = self.dispatch_locked(request).await;
+        let routed = self.prepare_dispatch_routing(&request).await?;
+        let result = self.dispatch_locked(request, routed).await;
         if matches!(result, Ok((_, false))) {
             self.signal_board_changed();
         }
         result
     }
 
+    async fn prepare_dispatch_routing(
+        &self,
+        request: &DispatchRequest,
+    ) -> Result<Option<RoutedDispatch>, String> {
+        if !request.dispatch_routing {
+            return Ok(None);
+        }
+        if let Some(worker_id) = request.worker_id.as_deref() {
+            let records = self.records.lock().await;
+            if records.iter().any(|worker| worker.id == worker_id) {
+                return Ok(None);
+            }
+        }
+        let plan = request
+            .plan
+            .as_ref()
+            .ok_or_else(|| "dispatch routing requires a board plan step".to_string())?;
+        let board = self
+            .board()
+            .ok_or_else(|| "the plan board is not available".to_string())?;
+        let step_text = board
+            .get(&plan.plan_id)?
+            .steps
+            .get(plan.step)
+            .ok_or_else(|| format!("plan {} has no step {}", plan.plan_id, plan.step + 1))?
+            .text
+            .clone();
+        self.route_implementation_dispatch(request, &step_text, &request.brief)
+            .await
+            .map(Some)
+    }
+
     async fn dispatch_locked(
         &self,
         request: DispatchRequest,
+        routed: Option<RoutedDispatch>,
     ) -> Result<(WorkerRecord, bool), String> {
         let DispatchRequest {
             brief,
+            tier,
+            dispatch_routing,
+            source: _,
             model,
             reasoning_effort,
             worker_id,
@@ -2229,9 +2615,25 @@ impl TeamRuntime {
                 records.iter().find(|worker| worker.id == id).cloned()
             };
             if let Some(existing) = existing {
+                let retry_model = if dispatch_routing {
+                    match tier.as_deref() {
+                        Some("auto") | None if model.is_none() => existing.model.clone(),
+                        _ => self.lead_model_choice(
+                            tier.as_deref().filter(|tier| *tier != "auto"),
+                            model.clone(),
+                        )?,
+                    }
+                } else {
+                    model.clone()
+                };
+                let retry_effort = if dispatch_routing && reasoning_effort.is_none() {
+                    existing.reasoning_effort.clone()
+                } else {
+                    reasoning_effort.clone()
+                };
                 if existing.brief != brief
-                    || existing.model != model
-                    || existing.reasoning_effort != reasoning_effort
+                    || existing.model != retry_model
+                    || existing.reasoning_effort != retry_effort
                     || existing.read_back != read_back
                     || plan.as_ref().is_some_and(|plan| {
                         existing.plan_id.as_deref() != Some(plan.plan_id.as_str())
@@ -2281,6 +2683,27 @@ impl TeamRuntime {
             }
             None => None,
         };
+        let (model, reasoning_effort, tier, routing, routing_rows, routing_error) =
+            if dispatch_routing {
+                let routed = routed
+                    .ok_or_else(|| "dispatch routing was not prepared".to_string())?;
+                (
+                    routed.model,
+                    routed.reasoning_effort,
+                    routed.tier,
+                    routed.routing,
+                    routed.rows,
+                    routed.error,
+                )
+            } else {
+                (model, reasoning_effort, tier, None, Vec::new(), None)
+            };
+        if let Some(error) = routing_error {
+            for row in &routing_rows {
+                self.append_dispatch_routing_row(row);
+            }
+            return Err(error);
+        }
         self.validate_model(&model, &reasoning_effort)?;
         if let Some(id) = worker_id.as_deref() {
             let branch = agent_branch(id);
@@ -2310,6 +2733,7 @@ impl TeamRuntime {
                 reasoning_effort,
                 worker_id,
                 review_risk,
+                tier,
                 plan,
             )
             .await;
@@ -2318,10 +2742,22 @@ impl TeamRuntime {
         // matches the record the session was started from.
         let result = match provisioned {
             Ok(record) => {
-                self.update_worker(&record.id, |worker| worker.read_back = read_back)
-                    .await;
-                self.start_worker(WorkerRecord { read_back, ..record })
-                    .await
+                for mut row in routing_rows {
+                    row.with_worker_id(&record.id);
+                    self.append_dispatch_routing_row(&row);
+                }
+                let routing_for_record = routing.clone();
+                self.update_worker(&record.id, |worker| {
+                    worker.read_back = read_back;
+                    worker.routing = routing_for_record;
+                })
+                .await;
+                self.start_worker(WorkerRecord {
+                    read_back,
+                    routing,
+                    ..record
+                })
+                .await
             }
             Err(err) => Err(err),
         };
@@ -2533,6 +2969,7 @@ impl TeamRuntime {
             plan_id: None,
             plan_step: None,
             tier: None,
+            routing: None,
         };
         let audit = self.start_audit_worker(record, base_tip).await?;
         // One audit per audit worker: retrying the same reviewer at the same
@@ -2663,6 +3100,7 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         worker_id: Option<String>,
         review_risk: String,
+        tier: Option<String>,
         plan: Option<PlanRef>,
     ) -> Result<WorkerRecord, String> {
         let base_ref = current_branch(&self.workspace_root).map_err(|err| {
@@ -2734,7 +3172,8 @@ impl TeamRuntime {
             error: None,
             plan_id: plan.as_ref().map(|plan| plan.plan_id.clone()),
             plan_step: plan.map(|plan| plan.step),
-            tier: None,
+            tier,
+            routing: None,
         };
         self.records.lock().await.push(record.clone());
         if let Err(err) = self.persist().await {
@@ -6089,6 +6528,9 @@ fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
         "cost_micros": worker.cost_micros,
         "last_activity_ms": worker.last_activity_ms,
     });
+    if let Some(routing) = &worker.routing {
+        view["routing"] = json!(routing);
+    }
     if let Some(review) = &worker.review {
         view["review"] = json!({
             "summary": review.summary,
@@ -6152,7 +6594,11 @@ fn worker_result(result: Result<WorkerRecord, String>, action: &str) -> ToolResu
 
 /// A dispatch answer: the compact worker entry next to the idempotent-reuse
 /// flag. `data` keeps the whole record, as the single-worker answers do.
-fn dispatch_result(result: Result<(WorkerRecord, bool), String>, action: &str) -> ToolResult {
+fn dispatch_result(
+    result: Result<(WorkerRecord, bool), String>,
+    action: &str,
+    mode: RoutingMode,
+) -> ToolResult {
     match result {
         Ok((worker, reused)) => {
             let output = serde_json::to_string(&json!({
@@ -6160,11 +6606,74 @@ fn dispatch_result(result: Result<(WorkerRecord, bool), String>, action: &str) -
                 "result": {"worker": worker_status_view(&worker, false), "reused": reused},
             }))
             .unwrap_or_else(|_| action.to_string());
+            let output = match dispatch_routing_line(mode, worker.routing.as_ref(), worker.tier.as_deref()) {
+                Some(line) => format!("{output}\n{line}"),
+                None => output,
+            };
             let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
             ToolResult::success(output).with_data(json!({"worker": data, "reused": reused}))
         }
         Err(err) => team_tool_error(err),
     }
+}
+
+fn dispatch_routing_line(
+    mode: RoutingMode,
+    routing: Option<&WorkerRouting>,
+    ran_tier: Option<&str>,
+) -> Option<String> {
+    let routing = routing?;
+    if mode == RoutingMode::Off {
+        return None;
+    }
+    let confidence = routing.confidence;
+    if routing.routed_by == "lead_override" {
+        let choice = match (ran_tier, routing.lead_tier.as_deref()) {
+            (Some(ran), Some(requested)) if ran != requested => {
+                format!("you ran {ran} (requested {requested})")
+            }
+            _ => format!(
+                "you chose {}",
+                routing
+                    .lead_tier
+                    .as_deref()
+                    .or(ran_tier)
+                    .unwrap_or("a custom model")
+            ),
+        };
+        return Some(format!(
+            "Laya: {} ({:.2}) — {choice}; logged as an override.",
+            routing.laya_tier.as_deref().unwrap_or("unknown"),
+            confidence.unwrap_or(0.0),
+        ));
+    }
+    if routing.routed_by == "laya" {
+        return Some(format!(
+            "Laya: routed to {} ({:.2}).",
+            routing.laya_tier.as_deref().unwrap_or("unknown"),
+            confidence.unwrap_or(0.0)
+        ));
+    }
+    if mode == RoutingMode::Shadow {
+        return Some(match (routing.laya_tier.as_deref(), confidence, routing.cleared) {
+            (Some(tier), Some(confidence), true) => {
+                format!("Laya would pick {tier} ({confidence:.2}).")
+            }
+            (_, Some(confidence), _) => format!("Laya: unsure ({confidence:.2})."),
+            _ => "Laya: offline.".to_string(),
+        });
+    }
+    if !routing.cleared {
+        return Some(match confidence {
+            Some(confidence) => format!("Laya: unsure ({confidence:.2})."),
+            None => "Laya: offline.".to_string(),
+        });
+    }
+    Some(format!(
+        "Laya: {} ({:.2}) — matches your tier.",
+        routing.laya_tier.as_deref().unwrap_or("unknown"),
+        confidence.unwrap_or(0.0)
+    ))
 }
 
 /// Scan a plan document for its `## Acceptance scenarios` section.
@@ -7141,6 +7650,7 @@ mod tests {
             plan_id: None,
             plan_step: None,
             tier: None,
+            routing: None,
         }
     }
 
@@ -7159,13 +7669,22 @@ mod tests {
         workers: Vec<WorkerRecord>,
     ) -> TeamRuntime {
         let config = tempfile::tempdir().expect("config");
+        open_test_team_with_config(root, state, workers, config.path()).await
+    }
+
+    async fn open_test_team_with_config(
+        root: &std::path::Path,
+        state: &std::path::Path,
+        workers: Vec<WorkerRecord>,
+        config: &std::path::Path,
+    ) -> TeamRuntime {
         std::fs::write(
-            config.path().join("config.toml"),
+            config.join("config.toml"),
             "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
         )
         .expect("config.toml");
         std::fs::write(
-            config.path().join("endpoints.toml"),
+            config.join("endpoints.toml"),
             "[[endpoint]]
 name = \"test\"
 kind = \"local\"
@@ -7183,7 +7702,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             .expect("save the team ledger");
         let engine = mnemo::headless::Engine::start(mnemo::headless::EngineOptions {
             workspace: mnemo::workspace::Workspace::new(root),
-            config_dir: Some(config.path().to_path_buf()),
+            config_dir: Some(config.to_path_buf()),
             permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
             memory: mnemo::headless::MemoryBackend::Disabled,
             index_codegraph: false,
@@ -7196,6 +7715,9 @@ models = [\"scripted-a\", \"scripted-b\"]
             engine: Arc::new(engine),
             workspace_root: root.to_path_buf(),
             state_dir: state.to_path_buf(),
+            config_dir: config.to_path_buf(),
+            classifier: None,
+            routing_log_path: Some(state.join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: Vec::new(),
             pricing: Vec::new(),
@@ -8591,6 +9113,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         let (reused, fresh) = team
             .dispatch_request(DispatchRequest {
                 brief: "BRIEF-91x".to_string(),
+                tier: None,
+                dispatch_routing: false,
+            source: DispatchSource::Ipc,
                 model: None,
                 reasoning_effort: None,
                 worker_id: Some(existing.id.clone()),
@@ -8606,6 +9131,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         let refused = team
             .dispatch_request(DispatchRequest {
                 brief: "BRIEF-91x".to_string(),
+                tier: None,
+                dispatch_routing: false,
+            source: DispatchSource::Ipc,
                 model: None,
                 reasoning_effort: None,
                 worker_id: Some(existing.id.clone()),
@@ -8802,4 +9330,1128 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
         team.shutdown().await;
     }
+
+    struct StubDispatchClassifier {
+        answer: Option<mnemo::memory::Answer>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        delay: std::time::Duration,
+    }
+
+    impl StubDispatchClassifier {
+        fn new(answer: Option<mnemo::memory::Answer>) -> Self {
+            Self {
+                answer,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                delay: std::time::Duration::ZERO,
+            }
+        }
+
+        fn slow(answer: Option<mnemo::memory::Answer>, delay: std::time::Duration) -> Self {
+            Self { delay, ..Self::new(answer) }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mnemo::memory::Classifier for StubDispatchClassifier {
+        async fn classify(
+            &self,
+            _state: &str,
+            _question: &mnemo::memory::Question,
+        ) -> Option<mnemo::memory::Answer> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+            self.answer.clone()
+        }
+    }
+
+    struct RoutingFixture {
+        _root: tempfile::TempDir,
+        state: tempfile::TempDir,
+        _config: tempfile::TempDir,
+        team: TeamRuntime,
+        plan_id: String,
+        classifier: std::sync::Arc<StubDispatchClassifier>,
+    }
+
+    impl RoutingFixture {
+        fn log_path(&self) -> std::path::PathBuf {
+            self.state.path().join("dispatch_routing.jsonl")
+        }
+
+        fn rows(&self) -> Vec<crate::mnemo2::dispatch_routing::DispatchRoutingRow> {
+            std::fs::read_to_string(self.log_path())
+                .expect("routing log")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect()
+        }
+
+        async fn dispatch(&self, tier: Option<&str>, model: Option<&str>) -> ToolResult {
+            let mut args = json!({
+                "worker_id": "routingworker",
+                "plan_id": self.plan_id,
+                "step": 1,
+                "brief": "Implement the step exactly and run its focused regression tests.",
+            });
+            if let Some(tier) = tier {
+                args["tier"] = json!(tier);
+            }
+            if let Some(model) = model {
+                args["model"] = json!(model);
+            }
+            self.team.handle_lead_host_tool("team_dispatch", args).await
+        }
+    }
+
+    fn routing_answer(label: &str, confidence: f64) -> Option<mnemo::memory::Answer> {
+        Some(mnemo::memory::Answer::Choice {
+            label: label.into(),
+            confidence,
+            probabilities: std::collections::BTreeMap::new(),
+        })
+    }
+
+    async fn routing_fixture_with(
+        settings: crate::mnemo2::dispatch_routing::RoutingSettings,
+        answer: Option<mnemo::memory::Answer>,
+        install_classifier: bool,
+        delay: std::time::Duration,
+    ) -> RoutingFixture {
+        use crate::mnemo2::dispatch_routing::save_routing_settings;
+        use mnemo::app::plan_board::{PlanBoard, PlanDraft};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        save_routing_settings(config.path(), &settings).expect("save routing mode");
+        let mut team = open_test_team_with_config(
+            root.path(),
+            state.path(),
+            Vec::new(),
+            config.path(),
+        )
+        .await;
+        let models = vec![
+            lead_model("scripted-difficult"),
+            lead_model("scripted-average"),
+            lead_model("scripted-simple"),
+        ];
+        team.set_catalog(
+            models,
+            mnemo::headless::TiersDto {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec!["test/scripted-average".into()],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            Vec::new(),
+        );
+        let classifier = std::sync::Arc::new(StubDispatchClassifier::slow(answer, delay));
+        if install_classifier {
+            let slot: mnemo::memory::classifier::ClassifierSlot =
+                std::sync::Arc::new(std::sync::RwLock::new(Some(classifier.clone())));
+            team.classifier = Some(slot);
+        }
+        let board = Arc::new(
+            PlanBoard::new(
+                root.path().join(".coding/plans"),
+                root.path().join(".coding/reviews"),
+            ),
+        );
+        let plan = board
+            .create(PlanDraft {
+                title: "Dispatch routing test".into(),
+                goal: "Exercise Laya dispatch routing through the real worker lifecycle".into(),
+                context: "A persisted board step supplies the exact implementation text and worker brief.".into(),
+                steps: vec!["Implement the requested routing behavior in src-tauri/src/mnemo2/team.rs and verify it with focused regression tests".into()],
+                ..PlanDraft::default()
+            })
+            .expect("create routing plan");
+        team.attach_board(board);
+        RoutingFixture {
+            _root: root,
+            state,
+            _config: config,
+            team,
+            plan_id: plan.id,
+            classifier,
+        }
+    }
+
+    async fn routing_fixture(
+        mode: crate::mnemo2::dispatch_routing::RoutingMode,
+        answer: Option<mnemo::memory::Answer>,
+        install_classifier: bool,
+    ) -> RoutingFixture {
+        routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            answer,
+            install_classifier,
+            std::time::Duration::ZERO,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn off_mode_never_asks_laya() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("average"), None).await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fixture.classifier.calls(), 0);
+        assert!(!fixture.log_path().exists());
+        assert!(fixture
+            .team
+            .worker("routingworker")
+            .await
+            .expect("worker")
+            .routing
+            .is_none());
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shadow_logs_layas_pick_and_runs_the_lead_tier() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("average"), None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Laya would pick average (0.62)."));
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("average"));
+        let routing = worker.routing.expect("routing metadata");
+        assert_eq!(routing.laya_tier.as_deref(), Some("average"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("average"));
+        assert_eq!(routing.routed_by, "lead");
+        assert_eq!(routing.confidence, Some(0.62));
+        assert!(routing.cleared);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(matches!(
+            &rows[0],
+            crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                tier: Some(tier),
+                ran_tier: Some(ran),
+                ..
+            } if tier == "average" && ran == "average"
+        ));
+        let status = team_status_answer(&fixture.team, json!({})).await;
+        assert_eq!(status["result"][0]["routing"]["laya_tier"], "average");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shadow_override_is_logged_when_laya_cleared_elsewhere() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert_eq!(fixture.classifier.calls(), 1);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(matches!(
+            &rows[1],
+            crate::mnemo2::dispatch_routing::DispatchRoutingRow::LeadOverride {
+                laya_tier: Some(laya),
+                lead_tier,
+                ..
+            } if laya == "difficult" && lead_tier == "average"
+        ));
+        assert_eq!(
+            fixture
+                .team
+                .worker("routingworker")
+                .await
+                .expect("worker")
+                .routing
+                .expect("routing")
+                .routed_by,
+            "lead_override"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suggest_auto_uses_a_cleared_laya_tier() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("difficult"));
+        assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+        assert_eq!(worker.routing.expect("routing").routed_by, "laya");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suggest_auto_refuses_when_unsure() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "Laya is unsure (0.41); pass a tier");
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                ran_tier: None,
+                ..
+            }]
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suggest_auto_refuses_when_laya_is_offline() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            None,
+            false,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "Laya is not running; pass a tier");
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn auto_mode_falls_back_when_unsure() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Laya: unsure (0.41)."));
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("average"));
+        assert_eq!(worker.routing.expect("routing").routed_by, "lead");
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                ran_tier: Some(ran),
+                ..
+            }] if ran == "average"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_model_wins_in_auto_mode() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(None, Some("test/scripted-simple")).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model.as_deref(), Some("test/scripted-simple"));
+        assert_eq!(worker.tier.as_deref(), Some("simple"));
+        assert_eq!(worker.routing.expect("routing").routed_by, "lead_override");
+        assert_eq!(fixture.rows().len(), 2);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_laya_times_out_as_offline() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let result = fixture.dispatch(None, None).await;
+        let elapsed = started.elapsed();
+        assert!(result.success, "{}", result.output);
+        assert!(elapsed >= std::time::Duration::from_secs(3), "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+        assert!(result.output.contains("Laya: offline."));
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn redispatch_does_not_classify_twice() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        let reused = fixture.dispatch(Some("average"), None).await;
+        assert!(reused.success, "{}", reused.output);
+        assert!(reused.output.contains("\"reused\":true"));
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert_eq!(fixture.rows().len(), 1);
+        assert_eq!(
+            fixture
+                .team
+                .worker("routingworker")
+                .await
+                .expect("worker")
+                .routing
+                .expect("stored routing")
+                .confidence,
+            Some(0.62)
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_dispatch_is_never_classified() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        fixture
+            .team
+            .stop("routingworker")
+            .await
+            .expect("stop the audit target");
+        *fixture.team.routing.write().unwrap_or_else(|e| e.into_inner()) =
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            };
+        let result = fixture
+            .team
+            .handle_lead_host_tool(
+                "team_audit_dispatch",
+                json!({
+                    "worker_id": "routingworker",
+                    "reviewer_id": "routingaudit",
+                    "plan_id": fixture.plan_id,
+                    "step": 1,
+                    "brief": "Audit the implementation independently against the complete step specification.",
+                }),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fixture.classifier.calls(), 0);
+        assert!(!fixture.log_path().exists());
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn schema_offers_auto_only_in_suggest_and_auto() {
+        for (mode, offers_auto) in [
+            (crate::mnemo2::dispatch_routing::RoutingMode::Off, false),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Shadow, false),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Suggest, true),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Auto, true),
+        ] {
+            let root = tempfile::tempdir().expect("workspace");
+            let state = tempfile::tempdir().expect("state");
+            init_git(root.path());
+            let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+            team.set_catalog(
+                vec![lead_model("scripted-model")],
+                mnemo::headless::TiersDto {
+                    simple: vec!["test/scripted-model".into()],
+                    average: vec!["test/scripted-model".into()],
+                    difficult: vec!["test/scripted-model".into()],
+                },
+                Vec::new(),
+            );
+            *team.routing.write().unwrap_or_else(|e| e.into_inner()) =
+                crate::mnemo2::dispatch_routing::RoutingSettings {
+                    mode,
+                    ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+                };
+            let tools = team.lead_host_tools();
+            let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+            let tiers = dispatch.parameters["properties"]["tier"]["enum"]
+                .as_array()
+                .expect("tier enum");
+            assert_eq!(tiers.contains(&json!("auto")), offers_auto, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_is_optional_only_in_auto_mode() {
+        for (mode, required) in [
+            (crate::mnemo2::dispatch_routing::RoutingMode::Off, true),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Shadow, true),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Suggest, true),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Auto, false),
+        ] {
+            let root = tempfile::tempdir().expect("workspace");
+            let state = tempfile::tempdir().expect("state");
+            init_git(root.path());
+            let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+            team.set_catalog(
+                vec![lead_model("scripted-model")],
+                mnemo::headless::TiersDto {
+                    simple: vec!["test/scripted-model".into()],
+                    average: vec!["test/scripted-model".into()],
+                    difficult: vec!["test/scripted-model".into()],
+                },
+                Vec::new(),
+            );
+            *team.routing.write().unwrap_or_else(|e| e.into_inner()) =
+                crate::mnemo2::dispatch_routing::RoutingSettings {
+                    mode,
+                    ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+                };
+            let tools = team.lead_host_tools();
+            let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+            let required_fields = dispatch.parameters["required"]
+                .as_array()
+                .expect("required fields");
+            assert_eq!(required_fields.contains(&json!("tier")), required, "{mode:?}");
+        }
+    }
+
+
+    #[tokio::test]
+    async fn suggest_auto_refuses_when_laya_returns_no_answer() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            None,
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "Laya is not running; pass a tier");
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn classification_happens_outside_merge_lock() {
+        let fixture = std::sync::Arc::new(
+            routing_fixture(
+                crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+                true,
+            )
+            .await,
+        );
+        let merge_guard = fixture.team.merge_lock.lock().await;
+        let dispatch_fixture = std::sync::Arc::clone(&fixture);
+        let dispatch = tokio::spawn(async move {
+            dispatch_fixture.dispatch(Some("average"), None).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while fixture.classifier.calls() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("classification runs while merge_lock is held elsewhere");
+        assert!(!dispatch.is_finished(), "dispatch still waits for merge_lock");
+        drop(merge_guard);
+        let result = dispatch.await.expect("dispatch task");
+        assert!(result.success, "{}", result.output);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permit_wait_counts_toward_laya_timeout() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        let _permit = fixture.team.routing_permit.acquire().await.expect("permit");
+        let request = DispatchRequest {
+            brief: "Use the complete step specification to choose this worker's model tier".into(),
+            tier: None,
+            dispatch_routing: true,
+            source: DispatchSource::Ipc,
+            model: None,
+            reasoning_effort: None,
+            worker_id: Some("permitwait".into()),
+            plan: Some(PlanRef {
+                plan_id: fixture.plan_id.clone(),
+                step: 0,
+            }),
+            review_risk: None,
+            read_back: false,
+        };
+        let routed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture.team.route_implementation_dispatch(
+                &request,
+                "Implement the requested routing behavior in src-tauri/src/mnemo2/team.rs and verify it with focused regression tests",
+                &request.brief,
+            ),
+        )
+        .await
+        .expect("the permit wait is inside Laya's 3 s timeout")
+        .expect("routing decision");
+        assert_eq!(routed.tier.as_deref(), Some("average"));
+        assert_eq!(fixture.classifier.calls(), 0);
+        assert!(matches!(
+            routed.rows.as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shadow_without_tiers_keeps_the_default_model() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        assert_eq!(fixture.classifier.calls(), 0);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn team_status_omits_routing_when_none() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            None,
+            false,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        let compact = team_status_answer(&fixture.team, json!({})).await;
+        assert!(compact["result"][0].get("routing").is_none());
+        let detailed = team_status_answer(&fixture.team, json!({"detail": true})).await;
+        assert!(detailed["result"][0].get("routing").is_none());
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn auto_fallback_without_that_tier_uses_the_default_model() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            true,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto {
+                simple: vec!["test/scripted-model".into()],
+                average: Vec::new(),
+                difficult: vec!["test/scripted-model".into()],
+            },
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        assert_eq!(worker.routing.expect("routing").routed_by, "lead");
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                ran_tier: None,
+                ..
+            }]
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn racing_duplicate_dispatch_logs_one_route_row() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let (first, second) = tokio::join!(
+            fixture.dispatch(Some("average"), None),
+            fixture.dispatch(Some("average"), None)
+        );
+        assert!(first.success, "{}", first.output);
+        assert!(second.success, "{}", second.output);
+        assert_eq!(fixture.classifier.calls(), 2);
+        assert_eq!(fixture.rows().len(), 1, "exactly one Route row is committed");
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn no_free_slot_writes_no_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        fixture
+            .team
+            .persistence
+            .slots
+            .store(0, Ordering::SeqCst);
+        let result = fixture.dispatch(Some("average"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "all 0 worker slots are busy");
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(!fixture.log_path().exists());
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provisioning_failure_writes_no_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let git = fixture._root.path().join(".git");
+        let parked = fixture._root.path().join(".git-parked");
+        std::fs::rename(&git, &parked).expect("park git metadata");
+        let result = fixture.dispatch(Some("average"), None).await;
+        assert!(!result.success);
+        assert!(result.output.contains("not a usable Git checkout"));
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(!fixture.log_path().exists());
+        std::fs::rename(parked, git).expect("restore git metadata");
+        fixture.team.shutdown().await;
+    }
+
+
+    #[test]
+    fn dispatch_routing_line_truth_table() {
+        let routing = WorkerRouting {
+            laya_tier: Some("difficult".into()),
+            confidence: Some(0.71),
+            cleared: true,
+            lead_tier: Some("average".into()),
+            routed_by: "lead_override".into(),
+            nudged: None,
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
+            Some("Laya: difficult (0.71) — you chose average; logged as an override.")
+        );
+        let routing = WorkerRouting {
+            laya_tier: Some("average".into()),
+            confidence: Some(0.62),
+            lead_tier: Some("average".into()),
+            routed_by: "lead".into(),
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
+            Some("Laya would pick average (0.62).")
+        );
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Suggest, Some(&routing), Some("average")).as_deref(),
+            Some("Laya: average (0.62) — matches your tier.")
+        );
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Off, Some(&routing), Some("average")),
+            None
+        );
+        let routing = WorkerRouting {
+            routed_by: "laya".into(),
+            lead_tier: None,
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing), Some("average")).as_deref(),
+            Some("Laya: routed to average (0.62).")
+        );
+        let routing = WorkerRouting {
+            confidence: Some(0.41),
+            cleared: false,
+            routed_by: "lead".into(),
+            lead_tier: Some("average".into()),
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing), Some("average")).as_deref(),
+            Some("Laya: unsure (0.41).")
+        );
+        let routing = WorkerRouting {
+            laya_tier: None,
+            confidence: None,
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
+            Some("Laya: offline.")
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_non_auto_without_tiers_uses_default_model() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            None,
+            false,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gated_answer_has_no_skip_reason() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(None, None).await.success);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                cleared: false,
+                confidence,
+                ..
+            }] if (*confidence - 0.41).abs() < f64::EPSILON
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_schema_is_unchanged() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto {
+                simple: vec!["test/scripted-model".into()],
+                average: vec!["test/scripted-model".into()],
+                difficult: vec!["test/scripted-model".into()],
+            },
+            Vec::new(),
+        );
+        let tools = team.lead_host_tools();
+        let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+        let expected = json!({
+            "type": "object",
+            "properties": {
+                "worker_id": {"type": "string", "minLength": 8, "maxLength": 64, "pattern": "^[A-Za-z0-9]+$"},
+                "plan_id": {"type": "string", "description": "The board plan this task belongs to (from plan_create or plan_list). Required."},
+                "step": {"type": "integer", "minimum": 1, "description": "The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},
+                "brief": {"type": "string", "description": "Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},
+                "tier": {
+                    "type": "string",
+                    "enum": ["difficult", "average", "simple"],
+                    "description": "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\ndifficult - design, debugging, bug_fixing plans, cross-cutting work, steps touching shared contracts: test/scripted-model\naverage - typical implementation steps: test/scripted-model\nsimple - single-file mechanical edits, checks, lookups, scaffolding: test/scripted-model"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "A specific model from the tiers, only when the tier's first model does not fit; it overrides `tier`. Prefer `tier`; models outside the tiers are refused.",
+                    "enum": ["test/scripted-model"]
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "description": "The worker's reasoning effort, chosen with its model: higher for hard design or debugging, lower for mechanical work. Applies to the model `tier` or `model` picks; a value that model does not support is rejected with its allowed list. Omit to use the model's configured default."
+                },
+                "read_back": {
+                    "type": "boolean",
+                    "description": "Optional. When true, the worker's first turn only reads its spec and the files it names, then messages the lead with numbered questions (ambiguities, contradictions with the code, open decisions) or exactly 'No questions.', and waits for the lead's reply before changing files. Use it for large or subtle specs."
+                }
+            },
+            "required": ["worker_id", "plan_id", "step", "brief", "tier"]
+        });
+        assert_eq!(&dispatch.parameters, &expected);
+    }
+
+
+    #[tokio::test]
+    async fn ipc_dispatch_on_plan_logs_a_shadow_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the IPC-dispatched step and run its regression tests".into(),
+                Some("test/scripted-average".into()),
+                None,
+                Some("ipcworker".into()),
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("IPC dispatch");
+        assert!(!reused);
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert_eq!(fixture.rows().len(), 1);
+        let routing = worker.routing.expect("IPC worker routing");
+        assert_eq!(routing.laya_tier.as_deref(), Some("average"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("average"));
+        assert_eq!(routing.routed_by, "lead");
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn tier_plus_cross_tier_model_logs_the_ran_tier() {
+        for (requested, ran, laya_label, expected_effort) in [
+            ("simple", "difficult", mnemo::agent::route_question::LABEL_TRIVIAL, "high"),
+            ("difficult", "simple", mnemo::agent::route_question::LABEL_HARD, "low"),
+        ] {
+            let fixture = routing_fixture_with(
+                crate::mnemo2::dispatch_routing::RoutingSettings {
+                    mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                    effort: std::collections::BTreeMap::from([
+                        ("difficult".into(), "high".into()),
+                        ("simple".into(), "low".into()),
+                    ]),
+                    ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+                },
+                routing_answer(laya_label, 0.91),
+                true,
+                std::time::Duration::ZERO,
+            )
+            .await;
+            fixture.team.set_catalog(
+                ["difficult", "average", "simple"]
+                    .into_iter()
+                    .map(|tier| LeadModel {
+                        reasoning_efforts: vec!["low".into(), "high".into()],
+                        ..lead_model(&format!("scripted-{tier}"))
+                    })
+                    .collect(),
+                mnemo::headless::TiersDto {
+                    difficult: vec!["test/scripted-difficult".into()],
+                    average: vec!["test/scripted-average".into()],
+                    simple: vec!["test/scripted-simple".into()],
+                },
+                Vec::new(),
+            );
+            let model = format!("test/scripted-{ran}");
+            let result = fixture.dispatch(Some(requested), Some(&model)).await;
+            assert!(result.success, "{requested} -> {ran}: {}", result.output);
+            assert!(result.output.contains(&format!(
+                "Laya: {requested} (0.91) — you ran {ran} (requested {requested}); logged as an override."
+            )));
+            let worker = fixture.team.worker("routingworker").await.expect("worker");
+            assert_eq!(worker.tier.as_deref(), Some(ran));
+            assert_eq!(worker.model.as_deref(), Some(model.as_str()));
+            assert_eq!(worker.reasoning_effort.as_deref(), Some(expected_effort));
+            let routing = worker.routing.expect("routing");
+            assert_eq!(routing.lead_tier.as_deref(), Some(requested));
+            assert_eq!(routing.laya_tier.as_deref(), Some(requested));
+            assert_eq!(routing.routed_by, "lead_override");
+            let rows = fixture.rows();
+            assert_eq!(rows.len(), 2);
+            assert!(matches!(
+                &rows[0],
+                crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                    lead_tier: Some(lead),
+                    ran_tier: Some(actual),
+                    ..
+                } if lead == requested && actual == ran
+            ));
+            assert!(matches!(
+                &rows[1],
+                crate::mnemo2::dispatch_routing::DispatchRoutingRow::LeadOverride {
+                    lead_tier,
+                    requested_tier,
+                    ..
+                } if lead_tier == ran && requested_tier.as_deref() == Some(requested)
+            ));
+            fixture.team.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_below_gate_with_a_different_fallback_reports_unsure() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                fallback_tier: "difficult".into(),
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            true,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Laya: unsure (0.41)."));
+        assert!(!result.output.contains("routed to difficult"));
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("difficult"));
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn ipc_auto_id_dispatch_row_carries_the_real_worker_id() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the auto-id IPC step and verify its routing log".into(),
+                Some("test/scripted-average".into()),
+                None,
+                None,
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("auto-id IPC dispatch");
+        assert!(!reused);
+        assert_eq!(fixture.classifier.calls(), 1);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0],
+            crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route { worker_id, .. }
+                if worker_id == &worker.id
+        ));
+        assert!(!worker.id.is_empty());
+
+
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn ipc_shadow_dispatch_without_model_classifies_and_uses_the_default() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the IPC default-model step and verify its routing metadata".into(),
+                None,
+                None,
+                Some("ipcdefault".into()),
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("IPC default-model dispatch");
+        assert!(!reused);
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert_eq!(fixture.rows().len(), 1);
+        let routing = worker.routing.expect("routing");
+        assert_eq!(routing.laya_tier.as_deref(), Some("difficult"));
+        assert_eq!(routing.routed_by, "lead");
+
+        let lead_tool = fixture.dispatch(None, None).await;
+        assert!(!lead_tool.success);
+        assert!(lead_tool.output.contains("choose a `tier` for this worker"));
+        fixture.team.shutdown().await;
+    }
+
 }

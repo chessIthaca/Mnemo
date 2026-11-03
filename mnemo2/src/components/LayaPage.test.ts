@@ -1,6 +1,16 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { describe, expect, it, vi } from "vitest";
-import type { LayaEvent, LayaFlags, LayaStatus, LayaTransport, RoutingPatch } from "../lib/layaSettings";
+import type {
+  DispatchRoutingSettings,
+  EvalReport,
+  LayaEvent,
+  LayaFlags,
+  LayaStatus,
+  LayaTransport,
+  RoutingEvalWire,
+  RoutingPatch,
+  RoutingStatusWire,
+} from "../lib/layaSettings";
 import { emptyEndpoint, emptyModel, type EndpointDetailDto } from "../lib/settingsEngine";
 import LayaPage from "./LayaPage.svelte";
 
@@ -28,6 +38,7 @@ function sampleStatus(overrides: Partial<LayaStatus> = {}): LayaStatus {
     },
     routing: {
       cheap: "ep/tiny",
+      routine: null,
       capable: "ep/big",
       lane_medium: null,
       lane_high: null,
@@ -46,9 +57,64 @@ function sampleEndpoints(): EndpointDetailDto[] {
   return [endpoint];
 }
 
+/** The Mnemo2 `[routing]` snapshot with only a few shadow decisions. */
+function sampleRoutingStatus(overrides: Partial<RoutingStatusWire> = {}): RoutingStatusWire {
+  return {
+    settings: {
+      mode: "off",
+      min_confidence_3: 0.475,
+      min_confidence_2: 0.6,
+      fallback_tier: "average",
+      nudges: true,
+      min_words: 20,
+      effort: {},
+    },
+    summary: {
+      decisions_by_mode: { shadow: 4, off: 2 },
+      agreement_rate: 0.5,
+      laya_accuracy: 0.75,
+      lead_accuracy: 1,
+      labelled: 4,
+      overrides_by_source: { lead: 1, user: 1 },
+      nudges: 2,
+      nudges_acted_on: 1,
+      eval_date: null,
+    },
+    eval: null,
+    ...overrides,
+  };
+}
+
+/** One eval report fixture. */
+function sampleReport(labels: number, suggested: number | null): EvalReport {
+  return {
+    labels,
+    default_gate: labels === 3 ? 0.475 : 0.6,
+    table: [
+      { threshold: 0.25, routed: 48, correct: 40, routed_share: 1, accuracy: 40 / 48 },
+      { threshold: 0.475, routed: 30, correct: 29, routed_share: 30 / 48, accuracy: 29 / 30 },
+    ],
+    suggested,
+    misses: [{ text: "Make it better.", expected: null, got: "routine", confidence: 0.9 }],
+  };
+}
+
+/** The `run_routing_eval` fixture. */
+function sampleEval(): RoutingEvalWire {
+  return {
+    three: sampleReport(3, 0.475),
+    two: sampleReport(2, 0.5),
+    record: { date: "2026-11-03", min_confidence_3: 0.475, min_confidence_2: 0.5, routed_share: 0.625, accuracy: 29 / 30 },
+  };
+}
+
 /** The transport fake: a mutable live snapshot, and handlers the test drives. */
-function makePage(initial: LayaStatus = sampleStatus(), options: { pendingSetup?: boolean } = {}) {
+function makePage(
+  initial: LayaStatus = sampleStatus(),
+  options: { pendingSetup?: boolean; routing?: RoutingStatusWire } = {},
+) {
   const status = initial;
+  const routingStatus = options.routing ?? sampleRoutingStatus();
   const handlers: ((event: LayaEvent) => void)[] = [];
   const transport = {
     status: vi.fn(async () => structuredClone(status)),
@@ -65,12 +131,18 @@ function makePage(initial: LayaStatus = sampleStatus(), options: { pendingSetup?
         if (index >= 0) handlers.splice(index, 1);
       };
     }),
+    routingStatus: vi.fn(async () => structuredClone(routingStatus)),
+    saveRoutingSettings: vi.fn(async (settings: DispatchRoutingSettings) => {
+      routingStatus.settings = structuredClone(settings);
+      return structuredClone(routingStatus);
+    }),
+    runRoutingEval: vi.fn(async () => sampleEval()),
   };
   const emit = (event: LayaEvent): void => {
     for (const handler of [...handlers]) handler(event);
   };
   render(LayaPage, { props: { transport, endpoints: sampleEndpoints() } });
-  return { status, transport, emit };
+  return { status, routingStatus, transport, emit };
 }
 
 describe("LayaPage", () => {
@@ -135,6 +207,7 @@ describe("LayaPage", () => {
     expect(sentFlags).toBeUndefined();
     expect(sentRouting).toEqual({
       cheap: null,
+      routine: null,
       capable: { endpoint: "ep", model: "big" },
       lane_medium: null,
       lane_high: null,
@@ -250,8 +323,50 @@ describe("LayaPage", () => {
       disable: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
       onLayaEvent: vi.fn(async () => () => {}),
+      routingStatus: vi.fn(async () => sampleRoutingStatus()),
+      saveRoutingSettings: vi.fn(async () => sampleRoutingStatus()),
+      runRoutingEval: vi.fn(async () => sampleEval()),
     };
     render(LayaPage, { props: { transport, endpoints: sampleEndpoints() } });
     expect(await screen.findByText("config unreadable")).toBeTruthy();
+  });
+
+  it("renders the four dispatch modes, locking suggest and auto under 30 labelled decisions", async () => {
+    makePage();
+    const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
+    expect(within(block).getAllByRole("radio")).toHaveLength(4);
+    expect((within(block).getByRole("radio", { name: /^Off / }) as HTMLInputElement).checked).toBe(true);
+    expect((within(block).getByRole("radio", { name: /^Shadow / }) as HTMLInputElement).disabled).toBe(false);
+    expect((within(block).getByRole("radio", { name: /^Suggest / }) as HTMLInputElement).disabled).toBe(true);
+    expect((within(block).getByRole("radio", { name: /^Auto / }) as HTMLInputElement).disabled).toBe(true);
+    const forced = within(block).getAllByRole("button", { name: /^force \(/ });
+    expect(forced).toHaveLength(2);
+    expect(forced[0].textContent).toContain("4 of 30 shadow decisions");
+    expect(screen.getAllByText(/provisional defaults, no eval yet/).length).toBe(2);
+  });
+
+  it("saves the [routing] table through saveRoutingSettings", async () => {
+    const { transport } = makePage();
+    const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
+    await fireEvent.click(within(block).getByRole("radio", { name: /^Shadow / }));
+    await fireEvent.input(within(block).getByLabelText("Three-label gate"), { target: { value: "0.5" } });
+    await fireEvent.click(within(block).getByRole("button", { name: "Save dispatch routing" }));
+    await waitFor(() => expect(transport.saveRoutingSettings).toHaveBeenCalledTimes(1));
+    const sent = transport.saveRoutingSettings.mock.calls[0][0] as unknown as DispatchRoutingSettings;
+    expect(sent.mode).toBe("shadow");
+    expect(sent.min_confidence_3).toBe(0.5);
+    expect(sent.fallback_tier).toBe("average");
+    expect(await within(block).findByText("Saved to mnemo2.toml.")).toBeTruthy();
+  });
+
+  it("runs the eval and shows the table, the misses and the suggested gates", async () => {
+    const { transport } = makePage();
+    const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
+    await fireEvent.click(within(block).getByRole("button", { name: "Run eval" }));
+    await waitFor(() => expect(transport.runRoutingEval).toHaveBeenCalledTimes(1));
+    expect(await within(block).findByText(/Three labels — suggested 0\.475/)).toBeTruthy();
+    expect(within(block).getByText(/Two labels — suggested 0\.500/)).toBeTruthy();
+    expect(within(block).getAllByText(/want no route · got routine/).length).toBeGreaterThan(0);
+    expect(within(block).getByRole("button", { name: "Apply suggested gates" })).toBeTruthy();
   });
 });

@@ -534,6 +534,9 @@ export interface ClassifierDraft {
   routingEnforce: boolean;
   /** The model a confidently-trivial task routes to (null = unset). */
   routingCheap: ModelRefConfig | null;
+  /** The model a confidently-routine first prompt routes to — the middle rung
+   *  of the shared three-label question (plan 2ba2168a, design §4.3). */
+  routingRoutine: ModelRefConfig | null;
   /** The model a confidently-architectural task routes to (null = unset). */
   routingCapable: ModelRefConfig | null;
   /** The model a medium-complexity plan step routes to — the escalation-lane
@@ -545,9 +548,13 @@ export interface ClassifierDraft {
   /** The model the escalate rung routes to (lane `escalate`, typically after
    *  a failed cycle). */
   routingEscalate: ModelRefConfig | null;
-  /** The calibrated-probability gate (0–1): a decision routes only at or
-   *  above it; below it today's model runs. */
+  /** The calibrated-probability gate (0–1) for the step-lane ladder: a
+   *  decision routes only at or above it. */
   routingThreshold: number;
+  /** The first-prompt gate (0–1), or null for the kernel's calibrated default
+   *  (0.475 for three labels, 0.60 for two) — the gate the session's one
+   *  first-prompt route rides. */
+  routingFirstPromptMinConfidence: number | null;
   /** The budget layer's opt-in (`[general.budget] enabled`, backlog
    *  a25a5323) — deterministic spend caps the model can never override: a cap
    *  reached pauses the plan with a question instead of killing it. */

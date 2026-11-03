@@ -246,6 +246,28 @@ export interface InboxEntry {
   atMs: number;
 }
 
+/**
+ * The one dispatch-time routing decision persisted with a worker (plan
+ * 2ba2168a, design §4.7): what Laya picked, at what confidence, whether it
+ * cleared the gate, who chose the tier that ran, and the one nudge sent.
+ */
+export interface WorkerRouting {
+  /** The tier Laya selected, when it returned a known label. */
+  laya_tier: string | null;
+  /** Laya's confidence, when it answered. */
+  confidence: number | null;
+  /** Whether the answer cleared the configured gate. */
+  cleared: boolean;
+  /** The tier the lead passed or the mode fell back to, when one was used. */
+  lead_tier: string | null;
+  /** Who selected the running tier: `lead`, `laya`, or `lead_override`. */
+  routed_by: string;
+  /** The tier the worker actually started on at dispatch. */
+  ran_tier: string | null;
+  /** The tier the one nudge suggested, if any. */
+  nudged: string | null;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -263,6 +285,8 @@ export interface Worker {
   tier?: string;
   /** The worker's chosen reasoning effort, when one was set. */
   reasoningEffort?: string;
+  /** The dispatch-time routing decision, when the dispatch recorded one. */
+  routing?: WorkerRouting | null;
   branch: string;
   worktree: string;
   files: string[];

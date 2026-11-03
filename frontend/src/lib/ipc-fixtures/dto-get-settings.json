@@ -44,8 +44,10 @@
       "cheap": null,
       "enforce": false,
       "escalate": null,
+      "first_prompt_min_confidence": null,
       "lane_high": null,
       "lane_medium": null,
+      "routine": null,
       "threshold": 0.8
     },
     "safety": "approve-each-action",

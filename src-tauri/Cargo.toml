@@ -58,6 +58,14 @@ required-features = ["mnemo2"]
 name = "mnemo2-mcp"
 path = "src/bin/mnemo2_mcp.rs"
 required-features = ["mnemo2"]
+# The routing eval (plan 2ba2168a, design §4.8): asks a running Laya the
+# hand-set and mined corpora, one prompt at a time, and prints the threshold
+# sweep with the suggested `min_confidence_3` / `min_confidence_2`.
+[[bin]]
+name = "mnemo2_route_eval"
+path = "src/bin/mnemo2_route_eval.rs"
+required-features = ["mnemo2"]
+
 
 [dev-dependencies]
 tempfile = "3"

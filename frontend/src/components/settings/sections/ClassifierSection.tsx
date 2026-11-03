@@ -145,6 +145,9 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   const [routing, setRouting] = useState(false);
   const [routingEnforce, setRoutingEnforce] = useState(false);
   const [routingCheap, setRoutingCheap] = useState<ModelRefConfig | null>(null);
+  // The middle rung of the shared three-label question (plan 2ba2168a): the
+  // model a confidently-ROUTINE first prompt routes to.
+  const [routingRoutine, setRoutingRoutine] = useState<ModelRefConfig | null>(null);
   const [routingCapable, setRoutingCapable] = useState<ModelRefConfig | null>(null);
   // The escalation-lane targets (backlog ad56c7bd): plan-step-granular routing
   // on top of the pre-prompt decision — at each plan step the compound reflex
@@ -154,6 +157,10 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   const [routingLaneHigh, setRoutingLaneHigh] = useState<ModelRefConfig | null>(null);
   const [routingEscalate, setRoutingEscalate] = useState<ModelRefConfig | null>(null);
   const [routingThreshold, setRoutingThreshold] = useState(0.8);
+  // The first-prompt gate (plan 2ba2168a, design §4.4): null = the kernel's
+  // calibrated default (0.475 for three labels, 0.60 for two).
+  const [routingFirstPromptMinConfidence, setRoutingFirstPromptMinConfidence] =
+    useState<number | null>(null);
   // The deterministic budget layer (backlog a25a5323, `[general.budget]`):
   // spend caps the model can never override — a reached cap pauses the plan
   // through a pending question (continue for this plan / double the cap /
@@ -195,11 +202,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         routing: laya?.routing ?? false,
         routingEnforce: routingWire?.enforce ?? false,
         routingCheap: routingWire?.cheap ?? null,
+        routingRoutine: routingWire?.routine ?? null,
         routingCapable: routingWire?.capable ?? null,
         routingLaneMedium: routingWire?.lane_medium ?? null,
         routingLaneHigh: routingWire?.lane_high ?? null,
         routingEscalate: routingWire?.escalate ?? null,
         routingThreshold: routingWire?.threshold ?? 0.8,
+        routingFirstPromptMinConfidence: routingWire?.first_prompt_min_confidence ?? null,
         budgetEnabled: budgetWire?.enabled ?? false,
         budgetMaxTokensPerPlan: budgetWire?.max_tokens_per_plan ?? 0,
         budgetMaxEscalationsPerPlan: budgetWire?.max_escalations_per_plan ?? 1,
@@ -214,11 +223,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setRouting(next.routing);
       setRoutingEnforce(next.routingEnforce);
       setRoutingCheap(next.routingCheap);
+      setRoutingRoutine(next.routingRoutine);
       setRoutingCapable(next.routingCapable);
       setRoutingLaneMedium(next.routingLaneMedium);
       setRoutingLaneHigh(next.routingLaneHigh);
       setRoutingEscalate(next.routingEscalate);
       setRoutingThreshold(next.routingThreshold);
+      setRoutingFirstPromptMinConfidence(next.routingFirstPromptMinConfidence);
       setBudgetEnabled(next.budgetEnabled);
       setBudgetMaxTokensPerPlan(next.budgetMaxTokensPerPlan);
       setBudgetMaxEscalationsPerPlan(next.budgetMaxEscalationsPerPlan);
@@ -279,11 +290,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     routing,
     routingEnforce,
     routingCheap,
+    routingRoutine,
     routingCapable,
     routingLaneMedium,
     routingLaneHigh,
     routingEscalate,
     routingThreshold,
+    routingFirstPromptMinConfidence,
     budgetEnabled,
     budgetMaxTokensPerPlan,
     budgetMaxEscalationsPerPlan,
@@ -332,6 +345,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
           laya_routing: routing,
           routing: {
             cheap: routingCheap,
+            routine: routingRoutine,
             capable: routingCapable,
             // The escalation-lane targets (backlog ad56c7bd) ride the same
             // null-clears contract as the other two.
@@ -339,6 +353,8 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             lane_high: routingLaneHigh,
             escalate: routingEscalate,
             threshold: routingThreshold,
+            // null = the kernel's calibrated default; the field below shows it.
+            first_prompt_min_confidence: routingFirstPromptMinConfidence,
             enforce: routingEnforce,
           },
           // The deterministic budget layer (backlog a25a5323): the enable
@@ -572,6 +588,27 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             </div>
             <div className="space-y-1">
               <div className="text-xs font-medium text-(--text-primary)">
+                Routine tasks
+              </div>
+              <ModelPickerBody
+                endpoints={endpoints}
+                value={
+                  routingRoutine ?? {
+                    endpoint: "",
+                    model: "",
+                    reasoning_effort: null,
+                  }
+                }
+                onChange={(v) => setRoutingRoutine(v)}
+              />
+              <div className="text-[0.7rem] text-(--text-muted)">
+                The middle rung: add a field end to end, a small command, a
+                component with tests. Leave it unset and a routine answer folds
+                up into the capable lane.
+              </div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs font-medium text-(--text-primary)">
                 Architectural tasks
               </div>
               <ModelPickerBody
@@ -657,7 +694,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             </div>
             <div className="flex items-center gap-2">
               <label className="text-[0.7rem] text-(--text-muted)">
-                Confidence gate
+                Step-lane gate
               </label>
               <input
                 type="number"
@@ -680,8 +717,48 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
                 className="w-20 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
               <span className="text-[0.7rem] text-(--text-muted)">
-                a decision routes only at or above it (default 0.80)
+                the per-step lane ladder routes only at or above it (default
+                0.80)
               </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-[0.7rem] text-(--text-muted)">
+                First-prompt gate
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={1}
+                step={0.025}
+                value={routingFirstPromptMinConfidence ?? ""}
+                placeholder="calibrated default 0.475"
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  // An empty field means "use the calibrated default", never 0
+                  // (which would route every first prompt).
+                  if (raw === "") {
+                    setRoutingFirstPromptMinConfidence(null);
+                    return;
+                  }
+                  const next = Number(raw);
+                  if (!Number.isFinite(next) || next < 0 || next > 1) {
+                    e.target.value = String(routingFirstPromptMinConfidence ?? "");
+                    return;
+                  }
+                  setRoutingFirstPromptMinConfidence(next);
+                }}
+                className="w-32 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
+              />
+              <span className="text-[0.7rem] text-(--text-muted)">
+                {routingFirstPromptMinConfidence === null
+                  ? "calibrated default 0.475 (0.60 with two labels) — the routing eval replaces it"
+                  : "a first-prompt route only at or above it"}
+              </span>
+            </div>
+            <div className="text-[0.7rem] text-(--text-muted)">
+              Routes the first prompt of a session once; afterwards Laya only
+              suggests. A manual model pick turns routing off for that session
+              and is logged.
             </div>
           </div>
         )}

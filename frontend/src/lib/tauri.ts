@@ -507,6 +507,9 @@ export interface AppSettings {
     routing?: {
       /** The model a confidently-trivial task routes to (null = unset). */
       cheap: ModelRefConfig | null;
+      /** The model a confidently-routine first prompt routes to — the shared
+       *  three-label question's middle rung (plan 2ba2168a, null = unset). */
+      routine: ModelRefConfig | null;
       /** The model a confidently-architectural task routes to (null = unset). */
       capable: ModelRefConfig | null;
       /** The model a medium-complexity plan step routes to — the escalation-
@@ -519,6 +522,9 @@ export interface AppSettings {
       /** The calibrated-probability gate: a decision routes only at or above
        *  it; below it today's model runs. */
       threshold: number;
+      /** The first-prompt gate (null = the kernel's calibrated default for the
+       *  offered label count). */
+      first_prompt_min_confidence: number | null;
       /** Whether a confident decision switches the turn's model (false =
        *  shadow: classify + log only). */
       enforce: boolean;
@@ -693,6 +699,8 @@ export interface SettingsSavePatch {
    *  `enforce` are plain optional scalars (absent = keep). */
   routing?: {
     cheap?: ModelRefConfig | null;
+    /** The shared question's middle rung (plan 2ba2168a) — null clears. */
+    routine?: ModelRefConfig | null;
     capable?: ModelRefConfig | null;
     /** The escalation-lane targets (backlog ad56c7bd) — the same
      *  absent/null/set contract as `cheap` / `capable`. */
@@ -700,6 +708,8 @@ export interface SettingsSavePatch {
     lane_high?: ModelRefConfig | null;
     escalate?: ModelRefConfig | null;
     threshold?: number;
+    /** The first-prompt gate; null clears back to the calibrated default. */
+    first_prompt_min_confidence?: number | null;
     enforce?: boolean;
   };
   /** `[general.budget]` patch (backlog a25a5323) — the deterministic budget

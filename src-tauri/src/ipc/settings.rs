@@ -499,6 +499,10 @@ pub struct LayaWire {
 pub struct RoutingWire {
     /// The model a confidently-TRIVIAL task routes to (`null` = unset).
     pub cheap: Option<ModelRefWire>,
+    /// The model a confidently-ROUTINE first prompt routes to — the middle
+    /// rung of the shared three-label question (plan 2ba2168a; `null` = unset:
+    /// the session keeps its model).
+    pub routine: Option<ModelRefWire>,
     /// The model a confidently-ARCHITECTURAL task routes to (`null` = unset).
     pub capable: Option<ModelRefWire>,
     /// The model a medium-complexity plan step routes to — the escalation-lane
@@ -509,9 +513,11 @@ pub struct RoutingWire {
     pub lane_high: Option<ModelRefWire>,
     /// The model the escalate rung routes to (lane `escalate`).
     pub escalate: Option<ModelRefWire>,
-    /// The calibrated-probability gate: a confident answer routes only at or
-    /// above it; below it today's model runs.
+    /// The calibrated-probability gate for the step-lane ladder.
     pub threshold: f64,
+    /// The first-prompt gate (`null` = the kernel's calibrated default for the
+    /// offered label count; the UI shows that default when unset).
+    pub first_prompt_min_confidence: Option<f64>,
     /// Whether a confident decision switches the turn's model (`false` =
     /// shadow: classify + log only).
     pub enforce: bool,
@@ -840,11 +846,13 @@ fn model_ref_wire(m: &mnemo::config::ModelRef) -> ModelRefWire {
 fn routing_wire(routing: &mnemo::config::RoutingConfig) -> RoutingWire {
     RoutingWire {
         cheap: routing.cheap.as_ref().map(model_ref_wire),
+        routine: routing.routine.as_ref().map(model_ref_wire),
         capable: routing.capable.as_ref().map(model_ref_wire),
         lane_medium: routing.lane_medium.as_ref().map(model_ref_wire),
         lane_high: routing.lane_high.as_ref().map(model_ref_wire),
         escalate: routing.escalate.as_ref().map(model_ref_wire),
         threshold: routing.threshold,
+        first_prompt_min_confidence: routing.first_prompt_min_confidence,
         enforce: routing.enforce,
     }
 }
@@ -1666,11 +1674,13 @@ mod settings_dto_tests {
                 optimizer: OptimizerConfig::default(),
                 routing: RoutingWire {
                     cheap: None,
+                    routine: None,
                     capable: None,
                     lane_medium: None,
                     lane_high: None,
                     escalate: None,
                     threshold: 0.80,
+                    first_prompt_min_confidence: None,
                     enforce: false,
                 },
                 budget: BudgetWire {
@@ -1837,11 +1847,13 @@ mod settings_dto_tests {
                 optimizer: OptimizerConfig::default(),
                 routing: RoutingWire {
                     cheap: None,
+                    routine: None,
                     capable: None,
                     lane_medium: None,
                     lane_high: None,
                     escalate: None,
                     threshold: 0.80,
+                    first_prompt_min_confidence: None,
                     enforce: false,
                 },
                 budget: BudgetWire {

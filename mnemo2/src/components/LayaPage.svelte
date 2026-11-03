@@ -1,17 +1,27 @@
 <script lang="ts">
   import { modelRefOptions } from "../lib/modelSettings";
   import {
+    DISPATCH_TIERS,
     LAYA_FLAG_META,
     LAYA_STATUS_META,
     ROUTING_LANES,
+    evalDateText,
     layaStatusHint,
+    modeAvailable,
+    modeUnlockText,
     routingDraft,
     routingWire,
+    shareText,
+    type DispatchRoutingSettings,
     type LayaEvent,
     type LayaFlags,
     type LayaStatus,
     type LayaTransport,
     type RoutingDraft,
+    type RoutingEvalWire,
+    type RoutingLogSummary,
+    type RoutingModeName,
+    type RoutingStatusWire,
   } from "../lib/layaSettings";
   import type { EndpointDetailDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
@@ -39,6 +49,40 @@
   let flags = $state({ draft: emptyFlags(), original: emptyFlags(), saving: false, error: "", saved: false });
   let routing = $state({ draft: emptyRouting(), original: emptyRouting(), saving: false, error: "", saved: false });
 
+  /** The Mnemo2 `[routing]` table, the log summary and the last eval record. */
+  let dispatch = $state<RoutingStatusWire | null>(null);
+  let dispatchDraft = $state<DispatchRoutingSettings | null>(null);
+  let dispatchSaving = $state(false);
+  let dispatchError = $state("");
+  let dispatchSaved = $state(false);
+  let evalRunning = $state(false);
+  let evalResult = $state<RoutingEvalWire | null>(null);
+  let evalError = $state("");
+
+  /** The four dispatch modes in display order (design §4.5). */
+  const MODES: readonly { mode: RoutingModeName; label: string; blurb: string }[] = [
+    { mode: "off", label: "Off", blurb: "Never asks Laya: the lead's tier is required and runs, as today." },
+    { mode: "shadow", label: "Shadow", blurb: "Asks Laya and logs its pick; the worker still runs on the lead's tier." },
+    { mode: "suggest", label: "Suggest", blurb: "A dispatch with tier \"auto\" runs on Laya's pick when it clears the gate, and is refused when it does not." },
+    { mode: "auto", label: "Auto", blurb: "Like suggest, with the fallback tier for a dispatch Laya does not clear." },
+  ];
+
+  /** The dispatch draft differs from what is saved. */
+  const dispatchDirty = $derived(
+    dispatch !== null && dispatchDraft !== null && different(dispatchDraft, dispatch.settings),
+  );
+  const summary = $derived(dispatch?.summary ?? null);
+  const evalRecord = $derived(dispatch?.eval ?? null);
+  /** The eval's two runs as the template renders them. */
+  const evalTables = $derived(
+    evalResult === null
+      ? []
+      : [
+          { title: "Three labels", report: evalResult.three },
+          { title: "Two labels", report: evalResult.two },
+        ],
+  );
+
   let setupBusy = $state(false);
   let progress = $state<{ label: string; fraction: number | null } | null>(null);
   let setupError = $state("");
@@ -56,7 +100,7 @@
   }
 
   function emptyRouting(): RoutingDraft {
-    return { cheap: "", capable: "", lane_medium: "", lane_high: "", escalate: "", threshold: "0.8", enforce: false };
+    return { cheap: "", routine: "", capable: "", lane_medium: "", lane_high: "", escalate: "", threshold: "0.8", enforce: false };
   }
 
   const options = $derived(modelRefOptions(endpoints));
@@ -94,6 +138,7 @@
       .catch((failure) => {
         if (!cancelled) loadError = errorText(failure);
       });
+    void loadDispatch();
     return () => {
       cancelled = true;
     };
@@ -227,6 +272,114 @@
     routing.error = "";
     routing.saved = false;
   }
+
+  /** Adopt a routing snapshot; unsaved edits keep the draft. */
+  function adoptDispatch(snapshot: RoutingStatusWire): void {
+    const dirty = dispatch !== null && dispatchDraft !== null && different(dispatchDraft, dispatch.settings);
+    dispatch = snapshot;
+    if (dispatchDraft === null || !dirty) {
+      dispatchDraft = structuredClone(snapshot.settings);
+    }
+  }
+
+  /** Read the routing snapshot (the page's second load leg). */
+  async function loadDispatch(): Promise<void> {
+    try {
+      adoptDispatch(await transport.routingStatus());
+    } catch (failure) {
+      dispatchError = errorText(failure);
+    }
+  }
+
+  /** Pick an unlocked mode. */
+  function selectMode(mode: RoutingModeName): void {
+    if (dispatchDraft === null || summary === null || !modeAvailable(mode, summary)) return;
+    dispatchDraft.mode = mode;
+    dispatchSaved = false;
+  }
+
+  /** Force a locked mode on, behind a confirm that names the missing record. */
+  function forceMode(mode: RoutingModeName): void {
+    if (dispatchDraft === null || summary === null) return;
+    if (modeAvailable(mode, summary)) return;
+    const progress = modeUnlockText(mode, summary);
+    if (!confirm(`${mode} mode unlocks at 30 labelled decisions (${progress}). Force it on anyway?`)) return;
+    dispatchDraft.mode = mode;
+    dispatchSaved = false;
+  }
+
+  async function saveDispatch(): Promise<void> {
+    if (dispatchDraft === null) return;
+    dispatchSaving = true;
+    dispatchError = "";
+    try {
+      // A successful save makes the returned snapshot the truth: the draft
+      // takes it verbatim, so "saved" and "clean" agree from here on.
+      const snapshot = await transport.saveRoutingSettings(
+        $state.snapshot(dispatchDraft) as DispatchRoutingSettings,
+      );
+      dispatch = snapshot;
+      dispatchDraft = structuredClone(snapshot.settings);
+      dispatchSaved = true;
+    } catch (failure) {
+      dispatchError = errorText(failure);
+    } finally {
+      dispatchSaving = false;
+    }
+  }
+
+  function discardDispatch(): void {
+    if (dispatch === null) return;
+    dispatchDraft = structuredClone(dispatch.settings);
+    dispatchError = "";
+    dispatchSaved = false;
+  }
+
+  /** Write one tier's default effort; an empty value clears it. */
+  function setEffort(tier: string, value: string): void {
+    if (dispatchDraft === null) return;
+    if (value.trim() === "") delete dispatchDraft.effort[tier];
+    else dispatchDraft.effort[tier] = value.trim();
+    dispatchSaved = false;
+  }
+
+  async function runEval(): Promise<void> {
+    evalRunning = true;
+    evalError = "";
+    try {
+      evalResult = await transport.runRoutingEval();
+      adoptDispatch(await transport.routingStatus());
+    } catch (failure) {
+      evalError = errorText(failure);
+    } finally {
+      evalRunning = false;
+    }
+  }
+
+  /** Save the eval's suggested gates through the normal save path. */
+  async function applySuggestion(): Promise<void> {
+    if (dispatchDraft === null || evalResult === null) return;
+    if (evalResult.record.min_confidence_3 !== null) {
+      dispatchDraft.min_confidence_3 = evalResult.record.min_confidence_3;
+    }
+    if (evalResult.record.min_confidence_2 !== null) {
+      dispatchDraft.min_confidence_2 = evalResult.record.min_confidence_2;
+    }
+    await saveDispatch();
+  }
+
+  /** A count map as "shadow 12 · suggest 3" (empty is "none"). */
+  function summaryText(counts: Record<string, number>): string {
+    const parts = Object.entries(counts)
+      .filter(([, count]) => count > 0)
+      .map(([key, count]) => `${key} ${count}`);
+    return parts.length === 0 ? "none" : parts.join(" · ");
+  }
+
+  /** The per-mode decision counts from the loaded summary. */
+  function decisionsText(counts: RoutingLogSummary): string {
+    return summaryText(counts.decisions_by_mode);
+  }
 </script>
 
 <datalist id="laya-page-refs">
@@ -315,11 +468,168 @@
         </div>
       </section>
 
+      <section class="group" aria-label="Worker dispatch routing">
+        <header>
+          <h3>Worker dispatch routing (Mnemo2)</h3>
+          <p class="micro">
+            One Laya question per dispatch, on the step spec and the lead's brief. Off by default; a mode only logs, suggests or picks the worker's tier at dispatch — it never switches a running session.
+          </p>
+        </header>
+        {#if dispatchDraft === null || summary === null}
+          <p class="micro">Loading…</p>
+        {:else}
+          <div class="mode-list">
+            {#each MODES as entry (entry.mode)}
+              <div class="mode-row">
+                <label class="lever-row">
+                  <input
+                    type="radio"
+                    name="dispatch-mode"
+                    value={entry.mode}
+                    checked={dispatchDraft.mode === entry.mode}
+                    disabled={!modeAvailable(entry.mode, summary)}
+                    onchange={() => selectMode(entry.mode)}
+                  />
+                  <span class="lever-text">
+                    <strong>{entry.label}</strong>
+                    <span class="micro">{entry.blurb}</span>
+                  </span>
+                </label>
+                {#if !modeAvailable(entry.mode, summary)}
+                  <button class="force-link" type="button" onclick={() => forceMode(entry.mode)}>
+                    force ({modeUnlockText(entry.mode, summary)})
+                  </button>
+                {/if}
+              </div>
+            {/each}
+          </div>
+
+          <div class="knob-list">
+            <div class="knob-row">
+              <label for="dispatch-gate-3">Three-label gate</label>
+              <span class="micro">Applies only at confidence ≥ the gate. {evalDateText(evalRecord)}.</span>
+              <input id="dispatch-gate-3" type="number" min="0" max="1" step="0.025" bind:value={dispatchDraft.min_confidence_3} />
+            </div>
+            <div class="knob-row">
+              <label for="dispatch-gate-2">Two-label gate</label>
+              <span class="micro">Used when only two tiers have a target. {evalDateText(evalRecord)}.</span>
+              <input id="dispatch-gate-2" type="number" min="0" max="1" step="0.025" bind:value={dispatchDraft.min_confidence_2} />
+            </div>
+            <div class="knob-row">
+              <label for="dispatch-fallback">Auto-mode fallback tier</label>
+              <span class="micro">What auto runs when Laya does not clear the gate.</span>
+              <select id="dispatch-fallback" bind:value={dispatchDraft.fallback_tier}>
+                {#each DISPATCH_TIERS as tier (tier)}
+                  <option value={tier}>{tier}</option>
+                {/each}
+              </select>
+            </div>
+            <div class="knob-row">
+              <label for="dispatch-min-words">Fewest words to classify</label>
+              <span class="micro">Shorter dispatches skip Laya entirely.</span>
+              <input id="dispatch-min-words" type="number" min="0" step="1" bind:value={dispatchDraft.min_words} />
+            </div>
+          </div>
+
+          <label class="lever-row enforce-row">
+            <input type="checkbox" bind:checked={dispatchDraft.nudges} />
+            <span class="lever-text">
+              <strong>Nudges</strong>
+              <span class="micro">When a worker looks stuck, Laya suggests a tier once — it never changes the model.</span>
+            </span>
+          </label>
+
+          <div class="effort-list">
+            {#each DISPATCH_TIERS as tier (tier)}
+              <div class="knob-row">
+                <label for={`dispatch-effort-${tier}`}>{tier} effort</label>
+                <input
+                  id={`dispatch-effort-${tier}`}
+                  value={dispatchDraft.effort[tier] ?? ""}
+                  placeholder="default"
+                  spellcheck="false"
+                  oninput={(event) => setEffort(tier, event.currentTarget.value)}
+                />
+              </div>
+            {/each}
+          </div>
+
+          <dl class="summary-list">
+            <div><dt>Decisions</dt><dd>{decisionsText(summary)}</dd></div>
+            <div><dt>Agreement</dt><dd>{shareText(summary.agreement_rate)}</dd></div>
+            <div><dt>Laya accuracy</dt><dd>{shareText(summary.laya_accuracy)}</dd></div>
+            <div><dt>Lead accuracy</dt><dd>{shareText(summary.lead_accuracy)}</dd></div>
+            <div><dt>Labelled</dt><dd>{summary.labelled}</dd></div>
+            <div><dt>Overrides</dt><dd>{summaryText(summary.overrides_by_source)}</dd></div>
+            <div><dt>Nudges</dt><dd>{summary.nudges} ({summary.nudges_acted_on} acted on)</dd></div>
+          </dl>
+
+          <div class="section-actions">
+            {#if dispatchError}<p class="section-error" role="alert">{dispatchError}</p>{/if}
+            {#if dispatchSaved && !dispatchDirty}<p class="section-note">Saved to mnemo2.toml.</p>{/if}
+            <div class="section-buttons">
+              <button class="button button-quiet" disabled={dispatchSaving || !dispatchDirty} onclick={discardDispatch}>Discard</button>
+              <button class="button button-primary" disabled={dispatchSaving || !dispatchDirty} onclick={saveDispatch}>
+                {dispatchSaving ? "Saving…" : "Save dispatch routing"}
+              </button>
+            </div>
+          </div>
+
+          <div class="eval-block">
+            <div class="section-buttons">
+              <button class="button button-quiet" disabled={evalRunning} onclick={runEval}>
+                {evalRunning ? "Running eval…" : "Run eval"}
+              </button>
+              {#if evalResult !== null}
+                <button class="button button-primary" disabled={dispatchSaving} onclick={applySuggestion}>
+                  Apply suggested gates
+                </button>
+              {/if}
+            </div>
+            {#if evalError}<p class="section-error" role="alert">{evalError}</p>{/if}
+            {#if evalResult !== null}
+              {#each evalTables as table (table.title)}
+                <div class="eval-report">
+                  <h4>
+                    {table.title} — suggested
+                    {table.report.suggested === null ? "nothing (the provisional default stands)" : table.report.suggested.toFixed(3)}
+                  </h4>
+                  <table>
+                    <thead>
+                      <tr><th>Gate</th><th>Routed</th><th>Accuracy</th></tr>
+                    </thead>
+                    <tbody>
+                      {#each table.report.table as row (row.threshold)}
+                        <tr>
+                          <td>{row.threshold.toFixed(3)}</td>
+                          <td>{Math.round(row.routed_share * 100)}%</td>
+                          <td>{Math.round(row.accuracy * 100)}%</td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                  {#if table.report.misses.length > 0}
+                    <p class="micro">Misses at {table.report.default_gate.toFixed(3)}: {table.report.misses.length}</p>
+                    <ul class="miss-list">
+                      {#each table.report.misses.slice(0, 5) as miss (miss.text)}
+                        <li class="micro">
+                          want {miss.expected ?? "no route"} · got {miss.got ?? "no answer"}{miss.confidence === null ? "" : ` (${miss.confidence.toFixed(2)})`} — {miss.text.slice(0, 90)}
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </div>
+              {/each}
+            {/if}
+          </div>
+        {/if}
+      </section>
+
       <section class="group" aria-label="Routing lanes">
         <header>
-          <h3>Routing lanes</h3>
+          <h3>Mnemo1: first-prompt routing and step lanes (not used by Mnemo2 workers)</h3>
           <p class="micro">
-            The models a confident decision routes to, as "endpoint/model". Used when the Model routing or Reflex opt-ins are on; empty lanes keep the tier the lead picks.
+            The models a confident Mnemo1 decision routes to, as "endpoint/model". The routine lane serves the shared three-label question's middle rung; the step lanes ride the Reflex opt-in. Empty lanes keep the tier the lead picks. Mnemo2 workers never read this block — their dispatch routing is the table above.
           </p>
         </header>
         {#each ROUTING_LANES as lane (lane.key)}
@@ -433,4 +743,33 @@
   .section-error { margin: 0; color: var(--danger); font-size: var(--text-body); overflow-wrap: anywhere; flex: 1; }
   .section-note { margin: 0; color: var(--muted); font-size: var(--text-body); flex: 1; }
   .section-buttons { display: flex; gap: 8px; flex-shrink: 0; }
+
+  .mode-list { display: grid; gap: 6px; }
+  .mode-row { display: grid; gap: 4px; }
+  .force-link {
+    justify-self: start;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: var(--text-body);
+    text-decoration: underline;
+  }
+
+  .effort-list { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 18px; }
+
+  .summary-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 6px 18px; margin: 0; }
+  .summary-list div { display: grid; gap: 1px; }
+  .summary-list dt { color: var(--muted); font-size: var(--text-body); }
+  .summary-list dd { margin: 0; font-size: var(--text-body); font-weight: 620; }
+
+  .eval-block { display: grid; gap: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .eval-report { display: grid; gap: 6px; }
+  .eval-report h4 { margin: 0; font-size: var(--text-body); font-weight: 620; }
+  .eval-report table { border-collapse: collapse; font-size: var(--text-body); }
+  .eval-report th,
+  .eval-report td { padding: 2px 10px 2px 0; text-align: left; }
+  .eval-report th { color: var(--muted); font-weight: 600; }
+  .miss-list { margin: 0; padding-left: 18px; }
 </style>

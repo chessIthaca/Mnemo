@@ -213,6 +213,29 @@ export function createMemoryTransport(bindings?: MemoryTransportBindings): Memor
 }
 
 // ---------------------------------------------------------------------------
+// The engine-start wait
+// ---------------------------------------------------------------------------
+
+/**
+ * The backend's "the project engine is still starting" text, verbatim from
+ * `ENGINE_STARTING` in `src-tauri/src/mnemo2/memory_view.rs`: every memory
+ * command goes through the open project's runtime, so while a project open is
+ * in flight there is no store to read yet. This is a WAIT, not a failure — the
+ * tab keeps its spinner up and retries.
+ */
+export const ENGINE_STARTING = "the project engine is still starting";
+
+/**
+ * True when a rejected memory command means "wait, the engine is starting"
+ * rather than a real error (a project open is in flight).
+ */
+export function isEngineStarting(failure: unknown): boolean {
+  if (typeof failure === "string") return failure.trim() === ENGINE_STARTING;
+  if (failure instanceof Error) return failure.message.trim() === ENGINE_STARTING;
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------------------
 

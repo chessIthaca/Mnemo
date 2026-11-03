@@ -1,4 +1,4 @@
-# Design: Laya routes each worker once, at dispatch (after marcreichel/laya-router)
+# Design: Laya routes once — each Mnemo2 worker at dispatch, each Mnemo1 session at its first prompt (after marcreichel/laya-router)
 
 Status: proposal, not on the board, not dispatched. Written 2026-11-03 by the
 lead (Claude) against wt/mnemo at a6984816. Each claim about Mnemo code cites
@@ -70,6 +70,21 @@ to the *dispatch*:
    later fine-tune trains on.
 7. Opt Mnemo2's sessions out of the per-turn gate, so routing happens in one
    place.
+8. **Fix Mnemo1 the same way** (added 2026-11-03 at the user's request, §4.12
+   and steps 2 and 7):
+   - both apps share one kernel question (the three neutral labels and their
+     descriptions) and one calibrated threshold per label count;
+   - Mnemo1 stops routing every turn: it routes a session's **first** real
+     prompt once, by pinning the model as the picker does, then only nudges;
+   - a manual model pick turns routing off for that session and is logged;
+   - Mnemo1's per-step lane ladder (`step_lanes.rs`, the reflex) is out of
+     scope.
+
+   Note: the 94 logged decisions are **all Mnemo2 text** (44 plan headers,
+   12 audit briefs, 38 lead messages and kickoffs). Mnemo1's gate has never
+   been measured on real use. Its design has the same weaknesses (a
+   two-label question, a guessed 0.80 gate, per-turn switching), so it is
+   fixed on design grounds, not on observed data.
 
 This is better than today on four counts:
 - It classifies the right text, the full step spec rather than a constant
@@ -233,6 +248,28 @@ turn is therefore classified:
   separately from Mnemo2's tiers in Settings > Decisions
   (src-tauri/src/mnemo2/laya_settings.rs:210-238).
 
+### 2.2a Mnemo1's gate on its own sessions
+
+On Mnemo1's main agent, `route_turn_start` classifies **every** user turn:
+
+- **The question** is the same two-label one at the same 0.80 gate.
+- **Enforced switching.** With `enforce` on, the decision arms a per-turn
+  `TurnRoute.target` (turn.rs:117-137) that each iteration's provider
+  resolution reads (`resolve_routed_model`, turn.rs:1317-1330). Each turn can
+  therefore run on a different model, which re-reads the conversation
+  uncached each time it changes.
+- **Targets** are `[general.routing] cheap` and `capable`
+  (src/config/general.rs:398-431). Routine work has no target.
+- **The manual picker** (`set_model`, src-tauri/src/ipc/agent.rs:607) pins the
+  provider with `set_explicit_provider`, state-scoped. The routing gate does
+  not know about it; it only loses to it through the resolver's guard.
+- **Notices.** There is no chat-visible routing notice. `AgentEvent` has
+  `ModelChanged` and `ModelSwapSummarized` (src/runtime/channels.rs:419, :440)
+  but nothing for a suggestion.
+
+None of the 94 logged rows is Mnemo1 text (see §0 note), so the gate's
+behaviour on real Mnemo1 prompts is unmeasured.
+
 ### 2.3 What exists to build on
 
 - **Laya is attached** once per engine, and every worker shares the
@@ -342,8 +379,9 @@ Rules:
   enabled tier absorbs everything above it. A disabled `simple` folds
   `trivial` into `routine`.
 - **One enabled tier means no classification** (`skip: "one_tier"`).
-- **Descriptions are constants** in one module, so the eval (§4.8) and
-  production use byte-identical text. Changing a description requires
+- **Descriptions are constants** in the kernel module
+  `src/agent/route_question.rs` (step 2), shared with Mnemo1 (§4.12), so the
+  eval (§4.8), Mnemo2 and Mnemo1 all use byte-identical text. Changing a description requires
   re-running the eval and updating the stored threshold (§4.4).
 
 ### 4.4 The gate
@@ -561,26 +599,138 @@ difficult = "high"
 | Log write fails | swallowed (`append_row` contract) |
 | Mnemo1 running at the same time | unaffected: it keeps its per-turn gate and its own config; the logs are different files |
 
+### 4.12 Mnemo1: route the first prompt once, then nudge
+
+**Shared kernel question.** The labels, descriptions, question builder and
+default thresholds move into a new kernel module,
+`src/agent/route_question.rs`. Mnemo2's dispatch module (step 3) and
+Mnemo1's gate both use it, so one eval run (step 8) calibrates both apps.
+Mnemo1's targets map as:
+
+| label | Mnemo1 target | when unset |
+| --- | --- | --- |
+| `trivial` | `[general.routing] cheap` | label not offered; keywords fold up into `routine` |
+| `routine` | `[general.routing] routine` (**new**, `Option<ModelRef>`) | always offered; a cleared `routine` with no target keeps the session's model (logged as `kept`) |
+| `hard` | `[general.routing] capable` | label not offered; keywords fold down into `routine` (the top offered label) |
+
+Folding follows §4.3. With only `routine` offered (neither `cheap` nor
+`capable` set), nothing is asked.
+
+**Gate.** New `[general.routing] first_prompt_min_confidence:
+Option<f64>`. When unset, the kernel default for the offered label count is
+used (`DEFAULT_MIN_CONFIDENCE_3 = 0.475`, `DEFAULT_MIN_CONFIDENCE_2 = 0.60`,
+provisional until the step 9 eval). The old `threshold` (0.80) keeps serving
+the step-lane ladder only. Its doc comment is updated to say so.
+
+**Route once.** New `RouteOnce` state on `AgentLoop`:
+
+```rust
+pub enum RouteOnce {
+    Pending,
+    Settled { label: Option<String>, confidence: Option<f64>, model: Option<String> },
+    Off { reason: &'static str },
+}
+```
+
+- **Start.** A fresh conversation is `Pending`. `seed_messages` with
+  non-empty history (a resumed session) sets `Off { "resumed" }`: switching
+  would drop a cache the history already paid for. `AgentCommand::Clear`
+  resets it to `Pending`, because a cleared conversation has no cache to
+  lose.
+- **The first user turn while `Pending`** (main agent only; subagents and
+  `skip_turn_routing` sessions are skipped, as today):
+  - text under 3 words: `Off { "too_short" }`;
+  - classify the turn's user text (capped at 2000 chars, as today) with the
+    shared question over the offered labels;
+  - no answer: `Off { "offline" }`;
+  - below the gate or an unknown label: `Settled { label, confidence, model:
+    None }`, and the model is unchanged;
+  - cleared, with `enforce` on and the target resolving: build the provider
+    exactly as the picker does and call `set_explicit_provider` (the same
+    state-scoped pin, src-tauri/src/ipc/agent.rs:582-595). Emit `ModelChanged`
+    so the picker shows it, and `RoutingNotice { kind: "routed", text: "Laya →
+    <model> (0.71)" }`. State: `Settled { model: Some(spec) }`;
+  - cleared in shadow (`enforce` off): log only, notice
+    `"Laya would pick <model> (0.71)"`, state `Settled`.
+- **The per-turn arm goes away.** For pre-prompt routing, `TurnRoute.target`
+  is always `None`, so no per-iteration switch happens. The decision and
+  outcome rows are still written for the one classified turn, keeping the
+  existing corpus format.
+- **Later turns while `Settled`.** No switch. Drift: in the background (a
+  detached task, never awaited), classify the new user text of at least 3
+  words. If it clears on a label above the settled one, send one
+  `RoutingNotice { kind: "nudge", text: "this got harder; consider
+  <capable model>" }`.
+- **Strikes.** In the turn's tool-result handling, 3 consecutive failed
+  tool results or identical calls (same canonical signature as Mnemo2's
+  `call_signature`, which moves to the shared module) produce one nudge to
+  the next label up. "Going in circles" is the reason text for the identical
+  case.
+- **One nudge per session.** A manual pick or a `Clear` resets the allowance.
+
+**Manual choice wins.** `set_model` (src-tauri/src/ipc/agent.rs:607), for
+the agent it targets, calls the new `AgentLoop::note_manual_model_choice()`:
+
+- state becomes `Off { "manual" }`;
+- any pending nudge is cleared;
+- a `reroute` row is logged with `from` (the routed model or null), `to`
+  and `nudged`.
+
+This applies before the first prompt too. Picking a model first means
+"don't route me", matching laya-router's `/model` rule. An effort-only
+change (same model) does **not** count, as laya-router's `/effort` does not.
+
+**New event** `AgentEvent::RoutingNotice { kind: String, text: String }` and
+its `SerializableAgentEvent` twin, following the pattern of
+`ModelSwapSummarized` (channels.rs:440, :858):
+- Mnemo1's events pipeline forwards it (src-tauri/src/ipc/events.rs);
+- the console renders it (src-tauri/src/console.rs);
+- the chat reducer shows it as an informational notice
+  (frontend/src/lib/agentEventReducer.ts, like the swap notice);
+- Mnemo2's pump ignores it, since Mnemo2 sessions skip turn routing.
+
+**Log.** New rows in `~/.mnemo/laya/training/session_routing.jsonl` (a new
+file; `routing.jsonl` keeps its existing row shapes). All rows use
+`#[serde(tag = "event")]`:
+- `route {agent_id, label, confidence, threshold, cleared, enforced, model, skip}`;
+- `nudge {agent_id, reason, to_label}`;
+- `reroute {agent_id, from, to, nudged}`;
+- `nudge_ignored {agent_id, to_label}`, written when the session ends or is
+  cleared with a nudge outstanding and no manual pick.
+
+**Settings (Mnemo1 ClassifierSection).** The routing block gains a
+`routine` model picker and the first-prompt threshold, showing "calibrated
+default 0.475" when unset. The copy changes from "every turn" to "the first
+prompt of a session; later only suggestions".
+
 ---
 
 ## 5. Plan (steps written as specs; not on the board yet)
 
 Order:
-- step 1 (kernel opt-out, eval scaffolding) and step 2 (question, gate, log
-  types; a pure module) can run in parallel;
-- step 3 (dispatch integration, shadow and suggest) waits for both;
-- step 4 (overrides and outcome) waits for 3;
-- step 5 (nudges) waits for 4;
-- step 6 (UI) waits for 3 and 5;
-- step 7 is the lead's own verification.
+- step 1 (kernel opt-out) and step 2 (the kernel shared question module)
+  run in parallel; their files are disjoint;
+- step 3 (Mnemo2 dispatch module) waits for 2;
+- step 4 (Mnemo2 dispatch integration) waits for 1 and 3;
+- step 5 (Mnemo2 overrides and outcome) waits for 4;
+- step 6 (Mnemo2 nudges) waits for 5;
+- step 7 (Mnemo1 route-once) waits for 1 and 2, and runs in parallel with
+  steps 3–6. Its only shared files are team.rs and runtime.rs, where it adds
+  one `RoutingNotice` match arm to each pump. Record that as a
+  `plan_update interface` before dispatching it beside steps 4–6;
+- step 8 (settings in both apps, mission control, eval tool) waits for 6
+  and 7;
+- step 9 is the lead's own verification.
 
 Proposed tiers:
 - 1 average (glm-5.3);
 - 2 simple;
-- 3 difficult, `review_risk` high (it changes the dispatch contract);
-- 4 average;
+- 3 simple;
+- 4 difficult, `review_risk` high (it changes the dispatch contract);
 - 5 average;
-- 6 average.
+- 6 average;
+- 7 difficult, `review_risk` high (it changes when Mnemo1 switches models);
+- 8 average.
 
 Verification for every step:
 - root: `cargo clippy --all-targets -- -D warnings`, `cargo test --lib`;
@@ -647,32 +797,107 @@ src-tauri/src/main.rs, src-tauri/src/mnemo2/team.rs, src-tauri/src/mnemo2/runtim
 - [ ] root `cargo test --lib` and src-tauri tests green
 - [ ] bins build
 
-**Do not touch** src-tauri/src/mnemo2/laya_settings.rs or the new routing
-module (step 2).
+**Do not touch** src-tauri/src/mnemo2/laya_settings.rs, or
+src/agent/route_question.rs (step 2).
 
-### Step 2: The dispatch routing module: question, gate, text, log rows
+### Step 2: Kernel: the shared routing question
 
-**Files:** `src-tauri/src/mnemo2/dispatch_routing.rs` (new),
-`src-tauri/src/mnemo2/mod.rs` (one `mod` line), tests in the new file.
+**Files:** `src/agent/route_question.rs` (new), `src/agent/mod.rs` (one
+`pub mod` line), tests in the new file. Nothing else: model_routing.rs and
+turn.rs keep their current question until step 7 switches Mnemo1 over.
 
-**New code** (all `pub(crate)`):
+**New code** (all `pub`; kernel API used by Mnemo2 step 3 and Mnemo1 step 7):
 
 ```rust
 pub const LABEL_TRIVIAL: &str = "trivial";
 pub const LABEL_ROUTINE: &str = "routine";
 pub const LABEL_HARD: &str = "hard";
-pub const ROUTING_INSTRUCTIONS: &str = "How demanding is this task for a coding agent that has the full spec in front of it?";
+pub const ROUTE_INSTRUCTIONS: &str = "How demanding is this task for a coding agent that has the full spec in front of it?";
 pub const DESCRIBE_TRIVIAL: &str = "rename, typo, version bump, config value, copy change, add a log line, delete dead code, update a doc comment, single-file mechanical edit";
 pub const DESCRIBE_ROUTINE: &str = "implement a specified function, add tests for existing code, wire an existing API into a new caller, UI component from a spec, schema or DTO field, follow an existing pattern in a new place, refactor inside one module";
 pub const DESCRIBE_HARD: &str = "subtle bug, race or deadlock, flaky test, data loss, memory or performance regression, security, persistence format, cross-module or shared-contract change, concurrency, migration, design decision the spec leaves open";
+pub const DEFAULT_MIN_CONFIDENCE_3: f64 = 0.475; // provisional until the step 9 eval
+pub const DEFAULT_MIN_CONFIDENCE_2: f64 = 0.60;  // provisional until the step 9 eval
+
+/// Which of the three labels have somewhere to route to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfferedLabels { pub trivial: bool, pub routine: bool, pub hard: bool }
+
+impl OfferedLabels { pub fn count(self) -> usize; }
+
+/// The choice question over the offered labels, with folding. `None` when
+/// fewer than two labels are offered.
+pub fn route_question(offered: OfferedLabels) -> Option<Question>;
+/// The default gate for an offered-label count: 3 -> DEFAULT_MIN_CONFIDENCE_3,
+/// 2 -> DEFAULT_MIN_CONFIDENCE_2.
+pub fn default_min_confidence(labels: usize) -> f64;
+/// The label one level harder, if offered (trivial -> routine -> hard).
+pub fn label_above(label: &str, offered: OfferedLabels) -> Option<&'static str>;
+/// Canonical tool-call signature for strike counting: `{name, args}` with
+/// object keys sorted and any `id` / `tool_use_id` / `call_id` key dropped.
+pub fn call_signature(name: &str, args: &serde_json::Value) -> String;
+
+/// Consecutive failed-or-repeated tool calls. `observe` returns true exactly
+/// once, on the call that brings the count to `limit` (3).
+pub struct Strikes { count: u32, last: Option<String>, limit: u32 }
+impl Strikes { pub fn new(limit: u32) -> Self; pub fn observe(&mut self, signature: String, failed: bool) -> bool; pub fn reset(&mut self); }
+```
+
+**Rules:**
+
+- **Folding.** An un-offered label's description is appended (`", "` +
+  text) to the nearest offered label: `trivial` folds **up** into `routine`
+  (or `hard` if routine is not offered), and `hard` folds **down** into the
+  highest offered label below it. An offered label's own description always
+  comes first.
+- **Labels and descriptions are byte-stable constants.** Changing one means
+  re-running the step 8 eval.
+- `Strikes::observe` counts when `failed` is true or `signature == last`,
+  otherwise it resets to 0. It always stores `last = signature`, and returns
+  true only on the transition to `limit`, never again until `reset`.
+
+**Tests (written first):**
+
+- `question_has_three_neutral_labels_when_all_are_offered`: exact labels,
+  exact descriptions, exact instructions; no label is `simple`, `average`,
+  `difficult`, `cheap` or `capable`.
+- `unoffered_hard_folds_down_into_routine`.
+- `unoffered_trivial_folds_up_into_routine`.
+- `one_offered_label_asks_nothing`.
+- `default_min_confidence_by_label_count`.
+- `label_above_skips_unoffered_labels`.
+- `call_signature_ignores_ids_and_key_order`.
+- `strikes_fire_once_at_three_failures`.
+- `identical_calls_count_as_strikes`.
+- `a_new_successful_call_resets`.
+
+**Done:**
+
+- [ ] root clippy clean
+- [ ] `cargo test --lib` green
+
+**Do not touch** turn.rs, loop_impl.rs or model_routing.rs (steps 1 and 7).
+Do not touch src-tauri.
+
+### Step 3: The Mnemo2 dispatch routing module: text, gate, log rows
+
+**Files:** `src-tauri/src/mnemo2/dispatch_routing.rs` (new),
+`src-tauri/src/mnemo2/mod.rs` (one `mod` line), tests in the new file.
+
+**New code** (all `pub(crate)`). The labels, descriptions, question,
+folding and default thresholds come from `mnemo::agent::route_question`
+(step 2). Never copy them.
+
+```rust
 pub const MIN_WORDS: usize = 20;
 pub const TEXT_MAX_CHARS: usize = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnabledTiers { pub simple: bool, pub average: bool, pub difficult: bool }
 
+impl EnabledTiers { pub fn offered(self) -> route_question::OfferedLabels; } // simple->trivial, average->routine, difficult->hard
 pub fn label_tier(label: &str) -> Option<&'static str>; // trivial->simple, routine->average, hard->difficult
-pub fn routing_question(enabled: EnabledTiers) -> Option<Question>; // None when fewer than 2 enabled
+pub fn routing_question(enabled: EnabledTiers) -> Option<Question>; // route_question::route_question(enabled.offered())
 pub fn routing_text(step_text: &str, brief: &str) -> Option<String>; // None when under MIN_WORDS
 pub fn threshold_for(labels: usize, cfg: &RoutingSettings) -> f64;
 pub async fn classify_dispatch(classifier: &dyn Classifier, text: &str, enabled: EnabledTiers, cfg: &RoutingSettings) -> Option<DispatchRoutingDecision>;
@@ -692,10 +917,8 @@ pub fn outcome_label(history: &[DispatchRoutingRow], final_status: &str, final_t
 
 **Rules:**
 
-- **Folding.** A disabled tier's description is appended (`", "` + text) to
-  the next enabled tier *up*. With difficult disabled, `hard`'s keywords go to
-  routine, the highest enabled tier. With simple disabled, `trivial` is
-  dropped and its keywords go to routine.
+- **Folding** is step 2's `route_question`. A tier with no available model is
+  an un-offered label.
 - **Text.** `routing_text` strips a leading `- [ ] N. ` or `- [x] N. `,
   joins `step + "\n\n" + brief`, and caps at `TEXT_MAX_CHARS` chars
   (char-safe, as `cap_task_text` does at model_routing.rs:189-195). Words are
@@ -708,10 +931,9 @@ pub fn outcome_label(history: &[DispatchRoutingRow], final_status: &str, final_t
 **Tests (written first, a stub `Classifier` like model_routing.rs's tests
 ~440-515):**
 
-- `question_has_three_neutral_labels_when_all_tiers_enabled`: exact labels,
-  exact descriptions, and no label equals a tier name.
-- `disabled_top_tier_folds_its_keywords_into_routine`.
-- `disabled_simple_tier_folds_trivial_into_routine`.
+- `enabled_tiers_map_to_offered_labels`: each of the 8 combinations.
+- `routing_question_uses_the_kernel_question`: equals
+  `route_question::route_question(enabled.offered())` byte for byte.
 - `one_enabled_tier_asks_nothing`.
 - `routing_text_strips_the_checkbox_and_caps_at_2000_chars`.
 - `short_step_is_not_classified`.
@@ -727,13 +949,13 @@ pub fn outcome_label(history: &[DispatchRoutingRow], final_status: &str, final_t
 - [ ] src-tauri clippy clean
 - [ ] tests green
 - [ ] no `#[allow(dead_code)]` or `cfg_attr` workaround. Nothing outside the
-  tests calls the module until step 3. If the dead-code lint fails clippy,
-  merge step 2 only together with step 3 (dispatch step 3 on top of step 2's
+  tests calls the module until step 4. If the dead-code lint fails clippy,
+  merge step 3 only together with step 4 (dispatch step 4 on top of step 3's
   branch).
 
-**Do not touch** team.rs (step 3).
+**Do not touch** team.rs (step 4) or src/agent (steps 1, 2 and 7).
 
-### Step 3: Dispatch routes through Laya (shadow and suggest; auto behind the same switch)
+### Step 4: Mnemo2 dispatch routes through Laya (shadow and suggest; auto behind the same switch)
 
 **Files:** `src-tauri/src/mnemo2/team.rs` (dispatch path, schema, result
 text, `team_status` JSON, tests), `src-tauri/src/mnemo2/model_settings.rs` or
@@ -821,10 +1043,10 @@ the settings store that holds Mnemo2's own settings (read it first and put
 - [ ] bins build
 - [ ] `plan_update decision` recording where `[routing]` lives
 
-**Do not touch** src/agent or src/headless (step 1), or ledger.rs
-(step 4).
+**Do not touch** src/agent or src/headless (steps 1, 2 and 7), or ledger.rs
+(step 5).
 
-### Step 4: Overrides, reroutes and outcomes in the log and the report
+### Step 5: Mnemo2 overrides, reroutes and outcomes in the log and the report
 
 **Files:** `src-tauri/src/mnemo2/team.rs` (`change_model` source,
 `resume` with tier, terminal-status hooks), `src-tauri/src/mnemo2/ipc.rs`
@@ -845,7 +1067,7 @@ the settings store that holds Mnemo2's own settings (read it first and put
    `nudged`.
 3. At the place the ledger marks a worker merged, and where a worker becomes
    failed-and-stopped or abandoned, append `Outcome` with `outcome_label(…)`
-   (step 2) computed from the worker's rows. Read the worker's rows by
+   (step 3) computed from the worker's rows. Read the worker's rows by
    scanning the log for its `worker_id`, which is cheap at this size, or keep
    them on `WorkerRecord.routing` as a `Vec` (decide in the step and record it
    with `plan_update decision`).
@@ -878,7 +1100,7 @@ the settings store that holds Mnemo2's own settings (read it first and put
 - [ ] tests green
 - [ ] bins build
 
-### Step 5: Nudges
+### Step 6: Mnemo2 nudges
 
 **Files:** `src-tauri/src/mnemo2/team.rs` (the worker event pump, the
 `team_message` / `route_fix` paths, the review path), tests in team.rs and
@@ -886,18 +1108,17 @@ runtime.rs.
 
 **New code:**
 
-1. `WorkerRecord` gets `#[serde(default)] strikes: u32` and
-   `#[serde(default)] last_call: Option<String>` (the canonical call
-   signature).
-2. The new `fn call_signature(name: &str, args: &serde_json::Value) -> String`
-   serializes `{name, args}` with sorted keys, dropping any `id` /
-   `tool_use_id` key.
+1. The live per-worker state in the team runtime (beside the live session
+   handle, not persisted) gets a `route_question::Strikes::new(3)` (step 2).
+2. Each worker tool call is fingerprinted with
+   `route_question::call_signature(name, args)` (step 2). Do not write a
+   second signature function.
 3. In the pump, on each worker tool result:
-   - update `last_call`;
-   - if failed or identical to `last_call`, `strikes += 1`, else `strikes = 0`;
-   - at `strikes == 3`, when a tier above the current one exists and
+   - `strikes.observe(signature, failed)`;
+   - when it returns true, a tier above the current one exists, and
      `routing.nudged` is None, queue the nudge notice (§4.6 text), set
-     `routing.nudged = Some(tier)` and append a `Nudge` row.
+     `routing.nudged = Some(tier)` and append a `Nudge` row;
+   - a reroute calls `strikes.reset()`.
 4. Drift: in `team_message` and `team_route_fix`, when mode is not `off` and
    the text has at least `min_words` words, spawn a detached task. It
    classifies the text (same question, same 3 s timeout, same permit) and, if
@@ -935,7 +1156,157 @@ runtime.rs.
 - [ ] tests green
 - [ ] bins build
 
-### Step 6: Settings, mission control and the eval tool
+### Step 7: Mnemo1 routes a session's first prompt once, then nudges
+
+**Files:** src/agent/turn.rs (`route_turn_start` ~1243-1311, the tool-result
+batch ~2675), src/agent/loop_impl.rs (`RouteOnce` state, accessors,
+`note_manual_model_choice`), src/agent/model_routing.rs (`RoutingPolicy`,
+`classify_task_text` switched to the shared question, new
+session-routing rows), src/config/general.rs (`RoutingConfig.routine`,
+`first_prompt_min_confidence`), src/model_resolver.rs (`routing_policy`
+~425, `resolve_routed` ~390 for the new `Routine` target),
+src/runtime/channels.rs (`RoutingNotice` and its serializable twin),
+src/runtime/agent.rs (`seed_messages` ~221, `AgentCommand::Clear` ~1096),
+src-tauri/src/ipc/agent.rs (`set_model` ~607), src-tauri/src/ipc/events.rs
+and src-tauri/src/console.rs (forward and render the notice),
+src-tauri/src/mnemo2/team.rs and src-tauri/src/mnemo2/runtime.rs (pump
+arms that ignore `RoutingNotice`, one line each),
+frontend/src/lib/agentEventReducer.ts (+ its test), src/agent/tests.rs.
+
+**New code:**
+
+1. `RoutingConfig` (general.rs:398) gets `pub routine: Option<ModelRef>`
+   (doc: "where a confidently routine first prompt routes; `None` keeps the
+   session's model") and `pub first_prompt_min_confidence: Option<f64>` (doc:
+   "the first-prompt gate; `None` uses the kernel's calibrated default for the
+   offered label count"). Both are serde-default and skipped while
+   `None`/default, and both are added to `is_default`. The `threshold` doc
+   gains: "Used by the step-lane ladder; first-prompt routing uses
+   `first_prompt_min_confidence`."
+2. `RouteTarget` (model_routing.rs:72) gets the variant `Routine`, label
+   `"routine"`. `ConfigModelResolver::resolve_routed` maps it to
+   `routing.routine`, under the same pin guards as `Cheap` and `Capable`.
+3. `RoutingPolicy` gets `pub offered: route_question::OfferedLabels` (trivial
+   = `cheap.is_some()`, routine = true, hard = `capable.is_some()`) and
+   `pub first_prompt_min_confidence: f64` (the configured value, or
+   `default_min_confidence(offered.count())`), filled in `routing_policy`
+   (model_resolver.rs:425-440).
+4. `classify_task_text` (model_routing.rs:161) takes `offered` and `min` and
+   asks `route_question::route_question(offered)`. `None` from the builder
+   (one label) means no call. It maps the labels trivial, routine and hard to
+   `RouteTarget::Cheap`, `Routine` and `Capable`. The old two-label
+   `routing_question` and its two constants are deleted, along with every
+   test that only covered them; update the rest.
+5. loop_impl.rs: `pub enum RouteOnce { Pending, Settled { label:
+   Option<String>, confidence: Option<f64>, model: Option<String> }, Off {
+   reason: &'static str } }`. `AgentLoop` gets `route_once:
+   std::sync::Mutex<RouteOnce>` (initially `Pending`), `nudge_sent:
+   AtomicBool`, and `strikes: std::sync::Mutex<route_question::Strikes>`
+   (limit 3). New methods:
+   - `pub fn route_once(&self) -> RouteOnce` (a clone);
+   - `pub fn note_manual_model_choice(&self, to: &str) -> Option<String>`
+     sets `Off { "manual" }`, clears `nudge_sent`, resets the strikes, and
+     returns the previously routed model for the reroute row;
+   - `pub(crate) fn reset_route_once(&self)` sets `Pending`, clears
+     `nudge_sent` and resets the strikes.
+6. `route_turn_start` (turn.rs:1243): keep the subagent and
+   `skip_turn_routing` guards. Then:
+   - **`Pending`:** apply §4.12's rules for the first turn. When cleared
+     with `enforce` on and the target resolving, build the provider with the
+     resolver's `build_turn_provider` and call `self.set_explicit_provider(
+     provider, context_manager)`; emit `AgentEvent::ModelChanged` with the
+     same fields the IPC `set_model` emits, then `RoutingNotice`. Write the
+     existing `RouteDecisionRow` (with `target` and `model`) and a
+     `session_routing.jsonl` `route` row. Return a `TurnRoute` whose `target`
+     is **always `None`**, so the outcome row is still written but no
+     per-iteration arm exists.
+   - **`Settled`:** if `!nudge_sent` and the text has at least 3 words,
+     spawn the drift check (a detached `tokio::spawn` with the cloned
+     classifier `Arc` and fan-in sender). It nudges once through a CAS on
+     `nudge_sent` when the label clears above the settled label. Return
+     `None`.
+   - **`Off`:** return `None`.
+7. Tool-result batch (turn.rs ~2675), main agent only: for each result,
+   `strikes.observe(call_signature(name, args), is_error)`. On true, with
+   `route_once` `Settled` and a label above it offered, CAS `nudge_sent` and
+   emit `RoutingNotice { kind: "nudge", text: "tools keep failing; consider
+   <model>" }` ("going in circles" when the trigger was a repeat). Append a
+   `nudge` row.
+8. `AgentEvent::RoutingNotice { kind: String, text: String }` and its
+   serializable twin (the `ModelSwapSummarized` pattern, channels.rs:440 and
+   :858):
+   - Mnemo1's events forwarding (events.rs) and console (`console.rs`) render
+     it as an info line;
+   - the frontend reducer adds an informational notice;
+   - Mnemo2's team and lead pumps ignore it explicitly in their `match`.
+9. `seed_messages` with non-empty history sets `Off { "resumed" }`.
+   `AgentCommand::Clear` calls `reset_route_once()`, and appends
+   `nudge_ignored` first when a nudge was sent and no manual pick followed.
+10. `set_model` (src-tauri/src/ipc/agent.rs:607), per-agent branch: when the
+    new model spec differs from the agent's current one, call
+    `agent_loop.note_manual_model_choice(&spec)` and append a `reroute` row.
+    An effort-only call does not count. The global (no `agent_id`) branch does
+    the same for every live loop it touches.
+11. model_routing.rs: `pub enum SessionRoutingRow` (`#[serde(tag = "event",
+    rename_all = "snake_case")]`) with `Route`, `Nudge`, `Reroute` and
+    `NudgeIgnored` per §4.12, each with `ts` and `agent_id`.
+    `pub fn session_routing_log_path() -> PathBuf`.
+
+**Rules:**
+
+- With `[general.laya] routing` off, nothing changes: no classifier call,
+  no row, no notice. This is today's guarantee.
+- A session is routed **at most once**. No code path switches a Mnemo1
+  model after the first classified turn except a human pick.
+- The step-lane ladder (`step_lane_target`, turn.rs ~1340) and the reflex
+  are untouched, and keep `threshold`.
+- The pin is the picker's state-scoped pin, so a later workflow-state
+  change with a configured `[models.*]` model behaves exactly as after a
+  manual pick.
+
+**Tests (written first, in src/agent/tests.rs, reusing `routing_gate(…)`
+(tests.rs:15950) and the gate tests' loop set-up ~16090):**
+
+- `first_prompt_routes_once_and_pins_the_model`: enforce on, stub answers
+  `hard 0.9`, two turns. One classifier call. The second turn's request goes
+  to the capable model. `route_once()` is `Settled{model: Some(..)}`. A
+  `ModelChanged` and a `RoutingNotice{kind:"routed"}` were emitted.
+- `later_turns_never_switch`: the second turn's stub answers `trivial 0.99`;
+  the model stays capable.
+- `shadow_first_prompt_notices_but_keeps_the_model`.
+- `short_first_prompt_turns_routing_off`: "hi" means 0 calls and
+  `Off{"too_short"}`.
+- `below_gate_settles_without_a_model`: 0.40 with 3 labels.
+- `routine_without_a_target_keeps_the_model`.
+- `resumed_session_is_never_routed`: `seed_messages` with history, then one
+  turn, gives 0 calls.
+- `clear_makes_the_next_prompt_routable`.
+- `manual_pick_turns_routing_off_and_logs_a_reroute`: call
+  `note_manual_model_choice`, then the next turn gives 0 calls, and the row
+  is present.
+- `three_failing_tool_calls_nudge_once` (the mock returns tool errors for 3
+  calls, then 3 more): exactly one `RoutingNotice{kind:"nudge"}`.
+- `drift_nudges_once_in_the_background`: the second prompt classifies as
+  `hard 0.9` while settled on routine. One nudge, and the turn did not wait
+  (the stub delays 2 s; the turn finishes first, then the notice arrives).
+- `routing_off_is_byte_identical`: the flag off means 0 calls, no rows and
+  no notices.
+- `classify_task_text_uses_the_shared_question` (model_routing.rs tests).
+- frontend `agentEventReducer.test.ts`: `RoutingNotice` renders an info
+  notice and changes no busy or compacting state.
+
+**Done:**
+
+- [ ] root and src-tauri clippy clean
+- [ ] root `cargo test --lib` and src-tauri tests green
+- [ ] bins build
+- [ ] frontend `npx vitest run src/lib` green (from frontend/)
+
+**Do not touch** src-tauri/src/mnemo2/dispatch_routing.rs, laya_settings.rs
+or the Mnemo2 dispatch path (steps 3–6). In team.rs and runtime.rs, change
+only the pump `match` arms.
+
+### Step 8: Settings (both apps), mission control and the eval tool
 
 **Files:**
 
@@ -949,7 +1320,11 @@ runtime.rs.
 - the eval tool `src-tauri/src/bin/mnemo2_route_eval.rs` (new) plus
   `src-tauri/tests/fixtures/route_eval.jsonl` (new, the hand set of design
   §4.8);
-- vitest tests beside the components.
+- vitest tests beside the components;
+- Mnemo1: `frontend/src/components/settings/sections/ClassifierSection.tsx`
+  (+ test), `frontend/src/components/settings/types.ts`, and the settings
+  DTO path that carries `[general.routing]`
+  (src-tauri/src/ipc/settings.rs `LayaWire` area, src/config/settings_dto.rs).
 
 **New code:**
 
@@ -963,8 +1338,15 @@ runtime.rs.
    - thresholds with the eval date;
    - fallback tier, nudges toggle and per-tier effort;
    - the summary numbers.
-   - Keep Mnemo1's `[general.routing]` lanes block, relabelled "Mnemo1
-     per-turn lanes (not used by Mnemo2 workers)".
+   - Keep Mnemo1's `[general.routing]` block, relabelled "Mnemo1: first-prompt
+     routing and step lanes (not used by Mnemo2 workers)", and add the
+     `routine` picker there too.
+   - Mnemo1 ClassifierSection: a `routine` model picker beside cheap and
+     capable; a "First-prompt gate" number field that shows "calibrated
+     default 0.475" when unset; copy reads "Routes the first prompt of a
+     session once; afterwards Laya only suggests"; the Step-lane `threshold`
+     is labelled as such. The DTO carries `routine` and
+     `first_prompt_min_confidence` round-trip.
 3. The worker card: a routing chip from `worker.routing` and a nudge chip.
 4. The eval tool:
    - `mnemo2_route_eval [--history] [--laya-url URL]`. It attaches to the
@@ -972,6 +1354,11 @@ runtime.rs.
      history set with `--history`) one prompt at a time;
    - it prints the threshold table and the misses as in design §4.8, and the
      suggested `min_confidence_<n>`;
+   - it uses `route_question::route_question` with all three labels offered
+     (and again with two), so one run calibrates both apps;
+   - `--mnemo1` adds a corpus of first-prompt-style texts (the hand set's
+     plain-language twins: "fix the typo recieve in README" rather than a step
+     spec), because Mnemo1 classifies chat prompts, not specs;
    - its pure parts (corpus parsing and table math) are unit-tested; the
      network part is not run in tests.
 
@@ -981,7 +1368,10 @@ runtime.rs.
   - `LayaPage` renders each mode;
   - auto is disabled with fewer than 30 labelled decisions;
   - save sends `[routing]`;
-  - the worker card shows `Laya: average 0.62` and the nudge chip.
+  - the worker card shows `Laya: average 0.62` and the nudge chip;
+  - Mnemo1 `ClassifierSection.test.ts`: the routine picker and the
+    first-prompt gate save round-trip, and the unset gate shows the
+    calibrated default.
 - rust:
   - `summary_counts_agreement_and_accuracy` over a fixture log;
   - `eval_table_picks_the_lowest_threshold_at_90_percent` over fixed scores;
@@ -990,25 +1380,32 @@ runtime.rs.
 
 **Done:**
 
-- [ ] svelte-check and vitest clean
+- [ ] svelte-check and vitest clean (mnemo2/)
+- [ ] `npx vitest run` clean (frontend/)
 - [ ] clippy clean
 - [ ] tests green
 - [ ] bins build
 
-### Step 7: Verification (lead only)
+### Step 9: Verification (lead only)
 
 1. Rebuild Mnemo2 and set mode `shadow`.
 2. Run the eval tool against the live Laya and record the measured thresholds
    in settings. If accuracy at any threshold that routes at least 50% of the
    hand set is below 80%, **stop**: tune the descriptions (step 2 constants)
-   and rerun before going on.
+   and rerun before going on. Do the same with `--mnemo1` and save Mnemo1's
+   first-prompt gate.
 3. Run one real plan in shadow. Check the `route` rows, the dispatch result
    lines, `team_status.routing`, the worker card chip, and the Effort table's
    Laya column.
 4. Change one worker's model by hand in mission control and check the
    `user_reroute` row.
-5. After about 30 dispatches, read the summary and decide with the user
-   whether to enable `suggest`.
+5. Mnemo1: with routing on and enforce off, open a session and send a real
+   first prompt. Check the `RoutingNotice` in chat, one `route` row in
+   session_routing.jsonl, and no classification on the second prompt (only a
+   possible drift nudge). Then pick a model by hand and check the `reroute`
+   row.
+6. After about 30 dispatches, read the summary and decide with the user
+   whether to enable `suggest` (Mnemo2) and `enforce` (Mnemo1).
 
 ### Acceptance scenarios
 
@@ -1028,6 +1425,13 @@ runtime.rs.
 - A merged worker's `outcome` row carries a derived label. The plan's review
   report shows Laya and Routed-by columns.
 - A dispatch never waits more than 3 s on Laya.
+- Mnemo1 with routing on classifies only a session's first prompt (at least
+  3 words), switches the model at most once (enforce on), and afterwards only
+  shows suggestions. A manual model pick turns routing off for that session
+  and is logged. A resumed session is never routed.
+- Mnemo1 with routing off behaves exactly as today.
+- Mnemo1 and Mnemo2 ask Laya byte-identical questions for the same offered
+  labels.
 
 ---
 
@@ -1047,8 +1451,8 @@ runtime.rs.
 4. **The fine-tune.** It is out of scope here. When the dispatch log has
    about 200 strong labels, a later plan can add a `dispatch_routing` corpus
    to the startup fine-tune (src-tauri/src/ipc/finetune.rs, which today
-   exports only failure triage). Do you want that in this plan as a step 8
+   exports only failure triage). Do you want that in this plan as a step 10
    instead?
-5. **Mnemo1's per-turn gate.** It keeps its two-label question and 0.80
-   gate. Its 94 logged rows show the same weakness. Should a follow-up give
-   Mnemo1 the same three-label question and calibrated gate?
+5. **Mnemo1's step-lane ladder** (per plan step, via the reflex) is left as
+   is. It can also switch models mid-session. Should a follow-up give it the
+   same route-once-and-nudge treatment?

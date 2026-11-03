@@ -291,7 +291,7 @@ impl PlanBoard {
         // The same resumability bar create_plan applies. A board plan's steps
         // are real work (no locked bug skeleton), so every kind gets the
         // step check.
-        let issues: Vec<String> = context_issue(&context, draft.kind, None, true)
+        let issues: Vec<String> = context_issue(&context, draft.kind, None)
             .into_iter()
             .chain(step_issue(&steps, false))
             .collect();

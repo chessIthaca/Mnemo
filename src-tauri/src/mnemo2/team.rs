@@ -1037,10 +1037,13 @@ fn deliver_nudge(
 }
 
 /// The `nudge_ignored` row (design §4.7): a nudged worker reached a
-/// terminal status still on the tier it was nudged from — the lead did not
-/// act on the nudge. `None` when the worker was not nudged, or ended on
-/// the suggested tier (every reroute clears the nudge, so an acted-on
-/// nudge is never seen here).
+/// truly terminal status — merged, stopped, or abandoned in cleanup —
+/// still on the tier it was nudged from, so the lead never acted on the
+/// nudge. A failed worker is resumable (`team_resume` on a stronger tier
+/// takes the nudge and logs a reroute), so failure never logs it.
+/// `None` when the worker was not nudged, or ended on the suggested
+/// tier (every reroute clears the nudge, so an acted-on nudge is never
+/// seen here).
 fn nudge_ignored_row(record: &WorkerRecord) -> Option<DispatchRoutingRow> {
     let nudged = record.routing.as_ref()?.nudged.as_deref()?;
     let tier = final_tier(record);
@@ -3723,11 +3726,11 @@ impl TeamRuntime {
         .await;
         let _ = self.persist().await;
         if let Ok(record) = self.worker(worker_id).await {
+            // A failure is not terminal — the worker can still be resumed
+            // on a stronger tier and take its nudge — so only the outcome
+            // row, never nudge_ignored.
             if logs_routing(&record, self.routing_mode()) {
                 if let Some(row) = outcome_row(&record, "failed") {
-                    self.append_dispatch_routing_row(&row);
-                }
-                if let Some(row) = nudge_ignored_row(&record) {
                     self.append_dispatch_routing_row(&row);
                 }
             }
@@ -6371,9 +6374,6 @@ async fn pump_worker(
     // The `outcome` row owed when the worker lands in a terminal status this
     // iteration; appended once the record save below has persisted it.
     let mut pending_outcome: Option<DispatchRoutingRow> = None;
-    // The `nudge_ignored` row owed beside it, when a nudged worker fails on
-    // the tier it was nudged from.
-    let mut pending_nudge_ignored: Option<DispatchRoutingRow> = None;
     // The tool calls whose results have not landed yet (the nudge strike
     // counter, design §4.6): the session streams arguments as index-keyed
     // fragments, matched to results by the provider's call id.
@@ -6740,11 +6740,11 @@ async fn pump_worker(
                                     .read()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .mode;
+                                // A failure is resumable, not terminal: the
+                                // outcome row only — nudge_ignored waits for
+                                // stop, merge, or cleanup.
                                 pending_outcome = outcome_row(worker, "failed")
                                     .filter(|_| logs_routing(worker, mode));
-                                pending_nudge_ignored = logs_routing(worker, mode)
-                                    .then(|| nudge_ignored_row(worker))
-                                    .flatten();
                             }
                             terminal = true;
                         }
@@ -6762,9 +6762,6 @@ async fn pump_worker(
             let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
         }
         if let Some(row) = pending_outcome.take() {
-            mnemo::agent::model_routing::append_row(&routing_log_path, &row);
-        }
-        if let Some(row) = pending_nudge_ignored.take() {
             mnemo::agent::model_routing::append_row(&routing_log_path, &row);
         }
         if let Some(repeated) = strike_fired.take() {
@@ -7087,12 +7084,17 @@ pub async fn cleanup_workspace(
         worker.error =
             Some("inactive checkout cleaned; the branch is retained for review".to_string());
         // Abandoned is terminal (design §4.7): the worker's `outcome` row
-        // lands beside the cleaned checkout — only for a worker routing ever
-        // applied to (cleanup has no settings handle, so the record decides).
-        let row = outcome_row(worker, "abandoned")
-            .filter(|_| logs_routing(worker, RoutingMode::Off));
+        // and, when its one nudge was never acted on, the `nudge_ignored`
+        // row land beside the cleaned checkout — only for a worker routing
+        // ever applied to (cleanup has no settings handle, so the record
+        // decides).
+        let rows = [outcome_row(worker, "abandoned"), nudge_ignored_row(worker)]
+            .into_iter()
+            .flatten()
+            .filter(|_| logs_routing(worker, RoutingMode::Off))
+            .collect::<Vec<_>>();
         persistence.save(&ledger)?;
-        if let Some(row) = row {
+        for row in rows {
             mnemo::agent::model_routing::append_row(routing_log_path, &row);
         }
     }
@@ -10596,18 +10598,143 @@ models = [\"scripted-a\", \"scripted-b\"]
             "exactly one nudge: {:?}",
             fixture.rows()
         );
-        // The failed worker finishes on the tier it was nudged from, so
-        // the ignored nudge lands with the terminal outcome.
+        // A failure is resumable, not terminal: the doom-guard failure
+        // logs the outcome but never nudge_ignored — a team_resume on a
+        // stronger tier can still take the nudge.
         assert!(
             matches!(
                 fixture.rows().as_slice(),
                 [DispatchRoutingRow::Route { .. },
                  DispatchRoutingRow::Nudge { .. },
-                 DispatchRoutingRow::Outcome { status, .. },
-                 DispatchRoutingRow::NudgeIgnored { tier, .. }]
-                    if status == "failed" && tier == "average"
+                 DispatchRoutingRow::Outcome { status, .. }]
+                    if status == "failed"
             ),
-            "the route, the nudge, and the terminal rows: {:?}",
+            "the route, the nudge, and the outcome rows: {:?}",
+            fixture.rows()
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// A failure is resumable, not terminal: the doom-guard failure that
+    /// rides the strike nudge logs the outcome but never `nudge_ignored` —
+    /// `team_resume` on a stronger tier can still take the nudge.
+    #[tokio::test]
+    async fn failed_worker_does_not_log_nudge_ignored() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("average"), None).await;
+        assert!(result.success, "{}", result.output);
+        // The terminal failure row is the deterministic marker that the
+        // pump has fully processed the worker's failure; the nudge row
+        // lands with the third tool result, before the Error event.
+        let outcome = eventually(|| async {
+            fixture.rows().into_iter().find(|row| {
+                matches!(row, DispatchRoutingRow::Outcome { status, .. } if status == "failed")
+            })
+        })
+        .await;
+        assert!(
+            matches!(&outcome, DispatchRoutingRow::Outcome { final_tier, .. } if final_tier == "average"),
+            "the failure outcome: {outcome:?}"
+        );
+        assert!(
+            fixture
+                .rows()
+                .iter()
+                .any(|row| matches!(row, DispatchRoutingRow::Nudge { .. })),
+            "the strike nudge fired before the failure: {:?}",
+            fixture.rows()
+        );
+        assert!(
+            fixture
+                .rows()
+                .iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::NudgeIgnored { .. })),
+            "a failed worker never logs nudge_ignored: {:?}",
+            fixture.rows()
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// Stopping the failed worker is truly terminal: the ignored nudge logs
+    /// there, once — a repeated stop writes nothing more.
+    #[tokio::test]
+    async fn stopped_after_failure_logs_nudge_ignored_once() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("average"), None).await;
+        assert!(result.success, "{}", result.output);
+        // The strike nudge fires and the doom guard fails the worker.
+        let failed = eventually(|| async {
+            let worker = fixture
+                .team
+                .worker("routingworker")
+                .await
+                .expect("worker");
+            (worker.status == WorkerStatus::Failed).then_some(worker)
+        })
+        .await;
+        assert!(
+            failed.routing.as_ref().expect("routed at dispatch").nudged.is_some(),
+            "the strike nudge was claimed before the failure: {failed:?}"
+        );
+        assert!(
+            fixture
+                .rows()
+                .iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::NudgeIgnored { .. })),
+            "the failure itself never logs nudge_ignored: {:?}",
+            fixture.rows()
+        );
+        // The lead stops the failed worker: the ignored nudge lands beside
+        // the stopped outcome.
+        let stopped = fixture
+            .team
+            .stop("routingworker")
+            .await
+            .expect("stop the failed worker");
+        assert!(matches!(stopped.status, WorkerStatus::Stopped), "{stopped:?}");
+        assert!(
+            matches!(
+                fixture.rows().as_slice(),
+                [..,
+                 DispatchRoutingRow::Outcome { status, .. },
+                 DispatchRoutingRow::NudgeIgnored { tier, .. }
+                ] if status == "stopped" && tier == "average"
+            ),
+            "the stopped outcome plus the ignored nudge: {:?}",
+            fixture.rows()
+        );
+        // Stopping again writes nothing more.
+        fixture
+            .team
+            .stop("routingworker")
+            .await
+            .expect("stopping again is a no-op");
+        assert_eq!(
+            fixture
+                .rows()
+                .iter()
+                .filter(|row| matches!(row, DispatchRoutingRow::NudgeIgnored { .. }))
+                .count(),
+            1,
+            "nudge_ignored logs once: {:?}",
             fixture.rows()
         );
         fixture.team.shutdown().await;

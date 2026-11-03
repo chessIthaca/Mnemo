@@ -16159,6 +16159,91 @@ async fn routing_disabled_never_classifies_and_keeps_todays_model() {
 }
 
 #[tokio::test]
+async fn skip_turn_routing_writes_no_routing_rows() {
+    // Plan 2ba2168a step 1: a session stamped with the skip (a Mnemo2
+    // worker or lead, routed once at dispatch) never runs the per-turn
+    // gate — no classification, no rows, and today's model.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    agent.set_skip_turn_routing(true);
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(
+        outcome.text, "from-default",
+        "a skipped session keeps today's model"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the turn is never classified"
+    );
+    let rows = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        rows.trim().is_empty(),
+        "a skipped session writes no routing rows: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn turn_routing_still_runs_by_default() {
+    // The Mnemo1 regression pin (plan 2ba2168a step 1): without the skip
+    // stamp the per-turn gate behaves exactly as before — one
+    // classification, one decision row.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(
+        outcome.text, "from-cheap-model",
+        "the default session still routes to the cheap model"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "classified exactly once"
+    );
+    let (decisions, outcomes) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1, "one decision row");
+    assert_eq!(outcomes.len(), 1, "one outcome row");
+}
+
+#[tokio::test]
 async fn routing_with_an_empty_classifier_slot_keeps_todays_model() {
     // Laya disabled / unconfigured = an EMPTY shared slot. Routing is opted in
     // and a target is configured, but with no classifier the turn must not

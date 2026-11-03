@@ -143,6 +143,12 @@ pub struct SessionOptions {
     /// [`AgentLoop::set_pinned_task`]; a subagent never inherits its
     /// parent's task (no parent fallback).
     pub pinned_task: Option<String>,
+    /// When true, this session's turns are never classified by the
+    /// pre-prompt routing gate, and no routing.jsonl rows are written for
+    /// them. Mnemo2 routes at dispatch instead. Stamped on the loop
+    /// post-build via [`AgentLoop::set_skip_turn_routing`]; `false` (every
+    /// Mnemo1 caller) keeps today's per-turn gate.
+    pub skip_turn_routing: bool,
 }
 
 /// Spawn a background agent: build its loop via the factory, spawn its task,
@@ -203,6 +209,7 @@ async fn spawn_agent_shared_inner(
         host_tools,
         trace_identity,
         pinned_task,
+        skip_turn_routing,
     } = session;
     match role.as_deref() {
         None | Some("reviewer") => {}
@@ -304,6 +311,10 @@ async fn spawn_agent_shared_inner(
     // subagent passes `None` and there is no parent fallback, so a child
     // never inherits the parent's assignment.
     agent_loop.set_pinned_task(pinned_task.clone());
+    // The per-turn-routing skip (plan 2ba2168a step 1): stamped
+    // unconditionally post-build, pre-registration — no request can race
+    // the stamp. `false` (every Mnemo1 caller) keeps the per-turn gate.
+    agent_loop.set_skip_turn_routing(skip_turn_routing);
     // 3c/G2 (§5.9.2): register the session's host tools into the registry
     // via the shared dynamic slot — the late-registration path the MCP
     // reveal machinery uses. A shim carries no deferred group, so it is
@@ -829,6 +840,10 @@ impl ParentAwareSpawner for HostSpawner {
                 trace_identity: None,
                 // a subagent never pins its parent's task (40eef714)
                 pinned_task: None,
+                // subagents already escape the gate via the is_subagent
+                // guard; the flag itself stays false, exactly today's
+                // behavior (2ba2168a step 1).
+                skip_turn_routing: false,
             },
         )
         .await?;
@@ -935,6 +950,8 @@ impl HostRuntime {
                 trace_identity: None,
                 // Mnemo1 has no pinned task (40eef714)
                 pinned_task: None,
+                // Mnemo1 keeps the per-turn routing gate (2ba2168a step 1)
+                skip_turn_routing: false,
             },
         )
         .await
@@ -1618,6 +1635,7 @@ mod tests {
             host_tools: vec![],
             trace_identity: None,
             pinned_task: None,
+            skip_turn_routing: false,
         }
     }
 

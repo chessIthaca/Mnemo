@@ -603,6 +603,10 @@ fn main() {
                                 // passes no pinned task — the head bytes stay
                                 // unchanged, exactly today's behavior.
                                 pinned_task: None,
+                                // Plan 2ba2168a step 1: Mnemo1's main agent
+                                // keeps the per-turn routing gate, exactly
+                                // today's behavior.
+                                skip_turn_routing: false,
                             },
                         )
                         .await

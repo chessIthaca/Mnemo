@@ -1153,6 +1153,10 @@ impl LeadRuntime {
                 // Plan 40eef714 step 1: the lead session carries no
                 // pinned task.
                 pinned_task: None,
+                // Plan 2ba2168a step 1: the lead session's turns are never
+                // classified by the per-prompt gate — Mnemo2 routes at
+                // dispatch instead.
+                skip_turn_routing: true,
             })
             .await
             .map_err(|err| format!("could not spawn the lead session: {err}"))?;
@@ -9464,6 +9468,79 @@ mod tests {
             matches!(resumed.status, crate::mnemo2::team::WorkerStatus::Idle),
             "the resumed worker idles: {resumed:?}"
         );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// Plan 2ba2168a step 1: Mnemo2 worker and lead sessions opt out of
+    /// the pre-prompt routing gate at spawn — Laya routes a worker once at
+    /// dispatch instead, so no turn is ever classified per prompt and no
+    /// routing.jsonl rows are written for the team's sessions.
+    #[tokio::test]
+    async fn mnemo2_worker_sessions_skip_turn_routing() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("done"),
+            gate: None,
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        team.dispatch_with_id(
+            "implement the counting feature".into(),
+            Some("test/model-a".into()),
+            Some("worker0001".into()),
+            None,
+        )
+        .await
+        .expect("dispatch the worker");
+
+        // The dispatch spawns the worker's session on the lead's engine;
+        // both loops are registered under the identities stamped at
+        // spawn, so the skip is observable on each before the worker's
+        // turn even finishes.
+        let engine = lead.engine_handle().await.expect("the engine");
+        let loops = engine.host().agent_loops.lock().await;
+        let worker_loop = loops
+            .values()
+            .find(|loopy| {
+                loopy
+                    .trace_identity()
+                    .map(|identity| identity.worker_id.as_deref() == Some("worker0001"))
+                    .unwrap_or(false)
+            })
+            .expect("the worker loop is registered");
+        assert!(
+            worker_loop.skip_turn_routing(),
+            "a Mnemo2 worker session skips the per-turn gate"
+        );
+        let lead_loop = loops
+            .values()
+            .find(|loopy| {
+                loopy
+                    .trace_identity()
+                    .map(|identity| {
+                        matches!(
+                            identity.actor_kind,
+                            mnemo::provider::trace::TraceActorKind::Lead
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("the lead loop is registered");
+        assert!(
+            lead_loop.skip_turn_routing(),
+            "the Mnemo2 lead session skips the per-turn gate"
+        );
+        drop(loops);
+
+        wait_for_worker_status(
+            &team,
+            "worker0001",
+            crate::mnemo2::team::WorkerStatus::Completed,
+        )
+        .await;
         team.shutdown().await;
         lead.shutdown().await;
     }

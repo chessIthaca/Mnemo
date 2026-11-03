@@ -1249,6 +1249,16 @@ impl AgentLoop {
         if self.is_subagent() {
             return None;
         }
+        // Plan 2ba2168a step 1: a session opted out at spawn (Mnemo2
+        // workers and leads) is never classified here — Laya routes it
+        // once at dispatch instead — so its turns write no
+        // decision/outcome rows either.
+        if self
+            .skip_turn_routing
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
         let policy = self.model_resolver.as_ref()?.routing_policy()?;
         let gate = self.routing.as_ref()?;
         let classifier = gate.classifier()?;

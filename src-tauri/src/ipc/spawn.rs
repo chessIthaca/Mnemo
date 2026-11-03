@@ -80,6 +80,9 @@ pub async fn spawn_agent(
             // Plan 40eef714 step 1: Mnemo1 spawns pass no pinned task —
             // the head bytes stay unchanged, exactly today's behavior.
             pinned_task: None,
+            // Plan 2ba2168a step 1: Mnemo1 spawns keep the per-turn
+            // routing gate, exactly today's behavior.
+            skip_turn_routing: false,
         },
     )
     .await?;
@@ -229,6 +232,9 @@ pub(crate) async fn spawn_run_all_agent(
             // Plan 40eef714 step 1: Mnemo1 spawns pass no pinned task —
             // the head bytes stay unchanged, exactly today's behavior.
             pinned_task: None,
+            // Plan 2ba2168a step 1: Mnemo1 spawns keep the per-turn
+            // routing gate, exactly today's behavior.
+            skip_turn_routing: false,
         },
     )
     .await
@@ -343,6 +349,10 @@ impl ParentAwareSpawner for IpcSpawner {
                 // Plan 40eef714 step 1: subagents never pin a task, and
                 // never inherit the parent's.
                 pinned_task: None,
+                // Plan 2ba2168a step 1: subagents already escape the
+                // gate via the is_subagent guard; the flag stays false,
+                // exactly today's behavior.
+                skip_turn_routing: false,
             },
         )
     .await?;

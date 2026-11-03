@@ -312,7 +312,9 @@ pub struct WorkerRecord {
     /// commit moves the tip and makes this audit stale for the new tip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_tip: Option<String>,
-
+    /// An audit worker delivered its read-only report; its job is over.
+    #[serde(default)]
+    pub report_delivered: bool,
     /// Durable lead findings.
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -544,6 +546,22 @@ fn default_review_risk() -> String {
 /// Legacy ledgers predate audit workers; they decode as `implementation`.
 fn default_worker_kind() -> String {
     "implementation".to_string()
+}
+
+/// Whether an audit worker's job is over: its report was recorded, or a
+/// ledger written before `report_delivered` existed merely records it as
+/// `Completed`. A finished audit is never resumed, compacted, messaged or
+/// model-changed — dispatch a fresh audit instead.
+fn audit_finished(record: &WorkerRecord) -> bool {
+    record.kind == "audit"
+        && (record.report_delivered || record.status == WorkerStatus::Completed)
+}
+
+/// The refusal every finished-audit gate carries.
+fn audit_finished_error(worker_id: &str) -> String {
+    format!(
+        "audit worker '{worker_id}' already delivered its report; dispatch a new audit with team_audit_dispatch"
+    )
 }
 
 /// The team's public snapshot.
@@ -1108,14 +1126,16 @@ pub struct TeamRuntime {
     engine: Arc<Engine>,
     workspace_root: PathBuf,
     records: Arc<Mutex<Vec<WorkerRecord>>>,
-    live: Mutex<HashMap<String, LiveWorker>>,
+    live: Arc<Mutex<HashMap<String, LiveWorker>>>,
     messages: Arc<Mutex<Vec<TeamMessage>>>,
     events: broadcast::Sender<TeamEvent>,
     generation: Arc<AtomicU64>,
     next_worker: AtomicU64,
     lead_busy: AtomicBool,
-    #[cfg(test)]
-    fail_next_close: AtomicBool,
+    /// Transition tests flip this to inject a worker-session close
+    /// failure; production never sets it. Shared with every worker pump
+    /// so the audit release closes sessions exactly like `stop_inner`.
+    fail_next_close: Arc<AtomicBool>,
     lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
@@ -1165,14 +1185,7 @@ pub const MAX_WORKER_SLOTS: usize = 32;
 
 impl TeamRuntime {
     async fn close_session_for_cleanup(&self, session: &AgentSession) -> Result<(), String> {
-        #[cfg(test)]
-        if self.fail_next_close.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Err("injected close failure for transition tests".to_string());
-        }
-        session
-            .close_and_wait()
-            .await
-            .map_err(|error| error.to_string())
+        close_worker_session(session, &self.fail_next_close).await
     }
 
     #[cfg(test)]
@@ -1209,14 +1222,13 @@ impl TeamRuntime {
             engine: options.engine,
             workspace_root: options.workspace_root,
             records: Arc::new(Mutex::new(workers)),
-            live: Mutex::new(HashMap::new()),
+            live: Arc::new(Mutex::new(HashMap::new())),
             messages: Arc::new(Mutex::new(Vec::new())),
             events,
             generation: Arc::new(AtomicU64::new(0)),
             next_worker: AtomicU64::new(1),
             lead_busy: AtomicBool::new(false),
-            #[cfg(test)]
-            fail_next_close: AtomicBool::new(false),
+            fail_next_close: Arc::new(AtomicBool::new(false)),
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
@@ -3294,6 +3306,7 @@ impl TeamRuntime {
             kind: "audit".to_string(),
             audit_target: Some(worker_id.to_string()),
             audit_tip: Some(tip),
+            report_delivered: false,
             reasoning_effort,
             review_rounds: 0,
             fix_rounds: 0,
@@ -3505,6 +3518,7 @@ impl TeamRuntime {
             kind: "implementation".to_string(),
             audit_target: None,
             audit_tip: None,
+            report_delivered: false,
             findings: Vec::new(),
 
             fixer_finding_id: None,
@@ -3613,6 +3627,8 @@ impl TeamRuntime {
             strikes.clone(),
             self.models.clone(),
             self.tiers.clone(),
+            self.live.clone(),
+            self.fail_next_close.clone(),
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {
@@ -3782,6 +3798,9 @@ impl TeamRuntime {
             return Err(
                 "a cleaned worker cannot accept new work; review its retained branch".to_string(),
             );
+        }
+        if audit_finished(&record) {
+            return Err(audit_finished_error(worker_id));
         }
         if record.compacting {
             return Err(
@@ -4100,6 +4119,9 @@ impl TeamRuntime {
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be resumed".to_string());
         }
+        if audit_finished(&record) {
+            return Err(audit_finished_error(worker_id));
+        }
         if !record.worktree.is_dir() {
             return Err(format!(
                 "the worker's worktree is missing: {}",
@@ -4147,6 +4169,8 @@ impl TeamRuntime {
             strikes.clone(),
             self.models.clone(),
             self.tiers.clone(),
+            self.live.clone(),
+            self.fail_next_close.clone(),
         ));
         self.live.lock().await.insert(
             worker_id.to_string(),
@@ -4268,6 +4292,9 @@ impl TeamRuntime {
         }
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot change its model".to_string());
+        }
+        if audit_finished(&record) {
+            return Err(audit_finished_error(worker_id));
         }
         self.validate_model(&model, &reasoning_effort)?;
         let from_spec = session_model_spec(&record).to_string();
@@ -4396,6 +4423,9 @@ impl TeamRuntime {
         let mut record = self.worker(worker_id).await?;
         if record.compacting {
             return Err(format!("worker '{worker_id}' is already compacting"));
+        }
+        if audit_finished(&record) {
+            return Err(audit_finished_error(worker_id));
         }
         if record.status == WorkerStatus::NeedsYou && self.live.lock().await.contains_key(worker_id)
         {
@@ -4790,6 +4820,12 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         let worker = self.worker(worker_id).await?;
+        // Audits only ever produce findings; they never receive them.
+        debug_assert_ne!(
+            worker.kind,
+            "audit",
+            "route_fix never targets an audit worker"
+        );
         if matches!(worker.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot receive a fixer".to_string());
         }
@@ -6377,6 +6413,8 @@ async fn pump_worker(
     strikes: Arc<Mutex<route_question::Strikes>>,
     models: Arc<std::sync::RwLock<Vec<LeadModel>>>,
     tiers: Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
+    live: Arc<Mutex<HashMap<String, LiveWorker>>>,
+    fail_next_close: Arc<AtomicBool>,
 ) {
     let mut turn_active = false;
     // The `outcome` row owed when the worker lands in a terminal status this
@@ -6410,6 +6448,20 @@ async fn pump_worker(
         {
             let result = worker_host_tool_result(&messages, &worker_id, name, args).await;
             send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
+            // An audit's report is the message_parent call that delivered
+            // it (plan 5779641): mark the record the moment the message is
+            // recorded, so the turn's Finished event below can end the
+            // session and free the slot it holds.
+            if name == "message_parent" {
+                let mut records = records.lock().await;
+                if let Some(worker) = records.iter_mut().find(|worker| {
+                    worker.id == worker_id
+                        && (worker.generation == 0 || worker.generation == generation)
+                        && worker.kind == "audit"
+                }) {
+                    worker.report_delivered = true;
+                }
+            }
         }
         // The nudge strike counter (design §4.6): fingerprint every finished
         // tool call — failures and verbatim repeats of the previous call
@@ -6463,6 +6515,10 @@ async fn pump_worker(
         let mut terminal = false;
         let mut refresh = false;
         let mut changed = false;
+        // Whether this event ended a reported audit's turn (plan 5779641):
+        // its live session is released below, once the save persists the
+        // report and the `Completed` status.
+        let mut audit_release = false;
         {
             let mut records = records.lock().await;
             if let Some(worker) = records.iter_mut().find(|worker| {
@@ -6659,6 +6715,14 @@ async fn pump_worker(
                             worker.status = WorkerStatus::Completed;
                             worker.turns = worker.turns.saturating_add(1);
                         }
+                        // An audit that reported ends its own job: its
+                        // session is released below so it stops holding a
+                        // worker slot. A turn that ended without a report
+                        // (failure, interrupt) keeps today's behavior —
+                        // the lead can still resume it.
+                        audit_release = worker.kind == "audit"
+                            && worker.report_delivered
+                            && matches!(worker.status, WorkerStatus::Completed);
                         terminal = true;
                     }
                     SerializableAgentEvent::Exited => {
@@ -6772,6 +6836,28 @@ async fn pump_worker(
         if terminal || changed {
             let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
         }
+        if audit_release {
+            // The record with the report and the `Completed` status is
+            // persisted above; end the live session exactly as
+            // `stop_inner` does — but keep the status `Completed`, since
+            // the audit finished its job on its own. Then stop pumping:
+            // the session is gone and this pump only outlives its turn.
+            // The ledger handles move over: the loop breaks right after.
+            let _ = release_finished_audit(
+                &worker_id,
+                generation,
+                &live,
+                PumpLedger {
+                    records: records.clone(),
+                    usage: usage.clone(),
+                    save_lock: save_lock.clone(),
+                    persistence,
+                },
+                &fail_next_close,
+            )
+            .await;
+            break;
+        }
         if let Some(row) = pending_outcome.take() {
             mnemo::agent::model_routing::append_row(&routing_log_path, &row);
         }
@@ -6852,6 +6938,100 @@ async fn pump_worker(
             });
         }
     }
+}
+
+/// Close a worker session for cleanup, honoring the transition tests'
+/// injected close failure. Shared by [`TeamRuntime::stop_inner`] and the
+/// audit release below so both paths behave identically.
+async fn close_worker_session(
+    session: &AgentSession,
+    fail_next_close: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    if fail_next_close.swap(false, Ordering::SeqCst) {
+        return Err("injected close failure for transition tests".to_string());
+    }
+    session
+        .close_and_wait()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The shared ledger handles a worker pump holds: the record store plus
+/// everything [`save_workers`] needs. [`release_finished_audit`] takes
+/// them as one group because the pump hands them over on its way out.
+struct PumpLedger {
+    records: Arc<Mutex<Vec<WorkerRecord>>>,
+    usage: Arc<Mutex<ProjectUsage>>,
+    save_lock: Arc<Mutex<()>>,
+    persistence: TeamPersistence,
+}
+
+/// End a finished audit's live session from inside its own pump (plan
+/// 5779641): the report was recorded and `Completed` is persisted, so the
+/// slot is freed the way [`TeamRuntime::stop_inner`] frees a stopped
+/// one — snapshot folded into the record, session closed, record and
+/// worktree kept — but the status stays `Completed`, because the audit
+/// ended its job on its own rather than being stopped.
+///
+/// On a failed close the [`LiveWorker`] goes back into `live` with
+/// `cleanup_retry_only` set, exactly like a failed stop: a later stop
+/// retries the close. The pump calling this breaks its loop right after,
+/// so no self-abort is needed.
+async fn release_finished_audit(
+    worker_id: &str,
+    generation: u64,
+    live: &Arc<Mutex<HashMap<String, LiveWorker>>>,
+    ledger: PumpLedger,
+    fail_next_close: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let Some(mut live_worker) = live.lock().await.remove(worker_id) else {
+        // Not live: a repeated Finished event, or the lead already
+        // stopped or deleted the audit. Nothing to release.
+        return Ok(());
+    };
+    let snapshot = live_worker.session.snapshot().await.ok();
+    {
+        let mut records = ledger.records.lock().await;
+        if let Some(worker) = records.iter_mut().find(|worker| {
+            worker.id == worker_id
+                && (worker.generation == 0 || worker.generation == generation)
+        }) {
+            if let Some(snapshot) = &snapshot {
+                if !snapshot.transcript.messages.is_empty() {
+                    worker.transcript = snapshot.transcript.clone();
+                    worker.used_tokens = snapshot.used_tokens;
+                    worker.max_tokens = snapshot.max_tokens;
+                    if worker.model_id.is_none() {
+                        worker.model_id = snapshot_model(snapshot);
+                    }
+                } else if worker.transcript.messages.is_empty() && worker.brief_sent {
+                    worker.transcript = Transcript {
+                        messages: vec![mnemo::provider::Message::user_text(
+                            kickoff_message(worker).to_string(),
+                        )],
+                    };
+                }
+            }
+        }
+    }
+    if let Err(error) = close_worker_session(&live_worker.session, fail_next_close).await {
+        let message = format!("could not close worker session: {error}");
+        live_worker.cleanup_retry_only = true;
+        live.lock().await.insert(worker_id.to_string(), live_worker);
+        {
+            let mut records = ledger.records.lock().await;
+            if let Some(worker) = records.iter_mut().find(|worker| {
+                worker.id == worker_id
+                    && (worker.generation == 0 || worker.generation == generation)
+            }) {
+                worker.error = Some(message.clone());
+            }
+        }
+        let _ = save_workers(&ledger.records, &ledger.usage, &ledger.save_lock, &ledger.persistence).await;
+        return Err(message);
+    }
+    let _ = save_workers(&ledger.records, &ledger.usage, &ledger.save_lock, &ledger.persistence).await;
+    Ok(())
 }
 
 /// Write the whole ledger — workers, slots, and the usage accumulator.
@@ -8391,6 +8571,7 @@ mod tests {
             kind: "implementation".to_string(),
             audit_target: None,
             audit_tip: None,
+            report_delivered: false,
             findings: Vec::new(),
             review: None,
             review_rounds: 0,
@@ -10032,6 +10213,196 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(audit.audits, 0, "the count lands on the target: {audit:?}");
         let target = team.worker(&record.id).await.expect("the audited worker");
         assert_eq!(target.audits, 1, "{target:?}");
+        team.shutdown().await;
+    }
+
+    /// An audit that reported ends its own session (plan 5779641): the
+    /// slot it held is freed the moment its turn ends, without the lead
+    /// stopping it, and its report is already recorded when that happens.
+    #[tokio::test]
+    async fn finished_audit_releases_its_slot() {
+        let (fixture, _notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings::default(),
+            None,
+            std::time::Duration::ZERO,
+            vec![
+                // The audit reports through message_parent, then ends its
+                // turn — exactly what audit_prompt() tells it to do.
+                tool_call_batch(
+                    "audit-report",
+                    "message_parent",
+                    r#"{"text":"Read-only audit: no findings; the change matches its plan."}"#,
+                ),
+                vec![
+                    mnemo::provider::LlmEvent::TextDelta {
+                        text: "reported".to_string(),
+                    },
+                    mnemo::provider::LlmEvent::Finish {
+                        reason: mnemo::provider::FinishReason::Stop,
+                    },
+                ],
+            ],
+        )
+        .await;
+        let team = &fixture.team;
+        // One slot: the audit itself is the only worker that may hold it.
+        team.persistence.slots.store(1, Ordering::SeqCst);
+        // The audited implementation worker: an idle record with a live
+        // checkout, dispatched on the fixture's board plan.
+        let mut target = worker(fixture._root.path(), "target00001");
+        target.plan_id = Some(fixture.plan_id.clone());
+        target.plan_step = Some(0);
+        provision_agent_worktree(
+            fixture._root.path().to_path_buf(),
+            target.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the target checkout");
+        team.records.lock().await.push(target.clone());
+
+        let (audit, reused) = team
+            .audit_dispatch(&target.id, "auditworker1", None, None, None)
+            .await
+            .expect("dispatch the audit into the one slot");
+        assert!(!reused, "a fresh audit is not a reuse");
+        let audit_id = audit.id.clone();
+        let finished = eventually(|| async {
+            let record = team.worker(&audit_id).await.ok()?;
+            (record.status == WorkerStatus::Completed).then_some(record)
+        })
+        .await;
+        // The report was recorded before the session ended.
+        assert!(finished.report_delivered, "{finished:?}");
+        assert!(
+            team.messages()
+                .await
+                .iter()
+                .any(|message| message.worker_id == audit_id),
+            "the audit's report is recorded for the lead"
+        );
+        // The finished audit no longer counts against the slots.
+        assert_eq!(
+            team.live.lock().await.len(),
+            0,
+            "the finished audit released its slot"
+        );
+        // The freed slot dispatches a fresh audit with no manual stop
+        // (a different id prefix: the finished audit's branch stays).
+        team.audit_dispatch(&target.id, "audittwo001", None, None, None)
+            .await
+            .expect("the released slot dispatches a fresh audit");
+        team.shutdown().await;
+    }
+
+    /// A finished audit never comes back (plan 5779641): resume, compact,
+    /// model change and message are all refused with the same words.
+    #[tokio::test]
+    async fn finished_audit_cannot_be_resumed() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut audit = worker(root.path(), "auditworker1");
+        audit.kind = "audit".to_string();
+        audit.status = WorkerStatus::Completed;
+        audit.report_delivered = true;
+        let team = open_test_team(root.path(), state.path(), vec![audit]).await;
+        let refusal = "audit worker 'auditworker1' already delivered its report; dispatch a new audit with team_audit_dispatch";
+        let error = team
+            .resume("auditworker1")
+            .await
+            .expect_err("resume refuses a finished audit");
+        assert_eq!(error, refusal);
+        let error = team
+            .compact("auditworker1")
+            .await
+            .expect_err("compact refuses a finished audit");
+        assert_eq!(error, refusal);
+        let error = team
+            .change_model("auditworker1", None, None, ChangeSource::User)
+            .await
+            .expect_err("change_model refuses a finished audit");
+        assert_eq!(error, refusal);
+        let error = team
+            .message(
+                "auditworker1",
+                "one more look at the diff".to_string(),
+                MessageSender::User,
+            )
+            .await
+            .expect_err("message refuses a finished audit");
+        assert_eq!(error, refusal);
+        team.shutdown().await;
+    }
+
+    /// The other side of the coin: an audit that failed before it reported
+    /// keeps today's resume path — the lead can still bring it back.
+    #[tokio::test]
+    async fn audit_that_failed_before_reporting_can_still_be_resumed() {
+        let (fixture, _notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings::default(),
+            None,
+            std::time::Duration::ZERO,
+            vec![vec![
+                mnemo::provider::LlmEvent::TextDelta {
+                    text: "done".to_string(),
+                },
+                mnemo::provider::LlmEvent::Finish {
+                    reason: mnemo::provider::FinishReason::Stop,
+                },
+            ]],
+        )
+        .await;
+        let team = &fixture.team;
+        let mut audit = worker(fixture._root.path(), "auditworker1");
+        audit.kind = "audit".to_string();
+        audit.status = WorkerStatus::Failed;
+        audit.error = Some("the audit's turn failed before any report".to_string());
+        provision_agent_worktree(
+            fixture._root.path().to_path_buf(),
+            audit.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the audit checkout");
+        team.records.lock().await.push(audit.clone());
+        let resumed = team
+            .resume("auditworker1")
+            .await
+            .expect("a failed audit can still be resumed");
+        assert_eq!(resumed.status, WorkerStatus::Idle, "{resumed:?}");
+        team.shutdown().await;
+    }
+
+    /// Ledgers written before `report_delivered` existed decode without it;
+    /// a `Completed` audit from such a ledger still counts as finished.
+    #[tokio::test]
+    async fn legacy_completed_audit_counts_as_finished() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut audit = worker(root.path(), "auditworker1");
+        audit.kind = "audit".to_string();
+        audit.status = WorkerStatus::Completed;
+        // The on-disk ledger predates the field: serialize and strip it.
+        let mut value = serde_json::to_value(&audit).expect("serialize the audit");
+        value
+            .as_object_mut()
+            .expect("the record serializes as an object")
+            .remove("report_delivered");
+        let legacy: WorkerRecord =
+            serde_json::from_value(value).expect("decode the legacy ledger");
+        assert!(!legacy.report_delivered, "{legacy:?}");
+        assert!(audit_finished(&legacy), "{legacy:?}");
+        let team = open_test_team(root.path(), state.path(), vec![legacy]).await;
+        let error = team
+            .resume("auditworker1")
+            .await
+            .expect_err("resume refuses a legacy completed audit");
+        assert_eq!(
+            error,
+            "audit worker 'auditworker1' already delivered its report; dispatch a new audit with team_audit_dispatch"
+        );
         team.shutdown().await;
     }
 

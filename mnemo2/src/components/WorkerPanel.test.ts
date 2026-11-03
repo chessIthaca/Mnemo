@@ -532,4 +532,47 @@ describe("WorkerPanel", () => {
     const select = screen.getByLabelText("Choose worker") as HTMLSelectElement;
     expect(Array.from(select.options).map((option) => option.value)).toEqual(["ana", "kai"]);
   });
+
+  it("hides Continue for a finished audit and points the lead at its report", async () => {
+    await openAppWith([
+      nativeWorker(),
+      kaiWorker({
+        id: "ada",
+        name: "Ada",
+        kind: "audit",
+        audit_target: "ana",
+        report_delivered: true,
+        // Stopped after reporting: the banner's one case for a finished audit.
+        status: "stopped",
+        error: null,
+      }),
+    ]);
+    actions.openWorkerPanel("ada");
+    render(App);
+    const panel = document.querySelector(".worker-panel") as HTMLElement;
+
+    expect(within(panel).getByText("Audit finished; its report is with the lead.")).toBeTruthy();
+    expect(within(panel).queryByRole("button", { name: "Continue" })).toBeNull();
+    // Delete stays: the lead can still clean the finished audit up.
+    expect(within(panel).getByRole("button", { name: "Delete Ada" })).toBeTruthy();
+  });
+
+  it("keeps Continue for an audit that failed before reporting", async () => {
+    await openAppWith([
+      nativeWorker(),
+      kaiWorker({
+        id: "ada",
+        name: "Ada",
+        kind: "audit",
+        status: "failed",
+        error: "the audit's turn failed before reporting",
+      }),
+    ]);
+    actions.openWorkerPanel("ada");
+    render(App);
+    const panel = document.querySelector(".worker-panel") as HTMLElement;
+
+    expect(within(panel).getByRole("button", { name: "Continue" })).toBeTruthy();
+    expect(within(panel).queryByText("Audit finished; its report is with the lead.")).toBeNull();
+  });
 });

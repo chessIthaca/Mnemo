@@ -310,6 +310,8 @@ export interface Worker {
   auditTarget?: string;
   /** For an audit worker: the exact implementation tip it inspected. */
   auditTip?: string;
+  /** True once an audit worker delivered its report; its job is over. */
+  reportDelivered?: boolean;
   fixerFindingId?: string;
   /** The board plan this worker's task belongs to. */
   planId?: string | null;

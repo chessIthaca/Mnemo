@@ -3796,6 +3796,16 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 ));
             }
         }
+        // The pinned task (plan 40eef714 step 1): the session's assignment,
+        // rendered verbatim between the tool groups and the session primer —
+        // part of the STABLE head, never the volatile tail, so the provider's
+        // prefix cache keeps working and every request (before and after a
+        // compaction or model switch) carries it byte-for-byte.
+        if let Some(task) = self.pinned_task() {
+            head_content.push_str("\n\n## Your task (pinned)\nThis is your assignment for this whole session. It stays here verbatim and is never summarized; after compaction or a model change, re-read it here.\n\n");
+            head_content.push_str(&task);
+            head_content.push('\n');
+        }
         match self.session_primer() {
             Some(Some(primer)) => {
                 head_content.push('\n');

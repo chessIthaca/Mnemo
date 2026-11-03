@@ -161,6 +161,11 @@ pub struct SpawnOptions {
     /// fills the allocated agent/session ids and stamps it on the loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_identity: Option<crate::provider::trace::TraceIdentity>,
+    /// The session's task, kept verbatim in the system message for the
+    /// whole session (never summarized by compaction or a model switch).
+    /// `None` for an ordinary session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_task: Option<String>,
 }
 
 /// A command to a live session (§5.3 :327-338) — the public mirror of the

@@ -4369,6 +4369,372 @@ async fn local_provider_tail_rides_as_user_messages_no_trailing_system_block() {
     );
 }
 
+#[tokio::test]
+async fn pinned_task_rides_the_system_head() {
+    // Plan 40eef714 step 1: the pinned task rides the STABLE HEAD
+    // (messages[0]) of every request for the session's whole life —
+    // never a conversation message, never the volatile tail — so
+    // compaction (which summarizes messages[1..]) and a model switch
+    // (which rebuilds messages[0]) can never eat it.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::single(vec![
+        LlmEvent::TextDelta {
+            text: "done".into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    agent.set_pinned_task(Some("TASK-7f3 do the thing".into()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("go")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let requests = recorder.requests.lock().expect("the request capture");
+    assert_eq!(requests.len(), 1, "one request serves the turn");
+    let request = &requests[0];
+    assert_eq!(request[0].role, Role::System, "the head is messages[0]");
+    let head = request[0].content.as_text();
+    assert!(
+        head.contains("## Your task (pinned)"),
+        "the pinned block rides the stable head: {head}"
+    );
+    assert!(
+        head.contains("TASK-7f3 do the thing"),
+        "the task text is verbatim in the head: {head}"
+    );
+    for message in &request[1..] {
+        assert!(
+            !message.content.as_text().contains("TASK-7f3"),
+            "the pinned task must not leak into any other message: {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pinned_task_survives_compaction() {
+    // Compaction summarizes conversation messages only and rebuilds
+    // every request's messages[0] from the stable head — so the request
+    // AFTER the summary still carries the pinned task byte-for-byte in
+    // the head, and the summarizer never sees the task at all.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![
+        // First the summarizer's call...
+        vec![
+            LlmEvent::TextDelta {
+                text: "summary of the conversation".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // ...then the main request after the summary replaced the
+        // history.
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let task = "TASK-7f3 do the thing — verbatim through compaction";
+    agent.set_pinned_task(Some(task.into()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    // ~400KB of text ≈ 80K tiktoken tokens ("word " is one BPE token) —
+    // past the 64K summarize threshold (128_000 * 0.5), triggering
+    // compaction before the main request. Nine messages so
+    // summarize_with_interrupt has something to summarize (it
+    // early-returns when len <= keep_recent + 1).
+    let mut messages = vec![Message::user_text("start")];
+    for i in 0..3 {
+        messages.push(Message::assistant_text(format!("ack {i}")));
+        messages.push(Message::user_text(format!("turn {i}")));
+    }
+    messages.push(Message::user_text("word ".repeat(80_000)));
+    messages.push(Message::assistant_text("done"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let requests = recorder.requests.lock().expect("the request capture");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the summarizer's request, then the main request"
+    );
+    // The summarizer summarizes the CONVERSATION — the pinned task lives
+    // in the head, so it never enters its prompt.
+    assert!(
+        !requests[0]
+            .iter()
+            .any(|m| m.content.as_text().contains("TASK-7f3")),
+        "the summary prompt must be built from the conversation, not the head"
+    );
+    // The MAIN request — the one after compaction replaced the history —
+    // still carries the full pinned task byte-for-byte in messages[0].
+    assert_eq!(
+        requests[1][0].role, Role::System,
+        "the compacted request still leads with the head"
+    );
+    let head = requests[1][0].content.as_text();
+    assert!(
+        head.contains(task),
+        "the pinned task survives compaction verbatim in messages[0]"
+    );
+}
+
+#[tokio::test]
+async fn pinned_task_survives_compaction_after_the_head_is_installed() {
+    // Review F2 (plan 40eef714 step 1): the sibling test above compacts
+    // on the FIRST turn — before any request has installed the head into
+    // the persistent history — so a production bug that fed messages[0]
+    // to the summarizer would go uncaught there. Here the head is
+    // already installed: turn 1 completes (its request build inserts
+    // the pinned head as messages[0]), the history then grows past the
+    // threshold, and turn 2 auto-compacts a history whose messages[0]
+    // IS the head. Assertions: no request carries the pinned task
+    // outside its own system head (the summary prompt is built from the
+    // conversation, never from messages[0]), and the post-compaction
+    // request's messages[0] carries the task byte-for-byte.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![
+        // Turn 1's response — its request build installs the head.
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // The summarizer's call on turn 2...
+        vec![
+            LlmEvent::TextDelta {
+                text: "summary of the conversation".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // ...then turn 2's main request after the summary replaced the
+        // history.
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let task = "TASK-7f3 do the thing — verbatim through a later compaction";
+    agent.set_pinned_task(Some(task.into()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    // Turn 1: a small exchange — its request build installs the pinned
+    // head as messages[0] of the PERSISTENT history, so the compaction
+    // below runs on a history that starts with the head.
+    let mut messages = vec![Message::user_text("go")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages[0].role, Role::System,
+        "turn 1's request build installed the head in the history"
+    );
+    assert!(
+        messages[0].content.as_text().contains(task),
+        "the installed head carries the pinned task"
+    );
+
+    // The conversation grows: one ~400KB message (≈ 80K tokens — past
+    // the 64K summarize threshold, under the 96K hard ceiling) followed
+    // by a small recent tail. Eleven messages in total, so the
+    // summarizer has something to summarize (it early-returns when
+    // len <= keep_recent + 1) and the big message lands INSIDE the
+    // summarized range, not in the keep-recent window.
+    messages.push(Message::user_text(format!(
+        "BIG-FILLER {}",
+        "word ".repeat(80_000)
+    )));
+    messages.push(Message::assistant_text("done"));
+    for i in 0..3 {
+        messages.push(Message::user_text(format!("turn {i}")));
+        messages.push(Message::assistant_text(format!("ack {i}")));
+    }
+    // Turn 2: auto-compaction runs BEFORE the main request — on the
+    // head-installed history.
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let requests = recorder.requests.lock().expect("the request capture");
+    assert_eq!(
+        requests.len(),
+        3,
+        "turn 1's request, the summarizer's request, then turn 2's main request"
+    );
+    // Proof the middle request is the summarizer's, and that its
+    // summarize region was real: the big conversation message was fed
+    // to it.
+    assert!(
+        requests[1]
+            .iter()
+            .any(|m| m.content.as_text().contains("BIG-FILLER")),
+        "the summarizer's request carries the summarized conversation"
+    );
+    // F2's core: the pinned task may ride a request's SYSTEM head, but
+    // no non-system message may carry it — the summary prompt is a user
+    // message built from the conversation (messages[1..cut]); if
+    // production fed it messages[0] (the installed head), the task
+    // would appear here and its survival would depend on the summary
+    // echoing it back.
+    for (i, request) in requests.iter().enumerate() {
+        for message in request {
+            if message.role == Role::System {
+                continue;
+            }
+            assert!(
+                !message.content.as_text().contains("TASK-7f3"),
+                "request {i} carries the pinned task outside its system head: {message:?}"
+            );
+        }
+    }
+    // The post-compaction main request still leads with the head, and
+    // the head carries the full pinned task byte-for-byte.
+    assert_eq!(
+        requests[2][0].role, Role::System,
+        "the compacted request still leads with the head"
+    );
+    let head = requests[2][0].content.as_text();
+    assert!(
+        head.contains(task),
+        "the pinned task survives the later compaction verbatim in messages[0]"
+    );
+}
+
+#[tokio::test]
+async fn blank_pinned_task_leaves_the_head_unchanged() {
+    // A whitespace-only pinned task is None (stored as unset), and with
+    // no pinned task the head bytes are exactly as before — the pinned
+    // block must not appear (Mnemo1 unchanged, prefix-cache stable).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let (provider, captured) = CapturingProvider::new();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: Arc::new(provider),
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    agent.set_pinned_task(Some("   ".into()));
+    assert_eq!(
+        agent.pinned_task(),
+        None,
+        "a whitespace-only task is stored as None"
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("hi")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let prompts = captured.lock().await;
+    assert_eq!(prompts.len(), 1, "one request serves the turn");
+    assert!(
+        !prompts[0].contains("## Your task (pinned)"),
+        "a blank pinned task must leave the head bytes unchanged"
+    );
+}
+
 /// A mock provider whose `complete` fails the first `fail_times` calls,
 /// then returns a minimal stop stream. Used to verify that
 /// `complete_with_retry` surfaces every failed attempt as a transient

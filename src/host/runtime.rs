@@ -137,6 +137,12 @@ pub struct SessionOptions {
     /// seed inherits its parent's identity instead (see
     /// [`session_trace_identity`]).
     pub trace_identity: Option<crate::provider::trace::TraceIdentity>,
+    /// The session's task, kept verbatim in the system message for the
+    /// whole session (never summarized by compaction or a model switch).
+    /// `None` for an ordinary session. Stamped on the loop post-build via
+    /// [`AgentLoop::set_pinned_task`]; a subagent never inherits its
+    /// parent's task (no parent fallback).
+    pub pinned_task: Option<String>,
 }
 
 /// Spawn a background agent: build its loop via the factory, spawn its task,
@@ -196,6 +202,7 @@ async fn spawn_agent_shared_inner(
         limits,
         host_tools,
         trace_identity,
+        pinned_task,
     } = session;
     match role.as_deref() {
         None | Some("reviewer") => {}
@@ -292,7 +299,11 @@ async fn spawn_agent_shared_inner(
     {
         agent_loop.set_trace_identity(identity);
     }
-
+    // The pinned task (plan 40eef714 step 1): stamped unconditionally
+    // post-build, pre-registration — no request can race the stamp. A
+    // subagent passes `None` and there is no parent fallback, so a child
+    // never inherits the parent's assignment.
+    agent_loop.set_pinned_task(pinned_task.clone());
     // 3c/G2 (§5.9.2): register the session's host tools into the registry
     // via the shared dynamic slot — the late-registration path the MCP
     // reveal machinery uses. A shim carries no deferred group, so it is
@@ -816,6 +827,8 @@ impl ParentAwareSpawner for HostSpawner {
                 // trace identity: none explicit — spawn_agent_shared inherits
                 // the parent's with the subagent actor kind (c3ba2b58 step A)
                 trace_identity: None,
+                // a subagent never pins its parent's task (40eef714)
+                pinned_task: None,
             },
         )
         .await?;
@@ -920,6 +933,8 @@ impl HostRuntime {
                 host_tools: vec![],
                 // Mnemo1's main agent is unattributed (c3ba2b58 step A)
                 trace_identity: None,
+                // Mnemo1 has no pinned task (40eef714)
+                pinned_task: None,
             },
         )
         .await
@@ -1602,6 +1617,7 @@ mod tests {
             limits: None,
             host_tools: vec![],
             trace_identity: None,
+            pinned_task: None,
         }
     }
 
@@ -1876,5 +1892,57 @@ mod tests {
         // Its request contexts are unattributed too (the empty handle).
         let ctx = agent.llm_request_context(Some("t-1"), crate::provider::trace::TracePurpose::Turn);
         assert_eq!(ctx.attribution, None);
+    }
+
+    #[tokio::test]
+    async fn spawn_stamps_the_pinned_task_and_subagents_do_not_inherit_it() {
+        // Plan 40eef714 step 1: the SessionOptions pinned task reaches the
+        // loop post-build (pre-registration — no request can race the
+        // stamp) and rides every request's stable head for the whole
+        // session. A subagent NEVER inherits its parent's task: the
+        // pinned task is the assignment of the session it was stamped
+        // on, so the spawn path has no parent fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        // SpawnHost is consumed by value; a second host sharing the same
+        // factory/manager/loop-map drives the child spawn below.
+        let host2 = SpawnHost {
+            factory: host.factory.clone(),
+            manager: host.manager.clone(),
+            agent_loops: host.agent_loops.clone(),
+        };
+        let mut session = test_session(None);
+        session.pinned_task = Some("T1".to_string());
+        let (parent_id, _) = spawn_agent_shared(
+            host,
+            "worker".to_string(),
+            None,
+            None,
+            session,
+        )
+        .await
+        .unwrap();
+        let agent = agent_loops.lock().await.get(&parent_id).cloned().unwrap();
+        assert_eq!(
+            agent.pinned_task().as_deref(),
+            Some("T1"),
+            "the spawn stamps the pinned task on the loop"
+        );
+
+        let (child_id, _) = spawn_agent_shared(
+            host2,
+            "child".to_string(),
+            None,
+            Some(parent_id),
+            test_session(None),
+        )
+        .await
+        .unwrap();
+        let child = agent_loops.lock().await.get(&child_id).cloned().unwrap();
+        assert_eq!(
+            child.pinned_task(),
+            None,
+            "a subagent never inherits the parent's pinned task"
+        );
     }
 }

@@ -2792,6 +2792,9 @@ impl TeamRuntime {
                 // from its record — every model call the worker makes is
                 // attributed to this worker, its plan, and its step.
                 trace_identity: Some(trace_identity),
+                // Plan 40eef714 step 1: unset until step 2 pins the
+                // worker's task here.
+                pinned_task: None,
             })
             .await
             .map_err(|err| format!("could not spawn the worker session: {err}"))

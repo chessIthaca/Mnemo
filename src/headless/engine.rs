@@ -430,6 +430,11 @@ impl Engine {
                 // the host spawn path fills the allocated ids and stamps
                 // it on the loop. `None` keeps records unattributed.
                 trace_identity: opts.trace_identity.clone(),
+                // Plan 40eef714 step 1: the session's pinned task — the
+                // host spawn path stamps it on the loop, and every
+                // request's stable head carries it verbatim for the
+                // whole session. `None` = ordinary session.
+                pinned_task: opts.pinned_task.clone(),
             },
         )
         .await

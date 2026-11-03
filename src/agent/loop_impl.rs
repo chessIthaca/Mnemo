@@ -613,6 +613,12 @@ pub struct AgentLoop {
     /// app's WorkflowPolicy for the workflow agent. Nothing consults it until
     /// 2a.3+.
     pub(crate) policy: std::sync::RwLock<Arc<dyn crate::agent::policy::AgentPolicy>>,
+    /// The session's pinned task (plan 40eef714 step 1): the spawn path's
+    /// assignment, kept verbatim in the stable head of every request's
+    /// system message for the whole session — compaction summarizes
+    /// conversation messages only, and a model switch rebuilds the head,
+    /// so the task survives both byte-for-byte. `None` = ordinary session.
+    pub(crate) pinned_task: std::sync::RwLock<Option<String>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -1159,6 +1165,10 @@ impl AgentLoop {
             policy: std::sync::RwLock::new(Arc::new(
                 crate::agent::policy::NoPolicy::with_coding_default(),
             )),
+            // Plan 40eef714 step 1: unset until the spawn path stamps the
+            // session's task (`set_pinned_task`) — every constructor starts
+            // pinned-free.
+            pinned_task: std::sync::RwLock::new(None),
         }
     }
 
@@ -1203,6 +1213,27 @@ impl AgentLoop {
     /// Mnemo1 paths, or a spawn without host identity).
     pub fn trace_identity(&self) -> Option<crate::provider::trace::TraceIdentity> {
         self.trace_identity.get()
+    }
+
+    /// Stamp the session's pinned task (plan 40eef714 step 1) — called
+    /// ONCE by the spawn path post-build (pre-registration, before any
+    /// turn can run, so no request can race the stamp). A whitespace-only
+    /// task is stored as `None` (unset); otherwise the text is stored with
+    /// trailing whitespace trimmed, and the stable-head builder renders
+    /// it verbatim under `## Your task (pinned)` on every request.
+    pub fn set_pinned_task(&self, task: Option<String>) {
+        let task = task.filter(|t| !t.trim().is_empty());
+        *self.pinned_task.write().expect("pinned task lock poisoned") =
+            task.map(|t| t.trim_end().to_string());
+    }
+
+    /// The session's pinned task (`None` = ordinary session — Mnemo1, or a
+    /// spawn without a task).
+    pub fn pinned_task(&self) -> Option<String> {
+        self.pinned_task
+            .read()
+            .expect("pinned task lock poisoned")
+            .clone()
     }
 
     /// Build the request-scoped trace context for a model call made by

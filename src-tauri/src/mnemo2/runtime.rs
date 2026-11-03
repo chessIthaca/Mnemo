@@ -1150,6 +1150,9 @@ impl LeadRuntime {
                     plan_id: None,
                     plan_step: None,
                 }),
+                // Plan 40eef714 step 1: the lead session carries no
+                // pinned task.
+                pinned_task: None,
             })
             .await
             .map_err(|err| format!("could not spawn the lead session: {err}"))?;

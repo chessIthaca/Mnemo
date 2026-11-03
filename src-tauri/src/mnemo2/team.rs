@@ -1085,9 +1085,11 @@ impl TeamRuntime {
         let mut refusal = None;
         let (chosen_model, chosen_tier) = if has_explicit_choice {
             let model = self.lead_model_choice(explicit_tier, request.model.clone())?;
-            let tier = explicit_tier
-                .map(str::to_string)
-                .or_else(|| self.tier_for_model(model.as_deref()));
+            let tier = if request.model.is_some() {
+                self.tier_for_model(model.as_deref())
+            } else {
+                explicit_tier.map(str::to_string)
+            };
             (model, tier)
         } else if let Some(tier) = cleared_tier {
             (self.lead_model_choice(Some(tier), None)?, Some(tier.to_string()))
@@ -1136,7 +1138,11 @@ impl TeamRuntime {
             confidence: decision.as_ref().map(|decision| decision.confidence),
             cleared: decision.as_ref().is_some_and(|decision| decision.cleared),
             lead_tier: (routed_by != "laya")
-                .then(|| chosen_tier.clone())
+                .then(|| {
+                    explicit_tier
+                        .map(str::to_string)
+                        .or_else(|| chosen_tier.clone())
+                })
                 .flatten(),
             routed_by: routed_by.to_string(),
             nudged: None,
@@ -1190,7 +1196,7 @@ impl TeamRuntime {
                         .unwrap_or_default(),
                     step: request.plan.as_ref().map_or(0, |plan| plan.step + 1),
                     laya_tier: Some(laya_tier),
-                    lead_tier: chosen_tier.clone().unwrap_or_else(|| "custom".into()),
+                    lead_tier: routing.lead_tier.clone().unwrap_or_else(|| "custom".into()),
                     confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
                 });
             }
@@ -10170,22 +10176,35 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
         let tools = team.lead_host_tools();
         let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
-        let expected_description = format!(
-            "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\n{}",
-            team.tier_guidance().expect("tier guidance")
-        );
-        assert_eq!(
-            dispatch.parameters["properties"]["tier"]["description"],
-            json!(expected_description)
-        );
-        assert_eq!(
-            dispatch.parameters["properties"]["tier"]["enum"],
-            json!(["difficult", "average", "simple"])
-        );
-        assert!(dispatch.parameters["required"]
-            .as_array()
-            .expect("required fields")
-            .contains(&json!("tier")));
+        let expected = json!({
+            "type": "object",
+            "properties": {
+                "worker_id": {"type": "string", "minLength": 8, "maxLength": 64, "pattern": "^[A-Za-z0-9]+$"},
+                "plan_id": {"type": "string", "description": "The board plan this task belongs to (from plan_create or plan_list). Required."},
+                "step": {"type": "integer", "minimum": 1, "description": "The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},
+                "brief": {"type": "string", "description": "Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},
+                "tier": {
+                    "type": "string",
+                    "enum": ["difficult", "average", "simple"],
+                    "description": "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\ndifficult - design, debugging, bug_fixing plans, cross-cutting work, steps touching shared contracts: test/scripted-model\naverage - typical implementation steps: test/scripted-model\nsimple - single-file mechanical edits, checks, lookups, scaffolding: test/scripted-model"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "A specific model from the tiers, only when the tier's first model does not fit; it overrides `tier`. Prefer `tier`; models outside the tiers are refused.",
+                    "enum": ["test/scripted-model"]
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "description": "The worker's reasoning effort, chosen with its model: higher for hard design or debugging, lower for mechanical work. Applies to the model `tier` or `model` picks; a value that model does not support is rejected with its allowed list. Omit to use the model's configured default."
+                },
+                "read_back": {
+                    "type": "boolean",
+                    "description": "Optional. When true, the worker's first turn only reads its spec and the files it names, then messages the lead with numbered questions (ambiguities, contradictions with the code, open decisions) or exactly 'No questions.', and waits for the lead's reply before changing files. Use it for large or subtle specs."
+                }
+            },
+            "required": ["worker_id", "plan_id", "step", "brief", "tier"]
+        });
+        assert_eq!(&dispatch.parameters, &expected);
     }
 
 
@@ -10218,6 +10237,96 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(routing.laya_tier.as_deref(), Some("average"));
         assert_eq!(routing.lead_tier.as_deref(), Some("average"));
         assert_eq!(routing.routed_by, "lead");
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn tier_plus_cross_tier_model_logs_the_ran_tier() {
+        for (requested, ran, laya_label, expected_effort) in [
+            ("simple", "difficult", mnemo::agent::route_question::LABEL_TRIVIAL, "high"),
+            ("difficult", "simple", mnemo::agent::route_question::LABEL_HARD, "low"),
+        ] {
+            let fixture = routing_fixture_with(
+                crate::mnemo2::dispatch_routing::RoutingSettings {
+                    mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                    effort: std::collections::BTreeMap::from([
+                        ("difficult".into(), "high".into()),
+                        ("simple".into(), "low".into()),
+                    ]),
+                    ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+                },
+                routing_answer(laya_label, 0.91),
+                true,
+                std::time::Duration::ZERO,
+            )
+            .await;
+            fixture.team.set_catalog(
+                ["difficult", "average", "simple"]
+                    .into_iter()
+                    .map(|tier| LeadModel {
+                        reasoning_efforts: vec!["low".into(), "high".into()],
+                        ..lead_model(&format!("scripted-{tier}"))
+                    })
+                    .collect(),
+                mnemo::headless::TiersDto {
+                    difficult: vec!["test/scripted-difficult".into()],
+                    average: vec!["test/scripted-average".into()],
+                    simple: vec!["test/scripted-simple".into()],
+                },
+                Vec::new(),
+            );
+            let model = format!("test/scripted-{ran}");
+            let result = fixture.dispatch(Some(requested), Some(&model)).await;
+            assert!(result.success, "{requested} -> {ran}: {}", result.output);
+            let worker = fixture.team.worker("routingworker").await.expect("worker");
+            assert_eq!(worker.tier.as_deref(), Some(ran));
+            assert_eq!(worker.model.as_deref(), Some(model.as_str()));
+            assert_eq!(worker.reasoning_effort.as_deref(), Some(expected_effort));
+            let routing = worker.routing.expect("routing");
+            assert_eq!(routing.lead_tier.as_deref(), Some(requested));
+            assert_eq!(routing.laya_tier.as_deref(), Some(requested));
+            assert_eq!(routing.routed_by, "lead_override");
+            let rows = fixture.rows();
+            assert_eq!(rows.len(), 2);
+            assert!(matches!(
+                &rows[0],
+                crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                    lead_tier: Some(lead),
+                    ran_tier: Some(actual),
+                    ..
+                } if lead == requested && actual == ran
+            ));
+            assert!(matches!(
+                &rows[1],
+                crate::mnemo2::dispatch_routing::DispatchRoutingRow::LeadOverride {
+                    lead_tier,
+                    ..
+                } if lead_tier == requested
+            ));
+            fixture.team.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_below_gate_with_a_different_fallback_reports_unsure() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                fallback_tier: "difficult".into(),
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            true,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Laya: unsure (0.41)."));
+        assert!(!result.output.contains("routed to difficult"));
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("difficult"));
         fixture.team.shutdown().await;
     }
 

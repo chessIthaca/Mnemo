@@ -16929,6 +16929,18 @@ async fn routine_without_a_target_keeps_the_model() {
     let (decisions, _) = read_routing_log(&log_path);
     assert_eq!(decisions[0].target.as_deref(), Some("routine"));
     assert!(!decisions[0].enforced);
+    let session_rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(matches!(
+        &session_rows[0],
+        model_routing::SessionRoutingRow::Route {
+            label,
+            cleared: true,
+            enforced: false,
+            model: None,
+            skip: Some(skip),
+            ..
+        } if label == "routine" && skip == "kept"
+    ));
 }
 
 #[tokio::test]
@@ -16996,13 +17008,19 @@ async fn manual_pick_turns_routing_off_and_logs_a_reroute() {
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
     assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-cheap-model");
+    let (_, epoch) = agent.route_once_with_epoch();
+    assert!(AgentLoop::claim_nudge(
+        &agent.route_session,
+        crate::agent::route_question::LABEL_HARD,
+        Some(epoch),
+    ));
     let (from, nudged) = agent.record_manual_model_choice("stub/manual-model");
     assert_eq!(from.as_deref(), Some("stub/cheap-model"));
-    assert!(!nudged);
+    assert!(nudged, "H3: the reroute captures the outstanding nudge");
     assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }));
     let rows = read_session_routing_log(&session_path);
     assert!(rows.iter().any(|row| matches!(row,
-        model_routing::SessionRoutingRow::Reroute { from: Some(from), to, nudged: false, .. }
+        model_routing::SessionRoutingRow::Reroute { from: Some(from), to, nudged: true, .. }
             if from == "stub/cheap-model" && to == "stub/manual-model")));
     assert_eq!(run_routing_turn(&agent, "classify this later prompt").await.text, "from-cheap-model");
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "a manual choice is final");
@@ -17397,6 +17415,62 @@ async fn agent_with_tool_nudge(
     (agent, session_log_path(&log_path))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drift_claim_during_clear_is_never_lost() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path);
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+
+    // Race the drift claim's linearization point directly against Clear. A
+    // winning claim MUST be returned as Clear's outstanding nudge; a Clear
+    // that wins first must make the old-epoch claim fail. Neither may vanish.
+    for _ in 0..64 {
+        let epoch = {
+            let mut state = agent.route_session.lock().expect("route-session lock");
+            state.route_once = crate::agent::loop_impl::RouteOnce::Settled {
+                label: Some("routine".into()),
+                confidence: Some(0.95),
+                model: None,
+            };
+            state.epoch
+        };
+        let claim_agent = agent.clone();
+        let claim = tokio::spawn(async move {
+            AgentLoop::claim_nudge(
+                &claim_agent.route_session,
+                crate::agent::route_question::LABEL_HARD,
+                Some(epoch),
+            )
+        });
+        let clear_agent = agent.clone();
+        let clear = tokio::spawn(async move { clear_agent.clear_route_session() });
+        let (claimed, outstanding) = tokio::join!(claim, clear);
+        let claimed = claimed.expect("claim task joins");
+        let outstanding = outstanding.expect("clear task joins");
+        assert_eq!(
+            claimed,
+            outstanding.is_some(),
+            "a successful drift claim must be handed to Clear for logging"
+        );
+        if claimed {
+            assert_eq!(outstanding.as_deref(), Some("hard"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn nudge_ignored_is_logged_when_a_nudged_session_ends() {
     let dir = tempdir().unwrap();
@@ -17446,6 +17520,72 @@ async fn nudge_ignored_is_logged_once_for_clear_then_end() {
         1,
         "Clear consumes the outstanding nudge, so termination adds no duplicate: {rows:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drift_after_session_end_emits_nothing() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(StaleDriftClassifier {
+        calls: std::sync::Mutex::new(0),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    assert_eq!(
+        run_routing_turn(&agent, "implement this routine change").await.text,
+        "from-default"
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("now design the concurrent protocol")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the drift classifier started");
+    turn.await.expect("provider turn joins");
+    let _ = drain_routing_events(&mut fanin_rx);
+
+    let task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent);
+    let (cmd_tx, end_cmd_rx) = mpsc::channel(1);
+    drop(cmd_tx);
+    let (end_tx, _end_rx) = mpsc::channel(8);
+    task.run(end_cmd_rx, end_tx).await;
+    release_tx.send(()).expect("release drift after session termination");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )), "a terminated session must not emit a late drift nudge: {events:?}");
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(!rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Nudge { .. }
+    )), "a terminated session must not append a late drift row: {rows:?}");
 }
 
 #[tokio::test]

@@ -1394,7 +1394,11 @@ impl AgentLoop {
                             skip = Some("no_target");
                         }
                     } else {
-                        skip = Some("no_target");
+                        skip = if decision.target == Some(model_routing::RouteTarget::Routine) {
+                            Some("kept")
+                        } else {
+                            Some("no_target")
+                        };
                     }
                 }
 

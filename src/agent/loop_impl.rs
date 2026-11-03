@@ -54,7 +54,7 @@ pub enum RouteOnce {
     },
     /// Routing is permanently off for this session incarnation.
     Off {
-        /// `too_short`, `offline`, `resumed`, or `manual`.
+        /// `too_short`, `offline`, `resumed`, `manual`, or `ended`.
         reason: &'static str,
     },
 }
@@ -1505,23 +1505,53 @@ impl AgentLoop {
         }
     }
 
-    /// Restore the initial state after `/clear` or `/new`.
-    pub(crate) fn reset_route_once(&self) {
-        {
+    /// Atomically return any outstanding nudge and restore the initial route
+    /// state. A drift claim either wins first and is returned for logging, or
+    /// loses to the epoch/Pending transition and can never be lost between two
+    /// separate locks.
+    pub(crate) fn clear_route_session(&self) -> Option<String> {
+        let outstanding = {
             let mut state = self
                 .route_session
                 .lock()
                 .expect("route-session lock poisoned");
+            let outstanding = if state.nudge_sent {
+                state.nudge_to_label.take()
+            } else {
+                state.nudge_to_label = None;
+                None
+            };
             state.route_once = RouteOnce::Pending;
             state.epoch = state.epoch.wrapping_add(1);
             state.nudge_sent = false;
-            state.nudge_to_label = None;
-        }
+            outstanding
+        };
         self.strikes.lock().expect("route strikes lock poisoned").reset();
         *self
             .last_route_tool_signature
             .lock()
             .expect("last tool signature lock poisoned") = None;
+        outstanding
+    }
+
+    /// Atomically invalidate all in-flight drift work and return any nudge
+    /// still outstanding at session termination. Off prevents a new claim;
+    /// the epoch bump rejects a task that snapshotted the old Settled state.
+    pub(crate) fn end_route_session(&self) -> Option<String> {
+        let mut state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        let outstanding = if state.nudge_sent {
+            state.nudge_to_label.take()
+        } else {
+            state.nudge_to_label = None;
+            None
+        };
+        state.route_once = RouteOnce::Off { reason: "ended" };
+        state.epoch = state.epoch.wrapping_add(1);
+        state.nudge_sent = false;
+        outstanding
     }
 
     /// Mark a resumed session as ineligible for first-prompt routing.
@@ -1566,23 +1596,16 @@ impl AgentLoop {
         true
     }
 
-    /// Log an outstanding nudge as ignored and consume it atomically. Clear
-    /// and session termination share this one helper, so clear-then-end (or a
-    /// repeated termination cleanup) can never append a duplicate row.
-    pub(crate) fn log_nudge_ignored(&self, agent_id: crate::runtime::AgentId) {
-        let to_label = {
-            let mut state = self
-                .route_session
-                .lock()
-                .expect("route-session lock poisoned");
-            if !state.nudge_sent {
-                None
-            } else {
-                state.nudge_sent = false;
-                state.nudge_to_label.take()
-            }
-        };
-        if let Some(to_label) = to_label {
+    /// Append the nudge returned by [`clear_route_session`](Self::clear_route_session)
+    /// or [`end_route_session`](Self::end_route_session). Those methods consume
+    /// the outstanding claim atomically, so this shared row helper is called at
+    /// most once for clear-then-end and repeated termination cleanup alike.
+    pub(crate) fn log_nudge_ignored(
+        &self,
+        agent_id: crate::runtime::AgentId,
+        outstanding: Option<String>,
+    ) {
+        if let Some(to_label) = outstanding {
             self.append_session_routing_row(
                 &model_routing::SessionRoutingRow::NudgeIgnored {
                     ts: model_routing::now_millis(),

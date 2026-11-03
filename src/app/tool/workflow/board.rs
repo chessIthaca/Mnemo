@@ -67,6 +67,67 @@ fn plan_data(plan: &BoardPlan) -> serde_json::Value {
     serde_json::to_value(plan).unwrap_or(serde_json::Value::Null)
 }
 
+// ── advisory spec notes ───────────────────────────────────────────────────
+
+/// The heading the advisory spec notes are appended under.
+const SPEC_NOTES_HEADING: &str = "\n\nSpec notes (advisory; nothing was refused):";
+
+/// Matches a `name(args): Type` shape — one of the signature signals
+/// [`spec_gaps`] accepts beside `fn `, `->` and `=>`.
+static SIGNATURE_SHAPED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\w+\([^)]*\)\s*:").expect("the signature-shape regex is valid")
+});
+
+/// Whether `text` carries a signature or a type shape.
+fn has_signature(text: &str) -> bool {
+    text.contains("fn ")
+        || text.contains("->")
+        || text.contains("=>")
+        || SIGNATURE_SHAPED.is_match(text)
+}
+
+/// The spec gaps of one step's text, in a fixed order. Advisory only: the
+/// caller notes them in the success output and never refuses the plan. A
+/// `no-code` step is exempt — it has no signatures or tests to name.
+fn spec_gaps(step_text: &str) -> Vec<&'static str> {
+    let lower = step_text.to_lowercase();
+    if lower.contains("no-code") {
+        return Vec::new();
+    }
+    let mut gaps = Vec::new();
+    if step_text.split_whitespace().count() < 120 {
+        gaps.push("under 120 words");
+    }
+    if !has_signature(step_text) {
+        gaps.push("no signatures");
+    }
+    if !lower.contains("test") {
+        gaps.push("no tests named");
+    }
+    if !lower.contains("done") {
+        gaps.push("no done checklist");
+    }
+    gaps
+}
+
+/// The advisory note block for `steps` (1-based number + text), or the empty
+/// string when every step is a full spec. The plan is already created or
+/// updated when this runs, so a gap is noted, never enforced.
+fn spec_notes(steps: &[(usize, &str)]) -> String {
+    let mut lines = Vec::new();
+    for &(number, text) in steps {
+        let gaps = spec_gaps(text);
+        if !gaps.is_empty() {
+            lines.push(format!("- step {number}: {}", gaps.join(", ")));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{SPEC_NOTES_HEADING}\n{}", lines.join("\n"))
+    }
+}
+
 // ── plan_create ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -128,7 +189,7 @@ impl Tool for PlanCreateTool {
                     "title": {"type": "string", "description": "Short plan title."},
                     "goal": {"type": "string", "description": "The outcome, in one or two sentences."},
                     "context": {"type": "string", "description": "The record of intent, min 40 chars; workers read it. State WHY the work exists, the CONSTRAINTS, the key DECISIONS already taken, exact file paths/symbols, and the verification commands. Stable intent only; no execution state (commits, review status, next actions). Code does not carry this."},
-                    "steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered steps; optionally start each with a bold **header**."},
+                    "steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered steps, each a bold **header** followed by an implementation spec a cheaper model can follow without design decisions: the files and the functions/types to add or change with signatures (mark new code as new), the data shapes, the behaviour rules and edge cases, the order of edits, every test by name with its setup and assertions, a done checklist, and the files not to touch. Longer is better than vague."},
                     "kind": {"type": "string", "enum": ["implementation", "research", "bug_fixing"], "description": "Default implementation. bug_fixing needs `bug` and, to close, a recorded regression test."},
                     "bug": {"type": "string", "description": "The symptom (bug_fixing only)."},
                     "interfaces": {"type": "array", "items": {"type": "string"}, "description": "Contracts between steps, one per entry: exports, signatures, data shapes, file ownership, e.g. \"`src/game.js` — exports `Game` as a named export; UI owns rendering and must not modify it\". Record one whenever two steps touch the same file or module boundary, before dispatching them."},
@@ -179,6 +240,14 @@ impl Tool for PlanCreateTool {
             step_lines(&plan),
             plan.id
         );
+        // Advisory spec notes: a thin step is noted, never refused — the plan
+        // already exists, and the lead decides whether the step is enough.
+        let step_specs: Vec<(usize, &str)> = plan
+            .steps
+            .iter()
+            .map(|s| (s.number, s.text.as_str()))
+            .collect();
+        output.push_str(&spec_notes(&step_specs));
         // Passive recall rides the result, like create_plan: prior knowledge
         // arrives with the plan. Best-effort; never blocks creation.
         if let Some(rider) = crate::tool::steering::recalled_context_block(
@@ -264,7 +333,7 @@ impl Tool for PlanUpdateTool {
                     "interface": {"type": "string", "description": "A contract between steps, dated into Interfaces: exports, signatures, data shapes, file ownership. Workers must follow it exactly."},
                     "progress": {"type": "string", "description": "Execution state, dated into Progress: commits, review status, what is next. Not shown to workers."},
                     "context_append": {"type": "string", "description": "A paragraph of stable intent appended to the context (why, constraints). Workers read the context, so never put execution state here; use `progress`."},
-                    "add_steps": {"type": "array", "items": {"type": "string"}, "description": "Steps appended after the existing ones."},
+                    "add_steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered steps, each a bold **header** followed by an implementation spec a cheaper model can follow without design decisions: the files and the functions/types to add or change with signatures (mark new code as new), the data shapes, the behaviour rules and edge cases, the order of edits, every test by name with its setup and assertions, a done checklist, and the files not to touch. Longer is better than vague."},
                     "add_acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes appended to the plan's '## Acceptance scenarios', one per entry; workers receive them, and a review_risk='high' dispatch requires at least one. A scenario already recorded is not repeated."},
                     "regression_test": {"type": "string", "description": "The regression test name (bug_fixing)."},
                     "landed_design": {"type": "boolean"}
@@ -283,6 +352,13 @@ impl Tool for PlanUpdateTool {
             Ok(a) => a,
             Err(e) => return e,
         };
+        // Steps this call adds are the plan's tail; their numbers are the
+        // plan's own 1-based numbers, so the advisory note can name them.
+        let added = args
+            .add_steps
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .count();
         let edit = PlanEdit {
             context_append: args.context_append,
             decision: args.decision,
@@ -294,16 +370,27 @@ impl Tool for PlanUpdateTool {
             landed_design: args.landed_design,
         };
         match self.board.update(&args.plan_id, edit) {
-            Ok(plan) => ToolResult {
-                success: true,
-                output: format!(
+            Ok(plan) => {
+                let mut output = format!(
                     "Updated plan {} \"{}\" ({} steps)",
                     plan.id,
                     plan.title,
                     plan.steps.len()
-                ),
-                data: Some(plan_data(&plan)),
-            },
+                );
+                if added > 0 {
+                    let start = plan.steps.len().saturating_sub(added);
+                    let step_specs: Vec<(usize, &str)> = plan.steps[start..]
+                        .iter()
+                        .map(|s| (s.number, s.text.as_str()))
+                        .collect();
+                    output.push_str(&spec_notes(&step_specs));
+                }
+                ToolResult {
+                    success: true,
+                    output,
+                    data: Some(plan_data(&plan)),
+                }
+            }
             Err(e) => ToolResult::error(format!("plan_update failed: {e}")),
         }
     }
@@ -669,6 +756,18 @@ mod tests {
         res.data.unwrap()["id"].as_str().unwrap().to_string()
     }
 
+    /// A step that satisfies every spec check: 120+ words, a signature, a
+    /// named test, and a done checklist.
+    fn full_spec_step() -> String {
+        let rule = "The loader keeps every existing default and rejects silently corrupt input. ";
+        format!(
+            "**Load the config** — edit src/config.rs: new `fn load(path: &Path) -> Result<Config>` \
+             parses the file. Rule: a blank file is an error, not an empty config. The test \
+             `load_rejects_empty` asserts the error. Done: `cargo test --lib config` is green. {}",
+            rule.repeat(16)
+        )
+    }
+
     #[tokio::test]
     async fn the_board_tools_create_update_show_and_list() {
         let dir = tempfile::tempdir().unwrap();
@@ -700,6 +799,101 @@ mod tests {
                 .await
                 .success
         );
+    }
+
+    #[tokio::test]
+    async fn create_notes_thin_steps_without_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let res = PlanCreateTool::new(board)
+            .execute(json!({
+                "title": "Importer",
+                "goal": "Fix the importer",
+                "context": "Rows vanish on empty cells; keep the CLI flags.",
+                "steps": ["**One** — edit src/lib.rs"]
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output
+                .contains("Spec notes (advisory; nothing was refused)"),
+            "{}",
+            res.output
+        );
+        assert!(
+            res.output.contains(
+                "step 1: under 120 words, no signatures, no tests named, no done checklist"
+            ),
+            "{}",
+            res.output
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_a_full_spec_step_has_no_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let step = full_spec_step();
+        assert!(step.split_whitespace().count() >= 120, "{step}");
+        let res = PlanCreateTool::new(board)
+            .execute(json!({
+                "title": "Config loader",
+                "goal": "Load the config from disk",
+                "context": "The loader keeps every default and rejects corrupt input; cargo test --lib config verifies it.",
+                "steps": [step]
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(!res.output.contains("Spec notes"), "{}", res.output);
+    }
+
+    #[tokio::test]
+    async fn no_code_steps_are_not_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let res = PlanCreateTool::new(board)
+            .execute(json!({
+                "title": "Retry policy",
+                "goal": "Pick the retry policy",
+                "context": "Compare the retry policies in use; no source changes result from this.",
+                "steps": ["no-code research — compare retry policies"]
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(!res.output.contains("Spec notes"), "{}", res.output);
+    }
+
+    #[tokio::test]
+    async fn add_steps_notes_thin_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let res = PlanCreateTool::new(board.clone())
+            .execute(json!({
+                "title": "Config loader",
+                "goal": "Load the config from disk",
+                "context": "The loader keeps every default and rejects corrupt input; cargo test --lib config verifies it.",
+                "steps": [full_spec_step()]
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        let id = res.data.unwrap()["id"].as_str().unwrap().to_string();
+        let res = PlanUpdateTool::new(board.clone())
+            .execute(json!({"plan_id": id, "add_steps": ["**Two** — edit src/a.rs"]}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output
+                .contains("Spec notes (advisory; nothing was refused)"),
+            "{}",
+            res.output
+        );
+        assert!(res.output.contains("step 2:"), "{}", res.output);
+        // An update that adds no steps notes nothing.
+        let res = PlanUpdateTool::new(board)
+            .execute(json!({"plan_id": id, "decision": "use serde"}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(!res.output.contains("Spec notes"), "{}", res.output);
     }
 
     #[tokio::test]

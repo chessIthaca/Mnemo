@@ -413,6 +413,12 @@ struct RoutedDispatch {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchSource {
+    LeadTool,
+    Ipc,
+}
+
 /// One dispatch request's knobs, threaded through the dispatch path together.
 #[derive(Clone, Debug)]
 struct DispatchRequest {
@@ -420,8 +426,10 @@ struct DispatchRequest {
     brief: String,
     /// The requested tier, including `auto` where the mode offers it.
     tier: Option<String>,
-    /// Whether this is the lead tool's dispatch-time routing point.
+    /// Whether this implementation dispatch uses dispatch-time routing.
     dispatch_routing: bool,
+    /// Which public entry point supplied the dispatch.
+    source: DispatchSource,
     /// The exact model spec, when the lead chose one.
     model: Option<String>,
     /// The chosen reasoning effort, when the lead chose one.
@@ -1020,6 +1028,7 @@ impl TeamRuntime {
         if requested_tier.is_none()
             && request.model.is_none()
             && settings.mode != RoutingMode::Auto
+            && request.source == DispatchSource::LeadTool
         {
             if let Some(required) = self.tier_required() {
                 return Err(required);
@@ -1091,7 +1100,10 @@ impl TeamRuntime {
                 explicit_tier.map(str::to_string)
             };
             (model, tier)
-        } else if let Some(tier) = cleared_tier {
+        } else if let Some(tier) = cleared_tier.filter(|_| {
+            settings.mode == RoutingMode::Auto
+                || (settings.mode == RoutingMode::Suggest && requested_tier == Some("auto"))
+        }) {
             (self.lead_model_choice(Some(tier), None)?, Some(tier.to_string()))
         } else if settings.mode == RoutingMode::Suggest && requested_tier == Some("auto") {
             refusal = Some(if skip_reason == Some("offline") {
@@ -1119,7 +1131,11 @@ impl TeamRuntime {
             } else {
                 "lead"
             }
-        } else if cleared_tier.is_some() && refusal.is_none() {
+        } else if cleared_tier.is_some()
+            && refusal.is_none()
+            && (settings.mode == RoutingMode::Auto
+                || (settings.mode == RoutingMode::Suggest && requested_tier == Some("auto")))
+        {
             "laya"
         } else {
             "lead"
@@ -1196,7 +1212,10 @@ impl TeamRuntime {
                         .unwrap_or_default(),
                     step: request.plan.as_ref().map_or(0, |plan| plan.step + 1),
                     laya_tier: Some(laya_tier),
-                    lead_tier: routing.lead_tier.clone().unwrap_or_else(|| "custom".into()),
+                    lead_tier: chosen_tier.clone().unwrap_or_else(|| "custom".into()),
+                    requested_tier: explicit_tier.map(str::to_string).filter(|requested| {
+                        Some(requested.as_str()) != chosen_tier.as_deref()
+                    }),
                     confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
                 });
             }
@@ -2189,6 +2208,7 @@ impl TeamRuntime {
                     brief: brief.to_string(),
                     tier,
                     dispatch_routing: true,
+                    source: DispatchSource::LeadTool,
                     model,
                     reasoning_effort,
                     worker_id: Some(worker_id.to_string()),
@@ -2435,6 +2455,7 @@ impl TeamRuntime {
             brief,
             tier: None,
             dispatch_routing: true,
+            source: DispatchSource::Ipc,
             model,
             reasoning_effort,
             worker_id,
@@ -2467,6 +2488,7 @@ impl TeamRuntime {
             brief,
             tier: None,
             dispatch_routing: false,
+            source: DispatchSource::Ipc,
             model,
             reasoning_effort: None,
             worker_id,
@@ -2490,6 +2512,7 @@ impl TeamRuntime {
             brief,
             tier: None,
             dispatch_routing: false,
+            source: DispatchSource::Ipc,
             model,
             reasoning_effort,
             worker_id,
@@ -2554,6 +2577,7 @@ impl TeamRuntime {
             brief,
             tier,
             dispatch_routing,
+            source: _,
             model,
             reasoning_effort,
             worker_id,
@@ -6582,7 +6606,7 @@ fn dispatch_result(
                 "result": {"worker": worker_status_view(&worker, false), "reused": reused},
             }))
             .unwrap_or_else(|_| action.to_string());
-            let output = match dispatch_routing_line(mode, worker.routing.as_ref()) {
+            let output = match dispatch_routing_line(mode, worker.routing.as_ref(), worker.tier.as_deref()) {
                 Some(line) => format!("{output}\n{line}"),
                 None => output,
             };
@@ -6593,18 +6617,34 @@ fn dispatch_result(
     }
 }
 
-fn dispatch_routing_line(mode: RoutingMode, routing: Option<&WorkerRouting>) -> Option<String> {
+fn dispatch_routing_line(
+    mode: RoutingMode,
+    routing: Option<&WorkerRouting>,
+    ran_tier: Option<&str>,
+) -> Option<String> {
     let routing = routing?;
     if mode == RoutingMode::Off {
         return None;
     }
     let confidence = routing.confidence;
     if routing.routed_by == "lead_override" {
+        let choice = match (ran_tier, routing.lead_tier.as_deref()) {
+            (Some(ran), Some(requested)) if ran != requested => {
+                format!("you ran {ran} (requested {requested})")
+            }
+            _ => format!(
+                "you chose {}",
+                routing
+                    .lead_tier
+                    .as_deref()
+                    .or(ran_tier)
+                    .unwrap_or("a custom model")
+            ),
+        };
         return Some(format!(
-            "Laya: {} ({:.2}) — you chose {}; logged as an override.",
+            "Laya: {} ({:.2}) — {choice}; logged as an override.",
             routing.laya_tier.as_deref().unwrap_or("unknown"),
             confidence.unwrap_or(0.0),
-            routing.lead_tier.as_deref().unwrap_or("a custom model")
         ));
     }
     if routing.routed_by == "laya" {
@@ -9075,6 +9115,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 brief: "BRIEF-91x".to_string(),
                 tier: None,
                 dispatch_routing: false,
+            source: DispatchSource::Ipc,
                 model: None,
                 reasoning_effort: None,
                 worker_id: Some(existing.id.clone()),
@@ -9092,6 +9133,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 brief: "BRIEF-91x".to_string(),
                 tier: None,
                 dispatch_routing: false,
+            source: DispatchSource::Ipc,
                 model: None,
                 reasoning_effort: None,
                 worker_id: Some(existing.id.clone()),
@@ -9881,6 +9923,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             brief: "Use the complete step specification to choose this worker's model tier".into(),
             tier: None,
             dispatch_routing: true,
+            source: DispatchSource::Ipc,
             model: None,
             reasoning_effort: None,
             worker_id: Some("permitwait".into()),
@@ -10065,7 +10108,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             nudged: None,
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
             Some("Laya: difficult (0.71) — you chose average; logged as an override.")
         );
         let routing = WorkerRouting {
@@ -10076,15 +10119,15 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
             Some("Laya would pick average (0.62).")
         );
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Suggest, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Suggest, Some(&routing), Some("average")).as_deref(),
             Some("Laya: average (0.62) — matches your tier.")
         );
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Off, Some(&routing)),
+            dispatch_routing_line(RoutingMode::Off, Some(&routing), Some("average")),
             None
         );
         let routing = WorkerRouting {
@@ -10093,7 +10136,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing), Some("average")).as_deref(),
             Some("Laya: routed to average (0.62).")
         );
         let routing = WorkerRouting {
@@ -10104,7 +10147,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing), Some("average")).as_deref(),
             Some("Laya: unsure (0.41).")
         );
         let routing = WorkerRouting {
@@ -10113,7 +10156,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
             Some("Laya: offline.")
         );
     }
@@ -10280,6 +10323,9 @@ models = [\"scripted-a\", \"scripted-b\"]
             let model = format!("test/scripted-{ran}");
             let result = fixture.dispatch(Some(requested), Some(&model)).await;
             assert!(result.success, "{requested} -> {ran}: {}", result.output);
+            assert!(result.output.contains(&format!(
+                "Laya: {requested} (0.91) — you ran {ran} (requested {requested}); logged as an override."
+            )));
             let worker = fixture.team.worker("routingworker").await.expect("worker");
             assert_eq!(worker.tier.as_deref(), Some(ran));
             assert_eq!(worker.model.as_deref(), Some(model.as_str()));
@@ -10302,8 +10348,9 @@ models = [\"scripted-a\", \"scripted-b\"]
                 &rows[1],
                 crate::mnemo2::dispatch_routing::DispatchRoutingRow::LeadOverride {
                     lead_tier,
+                    requested_tier,
                     ..
-                } if lead_tier == requested
+                } if lead_tier == ran && requested_tier.as_deref() == Some(requested)
             ));
             fixture.team.shutdown().await;
         }
@@ -10364,6 +10411,46 @@ models = [\"scripted-a\", \"scripted-b\"]
                 if worker_id == &worker.id
         ));
         assert!(!worker.id.is_empty());
+
+
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn ipc_shadow_dispatch_without_model_classifies_and_uses_the_default() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the IPC default-model step and verify its routing metadata".into(),
+                None,
+                None,
+                Some("ipcdefault".into()),
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("IPC default-model dispatch");
+        assert!(!reused);
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert_eq!(fixture.rows().len(), 1);
+        let routing = worker.routing.expect("routing");
+        assert_eq!(routing.laya_tier.as_deref(), Some("difficult"));
+        assert_eq!(routing.routed_by, "lead");
+
+        let lead_tool = fixture.dispatch(None, None).await;
+        assert!(!lead_tool.success);
+        assert!(lead_tool.output.contains("choose a `tier` for this worker"));
         fixture.team.shutdown().await;
     }
 

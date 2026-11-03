@@ -416,8 +416,10 @@ pub enum DispatchRoutingRow {
         step: usize,
         /// The tier Laya cleared on (`None` when it cleared nothing).
         laya_tier: Option<String>,
-        /// The tier the lead chose.
+        /// The tier the lead's model actually ran on.
         lead_tier: String,
+        /// The requested tier, when it differed from the ran tier.
+        requested_tier: Option<String>,
         /// The confidence of the overridden answer.
         confidence: f64,
     },
@@ -997,6 +999,7 @@ mod tests {
                 step: 4,
                 laya_tier: Some("average".into()),
                 lead_tier: "difficult".into(),
+                requested_tier: None,
                 confidence: 0.62,
             },
             reroute_row(),

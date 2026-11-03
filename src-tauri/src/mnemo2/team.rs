@@ -38,9 +38,8 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::mnemo2::dispatch_routing::{
-    classify_dispatch, load_routing_settings, routing_text, threshold_for,
-    DispatchRoutingDecision, DispatchRoutingRow, EnabledTiers, RoutingMode,
-    RoutingSettings,
+    classify_dispatch, load_routing_settings, outcome_label, routing_text, threshold_for,
+    DispatchRoutingDecision, DispatchRoutingRow, EnabledTiers, RoutingMode, RoutingSettings,
 };
 use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::lock_holders;
@@ -190,8 +189,24 @@ pub struct WorkerRouting {
     pub lead_tier: Option<String>,
     /// Who selected the running tier: `lead`, `laya`, or `lead_override`.
     pub routed_by: String,
+    /// The tier the worker actually started on at dispatch, frozen beside the
+    /// decision so a later manual reroute cannot rewrite what a re-dispatch
+    /// reports (audit finding M1).
+    #[serde(default)]
+    pub ran_tier: Option<String>,
     /// The one nudge sent for this worker, if any.
     pub nudged: Option<String>,
+}
+
+/// Who moved a worker to another model: the lead through `team_resume`, or
+/// the user through mission control. The reroute row logged beside the
+/// switch carries the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeSource {
+    /// A lead-side switch: `team_resume` with a tier or model.
+    Lead,
+    /// The user's model change in mission control.
+    User,
 }
 
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
@@ -337,6 +352,12 @@ pub struct WorkerRecord {
     /// The dispatch-time Laya decision, absent for legacy and unrouted workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<WorkerRouting>,
+    /// The `lead_reroute` / `user_reroute` rows this worker logged, in order:
+    /// the reroute half of its routing history, kept beside the record so the
+    /// outcome label and the Effort table read the worker without scanning
+    /// the log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reroutes: Vec<DispatchRoutingRow>,
 }
 
 /// The opening prompt of a worker that implements its pinned task straight
@@ -791,6 +812,79 @@ fn unix_ms() -> u64 {
     u64::try_from(phase3::now_ms()).unwrap_or(u64::MAX)
 }
 
+/// A worker status as the short string the routing rows log (`working`,
+/// `stopped`, …) — the serde tag of [`WorkerStatus`].
+fn status_name(status: WorkerStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Whether the routing log may be written for this worker: it was dispatched
+/// with routing (its record carries a decision) or routing is on now. With
+/// routing off and an unrouted worker nothing is appended, so off mode keeps
+/// writing exactly what it wrote before routing existed. Cleanup, which has no
+/// settings handle, passes [`RoutingMode::Off`] and goes by the record alone.
+fn logs_routing(record: &WorkerRecord, mode: RoutingMode) -> bool {
+    record.routing.is_some() || mode != RoutingMode::Off
+}
+
+/// The tier a worker finished on: the destination of its last reroute, else
+/// its recorded tier, `custom` when it never had one.
+fn final_tier(record: &WorkerRecord) -> String {
+    record
+        .reroutes
+        .iter()
+        .rev()
+        .find_map(|row| match row {
+            DispatchRoutingRow::LeadReroute { to_tier, .. }
+            | DispatchRoutingRow::UserReroute { to_tier, .. } => Some(to_tier.clone()),
+            _ => None,
+        })
+        .or_else(|| record.tier.clone())
+        .unwrap_or_else(|| "custom".to_string())
+}
+
+/// The `outcome` row for a worker that reached a terminal status (design
+/// §4.7), with the label derived from its own routing history
+/// ([`outcome_label`], design §4.8). An audit worker is a reviewer, never a
+/// routed outcome: `None`.
+fn outcome_row(record: &WorkerRecord, status: &str) -> Option<DispatchRoutingRow> {
+    if record.kind == "audit" {
+        return None;
+    }
+    let final_tier = final_tier(record);
+    let high_findings = record
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == "high")
+        .count();
+    let label = outcome_label(
+        &record.reroutes,
+        status,
+        &final_tier,
+        record.fix_rounds,
+        high_findings,
+    );
+    Some(DispatchRoutingRow::Outcome {
+        ts: unix_ms(),
+        worker_id: record.id.clone(),
+        plan_id: record.plan_id.clone().unwrap_or_default(),
+        step: record.plan_step.map_or(0, |step| step + 1),
+        status: status.to_string(),
+        final_tier,
+        models_used: record.models_used.clone(),
+        review_rounds: record.review_rounds,
+        fix_rounds: record.fix_rounds,
+        findings: record.findings.len(),
+        findings_high: high_findings,
+        audits: record.audits as usize,
+        cost_micros: record.cost_micros.unwrap_or(0),
+        label: label.map(|(label, _)| label.to_string()),
+    })
+}
+
 /// The shared team runtime: one engine, many real worker sessions.
 pub struct TeamRuntime {
     engine: Arc<Engine>,
@@ -808,7 +902,9 @@ pub struct TeamRuntime {
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     config_dir: PathBuf,
-    routing: std::sync::RwLock<RoutingSettings>,
+    /// The dispatch-routing settings, shared with every worker pump so a
+    /// failure's `outcome` row follows the mode in force when it happens.
+    routing: Arc<std::sync::RwLock<RoutingSettings>>,
     classifier: Option<ClassifierSlot>,
     routing_permit: tokio::sync::Semaphore,
     routing_log_path: PathBuf,
@@ -903,7 +999,7 @@ impl TeamRuntime {
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
             config_dir: config_dir.clone(),
-            routing: std::sync::RwLock::new(load_routing_settings(&config_dir)),
+            routing: Arc::new(std::sync::RwLock::new(load_routing_settings(&config_dir))),
             classifier: options.classifier,
             routing_permit: tokio::sync::Semaphore::new(1),
             routing_log_path,
@@ -1161,6 +1257,7 @@ impl TeamRuntime {
                 })
                 .flatten(),
             routed_by: routed_by.to_string(),
+            ran_tier: refusal.is_none().then(|| chosen_tier.clone()).flatten(),
             nudged: None,
         };
         let plan_id = request.plan.as_ref().map(|plan| plan.plan_id.clone());
@@ -1230,13 +1327,16 @@ impl TeamRuntime {
         })
     }
 
-    fn tier_for_model(&self, model: Option<&str>) -> Option<String> {
-        let model = model?;
+    /// The tier a model spec belongs to: the first tier whose list names it.
+    fn tier_of(&self, spec: &str) -> Option<&'static str> {
         TIER_PURPOSES
             .iter()
             .map(|(tier, _)| *tier)
-            .find(|tier| self.tier_models(tier).iter().any(|candidate| candidate.spec == model))
-            .map(str::to_string)
+            .find(|tier| self.tier_models(tier).iter().any(|model| model.spec == spec))
+    }
+
+    fn tier_for_model(&self, model: Option<&str>) -> Option<String> {
+        self.tier_of(model?).map(str::to_string)
     }
 
     fn enabled_routing_tiers(&self) -> EnabledTiers {
@@ -1249,6 +1349,11 @@ impl TeamRuntime {
 
     fn append_dispatch_routing_row(&self, row: &DispatchRoutingRow) {
         mnemo::agent::model_routing::append_row(&self.routing_log_path, row);
+    }
+
+    /// The routing mode in force right now.
+    fn routing_mode(&self) -> RoutingMode {
+        self.routing.read().unwrap_or_else(|e| e.into_inner()).mode
     }
 
     /// The refusal for a dispatch with no tier while tiers are configured.
@@ -1857,7 +1962,8 @@ impl TeamRuntime {
             .parent()
             .map(Path::to_path_buf)
             .ok_or_else(|| "the team ledger has no parent directory".to_string())?;
-        let report = cleanup_workspace(&self.workspace_root, &state_dir).await?;
+        let report = cleanup_workspace(&self.workspace_root, &state_dir, &self.routing_log_path)
+            .await?;
         let restored = self.persistence.load()?.unwrap_or_default();
         *self.records.lock().await = restored.workers;
         Ok(report)
@@ -2315,8 +2421,9 @@ impl TeamRuntime {
                                 Some(model) => Some(model),
                                 None => self.worker(worker_id).await.ok().and_then(|w| w.model),
                             };
-                            let changed =
-                                self.change_model(worker_id, model, reasoning_effort).await;
+                            let changed = self
+                                .change_model(worker_id, model, reasoning_effort, ChangeSource::Lead)
+                                .await;
                             match (changed, tier) {
                                 (Ok(_), Some(tier)) => {
                                     self.record_tier(worker_id, &tier).await;
@@ -2970,6 +3077,7 @@ impl TeamRuntime {
             plan_step: None,
             tier: None,
             routing: None,
+            reroutes: Vec::new(),
         };
         let audit = self.start_audit_worker(record, base_tip).await?;
         // One audit per audit worker: retrying the same reviewer at the same
@@ -3174,6 +3282,7 @@ impl TeamRuntime {
             plan_step: plan.map(|plan| plan.step),
             tier,
             routing: None,
+            reroutes: Vec::new(),
         };
         self.records.lock().await.push(record.clone());
         if let Err(err) = self.persist().await {
@@ -3265,6 +3374,8 @@ impl TeamRuntime {
             self.save_lock.clone(),
             self.pricing.clone(),
             self.persistence.clone(),
+            self.routing_log_path.clone(),
+            self.routing.clone(),
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {
@@ -3374,6 +3485,9 @@ impl TeamRuntime {
             .map_err(|err| format!("could not spawn the worker session: {err}"))
     }
 
+    /// Mark a worker failed after its session could not spawn or resume.
+    /// Failed-and-stopped is a terminal status (design §4.7): the worker's
+    /// `outcome` row is appended once the record persists.
     async fn fail_worker(&self, worker_id: &str, error: String) {
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Failed;
@@ -3381,6 +3495,13 @@ impl TeamRuntime {
         })
         .await;
         let _ = self.persist().await;
+        if let Ok(record) = self.worker(worker_id).await {
+            if logs_routing(&record, self.routing_mode()) {
+                if let Some(row) = outcome_row(&record, "failed") {
+                    self.append_dispatch_routing_row(&row);
+                }
+            }
+        }
     }
 
     /// Send a message to a worker with its sender attached. A busy worker gets
@@ -3548,10 +3669,21 @@ impl TeamRuntime {
     }
 
     /// Stop and detach a worker. The worktree and `wt/agent-*` branch stay for
-    /// audit; `resume` can reattach the saved transcript later.
+    /// audit; `resume` can reattach the saved transcript later. A worker that
+    /// was not already stopped has reached a terminal status, so its `outcome`
+    /// row (design §4.7) is appended beside the record.
     pub async fn stop(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
-        self.stop_inner(worker_id).await
+        let before = self.worker(worker_id).await?;
+        let record = self.stop_inner(worker_id).await?;
+        if !matches!(before.status, WorkerStatus::Stopped)
+            && logs_routing(&record, self.routing_mode())
+        {
+            if let Some(row) = outcome_row(&record, "stopped") {
+                self.append_dispatch_routing_row(&row);
+            }
+        }
+        Ok(record)
     }
 
     async fn stop_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
@@ -3676,6 +3808,8 @@ impl TeamRuntime {
             self.save_lock.clone(),
             self.pricing.clone(),
             self.persistence.clone(),
+            self.routing_log_path.clone(),
+            self.routing.clone(),
         ));
         self.live.lock().await.insert(
             worker_id.to_string(),
@@ -3700,6 +3834,73 @@ impl TeamRuntime {
         self.worker(worker_id).await
     }
 
+    /// The reroute row for a model switch (design §4.7): the worker's route
+    /// before and after, the status it was in, the nudge it carried, and who
+    /// moved it. `None` when the switch does not move the model (an
+    /// effort-only change): nothing was rerouted, nothing is logged.
+    fn reroute_row(
+        &self,
+        record: &WorkerRecord,
+        from_spec: &str,
+        to_model: Option<&str>,
+        source: ChangeSource,
+        nudged: Option<&str>,
+    ) -> Option<DispatchRoutingRow> {
+        let to_spec = to_model.unwrap_or("default");
+        if to_spec == from_spec {
+            return None;
+        }
+        let ts = unix_ms();
+        let worker_id = record.id.clone();
+        let plan_id = record.plan_id.clone().unwrap_or_default();
+        let step = record.plan_step.map_or(0, |step| step + 1);
+        let from_tier = self
+            .tier_of(from_spec)
+            .map(str::to_string)
+            .or_else(|| record.tier.clone())
+            .unwrap_or_else(|| "custom".to_string());
+        let to_tier = self
+            .tier_of(to_spec)
+            .map(str::to_string)
+            .unwrap_or_else(|| "custom".to_string());
+        let from_model = record.model.clone().filter(|spec| !spec.trim().is_empty());
+        let to_model = to_model.map(str::to_string);
+        let status = status_name(record.status);
+        let review_rounds = record.review_rounds;
+        let fix_rounds = record.fix_rounds;
+        let nudged = nudged.is_some();
+        Some(match source {
+            ChangeSource::Lead => DispatchRoutingRow::LeadReroute {
+                ts,
+                worker_id,
+                plan_id,
+                step,
+                from_tier,
+                to_tier,
+                from_model,
+                to_model,
+                status,
+                review_rounds,
+                fix_rounds,
+                nudged,
+            },
+            ChangeSource::User => DispatchRoutingRow::UserReroute {
+                ts,
+                worker_id,
+                plan_id,
+                step,
+                from_tier,
+                to_tier,
+                from_model,
+                to_model,
+                status,
+                review_rounds,
+                fix_rounds,
+                nudged,
+            },
+        })
+    }
+
     /// Move a worker to another model (and reasoning effort), keeping its
     /// transcript, branch, and worktree. A WORKING worker switches live at
     /// its next request: the call in flight finishes on the old model, the
@@ -3708,11 +3909,19 @@ impl TeamRuntime {
     /// restarted on the new model; a stopped, interrupted, or failed one
     /// is resumed on it; a worker whose brief never reached a session is
     /// started with it.
+    ///
+    /// A switch that moves the model appends a `lead_reroute` or
+    /// `user_reroute` row (design §4.7) — by [`source`] — carrying the
+    /// route before and after; it clears the record's tier and a pending
+    /// nudge (the nudge was answered by a hand, not by Laya). A same-tier
+    /// switch logs with `from_tier == to_tier` and never counts as an
+    /// override; an effort-only change logs nothing.
     pub async fn change_model(
         &self,
         worker_id: &str,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        source: ChangeSource,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         let record = self.worker(worker_id).await?;
@@ -3723,6 +3932,15 @@ impl TeamRuntime {
             return Err("a merged worker cannot change its model".to_string());
         }
         self.validate_model(&model, &reasoning_effort)?;
+        let from_spec = session_model_spec(&record).to_string();
+        let nudged = record
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.nudged.clone());
+        // The record keeps its reroute either way (team.json bookkeeping);
+        // the calibration log only gets it when routing applies to it.
+        let log_routing = logs_routing(&record, self.routing_mode());
+        let requested = model.as_deref().filter(|spec| !spec.trim().is_empty());
         if self.worker_is_busy(worker_id).await {
             if record.kind == "audit" {
                 // Audit workers' models are not user-switchable — the audit
@@ -3742,6 +3960,8 @@ impl TeamRuntime {
                     "worker '{worker_id}' is working; a live model switch needs a model; stop the worker to move it to routing"
                 ));
             };
+            let reroute =
+                self.reroute_row(&record, &from_spec, requested, source, nudged.as_deref());
             let switched = {
                 let live = self.live.lock().await;
                 let live = live
@@ -3773,27 +3993,46 @@ impl TeamRuntime {
                     worker.model_id = None;
                 }
                 worker.reasoning_effort = reasoning_effort.clone();
-                worker.tier = None;
+                if let Some(row) = &reroute {
+                    worker.tier = None;
+                    worker.reroutes.push(row.clone());
+                    if let Some(routing) = worker.routing.as_mut() {
+                        routing.nudged = None;
+                    }
+                }
                 let model = session_model_spec(worker).to_string();
                 note_model(worker, &model);
             })
             .await;
             self.persist().await?;
+            if let Some(row) = reroute.as_ref().filter(|_| log_routing) {
+                self.append_dispatch_routing_row(row);
+            }
             return self.worker(worker_id).await;
         }
         if self.live.lock().await.contains_key(worker_id) {
             self.stop_inner(worker_id).await?;
         }
+        let reroute = self.reroute_row(&record, &from_spec, requested, source, nudged.as_deref());
         self.update_worker(worker_id, |worker| {
             worker.model = model.clone();
             worker.model_id = None;
             worker.reasoning_effort = reasoning_effort.clone();
-            worker.tier = None;
+            if let Some(row) = &reroute {
+                worker.tier = None;
+                worker.reroutes.push(row.clone());
+                if let Some(routing) = worker.routing.as_mut() {
+                    routing.nudged = None;
+                }
+            }
             let model = session_model_spec(worker).to_string();
             note_model(worker, &model);
         })
         .await;
         self.persist().await?;
+        if let Some(row) = reroute.as_ref().filter(|_| log_routing) {
+            self.append_dispatch_routing_row(row);
+        }
         let record = self.worker(worker_id).await?;
         if !record.brief_sent {
             if !record.worktree.is_dir() {
@@ -4370,7 +4609,17 @@ impl TeamRuntime {
             .await;
             self.persist().await?;
         }
-        self.worker(worker_id).await
+        let record = self.worker(worker_id).await?;
+        if record.status == WorkerStatus::Merged && logs_routing(&record, self.routing_mode()) {
+            // The one terminal end a routed worker is labelled at (design
+            // §4.7): the merge landed and the record is Merged. The
+            // retryable InReview cleanup path above logs nothing; its
+            // successful retry arrives here.
+            if let Some(row) = outcome_row(&record, "merged") {
+                self.append_dispatch_routing_row(&row);
+            }
+        }
+        Ok(record)
     }
 
     /// Revert a worker merge on the lead branch before it reaches main.
@@ -5735,8 +5984,13 @@ async fn pump_worker(
     save_lock: Arc<Mutex<()>>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     persistence: TeamPersistence,
+    routing_log_path: PathBuf,
+    routing: Arc<std::sync::RwLock<RoutingSettings>>,
 ) {
     let mut turn_active = false;
+    // The `outcome` row owed when the worker lands in a terminal status this
+    // iteration; appended once the record save below has persisted it.
+    let mut pending_outcome: Option<DispatchRoutingRow> = None;
     loop {
         let event = match receiver.recv().await {
             Ok(event) => event,
@@ -6048,8 +6302,21 @@ async fn pump_worker(
                             changed = true;
                         } else if !retrying {
                             busy.store(false, Ordering::SeqCst);
+                            // Failed-and-stopped is terminal (design §4.7):
+                            // queue the worker's `outcome` row, appended after
+                            // the save below. Only the transition into Failed
+                            // queues it — a repeated terminal error does not.
+                            let first_failure = worker.status != WorkerStatus::Failed;
                             worker.status = WorkerStatus::Failed;
                             worker.error = Some(error.clone());
+                            if first_failure {
+                                let mode = routing
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .mode;
+                                pending_outcome = outcome_row(worker, "failed")
+                                    .filter(|_| logs_routing(worker, mode));
+                            }
                             terminal = true;
                         }
                     }
@@ -6064,6 +6331,9 @@ async fn pump_worker(
         });
         if terminal || changed {
             let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+        }
+        if let Some(row) = pending_outcome.take() {
+            mnemo::agent::model_routing::append_row(&routing_log_path, &row);
         }
         if terminal || refresh {
             let engine = engine.clone();
@@ -6245,7 +6515,11 @@ pub struct CleanupReport {
 }
 
 /// Clean only inactive, clean worker checkouts; retain every worker branch.
-pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupReport, String> {
+pub async fn cleanup_workspace(
+    root: &Path,
+    state_dir: &Path,
+    routing_log_path: &Path,
+) -> Result<CleanupReport, String> {
     current_branch(root)?;
     let persistence = TeamPersistence::new(state_dir);
     let Some(mut ledger) = persistence.load()? else {
@@ -6359,7 +6633,15 @@ pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupR
         worker.worktree = PathBuf::new();
         worker.error =
             Some("inactive checkout cleaned; the branch is retained for review".to_string());
+        // Abandoned is terminal (design §4.7): the worker's `outcome` row
+        // lands beside the cleaned checkout — only for a worker routing ever
+        // applied to (cleanup has no settings handle, so the record decides).
+        let row = outcome_row(worker, "abandoned")
+            .filter(|_| logs_routing(worker, RoutingMode::Off));
         persistence.save(&ledger)?;
+        if let Some(row) = row {
+            mnemo::agent::model_routing::append_row(routing_log_path, &row);
+        }
     }
     Ok(report)
 }
@@ -6606,7 +6888,7 @@ fn dispatch_result(
                 "result": {"worker": worker_status_view(&worker, false), "reused": reused},
             }))
             .unwrap_or_else(|_| action.to_string());
-            let output = match dispatch_routing_line(mode, worker.routing.as_ref(), worker.tier.as_deref()) {
+            let output = match dispatch_routing_line(mode, worker.routing.as_ref()) {
                 Some(line) => format!("{output}\n{line}"),
                 None => output,
             };
@@ -6617,16 +6899,17 @@ fn dispatch_result(
     }
 }
 
-fn dispatch_routing_line(
-    mode: RoutingMode,
-    routing: Option<&WorkerRouting>,
-    ran_tier: Option<&str>,
-) -> Option<String> {
+fn dispatch_routing_line(mode: RoutingMode, routing: Option<&WorkerRouting>) -> Option<String> {
     let routing = routing?;
     if mode == RoutingMode::Off {
         return None;
     }
+    // The dispatch-time ran tier (audit finding M1): a later manual reroute
+    // may have moved the worker to another tier, but what the dispatch ran
+    // is what this line reports.
+    let ran_tier = routing.ran_tier.as_deref();
     let confidence = routing.confidence;
+
     if routing.routed_by == "lead_override" {
         let choice = match (ran_tier, routing.lead_tier.as_deref()) {
             (Some(ran), Some(requested)) if ran != requested => {
@@ -7490,9 +7773,13 @@ mod tests {
             })
             .expect("ledger");
 
-        let report = cleanup_workspace(root, state.path())
-            .await
-            .expect("cleanup");
+        let report = cleanup_workspace(
+            root,
+            state.path(),
+            &state.path().join("dispatch_routing.jsonl"),
+        )
+        .await
+        .expect("cleanup");
         assert_eq!(report.removed, vec![clean_branch.clone()]);
         assert!(report
             .skipped
@@ -7651,6 +7938,7 @@ mod tests {
             plan_step: None,
             tier: None,
             routing: None,
+            reroutes: Vec::new(),
         }
     }
 
@@ -8429,9 +8717,13 @@ models = [\"scripted-a\", \"scripted-b\"]
             })
             .expect("ledger");
 
-        let report = cleanup_workspace(root, state.path())
-            .await
-            .expect("cleanup");
+        let report = cleanup_workspace(
+            root,
+            state.path(),
+            &state.path().join("dispatch_routing.jsonl"),
+        )
+        .await
+        .expect("cleanup");
         assert_eq!(report.removed, vec![agent_branch.clone()]);
         assert!(!agent_path.exists());
         assert!(runall_path.is_dir(), "the Mnemo1 checkout survives");
@@ -9304,7 +9596,12 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
 
         let switched = team
-            .change_model("models00001", Some("test/scripted-b".into()), None)
+            .change_model(
+                "models00001",
+                Some("test/scripted-b".into()),
+                None,
+                ChangeSource::User,
+            )
             .await
             .expect("switch the worker to model B");
         assert_eq!(
@@ -9317,7 +9614,12 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
 
         let again = team
-            .change_model("models00001", Some("test/scripted-b".into()), None)
+            .change_model(
+                "models00001",
+                Some("test/scripted-b".into()),
+                None,
+                ChangeSource::User,
+            )
             .await
             .expect("switch to model B again");
         assert_eq!(
@@ -9382,9 +9684,11 @@ models = [\"scripted-a\", \"scripted-b\"]
             self.state.path().join("dispatch_routing.jsonl")
         }
 
+        /// The rows written so far; an absent log (routing off, never
+        /// touched) reads as no rows.
         fn rows(&self) -> Vec<crate::mnemo2::dispatch_routing::DispatchRoutingRow> {
             std::fs::read_to_string(self.log_path())
-                .expect("routing log")
+                .unwrap_or_default()
                 .lines()
                 .map(|line| serde_json::from_str(line).expect("routing row"))
                 .collect()
@@ -9751,6 +10055,479 @@ models = [\"scripted-a\", \"scripted-b\"]
     }
 
     #[tokio::test]
+    async fn user_model_change_logs_a_user_reroute() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        // A pending nudge travels with the reroute row and leaves the record.
+        fixture
+            .team
+            .update_worker("routingworker", |worker| {
+                if let Some(routing) = worker.routing.as_mut() {
+                    routing.nudged = Some("difficult".into());
+                }
+            })
+            .await;
+        fixture
+            .team
+            .change_model(
+                "routingworker",
+                Some("test/scripted-difficult".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("the user moves the worker onto difficult");
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        match &rows[1] {
+            DispatchRoutingRow::UserReroute {
+                worker_id,
+                from_tier,
+                to_tier,
+                from_model,
+                to_model,
+                nudged,
+                ..
+            } => {
+                assert_eq!(worker_id, "routingworker");
+                assert_eq!(from_tier, "average");
+                assert_eq!(to_tier, "difficult");
+                assert_eq!(from_model.as_deref(), Some("test/scripted-average"));
+                assert_eq!(to_model.as_deref(), Some("test/scripted-difficult"));
+                assert!(*nudged, "the pending nudge rides the row");
+            }
+            other => panic!("a user reroute row is logged: {other:?}"),
+        }
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.reroutes.len(), 1);
+        assert!(
+            worker
+                .routing
+                .as_ref()
+                .is_some_and(|routing| routing.nudged.is_none()),
+            "the nudge leaves the record: {worker:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lead_resume_onto_another_tier_logs_a_lead_reroute() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        let resumed = fixture
+            .team
+            .handle_lead_host_tool(
+                "team_resume",
+                json!({"worker_id": "routingworker", "tier": "difficult"}),
+            )
+            .await;
+        assert!(resumed.success, "{}", resumed.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("difficult"), "{worker:?}");
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        match &rows[1] {
+            DispatchRoutingRow::LeadReroute {
+                worker_id,
+                from_tier,
+                to_tier,
+                nudged,
+                ..
+            } => {
+                assert_eq!(worker_id, "routingworker");
+                assert_eq!(from_tier, "average");
+                assert_eq!(to_tier, "difficult");
+                assert!(!*nudged);
+            }
+            other => panic!("a lead reroute row is logged: {other:?}"),
+        }
+        assert_eq!(worker.reroutes.len(), 1);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn same_tier_switch_logs_without_counting_as_override() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-average2"),
+                lead_model("scripted-simple"),
+            ],
+            mnemo::headless::TiersDto {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec![
+                    "test/scripted-average".into(),
+                    "test/scripted-average2".into(),
+                ],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            Vec::new(),
+        );
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        fixture
+            .team
+            .change_model(
+                "routingworker",
+                Some("test/scripted-average2".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("the user picks another model inside the average tier");
+        let rows = fixture.rows();
+        match &rows[1] {
+            DispatchRoutingRow::UserReroute { from_tier, to_tier, .. } => {
+                assert_eq!(from_tier, "average");
+                assert_eq!(
+                    to_tier, "average",
+                    "a same-tier switch logs equal tiers"
+                );
+            }
+            other => panic!("a reroute row is still logged: {other:?}"),
+        }
+        // Equal tiers never count as an override: there is no effective
+        // reroute, so with two fix rounds the merged label follows the
+        // no-reroute rule (the tier above, weak) instead of the reroute
+        // rule (average, strong).
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        let (label, weak) = outcome_label(&worker.reroutes, "merged", "average", 2, 0)
+            .expect("a label still derives");
+        assert_eq!(label, "difficult");
+        assert!(weak);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn merge_appends_an_outcome_with_the_derived_label() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000002000000000002");
+        worker.status = WorkerStatus::InReview;
+        worker.plan_id = Some("plan0001".into());
+        worker.plan_step = Some(0);
+        worker.tier = Some("average".into());
+        worker.model = Some("test/scripted-average".into());
+        worker.routing = Some(WorkerRouting {
+            laya_tier: Some("average".into()),
+            confidence: Some(0.62),
+            cleared: true,
+            lead_tier: Some("average".into()),
+            routed_by: "lead".into(),
+            ran_tier: Some("average".into()),
+            nudged: None,
+        });
+        // The worker was rerouted up to difficult before its review closed.
+        worker.reroutes = vec![DispatchRoutingRow::LeadReroute {
+            ts: 1,
+            worker_id: worker.id.clone(),
+            plan_id: "plan0001".into(),
+            step: 1,
+            from_tier: "average".into(),
+            to_tier: "difficult".into(),
+            from_model: Some("test/scripted-average".into()),
+            to_model: Some("test/scripted-difficult".into()),
+            status: "idle".into(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }];
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        let merged = team.merge(&worker.id).await.expect("merge the worker");
+        assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+        let rows: Vec<DispatchRoutingRow> =
+            std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
+                .expect("the routing log")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect();
+        // The reroute up to difficult, merged with no fix rounds and no high
+        // findings, derives the strong difficult label (design §4.8 rule 2).
+        assert!(
+            matches!(
+                rows.as_slice(),
+                [DispatchRoutingRow::Outcome {
+                    worker_id,
+                    plan_id,
+                    status,
+                    final_tier,
+                    label: Some(label),
+                    review_rounds,
+                    fix_rounds,
+                    ..
+                }]
+                    if worker_id == "00000002000000000002"
+                        && plan_id == "plan0001"
+                        && status == "merged"
+                        && final_tier == "difficult"
+                        && label == "difficult"
+                        && *review_rounds == 0
+                        && *fix_rounds == 0
+            ),
+            "the merged outcome row: {rows:?}"
+        );
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_worker_outcome_has_no_label() {
+        // Routing on, so the worker carries a decision and its terminal
+        // failure is logged (with routing off nothing is written at all).
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        // A forced spec the engine cannot resolve to an endpoint: the
+        // dispatch records the worker, its session fails to spawn, and the
+        // worker lands Failed (the same path as a real host failure).
+        fixture.team.set_catalog(
+            vec![LeadModel {
+                endpoint: "broken".into(),
+                model: "broken".into(),
+                spec: "broken".into(),
+                is_default: false,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+        let result = fixture.dispatch(Some("average"), Some("broken")).await;
+        assert!(!result.success, "{result:?}");
+        let worker = fixture
+            .team
+            .worker("routingworker")
+            .await
+            .expect("the failed worker is tracked");
+        assert!(
+            matches!(worker.status, WorkerStatus::Failed),
+            "{worker:?}"
+        );
+        // Failed-and-stopped is terminal (design §4.7): the dispatch's route
+        // row is followed by one outcome row, and no label — the worker never
+        // merged.
+        let rows = fixture.rows();
+        assert!(
+            matches!(
+                rows.last(),
+                Some(DispatchRoutingRow::Outcome {
+                    worker_id,
+                    status,
+                    label: None,
+                    ..
+                })
+                    if worker_id == "routingworker" && status == "failed"
+            ),
+            "one unlabeled outcome row: {rows:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reused_dispatch_line_keeps_the_dispatch_time_tier() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        // Laya clears difficult, the lead passes average: an override that
+        // runs average.
+        let first = fixture.dispatch(Some("average"), None).await;
+        assert!(first.success, "{}", first.output);
+        assert!(
+            first
+                .output
+                .contains("you chose average; logged as an override."),
+            "{}",
+            first.output
+        );
+        // The worker's tier changes afterwards, on the same model: the
+        // record's mutable tier now reads 'difficult' while the dispatch ran
+        // average. (A switch that also moved the model is refused by the
+        // reuse guard, correctly — only the tier moved here.)
+        fixture
+            .team
+            .record_tier("routingworker", "difficult")
+            .await;
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("difficult"), "{worker:?}");
+        // An idempotent re-dispatch reports the dispatch-time ran tier, not
+        // the tier the worker was rerouted onto (audit finding M1).
+        let reused = fixture.dispatch(Some("average"), None).await;
+        assert!(reused.success, "{}", reused.output);
+        assert!(
+            reused
+                .output
+                .contains("you chose average; logged as an override."),
+            "the reused dispatch keeps the dispatch-time tier: {}",
+            reused.output
+        );
+        assert!(
+            !reused.output.contains("you ran difficult (requested average)"),
+            "{}",
+            reused.output
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_model_change_writes_no_routing_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            false,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        fixture
+            .team
+            .change_model(
+                "routingworker",
+                Some("test/scripted-difficult".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("the user moves the worker");
+        // The record keeps its reroute (team.json bookkeeping); the routing
+        // log is never created while routing is off and the worker was
+        // dispatched without a decision.
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.reroutes.len(), 1, "{worker:?}");
+        assert!(
+            !fixture.log_path().exists(),
+            "off mode must not write a reroute row"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_merge_writes_no_outcome_row() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000002000000000003");
+        worker.status = WorkerStatus::InReview;
+        worker.plan_id = Some("plan0001".into());
+        worker.plan_step = Some(0);
+        worker.tier = Some("average".into());
+        worker.model = Some("test/scripted-average".into());
+        // No dispatch decision: this worker ran with routing off.
+        worker.routing = None;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        let merged = team.merge(&worker.id).await.expect("merge the worker");
+        assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+        assert!(
+            !state.path().join("dispatch_routing.jsonl").exists(),
+            "off mode must not write an outcome row"
+        );
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn routed_worker_still_logs_after_routing_is_turned_off() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("average"), None).await.success);
+        // Routing is switched off after the worker was routed: the worker's
+        // own decision still makes it calibration data.
+        *fixture.team.routing.write().unwrap_or_else(|e| e.into_inner()) =
+            crate::mnemo2::dispatch_routing::RoutingSettings::default();
+        fixture
+            .team
+            .change_model(
+                "routingworker",
+                Some("test/scripted-difficult".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("the user moves the routed worker");
+        let rows = fixture.rows();
+        assert!(
+            matches!(
+                rows.as_slice(),
+                [_, DispatchRoutingRow::UserReroute { worker_id, .. }]
+                    if worker_id == "routingworker"
+            ),
+            "a routed worker still logs its reroute: {rows:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn audit_dispatch_is_never_classified() {
         let fixture = routing_fixture(
             crate::mnemo2::dispatch_routing::RoutingMode::Off,
@@ -9764,6 +10541,12 @@ models = [\"scripted-a\", \"scripted-b\"]
             .stop("routingworker")
             .await
             .expect("stop the audit target");
+        // Routing off and the worker was dispatched without a decision: the
+        // stop writes nothing at all.
+        assert!(
+            fixture.rows().is_empty(),
+            "off mode writes no stop outcome row"
+        );
         *fixture.team.routing.write().unwrap_or_else(|e| e.into_inner()) =
             crate::mnemo2::dispatch_routing::RoutingSettings {
                 mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
@@ -9784,7 +10567,12 @@ models = [\"scripted-a\", \"scripted-b\"]
             .await;
         assert!(result.success, "{}", result.output);
         assert_eq!(fixture.classifier.calls(), 0);
-        assert!(!fixture.log_path().exists());
+        // The audit dispatch classifies nothing and logs nothing: not even a
+        // shadow-mode row appears for it.
+        assert!(
+            !fixture.log_path().exists(),
+            "an audit dispatch adds no routing row"
+        );
         fixture.team.shutdown().await;
     }
 
@@ -10105,11 +10893,24 @@ models = [\"scripted-a\", \"scripted-b\"]
             cleared: true,
             lead_tier: Some("average".into()),
             routed_by: "lead_override".into(),
+            ran_tier: Some("average".into()),
             nudged: None,
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
             Some("Laya: difficult (0.71) — you chose average; logged as an override.")
+        );
+        // The dispatch-time ran tier decides the override line (audit finding
+        // M1): a reroute after dispatch never rewrites what this reports.
+        let routing = WorkerRouting {
+            ran_tier: Some("difficult".into()),
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            Some(
+                "Laya: difficult (0.71) — you ran difficult (requested average); logged as an override."
+            )
         );
         let routing = WorkerRouting {
             laya_tier: Some("average".into()),
@@ -10119,24 +10920,21 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
             Some("Laya would pick average (0.62).")
         );
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Suggest, Some(&routing), Some("average")).as_deref(),
+            dispatch_routing_line(RoutingMode::Suggest, Some(&routing)).as_deref(),
             Some("Laya: average (0.62) — matches your tier.")
         );
-        assert_eq!(
-            dispatch_routing_line(RoutingMode::Off, Some(&routing), Some("average")),
-            None
-        );
+        assert_eq!(dispatch_routing_line(RoutingMode::Off, Some(&routing)), None);
         let routing = WorkerRouting {
             routed_by: "laya".into(),
             lead_tier: None,
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Auto, Some(&routing), Some("average")).as_deref(),
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
             Some("Laya: routed to average (0.62).")
         );
         let routing = WorkerRouting {
@@ -10147,7 +10945,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Auto, Some(&routing), Some("average")).as_deref(),
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
             Some("Laya: unsure (0.41).")
         );
         let routing = WorkerRouting {
@@ -10156,7 +10954,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), Some("average")).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
             Some("Laya: offline.")
         );
     }

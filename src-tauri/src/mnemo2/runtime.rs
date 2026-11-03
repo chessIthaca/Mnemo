@@ -1772,7 +1772,7 @@ mod trace_tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions};
+    use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerSessionSpec};
     use mnemo::headless::{Engine, EngineOptions, SessionCommand, TraceApi};
     use mnemo::provider::trace::{TraceActorKind, TraceIdentity, LlmRequestSummary};
 
@@ -1922,14 +1922,15 @@ mod trace_tests {
         .expect("open the team runtime");
 
         let session = team
-            .spawn_worker_session(
-                None,
-                None,
-                root.path().to_path_buf(),
-                None,
-                "implementation",
-                worker_identity("Trace worker"),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: root.path().to_path_buf(),
+                resume: None,
+                kind: "implementation".to_string(),
+                trace_identity: worker_identity("Trace worker"),
+                pinned_task: None,
+            })
             .await
             .expect("spawn the worker session");
         session
@@ -1968,6 +1969,8 @@ mod tests {
         ToolChoice, ToolSchema,
     };
     use tempfile::TempDir;
+
+    use crate::mnemo2::team::{KICKOFF, READ_BACK_KICKOFF, WorkerSessionSpec};
 
     /// One scripted turn: the events to emit, optionally held inside
     /// `complete` until the test releases a gate.
@@ -6341,6 +6344,7 @@ mod tests {
                 None,
                 Some("stalesk01".into()),
                 Some("high".into()),
+                false,
                 &plan,
                 1,
             )
@@ -6448,6 +6452,7 @@ mod tests {
                 None,
                 Some("auditsk01".into()),
                 None,
+                false,
                 &plan,
                 1,
             )
@@ -6892,16 +6897,12 @@ mod tests {
             .stop("stamped001")
             .await
             .expect("stop snapshots the transcript");
-        let first_message = done
-            .transcript
-            .messages
-            .iter()
-            .map(|message| message.content.as_text())
-            .find(|text| text.contains("## Your step (2)"))
-            .expect("the worker's first prompt carries the plan brief");
         assert!(
-            first_message.trim_end().ends_with("do the second thing"),
-            "{first_message}"
+            done.transcript
+                .messages
+                .iter()
+                .any(|message| message.content.as_text() == KICKOFF),
+            "the worker's first prompt is the kickoff; the task rides the pinned system head"
         );
 
         let again = team.handle_lead_host_tool("team_dispatch", args).await;
@@ -6948,6 +6949,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                     plan_id,
                     step,
                 )
@@ -6964,6 +6966,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 &plan,
                 2,
             )
@@ -7026,6 +7029,7 @@ mod tests {
                 None,
                 Some("logic0001".into()),
                 None,
+                false,
                 &plan,
                 1,
             )
@@ -7044,6 +7048,7 @@ mod tests {
                 None,
                 Some("ui000001".into()),
                 None,
+                false,
                 &plan,
                 2,
             )
@@ -7077,6 +7082,7 @@ mod tests {
                 None,
                 Some("ui000001".into()),
                 None,
+                false,
                 &plan,
                 2,
             )
@@ -7093,6 +7099,7 @@ mod tests {
             None,
             Some("ui000001".into()),
             None,
+            false,
             &plan,
             2,
         )
@@ -7883,6 +7890,7 @@ mod tests {
                 None,
                 Some("notice0002".into()),
                 None,
+                false,
                 &plan,
                 1,
             )
@@ -7959,11 +7967,18 @@ mod tests {
             .expect("dispatch");
         let stopped = team.stop(&worker.id).await.expect("stop active worker");
         assert_eq!(stopped.status, crate::mnemo2::team::WorkerStatus::Stopped);
-        assert!(stopped
-            .transcript
-            .messages
-            .iter()
-            .any(|message| { message.content.as_text() == "retain the running brief" }));
+        assert_eq!(
+            stopped.brief, "retain the running brief",
+            "the record keeps the lead's brief"
+        );
+        assert!(
+            stopped
+                .transcript
+                .messages
+                .iter()
+                .any(|message| message.content.as_text() == KICKOFF),
+            "the fallback transcript records the kickoff the session was sent"
+        );
 
         team.shutdown().await;
         lead.shutdown().await;
@@ -8744,14 +8759,15 @@ mod tests {
         let (lead, team) =
             open_git_team(&root, &config, &state, Arc::new(ScriptedLlm::new(vec![]))).await;
         let session = team
-            .spawn_worker_session(
-                None,
-                None,
-                root.path().to_path_buf(),
-                None,
-                "implementation",
-                super::trace_tests::worker_identity("Executor test"),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: root.path().to_path_buf(),
+                resume: None,
+                kind: "implementation".to_string(),
+                trace_identity: super::trace_tests::worker_identity("Executor test"),
+                pinned_task: None,
+            })
             .await
             .expect("spawn executor");
         let tools = session.tool_names().await.expect("registered tool names");
@@ -8788,14 +8804,15 @@ mod tests {
         // The audit profile is the read-only counterpart: every mutation
         // surface is gone, and the identity forbids lifecycle actions.
         let audit = team
-            .spawn_worker_session(
-                None,
-                None,
-                root.path().to_path_buf(),
-                None,
-                "audit",
-                super::trace_tests::worker_identity("Audit test"),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: root.path().to_path_buf(),
+                resume: None,
+                kind: "audit".to_string(),
+                trace_identity: super::trace_tests::worker_identity("Audit test"),
+                pinned_task: None,
+            })
             .await
             .expect("spawn audit");
         let audit_tools = audit.tool_names().await.expect("registered audit tools");
@@ -8947,6 +8964,22 @@ mod tests {
                         .to_string()
                 })
                 .collect()
+        }
+
+        /// One recorded request body, cloned out so no lock guard outlives
+        /// the call.
+        fn body(&self, index: usize) -> serde_json::Value {
+            self.bodies
+                .lock()
+                .expect("the request log")
+                .get(index)
+                .cloned()
+                .expect("a recorded request")
+        }
+
+        /// How many requests the stub has recorded.
+        fn bodies_len(&self) -> usize {
+            self.bodies.lock().expect("the request log").len()
         }
     }
 
@@ -9529,6 +9562,7 @@ mod tests {
                 None,
                 Some("worker0001".into()),
                 None,
+                false,
                 &plan,
                 1,
             )
@@ -9581,6 +9615,201 @@ mod tests {
         assert_eq!(settled.model, Some("test/model-a".into()));
         assert_eq!(settled.generation, generation);
         assert_eq!(stub.models(), ["model-a", "model-a"]);
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// Plan 40eef714 step 2: dispatch pins the whole task — the plan header,
+    /// the step's spec and the lead's brief — into the stable system head,
+    /// and the first user message is the short kickoff instead of the task.
+    #[tokio::test]
+    async fn dispatch_pins_the_task_and_sends_the_kickoff() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let mut stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("done"),
+            gate: None,
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        let plan = new_plan(&lead, &["**Change** - implement src/lib.rs"]);
+        team.begin_lead_turn();
+        team.set_lead_busy(false);
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "worker0001",
+                    "plan_id": plan,
+                    "step": 1,
+                    "brief": "BRIEF-91x implement the counting feature",
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        let body = stub.body(0);
+        let messages = body["messages"]
+            .as_array()
+            .expect("the request messages");
+        assert_eq!(messages[0]["role"], "system", "{messages:?}");
+        let system = messages[0]["content"].as_str().expect("the system text");
+        assert!(
+            system.contains("# Plan: Board plan"),
+            "the plan header is pinned: {system}"
+        );
+        assert!(
+            system.contains("BRIEF-91x"),
+            "the lead's brief is pinned: {system}"
+        );
+        assert!(
+            system.contains("## Your step (1)") && system.contains("**Change** - implement src/lib.rs"),
+            "the step's full spec is pinned: {system}"
+        );
+        assert!(
+            system.contains("## Your task (pinned)"),
+            "the pinned heading renders: {system}"
+        );
+        let first_user = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("the first user message");
+        assert_eq!(first_user, KICKOFF);
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// A read-back dispatch sends the read-back kickoff and remembers the
+    /// choice on the durable record.
+    #[tokio::test]
+    async fn read_back_dispatch_sends_the_read_back_kickoff() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let mut stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("No questions."),
+            gate: None,
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        let plan = new_plan(&lead, &["**Change** - implement src/lib.rs"]);
+        team.begin_lead_turn();
+        team.set_lead_busy(false);
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "worker0001",
+                    "plan_id": plan,
+                    "step": 1,
+                    "brief": "BRIEF-91x implement the counting feature",
+                    "read_back": true,
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+
+        let worker = team.worker("worker0001").await.expect("the worker record");
+        assert!(
+            worker.read_back,
+            "the record remembers the read-back first turn: {worker:?}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        let body = stub.body(0);
+        let first_user = body["messages"]
+            .as_array()
+            .expect("the request messages")
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("the first user message");
+        assert_eq!(first_user, READ_BACK_KICKOFF);
+
+        let ledger = std::fs::read_to_string(state.path().join("team.json")).expect("the ledger");
+        assert!(
+            ledger.contains("\"read_back\": true"),
+            "the read-back flag persisted: {ledger}"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// A worker stopped and resumed on its transcript keeps the task pinned in
+    /// its new session's system head.
+    #[tokio::test]
+    async fn resumed_worker_keeps_its_pinned_task() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let mut stub = StubServer::start(vec![
+            StubTurn {
+                body: stub_text_turn("done"),
+                gate: None,
+            },
+            StubTurn {
+                body: stub_text_turn("resumed"),
+                gate: None,
+            },
+        ])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        let plan = new_plan(&lead, &["**Change** - implement src/lib.rs"]);
+        team.begin_lead_turn();
+        team.set_lead_busy(false);
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "worker0001",
+                    "plan_id": plan,
+                    "step": 1,
+                    "brief": "BRIEF-91x implement the counting feature",
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+            .await;
+
+        team.stop("worker0001").await.expect("stop the worker");
+        team.resume("worker0001")
+            .await
+            .expect("resume the worker on its transcript");
+        team.message(
+            "worker0001",
+            "carry on".to_string(),
+            crate::mnemo2::team::MessageSender::Lead,
+        )
+        .await
+        .expect("message the resumed worker");
+
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the resumed session's first request arrives");
+        assert_eq!(stub.bodies_len(), 2);
+        let body = stub.body(1);
+        let system = body["messages"][0]["content"]
+            .as_str()
+            .expect("the resumed system text");
+        assert!(
+            system.contains("BRIEF-91x"),
+            "the resumed session keeps its pinned task: {system}"
+        );
+        assert!(
+            system.contains("## Your task (pinned)"),
+            "the resumed session keeps the pinned heading: {system}"
+        );
         team.shutdown().await;
         lead.shutdown().await;
     }

@@ -1862,6 +1862,12 @@ impl AgentLoop {
                         }
                     }
                 }
+                // Publish the FINAL count of the deferred rewrite: the summary,
+                // the digest and every re-injected buffered command are the
+                // conversation the post-swap requests carry — a switch landing
+                // before them must measure that, not the pre-compaction count
+                // published at the top of the loop.
+                self.publish_message_tokens(messages);
                 if let Some(stop) = stop_reason {
                     // Interrupt/Cancel during summarization — emit a paired
                     // end event for the CompactStarted above (mirrors the main
@@ -3289,6 +3295,12 @@ impl AgentLoop {
                 }
             }
         }
+        // Publish the FINAL count of the IN-TURN rewrite: the summary, the
+        // survival digest and every re-injected buffered command are the
+        // conversation that exists now. Without this, a switch landing on the
+        // request that follows would measure the stale pre-compaction count
+        // published at the top of the loop and needlessly defer.
+        self.publish_message_tokens(messages);
         // Summarization (and any re-injected suggestions) changed the
         // messages, so the pre-summary accounting is stale — reset and
         // recompute once for an accurate ContextUsage event.

@@ -18236,3 +18236,143 @@ async fn recall_delta_all_elided_set_costs_one_sentinel_line() {
         "a savings row names the sentinel: {rows:?}"
     );
 }
+/// Serves the in-turn auto-compaction's summarization first, then fires `swap`
+/// on the request that FOLLOWS the rewrite — the moment a stale pre-compaction
+/// count would wrongly defer a switch.
+struct SwapAfterCompactionProvider {
+    agent: Arc<std::sync::OnceLock<Arc<AgentLoop>>>,
+    swap: Box<dyn Fn(&AgentLoop) + Send + Sync>,
+    /// Calls served so far (1 = the summarizer's, 2 = the request).
+    calls: std::sync::atomic::AtomicUsize,
+    caps: Capabilities,
+}
+
+#[async_trait]
+impl LlmClient for SwapAfterCompactionProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "compacting-model"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if call == 1 {
+            // The auto-compaction's summarizer call.
+            return Ok(Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta {
+                    text: "Summary of the earlier work.".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ])));
+        }
+        // The request the compaction left behind: the user switches model right
+        // here, while it is in flight.
+        let agent = self
+            .agent
+            .get()
+            .expect("the test must fill the agent slot before run_turn");
+        (self.swap)(agent);
+        Ok(Box::pin(futures::stream::iter(vec![
+            LlmEvent::TextDelta {
+                text: "served after the compaction".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])))
+    }
+}
+#[tokio::test]
+async fn a_switch_after_an_in_turn_compaction_reports_next_request() {
+    // In-turn rewrites must publish the FINAL conversation: once the
+    // auto-compaction shrinks it, a switch landing on the request that follows
+    // reports NextRequest and sets no pending swap (a stale pre-compaction count
+    // would defer it wrongly).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let slot: Arc<std::sync::OnceLock<Arc<AgentLoop>>> = Arc::new(std::sync::OnceLock::new());
+    let target: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
+        model: "swap-target".into(),
+        text: "from-swap-target".into(),
+        caps: Capabilities::openai(),
+    });
+    let seen: Arc<std::sync::Mutex<(bool, bool)>> =
+        Arc::new(std::sync::Mutex::new((true, true)));
+    let seen_in_swap = seen.clone();
+    let target_in_swap = target.clone();
+    let provider: Arc<dyn LlmClient> = Arc::new(SwapAfterCompactionProvider {
+        agent: slot.clone(),
+        swap: Box::new(move |agent: &AgentLoop| {
+            let next = context::ContextManager::new(80_000, 0.5);
+            agent.set_explicit_provider(target_in_swap.clone(), next.clone());
+            *seen_in_swap.lock().unwrap() =
+                (agent.swap_needs_compaction(&next), agent.has_pending_swap());
+        }),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        caps: Capabilities {
+            max_context: 100_000,
+            ..Capabilities::openai()
+        },
+    });
+    let agent = Arc::new(AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(100_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    ));
+    assert!(slot.set(agent.clone()).is_ok());
+    // ~350K chars of prose ≈ 90K tokens: far over the 50K auto-compaction
+    // trigger, in 60 messages so the summary really rewrites the conversation.
+    let mut messages: Vec<Message> = (0..60)
+        .map(|i| {
+            Message::text(
+                Role::User,
+                format!("{i} {}", "lorem ipsum dolor sit amet ".repeat(220)),
+            )
+        })
+        .collect();
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("the turn runs");
+    drop(fanin_tx);
+    // The auto-compaction really rewrote the conversation (summary + keep-recent).
+    assert!(
+        messages.len() <= 10,
+        "the turn must have auto-compacted the seeded history (got {} messages)",
+        messages.len()
+    );
+    let (deferred, pending) = *seen.lock().unwrap();
+    assert!(
+        !deferred,
+        "the compacted conversation fits — the switch must report NextRequest"
+    );
+    assert!(!pending, "a fitting switch must not set a deferred swap");
+    assert!(!agent.has_pending_swap());
+    while let Ok((_id, _event)) = fanin_rx.try_recv() {}
+}

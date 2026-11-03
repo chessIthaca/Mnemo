@@ -34,6 +34,9 @@
 //! - [`reflex`] — the Laya classifier's compound REFLEX decision layer (one
 //!   typed complexity/action/risk decision per systemone request,
 //!   confidence-gated, plus the shadow training log).
+//! - [`route_question`] — the shared Laya routing question (three neutral
+//!   labels, folding, per-count gates) plus the canonical tool-call signature
+//!   and the strike counter the nudge paths share.
 //! - [`ask_user_args`] — the `ask_user` argument parse (kernel-owned, 2b.3:
 //!   dispatch parses without importing the app's tool module; the app's
 //!   `AskUserTool` reads it back, app→kernel).
@@ -57,6 +60,7 @@ pub mod prompt;
 pub mod policy;
 pub mod reflex;
 pub mod review_scope;
+pub mod route_question;
 pub mod steering_stats;
 pub mod step_lanes;
 pub mod step_verify;

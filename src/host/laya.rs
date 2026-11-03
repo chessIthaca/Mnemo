@@ -37,6 +37,7 @@ use reqwest::Client;
 
 use crate::config::{global_config_dir, LayaConfig};
 use crate::memory::classifier::{Classifier, ClassifierSlot, ClassifierStatus, LayaClassifier};
+use crate::process_tree::KillOnCloseJob;
 
 /// A status-change push (job 4 D5): the core writes the shared status
 /// Arc AND hands every change to this sink — the app's command layer
@@ -260,7 +261,11 @@ pub struct LayaManager {
     /// The running `laya-serve` child, if any, tagged with the generation it
     /// was spawned for. Guarded so `stop` can be called from app exit while
     /// a start task runs.
-    child: Mutex<Option<(Child, u64)>>,
+    child: Mutex<Option<(Child, u64, Option<KillOnCloseJob>)>>,
+    /// Test-only substitute for the installed launcher; production always
+    /// resolves `laya_serve_path()`.
+    #[cfg(test)]
+    serve_override: Option<(PathBuf, Vec<String>)>,
     /// Monotonic spawn generation: a failed readiness probe stops only the
     /// child it spawned ([`LayaManager::stop_if_generation`]) — a newer
     /// child from a concurrent start (startup hook vs save-driven rewire
@@ -283,9 +288,18 @@ impl LayaManager {
             base_dir,
             status,
             child: Mutex::new(None),
+            #[cfg(test)]
+            serve_override: None,
             child_generation: AtomicU64::new(0),
             setup_in_flight: AtomicBool::new(false),
         }
+    }
+
+    /// Substitute the server launcher in process-tree regression tests.
+    #[cfg(test)]
+    fn with_serve_command(mut self, program: PathBuf, args: Vec<String>) -> Self {
+        self.serve_override = Some((program, args));
+        self
     }
 
     /// The managed root dir (`<config_dir>/laya`).
@@ -377,8 +391,8 @@ impl LayaManager {
             .expect("laya child lock poisoned")
             .take();
         match had {
-            Some((child, _)) => {
-                kill_child(child);
+            Some((child, _, job)) => {
+                kill_tree(child, job);
                 true
             }
             None => false,
@@ -393,10 +407,10 @@ impl LayaManager {
             .child
             .lock()
             .expect("laya child lock poisoned")
-            .take_if(|(_, g)| *g == generation);
+            .take_if(|(_, g, _)| *g == generation);
         match had {
-            Some((child, _)) => {
-                kill_child(child);
+            Some((child, _, job)) => {
+                kill_tree(child, job);
                 true
             }
             None => false,
@@ -412,7 +426,7 @@ impl LayaManager {
             .lock()
             .expect("laya child lock poisoned")
             .as_ref()
-            .is_some_and(|(_, g)| *g == generation)
+            .is_some_and(|(_, g, _)| *g == generation)
     }
 
     /// Pick a free loopback port (bind :0, read it, drop the listener).
@@ -442,11 +456,17 @@ impl LayaManager {
         // exit/Drop cleanup. `spawn()` is a few syscalls — no await under
         // the lock, only a millisecond-scale stall.
         let mut slot = self.child.lock().expect("laya child lock poisoned");
-        if let Some((child, _)) = slot.take() {
-            kill_child(child);
+        if let Some((child, _, job)) = slot.take() {
+            kill_tree(child, job);
         }
         let generation = self.child_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let serve = self.laya_serve_path();
+        #[cfg(test)]
+        let serve = self
+            .serve_override
+            .as_ref()
+            .map(|(program, _)| program.clone())
+            .unwrap_or(serve);
         if !serve.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -456,25 +476,74 @@ impl LayaManager {
         std::fs::create_dir_all(self.base_dir())?;
         let log = std::fs::File::create(self.server_log_path())?;
         let mut cmd = Command::new(&serve);
+        #[cfg(test)]
+        if let Some((_, args)) = &self.serve_override {
+            cmd.args(args);
+        }
         cmd.current_dir(self.base_dir())
             .envs(server_env(models, port, &self.hf_cache_dir()))
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log));
         hide_console_window(&mut cmd);
+        // Unix: make the server the leader of its own process group so
+        // kill_tree reaches its descendants as well as the root. Parent-death
+        // cleanup on Unix is intentionally out of scope.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
         let child = cmd.spawn().map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!("spawning {} failed: {e}", serve.display()),
             )
         })?;
-        *slot = Some((child, generation));
+        // The job handle lives in this host process. If Mnemo exits or is
+        // force-ended the OS closes it, and KILL_ON_JOB_CLOSE ends the whole
+        // Laya tree even when stop/Drop cannot run.
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::io::AsRawHandle as _;
+            let job = KillOnCloseJob::assign(child.as_raw_handle());
+            if job.is_none() {
+                eprintln!(
+                    "warning: could not assign laya-serve to a kill-on-close job; \
+                     only the root process will be killed on stop"
+                );
+            }
+            job
+        };
+        #[cfg(not(windows))]
+        let job = None;
+        *slot = Some((child, generation, job));
         Ok(generation)
     }
 }
 
-/// Kill + reap a child (the shared core of `stop` / `stop_if_generation` /
-/// the spawn critical section).
-fn kill_child(mut child: Child) {
+/// Kill and reap the server's whole process tree (the shared core of `stop` /
+/// `stop_if_generation` / the spawn critical section). If Windows job setup
+/// failed, this deliberately falls back to the old root-only kill.
+fn kill_tree(mut child: Child, job: Option<KillOnCloseJob>) {
+    #[cfg(windows)]
+    if let Some(job) = job {
+        job.kill();
+    }
+    #[cfg(not(windows))]
+    drop(job);
+    #[cfg(unix)]
+    {
+        // Mirror the shell tool's tree kill: `process_group(0)` made the
+        // server's pid its process-group id, and the POSIX kill utility
+        // accepts a negative pid to signal the whole group.
+        let pgid = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(pgid)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1168,6 +1237,145 @@ mod tests {
         std::fs::create_dir(dir.path().join("nested")).unwrap();
         std::fs::write(dir.path().join("nested").join("b.bin"), vec![0u8; 2048]).unwrap();
         assert_eq!(dir_size(dir.path()), 1024 + 2048);
+    }
+
+    /// Kill the complete fake-server tree before the manager's regular stop,
+    /// so a failed assertion can never strand a ping holding the tempdir.
+    #[cfg(windows)]
+    struct ManagerTreeCleanup<'a> {
+        manager: &'a LayaManager,
+        parent_pid: u32,
+        grandchild_pid: Option<u32>,
+    }
+
+    #[cfg(windows)]
+    impl Drop for ManagerTreeCleanup<'_> {
+        fn drop(&mut self) {
+            for (pid, tree) in [
+                (self.parent_pid, true),
+                (self.grandchild_pid.unwrap_or(0), false),
+            ] {
+                if pid == 0 {
+                    continue;
+                }
+                let mut command = std::process::Command::new("taskkill");
+                command.args(["/PID", &pid.to_string(), "/F"]);
+                if tree {
+                    command.arg("/T");
+                }
+                let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
+            self.manager.stop();
+        }
+    }
+
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: fixed query flags, no handle inheritance; the handle is
+        // closed on every path below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: the handle comes from OpenProcess above; query access
+        // suffices for GetExitCodeProcess.
+        let mut exit_code: u32 = 0;
+        let probed = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: the handle is no longer used.
+        unsafe { CloseHandle(handle) };
+        probed != 0 && exit_code == STILL_ACTIVE as u32
+    }
+
+    #[cfg(windows)]
+    fn assert_dead_within(pid: u32, description: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !pid_alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !pid_alive(pid),
+            "{description} (pid {pid}) survived LayaManager::stop"
+        );
+    }
+
+    #[cfg(windows)]
+    fn child_pid(parent: u32) -> u32 {
+        let script = format!(
+            "$end = [DateTime]::UtcNow.AddSeconds(5); do {{ \
+             $p = Get-CimInstance Win32_Process -Filter 'ParentProcessId = {parent}' \
+             | Select-Object -First 1; if ($p) {{ \
+             [Console]::Out.Write($p.ProcessId); exit 0 }}; \
+             Start-Sleep -Milliseconds 100 }} while ([DateTime]::UtcNow -lt $end); exit 1"
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .expect("query the fake server's grandchild");
+        assert!(
+            output.status.success(),
+            "grandchild query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("grandchild pid is UTF-8")
+            .trim()
+            .parse()
+            .expect("grandchild query returned a pid")
+    }
+
+    /// Regression: killing only laya-serve left its interpreter descendant
+    /// alive, holding the checkpoint after an orderly manager stop.
+    #[cfg(windows)]
+    #[test]
+    fn stopping_the_manager_kills_the_server_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = PathBuf::from(
+            std::env::var_os("COMSPEC").expect("COMSPEC points at the Windows command processor"),
+        );
+        let manager = LayaManager::with_base(
+            dir.path().to_path_buf(),
+            Arc::new(RwLock::new(ClassifierStatus::Disabled)),
+        )
+        .with_serve_command(
+            program,
+            vec!["/C".to_string(), "ping -n 60 127.0.0.1 >NUL".to_string()],
+        );
+        manager
+            .spawn_server("english", 38123)
+            .expect("spawn the fake laya-serve tree");
+        let parent_pid = manager
+            .child
+            .lock()
+            .expect("laya child lock poisoned")
+            .as_ref()
+            .expect("spawn recorded the fake server")
+            .0
+            .id();
+        let mut cleanup = ManagerTreeCleanup {
+            manager: &manager,
+            parent_pid,
+            grandchild_pid: None,
+        };
+        let grandchild_pid = child_pid(parent_pid);
+        cleanup.grandchild_pid = Some(grandchild_pid);
+        assert!(pid_alive(parent_pid), "the cmd parent must start alive");
+        assert!(
+            pid_alive(grandchild_pid),
+            "the ping grandchild must start alive"
+        );
+
+        assert!(manager.stop(), "the fake server was running");
+
+        assert_dead_within(parent_pid, "fake laya-serve parent");
+        assert_dead_within(grandchild_pid, "fake python.exe grandchild");
     }
 
     #[test]

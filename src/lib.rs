@@ -31,6 +31,7 @@ pub mod index_staleness;
 pub mod mcp;
 pub mod memory;
 pub mod model_resolver;
+pub mod process_tree;
 pub mod project;
 pub mod provider;
 pub mod runtime;

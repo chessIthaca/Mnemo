@@ -10691,7 +10691,7 @@ async fn set_explicit_provider_defers_when_the_conversation_exceeds_the_new_wind
     let history: Vec<Message> = (0..40)
         .map(|_| Message::text(Role::User, "y".repeat(4_000)))
         .collect();
-    agent.publish_history(&history);
+    agent.publish_message_tokens(&history);
     let small: Arc<dyn LlmClient> = Arc::new(MockProvider {
         caps: Capabilities {
             max_context: 64_000,
@@ -10760,7 +10760,7 @@ async fn a_resumed_transcript_too_big_for_the_new_window_compacts_first() {
             Message::text(role, "z".repeat(800))
         })
         .collect();
-    agent.publish_history(&history);
+    agent.publish_message_tokens(&history);
     let new: Arc<dyn LlmClient> = Arc::new(MockProvider {
         caps: Capabilities {
             max_context: 4_000,
@@ -10814,7 +10814,7 @@ async fn a_switch_that_fits_swaps_at_once_with_the_full_history() {
         Message::text(Role::User, "first question with real content to count"),
         Message::text(Role::Assistant, "first answer with real content to count"),
     ];
-    agent.publish_history(&messages);
+    agent.publish_message_tokens(&messages);
     let new: Arc<dyn LlmClient> = Arc::new(MockProvider {
         caps: Capabilities {
             max_context: 64_000,
@@ -10946,7 +10946,7 @@ async fn set_explicit_provider_clears_stale_deferred_swap_on_immediate() {
     let history: Vec<Message> = (0..40)
         .map(|_| Message::text(Role::User, "y".repeat(4_000)))
         .collect();
-    agent.publish_history(&history);
+    agent.publish_message_tokens(&history);
 
     // Step 1: defer a swap to a smaller-context model B.
     let small_b: Arc<dyn crate::provider::LlmClient> = Arc::new(CtxProvider {
@@ -11094,7 +11094,7 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
     // (2_000 × 0.5 = 1_000), so the pin defers for the OLD provider to
     // summarize first. Publishing is what the owning task does at turn
     // boundaries — the decision never reads a cached count.
-    agent.publish_history(&messages);
+    agent.publish_message_tokens(&messages);
     agent.set_explicit_provider(
         new_provider.clone(),
         context::ContextManager::new(2_000, 0.5),
@@ -11272,7 +11272,7 @@ async fn run_turn_model_switch_interrupt_emits_paired_compact_event() {
 
     // Defer the swap: the inclusive count (published conversation + tool-schema
     // overhead) exceeds the new model's trigger (2_000 × 0.5 = 1_000).
-    agent.publish_history(&messages);
+    agent.publish_message_tokens(&messages);
     agent.set_explicit_provider(
         new_provider.clone(),
         context::ContextManager::new(2_000, 0.5),

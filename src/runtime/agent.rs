@@ -224,7 +224,7 @@ impl AgentTask {
         // publish it so a model switch landing before the first request still
         // measures the real history instead of an empty/zero count (a
         // too-big history must compact first).
-        self.agent_loop.publish_history(&self.messages);
+        self.agent_loop.publish_message_tokens(&self.messages);
     }
 
     /// Build the user-message content for a text + images payload —
@@ -630,7 +630,7 @@ impl AgentTask {
             // again AFTER it (the turn's final message is part of it) — the
             // compact-before-switch decision never runs off a stale or zero
             // count.
-            self.agent_loop.publish_history(&self.messages);
+            self.agent_loop.publish_message_tokens(&self.messages);
             let result = self
                 .agent_loop
                 .run_turn(
@@ -641,7 +641,7 @@ impl AgentTask {
                     self.session_id.as_deref(),
                 )
                 .await;
-            self.agent_loop.publish_history(&self.messages);
+            self.agent_loop.publish_message_tokens(&self.messages);
             match result {
                 Ok(outcome) => {
                     if let Some(pending) = pending_triage.take() {
@@ -1399,7 +1399,7 @@ impl AgentTask {
         if stop.is_none() {
             self.messages = summarized;
         // The rewrite is the conversation a switch must measure from now on.
-        self.agent_loop.publish_history(&self.messages);
+        self.agent_loop.publish_message_tokens(&self.messages);
             // Token-optimizer lever 4 (backlog e4a50d22): the digest note plus
             // the checkpoint pointer, mirroring the auto path in turn.rs.
             if survival {
@@ -1576,7 +1576,7 @@ impl AgentTask {
     async fn clear_context(&mut self, fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>) {
         self.messages.clear();
         // /new: the conversation a switch measures is now empty.
-        self.agent_loop.publish_history(&self.messages);
+        self.agent_loop.publish_message_tokens(&self.messages);
         // A fresh session must not inherit the previous one's temporary raise
         // (backlog 11513ee5) — the ladder is session state, and /new starts a
         // new session.

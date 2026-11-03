@@ -694,7 +694,7 @@ impl AgentLoop {
             // token count cannot serve — it is stale after the turn's final
             // message and 0 before a resumed session's first request.
             self.publish_schema_tokens(schema_tokens);
-            self.publish_history(messages);
+            self.publish_message_tokens(messages);
 
             // Exact incremental token count + per-role breakdown in one pass
             // (see `TokenAccounting`). Summarization resets the accounting

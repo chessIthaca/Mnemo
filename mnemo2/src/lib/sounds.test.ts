@@ -20,6 +20,7 @@ import {
   workerTransitionSound,
   type AppearanceSettings,
   type AppearanceTransport,
+  type CloseBehavior,
   type SoundKind,
 } from "./sounds";
 
@@ -213,6 +214,7 @@ describe("toggle cache", () => {
         sound_input_needed: true,
         sound_stopped_errors: false,
         theme: "light",
+        close_behavior: "auto",
       }),
       save: async () => {
         throw new Error("not used");
@@ -248,15 +250,24 @@ describe("toggle cache", () => {
 
 describe("wire normalization", () => {
   it("fills defaults for fields an older host leaves out", () => {
-    expect(normalizeAppearance(null)).toEqual({ ...DEFAULT_SOUND_TOGGLES, theme: "dark" });
+    expect(normalizeAppearance(null)).toEqual({
+      ...DEFAULT_SOUND_TOGGLES,
+      theme: "dark",
+      close_behavior: "auto",
+    });
     expect(normalizeAppearance({ sound_complete: false })).toEqual({
       sound_complete: false,
       sound_input_needed: true,
       sound_stopped_errors: true,
       theme: "dark",
+      close_behavior: "auto",
     });
     expect(normalizeAppearance({ theme: "" }).theme).toBe("dark");
     expect(normalizeAppearance({ theme: "system" }).theme).toBe("system");
+    expect(normalizeAppearance({ close_behavior: "tray" }).close_behavior).toBe("tray");
+    expect(
+      normalizeAppearance({ close_behavior: "bogus" as CloseBehavior }).close_behavior,
+    ).toBe("auto");
   });
 
   it("talks to the two appearance commands through bindings", async () => {
@@ -268,11 +279,14 @@ describe("wire normalization", () => {
         sound_input_needed: false,
         sound_stopped_errors: true,
         theme: "dark",
+        close_behavior: "quit",
       };
       return settings;
     }) as unknown as typeof import("@tauri-apps/api/core").invoke;
     const transport = createTauriAppearanceTransport({ invoke });
-    expect((await transport.get()).sound_input_needed).toBe(false);
+    const loaded = await transport.get();
+    expect(loaded.sound_input_needed).toBe(false);
+    expect(loaded.close_behavior).toBe("quit");
     await transport.save({ sound_input_needed: true });
     expect(calls.map((call) => call.command)).toEqual([
       "appearance_settings_get",

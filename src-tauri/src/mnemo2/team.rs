@@ -2694,9 +2694,6 @@ impl TeamRuntime {
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));
         }
-        for row in &routing_rows {
-            self.append_dispatch_routing_row(row);
-        }
         let placed = plan.as_ref().map(|plan| (plan.plan_id.clone(), plan.step));
         let provisioned = self
             .provision_worker(
@@ -2715,6 +2712,9 @@ impl TeamRuntime {
         // matches the record the session was started from.
         let result = match provisioned {
             Ok(record) => {
+                for row in &routing_rows {
+                    self.append_dispatch_routing_row(row);
+                }
                 let routing_for_record = routing.clone();
                 self.update_worker(&record.id, |worker| {
                     worker.read_back = read_back;
@@ -10001,6 +10001,48 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(second.success, "{}", second.output);
         assert_eq!(fixture.classifier.calls(), 2);
         assert_eq!(fixture.rows().len(), 1, "exactly one Route row is committed");
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn no_free_slot_writes_no_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        fixture
+            .team
+            .persistence
+            .slots
+            .store(0, Ordering::SeqCst);
+        let result = fixture.dispatch(Some("average"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "all 0 worker slots are busy");
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(!fixture.log_path().exists());
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provisioning_failure_writes_no_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let git = fixture._root.path().join(".git");
+        let parked = fixture._root.path().join(".git-parked");
+        std::fs::rename(&git, &parked).expect("park git metadata");
+        let result = fixture.dispatch(Some("average"), None).await;
+        assert!(!result.success);
+        assert!(result.output.contains("not a usable Git checkout"));
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(!fixture.log_path().exists());
+        std::fs::rename(parked, git).expect("restore git metadata");
         fixture.team.shutdown().await;
     }
 

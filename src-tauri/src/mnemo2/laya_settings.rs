@@ -72,6 +72,7 @@ use crate::mnemo2::dispatch_routing;
 use crate::mnemo2::ipc::{settings_refresh, settings_setup, Mnemo2State};
 use crate::mnemo2::route_eval;
 use crate::mnemo2::runtime::LeadRuntime;
+use crate::mnemo2::team::TeamRuntime;
 
 /// The Tauri event channel `laya_setup` streams its install progress on:
 /// a [`SetupEvent`] payload — `Progress` events (fractions) while the
@@ -595,16 +596,36 @@ pub async fn routing_settings_status(
 }
 
 /// Persist the `[routing]` table to `mnemo2.toml` (every other table
-/// preserved) and return the fresh snapshot. Nothing else reads the file —
-/// Mnemo1 has its own `[general.routing]` block in `config.toml`.
+/// preserved) and push it into an open team, so the next dispatch sees the
+/// new mode without a restart. Returns the fresh snapshot.
 #[tauri::command]
 pub async fn save_routing_settings(
     state: State<'_, Mnemo2State>,
     settings: dispatch_routing::RoutingSettings,
 ) -> Result<RoutingSettingsWire, String> {
-    let (setup, _) = settings_setup(&state).await?;
-    dispatch_routing::save_routing_settings(setup.config_dir(), &settings)?;
+    let (setup, runtime) = settings_setup(&state).await?;
+    let team = match runtime {
+        Some(runtime) => runtime.team_handle().await.ok(),
+        None => None,
+    };
+    apply_routing_settings(setup.config_dir(), &settings, team.as_deref())?;
     Ok(routing_settings_wire(setup.config_dir()))
+}
+
+/// The command's core: write the `[routing]` table, then reload a live team's
+/// copy so the next dispatch acts on it (review R1). The Laya page's Save and
+/// the eval's Apply both land here; with no team open there is nothing to
+/// reload and the next `TeamRuntime::open` reads the file itself.
+pub fn apply_routing_settings(
+    config_dir: &Path,
+    settings: &dispatch_routing::RoutingSettings,
+    team: Option<&TeamRuntime>,
+) -> Result<(), String> {
+    dispatch_routing::save_routing_settings(config_dir, settings)?;
+    if let Some(team) = team {
+        team.reload_routing_settings();
+    }
+    Ok(())
 }
 
 /// The dispatch routing log summarised for the page.

@@ -1256,9 +1256,17 @@ impl TeamRuntime {
     ) {
         *self.models.write().unwrap_or_else(|e| e.into_inner()) = models;
         self.set_tiers(tiers);
+        self.reload_routing_settings();
+        *self.pricing.write().expect("pricing lock poisoned") = pricing;
+    }
+
+    /// Re-read the `[routing]` table of `mnemo2.toml` into the live team, so a
+    /// routing-settings save (the Laya page's Save, the eval's Apply) takes
+    /// effect on the next dispatch without a restart. [`Self::set_catalog`] is
+    /// the other reload path — a model-settings save.
+    pub fn reload_routing_settings(&self) {
         *self.routing.write().unwrap_or_else(|e| e.into_inner()) =
             load_routing_settings(&self.config_dir);
-        *self.pricing.write().expect("pricing lock poisoned") = pricing;
     }
 
     fn current_models(&self) -> Vec<LeadModel> {
@@ -11258,6 +11266,43 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(
             rows.lines().all(|line| !line.contains("\"nudge\"")),
             "nothing was written with nudges off: {rows}"
+        );
+        team.shutdown().await;
+    }
+
+    /// Review R1: a routing-settings save must reach a team that is already
+    /// open. The Laya page's Save and the eval's Apply share
+    /// `apply_routing_settings`, which writes the table and then reloads the
+    /// live team — no restart, no unrelated model-settings save.
+    #[tokio::test]
+    async fn saved_routing_mode_reaches_the_open_team() {
+        use crate::mnemo2::dispatch_routing::{load_routing_settings, RoutingMode, RoutingSettings};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let config = tempfile::tempdir().expect("config");
+        let team =
+            open_test_team_with_config(root.path(), state.path(), Vec::new(), config.path()).await;
+        assert_eq!(
+            team.routing_mode(),
+            RoutingMode::Off,
+            "no [routing] table yet: off"
+        );
+
+        let shadow = RoutingSettings { mode: RoutingMode::Shadow, ..RoutingSettings::default() };
+        crate::mnemo2::laya_settings::apply_routing_settings(config.path(), &shadow, Some(&team))
+            .expect("save through the command's core");
+
+        assert_eq!(
+            team.routing_mode(),
+            RoutingMode::Shadow,
+            "the open team reloads the saved mode without a restart"
+        );
+        assert_eq!(
+            load_routing_settings(config.path()).mode,
+            RoutingMode::Shadow,
+            "and the table is on disk for the next open"
         );
         team.shutdown().await;
     }

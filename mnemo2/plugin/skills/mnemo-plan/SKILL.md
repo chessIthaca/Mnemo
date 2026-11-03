@@ -22,7 +22,7 @@ Call `plan_create` with:
 - `title` and `goal`: the outcome in one or two sentences.
 - `kind`: `implementation` (the default), `research`, or `bug_fixing`. A defect is ALWAYS a `bug_fixing` plan, never `implementation`. It needs `bug` (the symptom), its context must name the regression test — which test, in which file, and how it fails without the fix — and the bare test function name is recorded with `plan_update` `regression_test` once it exists. Exception: a bug-triggered change that adds capabilities, new dependencies or spans multiple modules is an `implementation` plan, with the bug documented as motivation in `goal` and `context`. If you file a defect fix as `implementation` or `research`, the `plan_create` result appends a reminder line that bugs use `bug_fixing`: re-plan with the right kind unless the exception applies.
 - `context`: at least 40 characters, in practice a page. Why the work exists, constraints, decisions already taken, exact file paths and symbols, and the verification commands. Workers read it, so write stable intent only. Never put status in it (commits, review state, what is next); that goes into `plan_update` `progress`.
-- `steps`: ordered, each starting with a bold **header**. The board refuses a step that names no file path (a research-only step may carry an explicit "no-code research" marker instead), so name the files each step touches.
+- `steps`: ordered, each starting with a bold **header** and written as an implementation spec (see "Write each step as a spec" below), not a one-line task. The board refuses a step that names no file path (a research-only step may carry an explicit "no-code research" marker instead), so name the files each step touches.
 - `interfaces`: contracts between steps (exports, signatures, data shapes, file ownership).
 - `acceptance_scenarios`: observable outcomes, one per entry. Workers receive them, and high-risk dispatch requires at least one.
 
@@ -34,6 +34,22 @@ The board also refuses a plan that is too thin to resume from.
 - Give steps disjoint files. A file owned by two steps means either one step or a recorded interface.
 - Order by dependency. A step that needs another's output is dispatched after that step merges. Only independent steps run in parallel.
 - Add a final verification step for work only you can do, such as an end-to-end run. You tick it yourself with `plan_step_done`.
+
+### Write each step as a spec
+
+Mnemo exists so that cheap models do the implementing. A cheap model follows instructions well but cannot fill design gaps, so the design has to be in the plan. A step that names only the outcome ("add a loading state", "fix the cite bug") leaves the worker to design it, and the result comes back for several review rounds. Write every step so a worker can implement it without making a design decision:
+
+- **Files and symbols.** Every file the step changes, and in each the functions, types or components to add or change, with their signatures (parameters, return type, error type). Mark new code as new, for example "new: `fn conversation_needs_compaction(&self, cm: &ContextManager, messages: &[Message]) -> bool` in `src/agent/loop_impl.rs`". The board only rejects unlabelled claims that a symbol already exists; a labelled design is fine.
+- **Data shapes.** New fields, structs, events or wire types with their exact names and types, and who reads and writes them.
+- **Behaviour rules.** The rules the code must follow, as a list, including the edge cases: empty input, zero, a resumed session, concurrency, a failure halfway, what must stay unchanged.
+- **Order of edits.** When the order matters (a test first, a type before its users, a migration before code), say it.
+- **Tests.** Each test by name, with its setup, the action and the exact assertions. For a bug, the regression test comes first and must fail on today's code.
+- **Done checklist.** The commands to run and the observable result that means the step is finished.
+- **Don't touch.** Files that other steps or parallel plans own.
+
+In practice a step is 150 to 400 words. Put everything specific to the step in the step text, not only in the dispatch `brief`: the brief is not saved in the plan, so a worker that is resumed, compacted or switched to another model loses it.
+
+When you cannot write the spec because the design is not settled yet (an unclear approach, a performance question, an unfamiliar subsystem), make the first step a design step on the `difficult` tier. It writes the spec into a design document, or returns it for `plan_update` `add_steps`. Dispatch the implementation steps only after that.
 
 ### Acceptance and verification
 

@@ -48,7 +48,7 @@ Rules:
 
 ## Briefs
 
-The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. Your `brief` carries only what is specific to this task:
+The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. The design belongs in the step text, written as a spec as the `mnemo-plan` skill describes, because the brief is not saved in the plan: a resumed, compacted or model-switched worker loses it. If you notice while writing a brief that the step lacks signatures, rules or test names, add them to the plan first, with `plan_update` `add_steps` or `decision`. Your `brief` then carries only what is specific to this dispatch:
 
 - the goal of this task in one or two sentences;
 - the files it owns, and the files it must not touch because another step owns them;

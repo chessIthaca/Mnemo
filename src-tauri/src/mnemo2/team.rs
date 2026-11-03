@@ -2718,8 +2718,9 @@ impl TeamRuntime {
         // matches the record the session was started from.
         let result = match provisioned {
             Ok(record) => {
-                for row in &routing_rows {
-                    self.append_dispatch_routing_row(row);
+                for mut row in routing_rows {
+                    row.with_worker_id(&record.id);
+                    self.append_dispatch_routing_row(&row);
                 }
                 let routing_for_record = routing.clone();
                 self.update_worker(&record.id, |worker| {
@@ -10327,6 +10328,42 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(!result.output.contains("routed to difficult"));
         let worker = fixture.team.worker("routingworker").await.expect("worker");
         assert_eq!(worker.tier.as_deref(), Some("difficult"));
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn ipc_auto_id_dispatch_row_carries_the_real_worker_id() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the auto-id IPC step and verify its routing log".into(),
+                Some("test/scripted-average".into()),
+                None,
+                None,
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("auto-id IPC dispatch");
+        assert!(!reused);
+        assert_eq!(fixture.classifier.calls(), 1);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0],
+            crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route { worker_id, .. }
+                if worker_id == &worker.id
+        ));
+        assert!(!worker.id.is_empty());
         fixture.team.shutdown().await;
     }
 

@@ -544,6 +544,21 @@ pub enum DispatchRoutingRow {
     },
 }
 
+impl DispatchRoutingRow {
+    /// Replace the envelope's worker id with the provisioned worker's real id.
+    pub(crate) fn with_worker_id(&mut self, id: &str) {
+        match self {
+            Self::Route { worker_id, .. }
+            | Self::LeadOverride { worker_id, .. }
+            | Self::LeadReroute { worker_id, .. }
+            | Self::UserReroute { worker_id, .. }
+            | Self::Nudge { worker_id, .. }
+            | Self::NudgeIgnored { worker_id, .. }
+            | Self::Outcome { worker_id, .. } => *worker_id = id.to_string(),
+        }
+    }
+}
+
 /// The dispatch routing log's file:
 /// `~/.mnemo/laya/training/dispatch_routing.jsonl`, beside the Mnemo1
 /// `routing.jsonl`.

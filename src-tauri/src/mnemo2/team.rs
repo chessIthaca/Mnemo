@@ -2428,7 +2428,7 @@ impl TeamRuntime {
         self.dispatch_request(DispatchRequest {
             brief,
             tier: None,
-            dispatch_routing: false,
+            dispatch_routing: true,
             model,
             reasoning_effort,
             worker_id,
@@ -10186,6 +10186,39 @@ models = [\"scripted-a\", \"scripted-b\"]
             .as_array()
             .expect("required fields")
             .contains(&json!("tier")));
+    }
+
+
+    #[tokio::test]
+    async fn ipc_dispatch_on_plan_logs_a_shadow_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the IPC-dispatched step and run its regression tests".into(),
+                Some("test/scripted-average".into()),
+                None,
+                Some("ipcworker".into()),
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("IPC dispatch");
+        assert!(!reused);
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert_eq!(fixture.rows().len(), 1);
+        let routing = worker.routing.expect("IPC worker routing");
+        assert_eq!(routing.laya_tier.as_deref(), Some("average"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("average"));
+        assert_eq!(routing.routed_by, "lead");
+        fixture.team.shutdown().await;
     }
 
 }

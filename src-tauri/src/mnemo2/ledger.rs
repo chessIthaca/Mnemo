@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use mnemo::app::team_ledger::{OpenTask, PlanReview, TeamLedger};
 use tokio::sync::Mutex;
 
+use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
 use crate::mnemo2::team::{TeamRuntime, WorkerRecord, WorkerStatus};
 
 /// The lead's team slot, shared with `LeadRuntime`.
@@ -123,13 +124,18 @@ pub(crate) fn plan_review(workers: &[WorkerRecord], plan_id: &str, plan_title: &
     }
 }
 
-/// The effort table: per task, the models it ran on and the review, fix, and
-/// audit rounds it needed. Audit workers are reviewers, not tasks, so they get
-/// no row; the counters read zero for a ledger written before they existed.
+/// The effort table: per task, the models it ran on, what Laya said at
+/// dispatch and who routed it, and the review, fix, and audit rounds it
+/// needed. Audit workers are reviewers, not tasks, so they get no row; the
+/// counters read zero for a ledger written before they existed, and both
+/// routing columns render `-` for a task dispatched before routing existed
+/// or with routing off.
 fn render_effort(out: &mut String, tasks: &[&WorkerRecord]) {
     out.push_str("\n## Effort\n\n");
-    out.push_str("| Task | Step | Models | Review rounds | Fix rounds | Findings (high) | Audits |\n");
-    out.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
+    out.push_str(
+        "| Task | Step | Models | Laya | Routed by | Review rounds | Fix rounds | Findings (high) | Audits |\n",
+    );
+    out.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     let (mut reviews, mut fixes, mut audits, mut counted) = (0u32, 0u32, 0u32, 0usize);
     for task in tasks.iter().filter(|task| task.kind != "audit") {
         counted += 1;
@@ -148,6 +154,40 @@ fn render_effort(out: &mut String, tasks: &[&WorkerRecord]) {
         } else {
             task.models_used.join(" → ")
         };
+        let laya = task.routing.as_ref().map_or_else(
+            || "-".to_string(),
+            |routing| {
+                match (routing.laya_tier.as_deref(), routing.confidence, routing.cleared) {
+                    (Some(tier), Some(confidence), true) => format!("{tier} {confidence:.2}"),
+                    (_, Some(confidence), _) => format!("unsure {confidence:.2}"),
+                    _ => "-".to_string(),
+                }
+            },
+        );
+        // A reroute that keeps the tier never counts as an override: the
+        // column reports who picked the tier, and any hand that moved it
+        // afterwards.
+        let mut routed_by = task.routing.as_ref().map_or_else(
+            || "-".to_string(),
+            |routing| match routing.routed_by.as_str() {
+                "lead_override" => "lead (override)".to_string(),
+                other => other.to_string(),
+            },
+        );
+        if task
+            .reroutes
+            .iter()
+            .any(|row| matches!(row, DispatchRoutingRow::UserReroute { .. }))
+        {
+            routed_by.push_str(" + user reroute");
+        }
+        if task
+            .reroutes
+            .iter()
+            .any(|row| matches!(row, DispatchRoutingRow::LeadReroute { .. }))
+        {
+            routed_by.push_str(" + lead reroute");
+        }
         let high = task
             .findings
             .iter()
@@ -155,7 +195,7 @@ fn render_effort(out: &mut String, tasks: &[&WorkerRecord]) {
             .count();
         let _ = writeln!(
             out,
-            "| `{}` | {step} | {models} | {} | {} | {} ({high}) | {} |",
+            "| `{}` | {step} | {models} | {laya} | {routed_by} | {} | {} | {} ({high}) | {} |",
             task.id,
             task.review_rounds,
             task.fix_rounds,
@@ -351,7 +391,7 @@ impl TeamLedger for RecordsLedger {
 mod tests {
     use super::*;
     use crate::mnemo2::phase3::{Finding, MergeRecord};
-    use crate::mnemo2::team::WorkerCheck;
+    use crate::mnemo2::team::{WorkerCheck, WorkerRouting};
     use serde_json::json;
 
     fn worker(id: &str, status: &str, plan: Option<&str>, step: Option<usize>) -> WorkerRecord {
@@ -542,16 +582,16 @@ mod tests {
         assert!(report.contains("\n## Effort\n"), "{report}");
         assert!(
             report.contains(
-                "| Task | Step | Models | Review rounds | Fix rounds | Findings (high) | Audits |"
+                "| Task | Step | Models | Laya | Routed by | Review rounds | Fix rounds | Findings (high) | Audits |"
             ),
             "{report}"
         );
         assert!(
-            report.contains("| `w1` | 1 | test/scripted-a → test/scripted-b | 2 | 1 | 1 (1) | 1 |"),
+            report.contains("| `w1` | 1 | test/scripted-a → test/scripted-b | - | - | 2 | 1 | 1 (1) | 1 |"),
             "{report}"
         );
         assert!(
-            report.contains("| `w2` | 2 | test/scripted-a | 1 | 0 | 0 (0) | 0 |"),
+            report.contains("| `w2` | 2 | test/scripted-a | - | - | 1 | 0 | 0 (0) | 0 |"),
             "{report}"
         );
         assert!(!report.contains("| `r1` |"), "{report}");
@@ -591,11 +631,112 @@ mod tests {
             panic!("a merged task is closed");
         };
         assert!(
-            report.contains("| `old1` | 1 | test/scripted-a | 0 | 0 | 0 (0) | 0 |"),
+            report.contains("| `old1` | 1 | test/scripted-a | - | - | 0 | 0 | 0 (0) | 0 |"),
             "{report}"
         );
         assert!(
             report.contains("Total: 0 review rounds, 0 fix rounds, 0 audits across 1 tasks."),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn effort_table_shows_laya_and_routed_by() {
+        let mut lead_pick = worker("w1", "merged", Some("p1"), Some(0));
+        lead_pick.merge = Some(merge_record());
+        lead_pick.routing = Some(WorkerRouting {
+            laya_tier: Some("average".into()),
+            confidence: Some(0.62),
+            cleared: true,
+            lead_tier: Some("average".into()),
+            routed_by: "lead".into(),
+            ran_tier: Some("average".into()),
+            nudged: None,
+        });
+        lead_pick.reroutes = vec![DispatchRoutingRow::UserReroute {
+            ts: 2,
+            worker_id: "w1".into(),
+            plan_id: "p1".into(),
+            step: 1,
+            from_tier: "average".into(),
+            to_tier: "difficult".into(),
+            from_model: Some("test/scripted-a".into()),
+            to_model: Some("test/scripted-difficult".into()),
+            status: "idle".into(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }];
+        let mut laya_pick = worker("w2", "merged", Some("p1"), Some(1));
+        laya_pick.merge = Some(merge_record());
+        laya_pick.routing = Some(WorkerRouting {
+            laya_tier: Some("difficult".into()),
+            confidence: Some(0.41),
+            cleared: false,
+            lead_tier: None,
+            routed_by: "laya".into(),
+            ran_tier: None,
+            nudged: None,
+        });
+        let mut override_pick = worker("w3", "merged", Some("p1"), Some(2));
+        override_pick.merge = Some(merge_record());
+        override_pick.routing = Some(WorkerRouting {
+            laya_tier: Some("difficult".into()),
+            confidence: Some(0.91),
+            cleared: true,
+            lead_tier: Some("average".into()),
+            routed_by: "lead_override".into(),
+            ran_tier: Some("average".into()),
+            nudged: None,
+        });
+        override_pick.reroutes = vec![DispatchRoutingRow::LeadReroute {
+            ts: 3,
+            worker_id: "w3".into(),
+            plan_id: "p1".into(),
+            step: 3,
+            from_tier: "average".into(),
+            to_tier: "difficult".into(),
+            from_model: Some("test/scripted-a".into()),
+            to_model: Some("test/scripted-difficult".into()),
+            status: "idle".into(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }];
+        let PlanReview::Ready { report } =
+            plan_review(&[lead_pick, laya_pick, override_pick], "p1", "Ship it")
+        else {
+            panic!("closed work is ready");
+        };
+        assert!(
+            report.contains(
+                "| `w1` | 1 | test/scripted-a | average 0.62 | lead + user reroute | 0 | 0 | 0 (0) | 0 |"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("| `w2` | 2 | test/scripted-a | unsure 0.41 | laya | 0 | 0 | 0 (0) | 0 |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "| `w3` | 3 | test/scripted-a | difficult 0.91 | lead (override) + lead reroute | 0 | 0 | 0 (0) | 0 |"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn old_records_render_dashes_for_laya() {
+        let mut legacy = worker("old2", "merged", Some("p1"), Some(0));
+        legacy.merge = Some(merge_record());
+        let PlanReview::Ready { report } = plan_review(&[legacy], "p1", "T") else {
+            panic!("a merged task is closed");
+        };
+        // A record from before routing existed renders dashes in both
+        // routing columns, and never in the counter columns it predates.
+        assert!(
+            report.contains("| `old2` | 1 | test/scripted-a | - | - | 0 | 0 | 0 (0) | 0 |"),
             "{report}"
         );
     }

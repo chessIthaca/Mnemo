@@ -5961,7 +5961,12 @@ mod tests {
         // the tier.
         team.stop("worker0001").await.expect("stop");
         let changed = team
-            .change_model("worker0001", Some("test/scripted-c".into()), None)
+            .change_model(
+                "worker0001",
+                Some("test/scripted-c".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
             .await
             .expect("change model");
         assert_eq!(changed.model.as_deref(), Some("test/scripted-c"));
@@ -9440,7 +9445,12 @@ mod tests {
         // with the record updated and the status STILL Working — no stop,
         // no restart.
         let switched = team
-            .change_model("worker0001", Some("test/model-b".into()), None)
+            .change_model(
+                "worker0001",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
             .await
             .expect("the live switch is applied");
         assert_eq!(switched.model, Some("test/model-b".into()));
@@ -9565,7 +9575,12 @@ mod tests {
         // The switch lands while the worker is working: the conversation
         // exceeds model-b's trigger, so it DEFERS — no restart, still Working.
         let switched = team
-            .change_model("worker0001", Some("test/model-b".into()), None)
+            .change_model(
+                "worker0001",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
             .await
             .expect("the deferred switch is accepted");
         assert_eq!(switched.generation, 1, "no stop/resume");
@@ -9688,7 +9703,12 @@ mod tests {
         // Today's idle path: restart on the new model — the generation
         // advances (a NEW session), the worker comes back idle.
         let restarted = team
-            .change_model("worker0001", Some("test/model-b".into()), None)
+            .change_model(
+                "worker0001",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
             .await
             .expect("the idle path restarts on the new model");
         assert_eq!(restarted.model, Some("test/model-b".into()));
@@ -9709,7 +9729,12 @@ mod tests {
         wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Stopped)
             .await;
         let resumed = team
-            .change_model("worker0001", Some("test/model-a".into()), None)
+            .change_model(
+                "worker0001",
+                Some("test/model-a".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
             .await
             .expect("the stopped path resumes on the new model");
         assert_eq!(resumed.model, Some("test/model-a".into()));
@@ -9834,7 +9859,12 @@ mod tests {
         // Switch to the model already serving: the observed id must survive
         // the record update — the returned record still carries it.
         let switched = team
-            .change_model("worker0001", Some("test/model-b".into()), None)
+            .change_model(
+                "worker0001",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
             .await
             .expect("the live switch is applied");
         assert_eq!(
@@ -9926,7 +9956,12 @@ mod tests {
 
         // The busy switch refuses an audit worker.
         let refused = team
-            .change_model("auditor1", Some("test/model-b".into()), None)
+            .change_model(
+                "auditor1",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
             .await
             .expect_err("an audit worker's model is not switchable");
         assert!(

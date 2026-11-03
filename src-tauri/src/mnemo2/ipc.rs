@@ -44,8 +44,8 @@ use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
 use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
-    BoardSignal, BoardSnapshot, DeletionPhase, DeletionProgress, MessageSender, TeamMessage,
-    TeamRuntime, TeamSnapshot, TeamDeleteOutcome, WorkerDeletion, WorkerRecord,
+    BoardSignal, BoardSnapshot, ChangeSource, DeletionPhase, DeletionProgress, MessageSender,
+    TeamMessage, TeamRuntime, TeamSnapshot, TeamDeleteOutcome, WorkerDeletion, WorkerRecord,
     DELETION_EVENT_CHANNEL, TEAM_EVENT_CHANNEL,
 };
 use crate::mnemo2::workbench::{self, DiffSnapshot};
@@ -508,7 +508,12 @@ pub async fn project_cleanup(
             return Err(error);
         }
     };
-    let result = crate::mnemo2::team::cleanup_workspace(&root, &state_dir).await;
+    let result = crate::mnemo2::team::cleanup_workspace(
+        &root,
+        &state_dir,
+        &crate::mnemo2::dispatch_routing::dispatch_routing_log_path(),
+    )
+    .await;
     project::detach(&root);
     *state.marker_root.lock().await = None;
     result
@@ -941,7 +946,7 @@ pub async fn team_set_model(
 ) -> Result<WorkerRecord, String> {
     current_team(&state)
         .await?
-        .change_model(&worker_id, model, reasoning_effort)
+        .change_model(&worker_id, model, reasoning_effort, ChangeSource::User)
         .await
 }
 

@@ -126,6 +126,11 @@ fn public_types_serde_roundtrip() {
         // session's assignment riding the system head. The field's None
         // form round-trips via the default above.
         pinned_task: Some("do the thing, verbatim".into()),
+        // Plan 2ba2168a step 1: a representative per-turn-routing skip —
+        // the session opts out of the pre-prompt gate (Mnemo2 routes at
+        // dispatch instead). The field's false form round-trips via the
+        // default above (skip_serializing_if keeps it off the wire).
+        skip_turn_routing: true,
     });
 
     // 3c/G6 tier 3 (D5): the answer wire — the Gate/Deny form, the

@@ -2926,6 +2926,10 @@ impl TeamRuntime {
                 // system head so compaction and model switches never
                 // summarize it away.
                 pinned_task,
+                // Plan 2ba2168a step 1: the worker's turns are never
+                // classified by the per-prompt gate — Mnemo2 routes at
+                // dispatch instead.
+                skip_turn_routing: true,
             })
             .await
             .map_err(|err| format!("could not spawn the worker session: {err}"))

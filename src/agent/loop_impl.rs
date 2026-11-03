@@ -619,6 +619,11 @@ pub struct AgentLoop {
     /// conversation messages only, and a model switch rebuilds the head,
     /// so the task survives both byte-for-byte. `None` = ordinary session.
     pub(crate) pinned_task: std::sync::RwLock<Option<String>>,
+    /// Plan 2ba2168a step 1: a session opted out of the pre-prompt routing
+    /// gate at spawn — its turns are never classified and no routing.jsonl
+    /// rows are written for them (Mnemo2 routes once at dispatch instead).
+    /// `false` = the per-turn gate (Mnemo1, unchanged).
+    pub(crate) skip_turn_routing: std::sync::atomic::AtomicBool,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -1169,6 +1174,10 @@ impl AgentLoop {
             // session's task (`set_pinned_task`) — every constructor starts
             // pinned-free.
             pinned_task: std::sync::RwLock::new(None),
+            // Plan 2ba2168a step 1: false until the spawn path opts the
+            // session out (`set_skip_turn_routing`) — every constructor
+            // starts with the per-turn gate in force.
+            skip_turn_routing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1234,6 +1243,23 @@ impl AgentLoop {
             .read()
             .expect("pinned task lock poisoned")
             .clone()
+    }
+
+    /// Stamp the loop's per-turn-routing skip (plan 2ba2168a step 1) —
+    /// called ONCE by the spawn path post-build (pre-registration, before
+    /// any turn can run, so no request can race the stamp). `true` marks a
+    /// session that routes once at dispatch (Mnemo2 workers and leads);
+    /// `false` keeps the per-turn gate (Mnemo1).
+    pub fn set_skip_turn_routing(&self, skip: bool) {
+        self.skip_turn_routing
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this session's turns skip the pre-prompt routing gate
+    /// (`false` = the per-turn gate Mnemo1 runs).
+    pub fn skip_turn_routing(&self) -> bool {
+        self.skip_turn_routing
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Build the request-scoped trace context for a model call made by

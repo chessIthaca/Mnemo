@@ -435,6 +435,11 @@ impl Engine {
                 // request's stable head carries it verbatim for the
                 // whole session. `None` = ordinary session.
                 pinned_task: opts.pinned_task.clone(),
+                // Plan 2ba2168a step 1: the session's per-turn-routing
+                // skip — the host spawn path stamps it on the loop, so a
+                // Mnemo2 session's turns are never classified by the
+                // per-prompt gate. `false` = the gate (Mnemo1, unchanged).
+                skip_turn_routing: opts.skip_turn_routing,
             },
         )
         .await

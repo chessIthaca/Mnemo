@@ -166,6 +166,11 @@ pub struct SpawnOptions {
     /// `None` for an ordinary session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_task: Option<String>,
+    /// When true, this session's turns are never classified by the
+    /// pre-prompt routing gate, and no routing.jsonl rows are written for
+    /// them. Mnemo2 routes at dispatch instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_turn_routing: bool,
 }
 
 /// A command to a live session (§5.3 :327-338) — the public mirror of the

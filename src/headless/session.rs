@@ -1150,6 +1150,9 @@ mod lifecycle_tests {
                 host_tools: Vec::new(),
                 trace_identity: None,
                 pinned_task: None,
+                // Mnemo1-side sessions keep the per-turn gate
+                // (plan 2ba2168a step 1).
+                skip_turn_routing: false,
             },
         )
         .await
@@ -1229,6 +1232,9 @@ mod lifecycle_tests {
             host_tools: Vec::new(),
             trace_identity: None,
             pinned_task: None,
+            // Mnemo1-side sessions keep the per-turn gate
+            // (plan 2ba2168a step 1).
+            skip_turn_routing: false,
         };
         let (child, _) = crate::host::runtime::spawn_agent_shared(
             make_host(),

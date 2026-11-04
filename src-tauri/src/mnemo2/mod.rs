@@ -551,6 +551,8 @@ pub fn run() {
             laya_settings::laya_setup,
             laya_settings::laya_disable,
             laya_settings::save_laya_settings,
+            laya_settings::tiers_top_control_status,
+            laya_settings::save_tiers_top_control,
             safety_settings::safety_settings_get,
             safety_settings::save_safety_mode,
             safety_settings::save_safety_rules,

@@ -47,7 +47,16 @@ function endpoint(name: string, overrides: Partial<EndpointDetailDto> = {}): End
 
 function makeTransport(overrides: Partial<SettingsTransport> = {}) {
   const list = [endpoint("alpha"), endpoint("beta", { has_api_key: false })];
-  const tiers: TiersDto = { difficult: ["alpha/m1"], average: ["alpha/m1", "alpha/m2"], simple: [] };
+  /** The loaded ladder: trivial keeps its required model; medium and escalate are empty. */
+  const tiers: TiersDto = {
+    tiers: [
+      { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["alpha/m1"], effort: null, role: null, resolves_to: "trivial" },
+      { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["alpha/m1", "alpha/m2"], effort: null, role: null, resolves_to: "trivial" },
+      { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: [], effort: null, role: null, resolves_to: "routine" },
+      { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["alpha/m1"], effort: null, role: null, resolves_to: "medium" },
+      { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high" },
+    ],
+  };
   const base = {
     endpoints: vi.fn(async () => list),
     upsertEndpoint: vi.fn(async (saved: EndpointDetailDto, _previous?: string | null) => [saved, list[1]]),
@@ -143,7 +152,8 @@ describe("SettingsDialog", () => {
   it("shows tier membership and prices in the models table", async () => {
     makeTransport();
     await openDialog();
-    expect(screen.getByText("Difficult, Average")).toBeTruthy();
+    // The models table lists which ladder rungs reference each model.
+    expect(screen.getByText("Trivial, Routine, High")).toBeTruthy();
     expect((screen.getByLabelText("Input price for m1") as HTMLInputElement).value).toBe("3");
   });
 
@@ -220,10 +230,10 @@ describe("SettingsDialog", () => {
   });
 
   it("shows usage before deleting and needs a second click", async () => {
-    const transport = makeTransport({ endpointUsage: vi.fn(async () => ["tier difficult: alpha/m1"]) });
+    const transport = makeTransport({ endpointUsage: vi.fn(async () => ["tier high: alpha/m1"]) });
     await openDialog();
     await fireEvent.click(screen.getByRole("button", { name: "Delete endpoint" }));
-    expect(await screen.findByText("tier difficult: alpha/m1")).toBeTruthy();
+    expect(await screen.findByText("tier high: alpha/m1")).toBeTruthy();
     expect(transport.removeEndpoint).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
     await waitFor(() => expect(transport.removeEndpoint).toHaveBeenCalledWith("alpha"));
@@ -233,22 +243,31 @@ describe("SettingsDialog", () => {
     const transport = makeTransport();
     await openDialog();
     await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
-    const average = await screen.findByRole("region", { name: "Average tier" });
-    expect(within(average).getByText("Default")).toBeTruthy();
-    await fireEvent.click(within(average).getByRole("button", { name: "Move alpha/m2 up in Average" }));
-    await fireEvent.click(within(average).getByRole("button", { name: "Remove alpha/m1 from Average" }));
-    const simple = screen.getByRole("region", { name: "Simple and tools tier" });
-    await fireEvent.change(within(simple).getByLabelText("Add model to Simple and tools"), { target: { value: "beta/m1" } });
+    const routine = await screen.findByRole("region", { name: "Routine tier" });
+    await fireEvent.click(within(routine).getByRole("button", { name: "Move alpha/m2 up" }));
+    await fireEvent.click(within(routine).getByRole("button", { name: "Remove alpha/m1 from Routine" }));
+    const medium = screen.getByRole("region", { name: "Medium tier" });
+    await fireEvent.change(within(medium).getByLabelText("Add a model to Medium"), { target: { value: "beta/m1" } });
     await fireEvent.click(screen.getByRole("button", { name: "Save tiers" }));
-    await waitFor(() => expect(transport.saveTiers).toHaveBeenCalledWith({ difficult: ["alpha/m1"], average: ["alpha/m2"], simple: ["beta/m1"] }));
+    await waitFor(() =>
+      expect(transport.saveTiers).toHaveBeenCalledWith({
+        tiers: [
+          { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["alpha/m1"], effort: null, role: null, resolves_to: "trivial" },
+          { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["alpha/m2"], effort: null, role: null, resolves_to: "trivial" },
+          { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: ["beta/m1"], effort: null, role: null, resolves_to: "routine" },
+          { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["alpha/m1"], effort: null, role: null, resolves_to: "medium" },
+          { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high" },
+        ],
+      }),
+    );
   });
 
   it("shows tier validation errors", async () => {
     makeTransport({ saveTiers: vi.fn(async () => Promise.reject("unknown model x/y")) });
     await openDialog();
     await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
-    const simple = await screen.findByRole("region", { name: "Simple and tools tier" });
-    await fireEvent.change(within(simple).getByLabelText("Add model to Simple and tools"), { target: { value: "alpha/m1" } });
+    const medium = await screen.findByRole("region", { name: "Medium tier" });
+    await fireEvent.change(within(medium).getByLabelText("Add a model to Medium"), { target: { value: "alpha/m1" } });
     await fireEvent.click(screen.getByRole("button", { name: "Save tiers" }));
     expect(await screen.findByText("unknown model x/y")).toBeTruthy();
   });
@@ -297,7 +316,7 @@ describe("SettingsDialog", () => {
     expect((screen.getByLabelText("Model for row 1") as HTMLInputElement).value).toBe("m1");
   });
 
-  it("shows the Decisions page beside the others, with status, switches and lanes", async () => {
+  it("shows the Tiers page's Laya section with status, switches and the kNN count", async () => {
     makeTransport();
     mocks.layaTransport = {
       status: vi.fn(async () => ({
@@ -310,37 +329,82 @@ describe("SettingsDialog", () => {
           failure_triage_knn: false,
           auto_finetune: false,
           steer_tool_choice: false,
-          routing: false,
+          routing: true,
           reflex: false,
         },
         routing: {
-          cheap: "alpha/m1",
-          capable: "alpha/m2",
-          lane_medium: null,
-          lane_high: null,
-          escalate: null,
           threshold: 0.8,
+          first_prompt_min_confidence: null,
           enforce: false,
         },
+      })),
+      topControl: vi.fn(async () => ({
+        choice: "suggest",
+        mnemo1_enforce: false,
+        laya_routing: true,
+        laya_status: "ready",
+        checkpoint: "Laya (English)",
+        knn_rows: 42,
+        knn_min_rows: 30,
+      })),
+      routingStatus: vi.fn(async () => ({
+        settings: {
+          mode: "suggest",
+          min_confidence_4: 0.4,
+          min_confidence_3: 0.475,
+          min_confidence_2: 0.6,
+          knn_min_share: 0.8,
+          knn_min_rows: 30,
+          fallback_tier: "high",
+          nudges: true,
+          min_words: 20,
+          effort: {},
+        },
+        summary: {
+          decisions_by_mode: { shadow: 31, suggest: 8 },
+          agreement_rate: null,
+          laya_accuracy: null,
+          lead_accuracy: null,
+          labelled: 42,
+          overrides_by_source: {},
+          nudges: 0,
+          nudges_acted_on: 0,
+          eval_date: null,
+        },
+        eval: null,
       })),
       setup: vi.fn(async () => undefined),
       disable: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
+      saveRoutingSettings: vi.fn(),
+      runRoutingEval: vi.fn(),
+      saveTopControl: vi.fn(),
       onLayaEvent: vi.fn(async () => () => {}),
     };
     await openDialog();
-    await fireEvent.click(screen.getByRole("button", { name: "Decisions" }));
-    const status = await screen.findByRole("region", { name: "Decision models (Laya)" });
-    expect(within(status).getByText("Status: Ready")).toBeTruthy();
-    expect(within(status).getByRole("button", { name: "Disable" })).toBeTruthy();
-    expect((screen.getByLabelText("Cheap lane") as HTMLInputElement).value).toBe("alpha/m1");
+    // The retired Decisions tab is gone; the Laya content rides Tiers.
+    expect(screen.queryByRole("button", { name: "Decisions" })).toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
+    const laya = await screen.findByRole("region", { name: "Laya" });
+    expect(within(laya).getByText("Status: Ready")).toBeTruthy();
     expect((screen.getByRole("checkbox", { name: /Auto-type memories/ }) as HTMLInputElement).checked).toBe(true);
+    // The top control reads its own wire: the checkpoint and the kNN count.
+    expect(await screen.findByText(/kNN: 42 labelled workers/)).toBeTruthy();
+    expect(screen.getByText(/Laya \(English\) ready/)).toBeTruthy();
   });
 
-  it("explains decision settings need the desktop app without a Laya transport", async () => {
+  it("opens the Tiers page when asked for the retired Decisions page", async () => {
+    makeTransport();
+    render(SettingsDialog, { open: true, onclose: vi.fn(), initialPage: "laya" });
+    const tiers = await screen.findByRole("button", { name: "Tiers" });
+    expect(tiers.getAttribute("aria-current")).toBe("page");
+    expect(screen.queryByRole("button", { name: "Decisions" })).toBeNull();
+  });
+
+  it("explains Laya settings need the desktop app without a Laya transport", async () => {
     makeTransport();
     await openDialog();
-    await fireEvent.click(screen.getByRole("button", { name: "Decisions" }));
-    expect(await screen.findByText("Decision settings are available in the desktop app.")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
+    expect(await screen.findByText("Laya settings are available in the desktop app.")).toBeTruthy();
   });
 });

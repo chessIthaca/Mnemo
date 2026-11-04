@@ -162,10 +162,13 @@ fn cap_text(text: &str) -> String {
 }
 
 /// The confidence gate for a question offering `labels` labels: the
-/// three-label gate for 3+ labels, the stricter two-label gate otherwise
-/// (`route_question::route_question` never asks with fewer than two).
+/// four-label gate for the full ladder, the three-label gate for three,
+/// the stricter two-label gate otherwise (`route_question::route_question`
+/// never asks with fewer than two).
 pub fn threshold_for(labels: usize, cfg: &RoutingSettings) -> f64 {
-    if labels >= 3 {
+    if labels >= 4 {
+        cfg.min_confidence_4
+    } else if labels >= 3 {
         cfg.min_confidence_3
     } else {
         cfg.min_confidence_2
@@ -281,7 +284,7 @@ pub async fn classify_dispatch(
     })
 }
 
-/// Mnemo2's `[routing]` settings block (design §4.9): the mode, the two
+/// Mnemo2's `[routing]` settings block (design §4.9): the mode, the three
 /// per-label-count gates, the auto-mode fallback tier, the nudge switch, the
 /// minimum word count and the optional per-tier default effort.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -289,6 +292,9 @@ pub async fn classify_dispatch(
 pub struct RoutingSettings {
     /// What dispatch does with Laya's answer (default [`RoutingMode::Off`]).
     pub mode: RoutingMode,
+    /// The gate for the four-label question the full ladder asks. Provisional
+    /// until the eval replaces it (design §4.4).
+    pub min_confidence_4: f64,
     /// The gate for a three-label question. Provisional until the eval
     /// replaces it (design §4.4).
     pub min_confidence_3: f64,
@@ -313,6 +319,7 @@ impl Default for RoutingSettings {
     fn default() -> Self {
         Self {
             mode: RoutingMode::Off,
+            min_confidence_4: route_question::DEFAULT_MIN_CONFIDENCE_4,
             min_confidence_3: route_question::DEFAULT_MIN_CONFIDENCE_3,
             min_confidence_2: route_question::DEFAULT_MIN_CONFIDENCE_2,
             knn_min_share: 0.80,
@@ -811,6 +818,7 @@ mod tests {
         std::fs::write(&path, "[ui]\ncompact = true\n").expect("existing settings");
         let settings = RoutingSettings {
             mode: RoutingMode::Auto,
+            min_confidence_4: 0.42,
             min_confidence_3: 0.51,
             fallback_tier: "trivial".into(),
             ..RoutingSettings::default()
@@ -822,6 +830,21 @@ mod tests {
         )
         .expect("valid TOML");
         assert_eq!(saved["ui"]["compact"], toml::Value::Boolean(true));
+    }
+
+    #[test]
+    fn gates_follow_the_label_count() {
+        let cfg = RoutingSettings {
+            min_confidence_4: 0.40,
+            min_confidence_3: 0.45,
+            min_confidence_2: 0.60,
+            ..RoutingSettings::default()
+        };
+        // The full ladder asks the four-label question; three and two labels
+        // use their own gates.
+        assert_eq!(threshold_for(4, &cfg), cfg.min_confidence_4);
+        assert_eq!(threshold_for(3, &cfg), cfg.min_confidence_3);
+        assert_eq!(threshold_for(2, &cfg), cfg.min_confidence_2);
     }
 
     #[test]
@@ -972,6 +995,10 @@ mod tests {
         let cfg = RoutingSettings::default();
         let tiers = all_enabled();
         assert_eq!(
+            threshold_for(4, &cfg),
+            route_question::DEFAULT_MIN_CONFIDENCE_4
+        );
+        assert_eq!(
             threshold_for(3, &cfg),
             route_question::DEFAULT_MIN_CONFIDENCE_3
         );
@@ -982,7 +1009,7 @@ mod tests {
 
         let at = StubClassifier::new(choice(
             route_question::LABEL_ROUTINE,
-            route_question::DEFAULT_MIN_CONFIDENCE_3,
+            route_question::DEFAULT_MIN_CONFIDENCE_4,
         ));
         let decision = classify_dispatch(&at, None, "text", tiers, &cfg)
             .await
@@ -992,7 +1019,7 @@ mod tests {
 
         let below = StubClassifier::new(choice(
             route_question::LABEL_ROUTINE,
-            route_question::DEFAULT_MIN_CONFIDENCE_3 - 0.001,
+            route_question::DEFAULT_MIN_CONFIDENCE_4 - 0.001,
         ));
         let decision = classify_dispatch(&below, None, "text", tiers, &cfg)
             .await
@@ -1025,7 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn the_gate_reads_the_top_probability_not_the_margin() {
         // A live-shaped answer: the pick's margin-like `confidence` (0.30)
-        // sits below the 3-label gate (0.475), the top option's probability
+        // sits below the four-label gate (0.40), the top option's probability
         // (0.9113) above it — the gate and the logged confidence read the
         // latter (`route_question::answer_confidence`).
         let answer = Answer::Choice {

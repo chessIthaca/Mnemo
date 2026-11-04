@@ -72,9 +72,13 @@ const previewEndpoints: EndpointDetailDto[] = [
 ];
 
 const previewTiers: TiersDto = {
-  difficult: ["openrouter/gpt-5.2"],
-  average: ["openrouter/glm-5.3-flash"],
-  simple: ["openrouter/glm-4.6-flash"],
+  tiers: [
+    { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["openrouter/glm-4.6-flash"], effort: null, role: null, resolves_to: "trivial" },
+    { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["openrouter/glm-5.3-flash"], effort: null, role: null, resolves_to: "trivial" },
+    { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: [], effort: null, role: null, resolves_to: "routine" },
+    { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["openrouter/gpt-5.2"], effort: null, role: null, resolves_to: "medium" },
+    { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high" },
+  ],
 };
 
 function previewSettings(): ModelSettings {

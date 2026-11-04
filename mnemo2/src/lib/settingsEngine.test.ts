@@ -59,7 +59,15 @@ describe("settingsEngine", () => {
 
   it("asks for usage and saves tiers", async () => {
     const { invoke, transport: t } = transport();
-    const tiers = { difficult: ["a/m1"], average: [], simple: ["a/m2"] };
+    const tiers = {
+      tiers: [
+        { id: "trivial", name: "Trivial", definition: "Lookups", models: ["a/m2"], effort: null, role: null, resolves_to: "trivial" },
+        { id: "routine", name: "Routine", definition: "Steps", models: [], effort: null, role: null, resolves_to: "trivial" },
+        { id: "medium", name: "Medium", definition: "Features", models: ["a/m1"], effort: null, role: null, resolves_to: "routine" },
+        { id: "high", name: "High", definition: "Design", models: [], effort: null, role: null, resolves_to: "medium" },
+        { id: "escalate", name: "Escalate", definition: "After a failure", models: [], effort: null, role: "escalate", resolves_to: "high" },
+      ],
+    };
     await t.endpointUsage("a");
     await t.saveTiers(tiers);
     expect(invoke).toHaveBeenNthCalledWith(1, "settings_endpoint_usage", { name: "a" });

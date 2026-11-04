@@ -2243,21 +2243,21 @@ export const previewScenes: PreviewScene[] = [
     },
   },
   {
-    name: "settings-laya",
-    title: "Settings: Decisions",
+    name: "settings-tiers",
+    title: "Settings: Tiers",
     description:
-      "The settings dialog's Decisions page: the Laya status block with Enable/Disable and install progress, the seven opt-in switches, and the routing lanes with the confidence threshold and enforce switch.",
+      "The settings dialog's Tiers page: the top control (does Laya help pick the tier?) with its readiness line and kNN count, the five-rung ladder editor with fold hints and Laya labels, the dispatch tier-text preview, the collapsed routing details and the Laya section at the bottom.",
     // Same mount pattern as settings-models; the rail click opens the
-    // Decisions page directly so the scene shows the page it names.
+    // Tiers page directly so the scene shows the page it names.
     build: missionControl,
     mount: (target) => {
       const restoreSettings = seedPreviewSettings();
       const restoreLaya = seedPreviewLaya();
       const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {} } });
-      const decisions = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
-        (button) => button.textContent === "Decisions",
+      const tiers = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
+        (button) => button.textContent === "Tiers",
       );
-      decisions?.click();
+      tiers?.click();
       return () => {
         unmount(dialog);
         restoreLaya();

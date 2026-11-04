@@ -148,7 +148,7 @@ mod tests {
                 "name": "worker-kimi",
                 "model": "Kimi/kimi-k3.1-pro",
                 "model_short": "kimi",
-                "tier": "average",
+                "tier": "routine",
                 "status": "running",
                 "needs_you": false,
                 "elapsed_ms": 1250

@@ -18,7 +18,7 @@
     type MemoryOverview,
     type MemoryRow,
   } from "../lib/memoryView";
-  import { parseRepoPath, repoPathTarget, type RepoPathRef } from "../lib/repoPaths";
+  import { parseRepoPath, repoPathTarget } from "../lib/repoPaths";
   import { actions } from "../lib/store";
   import ElapsedTime from "./ElapsedTime.svelte";
   import Markdown from "./Markdown.svelte";
@@ -83,12 +83,6 @@
   let recallQuery = $state("");
   let recallHits = $state<MemoryHit[] | null>(null);
   let recallError = $state("");
-
-  /** Open a path a record names: a plan document, or a file in the workbench. */
-  function openRepoPath(ref: RepoPathRef): void {
-    if (ref.kind === "plan" && ref.planId !== null) actions.openPlanDocument(ref.planId);
-    else actions.openFileInWorkbench(ref.path, ref.line);
-  }
 
   /** Turn a rejected command into one readable line (errors stay inline). */
   function errorMessage(value: unknown): string {
@@ -512,7 +506,7 @@
                 {#if detail.path}
                   {@const pathRef = parseRepoPath(detail.path)}
                   {#if pathRef}
-                    <button class="path-link" title={repoPathTarget(pathRef)} onclick={() => openRepoPath(pathRef)}><code>{detail.path}</code></button>
+                    <button class="path-link" title={repoPathTarget(pathRef)} onclick={() => actions.openRepoPath(pathRef)}><code>{detail.path}</code></button>
                   {:else}
                     <code>{detail.path}</code>
                   {/if}
@@ -522,7 +516,7 @@
               </p>
             </header>
 
-            <Markdown source={detail.markdown} onOpenPath={openRepoPath} />
+            <Markdown source={detail.markdown} onOpenPath={actions.openRepoPath} />
 
             {#if detail.links.length > 0}
               <section class="record-links" aria-label="Links">
@@ -532,7 +526,7 @@
                     {@const linkRef = parseRepoPath(link)}
                     <li>
                       {#if linkRef}
-                        <button class="path-link" title={repoPathTarget(linkRef)} onclick={() => openRepoPath(linkRef)}><code>{link}</code></button>
+                        <button class="path-link" title={repoPathTarget(linkRef)} onclick={() => actions.openRepoPath(linkRef)}><code>{link}</code></button>
                       {:else}
                         <code>{link}</code>
                       {/if}

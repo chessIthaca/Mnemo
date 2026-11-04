@@ -200,7 +200,7 @@
         style:overflow-y={briefExpanded ? "auto" : "hidden"}
         bind:this={briefContent}
       >
-        <Markdown source={worker.task} onOpenLink={actions.openBrowser} />
+        <Markdown source={worker.task} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} />
       </div>
     </section>
 

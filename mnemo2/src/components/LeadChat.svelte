@@ -134,7 +134,7 @@
               class="chat-entry"
             >
               {#if entry.author === "lead"}
-                <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
+                <Markdown source={entry.body} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} />
               {:else}
                 {#if entry.body}<p>{entry.body}</p>{/if}
                 {#if entry.images && entry.images.length > 0}
@@ -162,7 +162,7 @@
               {#snippet heading()}{name} sent an update{/snippet}
               <div class="event-detail">
                 <span class="event-time">{entry.time}</span>
-                <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
+                <Markdown source={entry.body} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} />
                 <button onclick={() => actions.selectWorker(entry.workerId)}>Open {name}’s thread <ArrowUpRight size={13} /></button>
               </div>
             </EventRow>
@@ -192,7 +192,7 @@
                     Legacy review · structured evidence is missing, so a fresh review is required before merge.
                   </p>
                 {/if}
-                <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
+                <Markdown source={entry.body} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} />
                 <button onclick={() => actions.selectWorker(entry.workerId)}>Review {name}’s delta <ArrowUpRight size={13} /></button>
               </div>
             </EventRow>

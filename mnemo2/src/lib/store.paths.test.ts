@@ -68,4 +68,33 @@ describe("Memory path hand-overs", () => {
 
     expect(state().workbenchFile).toBeNull();
   });
+
+  it("opens a path ref in the Workbench's Files tab at its line", () => {
+    actions.openRepoPath({ path: "src/a.rs", line: 42, kind: "file", planId: null });
+
+    expect(state().route).toBe("lead");
+    expect(state().workbenchOpen).toBe(true);
+    expect(state().workbenchTab).toBe("files");
+    expect(state().workbenchFile).toEqual({ path: "src/a.rs", line: 42 });
+  });
+
+  it("opens a plan ref on the Plans route", () => {
+    actions.openRepoPath({
+      path: ".coding/plans/abc12345.md",
+      line: null,
+      kind: "plan",
+      planId: "abc12345",
+    });
+
+    expect(state().route).toBe("plans");
+    expect(state().planDocumentId).toBe("abc12345");
+    expect(state().workbenchFile).toBeNull();
+  });
+
+  it("falls back to the file for a plan ref that carries no id", () => {
+    actions.openRepoPath({ path: ".coding/plans/orphan.md", line: null, kind: "plan", planId: null });
+
+    expect(state().workbenchTab).toBe("files");
+    expect(state().workbenchFile).toEqual({ path: ".coding/plans/orphan.md", line: null });
+  });
 });

@@ -5,6 +5,7 @@ import {
   ROUTING_LANES,
   createLayaTransport,
   layaStatusHint,
+  leavesPage,
   routingDraft,
   routingWire,
   setPreviewLayaTransport,
@@ -137,5 +138,49 @@ describe("layaSettings", () => {
       "escalate",
     ]);
     for (const lane of ROUTING_LANES) expect(lane.blurb.trim()).not.toBe("");
+  });
+
+  it("marks Escape keydowns and outside button clicks as leaving the page", () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const insideButton = document.createElement("button");
+    root.appendChild(insideButton);
+    const outsideButton = document.createElement("button");
+    document.body.appendChild(outsideButton);
+    const outsideText = document.createElement("p");
+    document.body.appendChild(outsideText);
+
+    const withRoot: boolean[] = [];
+    const withoutRoot: boolean[] = [];
+    const clickHandler = (event: Event): void => {
+      withRoot.push(leavesPage(event, root));
+      withoutRoot.push(leavesPage(event, null));
+    };
+    window.addEventListener("click", clickHandler, true);
+    insideButton.click();
+    outsideButton.click();
+    outsideText.click();
+    window.removeEventListener("click", clickHandler, true);
+    // An in-page click keeps its own meaning; an outside button leaves.
+    expect(withRoot).toEqual([false, true, false]);
+    // Without a bound root, every button click counts as leaving.
+    expect(withoutRoot).toEqual([true, true, false]);
+
+    const keys: boolean[] = [];
+    const keyHandler = (event: Event): void => {
+      keys.push(leavesPage(event, root));
+    };
+    window.addEventListener("keydown", keyHandler, true);
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+    window.removeEventListener("keydown", keyHandler, true);
+    expect(keys).toEqual([true, false]);
+
+    // beforeunload is handled by its own branch, never as a leaving click.
+    expect(leavesPage(new Event("beforeunload"), root)).toBe(false);
+
+    root.remove();
+    outsideButton.remove();
+    outsideText.remove();
   });
 });

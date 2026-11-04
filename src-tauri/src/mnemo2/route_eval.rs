@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use mnemo::agent::failure_triage::training_log_dir;
+use mnemo::agent::route_knn::RouteKnn;
 use mnemo::agent::route_question::{self, OfferedLabels};
 use mnemo::memory::classifier::{Answer, Classifier};
 
@@ -397,6 +398,33 @@ pub struct Miss {
     pub confidence: Option<f64>,
 }
 
+/// The kNN overlay's side of an eval: its coverage and accuracy on the same
+/// cases, then the combined kNN+Laya policy that dispatch actually runs.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KnnEvalReport {
+    /// How many labelled workers the overlay had indexed.
+    pub indexed_rows: usize,
+    /// Cases where the overlay's vote cleared the share gate.
+    pub answered: usize,
+    /// Of those, how many named the expected (folded) tier.
+    pub correct: usize,
+    /// `correct / answered` (`0.0` when the overlay never answered).
+    pub accuracy: f64,
+    /// Laya-only: cases that cleared the default gate.
+    pub laya_routed: usize,
+    /// Laya-only: of those, how many named the expected tier.
+    pub laya_correct: usize,
+    /// `laya_correct / laya_routed` (`0.0` when nothing routed).
+    pub laya_accuracy: f64,
+    /// kNN+Laya: cases where either the overlay answered or Laya cleared its
+    /// gate.
+    pub combined_answered: usize,
+    /// kNN+Laya: of those, how many named the expected tier.
+    pub combined_correct: usize,
+    /// `combined_correct / combined_answered`.
+    pub combined_accuracy: f64,
+}
+
 /// One offered-label count's report.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EvalReport {
@@ -411,6 +439,9 @@ pub struct EvalReport {
     pub suggested: Option<f64>,
     /// The mismatches at [`default_gate`](Self::default_gate).
     pub misses: Vec<Miss>,
+    /// The overlay comparison, when the eval had a live [`RouteKnn`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn: Option<KnnEvalReport>,
 }
 
 impl EvalReport {
@@ -450,7 +481,118 @@ pub fn report(scores: &[CaseScore], offered: OfferedLabels) -> EvalReport {
             })
         })
         .collect();
-    EvalReport { labels, default_gate, table, suggested, misses }
+    EvalReport {
+        labels,
+        default_gate,
+        table,
+        suggested,
+        misses,
+        knn: None,
+    }
+}
+
+/// Attach the overlay comparison to a report built by [`report`].
+pub fn report_with_knn(
+    scores: &[CaseScore],
+    offered: OfferedLabels,
+    knn: Option<KnnEvalReport>,
+) -> EvalReport {
+    let mut report = report(scores, offered);
+    report.knn = knn;
+    report
+}
+
+/// The label a kNN tier vote names, for comparison with a case's expected
+/// label.
+fn label_for_tier(tier: &str) -> Option<&'static str> {
+    match tier {
+        "simple" => Some(TIERS[0]),
+        "average" => Some(TIERS[1]),
+        "difficult" => Some(TIERS[2]),
+        _ => None,
+    }
+}
+
+/// Score the kNN overlay and the combined kNN+Laya policy on the same cases.
+///
+/// The overlay answers when its vote clears `min_share` after at least
+/// `min_rows` labelled workers (exactly dispatch's rule); otherwise the case
+/// falls back to Laya at its default gate. The hand set is a fixed prompt set,
+/// so this is coverage/accuracy where the overlay answered; log-derived cases
+/// are the caller's choice and are not treated as leave-one-out here (the
+/// eval's report is a sample, not a training fit).
+pub async fn evaluate_knn(
+    cases: &[EvalCase],
+    scores: &[CaseScore],
+    offered: OfferedLabels,
+    knn: &RouteKnn,
+    min_rows: usize,
+    min_share: f64,
+) -> KnnEvalReport {
+    let default_gate = route_question::default_min_confidence(offered.count());
+    let indexed_rows = knn.indexed_rows().await;
+    let mut answered = 0;
+    let mut correct = 0;
+    let mut laya_routed = 0;
+    let mut laya_correct = 0;
+    let mut combined_answered = 0;
+    let mut combined_correct = 0;
+    for (index, score) in scores.iter().enumerate() {
+        let expected = score.expectation(offered);
+        let vote = match cases.get(index) {
+            Some(case) => knn
+                .classify(&case.text, offered, min_rows)
+                .await
+                .filter(|vote| vote.share >= min_share),
+            None => None,
+        };
+        let knn_label = vote.as_ref().and_then(|vote| label_for_tier(&vote.tier));
+        if let Some(label) = knn_label {
+            answered += 1;
+            if expected.as_deref() == Some(label) {
+                correct += 1;
+            }
+        }
+        let laya_cleared = score.routed_at(default_gate);
+        if laya_cleared {
+            laya_routed += 1;
+            if score.label == expected {
+                laya_correct += 1;
+            }
+        }
+        // The combined policy: the overlay's answer wins when it cleared;
+        // otherwise Laya's gated answer decides.
+        let chosen: Option<String> = match knn_label {
+            Some(label) => Some(label.to_string()),
+            None if laya_cleared => score.label.clone(),
+            None => None,
+        };
+        if chosen.is_some() {
+            combined_answered += 1;
+            if chosen.as_deref() == expected.as_deref() {
+                combined_correct += 1;
+            }
+        }
+    }
+    let share = |part: usize, whole: usize| {
+        if whole == 0 {
+            0.0
+        } else {
+            part as f64 / whole as f64
+        }
+    };
+    KnnEvalReport {
+        indexed_rows,
+        answered,
+        correct,
+        accuracy: share(correct, answered),
+        laya_routed,
+        laya_correct,
+        laya_accuracy: share(laya_correct, laya_routed),
+        combined_answered,
+        combined_correct,
+        combined_accuracy: share(combined_correct, combined_answered),
+    }
 }
 
 /// Ask Laya about every case, one prompt at a time, and collect the answers.
@@ -617,6 +759,10 @@ mod tests {
             text_sha256: String::new(),
             text: text.to_string(),
             skip: skip.map(str::to_string),
+            source: Some("laya".to_string()),
+            knn_label: None,
+            knn_share: None,
+            knn_k: None,
         }
     }
 
@@ -859,5 +1005,67 @@ mod tests {
         let scores = classify_corpus(&scored, three(), &cases).await;
         assert_eq!(scores[0].label, None);
         assert_eq!(scores[0].confidence, None);
+    }
+
+    #[test]
+    fn report_with_knn_keeps_the_laya_table_and_attaches_the_overlay() {
+        let scores = vec![score("right", Some("routine"), Some("routine"), 0.90)];
+        let overlay = KnnEvalReport {
+            indexed_rows: 30,
+            answered: 1,
+            correct: 1,
+            accuracy: 1.0,
+            laya_routed: 1,
+            laya_correct: 1,
+            laya_accuracy: 1.0,
+            combined_answered: 1,
+            combined_correct: 1,
+            combined_accuracy: 1.0,
+        };
+        let with = report_with_knn(&scores, three(), Some(overlay.clone()));
+        let without = report(&scores, three());
+        assert_eq!(with.table, without.table);
+        assert_eq!(with.knn, Some(overlay));
+    }
+
+    struct ColdEmbedder;
+
+    #[async_trait]
+    impl mnemo::memory::embedder::Embedder for ColdEmbedder {
+        async fn embed(&self, _text: &str) -> Vec<f32> {
+            vec![0.0; 4]
+        }
+
+        fn model_id(&self) -> &str {
+            "cold"
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_knn_reports_laya_only_when_the_overlay_is_cold() {
+        use std::sync::Arc;
+
+        use mnemo::agent::failure_triage_knn::EmbedderGetter;
+        use mnemo::agent::route_knn::RouteKnn;
+        use mnemo::memory::embedder::Embedder;
+
+        let getter: EmbedderGetter = Arc::new(|| {
+            Arc::new(ColdEmbedder) as Arc<dyn Embedder>
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let knn = RouteKnn::new(getter, dir.path().join("missing.jsonl"));
+        let cases = vec![EvalCase {
+            text: "a routine step".to_string(),
+            expected: Some("routine".to_string()),
+        }];
+        let scores = vec![score("a routine step", Some("routine"), Some("routine"), 0.90)];
+        let report = evaluate_knn(&cases, &scores, three(), &knn, 30, 0.80).await;
+        assert_eq!(report.indexed_rows, 0);
+        assert_eq!(report.answered, 0);
+        assert_eq!(report.laya_routed, 1);
+        assert_eq!(report.laya_correct, 1);
+        assert_eq!(report.combined_answered, 1);
+        assert_eq!(report.combined_correct, 1);
+        assert!((report.combined_accuracy - 1.0).abs() < 1e-9);
     }
 }

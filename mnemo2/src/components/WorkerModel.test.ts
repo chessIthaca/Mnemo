@@ -15,7 +15,7 @@ const worker = (status: Worker["status"]): Worker => ({
   status,
   model: "test/fast",
   modelSpec: "test/fast",
-  tier: "simple",
+  tier: "trivial",
 });
 
 describe("worker model", () => {
@@ -27,7 +27,7 @@ describe("worker model", () => {
   it("moves a stopped worker to another model from its header", async () => {
     const setWorkerModel = vi.spyOn(actions, "setWorkerModel").mockResolvedValue();
     render(WorkerDetail, { worker: worker("failed") });
-    expect(screen.getByText("tier: simple")).toBeTruthy();
+    expect(screen.getByText("tier: trivial")).toBeTruthy();
     const select = screen.getByRole("combobox", { name: /model$/ }) as HTMLSelectElement;
     expect(select.value).toBe("test/fast");
     await fireEvent.change(select, { target: { value: "test/deep" } });

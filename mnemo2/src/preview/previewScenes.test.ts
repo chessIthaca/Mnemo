@@ -79,7 +79,7 @@ describe("preview scenes", () => {
       "worker-thread",
       "lead-chat",
       "settings-models",
-      "settings-laya",
+      "settings-tiers",
       "settings-safety",
       "settings-mcp",
       "settings-appearance",

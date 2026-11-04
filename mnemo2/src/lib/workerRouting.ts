@@ -11,9 +11,10 @@ const FINISHED: readonly WorkerStatus[] = ["completed", "merged", "failed", "sto
 
 /**
  * The routing chip's text, or `null` when the dispatch recorded no decision.
+ * The tier ids are the five ladder ids (`trivial`…`escalate`).
  *
- * - a cleared answer reads `Laya: average 0.62` (the tier and its confidence);
- * - a decision Laya did not clear reads `lead chose difficult`;
+ * - a cleared answer reads `Laya: routine 0.62` (the tier and its confidence);
+ * - a decision Laya did not clear reads `lead chose high`;
  * - a dispatch with no tier at all reads `Laya unsure`.
  */
 export function routingChipText(routing: WorkerRouting | null | undefined): string | null {

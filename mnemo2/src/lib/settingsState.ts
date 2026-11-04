@@ -1,10 +1,17 @@
-import type { EndpointDetailDto, TierName, TiersDto } from "./settingsEngine";
+import type { EndpointDetailDto, TiersDto } from "./settingsEngine";
 
-export const TIER_META: Record<TierName, { label: string; blurb: string }> = {
-  difficult: { label: "Difficult", blurb: "Design, debugging, bug fixes, shared contracts" },
-  average: { label: "Average", blurb: "Typical implementation steps" },
-  simple: { label: "Simple and tools", blurb: "Single-file edits, checks, lookups, scaffolding" },
+/**
+ * Laya's neutral, byte-stable label per pickable tier (design §3.1): `medium`
+ * answers as `involved`, `high` as `hard`. `escalate` never gets one — Laya
+ * and the kNN are never offered it.
+ */
+export const LAYA_LABELS: Record<string, string> = {
+  trivial: "trivial",
+  routine: "routine",
+  medium: "involved",
+  high: "hard",
 };
+
 
 export interface EndpointPreset {
   id: string;
@@ -65,9 +72,7 @@ export function priceOfSpec(endpoints: EndpointDetailDto[], spec: string): strin
 
 /** Labels of the tiers that list this spec. */
 export function tiersListing(tiers: TiersDto, spec: string): string[] {
-  return (Object.keys(TIER_META) as TierName[])
-    .filter((name) => tiers[name].includes(spec))
-    .map((name) => TIER_META[name].label);
+  return tiers.tiers.filter((tier) => tier.models.includes(spec)).map((tier) => tier.name);
 }
 
 export function moveItem<T>(items: T[], index: number, delta: number): T[] {
@@ -79,5 +84,7 @@ export function moveItem<T>(items: T[], index: number, delta: number): T[] {
 }
 
 export function cloneTiers(tiers: TiersDto): TiersDto {
-  return { difficult: [...tiers.difficult], average: [...tiers.average], simple: [...tiers.simple] };
+  return {
+    tiers: tiers.tiers.map((tier) => ({ ...tier, models: [...tier.models] })),
+  };
 }

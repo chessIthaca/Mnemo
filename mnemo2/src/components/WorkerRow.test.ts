@@ -195,20 +195,20 @@ describe("WorkerRow", () => {
   it("shows the dispatch routing chip and the live nudge chip", () => {
     const routed: Worker = {
       ...worker(),
-      tier: "average",
+      tier: "routine",
       routing: {
-        laya_tier: "average",
+        laya_tier: "routine",
         confidence: 0.62,
         cleared: true,
         lead_tier: null,
         routed_by: "laya",
-        ran_tier: "average",
-        nudged: "difficult",
+        ran_tier: "routine",
+        nudged: "high",
       },
     };
     const { container } = render(WorkerRow, { worker: routed, onSelect: vi.fn() });
-    expect(screen.getByText("Laya: average 0.62")).toBeTruthy();
-    expect(screen.getByText("Laya suggests difficult — stuck")).toBeTruthy();
+    expect(screen.getByText("Laya: routine 0.62")).toBeTruthy();
+    expect(screen.getByText("Laya suggests high — stuck")).toBeTruthy();
     expect(container.querySelectorAll(".route-chip")).toHaveLength(2);
   });
 
@@ -216,20 +216,20 @@ describe("WorkerRow", () => {
     const routed: Worker = {
       ...worker(),
       status: "merged",
-      tier: "average",
+      tier: "routine",
       routing: {
-        laya_tier: "average",
+        laya_tier: "routine",
         confidence: 0.62,
         cleared: true,
         lead_tier: null,
         routed_by: "laya",
-        ran_tier: "average",
-        nudged: "difficult",
+        ran_tier: "routine",
+        nudged: "high",
       },
     };
     const { container } = render(WorkerRow, { worker: routed, onSelect: vi.fn() });
     expect(screen.queryByText(/Laya suggests/)).toBeNull();
-    expect(screen.getByText("Laya: average 0.62")).toBeTruthy();
+    expect(screen.getByText("Laya: routine 0.62")).toBeTruthy();
     expect(container.querySelectorAll(".route-chip")).toHaveLength(1);
   });
 });

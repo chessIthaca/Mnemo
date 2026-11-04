@@ -6,11 +6,10 @@
   import { createSafetyTransport } from "../lib/safetySettings";
   import { createAppearanceTransport } from "../lib/sounds";
   import { currentProject } from "../lib/store";
-  import { createSettingsTransport, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
+  import { createSettingsTransport, emptyTiers, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import AppearancePage from "./AppearancePage.svelte";
   import EndpointsPage from "./EndpointsPage.svelte";
-  import LayaPage from "./LayaPage.svelte";
   import McpPage from "./McpPage.svelte";
   import ModelsPage from "./ModelsPage.svelte";
   import ProjectPage from "./ProjectPage.svelte";
@@ -25,7 +24,6 @@
     | "tiers"
     | "models"
     | "savings"
-    | "laya"
     | "safety"
     | "mcp"
     | "appearance";
@@ -44,7 +42,6 @@
         { id: "tiers", label: "Tiers" },
         { id: "models", label: "Models" },
         { id: "savings", label: "Savings" },
-        { id: "laya", label: "Decisions" },
         { id: "safety", label: "Safety" },
         { id: "mcp", label: "MCP" },
         { id: "appearance", label: "Appearance" },
@@ -57,14 +54,16 @@
     onclose,
     /** The page to show on open; the top bar's gear asks for "project". */
     initialPage = "endpoints",
-  }: { open: boolean; onclose: () => void; initialPage?: Page } = $props();
+  }: { open: boolean; onclose: () => void; initialPage?: Page | "laya" } = $props();
 
   const hasProject = $derived($currentProject !== null);
   /** The Project page wears the project’s name; "Project" stands in without one. */
   const projectLabel = $derived($currentProject?.name ?? "Project");
 
-  /** The page an open request lands on — a Project request needs a project. */
-  function startPage(requested: Page): Page {
+  /** The page an open request lands on — a Project request needs a project,
+   * and the retired Decisions page redirects to Tiers (its Laya section). */
+  function startPage(requested: Page | "laya"): Page {
+    if (requested === "laya") return "tiers";
     return requested === "project" && !hasProject ? "endpoints" : requested;
   }
 
@@ -78,7 +77,7 @@
   });
 
   let endpoints = $state<EndpointDetailDto[]>([]);
-  let tiers = $state<TiersDto>({ difficult: [], average: [], simple: [] });
+  let tiers = $state<TiersDto>(emptyTiers());
   let loading = $state(false);
   let loadError = $state("");
   const transport = $derived(open ? createSettingsTransport() : null);
@@ -154,12 +153,6 @@
           {:else}
             <p class="settings-empty">Savings settings are available in the desktop app.</p>
           {/if}
-        {:else if page === "laya"}
-          {#if layaTransport}
-            <LayaPage transport={layaTransport} {endpoints} />
-          {:else}
-            <p class="settings-empty">Decision settings are available in the desktop app.</p>
-          {/if}
         {:else if page === "safety"}
           {#if safetyTransport}
             <SafetyPage transport={safetyTransport} />
@@ -179,7 +172,7 @@
             <p class="settings-empty">Sound and theme settings are available in the desktop app.</p>
           {/if}
         {:else}
-          <TiersPage {transport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />
+          <TiersPage {transport} {layaTransport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />
         {/if}
       </section>
     </div>

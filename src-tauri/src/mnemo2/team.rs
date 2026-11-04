@@ -953,15 +953,24 @@ fn enabled_tiers_over(
     models: &[LeadModel],
     tiers: &mnemo::headless::TiersDto,
 ) -> EnabledTiers {
-    let named = |specs: &[String]| {
-        specs
+    let named = |old_id: &str| {
+        let Some(id) = mnemo::config::TierLadder::convert_old_id(old_id) else {
+            return false;
+        };
+        tiers
+            .tiers
             .iter()
-            .any(|spec| models.iter().any(|model| model.spec == *spec))
+            .find(|tier| tier.id == id)
+            .is_some_and(|tier| {
+                tier.models
+                    .iter()
+                    .any(|spec| models.iter().any(|model| model.spec == *spec))
+            })
     };
     EnabledTiers {
-        simple: named(&tiers.simple),
-        average: named(&tiers.average),
-        difficult: named(&tiers.difficult),
+        simple: named("simple"),
+        average: named("average"),
+        difficult: named("difficult"),
     }
 }
 
@@ -1339,12 +1348,11 @@ impl TeamRuntime {
     /// The tier's configured models that are still available, in order.
     pub(crate) fn tier_models(&self, tier: &str) -> Vec<LeadModel> {
         let tiers = self.tiers.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let specs = match tier {
-            "difficult" => tiers.difficult,
-            "average" => tiers.average,
-            "simple" => tiers.simple,
-            _ => Vec::new(),
-        };
+        // Temporary old-id mapping until step 3 moves Mnemo2 onto the ladder.
+        let specs = mnemo::config::TierLadder::convert_old_id(tier)
+            .and_then(|id| tiers.tiers.iter().find(|candidate| candidate.id == id))
+            .map(|tier| tier.models.clone())
+            .unwrap_or_default();
         let models = self.current_models();
         specs
             .iter()
@@ -8156,6 +8164,19 @@ fn executor_gate_rules() -> Vec<GateRule> {
 mod tests {
     use super::*;
 
+    macro_rules! tiers_dto {
+        (difficult: $difficult:expr, average: $average:expr, simple: $simple:expr $(,)?) => {{
+            let mut dto = mnemo::headless::TiersDto::default();
+            dto.tiers[0].models = $simple;
+            dto.tiers[1].models = $average;
+            dto.tiers[3].models = $difficult;
+            dto
+        }};
+        (simple: $simple:expr, average: $average:expr, difficult: $difficult:expr $(,)?) => {{
+            tiers_dto!(difficult: $difficult, average: $average, simple: $simple)
+        }};
+    }
+
     #[tokio::test]
 
     async fn phase_two_ledgers_load_with_phase_three_defaults() {
@@ -10675,7 +10696,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         ];
         team.set_catalog(
             models,
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 difficult: vec!["test/scripted-difficult".into()],
                 average: vec!["test/scripted-average".into()],
                 simple: vec!["test/scripted-simple".into()],
@@ -10896,7 +10917,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 lead_model("scripted-average"),
                 lead_model("scripted-simple"),
             ],
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 difficult: vec!["test/scripted-difficult".into()],
                 average: vec!["test/scripted-average".into()],
                 simple: vec!["test/scripted-simple".into()],
@@ -11474,7 +11495,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 lead_model("scripted-average"),
                 lead_model("scripted-simple"),
             ],
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 difficult: vec!["test/scripted-difficult".into()],
                 average: vec!["test/scripted-average".into()],
                 simple: vec!["test/scripted-simple".into()],
@@ -11695,7 +11716,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 lead_model("scripted-average"),
                 lead_model("scripted-simple"),
             ],
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 difficult: vec!["test/scripted-difficult".into()],
                 average: vec!["test/scripted-average".into()],
                 simple: vec!["test/scripted-simple".into()],
@@ -12133,7 +12154,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 lead_model("scripted-average2"),
                 lead_model("scripted-simple"),
             ],
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 difficult: vec!["test/scripted-difficult".into()],
                 average: vec![
                     "test/scripted-average".into(),
@@ -12663,7 +12684,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             let team = open_test_team(root.path(), state.path(), Vec::new()).await;
             team.set_catalog(
                 vec![lead_model("scripted-model")],
-                mnemo::headless::TiersDto {
+                tiers_dto! {
                     simple: vec!["test/scripted-model".into()],
                     average: vec!["test/scripted-model".into()],
                     difficult: vec!["test/scripted-model".into()],
@@ -12698,7 +12719,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             let team = open_test_team(root.path(), state.path(), Vec::new()).await;
             team.set_catalog(
                 vec![lead_model("scripted-model")],
-                mnemo::headless::TiersDto {
+                tiers_dto! {
                     simple: vec!["test/scripted-model".into()],
                     average: vec!["test/scripted-model".into()],
                     difficult: vec!["test/scripted-model".into()],
@@ -12867,7 +12888,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         .await;
         fixture.team.set_catalog(
             vec![lead_model("scripted-model")],
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 simple: vec!["test/scripted-model".into()],
                 average: Vec::new(),
                 difficult: vec!["test/scripted-model".into()],
@@ -13082,7 +13103,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         let team = open_test_team(root.path(), state.path(), Vec::new()).await;
         team.set_catalog(
             vec![lead_model("scripted-model")],
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 simple: vec!["test/scripted-model".into()],
                 average: vec!["test/scripted-model".into()],
                 difficult: vec!["test/scripted-model".into()],
@@ -13184,7 +13205,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                         ..lead_model(&format!("scripted-{tier}"))
                     })
                     .collect(),
-                mnemo::headless::TiersDto {
+                tiers_dto! {
                     difficult: vec!["test/scripted-difficult".into()],
                     average: vec!["test/scripted-average".into()],
                     simple: vec!["test/scripted-simple".into()],

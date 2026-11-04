@@ -64,7 +64,7 @@ use mnemo::agent::route_knn::RouteKnn;
 use mnemo::agent::route_question::OfferedLabels;
 use mnemo::config::general::LayaConfig;
 use mnemo::config::settings_dto::{RoutingConfigDto, SettingsSaveDto};
-use mnemo::config::{Config, ModelRef};
+use mnemo::config::Config;
 use mnemo::headless::{EventReceiver, RecvError, Setup, SetupEvent};
 use mnemo::laya::{LayaManager, english_checkpoint};
 use mnemo::memory::classifier::{Classifier, ClassifierStatus};
@@ -236,11 +236,11 @@ pub(crate) fn laya_status_read(setup: &Setup, in_flight: bool) -> Result<LayaSta
             reflex: laya.reflex,
         },
         routing: RoutingWire {
-            cheap: qualified(routing.cheap.as_ref()),
-            capable: qualified(routing.capable.as_ref()),
-            lane_medium: qualified(routing.lane_medium.as_ref()),
-            lane_high: qualified(routing.lane_high.as_ref()),
-            escalate: qualified(routing.escalate.as_ref()),
+            cheap: config.tiers.first_model("trivial").map(str::to_string),
+            capable: config.tiers.first_model("high").map(str::to_string),
+            lane_medium: config.tiers.first_model("medium").map(str::to_string),
+            lane_high: config.tiers.first_model("high").map(str::to_string),
+            escalate: config.tiers.first_model("escalate").map(str::to_string),
             threshold: routing.threshold,
             enforce: routing.enforce,
         },
@@ -489,12 +489,6 @@ pub(crate) fn stop_held_manager() {
     {
         manager.stop();
     }
-}
-
-/// Compact `"endpoint/model"` form of a routing slot for the wire
-/// (model ids may contain slashes themselves — the first one splits).
-fn qualified(model: Option<&ModelRef>) -> Option<String> {
-    model.map(|model| format!("{}/{}", model.endpoint, model.model))
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -919,7 +913,6 @@ pub async fn routing_eval_reports(
 mod tests {
     use super::*;
     use mnemo::config::general::SafetyMode;
-    use mnemo::config::settings_dto::ModelRefDto;
     use crate::mnemo2::runtime::LeadRuntimeOptions;
 
     /// A temp config dir with a rich fixture: a `config.toml` whose
@@ -1012,10 +1005,10 @@ simple = ["ep1/exec-model"]
         assert!(!wire.flags.routing);
         assert!(!wire.flags.reflex);
         // The routing block rides in its compact form.
-        assert_eq!(wire.routing.cheap.as_deref(), Some("ep1/tiny"));
-        assert_eq!(wire.routing.capable.as_deref(), Some("ep1/big"));
+        assert_eq!(wire.routing.cheap.as_deref(), Some("ep1/exec-model"));
+        assert_eq!(wire.routing.capable.as_deref(), Some("ep1/plan-model"));
         assert_eq!(wire.routing.lane_medium, None);
-        assert_eq!(wire.routing.lane_high.as_deref(), Some("ep1/top"));
+        assert_eq!(wire.routing.lane_high.as_deref(), Some("ep1/plan-model"));
         assert_eq!(wire.routing.escalate, None);
         assert!((wire.routing.threshold - 0.75).abs() < 1e-9);
         assert!(wire.routing.enforce);
@@ -1125,24 +1118,6 @@ simple = ["ep1/exec-model"]
             reflex: Some(true),
         };
         let routing = RoutingConfigDto {
-            cheap: Some(Some(ModelRefDto {
-                endpoint: "ep1".into(),
-                model: "other-model".into(),
-                reasoning_effort: None,
-            })),
-            capable: None,
-            routine: Some(Some(ModelRefDto {
-                endpoint: "ep1".into(),
-                model: "small".into(),
-                reasoning_effort: None,
-            })),
-            lane_medium: Some(Some(ModelRefDto {
-                endpoint: "ep1".into(),
-                model: "mid".into(),
-                reasoning_effort: None,
-            })),
-            lane_high: Some(None),
-            escalate: None,
             threshold: Some(0.9),
             first_prompt_min_confidence: Some(Some(0.55)),
             enforce: Some(false),
@@ -1162,17 +1137,16 @@ simple = ["ep1/exec-model"]
         assert!(laya.routing);
         assert!(laya.reflex);
         let routing = &config.general.general.routing;
-        assert_eq!(routing.cheap.as_ref().expect("cheap set").model, "other-model");
-        assert_eq!(
-            routing.routine.as_ref().expect("routine set").model,
-            "small",
-            "the first-prompt routine target round-trips through the sanctioned save"
-        );
         assert_eq!(routing.first_prompt_min_confidence, Some(0.55));
-        assert_eq!(routing.capable.as_ref().expect("capable kept").model, "big");
-        assert_eq!(routing.lane_medium.as_ref().expect("lane_medium set").model, "mid");
-        assert!(routing.lane_high.is_none(), "Some(None) clears the slot");
-        assert!(routing.escalate.is_none());
+        assert_eq!(
+            config.tiers.get("trivial").unwrap().models,
+            vec!["ep1/exec-model", "ep1/tiny"]
+        );
+        assert_eq!(config.tiers.get("routine").unwrap().models, vec!["ep1/exec-model"]);
+        assert_eq!(
+            config.tiers.get("high").unwrap().models,
+            vec!["ep1/plan-model", "ep1/big", "ep1/top"]
+        );
         assert!((routing.threshold - 0.9).abs() < 1e-9);
         assert!(!routing.enforce);
 
@@ -1187,15 +1161,8 @@ simple = ["ep1/exec-model"]
         let config = Config::load(dir.path()).expect("reload");
         assert!(!config.general.general.laya.reflex);
         assert_eq!(
-            config
-                .general
-                .general
-                .routing
-                .cheap
-                .as_ref()
-                .expect("cheap kept")
-                .model,
-            "other-model"
+            config.tiers.get("trivial").unwrap().models,
+            vec!["ep1/exec-model", "ep1/tiny"]
         );
 
         // Unrelated sections survive the schema rewrite...
@@ -1212,8 +1179,12 @@ simple = ["ep1/exec-model"]
         );
         assert_eq!(config.general.context.summarize_at_fill_rate, 0.5);
         // ...and so does the [tiers] table save_all carries through.
-        let tiers = mnemo::config::endpoints::load_tiers(&dir.path().join("endpoints.toml"));
-        assert_eq!(tiers.difficult, vec!["ep1/plan-model".to_string()]);
+        let tiers = mnemo::config::endpoints::load_tier_ladder(
+            &dir.path().join("endpoints.toml"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tiers.get("high").unwrap().models[0], "ep1/plan-model");
     }
 
     #[tokio::test]

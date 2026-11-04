@@ -22,7 +22,7 @@ pub mod patch;
 pub mod projects;
 pub mod settings_dto;
 
-pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, Tiers, kind_wire};
+pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, Tier, TierLadder, kind_wire};
 pub use general::{
     BudgetConfig, EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig,
     MarkdownConfig, ModelRef, ModelsConfig, OptimizerConfig, RoutingConfig, SafetyMode,
@@ -47,6 +47,8 @@ pub struct Config {
     pub endpoints: Vec<Endpoint>,
     /// Per-model pricing from `endpoints.toml` (`[[pricing]]`).
     pub pricing: Vec<PricingEntry>,
+    /// The unified five-tier model ladder from `endpoints.toml` (`[[tier]]`).
+    pub tiers: TierLadder,
     /// API keys from `keys.toml`. Kept separate so it is never accidentally logged.
     pub keys: KeyStore,
     /// MCP server definitions from `mcp.toml` (names + transports; env-var
@@ -54,6 +56,170 @@ pub struct Config {
     pub mcp: Vec<McpServerDef>,
     /// Known-projects registry from `projects.toml`.
     pub projects: ProjectRegistry,
+}
+
+fn configured_default_model(general: &GeneralConfig, endpoints: &[Endpoint]) -> Option<String> {
+    let model = general.general.default_model.as_ref()?;
+    let endpoint = general
+        .general
+        .default_provider
+        .as_ref()
+        .and_then(|name| endpoints.iter().find(|endpoint| endpoint.name == *name))
+        .or_else(|| endpoints.first())?;
+    Some(format!("{}/{}", endpoint.name, model))
+}
+
+struct TierLoad {
+    general: GeneralConfig,
+    config_text: String,
+    endpoints: Vec<Endpoint>,
+    pricing: Vec<PricingEntry>,
+    tiers: TierLadder,
+    lanes_migrated: bool,
+    tiers_migrated: bool,
+}
+
+fn read_tier_load(config_path: &Path, endpoints_path: &Path) -> Result<TierLoad> {
+    let config_text = if config_path.exists() {
+        fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+    let general = GeneralConfig::from_toml_text(&config_text)?;
+    let (endpoints, pricing) = endpoints::load_or_default(endpoints_path)?;
+    let default_model = configured_default_model(&general, &endpoints);
+    let mut tiers = endpoints::load_tier_ladder(endpoints_path, default_model.as_deref())?;
+    let lanes_migrated = general::merge_legacy_lanes(&config_text, &mut tiers)?;
+    if lanes_migrated {
+        tiers.fill_default_model(default_model.as_deref());
+    }
+    let tiers_migrated = endpoints::tier_file_needs_migration(endpoints_path)?;
+    Ok(TierLoad {
+        general,
+        config_text,
+        endpoints,
+        pricing,
+        tiers,
+        lanes_migrated,
+        tiers_migrated,
+    })
+}
+
+/// OS-owned cross-process guard for every config/endpoints write and for
+/// interrupted-write recovery. The lock file is created once and never deleted
+/// or renamed; the operating system releases the lock when the holder exits.
+struct ConfigWriteLock {
+    file: fs::File,
+}
+
+impl ConfigWriteLock {
+    fn acquire(config_dir: &Path) -> Result<Self> {
+        Self::acquire_with_hook(config_dir, None)
+    }
+
+    fn acquire_with_hook(
+        config_dir: &Path,
+        on_contended: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<Self> {
+        Self::acquire_with_timeout(config_dir, on_contended, std::time::Duration::from_secs(5))
+    }
+
+    fn acquire_with_timeout(
+        config_dir: &Path,
+        on_contended: Option<&(dyn Fn() + Send + Sync)>,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        fs::create_dir_all(config_dir)?;
+        let path = config_dir.join("config.write.lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if let Some(hook) = on_contended {
+                        hook();
+                    }
+                    if started.elapsed() >= timeout {
+                        return Err(crate::error::Error::Config(format!(
+                            "timed out waiting for config write lock {}",
+                            path.display()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for ConfigWriteLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn lane_backup_is_valid(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return false;
+    };
+    value
+        .get("general")
+        .and_then(|general| general.get("routing"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|routing| {
+            ["cheap", "routine", "capable", "lane_medium", "lane_high", "escalate"]
+                .iter()
+                .any(|lane| routing.get(*lane).and_then(toml::Value::as_table).is_some())
+        })
+}
+
+/// Stage and fsync the lane backup before installing it. A valid existing
+/// backup is immutable; an empty, malformed, or lane-less one is replaced.
+fn write_lane_backup(path: &Path, original: &str) -> Result<()> {
+    use std::io::Write;
+
+    if path.exists() && lane_backup_is_valid(path) {
+        return Ok(());
+    }
+    let tmp = staging_path(path);
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(original.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        if !path.exists() {
+            match fs::rename(&tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(error) if !path.exists() => return Err(error.into()),
+                Err(_) => {}
+            }
+        }
+        if lane_backup_is_valid(path) {
+            let _ = fs::remove_file(&tmp);
+            return Ok(());
+        }
+        // An invalid pre-existing backup is replaced from the original text,
+        // still available because lane removal has not happened yet.
+        commit_atomic_rename(path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 impl Config {
@@ -69,15 +235,35 @@ impl Config {
         for name in ["config.toml", "endpoints.toml", "keys.toml", "mcp.toml"] {
             recover_interrupted_write(&config_dir.join(name));
         }
-        let general = GeneralConfig::load_or_default(&config_dir.join("config.toml"))?;
-        let (endpoints, pricing) = endpoints::load_or_default(&config_dir.join("endpoints.toml"))?;
+        let config_path = config_dir.join("config.toml");
+        let endpoints_path = config_dir.join("endpoints.toml");
+        let mut loaded = read_tier_load(&config_path, &endpoints_path)?;
+        if loaded.lanes_migrated || loaded.tiers_migrated {
+            let _lock = ConfigWriteLock::acquire(config_dir)?;
+            // A competing loader may have completed the migration while we
+            // waited. Re-read both inputs before deciding or writing anything.
+            loaded = read_tier_load(&config_path, &endpoints_path)?;
+            if loaded.lanes_migrated {
+                write_lane_backup(
+                    &config_dir.join("config.toml.lanes.bak"),
+                    &loaded.config_text,
+                )?;
+            }
+            if loaded.lanes_migrated || loaded.tiers_migrated {
+                endpoints::save_tier_ladder_unlocked(&endpoints_path, &loaded.tiers)?;
+            }
+            if loaded.lanes_migrated {
+                loaded.general.save_unlocked(&config_path)?;
+            }
+        }
         let keys = KeyStore::load_or_default(&config_dir.join("keys.toml"))?;
         let mcp = mcp::load_or_default(&config_dir.join("mcp.toml"))?;
         let projects = ProjectRegistry::load_or_default(&config_dir.join("projects.toml"))?;
         Ok(Self {
-            general,
-            endpoints,
-            pricing,
+            general: loaded.general,
+            endpoints: loaded.endpoints,
+            pricing: loaded.pricing,
+            tiers: loaded.tiers,
             keys,
             mcp,
             projects,
@@ -134,7 +320,10 @@ impl Config {
     /// `projects.toml` is owned by the project registry
     /// and is not touched here. Each file is fully rewritten from the in-memory
     /// `Config`, so the schema is the source of truth (unknown keys are
-    /// dropped).
+    /// dropped) — except the tier ladder in `endpoints.toml`, which a cached
+    /// `Config` does not own: the representation currently on disk (native
+    /// `[[tier]]` or legacy `[tiers]`) is carried through unchanged, and only
+    /// explicit tier writers replace it.
     ///
     /// **Transactional write (best-effort on plain FS):**
     /// 1. Serialize all four payloads first (serde failure never touches disk).
@@ -146,16 +335,35 @@ impl Config {
     ///    previous generation rather than a mixed old/new set.
     /// 6. On full success, delete the `.bak` files.
     pub fn save_all(&self, config_dir: &Path) -> Result<()> {
+        self.save_all_inner(config_dir, None)
+    }
+
+    fn save_all_inner(
+        &self,
+        config_dir: &Path,
+        after_tier_read: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<()> {
+        // This guard covers the read-preserve-commit window, not just the
+        // final rename: a concurrent set_tiers must wait until our snapshot
+        // has committed, then apply its own read-modify-write afterward.
+        let _lock = ConfigWriteLock::acquire(config_dir)?;
         // Serialize everything *before* touching disk so a serde failure
         // never partially updates files.
         let config_text = toml::to_string_pretty(&self.general)?;
         let endpoints_text = {
+            // A cached Config does not own the ladder. Preserve the native or
+            // legacy tier representation currently on disk; explicit tier
+            // writers are the only paths that replace it.
+            let (tier, legacy_tiers) =
+                endpoints::tier_storage(&config_dir.join("endpoints.toml"))?;
+            if let Some(hook) = after_tier_read {
+                hook();
+            }
             let file = endpoints::EndpointsFile {
                 endpoint: self.endpoints.clone(),
                 pricing: self.pricing.clone(),
-                // `[tiers]` is not part of the in-memory Config: carry the
-                // on-disk table through every Mnemo1 save.
-                tiers: endpoints::load_tiers(&config_dir.join("endpoints.toml")),
+                tier,
+                legacy_tiers,
             };
             toml::to_string_pretty(&file)?
         };
@@ -425,6 +633,39 @@ fn describe_rollback_failure(
 /// 2. `path.bak` (pre-save snapshot from save_all)
 /// 3. `path.tmp` (staged new contents — better than empty defaults)
 fn recover_interrupted_write(path: &Path) {
+    recover_interrupted_write_with_hook(path, None);
+}
+
+fn recover_interrupted_write_with_hook(
+    path: &Path,
+    on_contended: Option<&(dyn Fn() + Send + Sync)>,
+) {
+    let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+        return;
+    };
+    if !recovery_needed(path) {
+        return;
+    }
+    // Recovery can restore an aside or staging file, so it is a write and
+    // must wait for the same owner as ordinary config/endpoints writes.
+    let Ok(_lock) = ConfigWriteLock::acquire_with_hook(parent, on_contended) else {
+        return;
+    };
+    recover_interrupted_write_unlocked(path);
+}
+
+fn recovery_needed(path: &Path) -> bool {
+    let mut aside_name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| "file".into());
+    aside_name.push(".bak.commit");
+    path.with_file_name(aside_name).exists()
+        || staging_path(path).exists()
+        || (!path.exists() && backup_path(path).exists())
+}
+
+fn recover_interrupted_write_unlocked(path: &Path) {
     if path.exists() {
         // Clean stale pivot/tmp left beside a good live file.
         let mut aside_name = path
@@ -458,6 +699,16 @@ fn recover_interrupted_write(path: &Path) {
 
 /// Write `contents` to `path` via temp file + rename (single-file atomic).
 pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let _lock = ConfigWriteLock::acquire(parent)?;
+    write_atomic_unlocked(path, contents)
+}
+
+/// Write without acquiring the config lock. The caller must hold it.
+pub(crate) fn write_atomic_unlocked(path: &Path, contents: &str) -> Result<()> {
     write_atomic_staged(path, contents)?;
     commit_atomic_rename(path)?;
     Ok(())
@@ -1294,5 +1545,440 @@ api_key = "sk-x"
         assert!(msg.contains("config.toml"), "{msg}");
         assert!(msg.contains("device full"), "{msg}");
         assert!(msg.contains("half-committed"), "{msg}");
+    }
+}
+
+
+#[cfg(test)]
+mod unified_tier_migration_tests {
+    use super::*;
+
+    fn endpoint_table() -> &'static str {
+        r#"
+[[endpoint]]
+name = "ep"
+kind = "openai"
+base_url = "http://localhost/"
+models = ["default", "legacy-tiny", "tiny", "legacy-routine", "routine", "medium", "legacy-hard", "capable", "high", "top"]
+"#
+    }
+
+    #[test]
+    fn legacy_lanes_migrate_with_backup_and_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let original = r#"[general]
+default_provider = "ep"
+default_model = "default"
+
+[general.routing]
+threshold = 0.7
+enforce = true
+
+[general.routing.cheap]
+endpoint = "ep"
+model = "tiny"
+
+[general.routing.routine]
+endpoint = "ep"
+model = "routine"
+
+[general.routing.lane_medium]
+endpoint = "ep"
+model = "medium"
+
+[general.routing.capable]
+endpoint = "ep"
+model = "capable"
+reasoning_effort = "high"
+
+[general.routing.lane_high]
+endpoint = "ep"
+model = "high"
+reasoning_effort = "medium"
+
+[general.routing.escalate]
+endpoint = "ep"
+model = "top"
+"#;
+        fs::write(&config_path, original).unwrap();
+        fs::write(
+            dir.path().join("endpoints.toml"),
+            format!(
+                "{}\n[tiers]\nsimple = [\"ep/legacy-tiny\"]\naverage = [\"ep/legacy-routine\"]\ndifficult = [\"ep/legacy-hard\"]\n",
+                endpoint_table()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        let expected = [
+            ("trivial", vec!["ep/legacy-tiny", "ep/tiny"]),
+            ("routine", vec!["ep/legacy-routine", "ep/routine"]),
+            ("medium", vec!["ep/medium"]),
+            ("high", vec!["ep/legacy-hard", "ep/capable", "ep/high"]),
+            ("escalate", vec!["ep/top"]),
+        ];
+        for (id, models) in expected {
+            assert_eq!(config.tiers.get(id).unwrap().models, models, "{id}");
+        }
+        assert!((config.general.general.routing.threshold - 0.7).abs() < 1e-9);
+        assert!(config.general.general.routing.enforce);
+        assert_eq!(config.tiers.get("high").unwrap().effort.as_deref(), Some("high"));
+
+        let backup = dir.path().join("config.toml.lanes.bak");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        let migrated = fs::read_to_string(&config_path).unwrap();
+        for lane in ["cheap", "routine", "capable", "lane_medium", "lane_high", "escalate"] {
+            assert!(!migrated.contains(lane), "saved config still contains {lane}");
+        }
+        assert!(migrated.contains("threshold"));
+        assert!(migrated.contains("enforce"));
+        let endpoints = fs::read_to_string(dir.path().join("endpoints.toml")).unwrap();
+        assert!(endpoints.contains("[[tier]]"));
+        assert!(!endpoints.contains("[tiers]"));
+
+        let reloaded = Config::load(dir.path()).unwrap();
+        assert_eq!(reloaded.tiers, config.tiers);
+        reloaded.save_all(dir.path()).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+    }
+
+    #[test]
+    fn lane_migration_is_safe_when_endpoints_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[general.routing.cheap]
+endpoint = "ep"
+model = "tiny"
+"#,
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.tiers.get("trivial").unwrap().models, vec!["ep/tiny"]);
+        assert!(dir.path().join("endpoints.toml").exists());
+        assert!(dir.path().join("config.toml.lanes.bak").exists());
+        assert_eq!(Config::load(dir.path()).unwrap().tiers, config.tiers);
+    }
+
+    #[test]
+    fn legacy_empty_simple_uses_the_configured_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "[general]\ndefault_provider = \"ep\"\ndefault_model = \"default\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("endpoints.toml"),
+            format!("{}
+[tiers]
+average = [\"ep/routine\"]
+", endpoint_table()),
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.tiers.first_model("trivial"), Some("ep/default"));
+        let text = fs::read_to_string(dir.path().join("endpoints.toml")).unwrap();
+        assert!(text.contains("ep/default"));
+        assert!(!text.contains("[tiers]"));
+    }
+}
+
+
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+
+    const ENDPOINTS: &str = r#"
+[[endpoint]]
+name = "ep"
+kind = "openai"
+base_url = "http://localhost/"
+models = ["default", "legacy-tiny", "tiny", "routine"]
+"#;
+
+    #[test]
+    fn cached_config_save_preserves_a_newer_on_disk_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        let mut ladder_a = TierLadder::default();
+        ladder_a.tiers[0].models = vec!["ep/old".into()];
+        endpoints::save_tier_ladder(&path, &ladder_a).unwrap();
+        let cached = Config::load(dir.path()).unwrap();
+        assert_eq!(cached.tiers, ladder_a);
+
+        let mut ladder_b = TierLadder::default();
+        ladder_b.tiers[0].models = vec!["ep/new".into()];
+        ladder_b.tiers[2].models = vec!["ep/medium".into()];
+        endpoints::save_tier_ladder(&path, &ladder_b).unwrap();
+        cached.save_all(dir.path()).unwrap();
+
+        assert_eq!(endpoints::load_tier_ladder(&path, None).unwrap(), ladder_b);
+    }
+
+    #[test]
+    fn concurrent_migration_keeps_one_ladder_and_the_original_lane_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = r#"[general]
+default_provider = "ep"
+default_model = "default"
+
+[general.routing.cheap]
+endpoint = "ep"
+model = "tiny"
+reasoning_effort = "minimal"
+"#;
+        fs::write(dir.path().join("config.toml"), original).unwrap();
+        fs::write(
+            dir.path().join("endpoints.toml"),
+            format!("{ENDPOINTS}\n[tiers]\nsimple = [\"ep/legacy-tiny\"]\n"),
+        )
+        .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = dir.path().to_path_buf();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                Config::load(&path).unwrap().tiers
+            }));
+        }
+        let first = handles.remove(0).join().unwrap();
+        let second = handles.remove(0).join().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.get("trivial").unwrap().models,
+            vec!["ep/legacy-tiny", "ep/tiny"]
+        );
+        assert_eq!(first.get("trivial").unwrap().effort.as_deref(), Some("minimal"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("config.toml.lanes.bak")).unwrap(),
+            original
+        );
+        assert!(dir.path().join("config.write.lock").exists());
+    }
+
+    #[test]
+    fn plain_endpoint_save_leaves_legacy_tiers_for_default_filling_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        fs::write(&path, format!("{ENDPOINTS}\n[tiers]\naverage = [\"ep/routine\"]\n"))
+            .unwrap();
+        let (loaded, pricing) = endpoints::load_or_default(&path).unwrap();
+        endpoints::save(&path, &loaded, &pricing).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(before.contains("[tiers]"));
+        assert!(!before.contains("[[tier]]"));
+        assert!(before.contains("average = [\"ep/routine\"]"));
+
+        fs::write(
+            dir.path().join("config.toml"),
+            "[general]\ndefault_provider = \"ep\"\ndefault_model = \"default\"\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.tiers.first_model("trivial"), Some("ep/default"));
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("[tiers]"));
+        assert!(after.contains("[[tier]]"));
+    }
+}
+
+
+#[cfg(test)]
+mod config_write_lock_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn cached_save_and_tier_writer_are_serialized_across_read_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoints_path = dir.path().join("endpoints.toml");
+        let mut ladder_a = TierLadder::default();
+        ladder_a.tiers[0].models = vec!["ep/a".into()];
+        endpoints::save_tier_ladder(&endpoints_path, &ladder_a).unwrap();
+        let cached = Config::load(dir.path()).unwrap();
+        let mut ladder_b = TierLadder::default();
+        ladder_b.tiers[0].models = vec!["ep/b".into()];
+
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let save = {
+            let dir = dir.path().to_path_buf();
+            let release_rx = release_rx.clone();
+            std::thread::spawn(move || {
+                let hook = move || {
+                    read_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                };
+                cached.save_all_inner(&dir, Some(&hook))
+            })
+        };
+        read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let writer_ladder = ladder_b.clone();
+        let writer = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let hook = move || {
+                    let _ = contended_tx.send(());
+                };
+                endpoints::save_tier_ladder_with_hook(
+                    &dir.join("endpoints.toml"),
+                    &writer_ladder,
+                    Some(&hook),
+                )
+            })
+        };
+        // The tier writer has observed the cached save's lock and cannot pass
+        // its read-preserve-commit critical section.
+        contended_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_tx.send(()).unwrap();
+        save.join().unwrap().unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(endpoints::load_tier_ladder(&endpoints_path, None).unwrap(), ladder_b);
+    }
+
+    #[test]
+    fn separate_handles_are_serialized_until_the_first_guard_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ConfigWriteLock::acquire(dir.path()).unwrap();
+        let (contention_tx, contention_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let hook = move || {
+                    let _ = contention_tx.send(());
+                };
+                let guard = ConfigWriteLock::acquire_with_hook(&dir, Some(&hook)).unwrap();
+                acquired_tx.send(guard).unwrap();
+            })
+        };
+
+        contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            acquired_rx.try_recv().is_err(),
+            "a second file handle acquired while the first guard was alive"
+        );
+        drop(first);
+        let second = acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
+        drop(second);
+        assert!(dir.path().join("config.write.lock").exists());
+    }
+
+    #[test]
+    fn dropping_the_holder_releases_the_os_lock_without_removing_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("config.write.lock");
+        let first = ConfigWriteLock::acquire(dir.path()).unwrap();
+        assert!(lock_path.exists());
+
+        // No path cleanup: dropping the File guard alone must release the lock.
+        drop(first);
+        let second = ConfigWriteLock::acquire_with_timeout(
+            dir.path(),
+            None,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(lock_path.exists());
+        drop(second);
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn a_held_lock_makes_another_acquire_time_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ConfigWriteLock::acquire(dir.path()).unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let result = ConfigWriteLock::acquire_with_timeout(
+                    &dir,
+                    None,
+                    Duration::from_millis(100),
+                );
+                result_tx.send(result).unwrap();
+            })
+        };
+
+        let result = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let error = match result {
+            Ok(_) => panic!("a second handle acquired while the first guard was alive"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("timed out waiting for config write lock"),
+            "unexpected error: {error}"
+        );
+        waiter.join().unwrap();
+        drop(first);
+        let reacquired = ConfigWriteLock::acquire_with_timeout(
+            dir.path(),
+            None,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        drop(reacquired);
+    }
+
+
+    #[test]
+    fn recovery_waits_for_the_current_write_lock_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let backup = backup_path(&path);
+        fs::write(&backup, "recovered = true\n").unwrap();
+        let guard = ConfigWriteLock::acquire(dir.path()).unwrap();
+
+        let (contention_tx, contention_rx) = std::sync::mpsc::channel();
+        let recovery_path = path.clone();
+        let recovery = std::thread::spawn(move || {
+            let hook = move || {
+                let _ = contention_tx.send(());
+            };
+            recover_interrupted_write_with_hook(&recovery_path, Some(&hook));
+        });
+        contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!path.exists(), "recovery ran while another owner held the lock");
+        assert!(backup.exists());
+        drop(guard);
+        recovery.join().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "recovered = true\n");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn empty_lane_backup_is_replaced_from_the_original_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = r#"[general.routing.cheap]
+endpoint = "ep"
+model = "tiny"
+reasoning_effort = "minimal"
+"#;
+        fs::write(dir.path().join("config.toml"), original).unwrap();
+        let backup = dir.path().join("config.toml.lanes.bak");
+        fs::write(&backup, "").unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.tiers.first_model("trivial"), Some("ep/tiny"));
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        assert!(!staging_path(&backup).exists());
+        assert!(dir.path().join("config.write.lock").exists());
     }
 }

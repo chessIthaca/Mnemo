@@ -843,14 +843,27 @@ fn model_ref_wire(m: &mnemo::config::ModelRef) -> ModelRefWire {
 
 /// Convert the `[models]` section to its wire form (shared by `get_settings`).
 /// The wire shape of the `[general.routing]` section (backlog 091e694d).
-fn routing_wire(routing: &mnemo::config::RoutingConfig) -> RoutingWire {
+fn routing_wire(config: &mnemo::config::Config) -> RoutingWire {
+    let lane = |id: &str| {
+        let spec = config.tiers.first_model(id)?;
+        let (endpoint, model) = spec.split_once('/')?;
+        Some(ModelRefWire {
+            endpoint: endpoint.to_string(),
+            model: model.to_string(),
+            reasoning_effort: config
+                .tiers
+                .get(id)
+                .and_then(|tier| tier.effort.clone()),
+        })
+    };
+    let routing = &config.general.general.routing;
     RoutingWire {
-        cheap: routing.cheap.as_ref().map(model_ref_wire),
-        routine: routing.routine.as_ref().map(model_ref_wire),
-        capable: routing.capable.as_ref().map(model_ref_wire),
-        lane_medium: routing.lane_medium.as_ref().map(model_ref_wire),
-        lane_high: routing.lane_high.as_ref().map(model_ref_wire),
-        escalate: routing.escalate.as_ref().map(model_ref_wire),
+        cheap: lane("trivial"),
+        routine: lane("routine"),
+        capable: lane("high"),
+        lane_medium: lane("medium"),
+        lane_high: lane("high"),
+        escalate: lane("escalate"),
         threshold: routing.threshold,
         first_prompt_min_confidence: routing.first_prompt_min_confidence,
         enforce: routing.enforce,
@@ -979,7 +992,7 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
                 auto_finetune: config.general.general.laya.auto_finetune,
                 routing: config.general.general.laya.routing,
             },
-            routing: routing_wire(&config.general.general.routing),
+            routing: routing_wire(&config),
             budget: budget_wire(&config.general.general.budget),
             enable_browser_inspection: config.general.general.enable_browser_inspection,
             auto_compact_on_plan_complete: config.general.general.auto_compact_on_plan_complete,
@@ -2090,20 +2103,9 @@ mod settings_dto_tests {
         // models on an unrelated save. A configured target must now reach the
         // wire, and unset ones stay EMITTED as null (never skipped), so the
         // frontend's `| null` types and the draft round-trip hold.
-        use mnemo::config::{ModelRef, RoutingConfig};
-        let cfg = RoutingConfig {
-            lane_medium: Some(ModelRef {
-                endpoint: "stub".into(),
-                model: "mid".into(),
-                reasoning_effort: None,
-            }),
-            escalate: Some(ModelRef {
-                endpoint: "stub".into(),
-                model: "top".into(),
-                reasoning_effort: None,
-            }),
-            ..RoutingConfig::default()
-        };
+        let mut cfg = mnemo::config::Config::default();
+        cfg.tiers.tiers[2].models = vec!["stub/mid".into()];
+        cfg.tiers.tiers[4].models = vec!["stub/top".into()];
         let wire = routing_wire(&cfg);
         assert_eq!(
             wire.lane_medium.as_ref().map(|m| m.model.as_str()),

@@ -100,9 +100,9 @@ pub struct GeneralSection {
     /// trace of it (mirrors `[ui.steering_notes]`).
     #[serde(default, skip_serializing_if = "LayaConfig::is_default")]
     pub laya: LayaConfig,
-    /// **Pre-prompt model routing (opt-in; backlog 091e694d).** The targets
-    /// (cheap / capable) and the policy (confidence threshold, shadow vs
-    /// enforce) for running a turn on a different model based on a Laya
+    /// **Pre-prompt model routing (opt-in; backlog 091e694d).** The policy
+    /// (confidence threshold, shadow vs enforce) for running a turn on a
+    /// different model based on a Laya
     /// classification of the task text. Gated by [`LayaConfig::routing`]:
     /// with that flag off the section is inert. Omitted from the saved
     /// config while every field holds its default, so configs that never
@@ -295,9 +295,9 @@ pub struct LayaConfig {
     /// a user turn the task text is classified trivial vs architectural (a
     /// calibrated choice question), and, only with a confident answer, a
     /// configured target and [`enforce`](RoutingConfig::enforce) on, the
-    /// turn runs on [`cheap`](RoutingConfig::cheap) or
-    /// [`capable`](RoutingConfig::capable) instead of the state/default
-    /// model. **Shadow-first**: while `enforce` is off every turn is still
+    /// turn runs on the matching tier from the shared
+    /// [`TierLadder`](crate::config::endpoints::TierLadder) instead of the
+    /// state/default model. **Shadow-first**: while `enforce` is off every turn is still
     /// classified and its decision + outcome logged to `routing.jsonl`, but
     /// model choice is byte-identical to today. Confidence-gated (a
     /// below-threshold or missing answer, an unknown label, or an unset or
@@ -317,8 +317,8 @@ pub struct LayaConfig {
     /// answers are gated as ONE decision on the weakest of them (>=0.80).
     /// The **escalation lane ladder** (backlog ad56c7bd) is the first
     /// consumer: at each plan-step boundary the step is classified once, and
-    /// the lane it answers (`small` → the `[general.routing] cheap` target,
-    /// plus the `medium` / `high` / `escalate` lanes) serves that step while
+    /// the shared tier it answers (`trivial`, `medium`, `high`, or `escalate`)
+    /// serves that step while
     /// [`routing`](Self::routing) is on. Shadow-first like the pre-prompt
     /// decision (enforce off = log only), re-classifying a step only after a
     /// failed cycle; a fallback (a missing or non-choice answer, a label
@@ -365,7 +365,8 @@ impl LayaConfig {
 }
 
 /// The `[general.routing]` section (backlog 091e694d, item 2 of the Laya
-/// chain): the targets and the policy for pre-prompt model routing.
+/// chain): the policy for pre-prompt model routing. Model targets live in the
+/// shared [`TierLadder`](crate::config::endpoints::TierLadder).
 ///
 /// Gated by the [`LayaConfig::routing`] opt-in: with that flag off (or Laya
 /// disabled, or no classifier installed) this section is inert and model
@@ -375,17 +376,15 @@ impl LayaConfig {
 /// * [`enforce`](Self::enforce) `false` (the default) = **shadow**: the
 ///   decision is logged (with the turn's outcome) to
 ///   `~/.mnemo/laya/training/routing.jsonl`, and the model is not switched.
-/// * `true` = **enforce**: a confident `trivial` answer runs the turn on
-///   [`cheap`](Self::cheap), `architectural` on [`capable`](Self::capable).
+/// * `true` = **enforce**: a confident answer runs the turn on the model its
+///   tier resolves to in the shared ladder.
 ///
-/// The same section carries the **escalation lane ladder** (backlog ad56c7bd):
-/// [`lane_medium`](Self::lane_medium), [`lane_high`](Self::lane_high) and
-/// [`escalate`](Self::escalate) are the per-lane targets for step-granular
-/// routing — at each plan-step boundary (and again only after a failed cycle)
-/// the compound reflex call classifies the step and the ladder resolves
-/// cheap → default → medium → high → escalate. Every rung is USER-CHOSEN:
-/// unset (the default) falls through to the turn's configured model — there is
-/// never a built-in model id. Step routing is shadow-first under the same
+/// The same policy gates step-granular routing: at each plan-step boundary
+/// (and again only after a failed cycle) the compound reflex call classifies
+/// the step and the ladder resolves trivial → routine → medium → high →
+/// escalate, folding empty rungs down. An unresolved or dangling target keeps
+/// the turn's configured model — there is never a built-in model id. Step
+/// routing is shadow-first under the same
 /// [`enforce`](Self::enforce) switch as the pre-prompt decision.
 ///
 /// Every fallback keeps today's model: an answer below
@@ -397,35 +396,8 @@ impl LayaConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingConfig {
-    /// The endpoint + model a confidently-TRIVIAL task routes to (a small,
-    /// local, mechanical change). `None` (the default) keeps today's model.
-    pub cheap: Option<ModelRef>,
-    /// Where a confidently routine first prompt routes; `None` keeps the
-    /// session's model.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub routine: Option<ModelRef>,
-    /// The endpoint + model a confidently-ARCHITECTURAL task routes to
-    /// (design-level work: a new feature, cross-module refactor, a new
-    /// dependency, a data-model or concurrency change). `None` keeps today's.
-    pub capable: Option<ModelRef>,
-    /// The endpoint + model a medium-complexity plan step routes to (the
-    /// escalation-lane rung `medium`, backlog ad56c7bd). USER-CHOSEN: `None`
-    /// (the default) falls through to the turn's configured model — never a
-    /// built-in model id.
-    pub lane_medium: Option<ModelRef>,
-    /// The endpoint + model a high-complexity plan step routes to (the rung
-    /// `high`). `None` falls through to the configured model.
-    pub lane_high: Option<ModelRef>,
-    /// The endpoint + model the escalate rung routes to (a step the reflex
-    /// call flags `escalate`, typically after a failed cycle). `None` falls
-    /// through to the configured model.
-    pub escalate: Option<ModelRef>,
     /// The calibrated-probability gate: a decision routes only at
-    /// `confidence >= threshold`. Defaults to `0.80`, the same gate the
-    /// other Laya consumers use; a below-threshold answer keeps today's
-    /// model, so a too-high threshold is simply inert. Omitted while default.
-    /// Used by the step-lane ladder; first-prompt routing uses
-    /// [`first_prompt_min_confidence`](Self::first_prompt_min_confidence).
+    /// `confidence >= threshold`. Defaults to `0.80`.
     #[serde(skip_serializing_if = "routing_threshold_is_default")]
     pub threshold: f64,
     /// The first-prompt gate; `None` uses the kernel's calibrated default for
@@ -434,8 +406,6 @@ pub struct RoutingConfig {
     pub first_prompt_min_confidence: Option<f64>,
     /// Whether a confident decision actually switches the turn's model.
     /// `false` (the default) = shadow: classify + log only, model unchanged.
-    /// Flipping this is the post-fine-tune step: a config edit, never a code
-    /// change. Omitted while false.
     #[serde(skip_serializing_if = "laya_flag_off")]
     pub enforce: bool,
 }
@@ -443,12 +413,6 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            cheap: None,
-            routine: None,
-            capable: None,
-            lane_medium: None,
-            lane_high: None,
-            escalate: None,
             threshold: default_routing_threshold(),
             first_prompt_min_confidence: None,
             enforce: false,
@@ -458,20 +422,80 @@ impl Default for RoutingConfig {
 
 impl RoutingConfig {
     /// True while every field holds its default - the `[general.routing]`
-    /// section is then omitted from `config.toml` (mirrors
-    /// [`LayaConfig::is_default`]), so untouched configs keep no routing
-    /// trace.
+    /// section is then omitted from `config.toml`.
     fn is_default(&self) -> bool {
-        self.cheap.is_none()
-            && self.capable.is_none()
-            && self.routine.is_none()
-            && self.lane_medium.is_none()
-            && self.lane_high.is_none()
-            && self.escalate.is_none()
-            && routing_threshold_is_default(&self.threshold)
+        routing_threshold_is_default(&self.threshold)
             && self.first_prompt_min_confidence.is_none()
             && !self.enforce
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct LegacyGeneralConfig {
+    general: LegacyGeneralSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct LegacyGeneralSection {
+    routing: LegacyRoutingConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct LegacyRoutingConfig {
+    cheap: Option<ModelRef>,
+    routine: Option<ModelRef>,
+    capable: Option<ModelRef>,
+    lane_medium: Option<ModelRef>,
+    lane_high: Option<ModelRef>,
+    escalate: Option<ModelRef>,
+}
+
+/// Merge retired Mnemo1 routing lanes from the original config text into
+/// their mapped tiers. Returns whether any lane model was present.
+pub(crate) fn merge_legacy_lanes(
+    config_text: &str,
+    ladder: &mut crate::config::endpoints::TierLadder,
+) -> Result<bool> {
+    if config_text.trim().is_empty() {
+        return Ok(false);
+    }
+    let legacy: LegacyGeneralConfig = toml::from_str(config_text)?;
+    let routing = legacy.general.routing;
+    let lanes = [
+        ("trivial", routing.cheap),
+        ("routine", routing.routine),
+        ("medium", routing.lane_medium),
+        ("high", routing.capable),
+        ("high", routing.lane_high),
+        ("escalate", routing.escalate),
+    ];
+    let mut found = false;
+    for (tier_id, model) in lanes {
+        let Some(model) = model else { continue };
+        found = true;
+        let spec = format!("{}/{}", model.endpoint, model.model);
+        let effort = model.reasoning_effort;
+        let Some(tier) = ladder.tiers.iter_mut().find(|tier| tier.id == tier_id) else {
+            continue;
+        };
+        // The first configured lane effort wins. In particular, `capable`
+        // precedes `lane_high` when both migrate into `high`.
+        if tier.effort.is_none() {
+            tier.effort = effort;
+        }
+        if tier.models.contains(&spec) {
+            continue;
+        }
+        if tier.models.is_empty() {
+            tier.models.insert(0, spec);
+        } else {
+            tier.models.push(spec);
+        }
+    }
+    Ok(found)
 }
 
 /// The out-of-box routing confidence gate: the same `0.80` the other Laya
@@ -1403,10 +1427,15 @@ impl GeneralConfig {
             return Ok(Self::default());
         }
         let text = fs::read_to_string(path)?;
+        Self::from_toml_text(&text)
+    }
+
+    /// Parse `config.toml` text with the same clamping the file loader applies.
+    pub(crate) fn from_toml_text(text: &str) -> Result<Self> {
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
-        let cfg: Self = toml::from_str(&text)?;
+        let cfg: Self = toml::from_str(text)?;
         // Clamp the trace memory knobs into range — a typo (e.g. 0 or a
         // missing-suffix mistake) must not unbound or disable the log. Same
         // for the [memory] retrieval knobs (a 0 cap would zero out recall).
@@ -1430,6 +1459,15 @@ impl GeneralConfig {
     /// sections are preserved verbatim from the loaded value, so editing one
     /// field (e.g. `default_provider`) does not clobber the others.
     pub fn save(&self, path: &Path) -> Result<()> {
+        crate::config::write_atomic(path, &self.to_toml_text()?)
+    }
+
+    /// Write while the caller holds the shared config write lock.
+    pub(crate) fn save_unlocked(&self, path: &Path) -> Result<()> {
+        crate::config::write_atomic_unlocked(path, &self.to_toml_text()?)
+    }
+
+    fn to_toml_text(&self) -> Result<String> {
         // Clamp the trace memory knobs before persisting, mirroring the
         // load-time clamp so the file never holds out-of-range values. Same
         // for the [memory] retrieval knobs.
@@ -1438,9 +1476,7 @@ impl GeneralConfig {
             memory: self.memory.clone().clamped(),
             ..self.clone()
         };
-        let text = toml::to_string_pretty(&clamped)?;
-        crate::config::write_atomic(path, &text)?;
-        Ok(())
+        Ok(toml::to_string_pretty(&clamped)?)
     }
 }
 
@@ -1735,18 +1771,14 @@ enabled = true
     }
 
     #[test]
-    fn routing_defaults_off_and_round_trips() {
-        // Opt-in only, shadow-first: an absent [general.routing] section (and
-        // the routing flag off) means no classification, no log writes, and
-        // today's model selection exactly.
+    fn routing_gates_round_trip_and_legacy_lanes_are_not_serialized() {
         let cfg: GeneralConfig = toml::from_str("").unwrap();
         assert!(!cfg.general.laya.routing);
         assert!(!cfg.general.routing.enforce);
-        assert!(cfg.general.routing.cheap.is_none());
-        assert!(cfg.general.routing.capable.is_none());
         assert!((cfg.general.routing.threshold - 0.80).abs() < 1e-9);
 
-        let text = r#"
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
 [general.laya]
 enabled = true
 routing = true
@@ -1758,99 +1790,18 @@ enforce = true
 [general.routing.cheap]
 endpoint = "local"
 model = "tiny-model"
-
-[general.routing.capable]
-endpoint = "anthropic"
-model = "claude-opus-4-6"
-reasoning_effort = "max"
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(cfg.general.laya.routing);
-        assert!(cfg.general.routing.enforce);
-        assert!((cfg.general.routing.threshold - 0.9).abs() < 1e-9);
-        assert_eq!(cfg.general.routing.cheap.as_ref().unwrap().model, "tiny-model");
-        assert_eq!(
-            cfg.general
-                .routing
-                .capable
-                .as_ref()
-                .unwrap()
-                .reasoning_effort
-                .as_deref(),
-            Some("max")
-        );
-
-        // Re-serialize + re-parse: every field survives.
-        let back = toml::to_string(&cfg).unwrap();
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(cfg2.general.laya.routing);
-        assert!(cfg2.general.routing.enforce);
-        assert!((cfg2.general.routing.threshold - 0.9).abs() < 1e-9);
-        assert_eq!(cfg2.general.routing.cheap.unwrap().endpoint, "local");
-        assert_eq!(cfg2.general.routing.capable.unwrap().model, "claude-opus-4-6");
-    }
-
-    #[test]
-    fn routing_lane_targets_default_to_none_and_round_trip() {
-        // The escalation-lane ladder (backlog ad56c7bd) is USER-CHOSEN: every
-        // rung defaults to None -- there is never a built-in model id -- and
-        // an unset rung falls through to the turn's configured model.
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(cfg.general.routing.lane_medium.is_none());
-        assert!(cfg.general.routing.lane_high.is_none());
-        assert!(cfg.general.routing.escalate.is_none());
-
-        let text = r#"
-[general.laya]
-enabled = true
-routing = true
-
-[general.routing.lane_medium]
-endpoint = "local"
-model = "medium-model"
-
-[general.routing.escalate]
-endpoint = "anthropic"
-model = "big-model"
-reasoning_effort = "max"
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert_eq!(
-            cfg.general.routing.lane_medium.as_ref().unwrap().model,
-            "medium-model"
-        );
-        assert!(cfg.general.routing.lane_high.is_none());
-        assert_eq!(
-            cfg.general
-                .routing
-                .escalate
-                .as_ref()
-                .unwrap()
-                .reasoning_effort
-                .as_deref(),
-            Some("max")
-        );
-
-        // Re-serialize + re-parse: every set rung survives, the unset one
-        // stays unset.
-        let back = toml::to_string(&cfg).unwrap();
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert_eq!(cfg2.general.routing.lane_medium.unwrap().endpoint, "local");
-        assert!(cfg2.general.routing.lane_high.is_none());
-        assert_eq!(cfg2.general.routing.escalate.unwrap().model, "big-model");
-
-        // A lane target alone counts as touched: the section is written.
-        let cfg: GeneralConfig = toml::from_str(
-            r#"
-[general.routing.lane_high]
-endpoint = "ep"
-model = "m"
 "#,
         )
         .unwrap();
+        assert!(cfg.general.laya.routing);
+        assert!(cfg.general.routing.enforce);
+        assert!((cfg.general.routing.threshold - 0.9).abs() < 1e-9);
+
         let text = toml::to_string(&cfg).unwrap();
-        assert!(text.contains("general.routing"));
-        assert!(text.contains("lane_high"));
+        assert!(!text.contains("cheap"));
+        let back: GeneralConfig = toml::from_str(&text).unwrap();
+        assert!(back.general.routing.enforce);
+        assert!((back.general.routing.threshold - 0.9).abs() < 1e-9);
     }
 
     #[test]

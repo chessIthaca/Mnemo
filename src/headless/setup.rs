@@ -35,7 +35,7 @@ use crate::config::settings_dto::{SettingsSaveDto, VisionModelDto};
 
 mod endpoint_detail;
 pub use endpoint_detail::{
-    EndpointDetailDto, EndpointTestDto, ModelDetailDto, PriceDto, ProviderModelDto, TiersDto,
+    EndpointDetailDto, EndpointTestDto, ModelDetailDto, PriceDto, ProviderModelDto, TierDto, TiersDto,
 };
 
 /// Which agent.md a Setup method addresses (§5.8 :557): the install's
@@ -1469,17 +1469,25 @@ impl Setup {
             .retain(|p| !gone.contains(&p.model) || served.contains(&p.model));
         // Tier entries naming the endpoint drop with it.
         let tiers_path = self.config_dir.join("endpoints.toml");
-        let old_tiers = crate::config::endpoints::load_tiers(&tiers_path);
+        let old_tiers = crate::config::endpoints::load_tier_ladder(&tiers_path, None)
+            .map_err(|e| EngineError::start_failed(e.to_string()))?;
         let mut tiers = old_tiers.clone();
         let prefix = format!("{name}/");
-        for list in tiers.lists_mut() {
-            list.retain(|s| !s.starts_with(&prefix));
+        for tier in &mut tiers.tiers {
+            tier.models.retain(|s| !s.starts_with(&prefix));
+        }
+        if old_tiers.first_model("trivial").is_some()
+            && tiers.first_model("trivial").is_none()
+        {
+            return Err(EngineError::start_failed(format!(
+                "The trivial tier needs a model; give it another model before removing {name}"
+            )));
         }
         new_config
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(e.to_string()))?;
         if tiers != old_tiers {
-            crate::config::endpoints::save_tiers(&tiers_path, &tiers)
+            crate::config::endpoints::save_tier_ladder(&tiers_path, &tiers)
                 .map_err(|e| EngineError::start_failed(e.to_string()))?;
         }
         Ok(())

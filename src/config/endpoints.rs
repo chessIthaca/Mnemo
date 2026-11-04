@@ -23,78 +23,295 @@ pub struct EndpointsFile {
     /// `endpoints.toml` file as `[[endpoint]]`).
     #[serde(default)]
     pub pricing: Vec<PricingEntry>,
-    /// Optional `[tiers]` table (Mnemo2's model tiers). Mnemo1 never edits
-    /// it; every save path preserves it.
-    #[serde(default, skip_serializing_if = "Tiers::is_empty")]
-    pub tiers: Tiers,
+    /// The unified five-tier ladder, stored as `[[tier]]` tables.
+    #[serde(default, rename = "tier", skip_serializing_if = "Vec::is_empty")]
+    pub tier: Vec<Tier>,
+    /// The retired `[tiers]` table. Plain endpoint/pricing saves carry it
+    /// through unchanged; only the migration-owned writer replaces it.
+    #[serde(default, rename = "tiers", skip_serializing_if = "Option::is_none")]
+    pub legacy_tiers: Option<LegacyTiers>,
 }
 
-/// Mnemo2 model tiers: for each tier an ordered list of `endpoint/model`
-/// specs (the first entry is the tier's default).
+/// The fixed tier ids, cheapest first. The set and order are part of the wire contract.
+pub const TIER_IDS: [&str; 5] = ["trivial", "routine", "medium", "high", "escalate"];
+
+/// One rung of the unified model ladder.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tiers {
-    /// Design-heavy / debugging / shared-contract work.
+pub struct Tier {
+    /// Stable tier id (`trivial`, `routine`, `medium`, `high`, or `escalate`).
+    pub id: String,
+    /// Editable display name.
+    pub name: String,
+    /// Editable routing definition. Laya's fixed question never incorporates it.
+    pub definition: String,
+    /// Ordered `endpoint/model` specs; the first is the tier's default model.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Optional reasoning-effort override for models selected from this tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// `"escalate"` marks the escalation-only rung; ordinary tiers omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+impl Tier {
+    fn new(id: &str, name: &str, definition: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            definition: definition.to_string(),
+            models: Vec::new(),
+            effort: None,
+            role: (id == "escalate").then(|| "escalate".to_string()),
+        }
+    }
+}
+
+/// The ordered five-rung model ladder shared by Mnemo1 and Mnemo2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TierLadder {
+    /// Rungs in cheapest-first order. Use [`TierLadder::validate`] at trust boundaries.
+    pub tiers: Vec<Tier>,
+}
+
+impl Default for TierLadder {
+    fn default() -> Self {
+        Self {
+            tiers: vec![
+                Tier::new(
+                    "trivial",
+                    "Trivial",
+                    "Rename, typo, version bump, config value, copy change, a log line, dead code, doc comment, a single-file mechanical edit, a lookup or a check.",
+                ),
+                Tier::new(
+                    "routine",
+                    "Routine",
+                    "Implement a specified function, add tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.",
+                ),
+                Tier::new(
+                    "medium",
+                    "Medium",
+                    "A normal multi-file change with a clear spec: a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.",
+                ),
+                Tier::new(
+                    "high",
+                    "High",
+                    "Subtle bugs, races, flaky tests, data loss, performance regressions, security, persistence formats, cross-module or shared-contract changes, concurrency, design decisions the spec leaves open, bug_fixing plans.",
+                ),
+                Tier::new(
+                    "escalate",
+                    "Escalate",
+                    "Work a lower tier visibly failed at: repeated review failures, a stuck worker, an audit that keeps finding real problems. Not chosen for fresh work.",
+                ),
+            ],
+        }
+    }
+}
+
+impl TierLadder {
+    /// All rungs in their stored order.
+    pub fn ordered(&self) -> &[Tier] {
+        &self.tiers
+    }
+
+    /// Find a rung by its exact new-tier id. Legacy ids are deliberately not accepted.
+    pub fn get(&self, id: &str) -> Option<&Tier> {
+        self.tiers.iter().find(|tier| tier.id == id)
+    }
+
+    /// The four rungs Laya and the kNN may pick; escalation is never a first pick.
+    pub fn pickable(&self) -> Vec<&Tier> {
+        self.tiers
+            .iter()
+            .filter(|tier| tier.role.as_deref() != Some("escalate") && tier.id != "escalate")
+            .collect()
+    }
+
+    /// Resolve a tier to `(ran_tier_id, model)`, folding down to the nearest
+    /// lower rung with a model when the requested rung is empty.
+    pub fn resolve(&self, id: &str) -> Option<(String, String)> {
+        let start = self.tiers.iter().position(|tier| tier.id == id)?;
+        self.tiers[..=start].iter().rev().find_map(|tier| {
+            tier.models
+                .iter()
+                .find(|model| !model.trim().is_empty())
+                .map(|model| (tier.id.clone(), model.clone()))
+        })
+    }
+
+    /// The rung immediately above `id`, or `None` for an unknown id or the top rung.
+    pub fn next_up(&self, id: &str) -> Option<&Tier> {
+        let index = self.tiers.iter().position(|tier| tier.id == id)?;
+        self.tiers.get(index + 1)
+    }
+
+    /// The escalation-only rung.
+    pub fn escalation(&self) -> Option<&Tier> {
+        self.get("escalate")
+            .filter(|tier| tier.role.as_deref() == Some("escalate"))
+    }
+
+    /// The first non-empty model configured directly on `id`, without folding.
+    pub fn first_model(&self, id: &str) -> Option<&str> {
+        self.get(id)?
+            .models
+            .iter()
+            .find(|model| !model.trim().is_empty())
+            .map(String::as_str)
+    }
+
+    /// Convert a retired tier id for stored-data migration only.
+    pub fn convert_old_id(id: &str) -> Option<&'static str> {
+        match id {
+            "simple" => Some("trivial"),
+            "average" => Some("routine"),
+            "difficult" => Some("high"),
+            _ => None,
+        }
+    }
+
+    /// Refuse unknown, duplicate, missing, or out-of-order ids, a malformed
+    /// escalation role, and an empty lowest tier (the default-model rung).
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for expected in TIER_IDS {
+            let matches = self.tiers.iter().filter(|tier| tier.id == expected).count();
+            if matches > 1 {
+                return Err(format!("duplicate tier id '{expected}'"));
+            }
+        }
+        for tier in &self.tiers {
+            if !TIER_IDS.contains(&tier.id.as_str()) {
+                return Err(format!("unknown tier id '{}'", tier.id));
+            }
+        }
+        for expected in TIER_IDS {
+            if self.get(expected).is_none() {
+                return Err(format!("missing tier '{expected}'"));
+            }
+        }
+        for (index, expected) in TIER_IDS.iter().enumerate() {
+            if self.tiers[index].id != *expected {
+                return Err("tiers must stay in order: trivial, routine, medium, high, escalate".to_string());
+            }
+        }
+        if self.escalation().is_none() {
+            return Err("tier 'escalate' must have role 'escalate'".to_string());
+        }
+        if self.tiers[..4].iter().any(|tier| tier.role.is_some()) {
+            return Err("only the 'escalate' tier may have a role".to_string());
+        }
+        if self.first_model("trivial").is_none() {
+            return Err("the lowest tier 'trivial' must have a model".to_string());
+        }
+        Ok(())
+    }
+
+    /// Fill an empty lowest rung during migration from a configured default model.
+    pub(crate) fn fill_default_model(&mut self, default_model: Option<&str>) {
+        if self.first_model("trivial").is_none() {
+            if let Some(model) = default_model.filter(|model| !model.trim().is_empty()) {
+                if let Some(trivial) = self.tiers.iter_mut().find(|tier| tier.id == "trivial") {
+                    trivial.models.push(model.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Retired three-list `[tiers]` representation, accepted only while loading.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LegacyTiers {
+    /// Former highest tier, migrated to `high`.
     #[serde(default)]
     pub difficult: Vec<String>,
-    /// Typical implementation steps.
+    /// Former middle tier, migrated to `routine`.
     #[serde(default)]
     pub average: Vec<String>,
-    /// Mechanical single-file edits, checks, lookups.
+    /// Former lowest tier, migrated to `trivial`.
     #[serde(default)]
     pub simple: Vec<String>,
 }
 
-impl Tiers {
-    /// True when no tier lists any model.
-    pub fn is_empty(&self) -> bool {
-        self.difficult.is_empty() && self.average.is_empty() && self.simple.is_empty()
+fn read_endpoints_file(path: &Path) -> Result<EndpointsFile> {
+    if !path.exists() {
+        return Ok(EndpointsFile::default());
     }
-
-    /// Each tier with its name, in difficulty order.
-    pub fn named(&self) -> [(&'static str, &Vec<String>); 3] {
-        [
-            ("difficult", &self.difficult),
-            ("average", &self.average),
-            ("simple", &self.simple),
-        ]
+    let text = fs::read_to_string(path)?;
+    if text.trim().is_empty() {
+        return Ok(EndpointsFile::default());
     }
-
-    /// The ordered specs of a tier by name.
-    pub fn get(&self, tier: &str) -> Option<&Vec<String>> {
-        self.named()
-            .into_iter()
-            .find(|(n, _)| *n == tier)
-            .map(|(_, v)| v)
-    }
-
-    /// Mutable access to every tier list.
-    pub fn lists_mut(&mut self) -> [&mut Vec<String>; 3] {
-        [&mut self.difficult, &mut self.average, &mut self.simple]
-    }
+    Ok(toml::from_str(&text)?)
 }
 
-/// Load just the `[tiers]` table of `endpoints.toml` (empty when the file or
-/// table is absent or unparsable).
-pub fn load_tiers(path: &Path) -> Tiers {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Tiers::default();
-    };
-    toml::from_str::<EndpointsFile>(&text)
-        .map(|f| f.tiers)
-        .unwrap_or_default()
+/// Read the tier representation currently on disk without converting it.
+/// Unrelated config saves use this to preserve both native and legacy storage.
+pub(crate) fn tier_storage(path: &Path) -> Result<(Vec<Tier>, Option<LegacyTiers>)> {
+    let file = read_endpoints_file(path)?;
+    Ok((file.tier, file.legacy_tiers))
 }
 
-/// Rewrite the `[tiers]` table of `endpoints.toml` in place, leaving
-/// endpoints and pricing as loaded.
-pub fn save_tiers(path: &Path, tiers: &Tiers) -> Result<()> {
-    let (endpoints, pricing) = load_or_default(path)?;
-    let file = EndpointsFile {
-        endpoint: endpoints,
-        pricing,
-        tiers: tiers.clone(),
+/// Load the ladder from `[[tier]]`, or convert the retired `[tiers]` table.
+/// An empty converted `trivial` rung is filled from `default_model` when supplied.
+pub fn load_tier_ladder(path: &Path, default_model: Option<&str>) -> Result<TierLadder> {
+    let file = read_endpoints_file(path)?;
+    let converting_legacy = file.tier.is_empty() && file.legacy_tiers.is_some();
+    let mut ladder = if file.tier.is_empty() {
+        let mut ladder = TierLadder::default();
+        if let Some(legacy) = file.legacy_tiers {
+            for (id, models) in [
+                ("trivial", legacy.simple),
+                ("routine", legacy.average),
+                ("high", legacy.difficult),
+            ] {
+                if let Some(tier) = ladder.tiers.iter_mut().find(|tier| tier.id == id) {
+                    tier.models = models;
+                }
+            }
+        }
+        ladder
+    } else {
+        TierLadder { tiers: file.tier }
     };
+    if converting_legacy {
+        ladder.fill_default_model(default_model);
+    }
+    Ok(ladder)
+}
+
+/// Whether loading should rewrite a retired `[tiers]` table as `[[tier]]` entries.
+pub(crate) fn tier_file_needs_migration(path: &Path) -> Result<bool> {
+    Ok(read_endpoints_file(path)?.legacy_tiers.is_some())
+}
+
+/// Save the ladder as `[[tier]]` only, preserving endpoints and pricing and
+/// dropping any retired `[tiers]` table.
+pub fn save_tier_ladder(path: &Path, ladder: &TierLadder) -> Result<()> {
+    save_tier_ladder_with_hook(path, ladder, None)
+}
+
+/// Save a ladder, with an internal contention hook used by concurrency tests.
+pub(crate) fn save_tier_ladder_with_hook(
+    path: &Path,
+    ladder: &TierLadder,
+    on_contended: Option<&(dyn Fn() + Send + Sync)>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let _lock = crate::config::ConfigWriteLock::acquire_with_hook(parent, on_contended)?;
+    save_tier_ladder_unlocked(path, ladder)
+}
+
+/// Save a ladder while the caller holds the shared config write lock.
+pub(crate) fn save_tier_ladder_unlocked(path: &Path, ladder: &TierLadder) -> Result<()> {
+    let mut file = read_endpoints_file(path)?;
+    file.tier = ladder.tiers.clone();
+    file.legacy_tiers = None;
     let text = toml::to_string_pretty(&file)?;
-    crate::config::write_atomic(path, &text)?;
+    crate::config::write_atomic_unlocked(path, &text)?;
     Ok(())
 }
 
@@ -786,11 +1003,7 @@ pub fn load_or_default(path: &Path) -> Result<(Vec<Endpoint>, Vec<PricingEntry>)
     if !path.exists() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let text = fs::read_to_string(path)?;
-    if text.trim().is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let mut file: EndpointsFile = toml::from_str(&text)?;
+    let mut file = read_endpoints_file(path)?;
     for ep in &mut file.endpoint {
         let trimmed = ep.base_url.trim();
         ep.base_url = if trimmed.is_empty() {
@@ -812,14 +1025,31 @@ pub fn load_or_default(path: &Path) -> Result<(Vec<Endpoint>, Vec<PricingEntry>)
 /// (the schema is the source of truth), so unknown keys are dropped. Uses a
 /// temp-file + rename so a crash mid-write leaves the previous file intact.
 pub fn save(path: &Path, endpoints: &[Endpoint], pricing: &[PricingEntry]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let _lock = crate::config::ConfigWriteLock::acquire(parent)?;
+    save_unlocked(path, endpoints, pricing)
+}
+
+/// Write endpoints and pricing while the caller holds the config write lock.
+pub(crate) fn save_unlocked(
+    path: &Path,
+    endpoints: &[Endpoint],
+    pricing: &[PricingEntry],
+) -> Result<()> {
+    // Preserve the on-disk representation. In particular, only Config::load
+    // may convert legacy tiers because only it knows the default model.
+    let (tier, legacy_tiers) = tier_storage(path)?;
     let file = EndpointsFile {
         endpoint: endpoints.to_vec(),
         pricing: pricing.to_vec(),
-        // Mnemo1 saves never own tiers: keep whatever is on disk.
-        tiers: load_tiers(path),
+        tier,
+        legacy_tiers,
     };
     let text = toml::to_string_pretty(&file)?;
-    crate::config::write_atomic(path, &text)?;
+    crate::config::write_atomic_unlocked(path, &text)?;
     Ok(())
 }
 
@@ -935,7 +1165,7 @@ workspace_id = "ws_abc123"
         let ser = toml::to_string_pretty(&EndpointsFile {
             endpoint: vec![bare],
             pricing: vec![],
-            tiers: Tiers::default(),
+            ..EndpointsFile::default()
         })
         .unwrap();
         assert!(
@@ -2115,5 +2345,194 @@ id = "some-model"
             vec!["\u{3c}|endpoint|\u{3e}"]
         );
         assert!(bare.stop_boundary_strings_for("some-model").is_empty());
+    }
+}
+
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+
+    fn ladder_with_models() -> TierLadder {
+        let mut ladder = TierLadder::default();
+        ladder.tiers[0].models = vec!["ep/tiny".into()];
+        ladder.tiers[2].models = vec!["ep/medium".into()];
+        ladder
+    }
+
+    #[test]
+    fn legacy_tiers_convert_and_round_trip_as_tier_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        fs::write(
+            &path,
+            r#"
+[[endpoint]]
+name = "ep"
+kind = "openai"
+base_url = "http://localhost/"
+models = ["tiny", "routine", "hard"]
+
+[[pricing]]
+model = "tiny"
+input_per_1m = 1.0
+output_per_1m = 2.0
+cached_per_1m = 0.5
+
+[tiers]
+simple = ["ep/tiny"]
+average = ["ep/routine"]
+difficult = ["ep/hard"]
+"#,
+        )
+        .unwrap();
+
+        let ladder = load_tier_ladder(&path, None).unwrap();
+        assert_eq!(ladder.first_model("trivial"), Some("ep/tiny"));
+        assert_eq!(ladder.first_model("routine"), Some("ep/routine"));
+        assert_eq!(ladder.first_model("high"), Some("ep/hard"));
+        assert!(ladder.first_model("medium").is_none());
+        assert!(ladder.first_model("escalate").is_none());
+        assert!(!ladder.get("trivial").unwrap().definition.is_empty());
+
+        save_tier_ladder(&path, &ladder).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[tier]]"));
+        assert!(!text.contains("[tiers]"));
+        assert!(text.contains("[[pricing]]"));
+        assert_eq!(load_tier_ladder(&path, None).unwrap(), ladder);
+        let (endpoints, pricing) = load_or_default(&path).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(pricing.len(), 1);
+    }
+
+    #[test]
+    fn native_tier_tables_round_trip_names_definitions_and_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        let mut ladder = ladder_with_models();
+        ladder.tiers[0].name = "Small jobs".into();
+        ladder.tiers[0].definition = "A custom definition".into();
+        ladder.tiers[0].effort = Some("minimal".into());
+        save_tier_ladder(&path, &ladder).unwrap();
+        assert_eq!(load_tier_ladder(&path, None).unwrap(), ladder);
+    }
+
+    #[test]
+    fn conversion_fills_empty_trivial_from_the_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        fs::write(&path, "[tiers]\naverage = [\"ep/routine\"]\n").unwrap();
+        let ladder = load_tier_ladder(&path, Some("ep/default")).unwrap();
+        assert_eq!(ladder.first_model("trivial"), Some("ep/default"));
+        assert!(ladder.validate().is_ok());
+
+        let empty = load_tier_ladder(&path, None).unwrap();
+        assert!(empty.first_model("trivial").is_none());
+        assert!(empty.validate().unwrap_err().contains("lowest tier"));
+    }
+
+    #[test]
+    fn resolve_folds_every_empty_tier_down() {
+        let ladder = ladder_with_models();
+        assert_eq!(ladder.resolve("trivial"), Some(("trivial".into(), "ep/tiny".into())));
+        assert_eq!(ladder.resolve("routine"), Some(("trivial".into(), "ep/tiny".into())));
+        assert_eq!(ladder.resolve("medium"), Some(("medium".into(), "ep/medium".into())));
+        assert_eq!(ladder.resolve("high"), Some(("medium".into(), "ep/medium".into())));
+        assert_eq!(ladder.resolve("escalate"), Some(("medium".into(), "ep/medium".into())));
+        assert_eq!(ladder.resolve("unknown"), None);
+        assert_eq!(ladder.next_up("medium").map(|tier| tier.id.as_str()), Some("high"));
+        assert_eq!(ladder.escalation().map(|tier| tier.id.as_str()), Some("escalate"));
+        assert_eq!(ladder.pickable().len(), 4);
+    }
+
+    #[test]
+    fn validation_rejects_bad_shapes_and_old_ids_stay_migration_only() {
+        let valid = ladder_with_models();
+        assert!(valid.get("simple").is_none());
+        assert!(valid.get("average").is_none());
+        assert!(valid.get("difficult").is_none());
+        assert_eq!(TierLadder::convert_old_id("simple"), Some("trivial"));
+        assert_eq!(TierLadder::convert_old_id("average"), Some("routine"));
+        assert_eq!(TierLadder::convert_old_id("difficult"), Some("high"));
+        assert_eq!(TierLadder::convert_old_id("trivial"), None);
+
+        let mut unknown = valid.clone();
+        unknown.tiers[0].id = "simple".into();
+        assert!(unknown.validate().unwrap_err().contains("unknown tier"));
+        let mut duplicate = valid.clone();
+        duplicate.tiers[1].id = "trivial".into();
+        assert!(duplicate.validate().unwrap_err().contains("duplicate tier"));
+        let mut missing = valid.clone();
+        missing.tiers.remove(2);
+        assert!(missing.validate().unwrap_err().contains("missing tier"));
+    }
+
+    #[test]
+    fn endpoint_and_pricing_saves_keep_the_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        let ladder = ladder_with_models();
+        save_tier_ladder(&path, &ladder).unwrap();
+        let endpoints = vec![Endpoint {
+            name: "ep".into(),
+            base_url: "http://localhost/".into(),
+            models: vec!["tiny".into(), "medium".into()],
+            ..Endpoint::test_default()
+        }];
+        let pricing = vec![PricingEntry {
+            model: "tiny".into(),
+            input_per_1m: 1.0,
+            output_per_1m: 2.0,
+            cached_per_1m: 0.5,
+        }];
+        save(&path, &endpoints, &pricing).unwrap();
+        assert_eq!(load_tier_ladder(&path, None).unwrap(), ladder);
+        let (loaded_endpoints, loaded_pricing) = load_or_default(&path).unwrap();
+        assert_eq!(loaded_endpoints.len(), 1);
+        assert_eq!(loaded_pricing.len(), 1);
+    }
+}
+
+
+#[cfg(test)]
+mod default_tier_text_tests {
+    use super::*;
+
+    #[test]
+    fn default_names_and_definitions_match_the_design_verbatim() {
+        let expected = [
+            (
+                "trivial",
+                "Trivial",
+                "Rename, typo, version bump, config value, copy change, a log line, dead code, doc comment, a single-file mechanical edit, a lookup or a check.",
+            ),
+            (
+                "routine",
+                "Routine",
+                "Implement a specified function, add tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.",
+            ),
+            (
+                "medium",
+                "Medium",
+                "A normal multi-file change with a clear spec: a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.",
+            ),
+            (
+                "high",
+                "High",
+                "Subtle bugs, races, flaky tests, data loss, performance regressions, security, persistence formats, cross-module or shared-contract changes, concurrency, design decisions the spec leaves open, bug_fixing plans.",
+            ),
+            (
+                "escalate",
+                "Escalate",
+                "Work a lower tier visibly failed at: repeated review failures, a stuck worker, an audit that keeps finding real problems. Not chosen for fresh work.",
+            ),
+        ];
+        let ladder = TierLadder::default();
+        for (id, name, definition) in expected {
+            let tier = ladder.get(id).unwrap();
+            assert_eq!(tier.name, name);
+            assert_eq!(tier.definition, definition);
+        }
     }
 }

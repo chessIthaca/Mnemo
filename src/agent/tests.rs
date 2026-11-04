@@ -9876,6 +9876,7 @@ async fn resolve_turn_provider_uses_override_when_configured() {
             ..Endpoint::test_default()
         }],
         pricing: vec![],
+        tiers: Default::default(),
         keys: Default::default(),
         mcp: Vec::new(),
         projects: Default::default(),
@@ -9975,6 +9976,7 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
             ..Endpoint::test_default()
         }],
         pricing: vec![],
+        tiers: Default::default(),
         keys: Default::default(),
         mcp: Vec::new(),
         projects: Default::default(),
@@ -10111,6 +10113,7 @@ async fn summarize_provider_routes_through_the_summarize_slot() {
                 ..Endpoint::test_default()
             }],
             pricing: vec![],
+        tiers: Default::default(),
             keys: Default::default(),
             mcp: Vec::new(),
             projects: Default::default(),
@@ -10240,6 +10243,7 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
             ..Endpoint::test_default()
         }],
         pricing: vec![],
+        tiers: Default::default(),
         keys: Default::default(),
         mcp: Vec::new(),
         projects: Default::default(),
@@ -12503,6 +12507,7 @@ async fn skill_override_beats_explicit_picker_pin() {
             ..Endpoint::test_default()
         }],
         pricing: vec![],
+        tiers: Default::default(),
         keys: Default::default(),
         mcp: Vec::new(),
         projects: Default::default(),

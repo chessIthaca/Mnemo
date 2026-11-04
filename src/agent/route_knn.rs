@@ -36,9 +36,20 @@
 //! row shape is parsed field by field here rather than importing Mnemo2's
 //! `DispatchRoutingRow`: this crate is the headless kernel and does not depend
 //! on the src-tauri application crate.
+//!
+//! # Never on the dispatch path
+//!
+//! A refresh can embed a whole cold log, which may outlast a dispatch's
+//! classification timeout. [`RouteKnn::classify`] therefore never waits for
+//! one: it starts (or joins) a background refresh and votes on the index as it
+//! stands now. A cold or still-building index answers `None`, so Laya always
+//! gets the remaining dispatch budget; the completed build is published for
+//! the next dispatch. [`RouteKnn::indexed_rows`] is the synchronous seam for
+//! the offline eval and tests, which may wait for a build.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
@@ -99,8 +110,9 @@ struct RouteIndex {
 
 /// The kNN overlay over `dispatch_routing.jsonl`.
 ///
-/// Cheap to clone behind an `Arc` and safe to share across dispatch tasks: the
-/// index is read-locked for lookups and written only by a serialized refresh.
+/// Cheap to clone and safe to share across dispatch tasks: the index is
+/// read-locked for lookups and written only by a serialized refresh.
+#[derive(Clone)]
 pub struct RouteKnn {
     /// Live embedder access — read fresh on every refresh and query, so a
     /// settings swap reaches the overlay without rebuilding it.
@@ -108,28 +120,34 @@ pub struct RouteKnn {
     /// The append-only dispatch routing log.
     log_path: PathBuf,
     /// Serializes refreshes: concurrent dispatches do not embed the same new
-    /// rows twice.
-    refresh: tokio::sync::Mutex<()>,
+    /// rows twice, and a background build is not duplicated.
+    refresh: Arc<tokio::sync::Mutex<()>>,
     /// The cached index.
-    index: RwLock<RouteIndex>,
+    index: Arc<RwLock<RouteIndex>>,
+    /// One background refresh at a time (the async mutex is the real
+    /// serializer; this flag keeps `classify` from spawning a queued duplicate).
+    building: Arc<AtomicBool>,
 }
 
 impl RouteKnn {
     /// A cold overlay over `log_path`. The first [`classify`](Self::classify)
-    /// indexes whatever the log holds then.
+    /// starts a background build and votes on whatever is already indexed;
+    /// [`indexed_rows`](Self::indexed_rows) waits for a build to complete.
     pub fn new(embedder: EmbedderGetter, log_path: impl Into<PathBuf>) -> Self {
         Self {
             embedder,
             log_path: log_path.into(),
-            refresh: tokio::sync::Mutex::new(()),
-            index: RwLock::new(RouteIndex::default()),
+            refresh: Arc::new(tokio::sync::Mutex::new(())),
+            index: Arc::new(RwLock::new(RouteIndex::default())),
+            building: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// The number of workers with a trustworthy label currently indexed.
     ///
-    /// Refreshes the index first when the log grew, so a caller can report a
-    /// live corpus size.
+    /// Waits for any in-flight background refresh and catches up with the log,
+    /// so a caller can report a live corpus size. This is the synchronous seam
+    /// for the offline eval and tests; dispatch never calls it.
     pub async fn indexed_rows(&self) -> usize {
         self.refresh().await;
         self.index
@@ -141,6 +159,8 @@ impl RouteKnn {
     /// Vote on `text` among the nearest labelled rows that map onto an offered
     /// tier.
     ///
+    /// This never waits for an index build: it starts a background refresh (or
+    /// joins the one already running) and votes on the index as it stands now.
     /// `None` when the log holds fewer than `min_rows` labelled workers (the
     /// cold-start / not-enough-learning floor), when no neighbour maps onto an
     /// offered tier, when the embedder returns an all-zero query vector, or on
@@ -156,7 +176,7 @@ impl RouteKnn {
         if text.trim().is_empty() || offered.count() < 2 {
             return None;
         }
-        self.refresh().await;
+        self.start_background_refresh();
         let rows = self.index.read().ok()?.entries.len();
         if rows < min_rows {
             return None;
@@ -169,11 +189,35 @@ impl RouteKnn {
         self.vote(&query, offered)
     }
 
+    /// Kick off one background build if none is running. The caller (dispatch)
+    /// does not await it, so a build that takes longer than the classification
+    /// timeout still finishes and publishes its index for the next dispatch.
+    fn start_background_refresh(&self) {
+        if self
+            .building
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.building.store(false, Ordering::Release);
+            return;
+        };
+        let knn = self.clone();
+        handle.spawn(async move {
+            knn.refresh().await;
+            knn.building.store(false, Ordering::Release);
+        });
+    }
+
     /// Bring the index up to date with the log.
     ///
     /// A missing log is an empty corpus, not an error: the overlay has simply
     /// learned nothing yet. A file ending in a partial line stops the watermark
     /// before that line, so the next refresh parses it once it is complete.
+    /// Callers wait for this (`indexed_rows`, tests, eval) or run it on a
+    /// spawned task (`classify`); dispatch never blocks on it.
     async fn refresh(&self) {
         let bytes = match std::fs::read(&self.log_path) {
             Ok(bytes) => bytes,
@@ -191,8 +235,8 @@ impl RouteKnn {
                 return;
             }
         }
-        // Serialize refreshes. The 3 s dispatch classification timeout covers
-        // the wait and the embedding together.
+        // Serialize refreshes. Dispatch does not wait here; the offline eval
+        // and tests may, and `indexed_rows` waits for an in-flight build.
         let _guard = self.refresh.lock().await;
         // Re-read after taking the refresh lock: the other refresher may have
         // completed while we waited for the fast-path check. Copy the state the
@@ -568,6 +612,7 @@ mod tests {
             route(&path, &worker, "alpha beta gamma");
             outcome(&path, &worker, Some("average"));
         }
+        knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta gamma", all_offered(), 30)
             .await
@@ -596,6 +641,7 @@ mod tests {
             route(&path, &worker, "alpha beta gamma");
             reroute(&path, &worker, "average");
         }
+        knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta gamma", all_offered(), 5)
             .await
@@ -621,6 +667,7 @@ mod tests {
             route(&path, &format!("worker-{index}"), "alpha beta");
             reroute(&path, &format!("worker-{index}"), tier);
         }
+        knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta", all_offered(), 4)
             .await
@@ -644,6 +691,7 @@ mod tests {
             json!({"event": "lead_override", "worker_id": "worker-1", "lead_tier": "simple"}),
         );
         outcome(&path, "worker-1", Some("difficult"));
+        knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta", all_offered(), 1)
             .await
@@ -660,6 +708,7 @@ mod tests {
         let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
         route(&path, "worker-1", "alpha beta gamma");
         reroute(&path, "worker-1", "simple");
+        knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta", all_offered(), 1)
             .await
@@ -693,6 +742,7 @@ mod tests {
             routine: true,
             hard: false,
         };
+        knn.indexed_rows().await;
         let vote = knn.classify("alpha beta", two, 1).await.expect("vote");
         assert_eq!(vote.tier, "average");
         // simple is not offered: it folds UP to the nearest offered tier.
@@ -703,6 +753,7 @@ mod tests {
             routine: true,
             hard: true,
         };
+        knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta", no_simple, 1)
             .await
@@ -724,6 +775,7 @@ mod tests {
             route(&path, &worker, "alpha beta gamma");
             outcome(&path, &worker, Some("average"));
         }
+        knn.indexed_rows().await;
         knn.classify("alpha beta", all_offered(), 30)
             .await
             .expect("vote");
@@ -734,6 +786,7 @@ mod tests {
             route(&path, &worker, "alpha beta gamma");
             outcome(&path, &worker, Some("average"));
         }
+        knn.indexed_rows().await;
         knn.classify("alpha beta", all_offered(), 30)
             .await
             .expect("vote");
@@ -753,6 +806,7 @@ mod tests {
             outcome(&path, &worker, Some("average"));
         }
         embedder.failing.store(true, Ordering::Relaxed);
+        assert_eq!(knn.indexed_rows().await, 0);
         assert!(knn
             .classify("alpha beta", all_offered(), 30)
             .await

@@ -33,6 +33,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +45,12 @@ use mnemo::memory::classifier::{Answer, Classifier, Question};
 /// Fewest words (step text plus brief) a dispatch must have to be classified.
 /// A shorter spec is not a better routing signal than the lead's own tier.
 pub const MIN_WORDS: usize = 20;
+
+/// The most time one dispatch gives the kNN overlay before falling back to
+/// Laya. The overlay's index build runs in the background and is never awaited;
+/// this sub-budget bounds only the query embedding/vote, leaving Laya at least
+/// 2.5 s of the outer 3 s classification timeout.
+const KNN_OVERLAY_BUDGET: Duration = Duration::from_millis(500);
 
 /// Maximum chars of the classified text handed to Laya and stored in the log.
 pub const TEXT_MAX_CHARS: usize = 2000;
@@ -229,31 +236,36 @@ pub async fn classify_dispatch(
     // overlay vote that clears `knn_min_share` is the decision; a cold index,
     // an under-gate vote or an embedder failure leaves Laya to answer.
     if let Some(knn) = knn {
-        if let Some(vote) = knn
-            .classify(text, enabled.offered(), cfg.knn_min_rows)
-            .await
-        {
-            if vote.share >= cfg.knn_min_share {
-                if let Some(label) = label_for_tier(&vote.tier) {
-                    let probabilities = vote
-                        .probabilities
-                        .iter()
-                        .filter_map(|(tier, share)| {
-                            label_for_tier(tier).map(|label| (label.to_string(), *share))
-                        })
-                        .collect();
-                    return Some(DispatchRoutingDecision {
-                        label: label.to_string(),
-                        tier: label_tier(label),
-                        confidence: vote.share,
-                        probabilities,
-                        cleared: true,
-                        source: "knn",
-                        knn_label: Some(label.to_string()),
-                        knn_share: Some(vote.share),
-                        knn_k: Some(vote.k),
-                    });
-                }
+        // The background build is kicked off inside `classify`; this budget
+        // bounds only the query embed and vote, so a slow overlay can never
+        // eat Laya's answer.
+        let vote = tokio::time::timeout(
+            KNN_OVERLAY_BUDGET,
+            knn.classify(text, enabled.offered(), cfg.knn_min_rows),
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(vote) = vote.filter(|vote| vote.share >= cfg.knn_min_share) {
+            if let Some(label) = label_for_tier(&vote.tier) {
+                let probabilities = vote
+                    .probabilities
+                    .iter()
+                    .filter_map(|(tier, share)| {
+                        label_for_tier(tier).map(|label| (label.to_string(), *share))
+                    })
+                    .collect();
+                return Some(DispatchRoutingDecision {
+                    label: label.to_string(),
+                    tier: label_tier(label),
+                    confidence: vote.share,
+                    probabilities,
+                    cleared: true,
+                    source: "knn",
+                    knn_label: Some(label.to_string()),
+                    knn_share: Some(vote.share),
+                    knn_k: Some(vote.k),
+                });
             }
         }
     }
@@ -726,7 +738,7 @@ pub fn outcome_label(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -1317,13 +1329,19 @@ mod tests {
     struct TokenEmbedder {
         calls: AtomicUsize,
         failing: AtomicBool,
+        delay_ms: AtomicU64,
     }
 
     impl TokenEmbedder {
         fn new() -> Self {
+            Self::with_delay(0)
+        }
+
+        fn with_delay(delay_ms: u64) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
                 failing: AtomicBool::new(false),
+                delay_ms: AtomicU64::new(delay_ms),
             }
         }
     }
@@ -1331,6 +1349,10 @@ mod tests {
     #[async_trait]
     impl Embedder for TokenEmbedder {
         async fn embed(&self, text: &str) -> Vec<f32> {
+            let delay = self.delay_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.failing.load(Ordering::Relaxed) {
                 return vec![0.0; 8];
@@ -1405,6 +1427,8 @@ mod tests {
             append_labelled(&path, &worker, "alpha beta gamma", "average");
         }
         let knn = overlay(dir.path(), Arc::new(TokenEmbedder::new()));
+        // Warm the overlay: dispatch itself never waits for a build.
+        knn.indexed_rows().await;
         let stub = StubClassifier::new(choice(route_question::LABEL_HARD, 0.9));
         let decision = classify_dispatch(
             &stub,
@@ -1437,6 +1461,7 @@ mod tests {
             append_labelled(&path, &worker, "alpha beta gamma", tier);
         }
         let knn = overlay(dir.path(), Arc::new(TokenEmbedder::new()));
+        knn.indexed_rows().await;
         let stub = StubClassifier::new(choice(route_question::LABEL_HARD, 0.9));
         let cfg = RoutingSettings {
             knn_min_rows: 4,
@@ -1462,6 +1487,7 @@ mod tests {
         let embedder = Arc::new(TokenEmbedder::new());
         embedder.failing.store(true, Ordering::Relaxed);
         let knn = overlay(dir.path(), embedder);
+        assert_eq!(knn.indexed_rows().await, 0);
         let stub = StubClassifier::new(choice(route_question::LABEL_HARD, 0.9));
         let decision = classify_dispatch(
             &stub,
@@ -1474,6 +1500,54 @@ mod tests {
         .expect("decision");
         assert_eq!(decision.source, "laya");
         assert_eq!(stub.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_overlay_build_never_starves_laya_and_finishes_in_the_background() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dispatch_routing.jsonl");
+        for index in 0..30 {
+            let worker = format!("worker-{index}");
+            append_labelled(&path, &worker, "alpha beta gamma", "average");
+        }
+        // Each row takes 110 ms to embed; a cold build is ~3.3 s, past the 3 s
+        // dispatch timeout that used to drop the refresh future. The background
+        // build must not hold up Laya, and must still publish for a later call.
+        let knn = overlay(dir.path(), Arc::new(TokenEmbedder::with_delay(110)));
+        let stub = StubClassifier::new(choice(route_question::LABEL_HARD, 0.9));
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            classify_dispatch(
+                &stub,
+                Some(&knn),
+                "alpha beta gamma",
+                all_enabled(),
+                &RoutingSettings::default(),
+            ),
+        )
+        .await
+        .expect("classification returned inside the dispatch budget")
+        .expect("decision");
+        // The cold overlay did not hold up Laya; it kept building off-path.
+        assert_eq!(first.source, "laya");
+        assert_eq!(stub.calls(), 1);
+        // Let the spawned build take the refresh lock so the wait below
+        // observes the background build rather than a synchronous catch-up.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(knn.indexed_rows().await, 30);
+        let second = classify_dispatch(
+            &stub,
+            Some(&knn),
+            "alpha beta gamma",
+            all_enabled(),
+            &RoutingSettings::default(),
+        )
+        .await
+        .expect("decision");
+        assert_eq!(second.source, "knn");
+        assert_eq!(second.label, route_question::LABEL_ROUTINE);
+        assert_eq!(second.knn_k, Some(5));
+        assert!(second.knn_share.unwrap_or_default() >= 0.80);
     }
 
     #[test]

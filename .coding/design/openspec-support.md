@@ -1,6 +1,6 @@
 # OpenSpec support: current-state specs and schemas on Mnemo's plan board
 
-Status: spec, in the backlog (2026-11-04). Not planned yet. Decided with the user: adopt OpenSpec's **file formats and ideas**, keep Mnemo's own workflow; support OpenSpec **schemas** (templates) and give them a settings page.
+Status: planned 2026-11-04 (decisions in §12). Decided with the user: adopt OpenSpec's **file formats and ideas**, keep Mnemo's own workflow; support OpenSpec **schemas** (templates) and give them a settings page.
 
 ## 1. Why
 
@@ -11,15 +11,15 @@ Mnemo already has most of what OpenSpec offers, under other names. What it lacks
 | *(nothing kept; `/opsx:explore` is a chat)* | backlog (`.coding/backlog.jsonl`, "plans-to-be") |
 | `/opsx:propose`: change folder with proposal, design, tasks, spec deltas | `plan_create`: goal, context, steps, interfaces, acceptance scenarios |
 | `/opsx:apply` | `team_dispatch` → review / audit → `team_merge`, with gates OpenSpec lacks |
-| `/opsx:archive`: deltas merged into `openspec/specs/`, change moved to `archive/` | plan close + team review report under `.coding/reviews/` |
-| **current-state specs** (`openspec/specs/<capability>/spec.md`) | **missing** |
+| `/opsx:archive`: deltas merged into `.coding/openspec/specs/`, change moved to `archive/` | plan close + team review report under `.coding/reviews/` |
+| **current-state specs** (`.coding/openspec/specs/<capability>/spec.md`) | **missing** |
 
 The gap shows in practice. `SPEC:`/`DECISION:` memory records are an append-only pile: a rule change supersedes records one by one and nothing gathers "what dispatch routing does today". On 2026-11-04 the rule "routing off writes no rows" was spread over four records that a worker had to supersede individually. Plans' acceptance scenarios, which are exactly current-state requirements, vanish when the plan closes.
 
 ## 2. Decisions
 
 1. **Formats, not the tool.** Mnemo writes and reads OpenSpec-compatible files. It does not require the OpenSpec CLI (Node 22+, telemetry on by default) and does not install `/opsx:*` slash commands; those would compete with the plan board, and Mnemo's workers (Kimi, GLM, DeepSeek) are driven by Mnemo's tools, not slash commands.
-2. **The plan board stays the only home of in-flight work.** OpenSpec's `openspec/changes/<name>/` is not used as live state. On close, Mnemo writes an OpenSpec-style archive folder so the history is readable by OpenSpec tools.
+2. **The plan board stays the only home of in-flight work.** OpenSpec's `.coding/openspec/changes/<name>/` is not used as live state. On close, Mnemo writes an OpenSpec-style archive folder so the history is readable by OpenSpec tools.
 3. **Optional compatibility.** If the `openspec` CLI is on PATH, Mnemo offers `openspec validate` as an extra check. Nothing depends on it.
 4. **Schemas are supported.** A project picks an OpenSpec schema (default `spec-driven`, any community or own schema); the schema shapes what a plan must contain.
 5. **One settings page** for specs and schemas (§7).
@@ -27,14 +27,14 @@ The gap shows in practice. `SPEC:`/`DECISION:` memory records are an append-only
 ## 3. Layout
 
 ```
-openspec/
+.coding/openspec/
   config.yaml                     # schema, context, rules (OpenSpec format)
   specs/<capability>/spec.md      # current-state specs
   schemas/<name>/schema.yaml      # project schemas (+ templates/)
   changes/archive/<date>-<plan-slug>/   # written by Mnemo on plan close
 ```
 
-- `openspec/` at the repo root, as OpenSpec expects, so its tools work unchanged.
+- Decided 2026-11-04: the folder is `.coding/openspec/`, next to Mnemo's other files. OpenSpec's CLI looks for `.coding/openspec/` in its working directory, so Mnemo runs it with the working directory set to `.coding/`; nothing else needs configuring.
 - The existing `.coding/specs/` (free-form older notes: `headless-free-agent*.md`, `job1-host-extraction.md`) moves to `.coding/design/` to avoid two "specs" folders.
 - User-level schemas in `~/.local/share/openspec/schemas/` are read too (OpenSpec's own resolution order).
 
@@ -84,19 +84,19 @@ The system SHALL append a reroute row to dispatch_routing.jsonl for every user o
 
 When a plan's last step merges and the team review passes, before the plan closes:
 
-1. **Merge the deltas** into `openspec/specs/<capability>/spec.md` (OpenSpec's archive semantics: RENAMED, then REMOVED, MODIFIED, ADDED; a missing capability file is created).
-2. **Write the archive folder** `openspec/changes/archive/<YYYY-MM-DD>-<plan-slug>/` with the files the project's schema generates (for `spec-driven`: `proposal.md` from goal + context "why", `design.md` from context + decisions + interfaces, `tasks.md` from the steps with their done marks, `specs/<capability>/spec.md` deltas), plus `.openspec.yaml` naming the schema and the plan id.
+1. **Merge the deltas** into `.coding/openspec/specs/<capability>/spec.md` (OpenSpec's archive semantics: RENAMED, then REMOVED, MODIFIED, ADDED; a missing capability file is created).
+2. **Write the archive folder** `.coding/openspec/changes/archive/<YYYY-MM-DD>-<plan-slug>/` with the files the project's schema generates (for `spec-driven`: `proposal.md` from goal + context "why", `design.md` from context + decisions + interfaces, `tasks.md` from the steps with their done marks, `specs/<capability>/spec.md` deltas), plus `.openspec.yaml` naming the schema and the plan id.
 3. **Gate:** the board refuses to close a plan whose deltas cannot be applied (a MODIFIED requirement no longer exists, a conflict with a delta another plan merged meanwhile). The notice names the conflict; the lead fixes the delta with `plan_update` and the close is retried. This mirrors the existing "record a memory before close" gate.
-4. Commit the spec and archive changes on the lead branch with the review report (the merge already allows `.coding/` changes; `openspec/` gets the same allowance).
+4. Commit the spec and archive changes on the lead branch with the review report (the merge already allows `.coding/` changes; `.coding/openspec/` gets the same allowance).
 
 ## 7. Schemas
 
 ### 7.1 What an OpenSpec schema is
 
-`openspec/schemas/<name>/schema.yaml` + `templates/*.md`:
+`.coding/openspec/schemas/<name>/schema.yaml` + `templates/*.md`:
 - `artifacts[]`: `id`, `generates` (file or glob), `template` (file in `templates/`), `instruction` (guidance for writing it), `requires` (artifact ids).
 - `apply`: `requires` (artifacts that must exist before implementation) and `tracks` (the progress file).
-- `openspec/config.yaml`: `schema` (default), `context` (project info added to every artifact), `rules` (per-artifact guidance by artifact id).
+- `.coding/openspec/config.yaml`: `schema` (default), `context` (project info added to every artifact), `rules` (per-artifact guidance by artifact id).
 - Resolution order: a change's `.openspec.yaml` → `config.yaml schema` → `spec-driven`.
 
 ### 7.2 How Mnemo uses one
@@ -124,7 +124,7 @@ A plan records its schema (`schema: <name>@<version>`) when created; a later sch
 
 1. **Schema**
    - Active schema picker: `spec-driven`, project schemas, user-level schemas; shows where each resolves (like `openspec schema which`).
-   - **Add schema** from a folder or a git URL (community schemas such as `epic-driven`, `intent-driven`): validated (schema.yaml parses, every template exists, `requires` has no cycle, ids unique) before it is copied into `openspec/schemas/<name>/`.
+   - **Add schema** from a folder or a git URL (community schemas such as `epic-driven`, `intent-driven`): validated (schema.yaml parses, every template exists, `requires` has no cycle, ids unique) before it is copied into `.coding/openspec/schemas/<name>/`.
    - **Fork** the current schema under a new name (like `openspec schema fork`).
 2. **Artifacts**: the schema's artifacts in order, each with the file it generates, its prerequisites (cycles flagged), whether it gates dispatch; edit its template and instruction side by side with a rendered preview; changes are validated before saving.
 3. **Project context and rules**: edit `config.yaml` `context` and per-artifact `rules`.
@@ -147,7 +147,7 @@ The backlog stays the inbox before propose. A **Plan this** button on a backlog 
 
 1. **Spec files and parser** (kernel): read/write OpenSpec `spec.md` (requirements, scenarios), delta apply with OpenSpec's archive semantics, validation; move `.coding/specs/` to `.coding/design/`; index spec files for memory_search and the graph. — difficult
 2. **Plans carry deltas** (plan board): `spec_deltas` in plan_create/plan_update, validation against current specs, rendering, worker context, deltas as acceptance scenarios. — difficult
-3. **Archive on close**: merge deltas, archive folder per schema, close gate, commit allowance for `openspec/`. — difficult
+3. **Archive on close**: merge deltas, archive folder per schema, close gate, commit allowance for `.coding/openspec/`. — difficult
 4. **Schema support** (plan board): load and validate schemas and `config.yaml`, resolution order, sections from artifacts, template/instruction/rules in refusals and briefs, `apply.requires` dispatch gate, plan records its schema. — difficult
 5. **Settings > Specs page** + backend commands (schema list/add/fork/validate, artifact and template editing, context/rules, preview, status, optional `openspec validate`). — average
 6. **Backlog "Plan this"**. — average
@@ -156,8 +156,8 @@ The backlog stays the inbox before propose. A **Plan this** button on a backlog 
 
 Order: 1 → (2 ∥ 4) → 3 → (5 ∥ 6 ∥ 7) → 8.
 
-## 12. Open questions (answer when this is planned)
+## 12. Decisions (user, 2026-11-04)
 
-1. Folder: `openspec/` at the repo root (OpenSpec-compatible, visible) or under `.coding/openspec/` (hidden, needs a config flag for OpenSpec tools)?
-2. Should a plan be **required** to carry spec deltas once a capability has a spec (refuse plans touching files of a specced capability without deltas), or only encouraged?
-3. Which schema first besides `spec-driven`: one you already use, or a community one?
+1. Folder: `.coding/openspec/` (the CLI runs with `.coding/` as its working directory).
+2. Spec deltas are **encouraged, not required**: when a plan touches files of a capability that has a spec and carries no deltas, `plan_create` adds a reminder naming the affected specs but never refuses.
+3. Schemas: `spec-driven` plus any custom schema the user adds or forks on the Specs page; no community schema is bundled.

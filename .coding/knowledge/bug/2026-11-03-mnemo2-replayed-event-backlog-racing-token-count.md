@@ -1,0 +1,6 @@
++++
+title = "Mnemo2 replayed event backlog (racing token counters) after the window was hidden"
+created = "2026-11-03"
++++
+
+Symptom: after the Mnemo2 window sat hidden/minimised (esp. over Remote Desktop) for minutes, switching back replayed threads and token/context counters raced upward until caught up. Root cause: no tweening existed; every Tauri lead/team event ran its own app.update in store.ts (handleNativeLeadEvent, streamWorkerActivity, streamWorkerEvent), and the throttled webview delivered the backlog as one task per event, so the browser painted between them. Fix (commit 855b722a): mnemo2/src/lib/streamCoalescer.ts — applies each event at once while frames flow, queues while document is hidden or no rAF painted for 100 ms, flushes the queue in one ordered batch on next frame / visibilitychange / 250 ms fallback. Lead: leadStream folds events with reduce(applyLeadEvent) and must be flushed (leadStream.flush()) before any applyLeadSnapshot or optimistic lead write. Workers: workerStream marks dirty worker ids; the batch re-reads workerActivity/composeThread so it never undoes a newer syncTeam. Tests: streamCoalescer.test.ts, hidden-backlog cases in store.native.test.ts and store.activity.test.ts.

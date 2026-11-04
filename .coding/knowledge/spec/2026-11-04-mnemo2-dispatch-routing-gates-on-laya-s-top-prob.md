@@ -1,0 +1,6 @@
++++
+title = "Mnemo2 dispatch routing gates on Laya's top probability and a kNN overlay over the routing log"
+created = "2026-11-04"
++++
+
+Routing confidence is `route_question::answer_confidence(&Answer)`: the largest value in a Choice answer's probabilities (Laya's `answer_confidence`), falling back to `confidence`; dispatch routing, the routing eval and Mnemo1 route-once use it, while failure triage, auto-typing and tool-choice keep Laya's raw `confidence`. `src/agent/route_knn.rs` `RouteKnn` indexes (route text, tier) pairs from `~/.mnemo/laya/training/dispatch_routing.jsonl` (outcome labels, user/lead reroutes, lead overrides; one vote per worker, the latest label wins), using the shared embedder from `Engine::embedder_handle()`. `classify_dispatch` asks it first under a 500 ms sub-budget: K=5, at least `knn_min_rows` (30) labelled workers and a share of at least `knn_min_share` (0.80), both in mnemo2.toml [routing]; otherwise Laya answers. The index builds in a background task and is never awaited by dispatch. Route rows record `source` (knn or laya), `knn_label`, `knn_share` and `knn_k`. Laya 0.3.20 has no fine-tune module, so the kNN overlay is the learning path. Picking a mode on Settings > Laya saves it at once.

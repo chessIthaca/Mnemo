@@ -9,7 +9,7 @@ Reviewed-state: 671fa80fe8c73c29c4063486da7b518d27f82ec7
 - `git_read` `status` — the working tree is clean except `.coding/plans/2fc1d12d.md` (in-progress bookkeeping; accuracy-checked below). So the review scope is exactly commit 671fa80.
 - `git_read` `show` 671fa80 (message + stat), `git_read` `log` for `src/agent/budget.rs` (confirms 671fa80 did NOT touch it; its last touch is the a25a5323 budget commits).
 - Full code reads at HEAD: `src/app/workflow_policy.rs` (:140-184 — the spend_tags delegate, spawn_roles, on_session_end), `src/agent/turn.rs` (:478-537 spend consult + lane/reason construction, :1378-1402 read_plan_scope, :2080-2260 the whole batch loop: not-run synthesis+break, first exec, triage, tier-1 retry + `result = retry_result` merge at :2202, tier-2, the after_tool insert at :2223-2229, the stop-signal merge at :2243), `src/agent/dispatch.rs` (:175-294 — execute_tool_call's deny-latch, malformed-args, unknown-tool, and filter-denial early returns), `src/agent/policy.rs` (:165-239 — trait docs, NoPolicy impls), `src/runtime/agent.rs` (:1028-1112 — spawn_consolidation), `src/agent/factory.rs` (:1035-1059 — the WorkflowPolicy attach), `src/agent/loop_impl.rs` (:2399-2408 — workflow_handle), `src/agent/budget.rs` (:253-268 — SpendAttribution), `src/agent/tests.rs` (:14904-14948, :15090-15114 — the acceptance tests).
-- Specs: `.coding/specs/headless-free-agent/job-02a-agent-policy-seam.md` §2a.8 (:760-776), the trait skeleton (:336-357), the sub-plan `.coding/plans/2fc1d12d.md`.
+- Specs: `.coding/design/headless-free-agent/job-02a-agent-policy-seam.md` §2a.8 (:760-776), the trait skeleton (:336-357), the sub-plan `.coding/plans/2fc1d12d.md`.
 
 ## Check results
 

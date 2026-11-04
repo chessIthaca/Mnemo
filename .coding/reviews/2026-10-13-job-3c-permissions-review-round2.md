@@ -48,4 +48,4 @@ No lock-scope or lifetime behavior change around any consumption block: the owne
 - `tests/integration/headless_kernel.rs` — the full delta region (:1726-1884): the fixture + the regression test.
 - `src/host/runtime.rs` — `spawn_agent_shared`'s signature + head (:73-132): the build consumes the passed-in per-spawn factory Arc.
 - `src-tauri/src/main.rs` (:512-531) and `src-tauri/src/console.rs` (:1205-1224) — the app factory wirings, both startup-time.
-- `.coding/specs/headless-free-agent/job-03c-permissions.md` (:330-359 — §F incl. the new 3c.6 note), `.coding/plans/843eeed6.md` (full), `.coding/reviews/2026-10-13-job-3c-permissions-review.md` (full — the round-1 findings verified resolved).
+- `.coding/design/headless-free-agent/job-03c-permissions.md` (:330-359 — §F incl. the new 3c.6 note), `.coding/plans/843eeed6.md` (full), `.coding/reviews/2026-10-13-job-3c-permissions-review.md` (full — the round-1 findings verified resolved).

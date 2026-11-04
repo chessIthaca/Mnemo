@@ -7,7 +7,7 @@ Execute step 2a.7: compute_subagent_allowlist's parent-permission consult flips 
 implementation
 
 ## Context
-Step 2a.7 of .coding/specs/headless-free-agent/job-02a-agent-policy-seam.md :749-758 (the CURRENT STEP of master 694f5a97 — sub-plan pushes under it). spawn_roles: the parent snapshot via the policy.
+Step 2a.7 of .coding/design/headless-free-agent/job-02a-agent-policy-seam.md :749-758 (the CURRENT STEP of master 694f5a97 — sub-plan pushes under it). spawn_roles: the parent snapshot via the policy.
 
 Verified anchors (probed this session, tree = wt/mnemo @7e9dd3b):
 - verified: read src/host/runtime.rs :345-436 — compute_subagent_allowlist's full body: the loops lock → the parent clone → drop → `let wf = parent.workflow_handle(); let wf = wf.lock().await; let filter = wf.allowed_tools();` (:374-376) THEN the registered collection (:379-383, the comment: the borrow of parent ends at the block close) → the parent_allowed intersection → the role match (reviewer/other/None). THE CONSULT SITE = :374-376. The step table: the parent's allowed set comes from `parent_loop.policy().tool_surface().await.gate` (the SAME filter — WorkflowPolicy's gate IS allowed_tools(), the 2a.3 delegate; verified: workflow_policy.rs :53-70).

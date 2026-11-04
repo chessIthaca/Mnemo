@@ -1,6 +1,6 @@
 # Job 1 — move the brain and the spawn path into `mnemo::host`
 
-Parent spec: `.coding/specs/headless-free-agent.md` §5.1, §14. Tier: **deepseek**
+Parent spec: `.coding/design/headless-free-agent.md` §5.1, §14. Tier: **deepseek**
 for every step below. Anchors are from commit `f82ecfe`; match on the quoted
 text, not the line number. Each step is its own ALF job, reviewed and merged
 before the next starts.

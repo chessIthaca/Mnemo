@@ -1,12 +1,12 @@
 # Job 2a seam audit — every kernel→app coupling site (coordinator-direct enumeration)
 
-Purpose: the per-site input for `.coding/specs/headless-free-agent/job-02a-agent-policy-seam.md`
+Purpose: the per-site input for `.coding/design/headless-free-agent/job-02a-agent-policy-seam.md`
 (step file). Per master-spec §14.2 the coordinator enumerates directly when the glm plan pass
 produces nothing (agent id 8, 2026-10-12: no file, no plan, no scratch — its session output is
 lost). Method: code-graph + literal searches over the post-job-1 tree (branch `wt/mnemo`,
 tip `ef65642`); every production site below was probe-verified this session (search/graph hit
 with file:line); reads confirm context where noted. Spec line references are to
-`.coding/specs/headless-free-agent.md`.
+`.coding/design/headless-free-agent.md`.
 
 AgentPolicy method legend (master-spec :204-231): register_tools · stable_head · volatile_tail ·
 tool_surface · gate_call · route · on_prompt · after_tool · on_turn_end · spend_tags ·

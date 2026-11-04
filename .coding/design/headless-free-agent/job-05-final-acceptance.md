@@ -1,6 +1,6 @@
 # Job 5 — the final acceptance (the G1–G10 proof)
 
-Master spec `.coding/specs/headless-free-agent.md` §5.9.10 (:740-753), §6
+Master spec `.coding/design/headless-free-agent.md` §5.9.10 (:740-753), §6
 row 5 (:767), §7 row 34 (:889-892), §8 (:895-906), §9 (:908-933). The last
 job: prove the split — the feature lattice, the second consumer, the
 src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`

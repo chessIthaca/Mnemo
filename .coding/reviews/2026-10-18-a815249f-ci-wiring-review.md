@@ -1,6 +1,6 @@
 ## Verdict: FINDINGS (0 high, 2 low)
 
-Delta review of the uncommitted four-file change on wt/stream-plain (base = last branch commit; the working tree is dirty, so the empty-diff rule does not apply). Read in full: examples/second_consumer.rs (all 284 lines), .github/workflows/build.yml (all 301 lines — the whole-file integrity check after the repaired delete), .coding/plans/a815249f.md, .coding/specs/headless-free-agent/job-05-final-acceptance.md §F 5.2 and §5.7, src/headless/engine.rs:100-119, src/provider/mod.rs:55-74, src/runtime/channels.rs (HostToolCall/SerializableAgentEvent), README.md:50-79, plus the full `git diff HEAD` (stat + content) and `git status`.
+Delta review of the uncommitted four-file change on wt/stream-plain (base = last branch commit; the working tree is dirty, so the empty-diff rule does not apply). Read in full: examples/second_consumer.rs (all 284 lines), .github/workflows/build.yml (all 301 lines — the whole-file integrity check after the repaired delete), .coding/plans/a815249f.md, .coding/design/headless-free-agent/job-05-final-acceptance.md §F 5.2 and §5.7, src/headless/engine.rs:100-119, src/provider/mod.rs:55-74, src/runtime/channels.rs (HostToolCall/SerializableAgentEvent), README.md:50-79, plus the full `git diff HEAD` (stat + content) and `git status`.
 
 ### Verified sound (the risk-focus list)
 

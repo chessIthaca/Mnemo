@@ -4,7 +4,7 @@ Round 2 (delta-scoped, base `7a3cae6c58d9c29d43a0cd2083f5141e82080e35`): the del
 
 ### What I read
 
-`git log` (the six job-6 commits, one new since base), `git show 6bd853a` (message + stat: 6 files, 115+/7−), `git diff` (uncommitted remainder), and region reads against round-1's documented base state: `src-tauri/src/main.rs` :495-535 / :555-600 / :635-700 (spawner build, wiring, main-agent build, engine construction, restore, `app.manage`), `src-tauri/src/ipc/contract_fixtures.rs` :1-25, `PLAN.md` :28-65, `.coding/specs/headless-free-agent/job-06-app-unification.md` :95-149, `.coding/plans/c903c276.md` (full), and the round-1 report (full, committed verbatim in this commit). Repo-wide `dto-engine-stats` search and a main.rs setter-site search (with the graph confirming the setters are `src/agent/factory.rs::set_spawner::841` / `::set_descendant_tracker::853` — the per-build slot mutators round-1 cited).
+`git log` (the six job-6 commits, one new since base), `git show 6bd853a` (message + stat: 6 files, 115+/7−), `git diff` (uncommitted remainder), and region reads against round-1's documented base state: `src-tauri/src/main.rs` :495-535 / :555-600 / :635-700 (spawner build, wiring, main-agent build, engine construction, restore, `app.manage`), `src-tauri/src/ipc/contract_fixtures.rs` :1-25, `PLAN.md` :28-65, `.coding/design/headless-free-agent/job-06-app-unification.md` :95-149, `.coding/plans/c903c276.md` (full), and the round-1 report (full, committed verbatim in this commit). Repo-wide `dto-engine-stats` search and a main.rs setter-site search (with the graph confirming the setters are `src/agent/factory.rs::set_spawner::841` / `::set_descendant_tracker::853` — the per-build slot mutators round-1 cited).
 
 ### H1 fix — verified correct
 

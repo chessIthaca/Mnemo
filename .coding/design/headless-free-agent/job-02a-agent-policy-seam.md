@@ -1,10 +1,10 @@
 # Job 2a — the AgentPolicy seam (step file)
 
-Source of truth: `.coding/specs/headless-free-agent.md` §5.2 Phase 2 (:200-279 — the trait
+Source of truth: `.coding/design/headless-free-agent.md` §5.2 Phase 2 (:200-279 — the trait
 verbatim :204-231, cache contract :237-240, routing contract :241-246, kernel-owned stays
 :247-258, the 2a bullet :261-265), job-table row :760, acceptance rows :785-792, named tests
 :913-914, method §14 (:1002-1077). The per-site anchors live in the audit appendix:
-`.coding/specs/headless-free-agent/job-02a-seam-audit.md` (every production site
+`.coding/design/headless-free-agent/job-02a-seam-audit.md` (every production site
 probe-verified against tip `ef65642` this session). Job 1 (host extraction) is merged; job 2a
 routes kernel coupling through the policy — ZERO behaviour change — and 2b moves the app
 implementation under `mnemo::app`.

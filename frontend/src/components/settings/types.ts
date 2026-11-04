@@ -4,7 +4,7 @@
 
 /** Shared types and constants for the Settings dialog. */
 
-import type { EndpointEditable, ModelConfigEditable, ModelRefConfig, VisionModelInfo } from "../../lib/tauri";
+import type { EndpointEditable, ModelConfigEditable, VisionModelInfo } from "../../lib/tauri";
 import type { McpServer, McpServerStatus } from "../../lib/types";
 import type { SteeringNoteKey } from "../../lib/delegationNotes";
 
@@ -524,36 +524,20 @@ export interface ClassifierDraft {
   /** The `auto_finetune` opt-in — the startup fine-tune (managed only). */
   autoFinetune: boolean;
   /** The `routing` opt-in — pre-prompt model routing (backlog 091e694d: each
-   *  main-agent turn's task text is classified trivial vs architectural;
-   *  needs a fine-tuned checkpoint). Ships shadow-first — decisions are
-   *  classified + logged and the model switches only once `routingEnforce`
-   *  is on. */
+   *  main-agent turn's task text is classified on the shared four-label
+   *  question — trivial / routine / involved / hard; needs a fine-tuned
+   *  checkpoint). Ships shadow-first — decisions are classified + logged and
+   *  the model switches only once `routingEnforce` is on. */
   routing: boolean;
   /** Whether a confident routing decision actually switches the turn's model
    *  (false = shadow: classify + log only). */
   routingEnforce: boolean;
-  /** The model a confidently-trivial task routes to (null = unset). */
-  routingCheap: ModelRefConfig | null;
-  /** The model a confidently-routine first prompt routes to — the middle rung
-   *  of the shared three-label question (plan 2ba2168a, design §4.3). */
-  routingRoutine: ModelRefConfig | null;
-  /** The model a confidently-architectural task routes to (null = unset). */
-  routingCapable: ModelRefConfig | null;
-  /** The model a medium-complexity plan step routes to — the escalation-lane
-   *  rung `medium` (backlog ad56c7bd; null = unset: the step keeps the
-   *  configured model). */
-  routingLaneMedium: ModelRefConfig | null;
-  /** The model a high-complexity plan step routes to (lane `high`). */
-  routingLaneHigh: ModelRefConfig | null;
-  /** The model the escalate rung routes to (lane `escalate`, typically after
-   *  a failed cycle). */
-  routingEscalate: ModelRefConfig | null;
   /** The calibrated-probability gate (0–1) for the step-lane ladder: a
    *  decision routes only at or above it. */
   routingThreshold: number;
   /** The first-prompt gate (0–1), or null for the kernel's calibrated default
-   *  (0.475 for three labels, 0.60 for two) — the gate the session's one
-   *  first-prompt route rides. */
+   *  for the offered label count — the gate the session's one first-prompt
+   *  route rides. */
   routingFirstPromptMinConfidence: number | null;
   /** The budget layer's opt-in (`[general.budget] enabled`, backlog
    *  a25a5323) — deterministic spend caps the model can never override: a cap

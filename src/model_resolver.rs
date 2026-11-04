@@ -654,25 +654,28 @@ mod tests {
             first_prompt_min_confidence: routing.first_prompt_min_confidence,
             enforce: routing.enforce,
         };
-        for (tier_id, model) in [
-            ("trivial", routing.cheap),
+        let dir = tempfile::tempdir().expect("routing fixture");
+        config.save_all(dir.path()).expect("fixture endpoints");
+        let mut text = toml::to_string(&config.general).expect("fixture general");
+        for (lane, model) in [
+            ("cheap", routing.cheap),
             ("routine", routing.routine),
-            ("high", routing.capable),
-            ("medium", routing.lane_medium),
-            ("high", routing.lane_high),
+            ("capable", routing.capable),
+            ("lane_medium", routing.lane_medium),
+            ("lane_high", routing.lane_high),
             ("escalate", routing.escalate),
         ] {
             let Some(model) = model else { continue };
-            let tier = config
-                .tiers
-                .tiers
-                .iter_mut()
-                .find(|tier| tier.id == tier_id)
-                .expect("default tier");
-            tier.models = vec![format!("{}/{}", model.endpoint, model.model)];
-            tier.effort = model.reasoning_effort;
+            text.push_str(&format!(
+                "\n[general.routing.{lane}]\nendpoint = {:?}\nmodel = {:?}\n",
+                model.endpoint, model.model
+            ));
+            if let Some(effort) = model.reasoning_effort {
+                text.push_str(&format!("reasoning_effort = {:?}\n", effort));
+            }
         }
-        config
+        std::fs::write(dir.path().join("config.toml"), text).expect("legacy lanes");
+        Config::load(dir.path()).expect("migrate routing fixture")
     }
 
     fn cheap_ref() -> ModelRef {

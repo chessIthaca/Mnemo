@@ -69,6 +69,101 @@ fn configured_default_model(general: &GeneralConfig, endpoints: &[Endpoint]) -> 
     Some(format!("{}/{}", endpoint.name, model))
 }
 
+struct TierLoad {
+    general: GeneralConfig,
+    config_text: String,
+    endpoints: Vec<Endpoint>,
+    pricing: Vec<PricingEntry>,
+    tiers: TierLadder,
+    lanes_migrated: bool,
+    tiers_migrated: bool,
+}
+
+fn read_tier_load(config_path: &Path, endpoints_path: &Path) -> Result<TierLoad> {
+    let config_text = if config_path.exists() {
+        fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+    let general = GeneralConfig::from_toml_text(&config_text)?;
+    let (endpoints, pricing) = endpoints::load_or_default(endpoints_path)?;
+    let default_model = configured_default_model(&general, &endpoints);
+    let mut tiers = endpoints::load_tier_ladder(endpoints_path, default_model.as_deref())?;
+    let lanes_migrated = general::merge_legacy_lanes(&config_text, &mut tiers)?;
+    if lanes_migrated {
+        tiers.fill_default_model(default_model.as_deref());
+    }
+    let tiers_migrated = endpoints::tier_file_needs_migration(endpoints_path)?;
+    Ok(TierLoad {
+        general,
+        config_text,
+        endpoints,
+        pricing,
+        tiers,
+        lanes_migrated,
+        tiers_migrated,
+    })
+}
+
+struct MigrationLock {
+    path: PathBuf,
+}
+
+impl MigrationLock {
+    fn acquire(config_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(config_dir)?;
+        let path = config_dir.join("config.toml.migration.lock");
+        let started = std::time::Instant::now();
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    drop(file);
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(30));
+                    if stale && fs::remove_file(&path).is_ok() {
+                        continue;
+                    }
+                    if started.elapsed() >= std::time::Duration::from_secs(5) {
+                        return Err(crate::error::Error::Config(format!(
+                            "timed out waiting for tier migration lock {}",
+                            path.display()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn write_lane_backup(path: &Path, original: &str) -> Result<()> {
+    match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            if let Err(error) = std::io::Write::write_all(&mut file, original.as_bytes()) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                return Err(error.into());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Config {
     /// Load all global config files from the given config directory.
     ///
@@ -84,33 +179,33 @@ impl Config {
         }
         let config_path = config_dir.join("config.toml");
         let endpoints_path = config_dir.join("endpoints.toml");
-        let general = GeneralConfig::load_or_default(&config_path)?;
-        let (endpoints, pricing) = endpoints::load_or_default(&endpoints_path)?;
-        let default_model = configured_default_model(&general, &endpoints);
-        let mut tiers = endpoints::load_tier_ladder(&endpoints_path, default_model.as_deref())?;
-        let lanes_migrated = general::merge_legacy_lanes(&config_path, &mut tiers)?;
-        if lanes_migrated {
-            tiers.fill_default_model(default_model.as_deref());
-        }
-        let tiers_migrated = endpoints::tier_file_needs_migration(&endpoints_path)?;
-        if lanes_migrated {
-            // Keep the original lane-bearing file even after the successful save.
-            fs::copy(&config_path, backup_path(&config_path))?;
-        }
-        if lanes_migrated || tiers_migrated {
-            endpoints::save_tier_ladder(&endpoints_path, &tiers)?;
-        }
-        if lanes_migrated {
-            general.save(&config_path)?;
+        let mut loaded = read_tier_load(&config_path, &endpoints_path)?;
+        if loaded.lanes_migrated || loaded.tiers_migrated {
+            let _lock = MigrationLock::acquire(config_dir)?;
+            // A competing loader may have completed the migration while we
+            // waited. Re-read both inputs before deciding or writing anything.
+            loaded = read_tier_load(&config_path, &endpoints_path)?;
+            if loaded.lanes_migrated {
+                write_lane_backup(
+                    &config_dir.join("config.toml.lanes.bak"),
+                    &loaded.config_text,
+                )?;
+            }
+            if loaded.lanes_migrated || loaded.tiers_migrated {
+                endpoints::save_tier_ladder(&endpoints_path, &loaded.tiers)?;
+            }
+            if loaded.lanes_migrated {
+                loaded.general.save(&config_path)?;
+            }
         }
         let keys = KeyStore::load_or_default(&config_dir.join("keys.toml"))?;
         let mcp = mcp::load_or_default(&config_dir.join("mcp.toml"))?;
         let projects = ProjectRegistry::load_or_default(&config_dir.join("projects.toml"))?;
         Ok(Self {
-            general,
-            endpoints,
-            pricing,
-            tiers,
+            general: loaded.general,
+            endpoints: loaded.endpoints,
+            pricing: loaded.pricing,
+            tiers: loaded.tiers,
             keys,
             mcp,
             projects,
@@ -167,7 +262,10 @@ impl Config {
     /// `projects.toml` is owned by the project registry
     /// and is not touched here. Each file is fully rewritten from the in-memory
     /// `Config`, so the schema is the source of truth (unknown keys are
-    /// dropped).
+    /// dropped) — except the tier ladder in `endpoints.toml`, which a cached
+    /// `Config` does not own: the representation currently on disk (native
+    /// `[[tier]]` or legacy `[tiers]`) is carried through unchanged, and only
+    /// explicit tier writers replace it.
     ///
     /// **Transactional write (best-effort on plain FS):**
     /// 1. Serialize all four payloads first (serde failure never touches disk).
@@ -183,11 +281,16 @@ impl Config {
         // never partially updates files.
         let config_text = toml::to_string_pretty(&self.general)?;
         let endpoints_text = {
+            // A cached Config does not own the ladder. Preserve the native or
+            // legacy tier representation currently on disk; explicit tier
+            // writers are the only paths that replace it.
+            let (tier, legacy_tiers) =
+                endpoints::tier_storage(&config_dir.join("endpoints.toml"))?;
             let file = endpoints::EndpointsFile {
                 endpoint: self.endpoints.clone(),
                 pricing: self.pricing.clone(),
-                tier: self.tiers.tiers.clone(),
-                legacy_tiers: None,
+                tier,
+                legacy_tiers,
             };
             toml::to_string_pretty(&file)?
         };
@@ -1371,10 +1474,12 @@ model = "medium"
 [general.routing.capable]
 endpoint = "ep"
 model = "capable"
+reasoning_effort = "high"
 
 [general.routing.lane_high]
 endpoint = "ep"
 model = "high"
+reasoning_effort = "medium"
 
 [general.routing.escalate]
 endpoint = "ep"
@@ -1403,8 +1508,9 @@ model = "top"
         }
         assert!((config.general.general.routing.threshold - 0.7).abs() < 1e-9);
         assert!(config.general.general.routing.enforce);
+        assert_eq!(config.tiers.get("high").unwrap().effort.as_deref(), Some("high"));
 
-        let backup = dir.path().join("config.toml.bak");
+        let backup = dir.path().join("config.toml.lanes.bak");
         assert_eq!(fs::read_to_string(&backup).unwrap(), original);
         let migrated = fs::read_to_string(&config_path).unwrap();
         for lane in ["cheap", "routine", "capable", "lane_medium", "lane_high", "escalate"] {
@@ -1418,6 +1524,7 @@ model = "top"
 
         let reloaded = Config::load(dir.path()).unwrap();
         assert_eq!(reloaded.tiers, config.tiers);
+        reloaded.save_all(dir.path()).unwrap();
         assert_eq!(fs::read_to_string(&backup).unwrap(), original);
     }
 
@@ -1436,7 +1543,7 @@ model = "tiny"
         let config = Config::load(dir.path()).unwrap();
         assert_eq!(config.tiers.get("trivial").unwrap().models, vec!["ep/tiny"]);
         assert!(dir.path().join("endpoints.toml").exists());
-        assert!(dir.path().join("config.toml.bak").exists());
+        assert!(dir.path().join("config.toml.lanes.bak").exists());
         assert_eq!(Config::load(dir.path()).unwrap().tiers, config.tiers);
     }
 
@@ -1461,5 +1568,107 @@ average = [\"ep/routine\"]
         let text = fs::read_to_string(dir.path().join("endpoints.toml")).unwrap();
         assert!(text.contains("ep/default"));
         assert!(!text.contains("[tiers]"));
+    }
+}
+
+
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+
+    const ENDPOINTS: &str = r#"
+[[endpoint]]
+name = "ep"
+kind = "openai"
+base_url = "http://localhost/"
+models = ["default", "legacy-tiny", "tiny", "routine"]
+"#;
+
+    #[test]
+    fn cached_config_save_preserves_a_newer_on_disk_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        let mut ladder_a = TierLadder::default();
+        ladder_a.tiers[0].models = vec!["ep/old".into()];
+        endpoints::save_tier_ladder(&path, &ladder_a).unwrap();
+        let cached = Config::load(dir.path()).unwrap();
+        assert_eq!(cached.tiers, ladder_a);
+
+        let mut ladder_b = TierLadder::default();
+        ladder_b.tiers[0].models = vec!["ep/new".into()];
+        ladder_b.tiers[2].models = vec!["ep/medium".into()];
+        endpoints::save_tier_ladder(&path, &ladder_b).unwrap();
+        cached.save_all(dir.path()).unwrap();
+
+        assert_eq!(endpoints::load_tier_ladder(&path, None).unwrap(), ladder_b);
+    }
+
+    #[test]
+    fn concurrent_migration_keeps_one_ladder_and_the_original_lane_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = r#"[general]
+default_provider = "ep"
+default_model = "default"
+
+[general.routing.cheap]
+endpoint = "ep"
+model = "tiny"
+reasoning_effort = "minimal"
+"#;
+        fs::write(dir.path().join("config.toml"), original).unwrap();
+        fs::write(
+            dir.path().join("endpoints.toml"),
+            format!("{ENDPOINTS}\n[tiers]\nsimple = [\"ep/legacy-tiny\"]\n"),
+        )
+        .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = dir.path().to_path_buf();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                Config::load(&path).unwrap().tiers
+            }));
+        }
+        let first = handles.remove(0).join().unwrap();
+        let second = handles.remove(0).join().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.get("trivial").unwrap().models,
+            vec!["ep/legacy-tiny", "ep/tiny"]
+        );
+        assert_eq!(first.get("trivial").unwrap().effort.as_deref(), Some("minimal"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("config.toml.lanes.bak")).unwrap(),
+            original
+        );
+        assert!(!dir.path().join("config.toml.migration.lock").exists());
+    }
+
+    #[test]
+    fn plain_endpoint_save_leaves_legacy_tiers_for_default_filling_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        fs::write(&path, format!("{ENDPOINTS}\n[tiers]\naverage = [\"ep/routine\"]\n"))
+            .unwrap();
+        let (loaded, pricing) = endpoints::load_or_default(&path).unwrap();
+        endpoints::save(&path, &loaded, &pricing).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(before.contains("[tiers]"));
+        assert!(!before.contains("[[tier]]"));
+        assert!(before.contains("average = [\"ep/routine\"]"));
+
+        fs::write(
+            dir.path().join("config.toml"),
+            "[general]\ndefault_provider = \"ep\"\ndefault_model = \"default\"\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.tiers.first_model("trivial"), Some("ep/default"));
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("[tiers]"));
+        assert!(after.contains("[[tier]]"));
     }
 }

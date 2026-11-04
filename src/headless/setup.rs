@@ -1476,6 +1476,13 @@ impl Setup {
         for tier in &mut tiers.tiers {
             tier.models.retain(|s| !s.starts_with(&prefix));
         }
+        if old_tiers.first_model("trivial").is_some()
+            && tiers.first_model("trivial").is_none()
+        {
+            return Err(EngineError::start_failed(format!(
+                "The trivial tier needs a model; give it another model before removing {name}"
+            )));
+        }
         new_config
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(e.to_string()))?;

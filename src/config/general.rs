@@ -453,21 +453,16 @@ struct LegacyRoutingConfig {
     escalate: Option<ModelRef>,
 }
 
-/// Merge retired Mnemo1 routing lanes into their mapped tiers. Returns whether
-/// the source file contained any lane model, so the caller can make its backup
-/// and persist the lane-free config exactly once.
+/// Merge retired Mnemo1 routing lanes from the original config text into
+/// their mapped tiers. Returns whether any lane model was present.
 pub(crate) fn merge_legacy_lanes(
-    config_path: &Path,
+    config_text: &str,
     ladder: &mut crate::config::endpoints::TierLadder,
 ) -> Result<bool> {
-    if !config_path.exists() {
+    if config_text.trim().is_empty() {
         return Ok(false);
     }
-    let text = fs::read_to_string(config_path)?;
-    if text.trim().is_empty() {
-        return Ok(false);
-    }
-    let legacy: LegacyGeneralConfig = toml::from_str(&text)?;
+    let legacy: LegacyGeneralConfig = toml::from_str(config_text)?;
     let routing = legacy.general.routing;
     let lanes = [
         ("trivial", routing.cheap),
@@ -482,9 +477,15 @@ pub(crate) fn merge_legacy_lanes(
         let Some(model) = model else { continue };
         found = true;
         let spec = format!("{}/{}", model.endpoint, model.model);
+        let effort = model.reasoning_effort;
         let Some(tier) = ladder.tiers.iter_mut().find(|tier| tier.id == tier_id) else {
             continue;
         };
+        // The first configured lane effort wins. In particular, `capable`
+        // precedes `lane_high` when both migrate into `high`.
+        if tier.effort.is_none() {
+            tier.effort = effort;
+        }
         if tier.models.contains(&spec) {
             continue;
         }
@@ -1426,10 +1427,15 @@ impl GeneralConfig {
             return Ok(Self::default());
         }
         let text = fs::read_to_string(path)?;
+        Self::from_toml_text(&text)
+    }
+
+    /// Parse `config.toml` text with the same clamping the file loader applies.
+    pub(crate) fn from_toml_text(text: &str) -> Result<Self> {
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
-        let cfg: Self = toml::from_str(&text)?;
+        let cfg: Self = toml::from_str(text)?;
         // Clamp the trace memory knobs into range — a typo (e.g. 0 or a
         // missing-suffix mistake) must not unbound or disable the log. Same
         // for the [memory] retrieval knobs (a 0 cap would zero out recall).

@@ -26,8 +26,9 @@ pub struct EndpointsFile {
     /// The unified five-tier ladder, stored as `[[tier]]` tables.
     #[serde(default, rename = "tier", skip_serializing_if = "Vec::is_empty")]
     pub tier: Vec<Tier>,
-    /// The retired `[tiers]` table, read once for migration and never saved.
-    #[serde(default, rename = "tiers", skip_serializing)]
+    /// The retired `[tiers]` table. Plain endpoint/pricing saves carry it
+    /// through unchanged; only the migration-owned writer replaces it.
+    #[serde(default, rename = "tiers", skip_serializing_if = "Option::is_none")]
     pub legacy_tiers: Option<LegacyTiers>,
 }
 
@@ -81,28 +82,28 @@ impl Default for TierLadder {
             tiers: vec![
                 Tier::new(
                     "trivial",
-                    "trivial",
-                    "Narrow, mechanical, one clear change in one place; no design judgement.",
+                    "Trivial",
+                    "Rename, typo, version bump, config value, copy change, a log line, dead code, doc comment, a single-file mechanical edit, a lookup or a check.",
                 ),
                 Tier::new(
                     "routine",
-                    "routine",
-                    "A well-understood implementation step in a known module; follow the plan.",
+                    "Routine",
+                    "Implement a specified function, add tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.",
                 ),
                 Tier::new(
                     "medium",
-                    "medium",
-                    "Touches several modules or needs care with a shared contract, persistence, or concurrency.",
+                    "Medium",
+                    "A normal multi-file change with a clear spec: a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.",
                 ),
                 Tier::new(
                     "high",
-                    "high",
-                    "Design-heavy, cross-cutting, security-sensitive, or hard debugging; may change the design.",
+                    "High",
+                    "Subtle bugs, races, flaky tests, data loss, performance regressions, security, persistence formats, cross-module or shared-contract changes, concurrency, design decisions the spec leaves open, bug_fixing plans.",
                 ),
                 Tier::new(
                     "escalate",
-                    "escalate",
-                    "Reached by escalation only: a rung failed, or the lead chose it deliberately.",
+                    "Escalate",
+                    "Work a lower tier visibly failed at: repeated review failures, a stuck worker, an audit that keeps finding real problems. Not chosen for fresh work.",
                 ),
             ],
         }
@@ -220,7 +221,7 @@ impl TierLadder {
 }
 
 /// Retired three-list `[tiers]` representation, accepted only while loading.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LegacyTiers {
     /// Former highest tier, migrated to `high`.
     #[serde(default)]
@@ -242,6 +243,13 @@ fn read_endpoints_file(path: &Path) -> Result<EndpointsFile> {
         return Ok(EndpointsFile::default());
     }
     Ok(toml::from_str(&text)?)
+}
+
+/// Read the tier representation currently on disk without converting it.
+/// Unrelated config saves use this to preserve both native and legacy storage.
+pub(crate) fn tier_storage(path: &Path) -> Result<(Vec<Tier>, Option<LegacyTiers>)> {
+    let file = read_endpoints_file(path)?;
+    Ok((file.tier, file.legacy_tiers))
 }
 
 /// Load the ladder from `[[tier]]`, or convert the retired `[tiers]` table.
@@ -998,12 +1006,14 @@ pub fn load_or_default(path: &Path) -> Result<(Vec<Endpoint>, Vec<PricingEntry>)
 /// (the schema is the source of truth), so unknown keys are dropped. Uses a
 /// temp-file + rename so a crash mid-write leaves the previous file intact.
 pub fn save(path: &Path, endpoints: &[Endpoint], pricing: &[PricingEntry]) -> Result<()> {
+    // Preserve the on-disk representation. In particular, only Config::load
+    // may convert legacy tiers because only it knows the default model.
+    let (tier, legacy_tiers) = tier_storage(path)?;
     let file = EndpointsFile {
         endpoint: endpoints.to_vec(),
         pricing: pricing.to_vec(),
-        // Endpoint/pricing saves never own the ladder: keep whatever is on disk.
-        tier: load_tier_ladder(path, None)?.tiers,
-        legacy_tiers: None,
+        tier,
+        legacy_tiers,
     };
     let text = toml::to_string_pretty(&file)?;
     crate::config::write_atomic(path, &text)?;
@@ -2448,5 +2458,48 @@ difficult = ["ep/hard"]
         let (loaded_endpoints, loaded_pricing) = load_or_default(&path).unwrap();
         assert_eq!(loaded_endpoints.len(), 1);
         assert_eq!(loaded_pricing.len(), 1);
+    }
+}
+
+
+#[cfg(test)]
+mod default_tier_text_tests {
+    use super::*;
+
+    #[test]
+    fn default_names_and_definitions_match_the_design_verbatim() {
+        let expected = [
+            (
+                "trivial",
+                "Trivial",
+                "Rename, typo, version bump, config value, copy change, a log line, dead code, doc comment, a single-file mechanical edit, a lookup or a check.",
+            ),
+            (
+                "routine",
+                "Routine",
+                "Implement a specified function, add tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.",
+            ),
+            (
+                "medium",
+                "Medium",
+                "A normal multi-file change with a clear spec: a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.",
+            ),
+            (
+                "high",
+                "High",
+                "Subtle bugs, races, flaky tests, data loss, performance regressions, security, persistence formats, cross-module or shared-contract changes, concurrency, design decisions the spec leaves open, bug_fixing plans.",
+            ),
+            (
+                "escalate",
+                "Escalate",
+                "Work a lower tier visibly failed at: repeated review failures, a stuck worker, an audit that keeps finding real problems. Not chosen for fresh work.",
+            ),
+        ];
+        let ladder = TierLadder::default();
+        for (id, name, definition) in expected {
+            let tier = ladder.get(id).unwrap();
+            assert_eq!(tier.name, name);
+            assert_eq!(tier.definition, definition);
+        }
     }
 }

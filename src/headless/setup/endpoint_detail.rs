@@ -518,6 +518,13 @@ impl Setup {
             }
             *list = out;
         }
+        if old_tiers.first_model("trivial").is_some()
+            && tiers.first_model("trivial").is_none()
+        {
+            return Err(err(format!(
+                "The trivial tier needs a model; give it another model before removing {prev_name}"
+            )));
+        }
 
         let mut new_config = crate::config::patch::apply_endpoints(
             &current,
@@ -622,7 +629,7 @@ impl Setup {
     /// Validate and persist the tiers: every spec must resolve to a
     /// configured `endpoint/model`. Blank entries and duplicates are dropped.
     pub async fn set_tiers(&self, tiers: TiersDto) -> Result<TiersDto, EngineError> {
-        let mut cfg = self.load_config()?;
+        let cfg = self.load_config()?;
         let mut tiers: TierLadder = tiers.try_into()?;
         for tier in &mut tiers.tiers {
             let name = &tier.id;
@@ -644,9 +651,9 @@ impl Setup {
             }
             *list = out;
         }
-        cfg.tiers = tiers;
-        cfg.save_all(&self.config_dir).map_err(|e| err(e.to_string()))?;
-        Ok(cfg.tiers.into())
+        crate::config::endpoints::save_tier_ladder(&self.endpoints_path(), &tiers)
+            .map_err(|e| err(e.to_string()))?;
+        Ok(tiers.into())
     }
 
     /// What still references an endpoint: tier entries and the configured
@@ -707,7 +714,7 @@ mod tests {
         dto
     }
 
-    const BASE: &str = r#"
+    pub(super) const BASE: &str = r#"
 [[endpoint]]
 name = "a"
 kind = "openai"
@@ -748,7 +755,7 @@ simple = ["a/m2"]
         let cfg = Config::load(dir.path()).unwrap();
         cfg.save_all(dir.path()).unwrap();
         let text = std::fs::read_to_string(dir.path().join("endpoints.toml")).unwrap();
-        assert!(text.contains("[[tier]]"));
+        assert!(!text.contains("[[tier]]"));
         assert!(!text.contains("[tiers]"));
     }
 
@@ -873,5 +880,67 @@ simple = ["a/m2"]
         dto.models.retain(|m| m.id != "m1");
         let e = setup.upsert_endpoint_detail(dto, None).await.unwrap_err();
         assert!(e.to_string().contains("default model"), "{e}");
+    }
+}
+
+
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+
+    fn setup_with(toml: &str) -> (tempfile::TempDir, Setup) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("endpoints.toml"), toml).unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[general]\ndefault_provider = \"a\"\ndefault_model = \"m1\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("keys.toml"), "[a]\napi_key = \"sk-a\"\n").unwrap();
+        let setup = Setup::open(Some(dir.path().to_path_buf())).unwrap();
+        (dir, setup)
+    }
+
+    #[tokio::test]
+    async fn removing_the_last_trivial_model_is_refused_without_writing() {
+        let (dir, setup) = setup_with(&super::tests::BASE.replace(
+            "simple = [\"a/m2\"]",
+            "simple = [\"b/x\"]",
+        ));
+        // Complete the one-time legacy conversion before taking the snapshot.
+        setup.tiers().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = setup.remove_endpoint_applied("b").await.unwrap_err().to_string();
+        assert!(
+            error.ends_with(
+                "The trivial tier needs a model; give it another model before removing b"
+            ),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn set_tiers_preserves_the_original_lane_migration_backup() {
+        let (dir, setup) = setup_with(super::tests::BASE);
+        let original = r#"[general]
+default_provider = "a"
+default_model = "m1"
+
+[general.routing.cheap]
+endpoint = "a"
+model = "m1"
+reasoning_effort = "minimal"
+"#;
+        std::fs::write(dir.path().join("config.toml"), original).unwrap();
+        let mut dto = TiersDto::default();
+        dto.tiers[0].models = vec!["a/m2".into()];
+        setup.set_tiers(dto).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.lanes.bak")).unwrap(),
+            original
+        );
     }
 }

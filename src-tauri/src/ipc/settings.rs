@@ -491,28 +491,13 @@ pub struct LayaWire {
 }
 
 /// Pre-prompt model routing (`general.routing`, backlog 091e694d) — the
-/// targets + policy the Laya classifier's task-complexity routing uses. Always
-/// emitted as a nested object (like `laya`), so the frontend renders the
-/// current targets directly; the section is inert while the `laya` `routing`
-/// opt-in is off.
+/// policy the Laya classifier's task-complexity routing uses. The routing
+/// models moved to the shared tier ladder (plan 87932c46: the Tiers page
+/// edits `endpoints.toml`); only the routing gates and the enforce flag
+/// remain here. Always emitted as a nested object (like `laya`); the
+/// section is inert while the `laya` `routing` opt-in is off.
 #[derive(Debug, Clone, Serialize)]
 pub struct RoutingWire {
-    /// The model a confidently-TRIVIAL task routes to (`null` = unset).
-    pub cheap: Option<ModelRefWire>,
-    /// The model a confidently-ROUTINE first prompt routes to — the middle
-    /// rung of the shared three-label question (plan 2ba2168a; `null` = unset:
-    /// the session keeps its model).
-    pub routine: Option<ModelRefWire>,
-    /// The model a confidently-ARCHITECTURAL task routes to (`null` = unset).
-    pub capable: Option<ModelRefWire>,
-    /// The model a medium-complexity plan step routes to — the escalation-lane
-    /// rung `medium` (backlog ad56c7bd; `null` = unset: the step keeps the
-    /// configured model).
-    pub lane_medium: Option<ModelRefWire>,
-    /// The model a high-complexity plan step routes to (lane `high`).
-    pub lane_high: Option<ModelRefWire>,
-    /// The model the escalate rung routes to (lane `escalate`).
-    pub escalate: Option<ModelRefWire>,
     /// The calibrated-probability gate for the step-lane ladder.
     pub threshold: f64,
     /// The first-prompt gate (`null` = the kernel's calibrated default for the
@@ -843,27 +828,11 @@ fn model_ref_wire(m: &mnemo::config::ModelRef) -> ModelRefWire {
 
 /// Convert the `[models]` section to its wire form (shared by `get_settings`).
 /// The wire shape of the `[general.routing]` section (backlog 091e694d).
+/// The routing models live on the tier ladder (plan 87932c46); only the
+/// gates and the enforce flag travel on the wire.
 fn routing_wire(config: &mnemo::config::Config) -> RoutingWire {
-    let lane = |id: &str| {
-        let spec = config.tiers.first_model(id)?;
-        let (endpoint, model) = spec.split_once('/')?;
-        Some(ModelRefWire {
-            endpoint: endpoint.to_string(),
-            model: model.to_string(),
-            reasoning_effort: config
-                .tiers
-                .get(id)
-                .and_then(|tier| tier.effort.clone()),
-        })
-    };
     let routing = &config.general.general.routing;
     RoutingWire {
-        cheap: lane("trivial"),
-        routine: lane("routine"),
-        capable: lane("high"),
-        lane_medium: lane("medium"),
-        lane_high: lane("high"),
-        escalate: lane("escalate"),
         threshold: routing.threshold,
         first_prompt_min_confidence: routing.first_prompt_min_confidence,
         enforce: routing.enforce,
@@ -1686,12 +1655,6 @@ mod settings_dto_tests {
                 auto_compact_on_plan_complete: false,
                 optimizer: OptimizerConfig::default(),
                 routing: RoutingWire {
-                    cheap: None,
-                    routine: None,
-                    capable: None,
-                    lane_medium: None,
-                    lane_high: None,
-                    escalate: None,
                     threshold: 0.80,
                     first_prompt_min_confidence: None,
                     enforce: false,
@@ -1859,12 +1822,6 @@ mod settings_dto_tests {
                 auto_compact_on_plan_complete: false,
                 optimizer: OptimizerConfig::default(),
                 routing: RoutingWire {
-                    cheap: None,
-                    routine: None,
-                    capable: None,
-                    lane_medium: None,
-                    lane_high: None,
-                    escalate: None,
                     threshold: 0.80,
                     first_prompt_min_confidence: None,
                     enforce: false,
@@ -2093,36 +2050,31 @@ mod settings_dto_tests {
     }
 
     #[test]
-    fn routing_wire_carries_the_lane_targets() {
-        // Regression (found while wiring the budget Settings block, backlog
-        // a25a5323): the wire emitted only cheap/capable/threshold/enforce —
-        // the three escalation-lane targets never reached getSettings, so the
-        // section loaded them as null and every save sent an EXPLICIT null,
-        // which the [general.routing] patch reads as "clear the target"
-        // (absent = keep, null = clear) — silently wiping configured lane
-        // models on an unrelated save. A configured target must now reach the
-        // wire, and unset ones stay EMITTED as null (never skipped), so the
-        // frontend's `| null` types and the draft round-trip hold.
+    fn routing_wire_carries_only_the_gates() {
+        // Plan 87932c46: the routing models live on the tier ladder (the Tiers
+        // page edits them); this wire carries only the gates and the enforce
+        // flag. A configured tier must NOT leak a lane-shaped field onto the
+        // wire — the old lane targets are gone with no aliases, and nothing
+        // here can silently wipe a tier's models on an unrelated save (the
+        // failure mode the lane-target regression below used to pin).
         let mut cfg = mnemo::config::Config::default();
         cfg.tiers.tiers[2].models = vec!["stub/mid".into()];
         cfg.tiers.tiers[4].models = vec!["stub/top".into()];
         let wire = routing_wire(&cfg);
-        assert_eq!(
-            wire.lane_medium.as_ref().map(|m| m.model.as_str()),
-            Some("mid"),
-            "a configured lane target must reach the wire"
-        );
-        assert_eq!(
-            wire.escalate.as_ref().map(|m| m.model.as_str()),
-            Some("top")
-        );
         let json = serde_json::to_value(&wire).unwrap();
-        assert_eq!(json["lane_medium"]["model"], "mid");
-        assert_eq!(json["lane_medium"]["endpoint"], "stub");
-        // Unset targets are present-and-null, never absent.
-        assert!(json.get("lane_high").is_some(), "{json}");
-        assert!(json["lane_high"].is_null(), "{json}");
-        assert_eq!(json["escalate"]["model"], "top");
+        assert_eq!(
+            json.as_object().unwrap().len(),
+            3,
+            "only threshold + first_prompt_min_confidence + enforce travel: {json}"
+        );
+        assert!(json.get("cheap").is_none(), "{json}");
+        assert!(json.get("capable").is_none(), "{json}");
+        assert!(json.get("lane_medium").is_none(), "{json}");
+        assert!(json.get("lane_high").is_none(), "{json}");
+        assert!(json.get("escalate").is_none(), "{json}");
+        assert_eq!(json["threshold"], 0.80);
+        assert!(json["first_prompt_min_confidence"].is_null(), "{json}");
+        assert_eq!(json["enforce"], false);
     }
 
     #[test]

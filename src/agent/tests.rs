@@ -16044,16 +16044,17 @@ impl Classifier for StaleDriftClassifier {
     }
 }
 
-/// Resolver that blocks only the capable target used by a tool-strike nudge.
-/// The routine first-prompt probe stays immediate, so the test can Clear while
+/// Resolver that blocks only the medium target used by a tool-strike nudge
+/// (a `routine` session now strikes toward `involved`, plan 87932c46). The
+/// routine first-prompt probe stays immediate, so the test can Clear while
 /// the strike path is resolving its post-snapshot target.
-struct BlockingCapableResolver {
+struct BlockingMediumResolver {
     inner: RoutingStubResolver,
     entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
-impl crate::model_resolver::ModelResolver for BlockingCapableResolver {
+impl crate::model_resolver::ModelResolver for BlockingMediumResolver {
     fn resolve(
         &self,
         _context: crate::model_resolver::ModelContext,
@@ -16066,7 +16067,7 @@ impl crate::model_resolver::ModelResolver for BlockingCapableResolver {
         target: model_routing::RouteTarget,
         context: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
-        if target == model_routing::RouteTarget::Capable {
+        if target == model_routing::RouteTarget::Medium {
             if let Some(entered) = self
                 .entered
                 .lock()
@@ -16154,12 +16155,10 @@ fn scripted_routing_gate(
         .with_log_path(log_path)
 }
 
-/// A policy with a caller-selected legacy ladder threshold, offered as the
-/// interim legacy three-label set: `involved` stays un-offered until Mnemo1's
-/// strike ladder learns the `medium` rung — offering it here would point the
-/// strike escalation's `label_above` walk at a rung Mnemo1 cannot resolve
-/// into a `RouteTarget` yet (and the first-prompt gate is calibrated for
-/// three labels).
+/// A policy with a caller-selected drift threshold, offered as the full
+/// four-label set (plan 87932c46): `trivial` / `routine` / `involved` /
+/// `hard`, one per pickable tier. The first-prompt gate defaults to the
+/// four-label calibration.
 fn routing_policy_with_threshold(
     threshold: f64,
     enforce: bool,
@@ -16167,7 +16166,7 @@ fn routing_policy_with_threshold(
     let offered = crate::agent::route_question::OfferedLabels {
         trivial: true,
         routine: true,
-        involved: false,
+        involved: true,
         hard: true,
     };
     model_routing::RoutingPolicy {
@@ -16179,7 +16178,7 @@ fn routing_policy_with_threshold(
     }
 }
 
-/// The normal three-label first-prompt policy used by the route-once tests.
+/// The normal four-label first-prompt policy used by the route-once tests.
 fn session_routing_policy(enforce: bool) -> model_routing::RoutingPolicy {
     routing_policy_with_threshold(0.80, enforce)
 }
@@ -16248,8 +16247,7 @@ fn endpoint_routed_provider(
     })
 }
 
-/// A routing resolver with an alternate endpoint for the capable model. The
-/// fallback itself is internal and must never be mistaken for a human pick.
+/// A routing resolver with an alternate endpoint for the high-tier model. The
 struct FallbackRoutingResolver {
     inner: RoutingStubResolver,
 }
@@ -16295,10 +16293,10 @@ impl crate::model_resolver::ModelResolver for FallbackRoutingResolver {
         model_id: &str,
         exclude_endpoint: &str,
     ) -> Option<crate::config::ModelRef> {
-        if model_id == "capable-model" && exclude_endpoint == "stub" {
+        if model_id == "high-model" && exclude_endpoint == "stub" {
             Some(crate::config::ModelRef {
                 endpoint: "alternate".into(),
-                model: "capable-model".into(),
+            model: "high-model".into(),
                 reasoning_effort: None,
             })
         } else {
@@ -16361,8 +16359,9 @@ fn stub_model_ref(model: &str) -> crate::config::ModelRef {
 /// answers with the configured target. No HTTP client is ever built.
 struct RoutingStubResolver {
     policy: Option<model_routing::RoutingPolicy>,
-    cheap: Option<crate::config::ModelRef>,
-    capable: Option<crate::config::ModelRef>,
+    trivial: Option<crate::config::ModelRef>,
+    medium: Option<crate::config::ModelRef>,
+    high: Option<crate::config::ModelRef>,
     /// When set, every routed target builds THIS provider (a scripted mock for
     /// multi-iteration turns); otherwise a one-shot provider naming the model.
     routed_provider: Option<Arc<dyn LlmClient>>,
@@ -16387,14 +16386,15 @@ impl crate::model_resolver::ModelResolver for RoutingStubResolver {
         _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         match target {
-            model_routing::RouteTarget::Cheap => self.cheap.clone(),
+            model_routing::RouteTarget::Trivial => self.trivial.clone(),
+            // A routine pick keeps the session's model (the first-prompt
+            // behaviour these tests pin).
             model_routing::RouteTarget::Routine => None,
-            model_routing::RouteTarget::Capable => self.capable.clone(),
-            // The lane rungs get canned targets with the lane tests (backlog
-            // ad56c7bd); until then a rung resolves to nothing here.
-            model_routing::RouteTarget::Medium
-            | model_routing::RouteTarget::High
-            | model_routing::RouteTarget::Escalate => None,
+            model_routing::RouteTarget::Medium => self.medium.clone(),
+            model_routing::RouteTarget::High => self.high.clone(),
+            // The escalate rung has no canned target here; a step-lane test
+            // that needs one builds its own resolver.
+            model_routing::RouteTarget::Escalate => None,
         }
     }
 
@@ -16507,8 +16507,9 @@ async fn settled_route_agent(
     let session_path = gate.session_log_path().to_path_buf();
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -16544,8 +16545,9 @@ async fn routing_disabled_never_classifies_and_keeps_todays_model() {
     let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: None,
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16580,8 +16582,9 @@ async fn skip_turn_routing_writes_no_routing_rows() {
     let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16621,8 +16624,9 @@ async fn turn_routing_still_runs_by_default() {
     let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16635,8 +16639,8 @@ async fn turn_routing_still_runs_by_default() {
     let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
 
     assert_eq!(
-        outcome.text, "from-cheap-model",
-        "the default session still routes to the cheap model"
+        outcome.text, "from-trivial-model",
+        "the default session still routes to the trivial tier's model"
     );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -16659,8 +16663,9 @@ async fn routing_with_an_empty_classifier_slot_keeps_todays_model() {
     let gate = model_routing::RoutingGate::new(empty_slot).with_log_path(log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16677,18 +16682,19 @@ async fn routing_with_an_empty_classifier_slot_keeps_todays_model() {
 }
 
 #[tokio::test]
-async fn routing_enforced_trivial_runs_the_turn_on_the_cheap_model() {
+async fn routing_enforced_trivial_runs_the_turn_on_the_trivial_model() {
     // The acceptance path: routing on, enforcement on, a stub classifier
-    // answering a confident "trivial", and a configured cheap target -> the
-    // turn runs on the cheap model, and both log rows land.
+    // answering a confident "trivial", and a configured trivial tier -> the
+    // turn runs on the trivial tier's model, and both log rows land.
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("routing.jsonl");
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16701,8 +16707,8 @@ async fn routing_enforced_trivial_runs_the_turn_on_the_cheap_model() {
     let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
 
     assert_eq!(
-        outcome.text, "from-cheap-model",
-        "the routed cheap target served the turn"
+        outcome.text, "from-trivial-model",
+        "the routed trivial tier served the turn"
     );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -16716,11 +16722,11 @@ async fn routing_enforced_trivial_runs_the_turn_on_the_cheap_model() {
     let d = &decisions[0];
     assert_eq!(d.label, "trivial");
     assert!((d.confidence - 0.93).abs() < 1e-9);
-    assert!((d.threshold - 0.475).abs() < 1e-9);
-    assert_eq!(d.target.as_deref(), Some("cheap"));
+    assert!((d.threshold - 0.40).abs() < 1e-9);
+    assert_eq!(d.target.as_deref(), Some("trivial"));
     assert!(d.enforced, "enforcement was in effect");
     assert!(!d.shadow);
-    assert_eq!(d.model.as_deref(), Some("stub/cheap-model"));
+    assert_eq!(d.model.as_deref(), Some("stub/trivial-model"));
     assert_eq!(d.task_text, "bump the version to 1.1.1");
     assert_eq!(outcomes[0].turn_id, d.turn_id, "rows join on turn_id");
     assert_eq!(outcomes[0].outcome, "ok");
@@ -16734,11 +16740,12 @@ async fn routing_below_threshold_keeps_the_default_model_but_logs_the_answer() {
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("routing.jsonl");
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let gate = routing_gate(Some(("trivial", 0.40)), calls.clone(), log_path.clone());
+    let gate = routing_gate(Some(("trivial", 0.30)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16756,7 +16763,7 @@ async fn routing_below_threshold_keeps_the_default_model_but_logs_the_answer() {
     assert_eq!(outcomes.len(), 1);
     let d = &decisions[0];
     assert_eq!(d.label, "trivial");
-    assert!((d.confidence - 0.40).abs() < 1e-9);
+    assert!((d.confidence - 0.30).abs() < 1e-9);
     assert_eq!(d.target, None, "below the gate no target is selected");
     assert!(!d.enforced);
     assert_eq!(d.model, None);
@@ -16773,8 +16780,9 @@ async fn routing_no_answer_writes_nothing_and_keeps_todays_model() {
     let gate = routing_gate(None, calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16805,8 +16813,9 @@ async fn routing_shadow_logs_the_decision_but_never_switches_the_model() {
     let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, false)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16825,10 +16834,10 @@ async fn routing_shadow_logs_the_decision_but_never_switches_the_model() {
     let d = &decisions[0];
     assert!(d.shadow);
     assert!(!d.enforced);
-    assert_eq!(d.model.as_deref(), Some("stub/cheap-model"));
+    assert_eq!(d.model.as_deref(), Some("stub/trivial-model"));
     assert_eq!(
         d.target.as_deref(),
-        Some("cheap"),
+        Some("trivial"),
         "the log records what shadow WOULD have used"
     );
     assert_eq!(outcomes[0].turn_id, d.turn_id);
@@ -16848,12 +16857,13 @@ async fn routing_classifies_once_per_turn_across_iterations() {
     let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
     let scripted: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(vec![
         one_call_batch("call_1", "read_files"),
-        text_stop("from-cheap-model"),
+        text_stop("from-trivial-model"),
     ]));
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: Some(scripted),
     });
     let agent = routing_agent(
@@ -16865,7 +16875,7 @@ async fn routing_classifies_once_per_turn_across_iterations() {
 
     let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
 
-    assert_eq!(outcome.text, "from-cheap-model");
+    assert_eq!(outcome.text, "from-trivial-model");
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
         1,
@@ -16894,8 +16904,9 @@ async fn routing_never_classifies_a_subagent_turn() {
     let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16931,8 +16942,9 @@ async fn first_prompt_routes_once_and_pins_the_model() {
     let gate = routing_gate(Some(("hard", 0.90)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -16943,27 +16955,27 @@ async fn first_prompt_routes_once_and_pins_the_model() {
     );
 
     let (first, mut rx) = run_routing_turn_observed(&agent, "design the routing architecture").await;
-    assert_eq!(first.text, "from-capable-model");
+    assert_eq!(first.text, "from-high-model");
     let events = drain_routing_events(&mut rx);
     let changed = events.iter().position(|event| matches!(
         event,
         AgentEvent::ModelChanged { model, provider, .. }
-            if model == "capable-model" && provider.as_deref() == Some("stub")
+            if model == "high-model" && provider.as_deref() == Some("stub")
     )).expect("the routed model is announced");
     let noticed = events.iter().position(|event| matches!(
         event,
         AgentEvent::RoutingNotice { kind, text }
-            if kind == "routed" && text.contains("capable-model") && text.contains("0.90")
+            if kind == "routed" && text.contains("high-model") && text.contains("0.90")
     )).expect("the route notice is emitted");
     assert!(changed < noticed, "the model change precedes its explanation");
     assert!(matches!(
         agent.route_once(),
         crate::agent::loop_impl::RouteOnce::Settled { model: Some(model), .. }
-            if model == "stub/capable-model"
+            if model == "stub/high-model"
     ));
 
     let second = run_routing_turn(&agent, "now implement the approved design").await;
-    assert_eq!(second.text, "from-capable-model", "the state-scoped pin persists");
+    assert_eq!(second.text, "from-high-model", "the state-scoped pin persists");
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1,
         "a top-label route has no higher drift target and classifies only once");
     let (decisions, outcomes) = read_routing_log(&log_path);
@@ -16981,8 +16993,9 @@ async fn routed_target_needing_compaction_is_not_applied() {
     let resolver = Arc::new(SmallWindowRoutingResolver {
         inner: RoutingStubResolver {
             policy: Some(session_routing_policy(true)),
-            cheap: Some(stub_model_ref("cheap-model")),
-            capable: Some(stub_model_ref("capable-model")),
+            trivial: Some(stub_model_ref("trivial-model")),
+            medium: None,
+            high: Some(stub_model_ref("high-model")),
             routed_provider: None,
         },
     });
@@ -17023,7 +17036,7 @@ async fn routed_target_needing_compaction_is_not_applied() {
     let events = drain_routing_events(&mut fanin_rx);
     assert!(!events.iter().any(|event| matches!(
         event,
-        AgentEvent::ModelChanged { model, .. } if model == "capable-model"
+        AgentEvent::ModelChanged { model, .. } if model == "high-model"
     )));
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -17053,22 +17066,23 @@ async fn later_turns_never_switch() {
     );
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
         dir.path(), routed_provider("default-model", "from-default"), resolver, gate,
     );
-    assert_eq!(run_routing_turn(&agent, "bump the package version").await.text, "from-cheap-model");
+    assert_eq!(run_routing_turn(&agent, "bump the package version").await.text, "from-trivial-model");
     assert_eq!(run_routing_turn(&agent, "redesign the whole persistence layer").await.text,
-        "from-cheap-model", "a later harder answer may nudge but never switches");
+        "from-trivial-model", "a later harder answer may nudge but never switches");
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while calls.load(std::sync::atomic::Ordering::Relaxed) < 2 {
             tokio::task::yield_now().await;
         }
     }).await.expect("the detached drift check ran");
-    assert_eq!(agent.current_model_spec(), "cheap-model");
+    assert_eq!(agent.current_model_spec(), "trivial-model");
 }
 
 #[tokio::test]
@@ -17079,8 +17093,9 @@ async fn shadow_first_prompt_notices_but_keeps_the_model() {
     let gate = routing_gate(Some(("trivial", 0.93)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(false)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
@@ -17089,7 +17104,7 @@ async fn shadow_first_prompt_notices_but_keeps_the_model() {
     let events = drain_routing_events(&mut rx);
     assert!(events.iter().any(|event| matches!(event,
         AgentEvent::RoutingNotice { kind, text }
-            if kind == "routed" && text.contains("would pick cheap-model"))));
+            if kind == "routed" && text.contains("would pick trivial-model"))));
     assert!(!events.iter().any(|event| matches!(event, AgentEvent::ModelChanged { .. })));
     assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Settled { model: None, .. }));
 }
@@ -17102,8 +17117,9 @@ async fn short_first_prompt_turns_routing_off() {
     let gate = routing_gate(Some(("hard", 0.99)), calls.clone(), log_path);
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
@@ -17118,21 +17134,24 @@ async fn below_gate_settles_without_a_model() {
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("routing.jsonl");
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let gate = routing_gate(Some(("trivial", 0.40)), calls, log_path.clone());
+    let gate = routing_gate(Some(("trivial", 0.30)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
     assert_eq!(run_routing_turn(&agent, "rename this local variable").await.text, "from-default");
     assert!(matches!(agent.route_once(),
         crate::agent::loop_impl::RouteOnce::Settled { label: Some(label), confidence: Some(confidence), model: None }
-            if label == "trivial" && (confidence - 0.40).abs() < 1e-9));
+            if label == "trivial" && (confidence - 0.30).abs() < 1e-9));
     let (decisions, _) = read_routing_log(&log_path);
     assert_eq!(decisions.len(), 1);
-    assert!((decisions[0].threshold - 0.475).abs() < 1e-9);
+    // The first-prompt gate is now the four-label default (0.40), so the
+    // scripted 0.30 answer settles below it with no model switch.
+    assert!((decisions[0].threshold - 0.40).abs() < 1e-9);
     let session_rows = read_session_routing_log(&session_log_path(&log_path));
     assert!(matches!(&session_rows[0], model_routing::SessionRoutingRow::Route { cleared: false, model: None, .. }));
 }
@@ -17145,8 +17164,9 @@ async fn routine_without_a_target_keeps_the_model() {
     let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
@@ -17177,8 +17197,9 @@ async fn resumed_session_is_never_routed() {
     let gate = routing_gate(Some(("hard", 0.99)), calls.clone(), log_path);
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -17201,8 +17222,9 @@ async fn claimed_nudge_is_published_before_clear_can_run() {
     let session_path = gate.session_log_path().to_path_buf();
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -17225,7 +17247,7 @@ async fn claimed_nudge_is_published_before_clear_can_run() {
             crate::agent::loop_impl::NudgeNotice {
                 agent_id: 1,
                 reason: "drift",
-                text: "this got harder; consider capable-model".into(),
+                text: "this got harder; consider high-model".into(),
                 log_path: Some(session_path.clone()),
                 fanin_tx: fanin_tx.clone(),
             },
@@ -17283,7 +17305,7 @@ async fn full_event_channel_never_consumes_the_nudge_silently() {
             crate::agent::loop_impl::NudgeNotice {
                 agent_id: 1,
                 reason: "drift",
-                text: "this got harder; consider capable-model".into(),
+                text: "this got harder; consider high-model".into(),
                 log_path: Some(path),
                 fanin_tx: claim_tx,
             },
@@ -17365,19 +17387,20 @@ async fn clear_makes_the_next_prompt_routable() {
     );
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
         dir.path(), routed_provider("default-model", "from-default"), resolver, gate,
     ));
-    assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-cheap-model");
+    assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-trivial-model");
     let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent.clone());
     let (fanin_tx, _fanin_rx) = mpsc::channel(16);
     task.clear_context(&fanin_tx).await;
     assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Pending));
-    assert_eq!(run_routing_turn(&agent, "design a new storage engine").await.text, "from-capable-model");
+    assert_eq!(run_routing_turn(&agent, "design a new storage engine").await.text, "from-high-model");
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
@@ -17390,12 +17413,13 @@ async fn manual_pick_turns_routing_off_and_logs_a_reroute() {
     let session_path = gate.session_log_path().to_path_buf();
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
-    assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-cheap-model");
+    assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-trivial-model");
     let (_, epoch) = agent.route_once_with_epoch();
     assert!(AgentLoop::claim_nudge(
         &agent.route_session,
@@ -17403,14 +17427,14 @@ async fn manual_pick_turns_routing_off_and_logs_a_reroute() {
         Some(epoch),
     ));
     let (from, nudged) = agent.record_manual_model_choice("stub/manual-model");
-    assert_eq!(from.as_deref(), Some("stub/cheap-model"));
+    assert_eq!(from.as_deref(), Some("stub/trivial-model"));
     assert!(nudged, "H3: the reroute captures the outstanding nudge");
     assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }));
     let rows = read_session_routing_log(&session_path);
     assert!(rows.iter().any(|row| matches!(row,
         model_routing::SessionRoutingRow::Reroute { from: Some(from), to, nudged: true, .. }
-            if from == "stub/cheap-model" && to == "stub/manual-model")));
-    assert_eq!(run_routing_turn(&agent, "classify this later prompt").await.text, "from-cheap-model");
+            if from == "stub/trivial-model" && to == "stub/manual-model")));
+    assert_eq!(run_routing_turn(&agent, "classify this later prompt").await.text, "from-trivial-model");
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "a manual choice is final");
 }
 
@@ -17430,8 +17454,9 @@ async fn manual_pick_during_first_classification_wins() {
     .with_log_path(log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -17471,7 +17496,7 @@ async fn manual_pick_during_first_classification_wins() {
     let events = drain_routing_events(&mut fanin_rx);
     assert!(!events.iter().any(|event| matches!(
         event,
-        AgentEvent::ModelChanged { model, .. } if model == "capable-model"
+        AgentEvent::ModelChanged { model, .. } if model == "high-model"
     )), "the superseded route must not announce or serve its model: {events:?}");
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -17501,8 +17526,9 @@ async fn manual_mark_before_human_pin_wins() {
     .with_log_path(log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -17543,7 +17569,7 @@ async fn manual_mark_before_human_pin_wins() {
     let events = drain_routing_events(&mut fanin_rx);
     assert!(!events.iter().any(|event| matches!(
         event,
-        AgentEvent::ModelChanged { model, .. } if model == "capable-model"
+        AgentEvent::ModelChanged { model, .. } if model == "high-model"
     )));
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -17566,8 +17592,9 @@ async fn global_set_provider_after_routing_serves_the_human_model() {
     let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -17578,7 +17605,7 @@ async fn global_set_provider_after_routing_serves_the_human_model() {
     );
     assert_eq!(
         run_routing_turn(&agent, "design the routing architecture").await.text,
-        "from-capable-model"
+        "from-high-model"
     );
 
     // This is the GLOBAL set_model / Engine::swap_model surface: plain
@@ -17623,8 +17650,9 @@ async fn engine_swap_model_counts_as_manual() {
     .with_log_path(log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -17685,7 +17713,7 @@ async fn engine_swap_model_counts_as_manual() {
     let events = drain_routing_events(&mut fanin_rx);
     assert!(!events.iter().any(|event| matches!(
         event,
-        AgentEvent::ModelChanged { model, .. } if model == "capable-model"
+        AgentEvent::ModelChanged { model, .. } if model == "high-model"
     )));
     engine.shutdown().await.expect("engine shutdown");
 }
@@ -17698,8 +17726,9 @@ async fn skip_turn_routing_session_model_change_writes_no_session_row() {
     let gate = routing_gate(Some(("hard", 0.99)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -17737,8 +17766,9 @@ async fn subagent_model_change_writes_no_session_row() {
     let gate = routing_gate(Some(("hard", 0.99)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -17776,8 +17806,9 @@ async fn same_spec_or_effort_only_change_is_not_manual() {
     let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -17788,14 +17819,14 @@ async fn same_spec_or_effort_only_change_is_not_manual() {
     );
     assert_eq!(
         run_routing_turn(&agent, "design the routing architecture").await.text,
-        "from-capable-model"
+        "from-high-model"
     );
     agent.set_provider(
-        routed_provider("capable-model", "from-same-default"),
+        routed_provider("high-model", "from-same-default"),
         context::ContextManager::new(128_000, 0.5),
     );
     agent.set_explicit_provider(
-        routed_provider("capable-model", "from-same-pin"),
+        routed_provider("high-model", "from-same-pin"),
         context::ContextManager::new(128_000, 0.5),
     );
     assert_eq!(
@@ -17820,8 +17851,9 @@ async fn internal_429_fallback_is_not_a_manual_pick() {
     let resolver = Arc::new(FallbackRoutingResolver {
         inner: RoutingStubResolver {
             policy: Some(session_routing_policy(true)),
-            cheap: Some(stub_model_ref("cheap-model")),
-            capable: Some(stub_model_ref("capable-model")),
+            trivial: Some(stub_model_ref("trivial-model")),
+            medium: None,
+        high: Some(stub_model_ref("high-model")),
             routed_provider: None,
         },
     });
@@ -17868,8 +17900,9 @@ async fn stale_drift_nudge_is_dropped_after_manual_pick() {
     .with_log_path(log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -17925,8 +17958,9 @@ async fn three_failing_tool_calls_nudge_once() {
     let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: Some(stub_model_ref("medium-model")),
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let mut rounds = Vec::new();
@@ -17946,9 +17980,64 @@ async fn three_failing_tool_calls_nudge_once() {
         _ => None,
     }).collect();
     assert_eq!(nudges.len(), 1, "three failures nudge; three more do not nudge again: {nudges:?}");
-    assert!(nudges[0].contains("tools keep failing") && nudges[0].contains("capable-model"));
+    assert!(nudges[0].contains("tools keep failing") && nudges[0].contains("medium-model"));
     let rows = read_session_routing_log(&session_log_path(&log_path));
     assert_eq!(rows.iter().filter(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. })).count(), 1);
+}
+
+#[tokio::test]
+async fn an_involved_session_strikes_toward_the_high_tier() {
+    // Plan 87932c46: a confidently `involved` first prompt settles the session
+    // on the `medium` tier and runs it there (the first-prompt arm), and
+    // repeated tool failures strike from that rung: `label_above("involved")`
+    // offers `hard`, so the nudge suggests the high tier's model.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("involved", 0.95)), calls, log_path.clone());
+    let mut rounds = Vec::new();
+    for index in 0..3u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart { index, id: format!("involved-strike-{index}"), name: format!("missing_tool_{index}") },
+            LlmEvent::ToolCallArgumentDelta { index, fragment: "{}".into() },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: Some(stub_model_ref("medium-model")),
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: Some(provider),
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    let (_outcome, mut rx) = run_routing_turn_observed(&agent, "wire the feature across modules").await;
+    // Three consecutive tool errors abort the turn (the stuck-model breaker),
+    // but the events still show the whole path: the involved first prompt
+    // served the turn on the medium tier's model, and the strike nudge fired
+    // BEFORE the abort, toward the high tier.
+    let events = drain_routing_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, text } if kind == "routed" && text.contains("medium-model")
+    )), "the involved first prompt ran on the medium tier: {events:?}");
+    let nudges: Vec<_> = events.iter().filter_map(|event| match event {
+        AgentEvent::RoutingNotice { kind, text } if kind == "nudge" => Some(text),
+        _ => None,
+    }).collect();
+    assert_eq!(nudges.len(), 1, "three failures on an involved session nudge once: {nudges:?}");
+    assert!(nudges[0].contains("tools keep failing") && nudges[0].contains("high-model"));
+    // The first prompt itself ran on the medium tier, and the row records the
+    // ladder id.
+    let (decisions, _) = read_routing_log(&log_path);
+    assert_eq!(decisions[0].label, "involved");
+    assert_eq!(decisions[0].target.as_deref(), Some("medium"));
+    assert_eq!(decisions[0].model.as_deref(), Some("stub/medium-model"));
+    assert!(decisions[0].enforced, "enforcement was in effect");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -17959,11 +18048,12 @@ async fn stale_strike_nudge_is_dropped_after_clear() {
     let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let resolver = Arc::new(BlockingCapableResolver {
+    let resolver = Arc::new(BlockingMediumResolver {
         inner: RoutingStubResolver {
             policy: Some(session_routing_policy(true)),
-            cheap: Some(stub_model_ref("cheap-model")),
-            capable: Some(stub_model_ref("capable-model")),
+            trivial: Some(stub_model_ref("trivial-model")),
+            medium: Some(stub_model_ref("medium-model")),
+            high: Some(stub_model_ref("high-model")),
             routed_provider: None,
         },
         entered: std::sync::Mutex::new(Some(entered_tx)),
@@ -18033,8 +18123,9 @@ async fn drift_nudges_once_in_the_background() {
     );
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
@@ -18051,7 +18142,7 @@ async fn drift_nudges_once_in_the_background() {
             }
         }
     }).await.expect("the background nudge arrives after the turn");
-    assert!(matches!(notice, AgentEvent::RoutingNotice { text, .. } if text.contains("this got harder") && text.contains("capable-model")));
+    assert!(matches!(notice, AgentEvent::RoutingNotice { text, .. } if text.contains("this got harder") && text.contains("high-model")));
     assert_eq!(agent.current_model_spec(), "default-model", "a drift nudge never switches");
     assert_eq!(run_routing_turn(&agent, "a third full prompt").await.text, "from-default");
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2, "the one nudge suppresses later drift calls");
@@ -18066,8 +18157,9 @@ async fn agent_with_tool_nudge(
     let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: Some(stub_model_ref("medium-model")),
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let mut rounds = Vec::new();
@@ -18104,8 +18196,9 @@ async fn drift_claim_during_clear_is_never_lost() {
     let gate = routing_gate(Some(("routine", 0.95)), calls, log_path);
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -18172,7 +18265,7 @@ async fn nudge_ignored_is_logged_when_a_nudged_session_ends() {
     assert!(rows.iter().any(|row| matches!(
         row,
         model_routing::SessionRoutingRow::NudgeIgnored { agent_id, to_label, .. }
-            if agent_id == "1" && to_label == "hard"
+            if agent_id == "1" && to_label == "involved"
     )));
 }
 
@@ -18220,8 +18313,9 @@ async fn drift_after_session_end_emits_nothing() {
     .with_log_path(log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: Some(session_routing_policy(true)),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = Arc::new(routing_agent(
@@ -18277,8 +18371,9 @@ async fn routing_off_is_byte_identical() {
     let gate = routing_gate(Some(("hard", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: None,
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
@@ -18293,12 +18388,13 @@ async fn routing_off_is_byte_identical() {
 
 /// A resolver whose routed target only appears AFTER the turn-start probe:
 /// `resolve_routed` answers `None` on its first call (the turn-start
-/// resolution inside `route_turn_start`) and `cheap` on every later call --
-/// the mid-turn Settings save that must not route a turn whose decision row
-/// already recorded `enforced: false, model: None` (review L2).
+/// resolution inside `route_turn_start`) and the trivial tier's model on
+/// every later call -- the mid-turn Settings save that must not route a turn
+/// whose decision row already recorded `enforced: false, model: None`
+/// (review L2).
 struct LateTargetResolver {
     calls: std::sync::atomic::AtomicUsize,
-    cheap: crate::config::ModelRef,
+    trivial: crate::config::ModelRef,
 }
 
 #[async_trait::async_trait]
@@ -18327,7 +18423,7 @@ impl crate::model_resolver::ModelResolver for LateTargetResolver {
         if call == 0 {
             None
         } else {
-            Some(self.cheap.clone())
+            Some(self.trivial.clone())
         }
     }
 
@@ -18356,7 +18452,7 @@ async fn routing_memoizes_an_unresolved_target_so_a_mid_turn_target_cannot_route
     let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(LateTargetResolver {
         calls: std::sync::atomic::AtomicUsize::new(0),
-        cheap: stub_model_ref("cheap-model"),
+        trivial: stub_model_ref("trivial-model"),
     });
     let agent = routing_agent(
         dir.path(),
@@ -18386,7 +18482,7 @@ async fn routing_memoizes_an_unresolved_target_so_a_mid_turn_target_cannot_route
     assert_eq!(decisions.len(), 1, "one decision row");
     assert_eq!(outcomes.len(), 1, "one outcome row");
     let d = &decisions[0];
-    assert_eq!(d.target.as_deref(), Some("cheap"));
+    assert_eq!(d.target.as_deref(), Some("trivial"));
     assert!(!d.enforced, "the row records the miss: nothing was enforced");
     assert_eq!(d.model, None, "no model was routed onto");
     assert_eq!(outcomes[0].outcome, "ok");
@@ -18594,12 +18690,12 @@ fn reflex_handle(
 }
 
 /// A lane-only resolver: the pre-prompt path declines (`resolve` → None, no
-/// cheap/capable targets), while the three escalation rungs answer with the
-/// configured models. No HTTP client is ever built.
+/// first-prompt tier models), while the step-lane rungs answer with the
+/// configured tier models. No HTTP client is ever built.
 struct LaneStubResolver {
     policy: Option<model_routing::RoutingPolicy>,
-    lane_medium: Option<crate::config::ModelRef>,
-    lane_high: Option<crate::config::ModelRef>,
+    medium: Option<crate::config::ModelRef>,
+    high: Option<crate::config::ModelRef>,
     escalate: Option<crate::config::ModelRef>,
 }
 
@@ -18622,12 +18718,10 @@ impl crate::model_resolver::ModelResolver for LaneStubResolver {
         _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         match target {
-            // The lane tests never configure the pre-prompt targets.
-            model_routing::RouteTarget::Cheap
-            | model_routing::RouteTarget::Routine
-            | model_routing::RouteTarget::Capable => None,
-            model_routing::RouteTarget::Medium => self.lane_medium.clone(),
-            model_routing::RouteTarget::High => self.lane_high.clone(),
+            // The lane tests never configure the first-prompt tiers.
+            model_routing::RouteTarget::Trivial | model_routing::RouteTarget::Routine => None,
+            model_routing::RouteTarget::Medium => self.medium.clone(),
+            model_routing::RouteTarget::High => self.high.clone(),
             model_routing::RouteTarget::Escalate => self.escalate.clone(),
         }
     }
@@ -19240,8 +19334,8 @@ async fn spend_rows_follow_the_enforced_lane_switch() {
     let resolver = Arc::new(LaneUsageResolver {
         inner: LaneStubResolver {
             policy: Some(routing_policy_with_threshold(0.80, true)),
-            lane_medium: Some(stub_model_ref("medium-model")),
-            lane_high: None,
+            medium: Some(stub_model_ref("medium-model")),
+            high: None,
             escalate: None,
         },
         medium_provider: usage_provider(900, 40, 0),
@@ -19335,8 +19429,8 @@ async fn lane_verify_action_re_runs_the_checks_and_rides_the_note_on_the_tail() 
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, false)),
-        lane_medium: None,
-        lane_high: None,
+        medium: None,
+        high: None,
         escalate: None,
     });
     let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![vec![
@@ -19394,8 +19488,8 @@ async fn lane_verify_action_without_a_handle_stashes_no_note() {
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, false)),
-        lane_medium: None,
-        lane_high: None,
+        medium: None,
+        high: None,
         escalate: None,
     });
     let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![vec![
@@ -19469,8 +19563,8 @@ async fn lane_enforced_medium_serves_the_step_and_announces_the_switch() {
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -19544,8 +19638,8 @@ async fn lane_shadow_logs_the_decision_but_never_switches_the_model() {
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, false)),
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -19607,8 +19701,8 @@ async fn lane_reflex_flag_off_never_asks_the_classifier() {
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -19661,8 +19755,8 @@ async fn lane_routing_flag_off_never_asks_the_classifier() {
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: None,
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -19711,8 +19805,8 @@ async fn lane_without_a_target_falls_through_without_error() {
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        lane_medium: None,
-        lane_high: None,
+        medium: None,
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -19769,8 +19863,8 @@ async fn lane_memo_is_fresh_for_a_new_plan_that_repeats_the_title() {
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: Some(routing_policy_with_threshold(0.80, true)),
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));

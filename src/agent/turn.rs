@@ -2938,18 +2938,13 @@ impl AgentLoop {
                         if let Some(to_label) =
                             super::route_question::label_above(&settled, policy.offered)
                         {
-                            let target = match to_label {
-                                super::route_question::LABEL_TRIVIAL => {
-                                    Some(model_routing::RouteTarget::Cheap)
-                                }
-                                super::route_question::LABEL_ROUTINE => {
-                                    Some(model_routing::RouteTarget::Routine)
-                                }
-                                super::route_question::LABEL_HARD => {
-                                    Some(model_routing::RouteTarget::Capable)
-                                }
-                                _ => None,
-                            };
+                            // `tier_for_label` is the only label -> tier
+                            // mapping (plan 87932c46): it now carries the
+                            // `involved` -> medium arm too, so a strike on
+                            // a routine session can suggest the medium
+                            // tier's model.
+                            let target = super::route_question::tier_for_label(to_label)
+                                .and_then(model_routing::RouteTarget::from_tier_id);
                             if let Some(model_ref) = match target {
                                 Some(target) => self.resolve_routed_model(target).await,
                                 None => None,

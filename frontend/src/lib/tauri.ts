@@ -501,24 +501,11 @@ export interface AppSettings {
        *  on. */
       routing: boolean;
     };
-    /** Pre-prompt model routing targets + policy (`[general.routing]`, backlog
+    /** Pre-prompt model routing policy (`[general.routing]`, backlog
      *  091e694d). Gated by the laya `routing` opt-in; absent = the section is
-     *  at its defaults (no targets, threshold 0.80, shadow). */
+     *  at its defaults (threshold 0.80, shadow). The per-tier models live on
+     *  the one shared tier ladder (Settings > Tiers), never here. */
     routing?: {
-      /** The model a confidently-trivial task routes to (null = unset). */
-      cheap: ModelRefConfig | null;
-      /** The model a confidently-routine first prompt routes to — the shared
-       *  three-label question's middle rung (plan 2ba2168a, null = unset). */
-      routine: ModelRefConfig | null;
-      /** The model a confidently-architectural task routes to (null = unset). */
-      capable: ModelRefConfig | null;
-      /** The model a medium-complexity plan step routes to — the escalation-
-       *  lane rung `medium` (backlog ad56c7bd; null = unset). */
-      lane_medium: ModelRefConfig | null;
-      /** The model a high-complexity plan step routes to (lane `high`). */
-      lane_high: ModelRefConfig | null;
-      /** The model the escalate rung routes to (lane `escalate`). */
-      escalate: ModelRefConfig | null;
       /** The calibrated-probability gate: a decision routes only at or above
        *  it; below it today's model runs. */
       threshold: number;
@@ -694,19 +681,11 @@ export interface SettingsSavePatch {
    *  checkpoint). Shadow-first: enable the flag to collect decisions, then
    *  flip `routing.enforce` to actually switch models. */
   laya_routing?: boolean;
-  /** `[general.routing]` patch (backlog 091e694d). Each target is `null` to
-   *  clear it, an object to set it, or absent to keep it; `threshold` /
-   *  `enforce` are plain optional scalars (absent = keep). */
+  /** `[general.routing]` policy patch (backlog 091e694d): `threshold` /
+   *  `first_prompt_min_confidence` / `enforce` are plain optional scalars
+   *  (absent = keep). The per-tier models ride the shared tier ladder
+   *  (Settings > Tiers), not this patch. */
   routing?: {
-    cheap?: ModelRefConfig | null;
-    /** The shared question's middle rung (plan 2ba2168a) — null clears. */
-    routine?: ModelRefConfig | null;
-    capable?: ModelRefConfig | null;
-    /** The escalation-lane targets (backlog ad56c7bd) — the same
-     *  absent/null/set contract as `cheap` / `capable`. */
-    lane_medium?: ModelRefConfig | null;
-    lane_high?: ModelRefConfig | null;
-    escalate?: ModelRefConfig | null;
     threshold?: number;
     /** The first-prompt gate; null clears back to the calibrated default. */
     first_prompt_min_confidence?: number | null;

@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { get } from "svelte/store";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { app } from "../lib/store";
 import type { Worker } from "../lib/types";
@@ -92,6 +93,48 @@ describe("WorkerDetail brief", () => {
     });
     await waitFor(() => expect(measure).toHaveBeenCalled());
     expect(screen.queryByRole("button", { name: /Show (more|less) brief/ })).toBeNull();
+  });
+
+  it("opens a repository path named in the brief where it points", async () => {
+    const brief = [
+      "Goal: fix `.coding/design/unified-tiers.md` and `.coding/plans/abc12345.md`.",
+      "Then re-read `src/a.rs:42`.",
+      "",
+      "```text",
+      ".coding/design/fenced-only.md",
+      "```",
+    ].join("\n");
+    const { container } = render(WorkerDetail, {
+      worker: { ...worker(), task: brief },
+      measureBriefOverflow: () => false,
+    });
+    const markdown = container.querySelector(".worker-brief .markdown") as HTMLElement;
+    const pathButton = (text: string) =>
+      [...markdown.querySelectorAll<HTMLButtonElement>("button.md-path")].find(
+        (button) => button.textContent === text,
+      );
+
+    const design = await waitFor(() => {
+      const found = pathButton(".coding/design/unified-tiers.md");
+      expect(found).toBeTruthy();
+      return found as HTMLButtonElement;
+    });
+    await fireEvent.click(design);
+    expect(get(app).workbenchOpen).toBe(true);
+    expect(get(app).workbenchTab).toBe("files");
+    expect(get(app).workbenchFile).toEqual({ path: ".coding/design/unified-tiers.md", line: null });
+
+    await fireEvent.click(pathButton(".coding/plans/abc12345.md") as HTMLButtonElement);
+    expect(get(app).route).toBe("plans");
+    expect(get(app).planDocumentId).toBe("abc12345");
+
+    await fireEvent.click(pathButton("src/a.rs:42") as HTMLButtonElement);
+    expect(get(app).workbenchTab).toBe("files");
+    expect(get(app).workbenchFile).toEqual({ path: "src/a.rs", line: 42 });
+
+    const fence = markdown.querySelector(".code-block pre") as HTMLElement;
+    expect(fence.textContent).toContain(".coding/design/fenced-only.md");
+    expect(fence.querySelector("button.md-path")).toBeNull();
   });
 });
 

@@ -42,7 +42,7 @@
             </div>
             <div class="inbox-body">
               <Collapsible maxHeight={160} label="received message">
-                <Markdown source={entry.text} onOpenLink={actions.openBrowser} />
+                <Markdown source={entry.text} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} />
               </Collapsible>
             </div>
           </article>

@@ -82,4 +82,27 @@ describe("Markdown", () => {
     await fireEvent.click(buttons[0]);
     expect(opened).toEqual([{ path: "src/agent/turn.rs", line: 4352, kind: "file", planId: null }]);
   });
+
+  it("keeps a path inside a fenced code block plain", async () => {
+    markdown.renderMarkdown.mockImplementation(
+      () =>
+        '<div class="code-block"><pre><code>open .coding/design/unified-tiers.md</code></pre></div>' +
+        "<p>Then read .coding/design/unified-tiers.md.</p>",
+    );
+    const opened: RepoPathRef[] = [];
+    const { container } = render(Markdown, {
+      source: "open .coding/design/unified-tiers.md\n\nThen read .coding/design/unified-tiers.md.",
+      onOpenPath: (ref: RepoPathRef) => opened.push(ref),
+    });
+
+    await waitFor(() => expect(container.querySelectorAll("button.md-path")).toHaveLength(1));
+    const fence = container.querySelector("pre") as HTMLElement;
+    expect(fence.textContent).toBe("open .coding/design/unified-tiers.md");
+    expect(fence.querySelector("button.md-path")).toBeNull();
+
+    await fireEvent.click(container.querySelector("p button.md-path") as HTMLButtonElement);
+    expect(opened).toEqual([
+      { path: ".coding/design/unified-tiers.md", line: null, kind: "file", planId: null },
+    ]);
+  });
 });

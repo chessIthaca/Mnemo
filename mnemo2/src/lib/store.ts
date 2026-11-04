@@ -1,6 +1,7 @@
 import { derived, get, writable } from "svelte/store";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
 import { createProjectTransport, type ProjectPreferences, type ProjectRecord, type ProjectTransport } from "./projectEngine";
+import type { RepoPathRef } from "./repoPaths";
 import { probeMnemo2Host } from "./runtime";
 import { createStreamCoalescer } from "./streamCoalescer";
 import {
@@ -1101,6 +1102,16 @@ function openFileInWorkbench(path: string, line: number | null = null) {
 /** Clear a consumed file hand-over so returning to the tab opens the tree. */
 function clearWorkbenchFile() {
   app.update((state) => (state.workbenchFile === null ? state : { ...state, workbenchFile: null }));
+}
+
+/**
+ * Open a repository path a Markdown view names: a plan document goes to the
+ * Plans route, anything else to the Workbench's Files tab at its line. This is
+ * the one action every Markdown surface passes as `onOpenPath`.
+ */
+function openRepoPath(ref: RepoPathRef) {
+  if (ref.kind === "plan" && ref.planId !== null) openPlanDocument(ref.planId);
+  else openFileInWorkbench(ref.path, ref.line);
 }
 
 function toggleTeamPeek() {
@@ -2934,6 +2945,7 @@ export const actions = {
   clearPlanDocument,
   openFileInWorkbench,
   clearWorkbenchFile,
+  openRepoPath,
   toggleTeamPeek,
   selectWorker,
   setTeamFilter,

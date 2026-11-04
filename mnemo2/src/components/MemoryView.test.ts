@@ -267,7 +267,7 @@ describe("MemoryView", () => {
     const transport = plantedTransport();
     transport.read = async (id) => ({ ...DETAILS[id], path: ".coding/plans/fc536488.md" });
     mocks.transport = transport;
-    const openPlan = vi.spyOn(actions, "openPlanDocument").mockImplementation(() => {});
+    const openPath = vi.spyOn(actions, "openRepoPath").mockImplementation(() => {});
     try {
       render(MemoryView);
       await waitFor(() => expect(reader()).toBeTruthy());
@@ -277,14 +277,19 @@ describe("MemoryView", () => {
       expect(button.title).toBe("Open plan fc536488 in the Plans tab");
       await fireEvent.click(button);
 
-      expect(openPlan).toHaveBeenCalledWith("fc536488");
+      expect(openPath).toHaveBeenCalledWith({
+        path: ".coding/plans/fc536488.md",
+        line: null,
+        kind: "plan",
+        planId: "fc536488",
+      });
     } finally {
-      openPlan.mockRestore();
+      openPath.mockRestore();
     }
   });
 
   it("opens a record's own path in the Files tab", async () => {
-    const openFile = vi.spyOn(actions, "openFileInWorkbench").mockImplementation(() => {});
+    const openPath = vi.spyOn(actions, "openRepoPath").mockImplementation(() => {});
     try {
       render(MemoryView);
       await waitFor(() => expect(reader()).toBeTruthy());
@@ -294,9 +299,14 @@ describe("MemoryView", () => {
       expect(button.title).toBe(`Open ${SPEC.path} in the Files tab`);
       await fireEvent.click(button);
 
-      expect(openFile).toHaveBeenCalledWith(SPEC.path, null);
+      expect(openPath).toHaveBeenCalledWith({
+        path: SPEC.path,
+        line: null,
+        kind: "file",
+        planId: null,
+      });
     } finally {
-      openFile.mockRestore();
+      openPath.mockRestore();
     }
   });
 
@@ -304,7 +314,7 @@ describe("MemoryView", () => {
     const transport = plantedTransport();
     transport.read = async (id) => ({ ...DETAILS[id], markdown: "It edits `src/agent/turn.rs:4352` first." });
     mocks.transport = transport;
-    const openFile = vi.spyOn(actions, "openFileInWorkbench").mockImplementation(() => {});
+    const openPath = vi.spyOn(actions, "openRepoPath").mockImplementation(() => {});
     try {
       render(MemoryView);
       await waitFor(() => expect(within(reader()).getByText(/It edits/)).toBeTruthy());
@@ -317,9 +327,14 @@ describe("MemoryView", () => {
       expect(inline.title).toBe("Open src/agent/turn.rs at line 4352 in the Files tab");
       await fireEvent.click(inline);
 
-      expect(openFile).toHaveBeenCalledWith("src/agent/turn.rs", 4352);
+      expect(openPath).toHaveBeenCalledWith({
+        path: "src/agent/turn.rs",
+        line: 4352,
+        kind: "file",
+        planId: null,
+      });
     } finally {
-      openFile.mockRestore();
+      openPath.mockRestore();
     }
   });
 

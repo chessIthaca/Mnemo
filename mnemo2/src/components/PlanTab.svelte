@@ -140,7 +140,7 @@
         ><ChevronDown size={11} /> Details</button>
       </p>
       <h2>{plan.title}</h2>
-      {#if plan.goal}<Collapsible maxHeight={60} label={`${plan.title} goal`}><Markdown source={plan.goal} onOpenLink={actions.openBrowser} /></Collapsible>{/if}
+      {#if plan.goal}<Collapsible maxHeight={60} label={`${plan.title} goal`}><Markdown source={plan.goal} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} /></Collapsible>{/if}
       {#if plan.report_path}<code class="report">{plan.report_path}</code>{/if}
     </header>
     <ol class="steps">
@@ -172,7 +172,7 @@
         {:else if details[plan.id]?.error}
           <p class="details-note details-error">{details[plan.id].error}</p>
         {:else}
-          <Markdown source={detailSource(plan)} onOpenLink={actions.openBrowser} />
+          <Markdown source={detailSource(plan)} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} />
         {/if}
       </section>
     {/if}

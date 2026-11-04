@@ -24,6 +24,12 @@
 //! - a `lead_override` row's `lead_tier` (the lead chose another tier than
 //!   Laya's).
 //!
+//! Legacy rows keep their bytes on disk and are mapped when read:
+//! `simple` → `trivial`, `average` → `routine`, `difficult` → `high`
+//! ([`TierLadder::convert_old_id`]). `escalate` is not on the ladder — an
+//! escalation row is never indexed, so the overlay can never vote or return
+//! it (design §3.1: `escalate` is never a first pick).
+//!
 //! Rows without their own `text` borrow the `route` row of the same
 //! `worker_id`; a label row with no text at all is skipped. A later label for
 //! the same worker supersedes the earlier one, so every worker casts at most
@@ -56,21 +62,24 @@ use serde_json::Value;
 
 use super::failure_triage_knn::EmbedderGetter;
 use super::route_question::OfferedLabels;
+use crate::config::endpoints::TierLadder;
 
 /// How many logged neighbours vote. With an inclusive 0.80 gate a 5-neighbour
 /// vote needs at least 4 agreeing labels to answer.
 pub const ROUTE_KNN_K: usize = 5;
 
-/// The model tiers on the routing ladder, cheapest first.
-const TIER_LADDER: [&str; 3] = ["simple", "average", "difficult"];
+/// The pickable rungs of the tier ladder, cheapest first (interface contract,
+/// 2026-11-04). `escalate` is deliberately absent: it is never a first pick, so
+/// it is never indexed, voted or returned.
+const TIER_LADDER: [&str; 4] = ["trivial", "routine", "medium", "high"];
 
 /// One kNN answer: the winning offered tier, its vote share and the neighbours
 /// that voted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RouteKnnVote {
-    /// The offered tier with the most votes (`simple`, `average` or
-    /// `difficult`). Un-offered labels are folded onto their nearest offered
-    /// neighbour by [`RouteKnn::classify`].
+    /// The offered tier with the most votes (`trivial`, `routine`, `medium`
+    /// or `high` — never `escalate`). Un-offered labels are folded onto their
+    /// nearest offered neighbour by [`RouteKnn::classify`].
     pub tier: String,
     /// The winner's share of the votes (`votes_for_winner / k`, 0.0–1.0).
     pub share: f64,
@@ -320,7 +329,13 @@ impl RouteKnn {
             let Some(worker_id) = row.get("worker_id").and_then(Value::as_str) else {
                 continue;
             };
-            let Some(tier) = row_label(row) else {
+            // `escalate` and anything else off the pickable ladder is not a
+            // training label — the row is not indexed at all, so the overlay
+            // can never vote or return it (design §3.1: an escalation is
+            // never a first pick).
+            let Some(tier) =
+                row_label(row).map(logged_tier).filter(|tier| tier_rank(tier).is_some())
+            else {
                 continue;
             };
             let Some(row_text) = route_texts.get(worker_id).cloned() else {
@@ -430,6 +445,16 @@ fn row_label(row: &Value) -> Option<&str> {
     }
 }
 
+/// The ladder id a stored row carries, mapping the legacy ids on read
+/// (`simple` → `trivial`, `average` → `routine`, `difficult` → `high` —
+/// interface contract, 2026-11-04: old rows keep their bytes and are
+/// converted when read). Anything else stays as it is, so `tier_rank` then
+/// refuses `escalate` and unknown strings: they are never indexed, voted or
+/// returned.
+fn logged_tier(tier: &str) -> &str {
+    TierLadder::convert_old_id(tier).unwrap_or(tier)
+}
+
 /// The ladder rank of a tier name, `None` for `custom` or any unknown string.
 fn tier_rank(tier: &str) -> Option<usize> {
     TIER_LADDER.iter().position(|candidate| *candidate == tier)
@@ -443,6 +468,7 @@ fn fold_rank(rank: usize, offered: OfferedLabels) -> Option<usize> {
     let is_offered = |rank: usize| match rank {
         0 => offered.trivial,
         1 => offered.routine,
+        2 => offered.involved,
         _ => offered.hard,
     };
     if is_offered(rank) {
@@ -540,6 +566,7 @@ mod tests {
         OfferedLabels {
             trivial: true,
             routine: true,
+            involved: true,
             hard: true,
         }
     }
@@ -610,17 +637,17 @@ mod tests {
         for index in 0..30 {
             let worker = format!("worker-{index}");
             route(&path, &worker, "alpha beta gamma");
-            outcome(&path, &worker, Some("average"));
+            outcome(&path, &worker, Some("routine"));
         }
         knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta gamma", all_offered(), 30)
             .await
             .expect("vote");
-        assert_eq!(vote.tier, "average");
+        assert_eq!(vote.tier, "routine");
         assert_eq!(vote.k, ROUTE_KNN_K);
         assert!((vote.share - 1.0).abs() < 1e-9);
-        assert!((vote.probabilities["average"] - 1.0).abs() < 1e-9);
+        assert!((vote.probabilities["routine"] - 1.0).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -628,25 +655,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("dispatch_routing.jsonl");
         let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
-        // Five identical-text neighbours: three label simple, two average.
+        // Five identical-text neighbours: three label trivial, two routine.
         // The share is 0.6, under the default 0.80 kNN gate; the overlay still
         // reports the vote so the caller/eval can see the near miss.
         for index in 0..3 {
-            let worker = format!("simple-{index}");
+            let worker = format!("trivial-{index}");
             route(&path, &worker, "alpha beta gamma");
-            reroute(&path, &worker, "simple");
+            reroute(&path, &worker, "trivial");
         }
         for index in 0..2 {
-            let worker = format!("average-{index}");
+            let worker = format!("routine-{index}");
             route(&path, &worker, "alpha beta gamma");
-            reroute(&path, &worker, "average");
+            reroute(&path, &worker, "routine");
         }
         knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta gamma", all_offered(), 5)
             .await
             .expect("vote");
-        assert_eq!(vote.tier, "simple");
+        assert_eq!(vote.tier, "trivial");
         assert_eq!(vote.k, 5);
         assert!((vote.share - 0.6).abs() < 1e-9);
     }
@@ -657,10 +684,10 @@ mod tests {
         let path = dir.path().join("dispatch_routing.jsonl");
         let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
         for (index, tier) in [
-            ("a", "simple"),
-            ("b", "simple"),
-            ("c", "difficult"),
-            ("d", "difficult"),
+            ("a", "trivial"),
+            ("b", "trivial"),
+            ("c", "high"),
+            ("d", "high"),
         ]
         .into_iter()
         {
@@ -675,7 +702,7 @@ mod tests {
         assert_eq!(vote.k, 4);
         assert!((vote.share - 0.5).abs() < 1e-9);
         // Ties go to the cheaper tier.
-        assert_eq!(vote.tier, "simple");
+        assert_eq!(vote.tier, "trivial");
     }
 
     #[tokio::test]
@@ -684,20 +711,20 @@ mod tests {
         let path = dir.path().join("dispatch_routing.jsonl");
         let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
         route(&path, "worker-1", "alpha beta gamma");
-        // The lead first overrode to simple, then the worker merged on a
-        // harder tier. One worker casts one vote: difficult, k = 1.
+        // The lead first overrode to trivial, then the worker merged on a
+        // harder tier. One worker casts one vote: high, k = 1.
         append(
             &path,
-            json!({"event": "lead_override", "worker_id": "worker-1", "lead_tier": "simple"}),
+            json!({"event": "lead_override", "worker_id": "worker-1", "lead_tier": "trivial"}),
         );
-        outcome(&path, "worker-1", Some("difficult"));
+        outcome(&path, "worker-1", Some("high"));
         knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta", all_offered(), 1)
             .await
             .expect("vote");
         assert_eq!(vote.k, 1);
-        assert_eq!(vote.tier, "difficult");
+        assert_eq!(vote.tier, "high");
         assert!((vote.share - 1.0).abs() < 1e-9);
     }
 
@@ -707,13 +734,13 @@ mod tests {
         let path = dir.path().join("dispatch_routing.jsonl");
         let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
         route(&path, "worker-1", "alpha beta gamma");
-        reroute(&path, "worker-1", "simple");
+        reroute(&path, "worker-1", "trivial");
         knn.indexed_rows().await;
         let vote = knn
             .classify("alpha beta", all_offered(), 1)
             .await
             .expect("vote");
-        assert_eq!(vote.tier, "simple");
+        assert_eq!(vote.tier, "trivial");
         assert!((vote.share - 1.0).abs() < 1e-9);
     }
 
@@ -724,7 +751,7 @@ mod tests {
         let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
         route(&path, "worker-1", "alpha beta gamma");
         reroute(&path, "worker-1", "custom");
-        outcome(&path, "worker-without-a-route-row", Some("difficult"));
+        outcome(&path, "worker-without-a-route-row", Some("high"));
         assert_eq!(knn.indexed_rows().await, 0);
         assert!(knn.classify("alpha", all_offered(), 1).await.is_none());
     }
@@ -735,33 +762,106 @@ mod tests {
         let path = dir.path().join("dispatch_routing.jsonl");
         let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
         route(&path, "worker-1", "alpha beta");
-        outcome(&path, "worker-1", Some("difficult"));
-        // difficult is not offered: it folds DOWN to the hardest offered tier.
-        let two = OfferedLabels {
+        outcome(&path, "worker-1", Some("high"));
+        // `high` is not offered and nothing above it is either: it folds DOWN
+        // to the hardest offered tier below it (`routine`).
+        let only_bottom_two = OfferedLabels {
             trivial: true,
             routine: true,
+            involved: false,
             hard: false,
         };
         knn.indexed_rows().await;
-        let vote = knn.classify("alpha beta", two, 1).await.expect("vote");
-        assert_eq!(vote.tier, "average");
-        // simple is not offered: it folds UP to the nearest offered tier.
+        let vote = knn
+            .classify("alpha beta", only_bottom_two, 1)
+            .await
+            .expect("vote");
+        assert_eq!(vote.tier, "routine");
+        assert_eq!(vote.k, 1);
+        // `trivial` is not offered: it folds UP to the nearest offered tier
+        // (`medium`), while `high` stays put; the 1–1 tie goes to the cheaper
+        // tier.
         route(&path, "worker-2", "alpha beta");
-        reroute(&path, "worker-2", "simple");
-        let no_simple = OfferedLabels {
+        reroute(&path, "worker-2", "trivial");
+        let only_top_two = OfferedLabels {
             trivial: false,
-            routine: true,
+            routine: false,
+            involved: true,
             hard: true,
         };
         knn.indexed_rows().await;
         let vote = knn
-            .classify("alpha beta", no_simple, 1)
+            .classify("alpha beta", only_top_two, 1)
             .await
             .expect("vote");
-        // simple folded up to average, difficult stayed; the 1–1 tie goes to
-        // the cheaper tier.
-        assert_eq!(vote.tier, "average");
+        assert_eq!(vote.tier, "medium");
         assert_eq!(vote.k, 2);
+        assert!((vote.share - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn old_tier_ids_are_converted_when_read() {
+        // Legacy rows keep their bytes on disk; the overlay maps them onto
+        // the ladder when it reads them (interface contract, 2026-11-04), so
+        // an old `difficult` outcome votes `high` and the legacy id never
+        // leaks into a vote.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dispatch_routing.jsonl");
+        let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
+        for index in 0..5 {
+            let worker = format!("worker-{index}");
+            route(&path, &worker, "alpha beta");
+            outcome(&path, &worker, Some("difficult"));
+        }
+        knn.indexed_rows().await;
+        let vote = knn.classify("alpha beta", all_offered(), 5).await.expect("vote");
+        assert_eq!(vote.tier, "high");
+        assert!(!vote.probabilities.contains_key("difficult"), "the legacy id never votes");
+        // An old `average` reroute maps onto `routine` the same way: its own
+        // text makes it the nearest neighbour, so it lands inside the k=5
+        // vote and the converted id is what counts.
+        route(&path, "legacy-average", "alpha beta gamma delta");
+        reroute(&path, "legacy-average", "average");
+        knn.indexed_rows().await;
+        let vote =
+            knn.classify("alpha beta gamma delta", all_offered(), 6).await.expect("vote");
+        assert_eq!(vote.tier, "high");
+        assert!(
+            vote.probabilities.contains_key("routine"),
+            "the old average row voted routine: {:?}",
+            vote.probabilities
+        );
+        assert!(!vote.probabilities.contains_key("average"), "the legacy id never votes");
+    }
+
+    #[tokio::test]
+    async fn escalate_is_never_indexed_voted_or_returned() {
+        // `escalate` is never a first pick: escalation rows are not training
+        // labels, so the overlay cannot index, vote or return them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dispatch_routing.jsonl");
+        let knn = knn(dir.path(), Arc::new(TokenEmbedder::new()));
+        for index in 0..3 {
+            let worker = format!("escalated-{index}");
+            route(&path, &worker, "alpha beta");
+            reroute(&path, &worker, "escalate");
+        }
+        assert_eq!(knn.indexed_rows().await, 0, "an escalation row is never a label");
+        assert!(knn.classify("alpha beta", all_offered(), 1).await.is_none());
+        // Two real labels beside them still vote — never `escalate`.
+        for index in 0..2 {
+            let worker = format!("worker-{index}");
+            route(&path, &worker, "alpha beta");
+            outcome(&path, &worker, Some("high"));
+        }
+        knn.indexed_rows().await;
+        assert_eq!(knn.indexed_rows().await, 2);
+        let vote = knn.classify("alpha beta", all_offered(), 2).await.expect("vote");
+        assert_eq!(vote.tier, "high");
+        assert!(
+            !vote.probabilities.contains_key("escalate"),
+            "escalate is never among the voted tiers"
+        );
     }
 
     #[tokio::test]
@@ -773,7 +873,7 @@ mod tests {
         for index in 0..30 {
             let worker = format!("worker-{index}");
             route(&path, &worker, "alpha beta gamma");
-            outcome(&path, &worker, Some("average"));
+            outcome(&path, &worker, Some("routine"));
         }
         knn.indexed_rows().await;
         knn.classify("alpha beta", all_offered(), 30)
@@ -784,7 +884,7 @@ mod tests {
         for index in 30..32 {
             let worker = format!("worker-{index}");
             route(&path, &worker, "alpha beta gamma");
-            outcome(&path, &worker, Some("average"));
+            outcome(&path, &worker, Some("routine"));
         }
         knn.indexed_rows().await;
         knn.classify("alpha beta", all_offered(), 30)
@@ -803,7 +903,7 @@ mod tests {
         for index in 0..30 {
             let worker = format!("worker-{index}");
             route(&path, &worker, "alpha beta gamma");
-            outcome(&path, &worker, Some("average"));
+            outcome(&path, &worker, Some("routine"));
         }
         embedder.failing.store(true, Ordering::Relaxed);
         assert_eq!(knn.indexed_rows().await, 0);

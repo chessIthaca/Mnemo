@@ -1,8 +1,9 @@
-# The routing eval's hand set (plan 2ba2168a, design §4.8): step-spec texts in
-# the shape `team_dispatch` classifies, 15 per tier plus 3 vague ones that must
-# NOT route (`expected: null`). Adapted from marcreichel/laya-router's
-# eval/route.ts to step-spec form. One JSON object per line; `#` lines are
-# comments.
+# The routing eval's hand set (plan 2ba2168a, design §4.8; four labels since
+# design §5.1): step-spec texts in the shape `team_dispatch` classifies, at
+# least 10 per label plus 3 vague ones that must NOT route (`expected: null`).
+# The `involved` label routes to the `medium` tier (design §3.1). Adapted
+# from marcreichel/laya-router's eval/route.ts to step-spec form. One JSON
+# object per line; `#` lines are comments.
 {"text": "Fix the typo in the README: 'recieve' becomes 'receive'. Files: README.md. One-word change, no behaviour.", "expected": "trivial"}
 {"text": "Bump the serde patch version from 1.0.214 to 1.0.215 in Cargo.toml and refresh the lockfile.", "expected": "trivial"}
 {"text": "Add a log line at the start of the settings save command so the applied keys show up in the app log.", "expected": "trivial"}
@@ -14,25 +15,40 @@
 {"text": "Fix the broken anchor link to the design doc in the contributing guide.", "expected": "trivial"}
 {"text": "Add one sentence to the README's install section about the Windows installer requiring WebView2.", "expected": "trivial"}
 {"text": "Adjust the default nudge limit from 3 to 4 in the config constants and update the comment beside it.", "expected": "trivial"}
-{"text": "Add a unit test that pins `label_above(\"trivial\")` to `routine` when all three labels are offered.", "expected": "trivial"}
+{"text": "Add a unit test that pins `label_above(\"trivial\")` to `routine` when all four labels are offered.", "expected": "trivial"}
 {"text": "Remove the unused `std::fmt` import flagged by clippy in the worker card module.", "expected": "trivial"}
 {"text": "Fix the linter warning about an unreachable pattern in the event-kind match by deleting the dead arm.", "expected": "trivial"}
 {"text": "Rename the button label 'Apply' to 'Save' on the endpoints page; text only.", "expected": "trivial"}
 {"text": "Add a `routine` model picker to the classifier settings section, wired through the existing DTO save path and covered by one round-trip test.", "expected": "routine"}
-{"text": "Add a `routing_log_summary` command that reads the dispatch routing log and returns counts, then register it in the invoke handler.", "expected": "routine"}
+
 {"text": "Add a 'Run eval' button to the Laya page that calls the existing command and renders the returned table in a simple grid.", "expected": "routine"}
 {"text": "Extend the settings DTO with `first_prompt_min_confidence` and validate that it sits between 0 and 1.", "expected": "routine"}
 {"text": "Add a filter box to the backlog section that hides items whose title does not match the query, with a component test.", "expected": "routine"}
 {"text": "Wire a new keyboard shortcut (Ctrl+Shift+L) to open the Laya page, with a menu entry and a test for the handler.", "expected": "routine"}
-{"text": "Add a `skip` reason column to the routing log rows and a reader that counts rows per reason.", "expected": "routine"}
+
 {"text": "Expose the worker's `ran_tier` field in the mission control card and show it beside the model chip.", "expected": "routine"}
 {"text": "Add a CLI flag `--history` to the eval binary that mines plan steps from the plans directory.", "expected": "routine"}
 {"text": "Add a pagination control to the activity list capped at 50 rows per page, with prev/next buttons.", "expected": "routine"}
 {"text": "Add a tooltip explaining the confidence number on the routing chip, using the existing tooltip component.", "expected": "routine"}
 {"text": "Write a test suite for the corpus parser covering blank lines, comments and an unknown tier.", "expected": "routine"}
 {"text": "Validate the routing mode value on save and return a clear error naming the bad value.", "expected": "routine"}
-{"text": "Add a settings toggle for nudges that persists in the routing table and is honoured by the nudge path.", "expected": "routine"}
+
 {"text": "Add a cost column to the plan review report table, computed from each worker's recorded cost.", "expected": "routine"}
+{"text": "Add a `routing_log_summary` command that reads the dispatch routing log and returns counts, then register it in the invoke handler.", "expected": "involved"}
+{"text": "Add a `skip` reason column to the routing log rows and a reader that counts rows per reason.", "expected": "involved"}
+{"text": "Add a settings toggle for nudges that persists in the routing table and is honoured by the nudge path.", "expected": "involved"}
+{"text": "Rework retry and backoff for endpoint failures so a rate-limited call waits for the reset header, spanning the client, the scheduler and the tests.", "expected": "involved"}
+{"text": "Wire the tier ladder through team_status: read it on the settings load, expose it in the status DTO and render the rungs in the tier picker.", "expected": "involved"}
+{"text": "Add a per-tier reasoning-effort field that flows from the settings save path through the dispatch call into the worker spawn, with a round-trip test.", "expected": "involved"}
+{"text": "Thread the routing decision's tier and model into the worker chip: extend the status row, the store's record and the chip component, with a test per layer.", "expected": "involved"}
+{"text": "Split the settings patch handler into per-section functions and re-point the save command, its tests and the front-end state engine at them.", "expected": "involved"}
+{"text": "Add a `min_confidence_4` gate to the routing settings: the DTO field, the load-and-save path and the validation test.", "expected": "involved"}
+{"text": "Extract the offered-label construction into a helper shared by dispatch and the eval, then point both call sites and their tests at it.", "expected": "involved"}
+{"text": "Add a reroute-source column to the routing rows, write it on every model change and count the sources in the stats section.", "expected": "involved"}
+{"text": "Add a training-dataset export for the routing labels: a log reader, the label conversion and the JSONL writer, with a fixture test.", "expected": "involved"}
+{"text": "Surface each worker's resolved model in mission control: store it at dispatch, carry it through the status command and render it beside the tier chip.", "expected": "involved"}
+{"text": "Move the corpus parsing helpers into their own module and update the eval binary, the settings command and their tests to import from it.", "expected": "involved"}
+{"text": "Add a `team_summary` command that aggregates the ledger's per-plan rows into one payload, and render the table on the plans page.", "expected": "involved"}
 {"text": "Redesign the worker model tracking so a model change mid-run takes effect on the next API call without a restart, reworking the swap path and its tests.", "expected": "hard"}
 {"text": "Make the routing log append both a claim and a publication row inside one critical section, reworking the nudge claim protocol against concurrent clears.", "expected": "hard"}
 {"text": "Introduce a new persistence format for the team ledger with a migration from the old JSONL rows and a rollback path.", "expected": "hard"}
@@ -44,7 +60,7 @@
 {"text": "Redesign the prompt cache key so a mid-turn model switch cannot reuse a stale cache entry across providers.", "expected": "hard"}
 {"text": "Add a second process writer to the memory index with a file lock and crash recovery, keeping the single-writer invariant for the app.", "expected": "hard"}
 {"text": "Change the streaming protocol to carry tool-call deltas, updating the request builder, the accumulator and every provider adapter.", "expected": "hard"}
-{"text": "Rework retry and backoff for endpoint failures so a rate-limited call waits for the reset header, spanning the client, the scheduler and the tests.", "expected": "hard"}
+
 {"text": "Move the classifier lifecycle into a hot-swappable slot shared by the runtime and the setup pipeline, so enable, disable and reload never race.", "expected": "hard"}
 {"text": "Tighten the sandbox so a spawned agent cannot write outside its worktree, auditing every file tool and adding a cross-platform check.", "expected": "hard"}
 {"text": "Introduce a durable audit trail for every model override with ordering guarantees across restarts, touching persistence, the IPC surface and the UI.", "expected": "hard"}

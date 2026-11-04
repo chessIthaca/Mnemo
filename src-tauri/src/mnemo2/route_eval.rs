@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! The routing eval's core (plan 2ba2168a, design §4.8) — the corpora, the
-//! sequential classification pass, the threshold table that suggests
-//! `min_confidence_3` / `min_confidence_2`, and the `route_eval.json` record
-//! the Laya page reads back.
+//! The routing eval's core (plan 2ba2168a, design §4.8; four labels since
+//! design §5.1) — the corpora, the sequential classification pass, the
+//! threshold table that suggests `min_confidence_4` / `min_confidence_3` /
+//! `min_confidence_2`, and the `route_eval.json` record the Laya page reads
+//! back.
 //!
 //! Two surfaces share it: the `mnemo2_route_eval` CLI
 //! (`src-tauri/src/bin/mnemo2_route_eval.rs`, `--laya-url` required) and the
@@ -24,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use mnemo::agent::failure_triage::training_log_dir;
 use mnemo::agent::route_knn::RouteKnn;
 use mnemo::agent::route_question::{self, OfferedLabels};
+use mnemo::config::endpoints::TierLadder;
 use mnemo::memory::classifier::{Answer, Classifier};
 
 use super::dispatch_routing::DispatchRoutingRow;
@@ -32,8 +34,9 @@ use super::dispatch_routing::DispatchRoutingRow;
 /// embedded so the app's Run-eval button needs no fixture path at runtime.
 pub const HAND_SET_JSONL: &str = include_str!("../../tests/fixtures/route_eval.jsonl");
 
-/// The three tiers, easiest first — the eval's expected labels.
-pub const TIERS: [&str; 3] = ["trivial", "routine", "hard"];
+/// The four labels, easiest first — the eval's expected labels (`involved`
+/// is `medium`, `hard` is `high`; design §5.1).
+pub const TIERS: [&str; 4] = ["trivial", "routine", "involved", "hard"];
 
 /// The lowest gate the sweep tries.
 const GATE_START: f64 = 0.25;
@@ -234,8 +237,10 @@ pub fn history_corpus(plans: &[String], reviews: &[String]) -> Vec<EvalCase> {
 
 /// The cases the dispatch log already labels: a worker's routed text joined
 /// to its derived outcome label (design §4.8). The log does not record which
-/// labels were weak, so every labelled outcome is mined; a label outside the
-/// three tiers is not a case.
+/// labels were weak, so every labelled outcome is mined. Outcome rows carry
+/// tier ids — legacy ones (`simple` / `average` / `difficult`) are converted
+/// on read — mapped onto the Laya labels ([`logged_tier_label`]); anything
+/// that is not a pickable tier (`escalate`, `custom`) is not a case.
 pub fn outcome_cases(rows: &[DispatchRoutingRow]) -> Vec<EvalCase> {
     let mut texts: BTreeMap<&str, &str> = BTreeMap::new();
     for row in rows {
@@ -246,18 +251,29 @@ pub fn outcome_cases(rows: &[DispatchRoutingRow]) -> Vec<EvalCase> {
     let mut cases = Vec::new();
     for row in rows {
         if let DispatchRoutingRow::Outcome { worker_id, label: Some(label), .. } = row {
-            if !TIERS.contains(&label.as_str()) {
+            let Some(label) = logged_tier_label(label) else {
                 continue;
-            }
+            };
             if let Some(text) = texts.get(worker_id.as_str()) {
                 cases.push(EvalCase {
                     text: (*text).to_string(),
-                    expected: Some(label.clone()),
+                    expected: Some(label.to_string()),
                 });
             }
         }
     }
     cases
+}
+
+/// The Laya label for a tier id stored in a log row, converting legacy ids on
+/// the way (`simple` → `trivial`, `average` → `routine`, `difficult` →
+/// `high`); `None` for anything that is not a pickable tier — `escalate` (an
+/// escalation is never a training label), `custom`, and unknown strings. The
+/// two sanctioned mappings composed ([`TierLadder::convert_old_id`] then
+/// [`route_question::label_for_tier`]): nothing maps around them.
+pub fn logged_tier_label(tier: &str) -> Option<&'static str> {
+    let converted = TierLadder::convert_old_id(tier).unwrap_or(tier);
+    route_question::label_for_tier(converted)
 }
 
 /// The `--mnemo1` corpus: plain-language first-prompt twins of `cases` — the
@@ -277,11 +293,12 @@ pub fn mnemo1_twins(cases: &[EvalCase]) -> Vec<EvalCase> {
         .collect()
 }
 
-/// Whether `label` is one of the three tiers and is offered.
+/// Whether `label` is one of the four labels and is offered.
 fn is_offered_label(label: &str, offered: OfferedLabels) -> bool {
     match label {
         route_question::LABEL_TRIVIAL => offered.trivial,
         route_question::LABEL_ROUTINE => offered.routine,
+        route_question::LABEL_INVOLVED => offered.involved,
         route_question::LABEL_HARD => offered.hard,
         _ => false,
     }
@@ -428,7 +445,7 @@ pub struct KnnEvalReport {
 /// One offered-label count's report.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EvalReport {
-    /// How many labels were offered (3 or 2).
+    /// How many labels were offered (4, 3 or 2).
     pub labels: usize,
     /// The default gate for that count
     /// ([`route_question::default_min_confidence`]).
@@ -503,14 +520,11 @@ pub fn report_with_knn(
 }
 
 /// The label a kNN tier vote names, for comparison with a case's expected
-/// label.
+/// label. Votes carry ladder tier ids ([`RouteKnnVote::tier`]), already
+/// converted from legacy ids when the row was indexed, so this is a straight
+/// delegation to the kernel's only label↔tier mapping.
 fn label_for_tier(tier: &str) -> Option<&'static str> {
-    match tier {
-        "simple" => Some(TIERS[0]),
-        "average" => Some(TIERS[1]),
-        "difficult" => Some(TIERS[2]),
-        _ => None,
-    }
+    route_question::label_for_tier(tier)
 }
 
 /// Score the kNN overlay and the combined kNN+Laya policy on the same cases.
@@ -637,16 +651,20 @@ pub async fn classify_corpus(
 pub struct EvalRecord {
     /// The day the eval ran (`YYYY-MM-DD`, UTC).
     pub date: String,
+    /// The suggested four-label gate, when the sweep reached the floor (the
+    /// run dispatch actually makes: every pickable tier is offered).
+    #[serde(default)]
+    pub min_confidence_4: Option<f64>,
     /// The suggested three-label gate, when the sweep reached the floor.
     #[serde(default)]
     pub min_confidence_3: Option<f64>,
     /// The suggested two-label gate.
     #[serde(default)]
     pub min_confidence_2: Option<f64>,
-    /// The share of the three-label corpus that routed at the suggested gate.
+    /// The share of the four-label corpus that routed at the suggested gate.
     #[serde(default)]
     pub routed_share: Option<f64>,
-    /// The accuracy on the routed three-label prompts at the suggested gate.
+    /// The accuracy on the routed four-label prompts at the suggested gate.
     #[serde(default)]
     pub accuracy: Option<f64>,
 }
@@ -674,14 +692,16 @@ pub fn save_eval_record(record: &EvalRecord) -> Result<(), String> {
     std::fs::write(&path, encoded).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
-/// Build the record from the two runs, dated today. The stored share and
-/// accuracy are the three-label run's, at the gate the sweep suggested (the
-/// default when it suggested none).
-pub fn eval_record(three: &EvalReport, two: &EvalReport) -> EvalRecord {
-    let gate = three.suggested.unwrap_or(three.default_gate);
-    let row = three.row_at(gate);
+/// Build the record from the three runs (four-, three- and two-label),
+/// dated today. The stored share and accuracy are the four-label run's —
+/// the question dispatch actually asks — at the gate the sweep suggested
+/// (the default when it suggested none).
+pub fn eval_record(four: &EvalReport, three: &EvalReport, two: &EvalReport) -> EvalRecord {
+    let gate = four.suggested.unwrap_or(four.default_gate);
+    let row = four.row_at(gate);
     EvalRecord {
         date: today_utc(),
+        min_confidence_4: four.suggested,
         min_confidence_3: three.suggested,
         min_confidence_2: two.suggested,
         routed_share: row.map(|row| row.routed_share),
@@ -723,12 +743,20 @@ mod tests {
     use super::*;
     use crate::mnemo2::dispatch_routing::RoutingMode;
 
+    /// The four-label run: the question dispatch actually asks (design §5.1
+    /// — all four are offered whenever routing runs).
+    fn four() -> OfferedLabels {
+        OfferedLabels { trivial: true, routine: true, involved: true, hard: true }
+    }
+
+    /// The three-label run: the interim `EnabledTiers` shape, without the new
+    /// middle rung.
     fn three() -> OfferedLabels {
-        OfferedLabels { trivial: true, routine: true, hard: true }
+        OfferedLabels { trivial: true, routine: true, involved: false, hard: true }
     }
 
     fn two() -> OfferedLabels {
-        OfferedLabels { trivial: true, routine: false, hard: true }
+        OfferedLabels { trivial: true, routine: false, involved: false, hard: true }
     }
 
     fn score(text: &str, expected: Option<&str>, label: Option<&str>, confidence: f64) -> CaseScore {
@@ -869,18 +897,19 @@ mod tests {
     }
 
     #[test]
-    fn hand_set_has_fifteen_per_tier_and_three_vague() {
+    fn hand_set_has_at_least_ten_per_label_and_three_vague() {
         let cases = parse_hand_set(HAND_SET_JSONL).expect("the shipped hand set parses");
-        assert_eq!(cases.len(), 48);
-        for tier in TIERS {
-            let count = cases.iter().filter(|case| case.expected.as_deref() == Some(tier)).count();
-            assert_eq!(count, 15, "tier {tier}");
+        for label in TIERS {
+            let count = cases.iter().filter(|case| case.expected.as_deref() == Some(label)).count();
+            assert!(count >= 10, "label {label}: {count} cases, need at least 10");
         }
         assert_eq!(cases.iter().filter(|case| case.expected.is_none()).count(), 3);
     }
 
     #[test]
     fn parse_hand_set_rejects_an_unknown_tier() {
+        // Tier ids are not labels: `medium` (the tier `involved` routes to)
+        // must be rejected just like an unknown string.
         let error = parse_hand_set("{\"text\": \"x\", \"expected\": \"medium\"}").unwrap_err();
         assert!(error.contains("unknown tier"), "got: {error}");
         let error = parse_hand_set("{\"text\": \"x\"}\nnot json").unwrap_err();
@@ -889,27 +918,32 @@ mod tests {
 
     #[test]
     fn outcome_cases_join_route_text_with_labels() {
+        // Outcome rows carry tier ids: a legacy `average` converts to `routine`
+        // on read, a new-id row maps straight through, and anything that is
+        // not a pickable tier (`escalate`, `custom`) is not a case.
         let rows = vec![
             route_row("w1", "Add the log row", None),
             route_row("w2", "Fix the typo", Some("too_short")),
-            outcome_row("w1", Some("routine")),
+            outcome_row("w1", Some("average")),
             outcome_row("w2", Some("trivial")),
-            outcome_row("w3", Some("hard")),
+            outcome_row("w3", Some("high")),
             outcome_row("w1", None),
+            outcome_row("w4", Some("escalate")),
+            outcome_row("w4", Some("custom")),
         ];
         let cases = outcome_cases(&rows);
         assert_eq!(
             cases,
             vec![EvalCase { text: "Add the log row".to_string(), expected: Some("routine".to_string()) }],
-            "only a classified route row with a labelled outcome is a case"
+            "only a classified route row with a mappable outcome label is a case"
         );
     }
 
     #[test]
-    fn two_label_run_folds_the_missing_rung() {
-        // `routine` has no target in the two-label run, so a `hard` answer is
-        // the folded expectation — not a miss — while the three-label run
-        // counts it wrong.
+    fn two_label_run_folds_the_missing_rungs() {
+        // `routine` and `involved` have no target in the two-label run, so a
+        // `hard` answer is the folded expectation — not a miss — while the
+        // three-label run counts it wrong.
         let scores = vec![score("add the picker", Some("routine"), Some("hard"), 0.9)];
         let folded = report(&scores, two());
         assert_eq!(folded.labels, 2);
@@ -918,6 +952,17 @@ mod tests {
         let three_labels = report(&scores, three());
         assert!((three_labels.default_gate - route_question::default_min_confidence(3)).abs() < 1e-9);
         assert!((three_labels.row_at(0.75).unwrap().accuracy - 0.0).abs() < 1e-9);
+        // The four-label run keeps `routine` offered, so the answer is wrong
+        // there too — and it carries its own, lower default gate.
+        let four_labels = report(&scores, four());
+        assert_eq!(four_labels.labels, 4);
+        assert!((four_labels.default_gate - route_question::DEFAULT_MIN_CONFIDENCE_4).abs() < 1e-9);
+        assert!((four_labels.row_at(0.75).unwrap().accuracy - 0.0).abs() < 1e-9);
+        // An `involved` expectation is itself offered there: a matching answer
+        // is right at every gate.
+        let scores = vec![score("wire the feature", Some("involved"), Some("involved"), 0.9)];
+        let four_labels = report(&scores, four());
+        assert!(four_labels.table.iter().all(|row| row.accuracy == 1.0));
     }
 
     #[test]
@@ -945,14 +990,18 @@ mod tests {
         for index in 0..4 {
             scores.push(score(&format!("wrong {index}"), Some("routine"), Some("hard"), 0.30));
         }
+        let four_labels = report(&scores, four());
         let three_labels = report(&scores, three());
         let two_labels = report(&scores, two());
-        let record = eval_record(&three_labels, &two_labels);
+        let record = eval_record(&four_labels, &three_labels, &two_labels);
         assert_eq!(record.date, today_utc());
+        assert_eq!(record.min_confidence_4, four_labels.suggested);
         assert_eq!(record.min_confidence_3, three_labels.suggested);
         assert_eq!(record.min_confidence_2, two_labels.suggested);
-        let gate = three_labels.suggested.unwrap_or(three_labels.default_gate);
-        let row = three_labels.row_at(gate).expect("suggested gate is swept");
+        // The share and accuracy are the four-label run's — the question
+        // dispatch actually asks.
+        let gate = four_labels.suggested.unwrap_or(four_labels.default_gate);
+        let row = four_labels.row_at(gate).expect("suggested gate is swept");
         assert_eq!(record.routed_share, Some(row.routed_share));
         assert_eq!(record.accuracy, Some(row.accuracy));
     }

@@ -484,6 +484,7 @@ mod tests {
         crate::agent::route_question::OfferedLabels {
             trivial: true,
             routine: true,
+            involved: true,
             hard: true,
         }
     }
@@ -501,6 +502,7 @@ mod tests {
         let offered = crate::agent::route_question::OfferedLabels {
             trivial: true,
             routine: true,
+            involved: true,
             hard: true,
         };
         let stub = StubClassifier::new(choice("hard", 0.91));

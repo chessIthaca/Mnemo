@@ -6,16 +6,18 @@
 //!
 //! Both routing surfaces — Mnemo2's per-dispatch tier choice and Mnemo1's
 //! once-per-session route — ask Laya the SAME calibrated choice question over
-//! three neutral labels:
+//! four neutral labels:
 //!
 //! - [`LABEL_TRIVIAL`] — a mechanical edit ([`DESCRIBE_TRIVIAL`]);
 //! - [`LABEL_ROUTINE`] — specified implementation work ([`DESCRIBE_ROUTINE`]);
+//! - [`LABEL_INVOLVED`] — a normal multi-file change with a clear spec
+//!   ([`DESCRIBE_INVOLVED`]);
 //! - [`LABEL_HARD`] — work with a subtle failure mode, a shared contract or a
 //!   design decision the spec leaves open ([`DESCRIBE_HARD`]).
 //!
-//! The labels are deliberately neutral English, never the tier names the
-//! router maps them onto (`simple` / `average` / `difficult`) and never
-//! model-quality adjectives, because laya-router found that model- or
+//! The labels are deliberately neutral English — never model-quality
+//! adjectives, and never the harder tier ids they map onto (`medium` /
+//! `high`; see [`tier_for_label`]) — because laya-router found that model- or
 //! tier-shaped names skew the checkpoint; they are also never yes/no-ish
 //! words (see `Question::Choice`'s docs in `crate::memory::classifier`). The
 //! text is **byte-stable**: the eval that calibrates the gates (design §4.8)
@@ -35,9 +37,10 @@
 //! choose between.
 //!
 //! The gate depends on how many labels the question offered:
-//! [`DEFAULT_MIN_CONFIDENCE_3`] for three, [`DEFAULT_MIN_CONFIDENCE_2`] for
-//! two ([`default_min_confidence`]). Both defaults are provisional until the
-//! eval sets this checkpoint's measured values.
+//! [`DEFAULT_MIN_CONFIDENCE_4`] for four, [`DEFAULT_MIN_CONFIDENCE_3`] for
+//! three, [`DEFAULT_MIN_CONFIDENCE_2`] for two ([`default_min_confidence`]).
+//! All three defaults are provisional until the eval sets this checkpoint's
+//! measured values.
 //!
 //! # Nudge support
 //!
@@ -60,6 +63,10 @@ pub const LABEL_TRIVIAL: &str = "trivial";
 /// pattern.
 pub const LABEL_ROUTINE: &str = "routine";
 
+/// The label for a normal multi-file change with a clear spec — the
+/// `medium` tier's work (design §3.1).
+pub const LABEL_INVOLVED: &str = "involved";
+
 /// The label for work with a subtle failure mode, a shared contract or an
 /// open design decision.
 pub const LABEL_HARD: &str = "hard";
@@ -75,8 +82,18 @@ pub const DESCRIBE_TRIVIAL: &str = "rename, typo, version bump, config value, co
 /// What [`LABEL_ROUTINE`] covers.
 pub const DESCRIBE_ROUTINE: &str = "implement a specified function, add tests for existing code, wire an existing API into a new caller, UI component from a spec, schema or DTO field, follow an existing pattern in a new place, refactor inside one module";
 
+/// What [`LABEL_INVOLVED`] covers — written from the `medium` tier's
+/// definition (design §3.1) and byte-stable like every other description:
+/// the question text never follows user-edited tier names or definitions.
+pub const DESCRIBE_INVOLVED: &str = "multi-file change with a clear spec, feature across a few modules, endpoint with its tests and UI, migration of call sites, non-trivial refactor";
+
 /// What [`LABEL_HARD`] covers.
 pub const DESCRIBE_HARD: &str = "subtle bug, race or deadlock, flaky test, data loss, memory or performance regression, security, persistence format, cross-module or shared-contract change, concurrency, migration, design decision the spec leaves open";
+
+/// The default confidence gate for a four-label question. Provisional until
+/// the eval runs (design §5.1); the 4-label top probability has a floor of
+/// 0.25, so it needs its own gate next to the 3- and 2-label ones.
+pub const DEFAULT_MIN_CONFIDENCE_4: f64 = 0.40;
 
 /// The default confidence gate for a three-label question. Provisional until
 /// the eval runs (design §4.4).
@@ -86,25 +103,30 @@ pub const DEFAULT_MIN_CONFIDENCE_3: f64 = 0.475;
 /// the eval runs (design §4.4).
 pub const DEFAULT_MIN_CONFIDENCE_2: f64 = 0.60;
 
-/// The three labels in ascending difficulty order, each with the description
+/// The four labels in ascending difficulty order, each with the description
 /// Laya reads for it.
-const LABEL_LADDER: [(&str, &str); 3] = [
+const LABEL_LADDER: [(&str, &str); 4] = [
     (LABEL_TRIVIAL, DESCRIBE_TRIVIAL),
     (LABEL_ROUTINE, DESCRIBE_ROUTINE),
+    (LABEL_INVOLVED, DESCRIBE_INVOLVED),
     (LABEL_HARD, DESCRIBE_HARD),
 ];
 
-/// Which of the three labels have somewhere to route to.
+/// Which of the four labels have somewhere to route to.
 ///
 /// A label is offered only when its target resolves to a live endpoint; an
 /// un-offered label's description is folded into a neighbour by
-/// [`route_question`].
+/// [`route_question`]. All four are offered whenever routing runs on the
+/// tier ladder: an empty tier folds down to the tier below it at run time
+/// (design §3.2), so its label still has somewhere to route to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OfferedLabels {
     /// [`LABEL_TRIVIAL`] has a target.
     pub trivial: bool,
     /// [`LABEL_ROUTINE`] has a target.
     pub routine: bool,
+    /// [`LABEL_INVOLVED`] has a target.
+    pub involved: bool,
     /// [`LABEL_HARD`] has a target.
     pub hard: bool,
 }
@@ -112,7 +134,10 @@ pub struct OfferedLabels {
 impl OfferedLabels {
     /// How many labels have somewhere to route to.
     pub fn count(self) -> usize {
-        usize::from(self.trivial) + usize::from(self.routine) + usize::from(self.hard)
+        usize::from(self.trivial)
+            + usize::from(self.routine)
+            + usize::from(self.involved)
+            + usize::from(self.hard)
     }
 }
 
@@ -144,12 +169,14 @@ pub fn route_question(offered: OfferedLabels) -> Option<Question> {
     Some(Question::Choice { instructions: ROUTE_INSTRUCTIONS.to_string(), criteria })
 }
 
-/// Whether `label` is one of the three labels and is offered.
+/// Whether `label` is one of the four labels and is offered.
 fn is_offered(label: &str, offered: OfferedLabels) -> bool {
     if label == LABEL_TRIVIAL {
         offered.trivial
     } else if label == LABEL_ROUTINE {
         offered.routine
+    } else if label == LABEL_INVOLVED {
+        offered.involved
     } else if label == LABEL_HARD {
         offered.hard
     } else {
@@ -157,8 +184,8 @@ fn is_offered(label: &str, offered: OfferedLabels) -> bool {
     }
 }
 
-/// Where `label` sits on the ladder (0 `trivial`, 1 `routine`, 2 `hard`),
-/// or `None` for a label the ladder does not know.
+/// Where `label` sits on the ladder (0 `trivial`, 1 `routine`, 2 `involved`,
+/// 3 `hard`), or `None` for a label the ladder does not know.
 fn ladder_rank(label: &str) -> Option<usize> {
     LABEL_LADDER.iter().position(|(candidate, _)| *candidate == label)
 }
@@ -186,15 +213,16 @@ fn fold_target(label: &str, offered: OfferedLabels) -> Option<&'static str> {
         .map(|(candidate, _)| candidate)
 }
 
-/// The default gate for an offered-label count: three labels use
-/// [`DEFAULT_MIN_CONFIDENCE_3`], every other count the stricter two-label
-/// gate [`DEFAULT_MIN_CONFIDENCE_2`] (callers only pass 2 or 3 —
+/// The default gate for an offered-label count, one gate per count: four
+/// labels use [`DEFAULT_MIN_CONFIDENCE_4`], three [`DEFAULT_MIN_CONFIDENCE_3`],
+/// every other count the stricter two-label gate
+/// [`DEFAULT_MIN_CONFIDENCE_2`] (callers only pass 2, 3 or 4 —
 /// [`route_question`] returns `None` below two).
 pub fn default_min_confidence(labels: usize) -> f64 {
-    if labels >= 3 {
-        DEFAULT_MIN_CONFIDENCE_3
-    } else {
-        DEFAULT_MIN_CONFIDENCE_2
+    match labels {
+        4 => DEFAULT_MIN_CONFIDENCE_4,
+        3 => DEFAULT_MIN_CONFIDENCE_3,
+        _ => DEFAULT_MIN_CONFIDENCE_2,
     }
 }
 
@@ -205,8 +233,9 @@ pub fn default_min_confidence(labels: usize) -> f64 {
 ///
 /// A live `/v1/systemone` choice answer carries both numbers at once: the
 /// top value of the `probabilities` map — Laya's `answer_confidence` —
-/// which the routing gates ([`DEFAULT_MIN_CONFIDENCE_3`] /
-/// [`DEFAULT_MIN_CONFIDENCE_2`]) are calibrated for, and the lower,
+/// which the routing gates ([`DEFAULT_MIN_CONFIDENCE_4`] /
+/// [`DEFAULT_MIN_CONFIDENCE_3`] / [`DEFAULT_MIN_CONFIDENCE_2`]) are
+/// calibrated for, and the lower,
 /// margin-like `confidence` on the pick. Routing gates on the top
 /// probability; other consumers (failure triage, memory auto-typing, tool
 /// choice) are calibrated on [`Answer::confidence`] and keep reading that.
@@ -221,9 +250,9 @@ pub fn answer_confidence(answer: &Answer) -> f64 {
     }
 }
 
-/// The label one level harder, if offered (`trivial` → `routine` → `hard`),
-/// skipping un-offered labels. `None` for [`LABEL_HARD`], an unknown label,
-/// or when nothing harder is offered.
+/// The label one level harder, if offered (`trivial` → `routine` →
+/// `involved` → `hard`), skipping un-offered labels. `None` for
+/// [`LABEL_HARD`], an unknown label, or when nothing harder is offered.
 pub fn label_above(label: &str, offered: OfferedLabels) -> Option<&'static str> {
     let rank = ladder_rank(label)?;
     LABEL_LADDER
@@ -231,6 +260,44 @@ pub fn label_above(label: &str, offered: OfferedLabels) -> Option<&'static str> 
         .skip(rank + 1)
         .find(|(candidate, _)| is_offered(candidate, offered))
         .map(|(candidate, _)| candidate)
+}
+
+/// The tier id a Laya label routes to (design §3.1): `trivial` → `trivial`,
+/// `routine` → `routine`, `involved` → `medium`, `hard` → `high`. `None` for
+/// anything else — `escalate` has no label (it is never a first pick, so
+/// neither Laya nor the kNN is ever offered it) and unknown strings do not
+/// route. This is the ONLY label↔tier mapping in the codebase (interface
+/// contract, 2026-11-04): consumers map through it, never around it.
+pub fn tier_for_label(label: &str) -> Option<&'static str> {
+    if label == LABEL_TRIVIAL {
+        Some("trivial")
+    } else if label == LABEL_ROUTINE {
+        Some("routine")
+    } else if label == LABEL_INVOLVED {
+        Some("medium")
+    } else if label == LABEL_HARD {
+        Some("high")
+    } else {
+        None
+    }
+}
+
+/// The Laya label offered for a tier id — the inverse of [`tier_for_label`]:
+/// `trivial` → `trivial`, `routine` → `routine`, `medium` → `involved`,
+/// `high` → `hard`. `None` for `escalate` (never offered to Laya or the
+/// kNN) and for unknown ids.
+pub fn label_for_tier(tier_id: &str) -> Option<&'static str> {
+    if tier_id == "trivial" {
+        Some(LABEL_TRIVIAL)
+    } else if tier_id == "routine" {
+        Some(LABEL_ROUTINE)
+    } else if tier_id == "medium" {
+        Some(LABEL_INVOLVED)
+    } else if tier_id == "high" {
+        Some(LABEL_HARD)
+    } else {
+        None
+    }
 }
 
 /// Canonical tool-call signature for strike counting: `{name, args}` with
@@ -314,7 +381,7 @@ mod tests {
     use super::*;
 
     fn all_offered() -> OfferedLabels {
-        OfferedLabels { trivial: true, routine: true, hard: true }
+        OfferedLabels { trivial: true, routine: true, involved: true, hard: true }
     }
 
     fn criteria_of(offered: OfferedLabels) -> BTreeMap<String, String> {
@@ -325,85 +392,127 @@ mod tests {
     }
 
     #[test]
-    fn question_has_three_neutral_labels_when_all_are_offered() {
+    fn question_has_four_neutral_labels_when_all_are_offered() {
         let offered = all_offered();
-        assert_eq!(offered.count(), 3);
+        assert_eq!(offered.count(), 4);
         let Question::Choice { instructions, criteria } =
-            route_question(offered).expect("three labels offered")
+            route_question(offered).expect("four labels offered")
         else {
             panic!("the routing question must be a choice");
         };
         assert_eq!(instructions, ROUTE_INSTRUCTIONS);
-        assert_eq!(criteria.len(), 3);
+        assert_eq!(criteria.len(), 4);
         // Every label carries exactly its own byte-stable description — no
-        // folding salt when all three are offered.
+        // folding salt when all four are offered.
         assert_eq!(criteria.get(LABEL_TRIVIAL).map(String::as_str), Some(DESCRIBE_TRIVIAL));
         assert_eq!(criteria.get(LABEL_ROUTINE).map(String::as_str), Some(DESCRIBE_ROUTINE));
+        assert_eq!(criteria.get(LABEL_INVOLVED).map(String::as_str), Some(DESCRIBE_INVOLVED));
         assert_eq!(criteria.get(LABEL_HARD).map(String::as_str), Some(DESCRIBE_HARD));
-        // Neutral labels only: never the tier names the router maps onto,
+        // Neutral labels only: never the tier ids the harder rungs map onto,
         // never model-quality adjectives (design §4.3).
-        for forbidden in ["simple", "average", "difficult", "cheap", "capable"] {
+        for forbidden in ["simple", "average", "difficult", "medium", "high", "escalate", "cheap", "capable"] {
             assert!(!criteria.contains_key(forbidden), "{forbidden} must not be a label");
         }
     }
 
     #[test]
-    fn unoffered_hard_folds_down_into_routine() {
-        let criteria = criteria_of(OfferedLabels { trivial: true, routine: true, hard: false });
-        assert_eq!(criteria.len(), 2);
+    fn unoffered_hard_folds_down_into_involved() {
+        let criteria = criteria_of(OfferedLabels {
+            trivial: true,
+            routine: true,
+            involved: true,
+            hard: false,
+        });
+        assert_eq!(criteria.len(), 3);
         assert_eq!(criteria[LABEL_TRIVIAL].as_str(), DESCRIBE_TRIVIAL);
+        assert_eq!(criteria[LABEL_ROUTINE].as_str(), DESCRIBE_ROUTINE);
+        // A dropped `hard` folds DOWN onto the hardest label still offered
+        // below it (design §4.3): `involved` judges it.
         assert_eq!(
-            criteria[LABEL_ROUTINE].as_str(),
-            format!("{DESCRIBE_ROUTINE}, {DESCRIBE_HARD}")
+            criteria[LABEL_INVOLVED].as_str(),
+            format!("{DESCRIBE_INVOLVED}, {DESCRIBE_HARD}")
         );
     }
 
     #[test]
     fn unoffered_trivial_folds_up_into_routine() {
-        let criteria = criteria_of(OfferedLabels { trivial: false, routine: true, hard: true });
-        assert_eq!(criteria.len(), 2);
+        let criteria = criteria_of(OfferedLabels {
+            trivial: false,
+            routine: true,
+            involved: true,
+            hard: true,
+        });
+        assert_eq!(criteria.len(), 3);
         assert_eq!(
             criteria[LABEL_ROUTINE].as_str(),
             format!("{DESCRIBE_ROUTINE}, {DESCRIBE_TRIVIAL}")
+        );
+        assert_eq!(criteria[LABEL_INVOLVED].as_str(), DESCRIBE_INVOLVED);
+        assert_eq!(criteria[LABEL_HARD].as_str(), DESCRIBE_HARD);
+    }
+
+    #[test]
+    fn unoffered_routine_folds_up_into_involved() {
+        // A dropped middle label goes to the next label UP (design §4.3), so
+        // `routine` work is judged by `involved` when `routine` has no target.
+        let criteria = criteria_of(OfferedLabels {
+            trivial: true,
+            routine: false,
+            involved: true,
+            hard: true,
+        });
+        assert_eq!(criteria.len(), 3);
+        assert_eq!(criteria[LABEL_TRIVIAL].as_str(), DESCRIBE_TRIVIAL);
+        assert_eq!(
+            criteria[LABEL_INVOLVED].as_str(),
+            format!("{DESCRIBE_INVOLVED}, {DESCRIBE_ROUTINE}")
         );
         assert_eq!(criteria[LABEL_HARD].as_str(), DESCRIBE_HARD);
     }
 
     #[test]
-    fn unoffered_routine_folds_up_into_hard() {
-        // A dropped middle label goes to the next label UP (design §4.3), so
-        // `routine` work is judged by `hard` when `routine` has no target.
-        let criteria = criteria_of(OfferedLabels { trivial: true, routine: false, hard: true });
+    fn two_extreme_labels_fold_both_middles_into_hard() {
+        // The eval's two-label run: only `trivial` and `hard` are offered, so
+        // both middle labels fold UP into `hard`, in ladder order.
+        let criteria = criteria_of(OfferedLabels {
+            trivial: true,
+            routine: false,
+            involved: false,
+            hard: true,
+        });
         assert_eq!(criteria.len(), 2);
         assert_eq!(criteria[LABEL_TRIVIAL].as_str(), DESCRIBE_TRIVIAL);
         assert_eq!(
             criteria[LABEL_HARD].as_str(),
-            format!("{DESCRIBE_HARD}, {DESCRIBE_ROUTINE}")
+            format!("{DESCRIBE_HARD}, {DESCRIBE_ROUTINE}, {DESCRIBE_INVOLVED}")
         );
     }
 
     #[test]
     fn one_offered_label_asks_nothing() {
         let singles = [
-            OfferedLabels { trivial: true, routine: false, hard: false },
-            OfferedLabels { trivial: false, routine: true, hard: false },
-            OfferedLabels { trivial: false, routine: false, hard: true },
+            OfferedLabels { trivial: true, routine: false, involved: false, hard: false },
+            OfferedLabels { trivial: false, routine: true, involved: false, hard: false },
+            OfferedLabels { trivial: false, routine: false, involved: true, hard: false },
+            OfferedLabels { trivial: false, routine: false, involved: false, hard: true },
         ];
         for offered in singles {
             assert_eq!(offered.count(), 1);
             assert!(route_question(offered).is_none(), "one label leaves nothing to choose");
         }
-        let none = OfferedLabels { trivial: false, routine: false, hard: false };
+        let none = OfferedLabels { trivial: false, routine: false, involved: false, hard: false };
         assert_eq!(none.count(), 0);
         assert!(route_question(none).is_none());
     }
 
     #[test]
     fn default_min_confidence_by_label_count() {
+        assert_eq!(default_min_confidence(4), DEFAULT_MIN_CONFIDENCE_4);
         assert_eq!(default_min_confidence(3), DEFAULT_MIN_CONFIDENCE_3);
         assert_eq!(default_min_confidence(2), DEFAULT_MIN_CONFIDENCE_2);
-        // Both are provisional (design §4.4): pin the shipped values so the
-        // eval that replaces them is a deliberate edit.
+        // All three are provisional (design §5.1): pin the shipped values so
+        // the eval that replaces them is a deliberate edit.
+        assert_eq!(DEFAULT_MIN_CONFIDENCE_4, 0.40);
         assert_eq!(DEFAULT_MIN_CONFIDENCE_3, 0.475);
         assert_eq!(DEFAULT_MIN_CONFIDENCE_2, 0.60);
     }
@@ -412,16 +521,47 @@ mod tests {
     fn label_above_skips_unoffered_labels() {
         let all = all_offered();
         assert_eq!(label_above(LABEL_TRIVIAL, all), Some(LABEL_ROUTINE));
-        assert_eq!(label_above(LABEL_ROUTINE, all), Some(LABEL_HARD));
+        assert_eq!(label_above(LABEL_ROUTINE, all), Some(LABEL_INVOLVED));
+        assert_eq!(label_above(LABEL_INVOLVED, all), Some(LABEL_HARD));
         assert_eq!(label_above(LABEL_HARD, all), None);
 
-        let no_routine = OfferedLabels { trivial: true, routine: false, hard: true };
-        assert_eq!(label_above(LABEL_TRIVIAL, no_routine), Some(LABEL_HARD));
-        assert_eq!(label_above(LABEL_ROUTINE, no_routine), Some(LABEL_HARD));
+        let no_involved = OfferedLabels {
+            trivial: true,
+            routine: true,
+            involved: false,
+            hard: true,
+        };
+        assert_eq!(label_above(LABEL_ROUTINE, no_involved), Some(LABEL_HARD));
+        assert_eq!(label_above(LABEL_INVOLVED, no_involved), Some(LABEL_HARD));
 
-        let only_trivial = OfferedLabels { trivial: true, routine: false, hard: false };
+        let only_trivial =
+            OfferedLabels { trivial: true, routine: false, involved: false, hard: false };
         assert_eq!(label_above(LABEL_TRIVIAL, only_trivial), None);
         assert_eq!(label_above("unknown", all), None);
+    }
+
+    #[test]
+    fn labels_and_tier_ids_map_both_ways() {
+        // The four labels map to their four pickable tiers (interface
+        // contract, 2026-11-04) and back, round-trip total.
+        for (label, tier) in [
+            (LABEL_TRIVIAL, "trivial"),
+            (LABEL_ROUTINE, "routine"),
+            (LABEL_INVOLVED, "medium"),
+            (LABEL_HARD, "high"),
+        ] {
+            assert_eq!(tier_for_label(label), Some(tier));
+            assert_eq!(label_for_tier(tier), Some(label));
+        }
+        // `escalate` has no label in either direction: it is never a first
+        // pick, so Laya and the kNN are never offered it.
+        assert_eq!(label_for_tier("escalate"), None);
+        assert_eq!(tier_for_label("escalate"), None);
+        // Legacy ids and unknown strings do not map.
+        for stray in ["simple", "average", "difficult", "custom", ""] {
+            assert_eq!(tier_for_label(stray), None);
+            assert_eq!(label_for_tier(stray), None);
+        }
     }
 
     #[test]

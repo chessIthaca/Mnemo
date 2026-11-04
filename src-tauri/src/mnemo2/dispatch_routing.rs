@@ -77,10 +77,16 @@ pub struct EnabledTiers {
 impl EnabledTiers {
     /// The offered labels: `simple` → `trivial`, `average` → `routine`,
     /// `difficult` → `hard`.
+    ///
+    /// The new `involved` label (`medium`) is a step-3 placeholder here:
+    /// `EnabledTiers` still speaks the legacy three-tier universe and
+    /// cannot yet offer it, so the kernel folds its description into `hard`
+    /// until the ladder rework makes all four labels offered.
     pub fn offered(self) -> route_question::OfferedLabels {
         route_question::OfferedLabels {
             trivial: self.simple,
             routine: self.average,
+            involved: false,
             hard: self.difficult,
         }
     }
@@ -101,7 +107,16 @@ pub fn label_tier(label: &str) -> Option<&'static str> {
 /// The label a tier routes from: `simple` → `trivial`, `average` → `routine`,
 /// `difficult` → `hard`. The inverse of [`label_tier`], used when a kNN tier
 /// vote has to be recorded in the Laya-shaped decision fields.
+///
+/// The overlay votes ladder tier ids (`trivial`, `routine`, `medium`, `high`
+/// — legacy rows are converted when the overlay indexes them), so those map
+/// through the kernel's only label↔tier mapping
+/// ([`route_question::label_for_tier`]) first; the legacy table above stays
+/// for ids that are not on the ladder.
 fn label_for_tier(tier: &str) -> Option<&'static str> {
+    if let Some(label) = route_question::label_for_tier(tier) {
+        return Some(label);
+    }
     TIER_LADDER
         .iter()
         .position(|candidate| *candidate == tier)
@@ -859,6 +874,7 @@ mod tests {
                 route_question::OfferedLabels {
                     trivial: tiers.simple,
                     routine: tiers.average,
+                    involved: false,
                     hard: tiers.difficult,
                 },
                 "bits: {bits}"

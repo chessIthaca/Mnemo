@@ -103,6 +103,14 @@ Decided 2026-11-04: Laya chooses among **all tiers except `escalate`**, and is r
 - Old ids are refused with the list of new ones (no aliases).
 - The routing log's tier fields (`tier`, `lead_tier`, `ran_tier`, `from_tier`, `to_tier`, `final_tier`, `label`) hold ladder ids from now on.
 
+#### Audits run on a tier (user request, 2026-11-04)
+
+Today an audit with no `model` silently runs on the global default model (`[general] default_model`, Kimi on this machine), its model shows as empty in mission control until its session reports, and the UI and `change_model` refuse to switch it (team.rs ~4391). Instead:
+- `team_audit_dispatch` takes an optional `tier` (any ladder id, folded down like a dispatch); without `tier` or `model` it runs on **`high`**. The tool description lists the tiers like `team_dispatch`'s.
+- The audit record stores its resolved model and tier **at dispatch**, so team_status and mission control show them from the first moment (no more `model: null`).
+- Before an audit has produced its report, the user may switch its model or tier in mission control (and the lead via `team_resume` + `tier`); once it has reported (the finished-audit rule of plan 5779641d) it stays locked.
+- Audits are never routed by Laya or the kNN (they verify, they are not fresh work), and their switches are not training labels.
+
 ### 5.3 Mnemo1
 
 - **First prompt** (route-once, `model_routing.rs`): the decision's tier comes from §5.1 (kNN first once Mnemo1 has its own labelled rows, else Laya), and the session runs on that tier's first model. `RouteTarget::{Cheap, Routine, Capable}` become ladder ids.

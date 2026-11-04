@@ -348,14 +348,71 @@ describe("LayaPage", () => {
   it("saves the [routing] table through saveRoutingSettings", async () => {
     const { transport } = makePage();
     const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
-    await fireEvent.click(within(block).getByRole("radio", { name: /^Shadow / }));
     await fireEvent.input(within(block).getByLabelText("Three-label gate"), { target: { value: "0.5" } });
     await fireEvent.click(within(block).getByRole("button", { name: "Save dispatch routing" }));
     await waitFor(() => expect(transport.saveRoutingSettings).toHaveBeenCalledTimes(1));
     const sent = transport.saveRoutingSettings.mock.calls[0][0] as unknown as DispatchRoutingSettings;
-    expect(sent.mode).toBe("shadow");
+    expect(sent.mode).toBe("off");
     expect(sent.min_confidence_3).toBe(0.5);
     expect(sent.fallback_tier).toBe("average");
+    expect(await within(block).findByText("Saved to mnemo2.toml.")).toBeTruthy();
+  });
+
+  it("saves a picked mode at once, without the Save button", async () => {
+    const { transport } = makePage();
+    const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
+    await fireEvent.click(within(block).getByRole("radio", { name: /^Shadow / }));
+    await waitFor(() => expect(transport.saveRoutingSettings).toHaveBeenCalledTimes(1));
+    expect(transport.saveRoutingSettings.mock.calls[0][0]).toEqual({
+      mode: "shadow",
+      min_confidence_3: 0.475,
+      min_confidence_2: 0.6,
+      fallback_tier: "average",
+      nudges: true,
+      min_words: 20,
+      effort: {},
+    });
+    expect((within(block).getByRole("radio", { name: /^Shadow / }) as HTMLInputElement).checked).toBe(true);
+    expect(await within(block).findByText("Saved to mnemo2.toml.")).toBeTruthy();
+    // The section came back clean: the Save button goes quiet.
+    expect(
+      (within(block).getByRole("button", { name: "Save dispatch routing" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("reverts the radio and shows the error when a picked mode fails to save", async () => {
+    const { transport } = makePage();
+    transport.saveRoutingSettings.mockRejectedValueOnce(new Error("mnemo2.toml: disk full"));
+    const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
+    await fireEvent.click(within(block).getByRole("radio", { name: /^Shadow / }));
+    expect(await within(block).findByText("mnemo2.toml: disk full")).toBeTruthy();
+    expect((within(block).getByRole("radio", { name: /^Off / }) as HTMLInputElement).checked).toBe(true);
+    expect((within(block).getByRole("radio", { name: /^Shadow / }) as HTMLInputElement).checked).toBe(false);
+    expect(transport.saveRoutingSettings).toHaveBeenCalledTimes(1);
+    expect(within(block).queryByText("Saved to mnemo2.toml.")).toBeNull();
+  });
+
+  it("keeps an unsaved gate edit out of the mode save, then still saves it on its own", async () => {
+    const { transport } = makePage();
+    const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
+    await fireEvent.input(within(block).getByLabelText("Three-label gate"), { target: { value: "0.5" } });
+    await fireEvent.click(within(block).getByRole("radio", { name: /^Shadow / }));
+    await waitFor(() => expect(transport.saveRoutingSettings).toHaveBeenCalledTimes(1));
+    const modeSave = transport.saveRoutingSettings.mock.calls[0][0] as unknown as DispatchRoutingSettings;
+    expect(modeSave.mode).toBe("shadow");
+    // The gate rides the saved settings, not the draft's unsaved 0.5.
+    expect(modeSave.min_confidence_3).toBe(0.475);
+    // The draft keeps its unsaved edit: the gate still reads 0.5, the Save
+    // button stays live once the mode save settles, and the note stays honest.
+    expect((within(block).getByLabelText("Three-label gate") as HTMLInputElement).value).toBe("0.5");
+    const saveButton = within(block).getByRole("button", { name: "Save dispatch routing" }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    expect(within(block).queryByText("Saved to mnemo2.toml.")).toBeNull();
+    await fireEvent.click(saveButton);
+    await waitFor(() => expect(transport.saveRoutingSettings).toHaveBeenCalledTimes(2));
+    const tableSave = transport.saveRoutingSettings.mock.calls[1][0] as unknown as DispatchRoutingSettings;
+    expect(tableSave.mode).toBe("shadow");
+    expect(tableSave.min_confidence_3).toBe(0.5);
     expect(await within(block).findByText("Saved to mnemo2.toml.")).toBeTruthy();
   });
 
@@ -368,5 +425,71 @@ describe("LayaPage", () => {
     expect(within(block).getByText(/Two labels — suggested 0\.500/)).toBeTruthy();
     expect(within(block).getAllByText(/want no route · got routine/).length).toBeGreaterThan(0);
     expect(within(block).getByRole("button", { name: "Apply suggested gates" })).toBeTruthy();
+  });
+
+  it("asks before a navigation drops unsaved dispatch edits, and a decline cancels it", async () => {
+    const confirmSpy = vi.fn();
+    vi.stubGlobal("confirm", confirmSpy);
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    const heard = vi.fn();
+    outside.addEventListener("click", heard);
+    try {
+      makePage();
+      const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
+      await fireEvent.input(within(block).getByLabelText("Three-label gate"), { target: { value: "0.5" } });
+      // The guard is armed once the dirty flag renders.
+      const saveButton = within(block).getByRole("button", { name: "Save dispatch routing" }) as HTMLButtonElement;
+      await waitFor(() => expect(saveButton.disabled).toBe(false));
+      // In-app navigation: the declined click dies before the outside button hears it.
+      await fireEvent.click(outside);
+      await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+      expect(heard).not.toHaveBeenCalled();
+      // Escape asks too, and a decline keeps the dialog open.
+      const escaped = vi.fn();
+      window.addEventListener("keydown", escaped);
+      await fireEvent.keyDown(document.body, { key: "Escape" });
+      await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(2));
+      expect(escaped).not.toHaveBeenCalled();
+      window.removeEventListener("keydown", escaped);
+      // Window unload rides the browser's own prompt.
+      const unload = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(unload);
+      expect(unload.defaultPrevented).toBe(true);
+    } finally {
+      outside.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("lets navigation through when the user accepts, and never asks while clean", async () => {
+    const confirmSpy = vi.fn();
+    vi.stubGlobal("confirm", confirmSpy);
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    const heard = vi.fn();
+    outside.addEventListener("click", heard);
+    try {
+      makePage();
+      const block = await screen.findByRole("region", { name: "Worker dispatch routing" });
+      // Clean: the outside click needs no leave-taking.
+      await fireEvent.click(outside);
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(heard).toHaveBeenCalledTimes(1);
+      // Dirty but accepted: the navigation runs.
+      await fireEvent.input(within(block).getByLabelText("Three-label gate"), { target: { value: "0.5" } });
+      const saveButton = within(block).getByRole("button", { name: "Save dispatch routing" }) as HTMLButtonElement;
+      await waitFor(() => expect(saveButton.disabled).toBe(false));
+      await fireEvent.click(outside);
+      await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+      expect(heard).toHaveBeenCalledTimes(1);
+      confirmSpy.mockReturnValue(true);
+      await fireEvent.click(outside);
+      await waitFor(() => expect(heard).toHaveBeenCalledTimes(2));
+      expect(confirmSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      outside.remove();
+      vi.unstubAllGlobals();
+    }
   });
 });

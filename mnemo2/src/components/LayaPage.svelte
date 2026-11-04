@@ -7,6 +7,7 @@
     ROUTING_LANES,
     evalDateText,
     layaStatusHint,
+    leavesPage,
     modeAvailable,
     modeUnlockText,
     routingDraft,
@@ -58,6 +59,8 @@
   let evalRunning = $state(false);
   let evalResult = $state<RoutingEvalWire | null>(null);
   let evalError = $state("");
+  /** The page's own root element — the boundary a leaving click starts beyond. */
+  let pageEl = $state<HTMLDivElement | null>(null);
 
   /** The four dispatch modes in display order (design §4.5). */
   const MODES: readonly { mode: RoutingModeName; label: string; blurb: string }[] = [
@@ -291,11 +294,10 @@
     }
   }
 
-  /** Pick an unlocked mode. */
+  /** Pick an unlocked mode and save it at once. */
   function selectMode(mode: RoutingModeName): void {
     if (dispatchDraft === null || summary === null || !modeAvailable(mode, summary)) return;
-    dispatchDraft.mode = mode;
-    dispatchSaved = false;
+    void saveMode(mode);
   }
 
   /** Force a locked mode on, behind a confirm that names the missing record. */
@@ -304,29 +306,87 @@
     if (modeAvailable(mode, summary)) return;
     const progress = modeUnlockText(mode, summary);
     if (!confirm(`${mode} mode unlocks at 30 labelled decisions (${progress}). Force it on anyway?`)) return;
-    dispatchDraft.mode = mode;
-    dispatchSaved = false;
+    void saveMode(mode);
   }
 
-  async function saveDispatch(): Promise<void> {
-    if (dispatchDraft === null) return;
+  /**
+   * Save the picked mode at once: the payload rides the saved settings with
+   * only the mode swapped, so other unsaved draft edits stay unsaved. A
+   * failed save reverts the radio to the saved mode and shows the error.
+   */
+  async function saveMode(mode: RoutingModeName): Promise<void> {
+    if (dispatch === null || dispatchDraft === null || dispatchSaving) return;
+    const savedMode = dispatch.settings.mode;
+    dispatchDraft.mode = mode;
+    dispatchSaved = false;
+    const landed = await saveDispatch({
+      ...($state.snapshot(dispatch.settings) as DispatchRoutingSettings),
+      mode,
+    });
+    if (!landed) dispatchDraft.mode = savedMode;
+  }
+
+  /**
+   * Save the routing table. Without a payload the whole draft goes out and a
+   * successful save makes the returned snapshot the truth: the draft takes it
+   * verbatim, so "saved" and "clean" agree from here on. With a payload (a
+   * single-field save, e.g. a picked mode) the other unsaved draft edits stay
+   * in the draft. Resolves whether the save landed.
+   */
+  async function saveDispatch(payload?: DispatchRoutingSettings): Promise<boolean> {
+    if (dispatchDraft === null || dispatchSaving) return false;
+    const wire = payload ?? ($state.snapshot(dispatchDraft) as DispatchRoutingSettings);
     dispatchSaving = true;
     dispatchError = "";
     try {
-      // A successful save makes the returned snapshot the truth: the draft
-      // takes it verbatim, so "saved" and "clean" agree from here on.
-      const snapshot = await transport.saveRoutingSettings(
-        $state.snapshot(dispatchDraft) as DispatchRoutingSettings,
-      );
+      const snapshot = await transport.saveRoutingSettings(wire);
       dispatch = snapshot;
-      dispatchDraft = structuredClone(snapshot.settings);
+      if (payload === undefined) {
+        dispatchDraft = structuredClone(snapshot.settings);
+      }
       dispatchSaved = true;
+      return true;
     } catch (failure) {
       dispatchError = errorText(failure);
+      return false;
     } finally {
       dispatchSaving = false;
     }
   }
+
+  /**
+   * While dispatch edits are unsaved, ask before leaving the page. Window
+   * unload rides the browser's own prompt; in-app navigation (the settings
+   * rail, the dialog's close button or backdrop, Escape) rides capture-phase
+   * listeners on the window, so a declined confirm cancels the event before
+   * the dialog's own handlers ever run.
+   */
+  $effect(() => {
+    // Tracked in the body: the guard re-arms when the dirty flag flips or the
+    // root element binds; the callback reads only the captured root.
+    const root = pageEl;
+    if (!dispatchDirty) return;
+    const guard = (event: Event): void => {
+      if (event.type === "beforeunload") {
+        // The browser's own "changes you made may not be saved" prompt.
+        event.preventDefault();
+        (event as BeforeUnloadEvent).returnValue = true;
+        return;
+      }
+      if (!leavesPage(event, root)) return;
+      if (confirm("Discard unsaved dispatch routing edits?")) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    window.addEventListener("beforeunload", guard);
+    window.addEventListener("click", guard, true);
+    window.addEventListener("keydown", guard, true);
+    return () => {
+      window.removeEventListener("beforeunload", guard);
+      window.removeEventListener("click", guard, true);
+      window.removeEventListener("keydown", guard, true);
+    };
+  });
 
   function discardDispatch(): void {
     if (dispatch === null) return;
@@ -388,7 +448,7 @@
   {/each}
 </datalist>
 
-<div class="laya-page">
+<div class="laya-page" bind:this={pageEl}>
   <div class="laya-scroll">
     {#if loadError}
       <p class="load-error" role="alert">{loadError}</p>
@@ -569,7 +629,11 @@
             {#if dispatchSaved && !dispatchDirty}<p class="section-note">Saved to mnemo2.toml.</p>{/if}
             <div class="section-buttons">
               <button class="button button-quiet" disabled={dispatchSaving || !dispatchDirty} onclick={discardDispatch}>Discard</button>
-              <button class="button button-primary" disabled={dispatchSaving || !dispatchDirty} onclick={saveDispatch}>
+              <button
+                class="button button-primary"
+                disabled={dispatchSaving || !dispatchDirty}
+                onclick={() => void saveDispatch()}
+              >
                 {dispatchSaving ? "Saving…" : "Save dispatch routing"}
               </button>
             </div>

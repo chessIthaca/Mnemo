@@ -108,7 +108,9 @@ impl RouteTarget {
 pub struct RoutingDecision {
     /// The answered label (verbatim; an unknown label is kept as-is).
     pub label: String,
-    /// The answer's calibrated confidence (0.0-1.0).
+    /// The confidence the gate reads (0.0-1.0): the top option's probability
+    /// when the backend reported a distribution, else the pick's confidence
+    /// (`route_question::answer_confidence`).
     pub confidence: f64,
     /// The per-option distribution, when the backend reported one.
     pub probabilities: BTreeMap<String, f64>,
@@ -134,14 +136,14 @@ pub async fn classify_task_text(
 ) -> Option<RoutingDecision> {
     let capped = cap_task_text(text);
     let question = super::route_question::route_question(offered)?;
-    let Answer::Choice {
-        label,
-        confidence,
-        probabilities,
-    } = classifier.classify(&capped, &question).await?
-    else {
+    let answer = classifier.classify(&capped, &question).await?;
+    let Answer::Choice { label, probabilities, .. } = &answer else {
         return None;
     };
+    // The gate is calibrated on the top option's probability
+    // (`route_question::answer_confidence`), not the pick's lower,
+    // margin-like `confidence`.
+    let confidence = super::route_question::answer_confidence(&answer);
     let target = match label.as_str() {
         super::route_question::LABEL_TRIVIAL if confidence >= threshold => Some(RouteTarget::Cheap),
         super::route_question::LABEL_ROUTINE if confidence >= threshold => Some(RouteTarget::Routine),
@@ -149,9 +151,9 @@ pub async fn classify_task_text(
         _ => None,
     };
     Some(RoutingDecision {
-        label,
+        label: label.clone(),
         confidence,
-        probabilities,
+        probabilities: probabilities.clone(),
         target,
     })
 }
@@ -181,7 +183,8 @@ pub struct RouteDecisionRow {
     pub shadow: bool,
     /// The answered label (verbatim).
     pub label: String,
-    /// The calibrated confidence of the answer.
+    /// The gated confidence of the answer: the top option's probability when
+    /// the backend reported a distribution, else the pick's confidence.
     pub confidence: f64,
     /// The configured confidence gate the answer was compared against.
     pub threshold: f64,
@@ -525,6 +528,29 @@ mod tests {
             .await
             .expect("decision");
         assert_eq!(decision.label, crate::agent::route_question::LABEL_HARD);
+        assert_eq!(decision.target, Some(RouteTarget::Capable));
+    }
+
+    #[tokio::test]
+    async fn the_gate_reads_the_top_probability_not_the_margin() {
+        // A live-shaped answer: the pick's margin-like `confidence` (0.30)
+        // sits below the gate, the top option's probability (0.91) above it —
+        // routing gates on the latter (`route_question::answer_confidence`).
+        let answer = Answer::Choice {
+            label: crate::agent::route_question::LABEL_HARD.to_string(),
+            confidence: 0.30,
+            probabilities: BTreeMap::from([
+                (crate::agent::route_question::LABEL_TRIVIAL.to_string(), 0.03),
+                (crate::agent::route_question::LABEL_ROUTINE.to_string(), 0.06),
+                (crate::agent::route_question::LABEL_HARD.to_string(), 0.91),
+            ]),
+        };
+        let stub = StubClassifier::new(Some(answer));
+        let decision = classify_task_text(&stub, "fix a subtle race", all_offered(), 0.475)
+            .await
+            .expect("decision");
+        assert_eq!(decision.label, crate::agent::route_question::LABEL_HARD);
+        assert!((decision.confidence - 0.91).abs() < 1e-9);
         assert_eq!(decision.target, Some(RouteTarget::Capable));
     }
 

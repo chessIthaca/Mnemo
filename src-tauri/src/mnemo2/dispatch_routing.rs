@@ -175,7 +175,9 @@ pub struct DispatchRoutingDecision {
     pub label: String,
     /// The tier the label routes to: `Some` only for a known label.
     pub tier: Option<&'static str>,
-    /// The answer's calibrated confidence (0.0–1.0).
+    /// The confidence the gate reads (0.0–1.0): the top option's probability
+    /// when the backend reported a distribution, else the pick's confidence
+    /// (`route_question::answer_confidence`).
     pub confidence: f64,
     /// The per-option distribution, when the backend reported one.
     pub probabilities: BTreeMap<String, f64>,
@@ -200,21 +202,21 @@ pub async fn classify_dispatch(
     cfg: &RoutingSettings,
 ) -> Option<DispatchRoutingDecision> {
     let question = routing_question(enabled)?;
-    let Answer::Choice {
-        label,
-        confidence,
-        probabilities,
-    } = classifier.classify(text, &question).await?
-    else {
+    let answer = classifier.classify(text, &question).await?;
+    let Answer::Choice { label, probabilities, .. } = &answer else {
         return None;
     };
-    let tier = label_tier(&label);
+    // The gate is calibrated on the top option's probability
+    // (`route_question::answer_confidence`), not the pick's lower,
+    // margin-like `confidence`.
+    let confidence = route_question::answer_confidence(&answer);
+    let tier = label_tier(label);
     let cleared = tier.is_some() && confidence >= threshold_for(enabled.offered().count(), cfg);
     Some(DispatchRoutingDecision {
-        label,
+        label: label.clone(),
         tier,
         confidence,
-        probabilities,
+        probabilities: probabilities.clone(),
         cleared,
     })
 }
@@ -377,7 +379,9 @@ pub enum DispatchRoutingRow {
         label: String,
         /// The tier the label routes to, when the label is known.
         tier: Option<String>,
-        /// The answer's calibrated confidence (0.0 when nothing was asked).
+        /// The gated confidence — the top option's probability when the
+        /// backend reported a distribution, else the pick's confidence
+        /// (0.0 when nothing was asked).
         confidence: f64,
         /// The per-option distribution, when the backend reported one.
         #[serde(default)]
@@ -901,6 +905,32 @@ mod tests {
             .await
             .expect("decision");
         assert!(!decision.cleared);
+    }
+
+    #[tokio::test]
+    async fn the_gate_reads_the_top_probability_not_the_margin() {
+        // A live-shaped answer: the pick's margin-like `confidence` (0.30)
+        // sits below the 3-label gate (0.475), the top option's probability
+        // (0.9113) above it — the gate and the logged confidence read the
+        // latter (`route_question::answer_confidence`).
+        let answer = Answer::Choice {
+            label: route_question::LABEL_HARD.to_string(),
+            confidence: 0.30,
+            probabilities: BTreeMap::from([
+                (route_question::LABEL_TRIVIAL.to_string(), 0.0328),
+                (route_question::LABEL_ROUTINE.to_string(), 0.0559),
+                (route_question::LABEL_HARD.to_string(), 0.9113),
+            ]),
+        };
+        let stub = StubClassifier::new(Some(answer));
+        let decision =
+            classify_dispatch(&stub, "text", all_enabled(), &RoutingSettings::default())
+                .await
+                .expect("decision");
+        assert_eq!(decision.label, route_question::LABEL_HARD);
+        assert_eq!(decision.tier, Some("difficult"));
+        assert!((decision.confidence - 0.9113).abs() < 1e-9);
+        assert!(decision.cleared);
     }
 
     #[tokio::test]

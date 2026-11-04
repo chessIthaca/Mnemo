@@ -12277,13 +12277,13 @@ models = [\"scripted-a\", \"scripted-b\"]
     async fn suggest_auto_refuses_when_unsure() {
         let fixture = routing_fixture(
             crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
-            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
             true,
         )
         .await;
         let result = fixture.dispatch(Some("auto"), None).await;
         assert!(!result.success);
-        assert_eq!(result.output, "Laya is unsure (0.41); pass a tier");
+        assert_eq!(result.output, "Laya is unsure (0.39); pass a tier");
         assert!(matches!(
             fixture.rows().as_slice(),
             [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
@@ -12321,13 +12321,13 @@ models = [\"scripted-a\", \"scripted-b\"]
     async fn auto_mode_falls_back_when_unsure() {
         let fixture = routing_fixture(
             crate::mnemo2::dispatch_routing::RoutingMode::Auto,
-            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
             true,
         )
         .await;
         let result = fixture.dispatch(None, None).await;
         assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("Laya: unsure (0.41)."));
+        assert!(result.output.contains("Laya: unsure (0.39)."));
         let worker = fixture.team.worker("routingworker").await.expect("worker");
         assert_eq!(worker.tier.as_deref(), Some("routine"));
         assert_eq!(worker.routing.expect("routing").routed_by, "lead");
@@ -13261,7 +13261,7 @@ models = [\"scripted-a\", \"scripted-b\"]
     async fn auto_fallback_without_that_tier_folds_down() {
         let fixture = routing_fixture(
             crate::mnemo2::dispatch_routing::RoutingMode::Auto,
-            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
             true,
         )
         .await;
@@ -13416,7 +13416,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             Some("Laya: routed to routine (0.62).")
         );
         let routing = WorkerRouting {
-            confidence: Some(0.41),
+            confidence: Some(0.39),
             cleared: false,
             routed_by: "lead".into(),
             lead_tier: Some("routine".into()),
@@ -13424,7 +13424,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         };
         assert_eq!(
             dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
-            Some("Laya: unsure (0.41).")
+            Some("Laya: unsure (0.39).")
         );
         let routing = WorkerRouting {
             laya_tier: None,
@@ -13462,7 +13462,7 @@ models = [\"scripted-a\", \"scripted-b\"]
     async fn gated_answer_has_no_skip_reason() {
         let fixture = routing_fixture(
             crate::mnemo2::dispatch_routing::RoutingMode::Auto,
-            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
             true,
         )
         .await;
@@ -13474,7 +13474,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 cleared: false,
                 confidence,
                 ..
-            }] if (*confidence - 0.41).abs() < f64::EPSILON
+            }] if (*confidence - 0.39).abs() < f64::EPSILON
         ));
         fixture.team.shutdown().await;
     }
@@ -13811,14 +13811,14 @@ models = [\"scripted-a\", \"scripted-b\"]
                 fallback_tier: "high".into(),
                 ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
             },
-            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
             true,
             std::time::Duration::ZERO,
         )
         .await;
         let result = fixture.dispatch(None, None).await;
         assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("Laya: unsure (0.41)."));
+        assert!(result.output.contains("Laya: unsure (0.39)."));
         assert!(!result.output.contains("routed to difficult"));
         let worker = fixture.team.worker("routingworker").await.expect("worker");
         assert_eq!(worker.tier.as_deref(), Some("high"));

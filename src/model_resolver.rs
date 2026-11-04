@@ -443,6 +443,7 @@ impl ModelResolver for ConfigModelResolver {
         let offered = crate::agent::route_question::OfferedLabels {
             trivial: config.tiers.first_model("trivial").is_some(),
             routine: true,
+            involved: config.tiers.first_model("medium").is_some(),
             hard: config.tiers.first_model("high").is_some(),
         };
         Some(RoutingPolicy {
@@ -855,6 +856,7 @@ mod tests {
                 offered: crate::agent::route_question::OfferedLabels {
                     trivial: false,
                     routine: true,
+                    involved: false,
                     hard: false,
                 },
                 first_prompt_min_confidence:

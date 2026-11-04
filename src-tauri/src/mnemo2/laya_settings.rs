@@ -794,10 +794,14 @@ pub fn summarize_rows(rows: &[dispatch_routing::DispatchRoutingRow]) -> RoutingL
     summary
 }
 
-/// The Laya page's eval result: both label-count runs and the record written
-/// to `route_eval.json`.
+/// The Laya page's eval result: every label-count run (four labels — the
+/// question dispatch asks — then three and two) and the record written to
+/// `route_eval.json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RoutingEvalWire {
+    /// The four-label run — the question dispatch actually asks (design
+    /// §5.1).
+    pub four: route_eval::EvalReport,
     /// The three-label run.
     pub three: route_eval::EvalReport,
     /// The two-label run.
@@ -807,10 +811,10 @@ pub struct RoutingEvalWire {
 }
 
 /// Run the routing eval against the open lead's attached Laya: the hand set
-/// under three labels and again under two, one prompt at a time; writes
-/// `route_eval.json` and returns both reports. It never applies a threshold —
-/// the page's Apply button saves the suggestion through
-/// [`save_routing_settings`].
+/// under four labels — the question dispatch actually asks — and again under
+/// three and two, one prompt at a time; writes `route_eval.json` and returns
+/// all three reports. It never applies a threshold — the page's Apply button
+/// saves the suggestion through [`save_routing_settings`].
 #[tauri::command]
 pub async fn run_routing_eval(
     state: State<'_, Mnemo2State>,
@@ -826,16 +830,16 @@ pub async fn run_routing_eval(
         .ok()
         .and_then(|team| team.route_knn());
     let routing = dispatch_routing::load_routing_settings(setup.config_dir());
-    let (three, two) = routing_eval_reports(
+    let (four, three, two) = routing_eval_reports(
         classifier.as_ref(),
         route_knn.as_deref(),
         routing.knn_min_rows,
         routing.knn_min_share,
     )
     .await?;
-    let record = route_eval::eval_record(&three, &two);
+    let record = route_eval::eval_record(&four, &three, &two);
     route_eval::save_eval_record(&record)?;
-    Ok(RoutingEvalWire { three, two, record })
+    Ok(RoutingEvalWire { four, three, two, record })
 }
 
 /// The lead engine's live classifier, or a clear error naming what is
@@ -850,20 +854,52 @@ fn attached_classifier(setup: &Setup) -> Result<Arc<dyn Classifier>, String> {
     classifier.ok_or_else(missing)
 }
 
-/// Both corpus passes, sequentially, with no file writes — the command adds
-/// the record; the tests drive this with a stub classifier and never touch
-/// the network.
+/// The three corpus passes, sequentially, with no file writes — the command
+/// adds the record; the tests drive this with a stub classifier and never
+/// touch the network.
 pub async fn routing_eval_reports(
     classifier: &dyn Classifier,
     knn: Option<&RouteKnn>,
     knn_min_rows: usize,
     knn_min_share: f64,
-) -> Result<(route_eval::EvalReport, route_eval::EvalReport), String> {
+) -> Result<
+    (
+        route_eval::EvalReport,
+        route_eval::EvalReport,
+        route_eval::EvalReport,
+    ),
+    String,
+> {
     let cases = route_eval::parse_hand_set(route_eval::HAND_SET_JSONL)?;
-    let three_offered = OfferedLabels { trivial: true, routine: true, hard: true };
-    let two_offered = OfferedLabels { trivial: true, routine: false, hard: true };
+    // The four-label run is the question dispatch actually asks (design §5.1:
+    // every pickable tier is offered); the three- and two-label runs cover the
+    // reduced offered sets — the interim legacy-tier shape, and the extremes
+    // with both middles folded into `hard`.
+    let four_offered = OfferedLabels {
+        trivial: true,
+        routine: true,
+        involved: true,
+        hard: true,
+    };
+    let three_offered = OfferedLabels { trivial: true, routine: true, involved: false, hard: true };
+    let two_offered = OfferedLabels { trivial: true, routine: false, involved: false, hard: true };
+    let four_scores = route_eval::classify_corpus(classifier, four_offered, &cases).await;
     let three_scores = route_eval::classify_corpus(classifier, three_offered, &cases).await;
     let two_scores = route_eval::classify_corpus(classifier, two_offered, &cases).await;
+    let four_knn = match knn {
+        Some(knn) => Some(
+            route_eval::evaluate_knn(
+                &cases,
+                &four_scores,
+                four_offered,
+                knn,
+                knn_min_rows,
+                knn_min_share,
+            )
+            .await,
+        ),
+        None => None,
+    };
     let three_knn = match knn {
         Some(knn) => Some(
             route_eval::evaluate_knn(
@@ -893,6 +929,7 @@ pub async fn routing_eval_reports(
         None => None,
     };
     Ok((
+        route_eval::report_with_knn(&four_scores, four_offered, four_knn),
         route_eval::report_with_knn(&three_scores, three_offered, three_knn),
         route_eval::report_with_knn(&two_scores, two_offered, two_knn),
     ))
@@ -1560,19 +1597,40 @@ simple = ["ep1/exec-model"]
             .collect();
         let stub = StubClassifier { expected };
 
-        let (three, two) = routing_eval_reports(&stub, None, 30, 0.80)
+        let (four, three, two) = routing_eval_reports(&stub, None, 30, 0.80)
             .await
             .expect("reports");
+        assert_eq!(four.labels, 4);
         assert_eq!(three.labels, 3);
         assert_eq!(two.labels, 2);
+        assert_eq!(four.table.len(), 23);
         assert_eq!(three.table.len(), 23);
         assert_eq!(two.table.len(), 23);
-        // Every case clears the gate at 0.9: the 45 labelled ones are right,
-        // the three vague ones are false routes and so are the misses.
-        assert_eq!(three.table[0].routed, 48);
-        assert!((three.table[0].accuracy - 45.0 / 48.0).abs() < 1e-12);
+        // Every case clears the gate at 0.9: the four-label run — the question
+        // dispatch asks — gets all 56 labelled cases right, and the three
+        // vague ones are false routes and so are the misses.
+        assert_eq!(four.table[0].routed, 59);
+        assert!((four.table[0].accuracy - 56.0 / 59.0).abs() < 1e-12);
+        assert_eq!(four.misses.len(), 3);
+        assert!((four.suggested.expect("a suggested gate") - 0.25).abs() < 1e-9);
+        // The stub answers the recorded label, and an un-offered label folds
+        // the same way on the answer and the expectation side — so the
+        // reduced offered sets are also right on all 56 labelled cases. The
+        // runs differ in their labels count and their own default gate.
+        assert!((three.table[0].accuracy - 56.0 / 59.0).abs() < 1e-12);
         assert_eq!(three.misses.len(), 3);
-        assert!((three.suggested.expect("a suggested gate") - 0.25).abs() < 1e-9);
+        assert!((two.table[0].accuracy - 56.0 / 59.0).abs() < 1e-12);
+        assert!(
+            (four.default_gate - mnemo::agent::route_question::DEFAULT_MIN_CONFIDENCE_4).abs() < 1e-9
+        );
+        assert!(
+            (three.default_gate - mnemo::agent::route_question::DEFAULT_MIN_CONFIDENCE_3).abs()
+                < 1e-9
+        );
+        assert!(
+            (two.default_gate - mnemo::agent::route_question::DEFAULT_MIN_CONFIDENCE_2).abs() < 1e-9
+        );
+        assert!(three.suggested.is_some());
         assert!(two.suggested.is_some());
     }
 }

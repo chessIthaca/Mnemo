@@ -16154,7 +16154,12 @@ fn scripted_routing_gate(
         .with_log_path(log_path)
 }
 
-/// A three-label policy with a caller-selected legacy ladder threshold.
+/// A policy with a caller-selected legacy ladder threshold, offered as the
+/// interim legacy three-label set: `involved` stays un-offered until Mnemo1's
+/// strike ladder learns the `medium` rung — offering it here would point the
+/// strike escalation's `label_above` walk at a rung Mnemo1 cannot resolve
+/// into a `RouteTarget` yet (and the first-prompt gate is calibrated for
+/// three labels).
 fn routing_policy_with_threshold(
     threshold: f64,
     enforce: bool,
@@ -16162,6 +16167,7 @@ fn routing_policy_with_threshold(
     let offered = crate::agent::route_question::OfferedLabels {
         trivial: true,
         routine: true,
+        involved: false,
         hard: true,
     };
     model_routing::RoutingPolicy {

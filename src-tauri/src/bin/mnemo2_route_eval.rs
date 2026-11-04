@@ -7,8 +7,9 @@
 //! `mnemo2_route_eval` — the routing eval's CLI (plan 2ba2168a, design §4.8).
 //!
 //! Asks a RUNNING Laya about the hand set — and, with `--history` / `--mnemo1`,
-//! the mined corpora — one prompt at a time, under three labels and again under
-//! two, then prints the threshold sweep, the misses and the suggested gates.
+//! the mined corpora — one prompt at a time, under four labels and again under
+//! three and two, then prints the threshold sweep, the misses and the
+//! suggested gates.
 //! The last run's suggestions land in `<training_dir>/route_eval.json`, which
 //! the Laya page shows beside its gates.
 //!
@@ -176,8 +177,8 @@ fn print_report(report: &route_eval::EvalReport, cases: usize) {
     }
 }
 
-/// Build the classifier for `url`, run both label-count passes and write the
-/// record.
+/// Build the classifier for `url`, run the three label-count passes (four,
+/// three and two offered) and write the record.
 async fn run() -> Result<(), String> {
     let flags = parse_flags(std::env::args().skip(1))?;
     let url = flags
@@ -194,16 +195,27 @@ async fn run() -> Result<(), String> {
     let classifier = LayaClassifier::with_timeout(&url, status, Duration::from_secs(30))
         .map_err(|error| format!("cannot build the Laya client for {url}: {error}"))?;
 
-    let three_offered = OfferedLabels { trivial: true, routine: true, hard: true };
-    let two_offered = OfferedLabels { trivial: true, routine: false, hard: true };
+    let four_offered = OfferedLabels {
+        trivial: true,
+        routine: true,
+        involved: true,
+        hard: true,
+    };
+    let three_offered = OfferedLabels {
+        trivial: true,
+        routine: true,
+        involved: false,
+        hard: true,
+    };
+    let two_offered = OfferedLabels { trivial: true, routine: false, involved: false, hard: true };
     let mut reports = Vec::new();
-    for offered in [three_offered, two_offered] {
+    for offered in [four_offered, three_offered, two_offered] {
         let scores = route_eval::classify_corpus(&classifier, offered, &cases).await;
         reports.push(route_eval::report(&scores, offered));
         print_report(reports.last().expect("just pushed"), cases.len());
     }
 
-    let record = route_eval::eval_record(&reports[0], &reports[1]);
+    let record = route_eval::eval_record(&reports[0], &reports[1], &reports[2]);
     route_eval::save_eval_record(&record)?;
     println!("\nwrote {}", route_eval::route_eval_path().display());
     Ok(())

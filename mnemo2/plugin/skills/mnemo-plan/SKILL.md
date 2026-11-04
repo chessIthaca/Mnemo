@@ -51,7 +51,7 @@ You, the lead, write these specs yourself. Read the code they touch, so the name
 
 First plan, then implement: write every step's spec before the first dispatch, not step by step as workers finish.
 
-Only for really complicated work, where you cannot write the spec without substantial research (an unfamiliar subsystem, a performance question, several viable designs), may the first step be a spec-writing step on the `difficult` tier. It returns the specs, which you review and put into the plan, before any implementation step is dispatched.
+Only for really complicated work, where you cannot write the spec without substantial research (an unfamiliar subsystem, a performance question, several viable designs), may the first step be a spec-writing step on the `high` tier. It returns the specs, which you review and put into the plan, before any implementation step is dispatched.
 
 ### Acceptance and verification
 

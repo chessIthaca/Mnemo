@@ -350,7 +350,8 @@ pub struct WorkerRecord {
     #[serde(default)]
     pub plan_step: Option<usize>,
     /// The model tier (`difficult`, `average`, `simple`) the lead chose,
-    /// when it dispatched by tier.
+    /// when it dispatched by tier — and the tier a later model switch moved
+    /// the worker to, when the new model belongs to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
     /// The dispatch-time Laya decision, absent for legacy and unrouted workers.
@@ -846,13 +847,25 @@ fn status_name(status: WorkerStatus) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the routing log may be written for this worker: it was dispatched
-/// with routing (its record carries a decision) or routing is on now. With
-/// routing off and an unrouted worker nothing is appended, so off mode keeps
-/// writing exactly what it wrote before routing existed. Cleanup, which has no
-/// settings handle, passes [`RoutingMode::Off`] and goes by the record alone.
+/// Whether the Laya-derived routing rows (`nudge`, `nudge_ignored`) may be
+/// written for this worker: it was dispatched with routing (its record
+/// carries a decision) or routing is on now. With routing off and an
+/// unrouted worker nothing is appended, so off mode keeps writing exactly
+/// what it wrote before routing existed. Cleanup, which has no settings
+/// handle, passes [`RoutingMode::Off`] and goes by the record alone. Label
+/// rows — a hand's reroute and a rerouted worker's terminal outcome — go
+/// through [`logs_label`] instead.
 fn logs_routing(record: &WorkerRecord, mode: RoutingMode) -> bool {
     record.routing.is_some() || mode != RoutingMode::Off
+}
+
+/// Whether a *label* row is logged for this worker: every user or lead
+/// model change is a learning (decided 2026-11-04), so a reroute is appended
+/// in every routing mode, and a worker that was rerouted at least once
+/// keeps logging its terminal `outcome` row in every mode too — outcome
+/// labels are what calibration learns from.
+fn logs_label(record: &WorkerRecord, mode: RoutingMode) -> bool {
+    logs_routing(record, mode) || !record.reroutes.is_empty()
 }
 
 /// The tier a worker finished on: the destination of its last reroute, else
@@ -869,6 +882,19 @@ fn final_tier(record: &WorkerRecord) -> String {
         })
         .or_else(|| record.tier.clone())
         .unwrap_or_else(|| "custom".to_string())
+}
+
+/// The tier a reroute row moves the worker to — the label the record's
+/// `tier` field tracks after a switch, read from the same row [`final_tier`]
+/// prefers so they (and team_status) agree. `None` when the destination is a
+/// custom model.
+fn reroute_destination(row: &DispatchRoutingRow) -> Option<String> {
+    let to_tier = match row {
+        DispatchRoutingRow::LeadReroute { to_tier, .. }
+        | DispatchRoutingRow::UserReroute { to_tier, .. } => to_tier,
+        _ => return None,
+    };
+    (to_tier != "custom").then(|| to_tier.clone())
 }
 
 /// The `outcome` row for a worker that reached a terminal status (design
@@ -3753,7 +3779,7 @@ impl TeamRuntime {
             // A failure is not terminal — the worker can still be resumed
             // on a stronger tier and take its nudge — so only the outcome
             // row, never nudge_ignored.
-            if logs_routing(&record, self.routing_mode()) {
+            if logs_label(&record, self.routing_mode()) {
                 if let Some(row) = outcome_row(&record, "failed") {
                     self.append_dispatch_routing_row(&row);
                 }
@@ -4024,14 +4050,19 @@ impl TeamRuntime {
         let _guard = self.merge_lock.lock().await;
         let before = self.worker(worker_id).await?;
         let record = self.stop_inner(worker_id).await?;
-        if !matches!(before.status, WorkerStatus::Stopped)
-            && logs_routing(&record, self.routing_mode())
-        {
-            if let Some(row) = outcome_row(&record, "stopped") {
-                self.append_dispatch_routing_row(&row);
+        if !matches!(before.status, WorkerStatus::Stopped) {
+            // A hand reroute is a learning in every mode, so a rerouted
+            // worker's outcome row is written even off; the nudge row is
+            // Laya-derived and keeps the `logs_routing` gate.
+            if logs_label(&record, self.routing_mode()) {
+                if let Some(row) = outcome_row(&record, "stopped") {
+                    self.append_dispatch_routing_row(&row);
+                }
             }
-            if let Some(row) = nudge_ignored_row(&record) {
-                self.append_dispatch_routing_row(&row);
+            if logs_routing(&record, self.routing_mode()) {
+                if let Some(row) = nudge_ignored_row(&record) {
+                    self.append_dispatch_routing_row(&row);
+                }
             }
         }
         Ok(record)
@@ -4274,10 +4305,12 @@ impl TeamRuntime {
     ///
     /// A switch that moves the model appends a `lead_reroute` or
     /// `user_reroute` row (design §4.7) — by [`source`] — carrying the
-    /// route before and after; it clears the record's tier and a pending
-    /// nudge (the nudge was answered by a hand, not by Laya). A same-tier
-    /// switch logs with `from_tier == to_tier` and never counts as an
-    /// override; an effort-only change logs nothing.
+    /// route before and after, in every routing mode: a hand-moved model is
+    /// always a learning (decided 2026-11-04). It repoints the record's
+    /// tier at the destination tier (`None` for a custom model) and clears
+    /// a pending nudge (the nudge was answered by a hand, not by Laya). A
+    /// same-tier switch logs with `from_tier == to_tier` and never counts
+    /// as an override; an effort-only change logs nothing.
     pub async fn change_model(
         &self,
         worker_id: &str,
@@ -4302,9 +4335,9 @@ impl TeamRuntime {
             .routing
             .as_ref()
             .and_then(|routing| routing.nudged.clone());
-        // The record keeps its reroute either way (team.json bookkeeping);
-        // the calibration log only gets it when routing applies to it.
-        let log_routing = logs_routing(&record, self.routing_mode());
+        // The record keeps its reroute either way (team.json bookkeeping),
+        // and the calibration log gets it too: a hand-moved model is a
+        // learning in every routing mode (decided 2026-11-04).
         let requested = model.as_deref().filter(|spec| !spec.trim().is_empty());
         if self.worker_is_busy(worker_id).await {
             if record.kind == "audit" {
@@ -4359,7 +4392,7 @@ impl TeamRuntime {
                 }
                 worker.reasoning_effort = reasoning_effort.clone();
                 if let Some(row) = &reroute {
-                    worker.tier = None;
+                    worker.tier = reroute_destination(row);
                     worker.reroutes.push(row.clone());
                     if let Some(routing) = worker.routing.as_mut() {
                         routing.nudged = None;
@@ -4379,7 +4412,7 @@ impl TeamRuntime {
                     live.strikes.lock().await.reset();
                 }
             }
-            if let Some(row) = reroute.as_ref().filter(|_| log_routing) {
+            if let Some(row) = reroute.as_ref() {
                 self.append_dispatch_routing_row(row);
             }
             return self.worker(worker_id).await;
@@ -4393,7 +4426,7 @@ impl TeamRuntime {
             worker.model_id = None;
             worker.reasoning_effort = reasoning_effort.clone();
             if let Some(row) = &reroute {
-                worker.tier = None;
+                worker.tier = reroute_destination(row);
                 worker.reroutes.push(row.clone());
                 if let Some(routing) = worker.routing.as_mut() {
                     routing.nudged = None;
@@ -4404,7 +4437,7 @@ impl TeamRuntime {
         })
         .await;
         self.persist().await?;
-        if let Some(row) = reroute.as_ref().filter(|_| log_routing) {
+        if let Some(row) = reroute.as_ref() {
             self.append_dispatch_routing_row(row);
         }
         let record = self.worker(worker_id).await?;
@@ -5030,16 +5063,22 @@ impl TeamRuntime {
             self.persist().await?;
         }
         let record = self.worker(worker_id).await?;
-        if record.status == WorkerStatus::Merged && logs_routing(&record, self.routing_mode()) {
-            // The one terminal end a routed worker is labelled at (design
-            // §4.7): the merge landed and the record is Merged. The
-            // retryable InReview cleanup path above logs nothing; its
-            // successful retry arrives here.
-            if let Some(row) = outcome_row(&record, "merged") {
-                self.append_dispatch_routing_row(&row);
+        if record.status == WorkerStatus::Merged {
+            // The one terminal end a worker is labelled at (design §4.7):
+            // the merge landed and the record is Merged. The retryable
+            // InReview cleanup path above logs nothing; its successful retry
+            // arrives here. The outcome row follows `logs_label` — a hand
+            // reroute is a learning in every mode — while the nudge row is
+            // Laya-derived and keeps the `logs_routing` gate.
+            if logs_label(&record, self.routing_mode()) {
+                if let Some(row) = outcome_row(&record, "merged") {
+                    self.append_dispatch_routing_row(&row);
+                }
             }
-            if let Some(row) = nudge_ignored_row(&record) {
-                self.append_dispatch_routing_row(&row);
+            if logs_routing(&record, self.routing_mode()) {
+                if let Some(row) = nudge_ignored_row(&record) {
+                    self.append_dispatch_routing_row(&row);
+                }
             }
         }
         Ok(record)
@@ -6819,7 +6858,7 @@ async fn pump_worker(
                                 // outcome row only — nudge_ignored waits for
                                 // stop, merge, or cleanup.
                                 pending_outcome = outcome_row(worker, "failed")
-                                    .filter(|_| logs_routing(worker, mode));
+                                    .filter(|_| logs_label(worker, mode));
                             }
                             terminal = true;
                         }
@@ -7276,13 +7315,18 @@ pub async fn cleanup_workspace(
             Some("inactive checkout cleaned; the branch is retained for review".to_string());
         // Abandoned is terminal (design §4.7): the worker's `outcome` row
         // and, when its one nudge was never acted on, the `nudge_ignored`
-        // row land beside the cleaned checkout — only for a worker routing
-        // ever applied to (cleanup has no settings handle, so the record
-        // decides).
-        let rows = [outcome_row(worker, "abandoned"), nudge_ignored_row(worker)]
+        // row land beside the cleaned checkout — the outcome row for a
+        // worker routing ever applied to or one that was rerouted by hand
+        // (a hand reroute is a learning in every mode), the nudge row only
+        // for a worker routing ever applied to (cleanup has no settings
+        // handle, so the record decides).
+        let outcome = outcome_row(worker, "abandoned")
+            .filter(|_| logs_label(worker, RoutingMode::Off));
+        let nudge_ignored = nudge_ignored_row(worker)
+            .filter(|_| logs_routing(worker, RoutingMode::Off));
+        let rows = [outcome, nudge_ignored]
             .into_iter()
             .flatten()
-            .filter(|_| logs_routing(worker, RoutingMode::Off))
             .collect::<Vec<_>>();
         persistence.save(&ledger)?;
         for row in rows {
@@ -12290,7 +12334,7 @@ models = [\"scripted-a\", \"scripted-b\"]
     }
 
     #[tokio::test]
-    async fn off_mode_model_change_writes_no_routing_row() {
+    async fn off_mode_model_change_logs_the_user_reroute() {
         let fixture = routing_fixture(
             crate::mnemo2::dispatch_routing::RoutingMode::Off,
             routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
@@ -12298,6 +12342,8 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .await;
         assert!(fixture.dispatch(Some("average"), None).await.success);
+        // No hand reroute yet: off mode keeps the log absent.
+        assert!(!fixture.log_path().exists());
         fixture
             .team
             .change_model(
@@ -12308,20 +12354,40 @@ models = [\"scripted-a\", \"scripted-b\"]
             )
             .await
             .expect("the user moves the worker");
-        // The record keeps its reroute (team.json bookkeeping); the routing
-        // log is never created while routing is off and the worker was
-        // dispatched without a decision.
+        // A hand-moved model is a learning even with routing off (decided
+        // 2026-11-04): exactly one user reroute row lands in the log, and
+        // the record's tier is the destination tier — final_tier and
+        // team_status agree instead of showing null.
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        match &rows[0] {
+            DispatchRoutingRow::UserReroute {
+                worker_id,
+                from_tier,
+                to_tier,
+                from_model,
+                to_model,
+                ..
+            } => {
+                assert_eq!(worker_id, "routingworker");
+                assert_eq!(from_tier, "average");
+                assert_eq!(to_tier, "difficult");
+                assert_eq!(from_model.as_deref(), Some("test/scripted-average"));
+                assert_eq!(to_model.as_deref(), Some("test/scripted-difficult"));
+            }
+            other => panic!("a user reroute row is logged: {other:?}"),
+        }
         let worker = fixture.team.worker("routingworker").await.expect("worker");
         assert_eq!(worker.reroutes.len(), 1, "{worker:?}");
-        assert!(
-            !fixture.log_path().exists(),
-            "off mode must not write a reroute row"
-        );
+        assert_eq!(worker.tier.as_deref(), Some("difficult"), "{worker:?}");
+        assert_eq!(final_tier(&worker), "difficult");
+        let status = team_status_answer(&fixture.team, json!({})).await;
+        assert_eq!(status["result"][0]["tier"], "difficult");
         fixture.team.shutdown().await;
     }
 
     #[tokio::test]
-    async fn off_mode_merge_writes_no_outcome_row() {
+    async fn off_mode_unrerouted_merge_writes_no_outcome_row() {
         let root = tempfile::tempdir().expect("workspace");
         let state = tempfile::tempdir().expect("state");
         init_git(root.path());
@@ -12332,7 +12398,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         worker.plan_step = Some(0);
         worker.tier = Some("average".into());
         worker.model = Some("test/scripted-average".into());
-        // No dispatch decision: this worker ran with routing off.
+        // No dispatch decision and no hand reroute: this worker ran with
+        // routing off and was never moved by a hand, so it stays off the
+        // calibration log.
         worker.routing = None;
         provision_agent_worktree(
             root.path().to_path_buf(),
@@ -12362,7 +12430,93 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
         assert!(
             !state.path().join("dispatch_routing.jsonl").exists(),
-            "off mode must not write an outcome row"
+            "off mode writes no outcome row for a worker with no reroute"
+        );
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_rerouted_merge_writes_the_outcome_row() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000002000000000004");
+        worker.status = WorkerStatus::InReview;
+        worker.plan_id = Some("plan0001".into());
+        worker.plan_step = Some(0);
+        worker.tier = Some("average".into());
+        worker.model = Some("test/scripted-average".into());
+        // No dispatch decision: this worker ran with routing off — but the
+        // user moved it to difficult by hand, and a hand reroute is a
+        // learning in every mode (decided 2026-11-04), so its terminal
+        // outcome row is calibration data.
+        worker.routing = None;
+        worker.reroutes = vec![DispatchRoutingRow::UserReroute {
+            ts: 1,
+            worker_id: worker.id.clone(),
+            plan_id: "plan0001".into(),
+            step: 1,
+            from_tier: "average".into(),
+            to_tier: "difficult".into(),
+            from_model: Some("test/scripted-average".into()),
+            to_model: Some("test/scripted-difficult".into()),
+            status: "idle".into(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }];
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        let merged = team.merge(&worker.id).await.expect("merge the worker");
+        assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+        let rows: Vec<DispatchRoutingRow> =
+            std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
+                .expect("the routing log")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect();
+        // The hand reroute makes the off-mode worker calibration data: its
+        // merged outcome row is written, labelled difficult by the reroute
+        // rule (design §4.8 rule 2).
+        assert!(
+            matches!(
+                rows.as_slice(),
+                [DispatchRoutingRow::Outcome {
+                    worker_id,
+                    status,
+                    final_tier,
+                    label: Some(label),
+                    ..
+                }]
+                    if worker_id == "00000002000000000004"
+                        && status == "merged"
+                        && final_tier == "difficult"
+                        && label == "difficult"
+            ),
+            "the rerouted worker's outcome row: {rows:?}"
         );
         team.shutdown().await;
     }

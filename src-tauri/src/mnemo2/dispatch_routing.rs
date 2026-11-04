@@ -288,8 +288,8 @@ pub async fn classify_dispatch(
 }
 
 /// Mnemo2's `[routing]` settings block (design §4.9): the mode, the three
-/// per-label-count gates, the auto-mode fallback tier, the nudge switch, the
-/// minimum word count and the optional per-tier default effort.
+/// per-label-count gates, the auto-mode fallback tier, the nudge switch and
+/// the minimum word count.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingSettings {
@@ -339,8 +339,11 @@ pub fn routing_settings_path(config_dir: &Path) -> PathBuf {
     config_dir.join("mnemo2.toml")
 }
 
-/// Load `[routing]` from Mnemo2's settings, defaulting leniently when the file
-/// or table is absent or invalid.
+/// Load `[routing]` from Mnemo2's settings, defaulting leniently when the
+/// file or table is absent or invalid. Retired tier ids convert to their
+/// ladder ids, and a table that converted and loaded cleanly is written back
+/// to the file once, so the stored ids and the app agree (a failed
+/// write-back only logs; the converted settings still load).
 pub fn load_routing_settings(config_dir: &Path) -> RoutingSettings {
     let path = routing_settings_path(config_dir);
     let text = match std::fs::read_to_string(&path) {
@@ -363,16 +366,21 @@ pub fn load_routing_settings(config_dir: &Path) -> RoutingSettings {
             return RoutingSettings::default();
         }
     };
-    let Some(value) = document.get("routing").cloned() else {
+    let Some(mut routing) = document.get("routing").cloned() else {
         return RoutingSettings::default();
     };
-    match value.try_into() {
-        Ok(mut settings) => {
-            let settings: &mut RoutingSettings = &mut settings;
-            if let Some(tier) = TierLadder::convert_old_id(&settings.fallback_tier) {
-                settings.fallback_tier = tier.to_string();
+    let converted = convert_retired_tier_ids(&mut routing);
+    match routing.clone().try_into() {
+        Ok(settings) => {
+            if converted {
+                if let Err(error) = save_converted_routing_table(config_dir, &routing) {
+                    log::warn!(
+                        "using converted Mnemo2 routing settings; cannot rewrite {}: {error}",
+                        path.display()
+                    );
+                }
             }
-            settings.clone()
+            settings
         }
         Err(error) => {
             log::warn!(
@@ -407,6 +415,75 @@ pub fn save_routing_settings(
     let routing = toml::from_str::<toml::Value>(&encoded)
         .map_err(|error| format!("cannot encode Mnemo2 routing settings: {error}"))?;
     table.insert("routing".into(), routing);
+    let encoded = toml::to_string_pretty(&document)
+        .map_err(|error| format!("cannot serialize {}: {error}", path.display()))?;
+    std::fs::create_dir_all(config_dir)
+        .map_err(|error| format!("cannot create {}: {error}", config_dir.display()))?;
+    std::fs::write(&path, encoded)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// Rewrite retired tier ids in the raw `[routing]` table so the file and the
+/// app agree (plan 5310e9bc): the `fallback_tier` value and the keys of the
+/// vestigial `[routing.effort]` table — plan 87932c46 moved per-tier effort
+/// onto the ladder rungs, but older installs still carry the retired keys.
+/// An effort entry whose ladder id is already keyed keeps its current value;
+/// the retired alias is stale and drops. Returns whether anything changed,
+/// so [`load_routing_settings`] rewrites the file only when it did.
+fn convert_retired_tier_ids(routing: &mut toml::Value) -> bool {
+    let Some(table) = routing.as_table_mut() else {
+        return false;
+    };
+    let mut converted = false;
+    if let Some(toml::Value::String(tier)) = table.get_mut("fallback_tier") {
+        if let Some(ladder_id) = TierLadder::convert_old_id(tier.as_str()) {
+            *tier = ladder_id.to_string();
+            converted = true;
+        }
+    }
+    if let Some(toml::Value::Table(effort)) = table.get_mut("effort") {
+        let retired: Vec<(String, &'static str)> = effort
+            .keys()
+            .filter_map(|key| TierLadder::convert_old_id(key).map(|id| (key.clone(), id)))
+            .collect();
+        for (key, ladder_id) in retired {
+            let stale = effort.remove(&key);
+            // Removing the alias alone is a change: the retired id leaves
+            // the file even when the ladder key already carries a value.
+            converted = true;
+            if effort.contains_key(ladder_id) {
+                continue;
+            }
+            if let Some(value) = stale {
+                effort.insert(ladder_id.to_string(), value);
+            }
+        }
+    }
+    converted
+}
+
+/// Write a converted raw `[routing]` table back to `mnemo2.toml` without
+/// disturbing any other table — the read-modify-write discipline
+/// [`save_routing_settings`] established — so retired tier ids a load
+/// converted do not linger on disk. Unlike [`save_routing_settings`] this
+/// takes the raw table, not [`RoutingSettings`]: keys the struct no longer
+/// knows, like the vestigial `[routing.effort]`, survive the rewrite with
+/// their ids converted.
+fn save_converted_routing_table(config_dir: &Path, routing: &toml::Value) -> Result<(), String> {
+    let path = routing_settings_path(config_dir);
+    let mut document = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => toml::from_str::<toml::Value>(&text)
+            .map_err(|error| format!("invalid {}: {error}", path.display()))?,
+        Ok(_) => toml::Value::Table(toml::map::Map::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::map::Map::new())
+        }
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let table = document
+        .as_table_mut()
+        .ok_or_else(|| format!("{} must contain a TOML table", path.display()))?;
+    table.insert("routing".into(), routing.clone());
     let encoded = toml::to_string_pretty(&document)
         .map_err(|error| format!("cannot serialize {}: {error}", path.display()))?;
     std::fs::create_dir_all(config_dir)
@@ -866,6 +943,60 @@ mod tests {
             .expect("legacy routing settings");
             assert_eq!(load_routing_settings(config.path()).fallback_tier, ladder_id);
         }
+    }
+
+    #[test]
+    fn retired_tier_ids_are_rewritten_on_disk() {
+        let config = tempfile::tempdir().expect("config dir");
+        let path = routing_settings_path(config.path());
+        std::fs::write(
+            &path,
+            r#"[ui]
+compact = true
+
+[routing]
+fallback_tier = "average"
+
+[routing.effort]
+difficult = "high"
+"#,
+        )
+        .expect("legacy routing settings");
+        assert_eq!(load_routing_settings(config.path()).fallback_tier, "routine");
+        let text = std::fs::read_to_string(&path).expect("rewritten routing settings");
+        let saved: toml::Value = toml::from_str(&text).expect("valid TOML");
+        assert_eq!(
+            saved["routing"]["fallback_tier"],
+            toml::Value::String("routine".to_string())
+        );
+        assert_eq!(
+            saved["routing"]["effort"]["high"],
+            toml::Value::String("high".to_string())
+        );
+        assert_eq!(saved["ui"]["compact"], toml::Value::Boolean(true));
+        assert!(!text.contains("average"), "no retired ids: {text}");
+        assert!(!text.contains("difficult"), "no retired ids: {text}");
+    }
+
+    #[test]
+    fn ladder_tier_ids_are_not_rewritten_on_load() {
+        let config = tempfile::tempdir().expect("config dir");
+        let path = routing_settings_path(config.path());
+        let text = r#"[ui]
+compact = true
+
+[routing]
+fallback_tier = "routine"
+
+[routing.effort]
+high = "high"
+"#;
+        std::fs::write(&path, text).expect("current routing settings");
+        assert_eq!(load_routing_settings(config.path()).fallback_tier, "routine");
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged routing settings"),
+            text.as_bytes()
+        );
     }
 
     #[test]

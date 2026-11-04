@@ -60,6 +60,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use mnemo::agent::route_knn::RouteKnn;
 use mnemo::agent::route_question::OfferedLabels;
 use mnemo::config::general::LayaConfig;
 use mnemo::config::settings_dto::{RoutingConfigDto, SettingsSaveDto};
@@ -821,11 +822,23 @@ pub async fn run_routing_eval(
     state: State<'_, Mnemo2State>,
 ) -> Result<RoutingEvalWire, String> {
     let (setup, runtime) = settings_setup(&state).await?;
-    if runtime.is_none() {
+    let Some(runtime) = runtime else {
         return Err("open a lead first: the eval asks the lead's attached Laya".to_string());
-    }
+    };
     let classifier = attached_classifier(&setup)?;
-    let (three, two) = routing_eval_reports(classifier.as_ref()).await?;
+    let route_knn = runtime
+        .team_handle()
+        .await
+        .ok()
+        .and_then(|team| team.route_knn());
+    let routing = dispatch_routing::load_routing_settings(setup.config_dir());
+    let (three, two) = routing_eval_reports(
+        classifier.as_ref(),
+        route_knn.as_deref(),
+        routing.knn_min_rows,
+        routing.knn_min_share,
+    )
+    .await?;
     let record = route_eval::eval_record(&three, &two);
     route_eval::save_eval_record(&record)?;
     Ok(RoutingEvalWire { three, two, record })
@@ -848,15 +861,46 @@ fn attached_classifier(setup: &Setup) -> Result<Arc<dyn Classifier>, String> {
 /// the network.
 pub async fn routing_eval_reports(
     classifier: &dyn Classifier,
+    knn: Option<&RouteKnn>,
+    knn_min_rows: usize,
+    knn_min_share: f64,
 ) -> Result<(route_eval::EvalReport, route_eval::EvalReport), String> {
     let cases = route_eval::parse_hand_set(route_eval::HAND_SET_JSONL)?;
     let three_offered = OfferedLabels { trivial: true, routine: true, hard: true };
     let two_offered = OfferedLabels { trivial: true, routine: false, hard: true };
     let three_scores = route_eval::classify_corpus(classifier, three_offered, &cases).await;
     let two_scores = route_eval::classify_corpus(classifier, two_offered, &cases).await;
+    let three_knn = match knn {
+        Some(knn) => Some(
+            route_eval::evaluate_knn(
+                &cases,
+                &three_scores,
+                three_offered,
+                knn,
+                knn_min_rows,
+                knn_min_share,
+            )
+            .await,
+        ),
+        None => None,
+    };
+    let two_knn = match knn {
+        Some(knn) => Some(
+            route_eval::evaluate_knn(
+                &cases,
+                &two_scores,
+                two_offered,
+                knn,
+                knn_min_rows,
+                knn_min_share,
+            )
+            .await,
+        ),
+        None => None,
+    };
     Ok((
-        route_eval::report(&three_scores, three_offered),
-        route_eval::report(&two_scores, two_offered),
+        route_eval::report_with_knn(&three_scores, three_offered, three_knn),
+        route_eval::report_with_knn(&two_scores, two_offered, two_knn),
     ))
 }
 
@@ -1383,6 +1427,10 @@ simple = ["ep1/exec-model"]
             text_sha256: String::new(),
             text: "text".to_string(),
             skip: None,
+            source: Some("laya".to_string()),
+            knn_label: None,
+            knn_share: None,
+            knn_k: None,
         }
     }
 
@@ -1541,7 +1589,9 @@ simple = ["ep1/exec-model"]
             .collect();
         let stub = StubClassifier { expected };
 
-        let (three, two) = routing_eval_reports(&stub).await.expect("reports");
+        let (three, two) = routing_eval_reports(&stub, None, 30, 0.80)
+            .await
+            .expect("reports");
         assert_eq!(three.labels, 3);
         assert_eq!(two.labels, 2);
         assert_eq!(three.table.len(), 23);

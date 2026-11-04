@@ -214,6 +214,19 @@ impl Engine {
     pub(crate) fn brain(&self) -> &Brain {
         &self.brain
     }
+
+    /// The app's live shared embedder, when this engine owns a concrete memory
+    /// store. The handle is the store's current embedder — the same one recall
+    /// and ingestion use — so an online-learning overlay (the dispatch-route
+    /// kNN) never spins up a second embedding backend. `None` when memory is
+    /// disabled or the store was injected as a trait object: the caller then
+    /// degrades to the baseline classifier (Laya).
+    pub fn embedder_handle(&self) -> Option<Arc<dyn crate::memory::embedder::Embedder>> {
+        self.brain
+            .own_memory_store
+            .as_ref()
+            .map(|store| store.embedder_handle())
+    }
     /// Start an engine on an EXPLICIT workspace + config (§5.3 :297).
     /// Never blocks and never shows a picker (§7 row 9): an unusable
     /// workspace — the root missing, or `require_git` unmet on a non-repo

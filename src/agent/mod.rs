@@ -60,6 +60,7 @@ pub mod prompt;
 pub mod policy;
 pub mod reflex;
 pub mod review_scope;
+pub mod route_knn;
 pub mod route_question;
 pub mod steering_stats;
 pub mod step_lanes;

@@ -29,6 +29,8 @@ use mnemo::headless::{
 };
 use mnemo::headless::session::ModelSwitch;
 use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
+use mnemo::agent::failure_triage_knn::EmbedderGetter;
+use mnemo::agent::route_knn::RouteKnn;
 use mnemo::memory::classifier::ClassifierSlot;
 use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
@@ -1170,6 +1172,9 @@ pub struct TeamRuntime {
     /// failure's `outcome` row follows the mode in force when it happens.
     routing: Arc<std::sync::RwLock<RoutingSettings>>,
     classifier: Option<ClassifierSlot>,
+    /// The online-learning overlay over `dispatch_routing.jsonl`, present when
+    /// the engine exposes its shared embedder. Consulted before Laya.
+    route_knn: Option<Arc<RouteKnn>>,
     /// One classifier call at a time, shared with the drift checks.
     routing_permit: Arc<tokio::sync::Semaphore>,
     routing_log_path: PathBuf,
@@ -1244,6 +1249,15 @@ impl TeamRuntime {
         let routing_log_path = options.routing_log_path.clone().unwrap_or_else(
             crate::mnemo2::dispatch_routing::dispatch_routing_log_path,
         );
+        // The kNN overlay shares the app's live embedder (never a second
+        // backend). With no own memory store there is nothing to embed with,
+        // so the overlay is absent and Laya decides every dispatch.
+        let route_knn = options.engine.embedder_handle().map(|initial| {
+            let engine = Arc::clone(&options.engine);
+            let getter: EmbedderGetter =
+                Arc::new(move || engine.embedder_handle().unwrap_or_else(|| initial.clone()));
+            Arc::new(RouteKnn::new(getter, routing_log_path.clone()))
+        });
         let runtime = Self {
             engine: options.engine,
             workspace_root: options.workspace_root,
@@ -1261,6 +1275,7 @@ impl TeamRuntime {
             config_dir: config_dir.clone(),
             routing: Arc::new(std::sync::RwLock::new(load_routing_settings(&config_dir))),
             classifier: options.classifier,
+            route_knn,
             routing_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             routing_log_path,
             models: Arc::new(std::sync::RwLock::new(options.models)),
@@ -1278,6 +1293,13 @@ impl TeamRuntime {
         // trash folder but could not remove yet (something held them).
         schedule_trash_sweep(&runtime.workspace_root);
         Ok(runtime)
+    }
+
+    /// The live dispatch-routing kNN overlay, when the engine exposes its
+    /// shared embedder. The eval reads it to report Laya-only and kNN+Laya
+    /// accuracy side by side.
+    pub fn route_knn(&self) -> Option<Arc<RouteKnn>> {
+        self.route_knn.clone()
     }
 
     /// Replace the model tiers new dispatches resolve against.
@@ -1435,6 +1457,7 @@ impl TeamRuntime {
                     Ok::<Option<DispatchRoutingDecision>, String>(
                         classify_dispatch(
                             classifier.as_ref(),
+                            self.route_knn.as_deref(),
                             classified_text.as_deref().unwrap_or(""),
                             enabled,
                             &settings,
@@ -1556,13 +1579,26 @@ impl TeamRuntime {
                 .map(|decision| decision.probabilities.clone())
                 .unwrap_or_default(),
             tier: routing.laya_tier.clone(),
-            threshold: threshold_for(enabled.offered().count(), &settings),
+            threshold: decision.as_ref().map_or_else(
+                || threshold_for(enabled.offered().count(), &settings),
+                |decision| {
+                    if decision.source == "knn" {
+                        settings.knn_min_share
+                    } else {
+                        threshold_for(enabled.offered().count(), &settings)
+                    }
+                },
+            ),
             cleared: routing.cleared,
             lead_tier: explicit_tier.map(str::to_string),
             ran_tier: refusal.is_none().then(|| chosen_tier.clone()).flatten(),
             ran_model: refusal.is_none().then(|| chosen_model.clone()).flatten(),
             text: classified_text.unwrap_or_default(),
             skip: skip.map(str::to_string),
+            source: decision.as_ref().map(|decision| decision.source.to_string()),
+            knn_label: decision.as_ref().and_then(|decision| decision.knn_label.clone()),
+            knn_share: decision.as_ref().and_then(|decision| decision.knn_share),
+            knn_k: decision.as_ref().and_then(|decision| decision.knn_k),
         };
         let mut rows = vec![row];
         if routed_by == "lead_override" {
@@ -3954,6 +3990,7 @@ impl TeamRuntime {
         let signals = self.signals.clone();
         let routing_log_path = self.routing_log_path.clone();
         let permit = self.routing_permit.clone();
+        let route_knn = self.route_knn.clone();
         let worker_id = worker_id.to_string();
         let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
         let mode = settings.mode;
@@ -3963,7 +4000,14 @@ impl TeamRuntime {
             // Laya.
             let classified = async {
                 let _permit = permit.acquire().await;
-                classify_dispatch(classifier.as_ref(), &text, enabled, &settings).await
+                classify_dispatch(
+                    classifier.as_ref(),
+                    route_knn.as_deref(),
+                    &text,
+                    enabled,
+                    &settings,
+                )
+                .await
             };
             let decision =
                 match tokio::time::timeout(std::time::Duration::from_secs(3), classified).await {

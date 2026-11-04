@@ -1,6 +1,6 @@
 # Job 6 — App unification on the headless Engine (IpcState Engine + console rebuild)
 
-Master spec `.coding/specs/headless-free-agent.md` §5.9.10 (:740-753), §7 row 34
+Master spec `.coding/design/headless-free-agent.md` §5.9.10 (:740-753), §7 row 34
 (:889-892), §8 (:895-906). The item: "the mnemo app is rebuilt on the public
 API — IpcState holds an Engine; every IPC command + the console REPL go
 through Engine/AgentSession/Setup/*Api."

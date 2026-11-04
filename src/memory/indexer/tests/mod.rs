@@ -438,3 +438,4 @@ async fn rebuild_derived_replaces_derived_and_preserves_authored() {
 }
 
 mod knowledge;
+mod openspec;

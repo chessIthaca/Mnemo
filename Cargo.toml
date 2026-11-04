@@ -54,6 +54,7 @@ similar = "3"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+serde_norway = "0.9"
 toml = "1"
 
 # Errors

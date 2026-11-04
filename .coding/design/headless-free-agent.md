@@ -1008,7 +1008,7 @@ design stays with the coordinator, and every job is turned into **step files**
 that a worker can execute by matching text and typing code verbatim.
 
 ### 14.1 Step files
-- Each of the nine jobs gets a step file `.coding/specs/headless-free-agent/
+- Each of the nine jobs gets a step file `.coding/design/headless-free-agent/
   job-<nn>-<slug>.md`, written by the coordinator **right before** that job is
   delegated (so line anchors and counts are fresh against `main`), after the
   previous job merged. A job is split into steps of roughly ≤ 400 changed
@@ -1029,7 +1029,7 @@ that a worker can execute by matching text and typing code verbatim.
   once, or the code you find does not match this file, or a verify command
   still fails after 3 fix attempts, stop and report what differs. Don't
   redesign."
-- `.coding/specs/headless-free-agent/job-01-host-extraction.md` is the model:
+- `.coding/design/headless-free-agent/job-01-host-extraction.md` is the model:
   job 1 as three steps (1.1 pure helpers, 1.2 notifier + brain, 1.3 spawn path
   + bookkeeping), with 30 + 15 tabled replacements and 6 + 8 + 5 greps.
 

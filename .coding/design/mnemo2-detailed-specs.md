@@ -54,7 +54,7 @@ Typical size is 150–400 words. This works without code changes. It is the lead
 
 ### 2. Spec writers, only for really complicated work
 
-Decided: the lead writes every spec. Only when a design is really complicated, and the lead can't write the spec without research, (unfamiliar subsystem, performance question, several viable designs), the plan starts with a **spec step** on the difficult tier (glm-5.3 or Kimi). Its output is not code but `.coding/specs/<plan>-<step>.md`: the spec for each implementation step in the format above, written against the real code it read.
+Decided: the lead writes every spec. Only when a design is really complicated, and the lead can't write the spec without research, (unfamiliar subsystem, performance question, several viable designs), the plan starts with a **spec step** on the difficult tier (glm-5.3 or Kimi). Its output is not code but `.coding/design/<plan>-<step>.md`: the spec for each implementation step in the format above, written against the real code it read.
 
 The lead reviews that spec (cheap: it's a document) and then dispatches the implementation steps on the simple or average tier. This makes the expensive model do the expensive part once, and the cheap model do the volume.
 
@@ -62,7 +62,7 @@ The lead reviews that spec (cheap: it's a document) and then dispatches the impl
 
 Step text in `.coding/plans/<id>.md` gets long and the plan becomes hard to read. Instead:
 
-- Each step may point at a spec file: `spec: .coding/specs/<plan>-<step>.md`.
+- Each step may point at a spec file: `spec: .coding/design/<plan>-<step>.md`.
 - `team_dispatch` puts the full spec file into the worker's first message. The plan page shows a one-line summary with a link (in the Plans tab, the spec opens like any other path, using the hand-over merged today).
 - The spec is **pinned**: compaction and a summarize-for-smaller-model never drop it. The worker's summary keeps a pointer, and the spec is re-injected after every compaction or model switch. This fixes root causes 2 and 4.
 

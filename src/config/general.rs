@@ -1459,6 +1459,15 @@ impl GeneralConfig {
     /// sections are preserved verbatim from the loaded value, so editing one
     /// field (e.g. `default_provider`) does not clobber the others.
     pub fn save(&self, path: &Path) -> Result<()> {
+        crate::config::write_atomic(path, &self.to_toml_text()?)
+    }
+
+    /// Write while the caller holds the shared config write lock.
+    pub(crate) fn save_unlocked(&self, path: &Path) -> Result<()> {
+        crate::config::write_atomic_unlocked(path, &self.to_toml_text()?)
+    }
+
+    fn to_toml_text(&self) -> Result<String> {
         // Clamp the trace memory knobs before persisting, mirroring the
         // load-time clamp so the file never holds out-of-range values. Same
         // for the [memory] retrieval knobs.
@@ -1467,9 +1476,7 @@ impl GeneralConfig {
             memory: self.memory.clone().clamped(),
             ..self.clone()
         };
-        let text = toml::to_string_pretty(&clamped)?;
-        crate::config::write_atomic(path, &text)?;
-        Ok(())
+        Ok(toml::to_string_pretty(&clamped)?)
     }
 }
 

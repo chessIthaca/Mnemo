@@ -288,11 +288,30 @@ pub(crate) fn tier_file_needs_migration(path: &Path) -> Result<bool> {
 /// Save the ladder as `[[tier]]` only, preserving endpoints and pricing and
 /// dropping any retired `[tiers]` table.
 pub fn save_tier_ladder(path: &Path, ladder: &TierLadder) -> Result<()> {
+    save_tier_ladder_with_hook(path, ladder, None)
+}
+
+/// Save a ladder, with an internal contention hook used by concurrency tests.
+pub(crate) fn save_tier_ladder_with_hook(
+    path: &Path,
+    ladder: &TierLadder,
+    on_contended: Option<&(dyn Fn() + Send + Sync)>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let _lock = crate::config::ConfigWriteLock::acquire_with_hooks(parent, None, on_contended, None)?;
+    save_tier_ladder_unlocked(path, ladder)
+}
+
+/// Save a ladder while the caller holds the shared config write lock.
+pub(crate) fn save_tier_ladder_unlocked(path: &Path, ladder: &TierLadder) -> Result<()> {
     let mut file = read_endpoints_file(path)?;
     file.tier = ladder.tiers.clone();
     file.legacy_tiers = None;
     let text = toml::to_string_pretty(&file)?;
-    crate::config::write_atomic(path, &text)?;
+    crate::config::write_atomic_unlocked(path, &text)?;
     Ok(())
 }
 
@@ -1006,6 +1025,20 @@ pub fn load_or_default(path: &Path) -> Result<(Vec<Endpoint>, Vec<PricingEntry>)
 /// (the schema is the source of truth), so unknown keys are dropped. Uses a
 /// temp-file + rename so a crash mid-write leaves the previous file intact.
 pub fn save(path: &Path, endpoints: &[Endpoint], pricing: &[PricingEntry]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let _lock = crate::config::ConfigWriteLock::acquire(parent)?;
+    save_unlocked(path, endpoints, pricing)
+}
+
+/// Write endpoints and pricing while the caller holds the config write lock.
+pub(crate) fn save_unlocked(
+    path: &Path,
+    endpoints: &[Endpoint],
+    pricing: &[PricingEntry],
+) -> Result<()> {
     // Preserve the on-disk representation. In particular, only Config::load
     // may convert legacy tiers because only it knows the default model.
     let (tier, legacy_tiers) = tier_storage(path)?;
@@ -1016,7 +1049,7 @@ pub fn save(path: &Path, endpoints: &[Endpoint], pricing: &[PricingEntry]) -> Re
         legacy_tiers,
     };
     let text = toml::to_string_pretty(&file)?;
-    crate::config::write_atomic(path, &text)?;
+    crate::config::write_atomic_unlocked(path, &text)?;
     Ok(())
 }
 

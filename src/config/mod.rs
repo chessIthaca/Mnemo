@@ -105,87 +105,47 @@ fn read_tier_load(config_path: &Path, endpoints_path: &Path) -> Result<TierLoad>
     })
 }
 
-/// Token-owned cross-process guard for every config/endpoints write and for
-/// interrupted-write recovery. The lock is deliberately file-based so separate
-/// Mnemo processes do not read-preserve-commit over one another.
+/// OS-owned cross-process guard for every config/endpoints write and for
+/// interrupted-write recovery. The lock file is created once and never deleted
+/// or renamed; the operating system releases the lock when the holder exits.
 struct ConfigWriteLock {
-    path: PathBuf,
-    token: String,
+    file: fs::File,
 }
 
 impl ConfigWriteLock {
     fn acquire(config_dir: &Path) -> Result<Self> {
-        Self::acquire_with_hooks(config_dir, None, None, None)
+        Self::acquire_with_hook(config_dir, None)
     }
 
-    fn acquire_with_hooks(
+    fn acquire_with_hook(
         config_dir: &Path,
-        before_stale_rename: Option<&(dyn Fn() + Send + Sync)>,
         on_contended: Option<&(dyn Fn() + Send + Sync)>,
-        after_stale_rename: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<Self> {
+        Self::acquire_with_timeout(config_dir, on_contended, std::time::Duration::from_secs(5))
+    }
+
+    fn acquire_with_timeout(
+        config_dir: &Path,
+        on_contended: Option<&(dyn Fn() + Send + Sync)>,
+        timeout: std::time::Duration,
     ) -> Result<Self> {
         fs::create_dir_all(config_dir)?;
         let path = config_dir.join("config.write.lock");
-        let token = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
         let started = std::time::Instant::now();
         loop {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    if let Err(error) = file.write_all(token.as_bytes()).and_then(|_| file.sync_all()) {
-                        drop(file);
-                        let _ = fs::remove_file(&path);
-                        return Err(error.into());
-                    }
-                    return Ok(Self { path, token });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
                     if let Some(hook) = on_contended {
                         hook();
                     }
-                    // Observe the stale owner's identity together with its
-                    // mtime so a fresh lock moved by our rename can be restored.
-                    let observed_stale_token = fs::read_to_string(&path).unwrap_or_default();
-                    let stale = fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > std::time::Duration::from_secs(30));
-                    if stale {
-                        if let Some(hook) = before_stale_rename {
-                            hook();
-                        }
-                        // Quarantine first, then verify that the file we moved
-                        // is still the stale lock rather than a fresh successor.
-                        let quarantine = config_dir.join(format!("config.write.lock.stale-{token}"));
-                        let renamed = fs::rename(&path, &quarantine);
-                        if let Some(hook) = after_stale_rename {
-                            hook();
-                        }
-                        match renamed {
-                            Ok(()) => {
-                                let quarantined_token =
-                                    fs::read_to_string(&quarantine).unwrap_or_default();
-                                if quarantined_token == observed_stale_token {
-                                    let _ = fs::remove_file(quarantine);
-                                    continue;
-                                }
-                                // A fresh owner was installed between our
-                                // staleness check and rename. Restore its lock
-                                // without replacing any lock that may exist now,
-                                // then keep waiting instead of acquiring.
-                                let _ = fs::hard_link(&quarantine, &path);
-                                let _ = fs::remove_file(quarantine);
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(_) => {
-                                // Another waiter may have won the rename or
-                                // installed a fresh lock. Re-check on the next
-                                // iteration instead of deleting anything.
-                            }
-                        }
-                    }
-                    if started.elapsed() >= std::time::Duration::from_secs(5) {
+                    if started.elapsed() >= timeout {
                         return Err(crate::error::Error::Config(format!(
                             "timed out waiting for config write lock {}",
                             path.display()
@@ -193,7 +153,7 @@ impl ConfigWriteLock {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                Err(error) => return Err(error.into()),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
         }
     }
@@ -201,10 +161,7 @@ impl ConfigWriteLock {
 
 impl Drop for ConfigWriteLock {
     fn drop(&mut self) {
-        // Never remove a successor's lock after a stale takeover.
-        if fs::read_to_string(&self.path).is_ok_and(|content| content == self.token) {
-            let _ = fs::remove_file(&self.path);
-        }
+        let _ = self.file.unlock();
     }
 }
 
@@ -691,7 +648,7 @@ fn recover_interrupted_write_with_hook(
     }
     // Recovery can restore an aside or staging file, so it is a write and
     // must wait for the same owner as ordinary config/endpoints writes.
-    let Ok(_lock) = ConfigWriteLock::acquire_with_hooks(parent, None, on_contended, None) else {
+    let Ok(_lock) = ConfigWriteLock::acquire_with_hook(parent, on_contended) else {
         return;
     };
     recover_interrupted_write_unlocked(path);
@@ -1803,7 +1760,7 @@ reasoning_effort = "minimal"
             fs::read_to_string(dir.path().join("config.toml.lanes.bak")).unwrap(),
             original
         );
-        assert!(!dir.path().join("config.write.lock").exists());
+        assert!(dir.path().join("config.write.lock").exists());
     }
 
     #[test]
@@ -1836,7 +1793,7 @@ reasoning_effort = "minimal"
 #[cfg(test)]
 mod config_write_lock_tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -1895,142 +1852,91 @@ mod config_write_lock_tests {
     }
 
     #[test]
-    fn two_waiters_racing_stale_takeover_never_hold_the_lock_together() {
+    fn separate_handles_are_serialized_until_the_first_guard_drops() {
         let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("config.write.lock");
-        fs::write(&lock_path, "stale-owner").unwrap();
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&lock_path)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
-            .unwrap();
-
-        let before = Arc::new(Barrier::new(2));
-        let after = Arc::new(Barrier::new(2));
-        let (contention_tx, contention_rx) = std::sync::mpsc::channel();
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let dir = dir.path().to_path_buf();
-            let before = before.clone();
-            let after = after.clone();
-            let contention_tx = contention_tx.clone();
-            let acquired_tx = acquired_tx.clone();
-            handles.push(std::thread::spawn(move || {
-                let before_hook = move || {
-                    before.wait();
-                };
-                let after_hook = move || {
-                    after.wait();
-                };
-                let contention_hook = move || {
-                    let _ = contention_tx.send(());
-                };
-                let guard = ConfigWriteLock::acquire_with_hooks(
-                    &dir,
-                    Some(&before_hook),
-                    Some(&contention_hook),
-                    Some(&after_hook),
-                )
-                .unwrap();
-                acquired_tx.send(guard).unwrap();
-            }));
-        }
-        // Both waiters first contend on the stale lock, then pass the rename
-        // barrier. Exactly one can hold the lock while the other contends on it.
-        contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let first = acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(acquired_rx.try_recv().is_err(), "a second waiter entered while the first guard was alive");
-        let first_token = first.token.clone();
-        drop(first);
-        let second = acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_ne!(first_token, second.token);
-        drop(second);
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        assert!(!lock_path.exists());
-    }
-
-    #[test]
-    fn fresh_lock_is_restored_when_stale_takeover_races_a_new_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("config.write.lock");
-        fs::write(&lock_path, "stale-owner").unwrap();
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&lock_path)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
-            .unwrap();
-
-        let (before_tx, before_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
-        let (after_tx, after_rx) = std::sync::mpsc::channel();
+        let first = ConfigWriteLock::acquire(dir.path()).unwrap();
         let (contention_tx, contention_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let waiter = {
             let dir = dir.path().to_path_buf();
-            let release_rx = release_rx.clone();
             std::thread::spawn(move || {
-                let before_hook = move || {
-                    before_tx.send(()).unwrap();
-                    release_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(2))
-                        .unwrap();
-                };
-                let after_hook = move || {
-                    let _ = after_tx.send(());
-                };
-                let contention_hook = move || {
+                let hook = move || {
                     let _ = contention_tx.send(());
                 };
-                let guard = ConfigWriteLock::acquire_with_hooks(
-                    &dir,
-                    Some(&before_hook),
-                    Some(&contention_hook),
-                    Some(&after_hook),
-                )
-                .unwrap();
+                let guard = ConfigWriteLock::acquire_with_hook(&dir, Some(&hook)).unwrap();
                 acquired_tx.send(guard).unwrap();
             })
         };
 
-        // The waiter has observed the stale token and paused before rename.
         contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        before_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        // Simulate another waiter completing takeover and installing a fresh
-        // owner before our waiter performs its rename.
-        let first_quarantine = dir.path().join("first-stale-quarantine");
-        fs::rename(&lock_path, &first_quarantine).unwrap();
-        let fresh_owner = ConfigWriteLock::acquire(dir.path()).unwrap();
-        let fresh_token = fresh_owner.token.clone();
-        fs::remove_file(first_quarantine).unwrap();
-        release_tx.send(()).unwrap();
-
-        // Our waiter moves the fresh lock, detects the token mismatch, and
-        // restores it. Its next contention proves restoration has completed.
-        after_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(fs::read_to_string(&lock_path).unwrap(), fresh_token);
         assert!(
             acquired_rx.try_recv().is_err(),
-            "the waiter acquired while the fresh owner was alive"
+            "a second file handle acquired while the first guard was alive"
         );
-
-        drop(fresh_owner);
-        let waiter_guard = acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_ne!(waiter_guard.token, fresh_token);
+        drop(first);
+        let second = acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         waiter.join().unwrap();
-        drop(waiter_guard);
-        assert!(!lock_path.exists());
+        drop(second);
+        assert!(dir.path().join("config.write.lock").exists());
     }
+
+    #[test]
+    fn dropping_the_holder_releases_the_os_lock_without_removing_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("config.write.lock");
+        let first = ConfigWriteLock::acquire(dir.path()).unwrap();
+        assert!(lock_path.exists());
+
+        // No path cleanup: dropping the File guard alone must release the lock.
+        drop(first);
+        let second = ConfigWriteLock::acquire_with_timeout(
+            dir.path(),
+            None,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(lock_path.exists());
+        drop(second);
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn a_held_lock_makes_another_acquire_time_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ConfigWriteLock::acquire(dir.path()).unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let result = ConfigWriteLock::acquire_with_timeout(
+                    &dir,
+                    None,
+                    Duration::from_millis(100),
+                );
+                result_tx.send(result).unwrap();
+            })
+        };
+
+        let result = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let error = match result {
+            Ok(_) => panic!("a second handle acquired while the first guard was alive"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("timed out waiting for config write lock"),
+            "unexpected error: {error}"
+        );
+        waiter.join().unwrap();
+        drop(first);
+        let reacquired = ConfigWriteLock::acquire_with_timeout(
+            dir.path(),
+            None,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        drop(reacquired);
+    }
+
 
     #[test]
     fn recovery_waits_for_the_current_write_lock_owner() {
@@ -2073,6 +1979,6 @@ reasoning_effort = "minimal"
         assert_eq!(config.tiers.first_model("trivial"), Some("ep/tiny"));
         assert_eq!(fs::read_to_string(&backup).unwrap(), original);
         assert!(!staging_path(&backup).exists());
-        assert!(!dir.path().join("config.write.lock").exists());
+        assert!(dir.path().join("config.write.lock").exists());
     }
 }

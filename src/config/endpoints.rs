@@ -301,7 +301,7 @@ pub(crate) fn save_tier_ladder_with_hook(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let _lock = crate::config::ConfigWriteLock::acquire_with_hooks(parent, None, on_contended, None)?;
+    let _lock = crate::config::ConfigWriteLock::acquire_with_hook(parent, on_contended)?;
     save_tier_ladder_unlocked(path, ladder)
 }
 

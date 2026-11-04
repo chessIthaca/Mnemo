@@ -874,13 +874,21 @@ pub async fn team_audit_dispatch(
     state: State<'_, Mnemo2State>,
     worker_id: String,
     reviewer_id: String,
+    tier: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
     brief: Option<String>,
 ) -> Result<WorkerRecord, String> {
     current_team(&state)
         .await?
-        .audit_dispatch(&worker_id, &reviewer_id, model, reasoning_effort, brief)
+        .audit_dispatch_with_tier(
+            &worker_id,
+            &reviewer_id,
+            tier.as_deref(),
+            model,
+            reasoning_effort,
+            brief,
+        )
         .await
         .map(|(worker, _reused)| worker)
 }

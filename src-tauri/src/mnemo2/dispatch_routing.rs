@@ -7,11 +7,11 @@
 //!
 //! At `team_dispatch` — before a worker is provisioned — Mnemo2 asks Laya one
 //! question about the worker's step spec and the lead's brief: `trivial`,
-//! `routine` or `hard`, which map onto the `simple`, `average` and `difficult`
-//! model tiers. The question, its descriptions, the folding of a label whose
-//! tier has no available model, and the default gates all come from the
-//! kernel's shared [`route_question`] module, so Mnemo1's first-prompt gate
-//! asks the byte-identical question.
+//! `routine`, `involved` or `hard`, which map onto the ladder's `trivial`,
+//! `routine`, `medium` and `high` tiers. The question, its descriptions and
+//! the default gates all come from the kernel's shared [`route_question`]
+//! module, so Mnemo1's first-prompt gate asks the byte-identical question.
+//! Empty tiers remain offered and fold down to a model when the dispatch runs.
 //!
 //! This module owns the Mnemo2-specific pieces:
 //!
@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use mnemo::agent::failure_triage::training_log_dir;
 use mnemo::agent::route_knn::RouteKnn;
 use mnemo::agent::route_question;
+use mnemo::config::endpoints::TierLadder;
 use mnemo::memory::classifier::{Answer, Classifier, Question};
 
 /// Fewest words (step text plus brief) a dispatch must have to be classified.
@@ -55,74 +56,47 @@ const KNN_OVERLAY_BUDGET: Duration = Duration::from_millis(500);
 /// Maximum chars of the classified text handed to Laya and stored in the log.
 pub const TEXT_MAX_CHARS: usize = 2000;
 
-/// The model tiers the routing ladder climbs: `simple` < `average` <
-/// `difficult`.
-const TIER_LADDER: [&str; 3] = ["simple", "average", "difficult"];
+/// The fixed ladder ids in cheapest-first order. `escalate` is included for
+/// reroute comparisons, but is never offered to Laya or the kNN overlay.
+const TIER_LADDER: [&str; 5] = ["trivial", "routine", "medium", "high", "escalate"];
 
-/// Which of the three model tiers currently has at least one available model.
-///
-/// A tier without a model has no label to route to: its label is dropped and
-/// its keywords fold into a neighbouring label (the kernel
-/// [`route_question`] does the folding).
+/// Which non-escalate tiers resolve to an available model, directly or by
+/// folding down. All four labels remain independent: an empty `medium` tier is
+/// still offered as `involved` and resolves to `routine` at run time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnabledTiers {
-    /// The `simple` tier has at least one available model.
-    pub simple: bool,
-    /// The `average` tier has at least one available model.
-    pub average: bool,
-    /// The `difficult` tier has at least one available model.
-    pub difficult: bool,
+    /// The `trivial` tier resolves to an available model.
+    pub trivial: bool,
+    /// The `routine` tier resolves to an available model.
+    pub routine: bool,
+    /// The `medium` tier resolves to an available model.
+    pub medium: bool,
+    /// The `high` tier resolves to an available model.
+    pub high: bool,
 }
 
 impl EnabledTiers {
-    /// The offered labels: `simple` → `trivial`, `average` → `routine`,
-    /// `difficult` → `hard`.
-    ///
-    /// The new `involved` label (`medium`) is a step-3 placeholder here:
-    /// `EnabledTiers` still speaks the legacy three-tier universe and
-    /// cannot yet offer it, so the kernel folds its description into `hard`
-    /// until the ladder rework makes all four labels offered.
+    /// The four neutral labels offered to the shared routing question.
     pub fn offered(self) -> route_question::OfferedLabels {
         route_question::OfferedLabels {
-            trivial: self.simple,
-            routine: self.average,
-            involved: false,
-            hard: self.difficult,
+            trivial: self.trivial,
+            routine: self.routine,
+            involved: self.medium,
+            hard: self.high,
         }
     }
 }
 
-/// The model tier a Laya label routes to: `trivial` → `simple`, `routine` →
-/// `average`, `hard` → `difficult`. `None` for a label the ladder does not
-/// know, which never clears the gate.
+/// The ladder tier a Laya label routes to. Unknown labels never clear the
+/// confidence gate.
 pub fn label_tier(label: &str) -> Option<&'static str> {
-    match label {
-        route_question::LABEL_TRIVIAL => Some(TIER_LADDER[0]),
-        route_question::LABEL_ROUTINE => Some(TIER_LADDER[1]),
-        route_question::LABEL_HARD => Some(TIER_LADDER[2]),
-        _ => None,
-    }
+    route_question::tier_for_label(label)
 }
 
-/// The label a tier routes from: `simple` → `trivial`, `average` → `routine`,
-/// `difficult` → `hard`. The inverse of [`label_tier`], used when a kNN tier
-/// vote has to be recorded in the Laya-shaped decision fields.
-///
-/// The overlay votes ladder tier ids (`trivial`, `routine`, `medium`, `high`
-/// — legacy rows are converted when the overlay indexes them), so those map
-/// through the kernel's only label↔tier mapping
-/// ([`route_question::label_for_tier`]) first; the legacy table above stays
-/// for ids that are not on the ladder.
+/// The Laya label for a ladder tier, used when a kNN tier vote is recorded in
+/// the Laya-shaped decision fields.
 fn label_for_tier(tier: &str) -> Option<&'static str> {
-    if let Some(label) = route_question::label_for_tier(tier) {
-        return Some(label);
-    }
-    TIER_LADDER
-        .iter()
-        .position(|candidate| *candidate == tier)
-        .map(|rank| {
-            [route_question::LABEL_TRIVIAL, route_question::LABEL_ROUTINE, route_question::LABEL_HARD][rank]
-        })
+    route_question::label_for_tier(tier)
 }
 
 /// The question a dispatch asks Laya: the kernel's shared choice question over
@@ -333,9 +307,6 @@ pub struct RoutingSettings {
     pub nudges: bool,
     /// Fewest words a dispatch must have to be classified.
     pub min_words: usize,
-    /// Optional per-tier default `reasoning_effort`, used only when the lead
-    /// passes none.
-    pub effort: BTreeMap<String, String>,
 }
 
 impl Default for RoutingSettings {
@@ -346,10 +317,9 @@ impl Default for RoutingSettings {
             min_confidence_2: route_question::DEFAULT_MIN_CONFIDENCE_2,
             knn_min_share: 0.80,
             knn_min_rows: 30,
-            fallback_tier: TIER_LADDER[1].to_string(),
+            fallback_tier: "routine".to_string(),
             nudges: true,
             min_words: MIN_WORDS,
-            effort: BTreeMap::new(),
         }
     }
 }
@@ -387,7 +357,13 @@ pub fn load_routing_settings(config_dir: &Path) -> RoutingSettings {
         return RoutingSettings::default();
     };
     match value.try_into() {
-        Ok(settings) => settings,
+        Ok(mut settings) => {
+            let settings: &mut RoutingSettings = &mut settings;
+            if let Some(tier) = TierLadder::convert_old_id(&settings.fallback_tier) {
+                settings.fallback_tier = tier.to_string();
+            }
+            settings.clone()
+        }
         Err(error) => {
             log::warn!(
                 "using default Mnemo2 routing settings; invalid [routing] in {}: {error}",
@@ -681,8 +657,7 @@ pub fn dispatch_routing_log_path() -> PathBuf {
     training_log_dir().join("dispatch_routing.jsonl")
 }
 
-/// The tier's rank on the ladder (`simple` 0, `average` 1, `difficult` 2), or
-/// `None` for a string the ladder does not know.
+/// The tier's rank on the fixed five-tier ladder, or `None` for an unknown id.
 fn tier_rank(tier: &str) -> Option<usize> {
     TIER_LADDER.iter().position(|candidate| *candidate == tier)
 }
@@ -710,7 +685,7 @@ fn last_reroute_rank(history: &[DispatchRoutingRow]) -> Option<usize> {
             continue;
         };
         if from_rank != to_rank {
-            return Some(to_rank);
+            return (to_rank < 4).then_some(to_rank);
         }
     }
     None
@@ -720,13 +695,14 @@ fn last_reroute_rank(history: &[DispatchRoutingRow]) -> Option<usize> {
 /// and outcome (design §4.8), plus whether the label is weak:
 ///
 /// 1. Merged on tier T with at most one fix round, no high finding and no
-///    reroute gives **T** — weak unless T is `simple`, because the lead chose
+///    reroute gives **T** — weak unless T is `trivial`, because the lead chose
 ///    it and nothing proves a cheaper tier would have failed.
 /// 2. Merged after a reroute UP to U gives **U**, strong.
 /// 3. Merged after a reroute DOWN to D gives **D**, strong (the cheaper tier
 ///    sufficed).
 /// 4. Merged on T with two or more fix rounds or a high finding, and no
-///    reroute, gives the tier above T (capped at `difficult`), weak.
+///    reroute, gives the tier above T (capped at `high`; `escalate` is never
+///    a training label), weak.
 /// 5. Failed, stopped or abandoned gives no label.
 ///
 /// `None` also when `final_tier` is not a ladder tier — there is no label to
@@ -741,14 +717,14 @@ pub fn outcome_label(
     if final_status != "merged" {
         return None;
     }
-    let rank = tier_rank(final_tier)?;
+    let rank = tier_rank(final_tier).filter(|rank| *rank < 4)?;
     if let Some(to_rank) = last_reroute_rank(history) {
         return Some((TIER_LADDER[to_rank], false));
     }
     if fix_rounds <= 1 && high_findings == 0 {
         return Some((TIER_LADDER[rank], rank != 0));
     }
-    Some((TIER_LADDER[(rank + 1).min(TIER_LADDER.len() - 1)], true))
+    Some((TIER_LADDER[(rank + 1).min(3)], true))
 }
 
 #[cfg(test)]
@@ -804,16 +780,17 @@ mod tests {
         })
     }
 
-    fn enabled(simple: bool, average: bool, difficult: bool) -> EnabledTiers {
+    fn enabled(trivial: bool, routine: bool, medium: bool, high: bool) -> EnabledTiers {
         EnabledTiers {
-            simple,
-            average,
-            difficult,
+            trivial,
+            routine,
+            medium,
+            high,
         }
     }
 
     fn all_enabled() -> EnabledTiers {
-        enabled(true, true, true)
+        enabled(true, true, true, true)
     }
 
     #[test]
@@ -835,8 +812,7 @@ mod tests {
         let settings = RoutingSettings {
             mode: RoutingMode::Auto,
             min_confidence_3: 0.51,
-            fallback_tier: "simple".into(),
-            effort: BTreeMap::from([("simple".into(), "low".into())]),
+            fallback_tier: "trivial".into(),
             ..RoutingSettings::default()
         };
         save_routing_settings(config.path(), &settings).expect("save routing settings");
@@ -846,6 +822,23 @@ mod tests {
         )
         .expect("valid TOML");
         assert_eq!(saved["ui"]["compact"], toml::Value::Boolean(true));
+    }
+
+    #[test]
+    fn legacy_fallback_tiers_convert_on_load() {
+        let config = tempfile::tempdir().expect("config dir");
+        for (old_id, ladder_id) in [
+            ("simple", "trivial"),
+            ("average", "routine"),
+            ("difficult", "high"),
+        ] {
+            std::fs::write(
+                routing_settings_path(config.path()),
+                format!("[routing]\nfallback_tier = \"{old_id}\"\n"),
+            )
+            .expect("legacy routing settings");
+            assert_eq!(load_routing_settings(config.path()).fallback_tier, ladder_id);
+        }
     }
 
     #[test]
@@ -867,23 +860,29 @@ mod tests {
 
     #[test]
     fn enabled_tiers_map_to_offered_labels() {
-        for bits in 0..8 {
-            let tiers = enabled(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+        for bits in 0..16 {
+            let tiers = enabled(
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+            );
             assert_eq!(
                 tiers.offered(),
                 route_question::OfferedLabels {
-                    trivial: tiers.simple,
-                    routine: tiers.average,
-                    involved: false,
-                    hard: tiers.difficult,
+                    trivial: tiers.trivial,
+                    routine: tiers.routine,
+                    involved: tiers.medium,
+                    hard: tiers.high,
                 },
                 "bits: {bits}"
             );
             assert_eq!(
                 tiers.offered().count(),
-                usize::from(tiers.simple)
-                    + usize::from(tiers.average)
-                    + usize::from(tiers.difficult),
+                usize::from(tiers.trivial)
+                    + usize::from(tiers.routine)
+                    + usize::from(tiers.medium)
+                    + usize::from(tiers.high),
                 "bits: {bits}"
             );
         }
@@ -891,8 +890,13 @@ mod tests {
 
     #[test]
     fn routing_question_uses_the_kernel_question() {
-        for bits in 0..8 {
-            let tiers = enabled(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+        for bits in 0..16 {
+            let tiers = enabled(
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+            );
             let ours = routing_question(tiers);
             let kernel = route_question::route_question(tiers.offered());
             assert_eq!(ours, kernel, "bits: {bits}");
@@ -909,9 +913,10 @@ mod tests {
     #[tokio::test]
     async fn one_enabled_tier_asks_nothing() {
         for tiers in [
-            enabled(true, false, false),
-            enabled(false, true, false),
-            enabled(false, false, true),
+            enabled(true, false, false, false),
+            enabled(false, true, false, false),
+            enabled(false, false, true, false),
+            enabled(false, false, false, true),
         ] {
             assert!(routing_question(tiers).is_none(), "{tiers:?}");
             let stub = StubClassifier::new(choice(route_question::LABEL_ROUTINE, 0.99));
@@ -982,7 +987,7 @@ mod tests {
         let decision = classify_dispatch(&at, None, "text", tiers, &cfg)
             .await
             .expect("decision");
-        assert_eq!(decision.tier, Some("average"));
+        assert_eq!(decision.tier, Some("routine"));
         assert!(decision.cleared);
 
         let below = StubClassifier::new(choice(
@@ -992,12 +997,12 @@ mod tests {
         let decision = classify_dispatch(&below, None, "text", tiers, &cfg)
             .await
             .expect("decision");
-        assert_eq!(decision.tier, Some("average"));
+        assert_eq!(decision.tier, Some("routine"));
         assert!(!decision.cleared);
 
         // The two-label gate is stricter: the same 0.60 answer clears there
         // only at the threshold itself.
-        let two_labels = enabled(true, true, false);
+        let two_labels = enabled(true, true, false, false);
         let at = StubClassifier::new(choice(
             route_question::LABEL_ROUTINE,
             route_question::DEFAULT_MIN_CONFIDENCE_2,
@@ -1038,7 +1043,7 @@ mod tests {
                 .await
                 .expect("decision");
         assert_eq!(decision.label, route_question::LABEL_HARD);
-        assert_eq!(decision.tier, Some("difficult"));
+        assert_eq!(decision.tier, Some("high"));
         assert!((decision.confidence - 0.9113).abs() < 1e-9);
         assert!(decision.cleared);
     }
@@ -1053,6 +1058,20 @@ mod tests {
         assert_eq!(decision.label, "medium");
         assert_eq!(decision.tier, None);
         assert!(!decision.cleared);
+    }
+
+    #[tokio::test]
+    async fn involved_maps_to_medium_and_escalate_is_never_a_pick() {
+        assert_eq!(label_tier(route_question::LABEL_INVOLVED), Some("medium"));
+        assert_eq!(label_tier("escalate"), None);
+        let stub = StubClassifier::new(choice(route_question::LABEL_INVOLVED, 0.99));
+        let decision =
+            classify_dispatch(&stub, None, "text", all_enabled(), &RoutingSettings::default())
+                .await
+                .expect("involved decision");
+        assert_eq!(decision.tier, Some("medium"));
+        assert!(decision.cleared);
+
     }
 
     #[tokio::test]
@@ -1098,13 +1117,13 @@ mod tests {
             step: 3,
             mode: RoutingMode::Suggest,
             label: route_question::LABEL_ROUTINE.into(),
-            tier: Some("average".into()),
+            tier: Some("routine".into()),
             confidence: 0.62,
             probabilities,
             threshold: route_question::DEFAULT_MIN_CONFIDENCE_3,
             cleared: true,
             lead_tier: Some("auto".into()),
-            ran_tier: Some("average".into()),
+            ran_tier: Some("routine".into()),
             ran_model: Some("endpoint/model-a".into()),
             text_sha256: "0".repeat(64),
             text: "a dispatched step".into(),
@@ -1122,8 +1141,8 @@ mod tests {
             worker_id: "worker-1".into(),
             plan_id: "2ba2168a".into(),
             step: 3,
-            from_tier: "average".into(),
-            to_tier: "difficult".into(),
+            from_tier: "routine".into(),
+            to_tier: "high".into(),
             from_model: Some("endpoint/model-a".into()),
             to_model: Some("endpoint/model-b".into()),
             status: "running".into(),
@@ -1141,8 +1160,8 @@ mod tests {
                 worker_id: "worker-2".into(),
                 plan_id: "2ba2168a".into(),
                 step: 4,
-                laya_tier: Some("average".into()),
-                lead_tier: "difficult".into(),
+                laya_tier: Some("routine".into()),
+                lead_tier: "high".into(),
                 requested_tier: None,
                 confidence: 0.62,
             },
@@ -1152,8 +1171,8 @@ mod tests {
                 worker_id: "worker-2".into(),
                 plan_id: "2ba2168a".into(),
                 step: 4,
-                from_tier: "difficult".into(),
-                to_tier: "simple".into(),
+                from_tier: "high".into(),
+                to_tier: "trivial".into(),
                 from_model: Some("endpoint/model-b".into()),
                 to_model: Some("endpoint/model-c".into()),
                 status: "running".into(),
@@ -1167,8 +1186,8 @@ mod tests {
                 plan_id: "2ba2168a".into(),
                 step: 5,
                 reason: "strikes".into(),
-                from_tier: "average".into(),
-                to_tier: "difficult".into(),
+                from_tier: "routine".into(),
+                to_tier: "high".into(),
                 detail: "3 failing tool calls in a row".into(),
             },
             DispatchRoutingRow::NudgeIgnored {
@@ -1176,7 +1195,7 @@ mod tests {
                 worker_id: "worker-3".into(),
                 plan_id: "2ba2168a".into(),
                 step: 5,
-                tier: "average".into(),
+                tier: "routine".into(),
             },
             DispatchRoutingRow::Outcome {
                 ts: 1_700_000_000_006,
@@ -1184,7 +1203,7 @@ mod tests {
                 plan_id: "2ba2168a".into(),
                 step: 3,
                 status: "merged".into(),
-                final_tier: "difficult".into(),
+                final_tier: "high".into(),
                 models_used: vec!["endpoint/model-a".into(), "endpoint/model-b".into()],
                 review_rounds: 1,
                 fix_rounds: 1,
@@ -1192,7 +1211,7 @@ mod tests {
                 findings_high: 0,
                 audits: 0,
                 cost_micros: 12_345,
-                label: Some("difficult".into()),
+                label: Some("high".into()),
             },
         ]
     }
@@ -1253,80 +1272,81 @@ mod tests {
         // Rule 1: merged on T, at most one fix round, no high finding, no
         // reroute gives T — weak unless T is simple.
         assert_eq!(
-            outcome_label(&no_reroute, "merged", "simple", 1, 0),
-            Some(("simple", false))
+            outcome_label(&no_reroute, "merged", "trivial", 1, 0),
+            Some(("trivial", false))
         );
         assert_eq!(
-            outcome_label(&no_reroute, "merged", "average", 1, 0),
-            Some(("average", true))
+            outcome_label(&no_reroute, "merged", "routine", 1, 0),
+            Some(("routine", true))
         );
         assert_eq!(
-            outcome_label(&no_reroute, "merged", "difficult", 0, 0),
-            Some(("difficult", true))
+            outcome_label(&no_reroute, "merged", "high", 0, 0),
+            Some(("high", true))
         );
 
         // Rule 2: merged after a reroute UP to U gives U, strong.
         assert_eq!(
             outcome_label(
-                &reroute_history("average", "difficult"),
+                &reroute_history("routine", "high"),
                 "merged",
-                "difficult",
+                "high",
                 0,
                 0
             ),
-            Some(("difficult", false))
+            Some(("high", false))
         );
 
         // Rule 3: merged after a reroute DOWN to D gives D, strong.
         assert_eq!(
             outcome_label(
-                &reroute_history("difficult", "simple"),
+                &reroute_history("high", "trivial"),
                 "merged",
-                "simple",
+                "trivial",
                 3,
                 2
             ),
-            Some(("simple", false))
+            Some(("trivial", false))
         );
 
         // A model-only reroute (same tier) is not a tier reroute: rules 1 and
         // 4 still decide.
         assert_eq!(
             outcome_label(
-                &reroute_history("average", "average"),
+                &reroute_history("routine", "routine"),
                 "merged",
-                "average",
+                "routine",
                 0,
                 0
             ),
-            Some(("average", true))
+            Some(("routine", true))
         );
 
         // Rule 4: merged on T with two or more fix rounds or a high finding,
-        // and no reroute, gives the tier above T — weak, capped at difficult.
+        // and no reroute, gives the tier above T — weak, capped at high.
         assert_eq!(
-            outcome_label(&no_reroute, "merged", "simple", 2, 0),
-            Some(("average", true))
+            outcome_label(&no_reroute, "merged", "trivial", 2, 0),
+            Some(("routine", true))
         );
         assert_eq!(
-            outcome_label(&no_reroute, "merged", "average", 0, 1),
-            Some(("difficult", true))
+            outcome_label(&no_reroute, "merged", "routine", 0, 1),
+            Some(("medium", true))
         );
         assert_eq!(
-            outcome_label(&no_reroute, "merged", "difficult", 2, 1),
-            Some(("difficult", true))
+            outcome_label(&no_reroute, "merged", "high", 2, 1),
+            Some(("high", true))
         );
 
         // Rule 5: failed, stopped or abandoned gives no label.
         for status in ["failed", "stopped", "abandoned"] {
             assert_eq!(
-                outcome_label(&no_reroute, status, "average", 0, 0),
+                outcome_label(&no_reroute, status, "routine", 0, 0),
                 None,
                 "status: {status}"
             );
         }
 
-        // A tier outside the ladder has no label to derive.
+        // Escalation and tiers outside the ladder never become training labels.
+        assert_eq!(outcome_label(&no_reroute, "merged", "escalate", 2, 1), None);
         assert_eq!(outcome_label(&no_reroute, "merged", "unknown", 0, 0), None);
     }
 
@@ -1440,7 +1460,7 @@ mod tests {
         let path = dir.path().join("dispatch_routing.jsonl");
         for index in 0..30 {
             let worker = format!("worker-{index}");
-            append_labelled(&path, &worker, "alpha beta gamma", "average");
+            append_labelled(&path, &worker, "alpha beta gamma", "routine");
         }
         let knn = overlay(dir.path(), Arc::new(TokenEmbedder::new()));
         // Warm the overlay: dispatch itself never waits for a build.
@@ -1457,7 +1477,7 @@ mod tests {
         .expect("decision");
         assert_eq!(decision.source, "knn");
         assert_eq!(decision.label, route_question::LABEL_ROUTINE);
-        assert_eq!(decision.tier, Some("average"));
+        assert_eq!(decision.tier, Some("routine"));
         assert!(decision.cleared);
         assert_eq!(decision.knn_label.as_deref(), Some(route_question::LABEL_ROUTINE));
         assert_eq!(decision.knn_k, Some(5));
@@ -1470,7 +1490,7 @@ mod tests {
     async fn knn_tie_under_the_share_gate_falls_back_to_laya() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("dispatch_routing.jsonl");
-        for (index, tier) in [("a", "simple"), ("b", "simple"), ("c", "average"), ("d", "average")]
+        for (index, tier) in [("a", "trivial"), ("b", "trivial"), ("c", "routine"), ("d", "routine")]
             .into_iter()
         {
             let worker = format!("worker-{index}");
@@ -1498,7 +1518,7 @@ mod tests {
         let path = dir.path().join("dispatch_routing.jsonl");
         for index in 0..30 {
             let worker = format!("worker-{index}");
-            append_labelled(&path, &worker, "alpha beta gamma", "average");
+            append_labelled(&path, &worker, "alpha beta gamma", "routine");
         }
         let embedder = Arc::new(TokenEmbedder::new());
         embedder.failing.store(true, Ordering::Relaxed);
@@ -1524,7 +1544,7 @@ mod tests {
         let path = dir.path().join("dispatch_routing.jsonl");
         for index in 0..30 {
             let worker = format!("worker-{index}");
-            append_labelled(&path, &worker, "alpha beta gamma", "average");
+            append_labelled(&path, &worker, "alpha beta gamma", "routine");
         }
         // Each row takes 110 ms to embed; a cold build is ~3.3 s, past the 3 s
         // dispatch timeout that used to drop the refresh future. The background
@@ -1568,7 +1588,7 @@ mod tests {
 
     #[test]
     fn old_route_rows_without_the_knn_fields_still_parse() {
-        let line = r#"{"event":"route","ts":1700000000000,"worker_id":"worker-1","plan_id":"2ba2168a","step":3,"mode":"suggest","label":"routine","tier":"average","confidence":0.62,"probabilities":{"routine":0.62,"hard":0.38},"threshold":0.475,"cleared":true,"lead_tier":"auto","ran_tier":"average","ran_model":"endpoint/model-a","text_sha256":"0000000000000000000000000000000000000000000000000000000000000000","text":"a dispatched step","skip":null}"#;
+        let line = r#"{"event":"route","ts":1700000000000,"worker_id":"worker-1","plan_id":"2ba2168a","step":3,"mode":"suggest","label":"routine","tier":"routine","confidence":0.62,"probabilities":{"routine":0.62,"hard":0.38},"threshold":0.475,"cleared":true,"lead_tier":"auto","ran_tier":"routine","ran_model":"endpoint/model-a","text_sha256":"0000000000000000000000000000000000000000000000000000000000000000","text":"a dispatched step","skip":null}"#;
         let row: DispatchRoutingRow = serde_json::from_str(line).expect("old row");
         match row {
             DispatchRoutingRow::Route {

@@ -2660,13 +2660,13 @@ mod tests {
                     "plan_id": plan.id,
                     "step": 1,
                     "brief": "Implement the assigned step and report the checks that were run.",
-                    "tier": "average",
+                    "tier": "routine",
                 }),
             )
             .await;
         assert!(dispatched.success, "{}", dispatched.output);
         assert!(dispatched.output.contains(
-            "Laya: difficult (0.71) — you chose average; logged as an override."
+            "Laya: high (0.71) — you chose routine; logged as an override."
         ));
         tokio::time::timeout(std::time::Duration::from_secs(10), server.next_arrival())
             .await
@@ -2679,7 +2679,7 @@ mod tests {
             .iter()
             .find(|worker| worker["id"] == "routingworker")
             .expect("routing worker status");
-        assert_eq!(worker["routing"]["laya_tier"], "difficult");
+        assert_eq!(worker["routing"]["laya_tier"], "high");
         assert_eq!(worker["routing"]["routed_by"], "lead_override");
         team.shutdown().await;
 
@@ -5847,8 +5847,8 @@ mod tests {
         .expect("lead opens");
         let team = lead.team_handle().await.expect("team");
 
-        // The schema: a `tier` enum whose description carries purpose, models
-        // and prices; an unconfigured tier is left out.
+        // The schema: five ladder ids whose generated descriptions carry
+        // editable definitions, models, prices and fold-down destinations.
         let dispatch = team
             .lead_host_tools()
             .into_iter()
@@ -5857,17 +5857,18 @@ mod tests {
         let tier = &dispatch.parameters["properties"]["tier"];
         assert_eq!(
             tier["enum"],
-            serde_json::json!(["difficult", "average", "simple"])
+            serde_json::json!(["trivial", "routine", "medium", "high", "escalate"])
         );
         let description = tier["description"].as_str().expect("tier description");
         assert!(
-            description.contains("difficult - design, debugging, bug_fixing plans")
+            description.contains("high (High) - Subtle bugs")
                 && description.contains(": test/scripted-a ($15/$75)"),
             "{description}"
         );
-        assert!(description.contains("simple - single-file mechanical edits"));
+        assert!(description.contains("trivial (Trivial)"));
         assert!(description.contains(": test/scripted-b"));
-        assert!(!description.contains("average -"), "{description}");
+        assert!(description.contains("routine (Routine)"), "{description}");
+        assert!(description.contains("no model; folds down to trivial"), "{description}");
         assert!(!description.contains("test/missing"), "{description}");
         assert!(dispatch.parameters["properties"]["model"]["description"]
             .as_str()
@@ -5876,7 +5877,7 @@ mod tests {
         // and a tier is required.
         assert_eq!(
             dispatch.parameters["properties"]["model"]["enum"],
-            serde_json::json!(["test/scripted-a", "test/scripted-b"])
+            serde_json::json!(["test/scripted-b", "test/scripted-a"])
         );
         assert!(dispatch.parameters["required"]
             .as_array()
@@ -5923,33 +5924,35 @@ mod tests {
                     "plan_id": plan,
                     "step": 1,
                     "brief": "tiered task",
-                    "tier": "difficult"
+                    "tier": "high"
                 }),
             )
             .await;
         assert!(result.success, "{}", result.output);
         let worker = team.worker("worker0001").await.expect("worker");
         assert_eq!(worker.model.as_deref(), Some("test/scripted-a"));
-        assert_eq!(worker.tier.as_deref(), Some("difficult"));
+        assert_eq!(worker.tier.as_deref(), Some("high"));
 
-        // An unconfigured tier is refused with guidance.
+        // An empty tier folds down to the nearest tier below with a model.
         let empty = team
             .handle_lead_host_tool(
                 "team_dispatch",
                 serde_json::json!({
-                    "worker_id": "worker0002",
+                    "worker_id": "worker1002",
                     "plan_id": plan,
                     "step": 1,
                     "brief": "tiered task",
-                    "tier": "average"
+                    "tier": "routine"
                 }),
             )
             .await;
-        assert!(!empty.success);
+        assert!(empty.success, "{}", empty.output);
         assert!(empty
             .output
-            .contains("tier 'average' has no available models"));
-        assert!(team.worker("worker0002").await.is_err());
+            .contains("routine has no model; ran on trivial"));
+        let folded = team.worker("worker1002").await.expect("folded worker");
+        assert_eq!(folded.model.as_deref(), Some("test/scripted-b"));
+        assert_eq!(folded.tier.as_deref(), Some("trivial"));
 
         // The lead moves a worker to another tier with team_resume: the
         // record takes the tier's model and comes back idle. A model outside
@@ -5966,13 +5969,13 @@ mod tests {
         let moved = team
             .handle_lead_host_tool(
                 "team_resume",
-                serde_json::json!({"worker_id": "worker0001", "tier": "simple"}),
+                serde_json::json!({"worker_id": "worker0001", "tier": "trivial"}),
             )
             .await;
         assert!(moved.success, "{}", moved.output);
         let worker = team.worker("worker0001").await.expect("worker");
         assert_eq!(worker.model.as_deref(), Some("test/scripted-b"));
-        assert_eq!(worker.tier.as_deref(), Some("simple"));
+        assert_eq!(worker.tier.as_deref(), Some("trivial"));
         assert_eq!(worker.status, crate::mnemo2::team::WorkerStatus::Idle);
         // The user's own change (Settings-free, any configured model) clears
         // the tier.
@@ -5998,8 +6001,8 @@ mod tests {
             },
             Vec::new(),
         );
-        assert_eq!(team.tier_models("average")[0].spec, "test/scripted-b");
-        assert!(team.tier_models("difficult").is_empty());
+        assert_eq!(team.tier_models("routine")[0].spec, "test/scripted-b");
+        assert!(team.tier_models("high").is_empty());
 
         let _ = team.stop("worker0001").await;
         team.shutdown().await;
@@ -9907,7 +9910,7 @@ mod tests {
     /// refuses an audit worker outright, and the refusal leaves its record
     /// and its session untouched.
     #[tokio::test]
-    async fn change_model_refuses_a_busy_audit_worker() {
+    async fn change_model_switches_a_busy_unreported_audit() {
         let root = tempfile::tempdir().expect("root");
         let config = tempfile::tempdir().expect("config");
         let state = tempfile::tempdir().expect("state");
@@ -9971,8 +9974,10 @@ mod tests {
         assert_eq!(audit.kind, "audit");
         let generation = audit.generation;
 
-        // The busy switch refuses an audit worker.
-        let refused = team
+        // An unreported audit switches live: its in-flight request finishes
+        // on the old model, its next request uses the new one, and the session
+        // is not stopped or restarted.
+        let switched = team
             .change_model(
                 "auditor1",
                 Some("test/model-b".into()),
@@ -9980,20 +9985,18 @@ mod tests {
                 crate::mnemo2::team::ChangeSource::User,
             )
             .await
-            .expect_err("an audit worker's model is not switchable");
-        assert!(
-            refused.contains("audit worker"),
-            "the refusal names the audit rule: {refused}"
-        );
+            .expect("switch the unreported audit");
+        assert_eq!(switched.model, Some("test/model-b".into()));
+        assert_eq!(switched.generation, generation);
+        assert!(!switched.report_delivered);
         release.send(()).expect("release the held response");
 
-        // The audit kept its model and its session (no stop, no restart).
         let settled =
             wait_for_worker_status(&team, "auditor1", crate::mnemo2::team::WorkerStatus::Completed)
                 .await;
-        assert_eq!(settled.model, Some("test/model-a".into()));
+        assert_eq!(settled.model, Some("test/model-b".into()));
         assert_eq!(settled.generation, generation);
-        assert_eq!(stub.models(), ["model-a", "model-a"]);
+        assert_eq!(stub.models(), ["model-a", "model-b"]);
         team.shutdown().await;
         lead.shutdown().await;
     }

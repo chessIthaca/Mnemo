@@ -1476,8 +1476,8 @@ simple = ["ep1/exec-model"]
                 worker_id: worker.to_string(),
                 plan_id: "p".to_string(),
                 step: 1,
-                from_tier: "average".to_string(),
-                to_tier: "difficult".to_string(),
+                from_tier: "routine".to_string(),
+                to_tier: "high".to_string(),
                 from_model: None,
                 to_model: None,
                 status: "running".to_string(),
@@ -1491,8 +1491,8 @@ simple = ["ep1/exec-model"]
                 worker_id: worker.to_string(),
                 plan_id: "p".to_string(),
                 step: 1,
-                from_tier: "average".to_string(),
-                to_tier: "simple".to_string(),
+                from_tier: "routine".to_string(),
+                to_tier: "trivial".to_string(),
                 from_model: None,
                 to_model: None,
                 status: "running".to_string(),
@@ -1510,8 +1510,8 @@ simple = ["ep1/exec-model"]
             plan_id: "p".to_string(),
             step: 1,
             reason: "strikes".to_string(),
-            from_tier: "average".to_string(),
-            to_tier: "difficult".to_string(),
+            from_tier: "routine".to_string(),
+            to_tier: "high".to_string(),
             detail: "stuck".to_string(),
         }
     }
@@ -1522,20 +1522,20 @@ simple = ["ep1/exec-model"]
 
         let rows = vec![
             // Two shadow decisions with a lead tier, one of each kind.
-            route_row("w1", RoutingMode::Shadow, Some("average"), true, Some("average")),
-            route_row("w2", RoutingMode::Shadow, Some("simple"), true, Some("average")),
+            route_row("w1", RoutingMode::Shadow, Some("routine"), true, Some("routine")),
+            route_row("w2", RoutingMode::Shadow, Some("trivial"), true, Some("routine")),
             // An off-mode decision: Laya cleared nothing, the lead ran.
-            route_row("w3", RoutingMode::Off, None, false, Some("difficult")),
+            route_row("w3", RoutingMode::Off, None, false, Some("high")),
             // A suggest decision with no lead tier: routed, not compared.
-            route_row("w4", RoutingMode::Suggest, Some("difficult"), true, None),
+            route_row("w4", RoutingMode::Suggest, Some("high"), true, None),
             reroute_row("w1", true, true),
             reroute_row("w2", false, false),
             nudge_row("w1"),
             nudge_row("w2"),
-            outcome_row("w1", "average", Some("average")),
-            outcome_row("w2", "average", Some("difficult")),
-            outcome_row("w3", "difficult", Some("difficult")),
-            outcome_row("w4", "simple", Some("average")),
+            outcome_row("w1", "routine", Some("routine")),
+            outcome_row("w2", "routine", Some("high")),
+            outcome_row("w3", "high", Some("high")),
+            outcome_row("w4", "trivial", Some("routine")),
         ];
 
         let summary = summarize_rows(&rows);

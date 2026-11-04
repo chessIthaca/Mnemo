@@ -173,8 +173,9 @@ fn workers_label(running: usize) -> String {
     format!("Workers: {running} running")
 }
 
-/// How many worker turns are running on the open project.
-async fn running_workers(app: &tauri::AppHandle) -> usize {
+/// How many worker turns are running on the open project. Also what the
+/// external lead's `/app/quit` route reports and refuses on.
+pub(crate) async fn running_workers(app: &tauri::AppHandle) -> usize {
     use tauri::Manager as _;
 
     let Some(state) = app.try_state::<ipc::Mnemo2State>() else {

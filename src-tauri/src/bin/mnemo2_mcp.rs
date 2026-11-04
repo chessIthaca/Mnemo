@@ -13,7 +13,9 @@
 //! - `notices --drain | --session-start | --stop-check` and `gate-agent` are
 //!   Claude Code hooks (JSON on stdin, JSON on stdout, always exit 0);
 //! - `wait [--timeout <s>]` is the background command that wakes an idle lead
-//!   when a worker reports.
+//!   when a worker reports;
+//! - `quit [--force] [--timeout <s>]` asks every running Mnemo2 to leave (the
+//!   rebuild script needs it) and waits until it has.
 //!
 //! It is deliberately small and synchronous (no Tauri, no async runtime): the
 //! hooks run on every tool call.
@@ -28,6 +30,8 @@ mod http;
 mod instance;
 #[path = "mnemo2_mcp/permissions.rs"]
 mod permissions;
+#[path = "mnemo2_mcp/quit.rs"]
+mod quit;
 #[path = "mnemo2_mcp/serve.rs"]
 mod serve;
 #[path = "mnemo2_mcp/summary.rs"]
@@ -51,7 +55,8 @@ const USAGE: &str = "usage: mnemo2-mcp serve\n       \
     mnemo2-mcp hint --pre-search\n       \
     mnemo2-mcp gate-agent\n       \
     mnemo2-mcp team-summary [--json] [--cwd <dir>]\n       \
-    mnemo2-mcp show-worker <worker_id> [--cwd <dir>]";
+    mnemo2-mcp show-worker <worker_id> [--cwd <dir>]\n       \
+    mnemo2-mcp quit [--force] [--timeout <seconds>]";
 
 /// Default `wait` timeout, in seconds.
 const DEFAULT_WAIT_S: u64 = 1800;
@@ -246,6 +251,24 @@ fn main() -> ExitCode {
             let env = Env::from_process();
             match summary::show_worker(&env, rest) {
                 Ok(()) => ExitCode::SUCCESS,
+                Err(reason) => {
+                    eprintln!("{reason}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // `quit` runs in place too: it asks the running Mnemo2s to leave and
+        // waits for them, which a delegated second process would do just as
+        // well but with one more copy to track.
+        "quit" => {
+            let env = Env::from_process();
+            match quit::run(&env, rest) {
+                Ok(lines) => {
+                    for line in lines {
+                        print_line(&line);
+                    }
+                    ExitCode::SUCCESS
+                }
                 Err(reason) => {
                     eprintln!("{reason}");
                     ExitCode::FAILURE

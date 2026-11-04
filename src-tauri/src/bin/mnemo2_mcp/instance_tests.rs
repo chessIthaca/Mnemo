@@ -242,6 +242,93 @@ fn resolve_starts_mnemo2_and_waits_for_its_run_file() {
     assert!(lock_files(&sandbox).is_empty(), "the spawn lock must be released");
 }
 
+/// Write the marker `scripts/rebuild-mnemo2.mjs` writes, dated `age` ago.
+fn write_rebuild_marker(sandbox: &Sandbox, age: Duration) -> PathBuf {
+    let started = SystemTime::now().checked_sub(age).expect("after the epoch");
+    let path = sandbox.run_dir.join("rebuilding");
+    let body = serde_json::json!({
+        "pid": std::process::id(),
+        "started_ms": unix_ms(started).expect("epoch"),
+    });
+    std::fs::write(&path, body.to_string()).expect("write the rebuild marker");
+    path
+}
+
+#[test]
+fn a_fresh_rebuild_marker_stops_the_spawner_with_the_rebuild_message() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    write_rebuild_marker(&sandbox, Duration::from_secs(5));
+    let (env, calls) = counting_env(&sandbox);
+    let Resolution::Failed(message) = resolve(&env, &sandbox.deep) else {
+        panic!("expected the rebuild message");
+    };
+    assert_eq!(
+        message,
+        "Mnemo2 is being rebuilt (npm run rebuild:mnemo2); try again when the build finishes"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no Mnemo2 may start mid-build");
+}
+
+#[test]
+fn a_rebuild_marker_older_than_fifteen_minutes_does_not_stop_the_start() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let marker = write_rebuild_marker(&sandbox, Duration::from_secs(16 * 60));
+    let (mut env, calls) = counting_env(&sandbox);
+    env.spawn_timeout = Duration::from_millis(150);
+    // The start itself is expected to time out (the spawner starts nothing).
+    assert!(matches!(resolve(&env, &sandbox.deep), Resolution::Failed(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the stale marker is ignored");
+    assert!(!marker.exists(), "a stale marker is removed");
+}
+
+#[test]
+fn without_a_rebuild_marker_the_helper_starts_mnemo2_as_before() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let (mut env, calls) = counting_env(&sandbox);
+    env.spawn_timeout = Duration::from_millis(150);
+    assert!(matches!(resolve(&env, &sandbox.deep), Resolution::Failed(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_running_instance_is_still_found_during_a_rebuild() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let server = live(1101, Some(&project));
+    sandbox.write_run(1101, server.port, "tok", Some(&project));
+    write_rebuild_marker(&sandbox, Duration::from_secs(1));
+    let (env, calls) = counting_env(&sandbox);
+    let Resolution::Live(instance) = resolve(&env, &sandbox.deep) else {
+        panic!("the running instance must be used");
+    };
+    assert_eq!(instance.pid, 1101);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "a running Mnemo2 is reused, not started");
+}
+
+#[test]
+fn the_rebuild_marker_is_honoured_for_fifteen_minutes() {
+    let sandbox = Sandbox::new();
+    let now = SystemTime::now();
+    assert!(!rebuild_in_progress(&sandbox.run_dir, now), "no marker is no rebuild");
+    let path = sandbox.run_dir.join("rebuilding");
+    // Unparsable: the file's own age decides, and it was just written.
+    std::fs::write(&path, "{ not json").unwrap();
+    assert!(rebuild_in_progress(&sandbox.run_dir, now));
+    // Dated exactly at the limit, the rebuild is over.
+    let started_ms = unix_ms(now).unwrap() - 15 * 60 * 1000;
+    std::fs::write(&path, format!("{{\"pid\":1,\"started_ms\":{started_ms}}}")).unwrap();
+    assert!(!rebuild_in_progress(&sandbox.run_dir, now));
+    assert!(!path.exists(), "an expired marker is removed");
+    // A marker from slightly in the future (two clocks) is simply young.
+    let started_ms = unix_ms(now).unwrap() + 1000;
+    std::fs::write(&path, format!("{{\"pid\":1,\"started_ms\":{started_ms}}}")).unwrap();
+    assert!(rebuild_in_progress(&sandbox.run_dir, now));
+}
+
 /// What a hidden instance that failed to open the project does when asked
 /// to try again.
 enum Retry {

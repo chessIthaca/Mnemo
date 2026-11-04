@@ -1617,7 +1617,8 @@ impl AgentLoop {
         to_label: &str,
         expected_epoch: Option<u64>,
     ) -> bool {
-        if super::route_question::tier_for_label(to_label).is_none()
+        if (super::route_question::tier_for_label(to_label).is_none()
+            && to_label != model_routing::RouteTarget::Escalate.label())
             || !matches!(state.route_once, RouteOnce::Settled { .. })
             || expected_epoch.is_some_and(|epoch| epoch != state.epoch)
             || state.nudge_sent

@@ -16411,6 +16411,52 @@ impl crate::model_resolver::ModelResolver for RoutingStubResolver {
     }
 }
 
+/// A strike-test resolver whose targets use the real five-tier fold-down.
+/// The session is settled directly by the test, so no provider is rebuilt.
+struct StrikeLadderResolver {
+    policy: Option<model_routing::RoutingPolicy>,
+    ladder: crate::config::TierLadder,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for StrikeLadderResolver {
+    fn resolve(
+        &self,
+        _ctx: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.policy
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        _ctx: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        let (_, spec) = self.ladder.resolve(target.label())?;
+        let (endpoint, model) = spec.split_once('/')?;
+        Some(crate::config::ModelRef {
+            endpoint: endpoint.into(),
+            model: model.into(),
+            reasoning_effort: None,
+        })
+    }
+
+    fn build_turn_provider(
+        &self,
+        model_ref: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            routed_provider(&model_ref.model, "from-strike-ladder"),
+            context::ContextManager::new(128_000, 0.5),
+        ))
+    }
+}
+
 /// Build a routing test agent: `default_provider` serves unless a route fires,
 /// `resolver` carries the policy + targets, `gate` holds the classifier and the
 /// temp routing log.
@@ -17983,6 +18029,102 @@ async fn three_failing_tool_calls_nudge_once() {
     assert!(nudges[0].contains("tools keep failing") && nudges[0].contains("medium-model"));
     let rows = read_session_routing_log(&session_log_path(&log_path));
     assert_eq!(rows.iter().filter(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. })).count(), 1);
+}
+
+async fn hard_strike_nudges(
+    escalate_model: Option<&str>,
+) -> (Vec<String>, Vec<model_routing::SessionRoutingRow>) {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
+    let mut ladder = crate::config::TierLadder::default();
+    for rung in &mut ladder.tiers {
+        rung.models = match rung.id.as_str() {
+            "trivial" => vec!["stub/trivial-model".into()],
+            "routine" => vec!["stub/routine-model".into()],
+            "medium" => vec!["stub/medium-model".into()],
+            "high" => vec!["stub/high-model".into()],
+            "escalate" => escalate_model
+                .map(|model| vec![format!("stub/{model}")])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+    }
+    let resolver = Arc::new(StrikeLadderResolver {
+        policy: Some(session_routing_policy(true)),
+        ladder,
+    });
+    let mut rounds = Vec::new();
+    for index in 0..3u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart {
+                index,
+                id: format!("hard-strike-{index}"),
+                name: format!("missing_tool_{index}"),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index,
+                fragment: "{}".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let agent = routing_agent(dir.path(), provider, resolver, gate);
+    {
+        let mut state = agent.route_session.lock().expect("route-session lock");
+        state.route_once = crate::agent::loop_impl::RouteOnce::Settled {
+            label: Some("hard".into()),
+            confidence: Some(0.95),
+            model: Some("stub/high-model".into()),
+        };
+    }
+    let (_outcome, mut rx) = run_routing_turn_observed(&agent, "exercise the failing tools").await;
+    let events = drain_routing_events(&mut rx);
+    let nudges = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RoutingNotice { kind, text } if kind == "nudge" => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    (nudges, rows)
+}
+
+#[tokio::test]
+async fn a_hard_session_strikes_toward_the_escalate_tier() {
+    let (nudges, rows) = hard_strike_nudges(Some("escalate-model")).await;
+    assert_eq!(nudges.len(), 1, "the top ordinary tier escalates once: {nudges:?}");
+    assert!(nudges[0].contains("escalate-model"), "{nudges:?}");
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(
+                row,
+                model_routing::SessionRoutingRow::Nudge { to_label, .. }
+                    if to_label == "escalate"
+            ))
+            .count(),
+        1,
+        "the escalation tier id is logged like every other nudge: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hard_session_does_not_nudge_when_escalate_folds_to_its_model() {
+    let (nudges, rows) = hard_strike_nudges(None).await;
+    assert!(nudges.is_empty(), "folding back to high is not an escalation: {nudges:?}");
+    assert!(
+        !rows.iter().any(|row| matches!(
+            row,
+            model_routing::SessionRoutingRow::Nudge { .. }
+        )),
+        "a same-model fold must not claim or log a nudge: {rows:?}"
+    );
 }
 
 #[tokio::test]

@@ -2923,59 +2923,75 @@ impl AgentLoop {
                 };
                 if trigger {
                     let (route_state, route_epoch) = self.route_once_with_epoch();
-                    let settled_label = match route_state {
+                    let (settled_label, settled_model) = match route_state {
                         super::loop_impl::RouteOnce::Settled {
                             label: Some(label),
+                            model,
                             ..
-                        } => Some(label),
-                        _ => None,
+                        } => (Some(label), model),
+                        _ => (None, None),
                     };
                     let policy = self
                         .model_resolver
                         .as_ref()
                         .and_then(|resolver| resolver.routing_policy());
                     if let (Some(settled), Some(policy)) = (settled_label, policy) {
-                        if let Some(to_label) =
-                            super::route_question::label_above(&settled, policy.offered)
-                        {
-                            // `tier_for_label` is the only label -> tier
-                            // mapping (plan 87932c46): it now carries the
-                            // `involved` -> medium arm too, so a strike on
-                            // a routine session can suggest the medium
-                            // tier's model.
-                            let target = super::route_question::tier_for_label(to_label)
-                                .and_then(model_routing::RouteTarget::from_tier_id);
-                            if let Some(model_ref) = match target {
-                                Some(target) => self.resolve_routed_model(target).await,
-                                None => None,
-                            } {
-                                let reason = if repeated {
-                                    "repeat_failure"
+                        let above = super::route_question::label_above(&settled, policy.offered);
+                        // `escalate` has no Laya label. A strike on the highest
+                        // ordinary tier therefore carries the ladder tier id
+                        // itself through the otherwise unchanged nudge path.
+                        let top_escalation = above.is_none()
+                            && super::route_question::tier_for_label(&settled) == Some("high");
+                        let to_label = above.or(top_escalation.then_some("escalate"));
+                        let target = to_label.and_then(|to_label| {
+                            if top_escalation {
+                                Some(model_routing::RouteTarget::Escalate)
+                            } else {
+                                super::route_question::tier_for_label(to_label)
+                                    .and_then(model_routing::RouteTarget::from_tier_id)
+                            }
+                        });
+                        if let (Some(to_label), Some(target)) = (to_label, target) {
+                            if let Some(model_ref) = self.resolve_routed_model(target).await {
+                                let target_spec = if model_ref.endpoint.is_empty() {
+                                    model_ref.model.clone()
                                 } else {
-                                    "tool_failures"
+                                    format!("{}/{}", model_ref.endpoint, model_ref.model)
                                 };
-                                let text = if repeated {
-                                    format!("going in circles; consider {}", model_ref.model)
-                                } else {
-                                    format!("tools keep failing; consider {}", model_ref.model)
-                                };
-                                let log_path = self
-                                    .routing
-                                    .as_ref()
-                                    .map(|gate| gate.session_log_path().to_path_buf());
-                                let _ = AgentLoop::claim_and_publish_nudge(
-                                    &self.route_session,
-                                    to_label,
-                                    Some(route_epoch),
-                                    super::loop_impl::NudgeNotice {
-                                        agent_id,
-                                        reason,
-                                        text,
-                                        log_path,
-                                        fanin_tx: fanin_tx.clone(),
-                                    },
-                                )
-                                .await;
+                                let current_spec = self.current_model_spec();
+                                let folded_onto_current = top_escalation
+                                    && (settled_model.as_deref() == Some(target_spec.as_str())
+                                        || current_spec == target_spec
+                                        || current_spec == model_ref.model);
+                                if !folded_onto_current {
+                                    let reason = if repeated {
+                                        "repeat_failure"
+                                    } else {
+                                        "tool_failures"
+                                    };
+                                    let text = if repeated {
+                                        format!("going in circles; consider {}", model_ref.model)
+                                    } else {
+                                        format!("tools keep failing; consider {}", model_ref.model)
+                                    };
+                                    let log_path = self
+                                        .routing
+                                        .as_ref()
+                                        .map(|gate| gate.session_log_path().to_path_buf());
+                                    let _ = AgentLoop::claim_and_publish_nudge(
+                                        &self.route_session,
+                                        to_label,
+                                        Some(route_epoch),
+                                        super::loop_impl::NudgeNotice {
+                                            agent_id,
+                                            reason,
+                                            text,
+                                            log_path,
+                                            fanin_tx: fanin_tx.clone(),
+                                        },
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }

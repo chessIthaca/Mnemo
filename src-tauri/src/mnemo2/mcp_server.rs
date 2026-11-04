@@ -108,6 +108,8 @@ const OPEN_MISSION_CONTROL: &str = "open_mission_control";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Give the quit response time to reach the helper before the event loop exits.
+const QUIT_RESPONSE_DELAY: Duration = Duration::from_millis(300);
 const DEFAULT_WAIT_S: u64 = 1800;
 const MAX_WAIT_S: u64 = 3600;
 const IDLE_SWEEP_EVERY: Duration = Duration::from_secs(30);
@@ -124,6 +126,10 @@ pub trait LeadHost: Send + Sync + 'static {
     async fn lead(&self) -> Option<Arc<LeadRuntime>>;
     /// The Mnemo config directory (registered projects, `config.toml`).
     fn config_dir(&self) -> PathBuf;
+    /// The number of worker turns currently running in the app.
+    async fn running_workers(&self) -> usize;
+    /// Leave through Mnemo2's orderly shutdown (the tray's quit path).
+    fn quit(&self);
     /// Ask the UI to open the registered project at `root`.
     fn request_open(&self, root: &Path);
     /// An external lead attached to or detached from the project at `root`.
@@ -623,6 +629,7 @@ impl Shared {
         }
         match request.path.as_str() {
             "/health" => self.health(&request.body).await,
+            "/app/quit" => self.app_quit(&request.body).await,
             "/mcp" => self.mcp(request).await,
             "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach" => {
                 self.lead_route(request).await
@@ -659,6 +666,40 @@ impl Shared {
                 "open_error_age_ms": age_ms,
             }),
         )
+    }
+
+    /// Answer a rebuild helper's quit request, then leave through the same
+    /// orderly shutdown path as the tray. The short delay lets the response
+    /// reach the helper before the process exits.
+    async fn app_quit(&self, body: &[u8]) -> Response {
+        #[derive(serde::Deserialize)]
+        struct QuitBody {
+            #[serde(default)]
+            force: bool,
+        }
+
+        let body: QuitBody = match serde_json::from_slice(body) {
+            Ok(body) => body,
+            Err(err) => return Response::error(400, &format!("invalid JSON body: {err}")),
+        };
+        let running = self.host.running_workers().await;
+        if running > 0 && !body.force {
+            return Response::json(
+                409,
+                &json!({
+                    "error": format!(
+                        "{running} worker(s) are running; quit with force to interrupt them"
+                    ),
+                    "running": running,
+                }),
+            );
+        }
+        let host = Arc::clone(&self.host);
+        tokio::spawn(async move {
+            tokio::time::sleep(QUIT_RESPONSE_DELAY).await;
+            host.quit();
+        });
+        Response::json(200, &json!({ "quitting": true, "pid": std::process::id() }))
     }
 
     /// Ask the UI to try opening the registered project at `root` again: the
@@ -1378,6 +1419,14 @@ impl LeadHost for AppLeadHost {
         mnemo::config::resolve_config_dir(None)
     }
 
+    async fn running_workers(&self) -> usize {
+        crate::mnemo2::running_workers(&self.app).await
+    }
+
+    fn quit(&self) {
+        self.app.exit(0);
+    }
+
     fn open_failure(&self, root: &Path) -> Option<OpenFailure> {
         let state = self.app.try_state::<crate::mnemo2::ipc::Mnemo2State>()?;
         state.open_failure(root)
@@ -1483,6 +1532,10 @@ mod tests {
         opened_workers: Mutex<Vec<(PathBuf, String)>>,
         changes: Mutex<Vec<(bool, Option<PathBuf>)>>,
         shown: AtomicUsize,
+        /// Worker turns the fake UI reports as running.
+        running: AtomicUsize,
+        /// How often the fake UI was asked to leave.
+        quits: AtomicUsize,
         /// A reported open failure: the canonical root and what was reported.
         failure: Mutex<Option<(PathBuf, OpenFailure)>>,
     }
@@ -1495,6 +1548,14 @@ mod tests {
 
         fn config_dir(&self) -> PathBuf {
             self.config.clone()
+        }
+
+        async fn running_workers(&self) -> usize {
+            self.running.load(Ordering::SeqCst)
+        }
+
+        fn quit(&self) {
+            self.quits.fetch_add(1, Ordering::SeqCst);
         }
 
         fn request_open(&self, root: &Path) {
@@ -1881,7 +1942,7 @@ mod tests {
     #[tokio::test]
     async fn every_route_needs_the_bearer_token() {
         let fixture = Fixture::new(true, true, ServerOptions::default()).await;
-        for path in ["/health", "/mcp", "/lead/notices", "/lead/wait", "/nope"] {
+        for path in ["/health", "/app/quit", "/mcp", "/lead/notices", "/lead/wait", "/nope"] {
             let (status, _) = fixture.post(path, None, &[], "{}").await;
             assert_eq!(status, 401, "{path} without a token");
             let (status, _) = fixture.post(path, Some("wrong"), &[], "{}").await;
@@ -1897,6 +1958,61 @@ mod tests {
         assert!(health["open_error_age_ms"].is_null());
         let (status, _) = fixture.post("/nope", Some("tok-123"), &[], "{}").await;
         assert_eq!(status, 404);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn app_quit_refuses_busy_teams_and_defers_the_orderly_exit() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let shared = Arc::clone(&fixture.server.shared);
+        let request = |body: Value| Request {
+            method: "POST".into(),
+            path: "/app/quit".into(),
+            headers: vec![("Authorization".into(), "Bearer tok-123".into())],
+            body: body.to_string().into_bytes(),
+        };
+        fixture.host.running.store(2, Ordering::SeqCst);
+
+        let response = shared.handle(&request(json!({}))).await;
+        assert_eq!(response.status, 409);
+        let body: Value = serde_json::from_slice(&response.body).expect("409 json");
+        assert_eq!(body["running"], 2);
+        assert_eq!(
+            body["error"],
+            "2 worker(s) are running; quit with force to interrupt them"
+        );
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 0);
+
+        fixture.host.running.store(0, Ordering::SeqCst);
+        let response = shared.handle(&request(json!({}))).await;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).expect("200 json");
+        assert_eq!(body["quitting"], true);
+        assert_eq!(body["pid"], std::process::id());
+        // The response existed before the host was asked to quit. Let the
+        // spawned quit task start its delay, so its deadline is fixed on the
+        // paused clock, and show that nothing happens before it is over.
+        tokio::task::yield_now().await;
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 0);
+        tokio::time::advance(QUIT_RESPONSE_DELAY - Duration::from_millis(1)).await;
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 1);
+
+        // A busy team quits too when the caller insists.
+        fixture.host.running.store(2, Ordering::SeqCst);
+        let response = shared.handle(&request(json!({ "force": true }))).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 1);
+        tokio::task::yield_now().await;
+        tokio::time::advance(QUIT_RESPONSE_DELAY).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 2);
         fixture.shutdown().await;
     }
 

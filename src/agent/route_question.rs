@@ -51,7 +51,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::memory::classifier::Question;
+use crate::memory::classifier::{Answer, Question};
 
 /// The label for a small, local, mechanical change.
 pub const LABEL_TRIVIAL: &str = "trivial";
@@ -195,6 +195,29 @@ pub fn default_min_confidence(labels: usize) -> f64 {
         DEFAULT_MIN_CONFIDENCE_3
     } else {
         DEFAULT_MIN_CONFIDENCE_2
+    }
+}
+
+/// The confidence a routing gate reads from one Laya answer: for a choice,
+/// the largest per-option probability when the backend reported a
+/// distribution, else the pick's own calibrated [`Answer::confidence`];
+/// every other primitive keeps its [`Answer::confidence`] as-is.
+///
+/// A live `/v1/systemone` choice answer carries both numbers at once: the
+/// top value of the `probabilities` map — Laya's `answer_confidence` —
+/// which the routing gates ([`DEFAULT_MIN_CONFIDENCE_3`] /
+/// [`DEFAULT_MIN_CONFIDENCE_2`]) are calibrated for, and the lower,
+/// margin-like `confidence` on the pick. Routing gates on the top
+/// probability; other consumers (failure triage, memory auto-typing, tool
+/// choice) are calibrated on [`Answer::confidence`] and keep reading that.
+pub fn answer_confidence(answer: &Answer) -> f64 {
+    match answer {
+        Answer::Choice { confidence, probabilities, .. } => probabilities
+            .values()
+            .copied()
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap_or(*confidence),
+        other => other.confidence(),
     }
 }
 
@@ -399,6 +422,49 @@ mod tests {
         let only_trivial = OfferedLabels { trivial: true, routine: false, hard: false };
         assert_eq!(label_above(LABEL_TRIVIAL, only_trivial), None);
         assert_eq!(label_above("unknown", all), None);
+    }
+
+    #[test]
+    fn answer_confidence_reads_the_top_probability() {
+        // The live `/v1/systemone` shape: the pick's `confidence` is a lower,
+        // margin-like score while the top option's probability is the number
+        // the gates are calibrated on.
+        let answer = Answer::Choice {
+            label: LABEL_HARD.to_string(),
+            confidence: 0.6742,
+            probabilities: BTreeMap::from([
+                (LABEL_TRIVIAL.to_string(), 0.0328),
+                (LABEL_ROUTINE.to_string(), 0.0559),
+                (LABEL_HARD.to_string(), 0.9113),
+            ]),
+        };
+        assert!((answer_confidence(&answer) - 0.9113).abs() < 1e-9);
+
+        // The maximum may sit on any option, not the pick alone.
+        let answered = Answer::Choice {
+            label: LABEL_ROUTINE.to_string(),
+            confidence: 0.42,
+            probabilities: BTreeMap::from([
+                (LABEL_TRIVIAL.to_string(), 0.91),
+                (LABEL_ROUTINE.to_string(), 0.05),
+                (LABEL_HARD.to_string(), 0.04),
+            ]),
+        };
+        assert!((answer_confidence(&answered) - 0.91).abs() < 1e-9);
+
+        // An empty distribution falls back to the pick's own confidence.
+        let bare = Answer::Choice {
+            label: LABEL_HARD.to_string(),
+            confidence: 0.6742,
+            probabilities: BTreeMap::new(),
+        };
+        assert!((answer_confidence(&bare) - 0.6742).abs() < 1e-9);
+
+        // Other primitives keep their calibrated confidence.
+        let scored = Answer::Score { value: 2.0, confidence: 0.42 };
+        assert!((answer_confidence(&scored) - 0.42).abs() < 1e-9);
+        let noul = Answer::NoUl { probability: 0.7 };
+        assert!((answer_confidence(&noul) - 0.7).abs() < 1e-9);
     }
 
     #[test]

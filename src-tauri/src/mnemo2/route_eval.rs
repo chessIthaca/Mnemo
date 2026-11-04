@@ -306,7 +306,9 @@ pub struct CaseScore {
     pub expected: Option<String>,
     /// The offered label Laya named, `None` for no answer.
     pub label: Option<String>,
-    /// Laya's calibrated confidence, `None` for no answer.
+    /// The gated confidence — the top option's probability when the backend
+    /// reported a distribution, else the pick's confidence (`None` for no
+    /// answer).
     pub confidence: Option<f64>,
 }
 
@@ -465,11 +467,17 @@ pub async fn classify_corpus(
     let mut scores = Vec::with_capacity(cases.len());
     for case in cases {
         let answer = classifier.classify(&case.text, &question).await;
-        let (label, confidence) = match answer {
-            Some(Answer::Choice { label, confidence, .. }) => {
-                (fold_label(&label, offered), Some(confidence))
-            }
-            _ => (None, None),
+        // The score carries the top option's probability, the number the
+        // gates are calibrated on (`route_question::answer_confidence`).
+        let (label, confidence) = match &answer {
+            Some(answer) => match answer {
+                Answer::Choice { label, .. } => (
+                    fold_label(label, offered),
+                    Some(route_question::answer_confidence(answer)),
+                ),
+                _ => (None, None),
+            },
+            None => (None, None),
         };
         scores.push(CaseScore {
             text: case.text.clone(),
@@ -567,6 +575,9 @@ pub fn today_utc() -> String {
 }
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use mnemo::memory::classifier::Question;
+
     use super::*;
     use crate::mnemo2::dispatch_routing::RoutingMode;
 
@@ -625,6 +636,19 @@ mod tests {
             audits: 0,
             cost_micros: 0,
             label: label.map(str::to_string),
+        }
+    }
+
+    /// A classifier with one canned answer — enough to drive
+    /// [`classify_corpus`], the only networked function under test here.
+    struct StubClassifier {
+        answer: Option<Answer>,
+    }
+
+    #[async_trait]
+    impl Classifier for StubClassifier {
+        async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+            self.answer.clone()
         }
     }
 
@@ -801,5 +825,39 @@ mod tests {
                 expected: Some("routine".to_string()),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn classify_corpus_scores_the_top_probability() {
+        // A live-shaped answer: the pick's margin-like `confidence` (0.30)
+        // sits below the default gate, the top option's probability (0.9113)
+        // above it — the eval scores the latter.
+        let answer = Answer::Choice {
+            label: "hard".to_string(),
+            confidence: 0.30,
+            probabilities: BTreeMap::from([
+                ("trivial".to_string(), 0.0328),
+                ("routine".to_string(), 0.0559),
+                ("hard".to_string(), 0.9113),
+            ]),
+        };
+        let stub = StubClassifier { answer: Some(answer) };
+        let cases = [EvalCase {
+            text: "a subtle race in the dispatch pump".to_string(),
+            expected: Some("hard".to_string()),
+        }];
+        let scores = classify_corpus(&stub, three(), &cases).await;
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].label.as_deref(), Some("hard"));
+        assert!((scores[0].confidence.expect("confidence") - 0.9113).abs() < 1e-9);
+        assert!(scores[0].routed_at(route_question::DEFAULT_MIN_CONFIDENCE_3));
+
+        // A non-choice answer is still no answer at all.
+        let scored = StubClassifier {
+            answer: Some(Answer::Score { value: 1.0, confidence: 0.99 }),
+        };
+        let scores = classify_corpus(&scored, three(), &cases).await;
+        assert_eq!(scores[0].label, None);
+        assert_eq!(scores[0].confidence, None);
     }
 }

@@ -214,6 +214,24 @@ pub enum ChangeSource {
     Lead,
     /// The user's model change in mission control.
     User,
+    /// An automatic switch after a review, audit, or strike-streak nudge.
+    Escalation,
+    /// A fix round deliberately running on a cheaper tier.
+    FixDownshift,
+    /// The restoration of the prior model after a failed fix downshift.
+    FixDownshiftRestore,
+}
+
+impl ChangeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lead => "lead",
+            Self::User => "user",
+            Self::Escalation => "escalation",
+            Self::FixDownshift => "fix_downshift",
+            Self::FixDownshiftRestore => "fix_downshift_restore",
+        }
+    }
 }
 
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
@@ -1113,9 +1131,9 @@ fn resolve_tier_over(
     ))
 }
 
-/// The tier ladder the nudges climb, lowest first; escalation is never a
-/// nudge destination.
-const NUDGE_LADDER: [&str; 4] = ["trivial", "routine", "medium", "high"];
+/// The tier ladder the nudges climb, lowest first. `escalate` is the
+/// deliberate final destination after the highest ordinary tier fails.
+const NUDGE_LADDER: [&str; 5] = ["trivial", "routine", "medium", "high", "escalate"];
 
 /// Consecutive failed or verbatim-repeated tool calls that fire a nudge
 /// (design §4.6).
@@ -1136,6 +1154,7 @@ fn enabled_tiers_over(
         routine: resolves("routine"),
         medium: resolves("medium"),
         high: resolves("high"),
+        escalate: resolves("escalate"),
     }
 }
 
@@ -1158,6 +1177,7 @@ fn direct_tiers_over(
         routine: direct("routine"),
         medium: direct("medium"),
         high: direct("high"),
+        escalate: direct("escalate"),
     }
 }
 
@@ -1168,7 +1188,13 @@ fn next_tier_above(enabled: EnabledTiers, current: &str) -> Option<&'static str>
     let rank = NUDGE_LADDER.iter().position(|tier| *tier == current)?;
     NUDGE_LADDER
         .iter()
-        .zip([enabled.trivial, enabled.routine, enabled.medium, enabled.high])
+        .zip([
+            enabled.trivial,
+            enabled.routine,
+            enabled.medium,
+            enabled.high,
+            enabled.escalate,
+        ])
         .skip(rank + 1)
         .find(|(_, offered)| *offered)
         .map(|(tier, _)| *tier)
@@ -1343,6 +1369,196 @@ async fn try_strike_nudge(worker_id: &str, nudges: StrikeNudges<'_>, repeated: b
         reason,
         detail,
     );
+}
+
+fn append_reroute_metadata(
+    path: &Path,
+    row: &DispatchRoutingRow,
+    source: ChangeSource,
+    finding_closed: Option<bool>,
+) {
+    let mut value = match serde_json::to_value(row) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("failed to serialize dispatch routing row: {error}");
+            return;
+        }
+    };
+    if let Some(object) = value.as_object_mut() {
+        if !matches!(source, ChangeSource::Lead | ChangeSource::User) {
+            object.insert("source".into(), source.as_str().into());
+        }
+        if let Some(closed) = finding_closed {
+            object.insert("finding_closed".into(), closed.into());
+        }
+    }
+    mnemo::agent::model_routing::append_row(path, &value);
+}
+
+/// The unreviewed model downshift on this routed fix, if any. `nudged` is the
+/// durable pending marker on this internal row; settling the review clears it.
+fn pending_fix_downshift(
+    worker: &WorkerRecord,
+    findings: &[Finding],
+) -> Option<(DispatchRoutingRow, bool)> {
+    let finding_id = worker.fixer_finding_id.as_deref()?;
+    let DispatchRoutingRow::LeadReroute {
+        from_tier,
+        to_tier,
+        nudged: true,
+        ..
+    } = worker.reroutes.last()?
+    else {
+        return None;
+    };
+    let from = NUDGE_LADDER.iter().position(|tier| tier == from_tier)?;
+    let to = NUDGE_LADDER.iter().position(|tier| tier == to_tier)?;
+    if from <= to {
+        return None;
+    }
+    let closed = !findings
+        .iter()
+        .any(|finding| finding.id == finding_id && finding.status == "open");
+    Some((worker.reroutes.last()?.clone(), closed))
+}
+
+fn route_fix_brief(worker: &WorkerRecord, routed: &Finding) -> String {
+    // Keep the established routed-finding prefix for callers that display or
+    // match it, then include every OTHER open finding in full as well.
+    let mut brief = format!(
+        "Fix review finding {}: {}\n{}\nFile: {}:{}\n",
+        routed.id, routed.title, routed.detail, routed.file, routed.line
+    );
+    for open in worker
+        .findings
+        .iter()
+        .filter(|candidate| candidate.status == "open" && candidate.id != routed.id)
+    {
+        brief.push_str(&format!(
+            "\nAlso fix open finding {} [{}]: {}\n{}\nFile: {}:{}\n",
+            open.id, open.severity, open.title, open.detail, open.file, open.line
+        ));
+    }
+    brief.push_str(
+        "\nCommit fixes for every finding above, rerun the affected checks, and report evidence for delta review.",
+    );
+    brief
+}
+
+/// The shared state an automatic idle escalation touches. The worker pump and
+/// the lead review path both have these handles already.
+struct AutoEscalation<'a> {
+    records: &'a Arc<Mutex<Vec<WorkerRecord>>>,
+    live: &'a Arc<Mutex<HashMap<String, LiveWorker>>>,
+    models: &'a Arc<std::sync::RwLock<Vec<LeadModel>>>,
+    tiers: &'a Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
+    signals: &'a broadcast::Sender<BoardSignal>,
+    routing_log_path: &'a Path,
+    usage: &'a Arc<Mutex<ProjectUsage>>,
+    save_lock: &'a Arc<Mutex<()>>,
+    persistence: &'a TeamPersistence,
+}
+
+/// Switch a nudged idle worker without stopping its session. `Ok(false)` means
+/// the original suggestion remains in force (busy, already claimed, or no live
+/// session); it is not an error and a later idle event may try again.
+async fn auto_escalate_idle(worker_id: &str, ctx: AutoEscalation<'_>) -> Result<bool, String> {
+    let record = ctx
+        .records
+        .lock()
+        .await
+        .iter()
+        .find(|worker| worker.id == worker_id)
+        .cloned()
+        .ok_or_else(|| format!("worker '{worker_id}' not found"))?;
+    if record.kind == "audit" {
+        return Ok(false);
+    }
+    let Some(to_tier) = record
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.nudged.clone())
+    else {
+        return Ok(false);
+    };
+    let (ran_tier, choice, effort) = {
+        let models = ctx.models.read().unwrap_or_else(|e| e.into_inner());
+        let tiers = ctx.tiers.read().unwrap_or_else(|e| e.into_inner());
+        let ladder = tier_ladder_from_dto(&tiers);
+        let (ran_tier, choice) = resolve_tier_over(&models, &ladder, &to_tier)?;
+        let effort = ladder.get(&ran_tier).and_then(|rung| rung.effort.clone());
+        (ran_tier, choice, effort)
+    };
+    let model = choice.spec.clone();
+    let new_model_id = {
+        let live = ctx.live.lock().await;
+        let Some(live) = live.get(worker_id) else {
+            return Ok(false);
+        };
+        if live.busy.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        live.admit_session_command(worker_id)?;
+        match live.session.set_model(&model, effort.clone()).await {
+            Ok(ModelSwitch::NextRequest { model })
+            | Ok(ModelSwitch::CompactsFirst { model }) => model,
+            Err(error) => {
+                return Err(format!(
+                    "could not switch worker '{worker_id}' to '{model}': {error}"
+                ));
+            }
+        }
+    };
+    let from_model = record.model.clone();
+    let from_tier = final_tier(&record);
+    let row = DispatchRoutingRow::LeadReroute {
+        ts: unix_ms(),
+        worker_id: worker_id.to_string(),
+        plan_id: record.plan_id.clone().unwrap_or_default(),
+        step: record.plan_step.map_or(0, |step| step + 1),
+        from_tier: from_tier.clone(),
+        to_tier: ran_tier.clone(),
+        from_model,
+        to_model: Some(model.clone()),
+        status: status_name(record.status),
+        review_rounds: record.review_rounds,
+        fix_rounds: record.fix_rounds,
+        nudged: true,
+    };
+    let mut records = ctx.records.lock().await;
+    let worker = records
+        .iter_mut()
+        .find(|worker| worker.id == worker_id)
+        .ok_or_else(|| format!("worker '{worker_id}' not found"))?;
+    if worker.routing.as_ref().and_then(|routing| routing.nudged.as_deref())
+        != Some(to_tier.as_str())
+    {
+        return Ok(false);
+    }
+    worker.model = Some(model.clone());
+    if worker.model_id.as_deref() != Some(new_model_id.as_str()) {
+        worker.model_id = None;
+    }
+    worker.reasoning_effort = effort;
+    worker.tier = Some(ran_tier.clone());
+    worker.reroutes.push(row.clone());
+    if let Some(routing) = worker.routing.as_mut() {
+        routing.nudged = None;
+    }
+    note_model(worker, &model);
+    drop(records);
+    if let Some(live) = ctx.live.lock().await.get(worker_id) {
+        live.strikes.lock().await.reset();
+    }
+    save_workers(ctx.records, ctx.usage, ctx.save_lock, ctx.persistence).await?;
+    append_reroute_metadata(ctx.routing_log_path, &row, ChangeSource::Escalation, None);
+    let _ = ctx.signals.send(BoardSignal::Notice {
+        key: format!("escalation:auto:{worker_id}"),
+        text: format!(
+            "Auto escalation switched worker {worker_id} from {from_tier} to {ran_tier} ({model}); its session and transcript were kept."
+        ),
+    });
+    Ok(true)
 }
 
 /// The shared team runtime: one engine, many real worker sessions.
@@ -1898,6 +2114,35 @@ impl TeamRuntime {
 
     fn append_dispatch_routing_row(&self, row: &DispatchRoutingRow) {
         mnemo::agent::model_routing::append_row(&self.routing_log_path, row);
+    }
+
+    /// Append a reroute with the step-6 metadata kept outside the legacy typed
+    /// row, so old readers and parallel settings code retain their contract.
+    fn append_reroute_row(
+        &self,
+        row: &DispatchRoutingRow,
+        source: ChangeSource,
+        finding_closed: Option<bool>,
+    ) {
+        append_reroute_metadata(&self.routing_log_path, row, source, finding_closed);
+    }
+
+    async fn auto_escalate_worker(&self, worker_id: &str) -> Result<bool, String> {
+        auto_escalate_idle(
+            worker_id,
+            AutoEscalation {
+                records: &self.records,
+                live: &self.live,
+                models: &self.models,
+                tiers: &self.tiers,
+                signals: &self.signals,
+                routing_log_path: &self.routing_log_path,
+                usage: &self.usage,
+                save_lock: &self.save_lock,
+                persistence: &self.persistence,
+            },
+        )
+        .await
     }
 
     /// The routing mode in force right now.
@@ -2788,8 +3033,8 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_route_fix".to_string(),
-                description: "Route a larger finding back to its tracked worker for repair and delta review.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"finding_id":{"type":"string"}},"required":["worker_id","finding_id"]}),
+                description: "Route a larger finding back to its tracked worker for repair and delta review. Pass `tier` to run this fix round on a ladder tier, or `auto` to classify the finding; auto never steps down for high-severity findings or shared contracts. The prompt includes every open finding.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"finding_id":{"type":"string"},"tier":{"type":"string","enum":["auto","trivial","routine","medium","high","escalate"]}},"required":["worker_id","finding_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -3079,9 +3324,10 @@ impl TeamRuntime {
                 .await
             }
             "team_route_fix" => {
-                self.route_fix(
+                self.route_fix_with_tier(
                     worker_id,
                     args.get("finding_id").and_then(Value::as_str).unwrap_or(""),
+                    args.get("tier").and_then(Value::as_str),
                 )
                 .await
             }
@@ -4453,10 +4699,24 @@ impl TeamRuntime {
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be stopped".to_string());
         }
+        let preserve_downshift_finding = record.reroutes.last().is_some_and(|row| {
+            matches!(
+                row,
+                DispatchRoutingRow::LeadReroute {
+                    from_tier,
+                    to_tier,
+                    nudged: true,
+                    ..
+                } if NUDGE_LADDER.iter().position(|tier| tier == from_tier)
+                    > NUDGE_LADDER.iter().position(|tier| tier == to_tier)
+            )
+        });
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Stopped;
             worker.pending = None;
-            worker.fixer_finding_id = None;
+            if !preserve_downshift_finding {
+                worker.fixer_finding_id = None;
+            }
             worker.compacting = false;
         })
         .await;
@@ -4636,9 +4896,14 @@ impl TeamRuntime {
         let status = status_name(record.status);
         let review_rounds = record.review_rounds;
         let fix_rounds = record.fix_rounds;
-        let nudged = nudged.is_some();
+        // A downshift stays marked until its delta review records the outcome;
+        // this is the durable pending marker in team.json.
+        let nudged = nudged.is_some() || source == ChangeSource::FixDownshift;
         Some(match source {
-            ChangeSource::Lead => DispatchRoutingRow::LeadReroute {
+            ChangeSource::Lead
+            | ChangeSource::Escalation
+            | ChangeSource::FixDownshift
+            | ChangeSource::FixDownshiftRestore => DispatchRoutingRow::LeadReroute {
                 ts,
                 worker_id,
                 plan_id,
@@ -4694,6 +4959,17 @@ impl TeamRuntime {
         source: ChangeSource,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.change_model_locked(worker_id, model, reasoning_effort, source)
+            .await
+    }
+
+    async fn change_model_locked(
+        &self,
+        worker_id: &str,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        source: ChangeSource,
+    ) -> Result<WorkerRecord, String> {
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Cancelled {
             return Err("a cleaned worker cannot change its model".to_string());
@@ -4780,9 +5056,9 @@ impl TeamRuntime {
                     live.strikes.lock().await.reset();
                 }
             }
-            if record.kind != "audit" {
+            if record.kind != "audit" && source != ChangeSource::FixDownshift {
                 if let Some(row) = reroute.as_ref() {
-                    self.append_dispatch_routing_row(row);
+                    self.append_reroute_row(row, source, None);
                 }
             }
             return self.worker(worker_id).await;
@@ -4807,9 +5083,9 @@ impl TeamRuntime {
         })
         .await;
         self.persist().await?;
-        if record.kind != "audit" {
+        if record.kind != "audit" && source != ChangeSource::FixDownshift {
             if let Some(row) = reroute.as_ref() {
-                self.append_dispatch_routing_row(row);
+                self.append_reroute_row(row, source, None);
             }
         }
         let record = self.worker(worker_id).await?;
@@ -4968,9 +5244,41 @@ impl TeamRuntime {
         let records = self.records.lock().await.clone();
         validate_audit_linkage(&records, &evidence, worker_id, &tip)?;
         let was_cancelled = worker.status == WorkerStatus::Cancelled;
-        // The review nudge (design §4.6) keys on this round's findings;
-        // captured before the closure below takes them.
-        let nudged_high = findings.iter().any(|finding| finding.severity == "high");
+        // Capture every escalation trigger before this review replaces the
+        // previous finding set and clears the routed-finding marker.
+        let rounds = worker.review_rounds.saturating_add(1);
+        let repeated = (rounds >= 2)
+            .then(|| {
+                findings.iter().find(|finding| {
+                    finding.status == "open"
+                        && worker.findings.iter().any(|old| {
+                            old.id == finding.id && old.status == "open"
+                        })
+                })
+            })
+            .flatten()
+            .cloned();
+        let routed = worker.fixer_finding_id.as_deref().and_then(|id| {
+            findings
+                .iter()
+                .find(|finding| finding.id == id && finding.status == "open")
+                .cloned()
+        });
+        let audited = (worker.fix_rounds > 0 && evidence.independent_reviewer_id.is_some())
+            .then(|| {
+                findings
+                    .iter()
+                    .find(|finding| finding.status == "open" && finding.severity == "high")
+                    .cloned()
+            })
+            .flatten();
+        let (escalation_finding, escalation_trigger) = match (routed, repeated, audited) {
+            (Some(finding), _, _) => (Some(finding), "route_fix"),
+            (None, Some(finding), _) => (Some(finding), "review"),
+            (None, None, Some(finding)) => (Some(finding), "audit"),
+            (None, None, None) => (None, "review"),
+        };
+        let downshift = pending_fix_downshift(&worker, &findings);
         self.update_worker(worker_id, |worker| {
             worker.status = if was_cancelled {
                 WorkerStatus::Cancelled
@@ -4991,38 +5299,56 @@ impl TeamRuntime {
         .await;
         self.persist().await?;
         let updated = self.worker(worker_id).await?;
-        // The deterministic review nudge (design §4.6): a review round past
-        // the first that still records a high finding nudges the lead to
-        // the next tier up. No classifier, every mode except `off`.
+        let updated = match downshift {
+            Some((row, closed)) => self.settle_fix_downshift(worker_id, row, closed).await?,
+            None => updated,
+        };
+        // Off/shadow/suggest leave a lead notice. Auto additionally switches
+        // an idle worker, preserving the live session and transcript.
         let settings = self
             .routing
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if settings.mode != RoutingMode::Off
-            && settings.nudges
-            && nudged_high
-            && updated.review_rounds >= 2
-        {
-            let enabled = self.direct_nudge_tiers();
-            if let Some(claim) =
-                claim_nudge(&self.records, worker_id, enabled, settings.mode, None).await
-            {
-                let detail = format!(
-                    "keeps a high finding after {} review rounds",
-                    updated.review_rounds
-                );
-                deliver_nudge(
-                    &self.signals,
-                    &self.routing_log_path,
-                    worker_id,
-                    &claim,
-                    "review",
-                    &detail,
-                );
+        if settings.mode != RoutingMode::Off && settings.nudges {
+            if let Some(finding) = escalation_finding {
+                let enabled = self.direct_nudge_tiers();
+                if let Some(claim) =
+                    claim_nudge(&self.records, worker_id, enabled, settings.mode, None).await
+                {
+                    let detail = if escalation_trigger == "audit" {
+                        format!(
+                            "high-severity audit finding {} remains after a fix round",
+                            finding.id
+                        )
+                    } else if finding.severity == "high" && updated.review_rounds >= 2 {
+                        format!(
+                            "keeps a high finding after {} review rounds",
+                            updated.review_rounds
+                        )
+                    } else if escalation_trigger == "route_fix" {
+                        format!("route-fix finding {} is still open", finding.id)
+                    } else {
+                        format!(
+                            "review finding {} stayed open after {} review rounds",
+                            finding.id, updated.review_rounds
+                        )
+                    };
+                    deliver_nudge(
+                        &self.signals,
+                        &self.routing_log_path,
+                        worker_id,
+                        &claim,
+                        "review",
+                        &detail,
+                    );
+                    if settings.mode == RoutingMode::Auto {
+                        self.auto_escalate_worker(worker_id).await?;
+                    }
+                }
+                // The claim (and any auto switch) changed the stored record.
+                return self.worker(worker_id).await;
             }
-            // The claim marked the record; return what was actually stored.
-            return self.worker(worker_id).await;
         }
         Ok(updated)
     }
@@ -5217,11 +5543,246 @@ impl TeamRuntime {
             .is_some_and(|live| live.busy.load(Ordering::SeqCst))
     }
 
+    async fn settle_fix_downshift(
+        &self,
+        worker_id: &str,
+        mut row: DispatchRoutingRow,
+        finding_closed: bool,
+    ) -> Result<WorkerRecord, String> {
+        let (ts, from_tier, from_model) = match &row {
+            DispatchRoutingRow::LeadReroute {
+                ts,
+                from_tier,
+                from_model,
+                ..
+            } => (*ts, from_tier.clone(), from_model.clone()),
+            _ => return self.worker(worker_id).await,
+        };
+        if let DispatchRoutingRow::LeadReroute { nudged, .. } = &mut row {
+            *nudged = false;
+        }
+        self.update_worker(worker_id, |worker| {
+            if let Some(DispatchRoutingRow::LeadReroute { nudged, .. }) = worker
+                .reroutes
+                .iter_mut()
+                .rev()
+                .find(|candidate| {
+                    matches!(
+                        candidate,
+                        DispatchRoutingRow::LeadReroute { ts: candidate_ts, .. }
+                            if *candidate_ts == ts
+                    )
+                })
+            {
+                *nudged = false;
+            }
+        })
+        .await;
+        self.persist().await?;
+        self.append_reroute_row(&row, ChangeSource::FixDownshift, Some(finding_closed));
+        if finding_closed {
+            return self.worker(worker_id).await;
+        }
+
+        // The cheaper round did not close its finding: restore the prior
+        // model now, while idle, so the next fix round starts there.
+        let model = match from_model {
+            Some(model) => Some(model),
+            None if NUDGE_LADDER.contains(&from_tier.as_str()) => self
+                .resolve_tier_choice(&from_tier)
+                .map(|(_, choice)| Some(choice.spec))?,
+            None => None,
+        };
+        let effort = self
+            .tier_ladder()
+            .get(&from_tier)
+            .and_then(|rung| rung.effort.clone());
+        let status = self.worker(worker_id).await?.status;
+        self.change_model_locked(
+            worker_id,
+            model,
+            effort,
+            ChangeSource::FixDownshiftRestore,
+        )
+        .await?;
+        self.update_worker(worker_id, |worker| worker.status = status)
+            .await;
+        self.persist().await?;
+        self.worker(worker_id).await
+    }
+
+    fn finding_is_shared_contract(&self, worker: &WorkerRecord, finding: &Finding) -> bool {
+        let Some(plan_id) = worker.plan_id.as_deref() else {
+            return false;
+        };
+        let Some(board) = self.board() else {
+            return false;
+        };
+        let Ok(markdown) = board.read_markdown(plan_id) else {
+            return false;
+        };
+        let mut interfaces = false;
+        for line in markdown.lines() {
+            if line.starts_with("## ") {
+                interfaces = line.trim() == "## Interfaces";
+            } else if interfaces && line.contains(&finding.file) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Classify a routed finding for `team_route_fix(tier: "auto")`. The
+    /// classification is logged for shadow/gate diagnostics but is not an
+    /// ordinary dispatch-training row (`skip` stays set).
+    async fn classify_fix_tier(
+        &self,
+        worker: &WorkerRecord,
+        finding: &Finding,
+    ) -> Result<Option<(String, LeadModel)>, String> {
+        let settings = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if settings.mode == RoutingMode::Off {
+            return Err("tier 'auto' needs routing mode shadow, suggest, or auto".to_string());
+        }
+        let text = routing_text(
+            &finding.title,
+            &format!("{}\nFile: {}", finding.detail, finding.file),
+        )
+        .unwrap_or_default();
+        let enabled = self.enabled_routing_tiers();
+        let classifier = self.classifier.as_ref().and_then(|slot| {
+            slot.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        let decision = if let Some(classifier) = classifier {
+            let attempt = async {
+                let _permit = self
+                    .routing_permit
+                    .acquire()
+                    .await
+                    .map_err(|_| "Laya routing is closed".to_string())?;
+                Ok::<_, String>(
+                    classify_dispatch(
+                        classifier.as_ref(),
+                        self.route_knn.as_deref(),
+                        &text,
+                        enabled,
+                        &settings,
+                    )
+                    .await,
+                )
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(3), attempt).await {
+                Ok(result) => result?,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let current_tier = worker
+            .tier
+            .clone()
+            .or_else(|| worker.routing.as_ref().and_then(|routing| routing.ran_tier.clone()));
+        let protected = finding.severity == "high" || self.finding_is_shared_contract(worker, finding);
+        let mut selected = None;
+        let skip = if decision.is_none() {
+            "fix_downshift_offline"
+        } else if !decision.as_ref().is_some_and(|decision| decision.cleared) {
+            "fix_downshift_below_gate"
+        } else if settings.mode == RoutingMode::Shadow {
+            "fix_downshift_shadow"
+        } else if protected {
+            "fix_downshift_protected"
+        } else if let Some(tier) = decision.as_ref().and_then(|decision| decision.tier) {
+            let (ran_tier, choice) = self.resolve_tier_choice(tier)?;
+            let cheaper = current_tier.as_deref().is_some_and(|current| {
+                NUDGE_LADDER.iter().position(|candidate| *candidate == ran_tier)
+                    < NUDGE_LADDER.iter().position(|candidate| *candidate == current)
+            });
+            if cheaper {
+                selected = Some((ran_tier, choice));
+                "fix_downshift_selected"
+            } else {
+                "fix_downshift_not_cheaper"
+            }
+        } else {
+            "fix_downshift_unknown_label"
+        };
+        use sha2::Digest as _;
+        let text_sha256 = sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let ran_model = selected
+            .as_ref()
+            .map(|(_, choice)| choice.spec.clone())
+            .or_else(|| worker.model.clone());
+        let row = DispatchRoutingRow::Route {
+            ts: unix_ms(),
+            worker_id: worker.id.clone(),
+            plan_id: worker.plan_id.clone().unwrap_or_default(),
+            step: worker.plan_step.map_or(0, |step| step + 1),
+            mode: settings.mode,
+            text_sha256,
+            label: decision
+                .as_ref()
+                .map(|decision| decision.label.clone())
+                .unwrap_or_default(),
+            confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
+            probabilities: decision
+                .as_ref()
+                .map(|decision| decision.probabilities.clone())
+                .unwrap_or_default(),
+            tier: decision.as_ref().and_then(|decision| decision.tier).map(str::to_string),
+            threshold: decision.as_ref().map_or_else(
+                || threshold_for(enabled.offered().count(), &settings),
+                |decision| {
+                    if decision.source == "knn" {
+                        settings.knn_min_share
+                    } else {
+                        threshold_for(enabled.offered().count(), &settings)
+                    }
+                },
+            ),
+            cleared: decision.as_ref().is_some_and(|decision| decision.cleared),
+            lead_tier: current_tier.clone(),
+            ran_tier: selected
+                .as_ref()
+                .map(|(tier, _)| tier.clone())
+                .or(current_tier),
+            ran_model: ran_model.clone(),
+            text,
+            skip: Some(skip.to_string()),
+            source: decision.as_ref().map(|decision| decision.source.to_string()),
+            knn_label: decision.as_ref().and_then(|decision| decision.knn_label.clone()),
+            knn_share: decision.as_ref().and_then(|decision| decision.knn_share),
+            knn_k: decision.as_ref().and_then(|decision| decision.knn_k),
+        };
+        self.append_dispatch_routing_row(&row);
+        Ok(selected)
+    }
+
     /// Route a non-tiny finding to the original tracked worker.
     pub async fn route_fix(
         &self,
         worker_id: &str,
         finding_id: &str,
+    ) -> Result<WorkerRecord, String> {
+        self.route_fix_with_tier(worker_id, finding_id, None).await
+    }
+
+    /// Route a fix on its current model or an explicitly/classifier-selected
+    /// ladder tier. The worker keeps its session and transcript.
+    pub async fn route_fix_with_tier(
+        &self,
+        worker_id: &str,
+        finding_id: &str,
+        tier: Option<&str>,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         let worker = self.worker(worker_id).await?;
@@ -5247,6 +5808,36 @@ impl TeamRuntime {
             self.resume_inner(worker_id).await?;
         }
         let previous = self.worker(worker_id).await?;
+        let selected = match tier.map(str::trim).filter(|tier| !tier.is_empty()) {
+            None => None,
+            Some("auto") => self.classify_fix_tier(&previous, &finding).await?,
+            Some(tier) => Some(self.resolve_tier_choice(tier)?),
+        };
+        if let Some((ran_tier, choice)) = selected {
+            let current_tier = previous
+                .tier
+                .as_deref()
+                .or_else(|| previous.routing.as_ref().and_then(|routing| routing.ran_tier.as_deref()));
+            let cheaper = current_tier.is_some_and(|current| {
+                NUDGE_LADDER.iter().position(|candidate| *candidate == ran_tier)
+                    < NUDGE_LADDER.iter().position(|candidate| *candidate == current)
+            });
+            let effort = self
+                .tier_ladder()
+                .get(&ran_tier)
+                .and_then(|rung| rung.effort.clone());
+            self.change_model_locked(
+                worker_id,
+                Some(choice.spec),
+                effort,
+                if cheaper {
+                    ChangeSource::FixDownshift
+                } else {
+                    ChangeSource::Lead
+                },
+            )
+            .await?;
+        }
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Fixing;
             worker.fixer_finding_id = Some(finding_id.to_string());
@@ -5256,10 +5847,7 @@ impl TeamRuntime {
         })
         .await;
         self.persist().await?;
-        let brief = format!(
-            "Fix review finding {}: {}\n{}\nFile: {}:{}\nCommit the fix, rerun the affected checks, and report evidence for delta review.",
-            finding.id, finding.title, finding.detail, finding.file, finding.line
-        );
+        let brief = route_fix_brief(&worker, &finding);
         if let Err(err) = self
             .message_inner_with_kind(worker_id, brief, MessageSender::Mnemo, Some(InboxKind::Fix))
             .await
@@ -7292,6 +7880,29 @@ async fn pump_worker(
                 )
                 .await;
             }
+        }
+        let settings = routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if settings.nudges && settings.mode == RoutingMode::Auto {
+            // A strike fires during a busy turn. Trying on every event makes
+            // the first idle event apply the pending nudge without a restart.
+            let _ = auto_escalate_idle(
+                &worker_id,
+                AutoEscalation {
+                    records: &records,
+                    live: &live,
+                    models: &models,
+                    tiers: &tiers,
+                    signals: &signals,
+                    routing_log_path: &routing_log_path,
+                    usage: &usage,
+                    save_lock: &save_lock,
+                    persistence: &persistence,
+                },
+            )
+            .await;
         }
         if terminal || refresh {
             let engine = engine.clone();
@@ -10573,6 +11184,92 @@ models = [\"scripted-a\", \"scripted-b\"]
             fix_commit: None,
             evidence: None,
             justification: None,
+        }
+    }
+
+    struct ReviewFixture {
+        _root: tempfile::TempDir,
+        state: tempfile::TempDir,
+        _config: tempfile::TempDir,
+        team: TeamRuntime,
+        record: WorkerRecord,
+    }
+
+    impl ReviewFixture {
+        fn rows(&self) -> Vec<DispatchRoutingRow> {
+            std::fs::read_to_string(self.state.path().join("dispatch_routing.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect()
+        }
+    }
+
+    async fn review_fixture(
+        mode: crate::mnemo2::dispatch_routing::RoutingMode,
+        id: &str,
+    ) -> ReviewFixture {
+        use crate::mnemo2::dispatch_routing::{save_routing_settings, RoutingSettings};
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        save_routing_settings(
+            config.path(),
+            &RoutingSettings {
+                mode,
+                ..RoutingSettings::default()
+            },
+        )
+        .expect("routing settings");
+        let mut record = worker(root.path(), id);
+        record.model = Some("test/scripted-difficult".into());
+        record.tier = Some("high".into());
+        record.routing = Some(WorkerRouting {
+            laya_tier: Some("high".into()),
+            confidence: Some(0.8),
+            cleared: true,
+            lead_tier: Some("high".into()),
+            routed_by: "lead".into(),
+            ran_tier: Some("high".into()),
+            nudged: None,
+        });
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("worker checkout");
+        let team = open_test_team_with_config(
+            root.path(),
+            state.path(),
+            vec![record.clone()],
+            config.path(),
+        )
+        .await;
+        let mut tiers = tiers_dto! {
+            difficult: vec!["test/scripted-difficult".into()],
+            average: vec!["test/scripted-average".into()],
+            simple: vec!["test/scripted-simple".into()],
+        };
+        tiers.tiers[4].models = vec!["test/scripted-escalate".into()];
+        team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-simple"),
+                lead_model("scripted-escalate"),
+            ],
+            tiers,
+            Vec::new(),
+        );
+        ReviewFixture {
+            _root: root,
+            state,
+            _config: config,
+            team,
+            record,
         }
     }
 
@@ -13898,6 +14595,290 @@ models = [\"scripted-a\", \"scripted-b\"]
         let lead_tool = fixture.dispatch(None, None).await;
         assert!(!lead_tool.success);
         assert!(lead_tool.output.contains("choose a `tier` for this worker"));
+        fixture.team.shutdown().await;
+    }
+
+    #[test]
+    fn route_fix_prompt_contains_every_open_finding_detail() {
+        let root = tempfile::tempdir().expect("workspace");
+        let mut record = worker(root.path(), "fixprompt001");
+        let routed = open_finding("finding1");
+        let mut other = open_finding("finding2");
+        other.severity = "medium".into();
+        other.title = "the second unchecked path".into();
+        other.detail = "EVERY OTHER OPEN FINDING DETAIL".into();
+        other.file = "src/other.rs".into();
+        record.findings = vec![routed.clone(), other];
+        let mut closed = open_finding("finding3");
+        closed.status = "fixed".into();
+        closed.detail = "CLOSED DETAIL MUST NOT BE SENT".into();
+        record.findings.push(closed);
+        let brief = route_fix_brief(&record, &routed);
+        assert!(brief.contains(&routed.detail), "{brief}");
+        assert!(brief.contains("EVERY OTHER OPEN FINDING DETAIL"), "{brief}");
+        assert!(brief.contains("src/other.rs"), "{brief}");
+        assert!(!brief.contains("CLOSED DETAIL MUST NOT BE SENT"), "{brief}");
+    }
+
+    #[tokio::test]
+    async fn failed_downshift_restores_prior_tier_and_logs_both_outcomes() {
+        let fixture = review_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            "downshift001",
+        )
+        .await;
+        let routed = open_finding("finding1");
+        fixture
+            .team
+            .review(&fixture.record.id, "first".into(), vec![routed.clone()], evidence())
+            .await
+            .expect("first review");
+        let down = fixture
+            .team
+            .route_fix_with_tier(&fixture.record.id, "finding1", Some("routine"))
+            .await
+            .expect("explicit downshift is allowed even for a high finding");
+        assert_eq!(down.tier.as_deref(), Some("routine"));
+        assert_eq!(down.model.as_deref(), Some("test/scripted-average"));
+        fixture.team.stop_inner(&fixture.record.id).await.expect("stop fixer");
+        let restored = fixture
+            .team
+            .review(&fixture.record.id, "still open".into(), vec![routed.clone()], evidence())
+            .await
+            .expect("failed downshift review");
+        assert_eq!(restored.tier.as_deref(), Some("high"));
+        assert_eq!(restored.model.as_deref(), Some("test/scripted-difficult"));
+        let raw = std::fs::read_to_string(fixture.state.path().join("dispatch_routing.jsonl"))
+            .expect("routing log");
+        assert!(raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                row["source"] == "fix_downshift" && row["finding_closed"] == false
+            })
+        }), "{raw}");
+
+        fixture
+            .team
+            .route_fix_with_tier(&fixture.record.id, "finding1", Some("routine"))
+            .await
+            .expect("second deliberate downshift");
+        fixture.team.stop_inner(&fixture.record.id).await.expect("stop second fixer");
+        let mut closed = routed;
+        closed.status = "fixed".into();
+        closed.evidence = Some("fixed and checked".into());
+        let stayed = fixture
+            .team
+            .review(&fixture.record.id, "closed".into(), vec![closed], evidence())
+            .await
+            .expect("closed downshift review");
+        assert_eq!(stayed.tier.as_deref(), Some("routine"));
+        let raw = std::fs::read_to_string(fixture.state.path().join("dispatch_routing.jsonl"))
+            .expect("routing log");
+        assert!(raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                row["source"] == "fix_downshift" && row["finding_closed"] == true
+            })
+        }), "{raw}");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auto_fix_classification_never_lowers_a_high_severity_finding() {
+        let mut fixture = review_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            "protected001",
+        )
+        .await;
+        let classifier = std::sync::Arc::new(StubDispatchClassifier::slow(
+            routing_answer(mnemo::agent::route_question::LABEL_TRIVIAL, 0.95),
+            std::time::Duration::ZERO,
+        ));
+        fixture.team.classifier = Some(std::sync::Arc::new(std::sync::RwLock::new(Some(
+            classifier.clone(),
+        ))));
+        fixture
+            .team
+            .review(
+                &fixture.record.id,
+                "first".into(),
+                vec![open_finding("finding1")],
+                evidence(),
+            )
+            .await
+            .expect("first review");
+        let unchanged = fixture
+            .team
+            .route_fix_with_tier(&fixture.record.id, "finding1", Some("auto"))
+            .await
+            .expect("classified but protected fix");
+        assert_eq!(unchanged.tier.as_deref(), Some("high"));
+        assert_eq!(unchanged.model.as_deref(), Some("test/scripted-difficult"));
+        assert_eq!(classifier.calls(), 1);
+        assert!(fixture.rows().iter().any(|row| matches!(
+            row,
+            DispatchRoutingRow::Route { skip, .. }
+                if skip.as_deref() == Some("fix_downshift_protected")
+        )));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn high_audit_finding_after_fix_nudges_to_escalate() {
+        let fixture = review_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            "auditnudge001",
+        )
+        .await;
+        fixture
+            .team
+            .review(
+                &fixture.record.id,
+                "first".into(),
+                vec![open_finding("finding1")],
+                evidence(),
+            )
+            .await
+            .expect("first review");
+        fixture
+            .team
+            .route_fix(&fixture.record.id, "finding1")
+            .await
+            .expect("route fix");
+        fixture.team.stop_inner(&fixture.record.id).await.expect("stop fixer");
+        let tip = fixture.team.worker_tip(&fixture.record).await.expect("tip");
+        let audit = audit_worker(WorkerStatus::Completed, &fixture.record.id, &tip);
+        fixture.team.records.lock().await.push(audit);
+        fixture.team.persist().await.expect("save audit");
+        let mut audit_evidence = evidence();
+        audit_evidence.independent_reviewer_id = Some("auditor0001".into());
+        audit_evidence.audit_adjudication = Some("accepted the high finding".into());
+        let reviewed = fixture
+            .team
+            .review(
+                &fixture.record.id,
+                "audit still open".into(),
+                vec![open_finding("finding1")],
+                audit_evidence,
+            )
+            .await
+            .expect("audited review");
+        assert_eq!(
+            reviewed.routing.as_ref().and_then(|routing| routing.nudged.as_deref()),
+            Some("escalate")
+        );
+        assert!(fixture.rows().iter().any(|row| matches!(
+            row,
+            DispatchRoutingRow::Nudge { to_tier, .. } if to_tier == "escalate"
+        )));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auto_mode_switches_an_idle_nudged_worker_and_notifies_the_lead() {
+        let (fixture, mut notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.8),
+            std::time::Duration::ZERO,
+            vec![vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".into() },
+                mnemo::provider::LlmEvent::Finish {
+                    reason: mnemo::provider::FinishReason::Stop,
+                },
+            ]],
+        )
+        .await;
+        let dispatched = fixture.dispatch(Some("routine"), None).await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        wait_worker_settled(&fixture.team, "routingworker").await;
+        fixture
+            .team
+            .update_worker("routingworker", |worker| {
+                if let Some(routing) = worker.routing.as_mut() {
+                    routing.nudged = Some("high".into());
+                }
+            })
+            .await;
+        fixture.team.persist().await.expect("save pending nudge");
+        assert!(
+            fixture
+                .team
+                .auto_escalate_worker("routingworker")
+                .await
+                .expect("auto escalation")
+        );
+        let switched = fixture.team.worker("routingworker").await.expect("switched");
+        assert_eq!(switched.model.as_deref(), Some("test/scripted-difficult"));
+        assert_eq!(switched.tier.as_deref(), Some("high"));
+        assert!(switched.routing.expect("routing").nudged.is_none());
+        let raw = std::fs::read_to_string(fixture.log_path()).expect("routing log");
+        assert!(raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                row["event"] == "lead_reroute" && row["source"] == "escalation"
+            })
+        }), "{raw}");
+        let mut notice = None;
+        for _ in 0..800 {
+            while let Ok(signal) = notices.try_recv() {
+                if let BoardSignal::Notice { key, text } = signal {
+                    if key == "escalation:auto:routingworker" {
+                        notice = Some(text);
+                    }
+                }
+            }
+            if notice.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let notice = notice.expect("auto escalation notice");
+        assert!(notice.contains("session and transcript were kept"), "{notice}");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auto_strike_streak_escalates_when_the_worker_becomes_idle() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("auto-call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .chain([vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".into() },
+                mnemo::provider::LlmEvent::Finish {
+                    reason: mnemo::provider::FinishReason::Stop,
+                },
+            ]])
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.8),
+            std::time::Duration::ZERO,
+            responses,
+        )
+        .await;
+        let dispatched = fixture.dispatch(Some("routine"), None).await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        let switched = eventually(|| async {
+            let worker = fixture.team.worker("routingworker").await.expect("worker");
+            (worker.model.as_deref() == Some("test/scripted-difficult")).then_some(worker)
+        })
+        .await;
+        assert_eq!(switched.tier.as_deref(), Some("high"));
+        assert!(switched.routing.expect("routing").nudged.is_none());
+        let raw = std::fs::read_to_string(fixture.log_path()).expect("routing log");
+        assert!(raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                row["source"] == "escalation" && row["nudged"] == true
+            })
+        }), "{raw}");
         fixture.team.shutdown().await;
     }
 

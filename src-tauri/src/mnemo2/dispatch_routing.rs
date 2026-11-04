@@ -73,6 +73,9 @@ pub struct EnabledTiers {
     pub medium: bool,
     /// The `high` tier resolves to an available model.
     pub high: bool,
+    /// The escalation-only rung has a model. Never offered to Laya or kNN;
+    /// this is used only by the deterministic nudge ladder.
+    pub escalate: bool,
 }
 
 impl EnabledTiers {
@@ -786,6 +789,7 @@ mod tests {
             routine,
             medium,
             high,
+            escalate: false,
         }
     }
 

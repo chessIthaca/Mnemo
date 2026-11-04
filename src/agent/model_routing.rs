@@ -6,19 +6,18 @@
 //! layer (backlog 091e694d, item 2 of the Laya chain).
 //!
 //! On a main-agent session's first classifiable prompt the task text is
-//! classified as `trivial`, `routine`, or `hard` with the shared calibrated
-//! choice question ([`super::route_question::route_question`]). The decision is
-//! gated three ways:
+//! classified as `trivial`, `routine`, `involved`, or `hard` with the shared
+//! calibrated choice question ([`super::route_question::route_question`]) --
+//! four labels, one per pickable tier. The decision is gated three ways:
 //!
 //! 1. The [`LayaConfig::routing`](crate::config::LayaConfig::routing) opt-in
 //!    must be on and a classifier installed.
 //! 2. The answer must clear the first-prompt confidence gate
 //!    ([`first_prompt_min_confidence`](crate::config::RoutingConfig::first_prompt_min_confidence),
 //!    or the kernel default for the offered label count) with a known label.
-//! 3. A target must be configured for that label
-//!    ([`cheap`](crate::config::RoutingConfig::cheap) /
-//!    [`routine`](crate::config::RoutingConfig::routine) /
-//!    [`capable`](crate::config::RoutingConfig::capable)) and resolve to a
+//! 3. The label's tier must resolve on the shared ladder
+//!    ([`TierLadder::resolve`](crate::config::endpoints::TierLadder::resolve);
+//!    an empty tier folds down to the nearest lower tier with a model) to a
 //!    live endpoint.
 //!
 //! Every miss keeps the turn's pre-classifier model exactly: no answer,
@@ -57,43 +56,54 @@ use super::failure_triage::training_log_dir;
 /// routing log.
 pub const ROUTING_TEXT_MAX_CHARS: usize = 2000;
 
-/// The routing targets a confident classification selects between.
-///
-/// `Cheap` / `Capable` are the pre-prompt routing targets (backlog 091e694d);
-/// `Medium` / `High` / `Escalate` are the escalation-lane rungs (backlog
-/// ad56c7bd) selected step-granularly by the compound reflex call.
+/// The tier a routing decision selects: the five ladder ids, cheapest first
+/// (`.coding/design/unified-tiers.md` §3, plan 87932c46). A first-prompt pick
+/// is one of the four non-escalate tiers -- `escalate` is never a first pick,
+/// it is not offered to Laya or the kNN -- while the step-lane ladder
+/// (backlog ad56c7bd) reaches all five rungs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteTarget {
-    /// A confidently-TRIVIAL task: run on the configured `cheap` model.
-    Cheap,
-    /// A confidently routine first prompt: run on the configured `routine`
-    /// model, or keep the session's model when no target is configured.
+    /// The `trivial` tier: a confidently-trivial task runs on its first model
+    /// (the pre-ladder `cheap` target).
+    Trivial,
+    /// The `routine` tier: a confidently routine first prompt runs on its
+    /// first model.
     Routine,
-    /// A confidently hard first prompt: run on the configured `capable`
-    /// model.
-    Capable,
-    /// A medium-complexity plan step (reflex rung `medium`): run on the
-    /// configured `lane_medium` model.
+    /// The `medium` tier: a medium-complexity plan step (reflex rung
+    /// `medium`), or a confidently `involved` first prompt.
     Medium,
-    /// A high-complexity plan step (reflex rung `high`): run on the
-    /// configured `lane_high` model.
+    /// The `high` tier: a high-complexity plan step (reflex rung `high`), or a
+    /// confidently hard first prompt (the pre-ladder `capable` target).
     High,
-    /// An escalate-rung plan step (reflex rung `escalate`, typically after a
-    /// failed cycle): run on the configured `escalate` model.
+    /// The `escalate` tier: an escalate-rung plan step (typically after a
+    /// failed cycle) -- step lanes only.
     Escalate,
 }
 
 impl RouteTarget {
-    /// The wire/log label (`"cheap"` / `"routine"` / `"capable"` / `"medium"` / `"high"` /
-    /// `"escalate"`).
+    /// The ladder tier id (`"trivial"` / `"routine"` / `"medium"` /
+    /// `"high"` / `"escalate"`) -- the string the routing log, the kNN
+    /// overlay and the team records all carry.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Cheap => "cheap",
+            Self::Trivial => "trivial",
             Self::Routine => "routine",
-            Self::Capable => "capable",
             Self::Medium => "medium",
             Self::High => "high",
             Self::Escalate => "escalate",
+        }
+    }
+
+    /// The target for a ladder tier id -- the inverse of
+    /// [`RouteTarget::label`]. `None` for an unknown id.
+    pub fn from_tier_id(id: &str) -> Option<Self> {
+        match id {
+            "trivial" => Some(Self::Trivial),
+            "routine" => Some(Self::Routine),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "escalate" => Some(Self::Escalate),
+            _ => None,
         }
     }
 }
@@ -120,7 +130,7 @@ pub struct RoutingDecision {
 }
 
 /// Classify one session's first prompt (capped at
-/// [`ROUTING_TEXT_MAX_CHARS`]) with the shared three-label question.
+/// [`ROUTING_TEXT_MAX_CHARS`]) with the shared four-label question.
 ///
 /// `None` = no usable answer (disabled backend, timeout, malformed response,
 /// or a non-choice answer -- all treated as "no answer", mirroring the
@@ -144,12 +154,13 @@ pub async fn classify_task_text(
     // (`route_question::answer_confidence`), not the pick's lower,
     // margin-like `confidence`.
     let confidence = super::route_question::answer_confidence(&answer);
-    let target = match label.as_str() {
-        super::route_question::LABEL_TRIVIAL if confidence >= threshold => Some(RouteTarget::Cheap),
-        super::route_question::LABEL_ROUTINE if confidence >= threshold => Some(RouteTarget::Routine),
-        super::route_question::LABEL_HARD if confidence >= threshold => Some(RouteTarget::Capable),
-        _ => None,
-    };
+    // `tier_for_label` is the only label -> tier mapping (plan 87932c46):
+    // trivial -> trivial, routine -> routine, involved -> medium, hard ->
+    // high. `escalate` is never offered to the classifier, so it is never a
+    // first pick.
+    let target = super::route_question::tier_for_label(label)
+        .filter(|_| confidence >= threshold)
+        .and_then(RouteTarget::from_tier_id);
     Some(RoutingDecision {
         label: label.clone(),
         confidence,
@@ -166,6 +177,34 @@ pub fn cap_task_text(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// The ladder tier id a legacy routing row carried, mapped when read
+/// (plan 87932c46: old routing-log rows keep their bytes). Mnemo1's
+/// pre-ladder `cheap` target IS the `trivial` tier and `capable` IS `high`;
+/// Mnemo2's legacy `simple` / `average` / `difficult` tier ids never appear
+/// in this log, but the ladder owns their stored-data conversion, so route
+/// through it anyway. Every other value -- including all current tier ids --
+/// passes through unchanged.
+fn map_legacy_target_id(raw: Option<String>) -> Option<String> {
+    raw.map(|value| match value.as_str() {
+        "cheap" => "trivial".to_string(),
+        "capable" => "high".to_string(),
+        legacy => crate::config::endpoints::TierLadder::convert_old_id(legacy)
+            .unwrap_or(legacy)
+            .to_string(),
+    })
+}
+
+/// The deserializer for [`RouteDecisionRow::target`](RouteDecisionRow::target)
+/// and [`RouteDecisionRow::lane`](RouteDecisionRow::lane): readers see ladder
+/// ids, whatever era the row was written in.
+fn deserialize_target_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(map_legacy_target_id(raw))
 }
 
 /// One row of the routing training log, written when a turn starts and a
@@ -188,15 +227,26 @@ pub struct RouteDecisionRow {
     pub confidence: f64,
     /// The configured confidence gate the answer was compared against.
     pub threshold: f64,
-    /// The selected target's label (`"cheap"` / `"capable"`); absent when the
-    /// answer did not clear the gate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The selected target's ladder tier id (`"trivial"` / `"routine"` /
+    /// `"medium"` / `"high"`); absent when the answer did not clear the
+    /// gate. Rows written before the unified ladder keep their bytes and
+    /// are mapped when read (see [`deserialize_target_id`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_target_id"
+    )]
     pub target: Option<String>,
     /// The escalation-lane rung a step-granular classification selected
-    /// (backlog ad56c7bd): one of `"cheap"` / `"medium"` / `"high"` /
+    /// (backlog ad56c7bd): one of `"trivial"` / `"medium"` / `"high"` /
     /// `"escalate"`. Absent on pre-prompt (turn-granular) rows and on lane
-    /// rows whose answer did not clear the gate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// rows whose answer did not clear the gate. Mapped when read like
+    /// [`target`](Self::target).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_target_id"
+    )]
     pub lane: Option<String>,
     /// The 0-based index of the plan step a lane row classified (backlog
     /// ad56c7bd; the same index the plan-file `Step` type carries). Absent on
@@ -509,7 +559,7 @@ mod tests {
         let decision = classify_task_text(&stub, "design a storage engine", offered, 0.475)
             .await
             .expect("decision");
-        assert_eq!(decision.target, Some(RouteTarget::Capable));
+        assert_eq!(decision.target, Some(RouteTarget::High));
         let actual = stub.question.lock().expect("question lock").clone();
         let expected = crate::agent::route_question::route_question(offered);
         assert_eq!(actual, expected, "Mnemo1 asks the kernel question byte-for-byte");
@@ -523,14 +573,14 @@ mod tests {
             .expect("decision");
         assert_eq!(decision.label, crate::agent::route_question::LABEL_TRIVIAL);
         assert!((decision.confidence - 0.9).abs() < 1e-9);
-        assert_eq!(decision.target, Some(RouteTarget::Cheap));
+        assert_eq!(decision.target, Some(RouteTarget::Trivial));
 
         let architectural = StubClassifier::new(choice(crate::agent::route_question::LABEL_HARD, 0.95));
         let decision = classify_task_text(&architectural, "add a new feature", all_offered(), 0.80)
             .await
             .expect("decision");
         assert_eq!(decision.label, crate::agent::route_question::LABEL_HARD);
-        assert_eq!(decision.target, Some(RouteTarget::Capable));
+        assert_eq!(decision.target, Some(RouteTarget::High));
     }
 
     #[tokio::test]
@@ -553,14 +603,14 @@ mod tests {
             .expect("decision");
         assert_eq!(decision.label, crate::agent::route_question::LABEL_HARD);
         assert!((decision.confidence - 0.91).abs() < 1e-9);
-        assert_eq!(decision.target, Some(RouteTarget::Capable));
+        assert_eq!(decision.target, Some(RouteTarget::High));
     }
 
     #[tokio::test]
     async fn threshold_is_inclusive_and_below_keeps_no_target() {
         let at = StubClassifier::new(choice(crate::agent::route_question::LABEL_TRIVIAL, 0.80));
         let decision = classify_task_text(&at, "typo", all_offered(), 0.80).await.expect("decision");
-        assert_eq!(decision.target, Some(RouteTarget::Cheap));
+        assert_eq!(decision.target, Some(RouteTarget::Trivial));
 
         let below = StubClassifier::new(choice(crate::agent::route_question::LABEL_TRIVIAL, 0.79));
         let decision = classify_task_text(&below, "typo", all_offered(), 0.80)
@@ -620,7 +670,7 @@ mod tests {
             label: crate::agent::route_question::LABEL_TRIVIAL.into(),
             confidence: 0.93,
             threshold: 0.80,
-            target: Some(RouteTarget::Cheap.label().to_string()),
+            target: Some(RouteTarget::Trivial.label().to_string()),
             lane: None,
             step_index: None,
             enforced: false,
@@ -651,16 +701,25 @@ mod tests {
     }
 
     #[test]
-    fn lane_labels_are_the_plain_rung_names() {
-        // The escalation-lane rungs (backlog ad56c7bd) use the same plain
-        // class labels the other Laya consumers do; the pre-prompt labels
-        // stay byte-identical (the shipped corpus depends on them).
+    fn target_labels_are_the_ladder_tier_ids() {
+        // Every routing target IS a ladder tier id (plan 87932c46): the
+        // routing log, the kNN overlay and the team records all carry these
+        // strings, and `from_tier_id` is the exact inverse.
+        assert_eq!(RouteTarget::Trivial.label(), "trivial");
+        assert_eq!(RouteTarget::Routine.label(), "routine");
         assert_eq!(RouteTarget::Medium.label(), "medium");
         assert_eq!(RouteTarget::High.label(), "high");
         assert_eq!(RouteTarget::Escalate.label(), "escalate");
-        assert_eq!(RouteTarget::Cheap.label(), "cheap");
-        assert_eq!(RouteTarget::Routine.label(), "routine");
-        assert_eq!(RouteTarget::Capable.label(), "capable");
+        for target in [
+            RouteTarget::Trivial,
+            RouteTarget::Routine,
+            RouteTarget::Medium,
+            RouteTarget::High,
+            RouteTarget::Escalate,
+        ] {
+            assert_eq!(RouteTarget::from_tier_id(target.label()), Some(target));
+        }
+        assert_eq!(RouteTarget::from_tier_id("average"), None);
     }
 
     #[test]
@@ -690,11 +749,47 @@ mod tests {
         assert_eq!(back, lane_row);
 
         // A row written BEFORE the lane fields existed (no `lane`, no
-        // `step_index`) still parses: both default to None.
+        // `step_index`) still parses: both default to None, and the legacy
+        // `cheap` target reads as the `trivial` tier.
         let old = r#"{"ts":1,"turn_id":"t","agent_id":"main","shadow":true,"label":"trivial","confidence":0.9,"threshold":0.8,"target":"cheap","enforced":false,"task_text":"x"}"#;
         let back_old: RouteDecisionRow = serde_json::from_str(old).expect("old row parses");
         assert_eq!(back_old.lane, None);
         assert_eq!(back_old.step_index, None);
+        assert_eq!(back_old.target.as_deref(), Some("trivial"));
+    }
+
+    #[tokio::test]
+    async fn an_involved_answer_routes_the_medium_tier() {
+        // The `involved` label joined the offered set in plan 87932c46: it
+        // maps to the `medium` tier through `tier_for_label` (never around
+        // it), and `escalate` stays un-offered to the classifier.
+        let stub = StubClassifier::new(choice(crate::agent::route_question::LABEL_INVOLVED, 0.9));
+        let decision =
+            classify_task_text(&stub, "wire the feature across modules", all_offered(), 0.80)
+                .await
+                .expect("decision");
+        assert_eq!(decision.label, crate::agent::route_question::LABEL_INVOLVED);
+        assert_eq!(decision.target, Some(RouteTarget::Medium));
+    }
+
+    #[test]
+    fn legacy_target_labels_map_onto_ladder_ids_when_read() {
+        // Old rows keep their bytes; every reader sees ladder ids (Mnemo1's
+        // pre-ladder `cheap` was the `trivial` tier, `capable` was `high`).
+        let legacy = r#"{"ts":1,"turn_id":"t","agent_id":"main","shadow":true,"label":"trivial","confidence":0.9,"threshold":0.8,"target":"cheap","lane":"cheap","step_index":1,"enforced":false,"task_text":"x"}"#;
+        let row: RouteDecisionRow = serde_json::from_str(legacy).expect("legacy row parses");
+        assert_eq!(row.target.as_deref(), Some("trivial"));
+        assert_eq!(row.lane.as_deref(), Some("trivial"));
+
+        let legacy = r#"{"ts":2,"turn_id":"t","agent_id":"main","shadow":true,"label":"hard","confidence":0.9,"threshold":0.8,"target":"capable","enforced":false,"task_text":"x"}"#;
+        let row: RouteDecisionRow = serde_json::from_str(legacy).expect("legacy row parses");
+        assert_eq!(row.target.as_deref(), Some("high"));
+
+        // Current rows pass through untouched.
+        let current = r#"{"ts":3,"turn_id":"t","agent_id":"main","shadow":true,"label":"routine","confidence":0.9,"threshold":0.8,"target":"routine","lane":"medium","enforced":false,"task_text":"x"}"#;
+        let row: RouteDecisionRow = serde_json::from_str(current).expect("current row parses");
+        assert_eq!(row.target.as_deref(), Some("routine"));
+        assert_eq!(row.lane.as_deref(), Some("medium"));
     }
 
     #[test]

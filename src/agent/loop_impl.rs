@@ -1617,12 +1617,7 @@ impl AgentLoop {
         to_label: &str,
         expected_epoch: Option<u64>,
     ) -> bool {
-        if ![
-            super::route_question::LABEL_TRIVIAL,
-            super::route_question::LABEL_ROUTINE,
-            super::route_question::LABEL_HARD,
-        ]
-        .contains(&to_label)
+        if super::route_question::tier_for_label(to_label).is_none()
             || !matches!(state.route_once, RouteOnce::Settled { .. })
             || expected_epoch.is_some_and(|epoch| epoch != state.epoch)
             || state.nudge_sent

@@ -406,17 +406,10 @@ impl ModelResolver for ConfigModelResolver {
             .config
             .read()
             .expect("ConfigModelResolver config lock poisoned");
-        let tier_id = match target {
-            RouteTarget::Cheap => "trivial",
-            RouteTarget::Routine => "routine",
-            RouteTarget::Capable => "high",
-            RouteTarget::Medium => "medium",
-            RouteTarget::High => "high",
-            RouteTarget::Escalate => "escalate",
-        };
-        // Temporary Mnemo1 compatibility: step 4 replaces RouteTarget itself.
-        // The ladder supplies fold-down; a dangling endpoint still falls back.
-        let (ran_tier, spec) = config.tiers.resolve(tier_id)?;
+        // The target IS the ladder tier id (plan 87932c46): the ladder
+        // supplies fold-down (an empty tier resolves to the nearest lower
+        // tier with a model), and a dangling endpoint still falls back.
+        let (ran_tier, spec) = config.tiers.resolve(target.label())?;
         let (endpoint, model) = spec.split_once('/')?;
         let target_ref = ModelRef {
             endpoint: endpoint.to_string(),
@@ -709,8 +702,8 @@ mod tests {
         }));
         let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
         let cheap = r
-            .resolve_routed(RouteTarget::Cheap, ctx.clone())
-            .expect("cheap target");
+            .resolve_routed(RouteTarget::Trivial, ctx.clone())
+            .expect("trivial target");
         assert_eq!(cheap.endpoint, "deepseek");
         assert_eq!(cheap.model, "deepseek-v4-flash");
         assert_eq!(cheap.reasoning_effort.as_deref(), Some("minimal"));
@@ -719,8 +712,8 @@ mod tests {
             .expect("routine target");
         assert_eq!(routine.model, "routine-model");
         let capable = r
-            .resolve_routed(RouteTarget::Capable, ctx.clone())
-            .expect("capable target");
+            .resolve_routed(RouteTarget::High, ctx.clone())
+            .expect("high target");
         assert_eq!(capable.endpoint, "openai");
         assert_eq!(capable.model, "o3");
         assert_eq!(capable.reasoning_effort.as_deref(), Some("max"));
@@ -731,8 +724,8 @@ mod tests {
         let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
         // Unset: no routing config at all (the default config shape).
         let plain = resolver(config_with_endpoints(ModelsConfig::default()));
-        assert!(plain.resolve_routed(RouteTarget::Cheap, ctx.clone()).is_none());
-        assert!(plain.resolve_routed(RouteTarget::Capable, ctx.clone()).is_none());
+        assert!(plain.resolve_routed(RouteTarget::Trivial, ctx.clone()).is_none());
+        assert!(plain.resolve_routed(RouteTarget::High, ctx.clone()).is_none());
 
         // Dangling: the endpoint no longer exists -> today's model.
         let dangling = resolver(config_with_routing(RoutingConfig {
@@ -744,8 +737,8 @@ mod tests {
             capable: Some(capable_ref()),
             ..RoutingConfig::default()
         }));
-        assert!(dangling.resolve_routed(RouteTarget::Cheap, ctx.clone()).is_none());
-        assert!(dangling.resolve_routed(RouteTarget::Capable, ctx.clone()).is_some());
+        assert!(dangling.resolve_routed(RouteTarget::Trivial, ctx.clone()).is_none());
+        assert!(dangling.resolve_routed(RouteTarget::High, ctx.clone()).is_some());
     }
 
     #[test]
@@ -766,7 +759,7 @@ mod tests {
         }));
         let medium = r
             .resolve_routed(RouteTarget::Medium, ctx.clone())
-            .expect("lane_medium target");
+            .expect("medium tier target");
         assert_eq!(medium.endpoint, "deepseek");
         assert_eq!(medium.model, "medium-model");
         // An empty rung folds down to the nearest lower rung with a model.
@@ -803,6 +796,28 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_medium_tier_folds_down_to_routine() {
+        // Design §3.2: every tier resolves — an empty tier folds down to the
+        // nearest lower tier with a model. Here `medium` is empty, so the
+        // step-lane `medium` rung runs on `routine`'s first model.
+        let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
+        let r = resolver(config_with_routing(RoutingConfig {
+            routine: Some(ModelRef {
+                endpoint: "openai".into(),
+                model: "routine-model".into(),
+                reasoning_effort: None,
+            }),
+            ..RoutingConfig::default()
+        }));
+        assert_eq!(
+            r.resolve_routed(RouteTarget::Medium, ctx)
+                .expect("medium folds down to routine")
+                .model,
+            "routine-model"
+        );
+    }
+
+    #[test]
     fn explicit_pins_beat_routing() {
         let r = resolver(config_with_routing(RoutingConfig {
             cheap: Some(cheap_ref()),
@@ -811,10 +826,10 @@ mod tests {
         }));
         // A skill is a deliberate context switch.
         let skill = ModelContext::new(WorkflowState::Skill, Some("merge_to_main"), false, None);
-        assert!(r.resolve_routed(RouteTarget::Cheap, skill).is_none());
+        assert!(r.resolve_routed(RouteTarget::Trivial, skill).is_none());
         // Subagents have their own role slot.
         let sub = ModelContext::new(WorkflowState::Subagent, None, true, None);
-        assert!(r.resolve_routed(RouteTarget::Capable, sub).is_none());
+        assert!(r.resolve_routed(RouteTarget::High, sub).is_none());
         // The bug-fixing plan-kind slot wins in its active lifecycle.
         let bug = ModelContext::new(
             WorkflowState::Executing,
@@ -822,7 +837,7 @@ mod tests {
             false,
             Some(PlanKind::BugFixing),
         );
-        assert!(r.resolve_routed(RouteTarget::Capable, bug).is_none());
+        assert!(r.resolve_routed(RouteTarget::High, bug).is_none());
         // ... but not in Complete (the plan is finished, no slot engaged).
         let done = ModelContext::new(
             WorkflowState::Complete,
@@ -830,7 +845,7 @@ mod tests {
             false,
             Some(PlanKind::BugFixing),
         );
-        assert!(r.resolve_routed(RouteTarget::Capable, done).is_some());
+        assert!(r.resolve_routed(RouteTarget::High, done).is_some());
     }
 
     #[test]

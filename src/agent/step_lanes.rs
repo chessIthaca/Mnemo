@@ -8,12 +8,14 @@
 //!
 //! The ladder resolves a plan STEP, not a whole turn: at each step boundary
 //! the compound reflex call ([`super::reflex`]) classifies the step in ONE
-//! request, and the rung it answers — `cheap` → default → `medium` → `high` →
-//! `escalate` — selects the matching `[general.routing]` lane target
-//! ([`Cheap`](LaneRung::Cheap) rides the pre-prompt `cheap` target) for the
-//! iterations that follow. A rung whose target is unset (the default) or
-//! dangling falls through to the turn's configured model: the ladder NEVER
-//! invents a model id, and a miss is always the fail-safe.
+//! request, and the rung it answers — `small` → `trivial` → `medium` →
+//! `high` → `escalate` — selects the matching tier on the shared tier ladder
+//! (plan 87932c46: the reflex's `small` maps onto the `trivial` tier) for the
+//! iterations that follow. Resolution goes through
+//! [`TierLadder::resolve`](crate::config::endpoints::TierLadder::resolve):
+//! an empty tier folds down to the nearest lower tier with a model, and a
+//! tier that resolves to nothing at all keeps the turn's configured model —
+//! the ladder NEVER invents a model id, and a miss is always the fail-safe.
 //!
 //! # When a classification happens
 //!
@@ -49,26 +51,30 @@ use super::model_routing;
 use super::model_routing::{RouteDecisionRow, RouteTarget};
 use super::reflex::{Complexity, ReflexAction, ReflexDecision, ReflexKeepReason, REFLEX_THRESHOLD};
 
-/// One rung of the escalation ladder, cheapest first.
+/// One rung of the escalation ladder, cheapest first. Every rung IS a
+/// ladder tier id (plan 87932c46): the reflex's complexity answer maps onto
+/// the tier, and the tier's models live in `endpoints.toml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneRung {
-    /// The bounded-change rung: rides the pre-prompt `[general.routing]
-    /// cheap` target (the task-complexity router already owns that model).
-    Cheap,
-    /// A normal multi-file change: the `lane_medium` target.
+    /// The bounded-change rung: the `trivial` tier (the reflex answers
+    /// `small`; the task-complexity router picks the same tier for a
+    /// trivially-classified first prompt).
+    Trivial,
+    /// A normal multi-file change: the `medium` tier.
     Medium,
-    /// Capable-lane work: the `lane_high` target.
+    /// Capable-lane work: the `high` tier.
     High,
-    /// Hand-it-upward work: the `escalate` target.
+    /// Hand-it-upward work: the `escalate` tier.
     Escalate,
 }
 
 impl LaneRung {
-    /// The wire/log label (`"cheap"` / `"medium"` / `"high"` / `"escalate"`),
-    /// identical to the [`RouteTarget`] label of the same name.
+    /// The wire/log label (`"trivial"` / `"medium"` / `"high"` /
+    /// `"escalate"`), identical to the [`RouteTarget`] label of the same
+    /// name.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Cheap => "cheap",
+            Self::Trivial => "trivial",
             Self::Medium => "medium",
             Self::High => "high",
             Self::Escalate => "escalate",
@@ -78,7 +84,7 @@ impl LaneRung {
     /// The routing target this rung selects.
     pub fn to_route_target(self) -> RouteTarget {
         match self {
-            Self::Cheap => RouteTarget::Cheap,
+            Self::Trivial => RouteTarget::Trivial,
             Self::Medium => RouteTarget::Medium,
             Self::High => RouteTarget::High,
             Self::Escalate => RouteTarget::Escalate,
@@ -88,7 +94,7 @@ impl LaneRung {
 
 /// The rung a decided reflex decision selects.
 ///
-/// Complexity picks the rung (`small` → cheap, `medium` → medium, `high` →
+/// Complexity picks the rung (`small` → trivial, `medium` → medium, `high` →
 /// high, `escalate` → escalate), and an `escalate` ACTION overrides it
 /// outright: the action question answers "what should happen to this step
 /// next", and when the answer is "hand it upward" the lane follows even if the
@@ -100,7 +106,7 @@ pub fn rung_from_decision(decision: &ReflexDecision) -> LaneRung {
         return LaneRung::Escalate;
     }
     match decision.complexity {
-        Complexity::Small => LaneRung::Cheap,
+        Complexity::Small => LaneRung::Trivial,
         Complexity::Medium => LaneRung::Medium,
         Complexity::High => LaneRung::High,
         Complexity::Escalate => LaneRung::Escalate,
@@ -375,7 +381,7 @@ mod tests {
     #[test]
     fn rung_follows_complexity_and_escalate_action_overrides() {
         for (complexity, expected) in [
-            (Complexity::Small, LaneRung::Cheap),
+            (Complexity::Small, LaneRung::Trivial),
             (Complexity::Medium, LaneRung::Medium),
             (Complexity::High, LaneRung::High),
             (Complexity::Escalate, LaneRung::Escalate),
@@ -407,10 +413,11 @@ mod tests {
 
     #[test]
     fn lane_rungs_use_the_routing_vocabulary() {
-        // One label per rung, and the same label the routing target carries --
-        // the config keys, the rows and the log speak one vocabulary.
+        // One label per rung, and the same ladder tier id the routing target
+        // carries -- the config keys, the rows and the log speak one
+        // vocabulary.
         for (rung, label) in [
-            (LaneRung::Cheap, "cheap"),
+            (LaneRung::Trivial, "trivial"),
             (LaneRung::Medium, "medium"),
             (LaneRung::High, "high"),
             (LaneRung::Escalate, "escalate"),

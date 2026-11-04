@@ -117,6 +117,17 @@ Both apps get the same escalation rule, built on the existing nudge machinery (M
 - **What:** a nudge "escalate to <next tier up>" for the lead (Mnemo2) or the turn loop (Mnemo1). In shadow and suggest modes it is a suggestion the lead accepts with `team_resume` + `tier`; in auto mode Mnemo2 switches the idle worker itself without asking (decided 2026-11-04) and tells the lead in a notice. A worker already on the highest non-escalate tier is offered `escalate`.
 - **Logged** as a reroute row with `source: "escalation"`, so the kNN learns from it.
 
+### 6.1 Fix rounds may step down (suggested by the user, 2026-11-04)
+
+The opposite case: a strong-tier worker whose review left only small, exact fixes (a rename, a missing test, a wording change, a one-line guard) does not need its expensive model for the fix round.
+
+- **`team_route_fix` takes an optional `tier`.** The fix round runs on that tier's model in the **same session** (transcript, worktree and branch kept, as `team_resume` + `tier` does today), so the cheaper model starts with full context.
+- **Who picks:** the lead, explicitly; or, when the lead passes `tier: "auto"`, the routing question (Laya + kNN, §5.1) classifies the findings' text (title, detail, file) — the same question as for dispatch, so no new calibration. In shadow mode the pick is only logged; in suggest/auto it is used when it clears the gate.
+- **Never below what the finding needs:** a finding marked `high` severity, or touching a file the plan marks as a shared contract, never steps down automatically (the lead can still choose).
+- **Back up when it fails:** if the stepped-down fix round does not close its finding (the re-review keeps it open), the next round returns to the worker's previous tier — the escalation rule above applies from there.
+- **Logged** as a reroute row with `source: "fix_downshift"` plus the outcome of that fix round (closed or not), so the kNN learns which findings a cheap model can fix.
+- **Audits:** a high-risk worker still needs a fresh audit after any fix commit, whatever tier made it.
+
 ## 7. Settings > Tiers (the one place)
 
 Decided with the user (2026-11-04): the Tiers page and the routing half of the Decisions (Laya) page become **one Tiers page**. Everything about "which tier, and who picks it" lives there. The Mnemo1 lane block disappears.
@@ -184,7 +195,7 @@ Found by grep for the three ids and the lane fields; each is in scope.
 3. **Mnemo2 on the ladder**: team.rs (tool schema + generated description, validation, fold-down result note, reroutes, outcomes, `team.json` conversion), dispatch_routing.rs, route_knn.rs (tier ids, old-row mapping), route_eval.rs, ledger. — difficult
 4. **Mnemo1 on the ladder**: model_routing.rs, step_lanes.rs, the reflex mapping, settings DTO/patch, `routing.jsonl` old-row mapping. — average
 5. **One Tiers page** (§7): the "who picks the tier" control with Laya readiness states and inline install/turn-on, the ladder editor, the collapsed routing details and eval moved from the Laya page; the Decisions page shrinks to Laya's non-routing uses. — average (UI) after a small backend step for the combined save (mode + Mnemo1 enforce/laya.routing in one call).
-6. **Escalation** (§6) for both apps on the nudge machinery, auto-switch in auto mode. — difficult
+6. **Escalation and fix-round step-down** (§6, §6.1) for both apps on the nudge machinery: auto-switch up in auto mode, and `team_route_fix` with an optional `tier` (explicit or `auto`) that runs the fix round on a cheaper tier and returns to the previous tier if the finding stays open. — difficult
 7. **Plugin text**: mnemo-lead skill, server instructions, SessionStart summary. — simple
 8. **Live check (lead)**: migration on the real config, a dispatch per tier, a folded `medium` dispatch, the four-label eval and Apply, an escalation, Mnemo1 first prompt, the Tiers page with Laya ready / not installed.
 

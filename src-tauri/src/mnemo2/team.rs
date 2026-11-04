@@ -22,6 +22,7 @@ use mnemo::app::worktrees::{
     agent_branch, agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
 };
 use mnemo::agent::route_question;
+use mnemo::config::endpoints::{Tier, TierLadder};
 use mnemo::headless::{
     AgentSession, Engine, EventReceiver, GateRule, GateVerdict, Guardrails, HostToolSpec,
     PendingInteraction, QuestionPolicy, SessionCommand, SessionEvent, SessionId, SpawnOptions,
@@ -61,6 +62,8 @@ pub const DELETION_EVENT_CHANNEL: &str = "mnemo2://worker-deletion";
 
 /// The persisted worker ledger inside the team's state directory.
 const TEAM_STATE_FILE: &str = "team.json";
+/// Original bytes preserved before the one-time legacy tier-id conversion.
+const TEAM_PRE_TIERS_BACKUP: &str = "team.json.pre-tiers.bak";
 
 /// How many transient team events the broadcast bus keeps for a slow consumer.
 const EVENT_BUFFER: usize = 1024;
@@ -351,9 +354,8 @@ pub struct WorkerRecord {
     /// The 0-based plan step the task was dispatched under.
     #[serde(default)]
     pub plan_step: Option<usize>,
-    /// The model tier (`difficult`, `average`, `simple`) the lead chose,
-    /// when it dispatched by tier — and the tier a later model switch moved
-    /// the worker to, when the new model belongs to one.
+    /// The resolved ladder tier (`trivial`, `routine`, `medium`, `high`, or
+    /// `escalate`) the worker ran on, including later model switches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
     /// The dispatch-time Laya decision, absent for legacy and unrouted workers.
@@ -670,17 +672,35 @@ impl TeamPersistence {
 
     fn load(&self) -> Result<Option<PersistedTeam>, String> {
         let backup = self.path.with_extension("json.bak");
-        match Self::decode(&self.path) {
-            Ok(Some(team)) => Ok(Some(team)),
-            Ok(None) => Self::decode(&backup),
+        let loaded = match Self::decode(&self.path) {
+            Ok(Some(team)) => Some((team, self.path.clone())),
+            Ok(None) => Self::decode(&backup)?.map(|team| (team, backup.clone())),
             Err(primary_error) => match Self::decode(&backup) {
-                Ok(Some(team)) => Ok(Some(team)),
-                Ok(None) => Err(primary_error),
-                Err(backup_error) => Err(format!(
-                    "{primary_error}; backup also failed: {backup_error}"
-                )),
+                Ok(Some(team)) => Some((team, backup.clone())),
+                Ok(None) => return Err(primary_error),
+                Err(backup_error) => {
+                    return Err(format!(
+                        "{primary_error}; backup also failed: {backup_error}"
+                    ));
+                }
             },
+        };
+        let Some((mut team, source)) = loaded else {
+            return Ok(None);
+        };
+        if convert_legacy_team_tiers(&mut team) {
+            let pre_tiers = self.path.with_file_name(TEAM_PRE_TIERS_BACKUP);
+            if !pre_tiers.exists() {
+                std::fs::copy(&source, &pre_tiers).map_err(|error| {
+                    format!(
+                        "could not preserve legacy team ledger as {}: {error}",
+                        pre_tiers.display()
+                    )
+                })?;
+            }
+            self.save(&team)?;
         }
+        Ok(Some(team))
     }
 
     fn save(&self, team: &PersistedTeam) -> Result<(), String> {
@@ -719,6 +739,97 @@ impl TeamPersistence {
             }
         }
     }
+}
+
+/// Convert one stored tier id, returning whether it changed.
+fn convert_legacy_tier(tier: &mut String) -> bool {
+    let Some(converted) = TierLadder::convert_old_id(tier) else {
+        return false;
+    };
+    *tier = converted.to_string();
+    true
+}
+
+/// Convert an optional stored tier id, returning whether it changed.
+fn convert_legacy_optional_tier(tier: &mut Option<String>) -> bool {
+    tier.as_mut().is_some_and(convert_legacy_tier)
+}
+
+/// Convert every tier id embedded in one historical routing row.
+fn convert_legacy_row_tiers(row: &mut DispatchRoutingRow) -> bool {
+    let mut changed = false;
+    match row {
+        DispatchRoutingRow::Route {
+            tier,
+            lead_tier,
+            ran_tier,
+            ..
+        } => {
+            changed |= convert_legacy_optional_tier(tier);
+            changed |= convert_legacy_optional_tier(lead_tier);
+            changed |= convert_legacy_optional_tier(ran_tier);
+        }
+        DispatchRoutingRow::LeadOverride {
+            laya_tier,
+            lead_tier,
+            requested_tier,
+            ..
+        } => {
+            changed |= convert_legacy_optional_tier(laya_tier);
+            changed |= convert_legacy_tier(lead_tier);
+            changed |= convert_legacy_optional_tier(requested_tier);
+        }
+        DispatchRoutingRow::LeadReroute {
+            from_tier,
+            to_tier,
+            ..
+        }
+        | DispatchRoutingRow::UserReroute {
+            from_tier,
+            to_tier,
+            ..
+        }
+        | DispatchRoutingRow::Nudge {
+            from_tier,
+            to_tier,
+            ..
+        }
+        => {
+            changed |= convert_legacy_tier(from_tier);
+            changed |= convert_legacy_tier(to_tier);
+        }
+        DispatchRoutingRow::NudgeIgnored { tier, .. } => {
+            changed |= convert_legacy_tier(tier);
+        }
+        DispatchRoutingRow::Outcome {
+            final_tier,
+            label,
+            ..
+        } => {
+            changed |= convert_legacy_tier(final_tier);
+            changed |= convert_legacy_optional_tier(label);
+        }
+    }
+    changed
+}
+
+/// Convert legacy ids throughout a decoded ledger. The caller preserves the
+/// original bytes once before saving the converted records.
+fn convert_legacy_team_tiers(team: &mut PersistedTeam) -> bool {
+    let mut changed = false;
+    for worker in &mut team.workers {
+        changed |= worker.tier.as_mut().is_some_and(convert_legacy_tier);
+        if let Some(routing) = &mut worker.routing {
+            changed |= convert_legacy_optional_tier(&mut routing.laya_tier);
+            changed |= convert_legacy_optional_tier(&mut routing.lead_tier);
+            changed |= convert_legacy_optional_tier(&mut routing.ran_tier);
+            changed |= convert_legacy_optional_tier(&mut routing.nudged);
+        }
+        for row in &mut worker.reroutes {
+            changed |= convert_legacy_row_tiers(row);
+        }
+    }
+    changed
 }
 
 struct LiveWorker {
@@ -938,8 +1049,73 @@ fn outcome_row(record: &WorkerRecord, status: &str) -> Option<DispatchRoutingRow
     })
 }
 
-/// The tier ladder the nudges climb, lowest first (design §4.6).
-const NUDGE_LADDER: [&str; 3] = ["simple", "average", "difficult"];
+/// Convert the settings wire shape into the only tier-reading interface.
+/// An entirely empty ladder is allowed here (no models configured yet); the
+/// Settings save path performs the stricter non-empty-`trivial` validation.
+fn tier_ladder_from_dto(tiers: &mnemo::headless::TiersDto) -> TierLadder {
+    TierLadder {
+        tiers: tiers
+            .tiers
+            .iter()
+            .map(|tier| Tier {
+                id: tier.id.clone(),
+                name: tier.name.clone(),
+                definition: tier.definition.clone(),
+                models: tier.models.clone(),
+                effort: tier.effort.clone(),
+                role: tier.role.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Ladder ids in their fixed order, for schemas and diagnostics.
+fn tier_ids(ladder: &TierLadder) -> Vec<&str> {
+    ladder.ordered().iter().map(|tier| tier.id.as_str()).collect()
+}
+
+/// Resolve a requested tier to its nearest available model at or below it.
+fn resolve_tier_over(
+    models: &[LeadModel],
+    ladder: &TierLadder,
+    tier: &str,
+) -> Result<(String, LeadModel), String> {
+    if ladder.get(tier).is_none() {
+        return Err(format!(
+            "unknown tier '{tier}'; expected one of: {}",
+            tier_ids(ladder).join(", ")
+        ));
+    }
+    let (mut ran_tier, _) = ladder.resolve(tier).ok_or_else(|| {
+        format!("tier '{tier}' has no available models; pass a `model` or another tier")
+    })?;
+    loop {
+        if let Some(model) = ladder
+            .get(&ran_tier)
+            .into_iter()
+            .flat_map(|rung| rung.models.iter())
+            .find_map(|spec| models.iter().find(|model| model.spec == *spec))
+        {
+            return Ok((ran_tier.to_string(), model.clone()));
+        }
+        let rank = ladder
+            .ordered()
+            .iter()
+            .position(|candidate| candidate.id == ran_tier)
+            .expect("a resolved tier is on the ladder");
+        if rank == 0 {
+            break;
+        }
+        ran_tier = ladder.ordered()[rank - 1].id.clone();
+    }
+    Err(format!(
+        "tier '{tier}' has no available models; pass a `model` or another tier"
+    ))
+}
+
+/// The tier ladder the nudges climb, lowest first; escalation is never a
+/// nudge destination.
+const NUDGE_LADDER: [&str; 4] = ["trivial", "routine", "medium", "high"];
 
 /// Consecutive failed or verbatim-repeated tool calls that fire a nudge
 /// (design §4.6).
@@ -953,24 +1129,35 @@ fn enabled_tiers_over(
     models: &[LeadModel],
     tiers: &mnemo::headless::TiersDto,
 ) -> EnabledTiers {
-    let named = |old_id: &str| {
-        let Some(id) = mnemo::config::TierLadder::convert_old_id(old_id) else {
-            return false;
-        };
-        tiers
-            .tiers
-            .iter()
-            .find(|tier| tier.id == id)
-            .is_some_and(|tier| {
-                tier.models
-                    .iter()
-                    .any(|spec| models.iter().any(|model| model.spec == *spec))
-            })
+    let ladder = tier_ladder_from_dto(tiers);
+    let resolves = |tier| resolve_tier_over(models, &ladder, tier).is_ok();
+    EnabledTiers {
+        trivial: resolves("trivial"),
+        routine: resolves("routine"),
+        medium: resolves("medium"),
+        high: resolves("high"),
+    }
+}
+
+/// Directly modelled tiers for nudges. Unlike dispatch routing, a nudge must
+/// not target an empty tier that would fold back to the worker's current one.
+fn direct_tiers_over(
+    models: &[LeadModel],
+    tiers: &mnemo::headless::TiersDto,
+) -> EnabledTiers {
+    let ladder = tier_ladder_from_dto(tiers);
+    let direct = |tier| {
+        ladder.get(tier).is_some_and(|rung| {
+            rung.models
+                .iter()
+                .any(|spec| models.iter().any(|model| model.spec == *spec))
+        })
     };
     EnabledTiers {
-        simple: named("simple"),
-        average: named("average"),
-        difficult: named("difficult"),
+        trivial: direct("trivial"),
+        routine: direct("routine"),
+        medium: direct("medium"),
+        high: direct("high"),
     }
 }
 
@@ -981,7 +1168,7 @@ fn next_tier_above(enabled: EnabledTiers, current: &str) -> Option<&'static str>
     let rank = NUDGE_LADDER.iter().position(|tier| *tier == current)?;
     NUDGE_LADDER
         .iter()
-        .zip([enabled.simple, enabled.average, enabled.difficult])
+        .zip([enabled.trivial, enabled.routine, enabled.medium, enabled.high])
         .skip(rank + 1)
         .find(|(_, offered)| *offered)
         .map(|(tier, _)| *tier)
@@ -1134,7 +1321,7 @@ struct StrikeNudges<'a> {
 /// already nudged, has no routing record, or sits on the top enabled
 /// tier.
 async fn try_strike_nudge(worker_id: &str, nudges: StrikeNudges<'_>, repeated: bool) {
-    let enabled = enabled_tiers_over(
+    let enabled = direct_tiers_over(
         &nudges.models.read().unwrap_or_else(|e| e.into_inner()),
         &nudges.tiers.read().unwrap_or_else(|e| e.into_inner()),
     );
@@ -1206,19 +1393,6 @@ pub struct TeamRuntime {
     /// Wakes [`TeamRuntime::wait_external_notices`] on a push or a detach.
     external_wake: tokio::sync::Notify,
 }
-
-/// The model tiers the lead may dispatch by, with their one-line purpose.
-const TIER_PURPOSES: [(&str, &str); 3] = [
-    (
-        "difficult",
-        "design, debugging, bug_fixing plans, cross-cutting work, steps touching shared contracts",
-    ),
-    ("average", "typical implementation steps"),
-    (
-        "simple",
-        "single-file mechanical edits, checks, lookups, scaffolding",
-    ),
-];
 
 /// Upper bound for concurrently live worker sessions in one project.
 pub const MAX_WORKER_SLOTS: usize = 32;
@@ -1345,25 +1519,33 @@ impl TeamRuntime {
             .clone()
     }
 
+    /// The live ladder new dispatches and tool descriptions resolve against.
+    fn tier_ladder(&self) -> TierLadder {
+        tier_ladder_from_dto(&self.tiers.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The tier's configured models that are still available, in order.
     pub(crate) fn tier_models(&self, tier: &str) -> Vec<LeadModel> {
-        let tiers = self.tiers.read().unwrap_or_else(|e| e.into_inner()).clone();
-        // Temporary old-id mapping until step 3 moves Mnemo2 onto the ladder.
-        let specs = mnemo::config::TierLadder::convert_old_id(tier)
-            .and_then(|id| tiers.tiers.iter().find(|candidate| candidate.id == id))
-            .map(|tier| tier.models.clone())
-            .unwrap_or_default();
+        let ladder = self.tier_ladder();
         let models = self.current_models();
-        specs
-            .iter()
-            .filter_map(|spec| models.iter().find(|m| &m.spec == spec).cloned())
+        ladder
+            .get(tier)
+            .into_iter()
+            .flat_map(|rung| rung.models.iter())
+            .filter_map(|spec| models.iter().find(|model| model.spec == *spec).cloned())
             .collect()
+    }
+
+    /// Resolve one lead tier through the ladder's fold-down rule.
+    fn resolve_tier_choice(&self, tier: &str) -> Result<(String, LeadModel), String> {
+        resolve_tier_over(&self.current_models(), &self.tier_ladder(), tier)
     }
 
     /// Every available model some tier names, in tier order, once each.
     fn tiered_models(&self) -> Vec<LeadModel> {
         let mut models: Vec<LeadModel> = Vec::new();
-        for (tier, _) in TIER_PURPOSES {
+        let ladder = self.tier_ladder();
+        for tier in tier_ids(&ladder) {
             for model in self.tier_models(tier) {
                 if !models.iter().any(|known| known.spec == model.spec) {
                     models.push(model);
@@ -1381,15 +1563,16 @@ impl TeamRuntime {
         tier: Option<&str>,
         model: Option<String>,
     ) -> Result<Option<String>, String> {
+        if let Some(tier) = tier {
+            if self.tier_ladder().get(tier).is_none() {
+                return Err(format!(
+                    "unknown tier '{tier}'; expected one of: {}",
+                    tier_ids(&self.tier_ladder()).join(", ")
+                ));
+            }
+        }
         let model = match (model, tier) {
-            (None, Some(tier)) => match self.tier_models(tier).into_iter().next() {
-                Some(first) => Some(first.spec),
-                None => {
-                    return Err(format!(
-                        "tier '{tier}' has no available models; pass a `model` or another tier"
-                    ));
-                }
-            },
+            (None, Some(tier)) => Some(self.resolve_tier_choice(tier)?.1.spec),
             (model, _) => model,
         };
         let tiered = self.tiered_models();
@@ -1402,6 +1585,24 @@ impl TeamRuntime {
             }
             _ => Ok(model),
         }
+    }
+
+    /// Resolve a lead's model/tier choice and retain the tier that actually
+    /// runs (which may be below the requested tier).
+    fn lead_choice_with_tier(
+        &self,
+        tier: Option<&str>,
+        model: Option<String>,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        if model.is_none() {
+            if let Some(tier) = tier {
+                let (ran_tier, choice) = self.resolve_tier_choice(tier)?;
+                return Ok((Some(choice.spec), Some(ran_tier)));
+            }
+        }
+        let model = self.lead_model_choice(tier, model)?;
+        let ran_tier = self.tier_for_model(model.as_deref());
+        Ok((model, ran_tier))
     }
 
     async fn route_implementation_dispatch(
@@ -1429,10 +1630,16 @@ impl TeamRuntime {
             }
         }
         if settings.mode == RoutingMode::Off {
+            let (model, tier) =
+                self.lead_choice_with_tier(requested_tier, request.model.clone())?;
+            let reasoning_effort = request.reasoning_effort.clone().or_else(|| {
+                tier.as_deref()
+                    .and_then(|tier| self.tier_ladder().get(tier).and_then(|rung| rung.effort.clone()))
+            });
             return Ok(RoutedDispatch {
-                model: self.lead_model_choice(requested_tier, request.model.clone())?,
-                tier: request.tier.clone(),
-                reasoning_effort: request.reasoning_effort.clone(),
+                model,
+                tier,
+                reasoning_effort,
                 routing: None,
                 rows: Vec::new(),
                 error: None,
@@ -1488,18 +1695,13 @@ impl TeamRuntime {
 
         let mut refusal = None;
         let (chosen_model, chosen_tier) = if has_explicit_choice {
-            let model = self.lead_model_choice(explicit_tier, request.model.clone())?;
-            let tier = if request.model.is_some() {
-                self.tier_for_model(model.as_deref())
-            } else {
-                explicit_tier.map(str::to_string)
-            };
-            (model, tier)
+            self.lead_choice_with_tier(explicit_tier, request.model.clone())?
         } else if let Some(tier) = cleared_tier.filter(|_| {
             settings.mode == RoutingMode::Auto
                 || (settings.mode == RoutingMode::Suggest && requested_tier == Some("auto"))
         }) {
-            (self.lead_model_choice(Some(tier), None)?, Some(tier.to_string()))
+            let (ran_tier, choice) = self.resolve_tier_choice(tier)?;
+            (Some(choice.spec), Some(ran_tier))
         } else if settings.mode == RoutingMode::Suggest && requested_tier == Some("auto") {
             refusal = Some(if skip_reason == Some("offline") {
                 "Laya is not running; pass a tier".to_string()
@@ -1512,16 +1714,27 @@ impl TeamRuntime {
             (None, None)
         } else if settings.mode == RoutingMode::Auto {
             let tier = settings.fallback_tier.clone();
-            if self.tier_models(&tier).is_empty() {
+            if self.tiered_models().is_empty() {
                 (self.lead_model_choice(None, None)?, None)
             } else {
-                (self.lead_model_choice(Some(&tier), None)?, Some(tier))
+                let (ran_tier, choice) = self.resolve_tier_choice(&tier)?;
+                (Some(choice.spec), Some(ran_tier))
             }
         } else {
             (self.lead_model_choice(None, None)?, None)
         };
+        let auto_fallback_tier = (!has_explicit_choice
+            && settings.mode == RoutingMode::Auto
+            && cleared_tier.is_none()
+            && chosen_tier.is_some())
+        .then(|| settings.fallback_tier.clone());
         let routed_by = if has_explicit_choice {
-            if cleared_tier.is_some() && cleared_tier != chosen_tier.as_deref() {
+            let lead_tier = if request.model.is_some() {
+                chosen_tier.as_deref()
+            } else {
+                explicit_tier
+            };
+            if cleared_tier.is_some() && cleared_tier != lead_tier {
                 "lead_override"
             } else {
                 "lead"
@@ -1536,10 +1749,11 @@ impl TeamRuntime {
             "lead"
         };
         let reasoning_effort = request.reasoning_effort.clone().or_else(|| {
-            chosen_tier
-                .as_ref()
-                .and_then(|tier| settings.effort.get(tier))
-                .cloned()
+            chosen_tier.as_deref().and_then(|tier| {
+                self.tier_ladder()
+                    .get(tier)
+                    .and_then(|rung| rung.effort.clone())
+            })
         });
         let routing = WorkerRouting {
             laya_tier: decision
@@ -1552,6 +1766,7 @@ impl TeamRuntime {
                 .then(|| {
                     explicit_tier
                         .map(str::to_string)
+                        .or_else(|| auto_fallback_tier.clone())
                         .or_else(|| chosen_tier.clone())
                 })
                 .flatten(),
@@ -1598,7 +1813,7 @@ impl TeamRuntime {
                 },
             ),
             cleared: routing.cleared,
-            lead_tier: explicit_tier.map(str::to_string),
+            lead_tier: routing.lead_tier.clone(),
             ran_tier: refusal.is_none().then(|| chosen_tier.clone()).flatten(),
             ran_model: refusal.is_none().then(|| chosen_model.clone()).flatten(),
             text: classified_text.unwrap_or_default(),
@@ -1622,9 +1837,9 @@ impl TeamRuntime {
                     step: request.plan.as_ref().map_or(0, |plan| plan.step + 1),
                     laya_tier: Some(laya_tier),
                     lead_tier: chosen_tier.clone().unwrap_or_else(|| "custom".into()),
-                    requested_tier: explicit_tier.map(str::to_string).filter(|requested| {
-                        Some(requested.as_str()) != chosen_tier.as_deref()
-                    }),
+                    requested_tier: explicit_tier
+                        .map(str::to_string)
+                        .filter(|requested| Some(requested.as_str()) != chosen_tier.as_deref()),
                     confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
                 });
             }
@@ -1639,20 +1854,40 @@ impl TeamRuntime {
         })
     }
 
-    /// The tier a model spec belongs to: the first tier whose list names it.
-    fn tier_of(&self, spec: &str) -> Option<&'static str> {
-        TIER_PURPOSES
-            .iter()
-            .map(|(tier, _)| *tier)
-            .find(|tier| self.tier_models(tier).iter().any(|model| model.spec == spec))
+    /// The tier a model spec belongs to: the first ladder rung whose list
+    /// names an available model.
+    fn tier_of(&self, spec: &str) -> Option<String> {
+        let ladder = self.tier_ladder();
+        let models = self.current_models();
+        tier_ids(&ladder).into_iter().find(|tier| {
+            ladder
+                .get(tier)
+                .into_iter()
+                .flat_map(|rung| rung.models.iter())
+                .any(|candidate| {
+                    candidate == spec && models.iter().any(|model| model.spec == *candidate)
+                })
+        }).map(str::to_string)
     }
 
     fn tier_for_model(&self, model: Option<&str>) -> Option<String> {
-        self.tier_of(model?).map(str::to_string)
+        self.tier_of(model?)
     }
 
     fn enabled_routing_tiers(&self) -> EnabledTiers {
         enabled_tiers_over(
+            &self.current_models(),
+            &self.tiers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+
+    /// Nudge destinations have their own models, so a nudge cannot fold back
+    /// onto the tier the worker is already running.
+    fn direct_nudge_tiers(&self) -> EnabledTiers {
+        direct_tiers_over(
             &self.current_models(),
             &self.tiers
                 .read()
@@ -1686,34 +1921,57 @@ impl TeamRuntime {
             .map(|p| format!("${}/${}", p.input_per_1m, p.output_per_1m))
     }
 
-    /// The tier guidance shown to the lead: each tier with its one-line
-    /// purpose and its models (with prices).
+    /// Generate the lead's tier guidance from the ladder itself: editable
+    /// names and definitions, available models with prices, effort and the
+    /// fold-down destination of an empty tier.
     fn tier_guidance(&self) -> Option<String> {
+        if self.tiered_models().is_empty() {
+            return None;
+        }
+        let ladder = self.tier_ladder();
         let mut lines = Vec::new();
-        for (tier, purpose) in TIER_PURPOSES {
+        for rung in ladder.ordered() {
+            let tier = rung.id.as_str();
             let models = self.tier_models(tier);
-            if models.is_empty() {
-                continue;
-            }
-            let list = models
-                .iter()
-                .map(|m| match self.price_label(m) {
-                    Some(price) => format!("{} ({price})", m.spec),
-                    None => m.spec.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(format!("{tier} - {purpose}: {list}"));
+            let list = if models.is_empty() {
+                match self.resolve_tier_choice(tier) {
+                    Ok((ran_tier, _)) if ran_tier != tier => {
+                        format!("no model; folds down to {ran_tier}")
+                    }
+                    _ => "no model".to_string(),
+                }
+            } else {
+                models
+                    .iter()
+                    .map(|model| match self.price_label(model) {
+                        Some(price) => format!("{} ({price})", model.spec),
+                        None => model.spec.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let effort = rung
+                .effort
+                .as_deref()
+                .map(|effort| format!("; effort {effort}"))
+                .unwrap_or_default();
+            let escalation = if rung.role.as_deref() == Some("escalate") {
+                "; escalation only, never a first pick"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "{tier} ({}) - {}: {list}{effort}{escalation}",
+                rung.name, rung.definition
+            ));
         }
-        if !lines.is_empty()
-            && matches!(
-                self.routing.read().unwrap_or_else(|e| e.into_inner()).mode,
-                RoutingMode::Suggest | RoutingMode::Auto
-            )
-        {
-            lines.push("auto - let Laya choose from the step spec".into());
+        if matches!(
+            self.routing.read().unwrap_or_else(|e| e.into_inner()).mode,
+            RoutingMode::Suggest | RoutingMode::Auto
+        ) {
+            lines.push("auto - let Laya choose from the step spec (never escalate)".into());
         }
-        (!lines.is_empty()).then(|| lines.join("\n"))
+        Some(lines.join("\n"))
     }
 
     /// Subscribe to every worker event.
@@ -2373,17 +2631,18 @@ impl TeamRuntime {
         let mut model = json!({"type": "string", "description": model_description});
         let tier_description = match (&guidance, routing_mode) {
             (Some(text), RoutingMode::Off) => format!(
-                "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\n{text}"
+                "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (Some(text), RoutingMode::Auto) => format!(
-                "Optional: choose the cheapest tier that fits the step, or auto to let Laya choose; the worker runs on that tier's first model.\n{text}"
+                "Optional: choose the cheapest tier that fits the step, or auto to let Laya choose; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (Some(text), _) => format!(
-                "Required: choose the cheapest tier that fits the step, or auto where offered; the worker runs on that tier's first model.\n{text}"
+                "Required: choose the cheapest tier that fits the step, or auto where offered; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (None, _) => "The model tier. No tiers are configured (Settings > Tiers), so omit it and the default model is used.".to_string(),
         };
-        let mut tier_names = TIER_PURPOSES.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        let ladder = self.tier_ladder();
+        let mut tier_names = tier_ids(&ladder);
         if matches!(routing_mode, RoutingMode::Suggest | RoutingMode::Auto) {
             tier_names.push("auto");
         }
@@ -2391,6 +2650,11 @@ impl TeamRuntime {
             "type": "string",
             "enum": tier_names,
             "description": tier_description,
+        });
+        let audit_tier = json!({
+            "type": "string",
+            "enum": tier_ids(&self.tier_ladder()),
+            "description": "The audit's ladder tier; defaults to high. Empty tiers fold down. Audits are never routed by Laya or kNN; an unreported audit may be switched with team_resume, a reported audit is locked.",
         });
         let specs: Vec<&str> = lead_models
             .iter()
@@ -2430,7 +2694,7 @@ impl TeamRuntime {
             HostToolSpec {
                 name: "team_audit_dispatch".to_string(),
                 description: "Dispatch a fresh read-only independent audit of one implementation worker's current branch/tip for a high-risk review. The reviewer_id is a stable unique 8-64 ASCII letters/digits ID of your choosing; retry a timed-out dispatch with that same identity for the same worker and tip, and choose a new reviewer_id after any fix commit moves the tip. The audit receives the worker's board plan, its intent brief, and the target diff — never the worker's own summary or findings — and cannot edit files, commit, merge, spawn, ask the user, or tick plan steps. When it completes, link it through team_review's evidence.independent_reviewer_id and write an audit_adjudication; never merge the audit worker itself.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"reviewer_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"model":{"type":"string"},"reasoning_effort":{"type":"string","enum":["max","high","medium","low","minimal","none"]},"brief":{"type":"string"}},"required":["worker_id","reviewer_id"]}),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"reviewer_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"tier":audit_tier,"model":{"type":"string"},"reasoning_effort":{"type":"string","enum":["max","high","medium","low","minimal","none"]},"brief":{"type":"string"}},"required":["worker_id","reviewer_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -2461,7 +2725,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_resume".to_string(),
-                description: "Resume a stopped, interrupted, or failed worker from its saved transcript through TeamManager. Returns the same worker ID with a new session generation. To move the worker to another model (it failed, or its model does not fit the work), pass `tier` or `model` (and optionally `reasoning_effort`): an idle worker is restarted on it with its transcript kept; a working one must be stopped first. The resumed worker is idle: send it a team_message to continue.".to_string(),
+                description: "Resume a stopped, interrupted, or failed worker (including an audit that has not reported) from its saved transcript through TeamManager. Returns the same worker ID with a new session generation. To move the worker to another model (it failed, or its model does not fit the work), pass `tier` or `model` (and optionally `reasoning_effort`): an idle worker is restarted on it with its transcript kept; a working one must be stopped first. The resumed worker is idle: send it a team_message to continue.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"tier":tier,"model":model,"reasoning_effort":reasoning_effort},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
@@ -2623,6 +2887,8 @@ impl TeamRuntime {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .mode;
+            let explicit_model = model.is_some();
+            let fold_request = if model.is_none() { tier.clone() } else { None };
             let result = self
                 .dispatch_request(DispatchRequest {
                     brief: brief.to_string(),
@@ -2640,7 +2906,13 @@ impl TeamRuntime {
                     read_back,
                 })
                 .await;
-            return dispatch_result(result, "team_dispatch", mode);
+            return dispatch_result(
+                result,
+                "team_dispatch",
+                mode,
+                fold_request,
+                explicit_model,
+            );
         }
         if name == "team_audit_dispatch" {
             let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
@@ -2649,13 +2921,10 @@ impl TeamRuntime {
             let Some(reviewer_id) = args.get("reviewer_id").and_then(Value::as_str) else {
                 return ToolResult::error("team_audit_dispatch requires a 'reviewer_id' string");
             };
-            let model = match self.lead_model_choice(
-                None,
-                args.get("model").and_then(Value::as_str).map(str::to_string),
-            ) {
-                Ok(model) => model,
-                Err(err) => return ToolResult::error(err),
-            };
+            let requested_tier = args.get("tier").and_then(Value::as_str).unwrap_or("high");
+            let model = args.get("model").and_then(Value::as_str).map(str::to_string);
+            let explicit_model = model.is_some();
+            let fold_request = model.is_none().then(|| requested_tier.to_string());
             let reasoning_effort = args
                 .get("reasoning_effort")
                 .and_then(Value::as_str)
@@ -2665,15 +2934,22 @@ impl TeamRuntime {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let result = self
-                .audit_dispatch(
+                .audit_dispatch_with_tier(
                     worker_id,
                     reviewer_id,
+                    Some(requested_tier),
                     model,
                     reasoning_effort,
                     brief,
                 )
                 .await;
-            return dispatch_result(result, "team_audit_dispatch", RoutingMode::Off);
+            return dispatch_result(
+                result,
+                "team_audit_dispatch",
+                RoutingMode::Off,
+                fold_request,
+                explicit_model,
+            );
         }
         if name == "team_status" {
             let plan_id = args
@@ -3226,6 +3502,28 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         brief: Option<String>,
     ) -> Result<(WorkerRecord, bool), String> {
+        self.audit_dispatch_with_tier(
+            worker_id,
+            reviewer_id,
+            None,
+            model,
+            reasoning_effort,
+            brief,
+        )
+        .await
+    }
+
+    /// Dispatch an audit on an optional ladder tier (default `high`). The
+    /// resolved model and tier are stored before the worker starts.
+    pub async fn audit_dispatch_with_tier(
+        &self,
+        worker_id: &str,
+        reviewer_id: &str,
+        tier: Option<&str>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        brief: Option<String>,
+    ) -> Result<(WorkerRecord, bool), String> {
         let _guard = self.merge_lock.lock().await;
         validate_worker_id(reviewer_id)?;
         if let Some(effort) = reasoning_effort.as_deref() {
@@ -3296,6 +3594,29 @@ impl TeamRuntime {
                 return Ok((existing, true));
             }
         }
+        let requested_tier = tier.unwrap_or("high");
+        if self.tier_ladder().get(requested_tier).is_none() {
+            return Err(format!(
+                "unknown tier '{requested_tier}'; expected one of: {}",
+                tier_ids(&self.tier_ladder()).join(", ")
+            ));
+        }
+        let (model, resolved_tier) = if model.is_none() && self.tiered_models().is_empty() {
+            (
+                self.lead_model_choice(None, None)?,
+                Some(requested_tier.to_string()),
+            )
+        } else {
+            self.lead_choice_with_tier(Some(requested_tier), model)?
+        };
+        let resolved_tier = resolved_tier.or_else(|| Some(requested_tier.to_string()));
+        let reasoning_effort = reasoning_effort.or_else(|| {
+            resolved_tier.as_deref().and_then(|tier| {
+                self.tier_ladder()
+                    .get(tier)
+                    .and_then(|rung| rung.effort.clone())
+            })
+        });
         // Without a named model an effort cannot be applied to a session; it
         // stays in the audit brief as the depth the lead asked for.
         let depth_hint = reasoning_effort.clone();
@@ -3390,7 +3711,7 @@ impl TeamRuntime {
             opening_prompt: None,
             plan_id: None,
             plan_step: None,
-            tier: None,
+            tier: resolved_tier,
             routing: None,
             reroutes: Vec::new(),
         };
@@ -3454,13 +3775,17 @@ impl TeamRuntime {
         steps
     }
 
-    /// Stamp the tier the lead dispatched by onto the worker's record.
+    /// Stamp the resolved tier for a lead's explicit tier choice. An empty
+    /// requested tier folds down exactly as it did for model selection.
     async fn record_tier(&self, worker_id: &str, tier: &str) {
+        let Ok((resolved, _)) = self.resolve_tier_choice(tier) else {
+            return;
+        };
         {
             let mut records = self.records.lock().await;
             match records.iter_mut().find(|w| w.id == worker_id) {
-                Some(worker) if worker.tier.as_deref() != Some(tier) => {
-                    worker.tier = Some(tier.to_string());
+                Some(worker) if worker.tier.as_deref() != Some(resolved.as_str()) => {
+                    worker.tier = Some(resolved);
                 }
                 _ => return,
             }
@@ -3976,7 +4301,7 @@ impl TeamRuntime {
         else {
             return;
         };
-        let enabled = self.enabled_routing_tiers();
+        let enabled = self.direct_nudge_tiers();
         // The pre-checks run without detaching: a worker without a routing
         // record, already nudged, or on the top enabled tier never spends
         // a classifier call on drift.
@@ -4301,12 +4626,10 @@ impl TeamRuntime {
         let step = record.plan_step.map_or(0, |step| step + 1);
         let from_tier = self
             .tier_of(from_spec)
-            .map(str::to_string)
             .or_else(|| record.tier.clone())
             .unwrap_or_else(|| "custom".to_string());
         let to_tier = self
             .tier_of(to_spec)
-            .map(str::to_string)
             .unwrap_or_else(|| "custom".to_string());
         let from_model = record.model.clone().filter(|spec| !spec.trim().is_empty());
         let to_model = to_model.map(str::to_string);
@@ -4392,13 +4715,6 @@ impl TeamRuntime {
         // learning in every routing mode (decided 2026-11-04).
         let requested = model.as_deref().filter(|spec| !spec.trim().is_empty());
         if self.worker_is_busy(worker_id).await {
-            if record.kind == "audit" {
-                // Audit workers' models are not user-switchable — the audit
-                // runs on the model that dispatched it.
-                return Err(format!(
-                    "worker '{worker_id}' is an audit worker; its model is not switchable"
-                ));
-            }
             // Live switch — no stop, no restart: the provider request in
             // flight finishes on the old model; the worker's next request
             // serves on the new one. The kernel emits its model_changed
@@ -4464,8 +4780,10 @@ impl TeamRuntime {
                     live.strikes.lock().await.reset();
                 }
             }
-            if let Some(row) = reroute.as_ref() {
-                self.append_dispatch_routing_row(row);
+            if record.kind != "audit" {
+                if let Some(row) = reroute.as_ref() {
+                    self.append_dispatch_routing_row(row);
+                }
             }
             return self.worker(worker_id).await;
         }
@@ -4489,8 +4807,10 @@ impl TeamRuntime {
         })
         .await;
         self.persist().await?;
-        if let Some(row) = reroute.as_ref() {
-            self.append_dispatch_routing_row(row);
+        if record.kind != "audit" {
+            if let Some(row) = reroute.as_ref() {
+                self.append_dispatch_routing_row(row);
+            }
         }
         let record = self.worker(worker_id).await?;
         if !record.brief_sent {
@@ -4684,7 +5004,7 @@ impl TeamRuntime {
             && nudged_high
             && updated.review_rounds >= 2
         {
-            let enabled = self.enabled_routing_tiers();
+            let enabled = self.direct_nudge_tiers();
             if let Some(claim) =
                 claim_nudge(&self.records, worker_id, enabled, settings.mode, None).await
             {
@@ -7622,20 +7942,62 @@ fn dispatch_result(
     result: Result<(WorkerRecord, bool), String>,
     action: &str,
     mode: RoutingMode,
+    fold_request: Option<String>,
+    explicit_model: bool,
 ) -> ToolResult {
     match result {
         Ok((worker, reused)) => {
+            let routing = worker.routing.as_ref();
+            let requested = if explicit_model {
+                None
+            } else {
+                match fold_request.as_deref() {
+                    Some("auto") | None => routing.and_then(|routing| {
+                        if routing.routed_by == "laya" {
+                            routing.laya_tier.as_deref()
+                        } else {
+                            routing.lead_tier.as_deref()
+                        }
+                    }),
+                    Some(tier) => Some(tier),
+                }
+            };
+            let ran_tier = routing
+                .and_then(|routing| routing.ran_tier.as_deref())
+                .or(worker.tier.as_deref());
+            let routing_note = match (requested, ran_tier) {
+                (Some(requested), Some(ran))
+                    if requested != ran && TierLadder::default().get(requested).is_some() =>
+                {
+                    Some(format!("{requested} has no model; ran on {ran}"))
+                }
+                _ => None,
+            };
             let output = serde_json::to_string(&json!({
                 "action": action,
-                "result": {"worker": worker_status_view(&worker, false), "reused": reused},
+                "result": {
+                    "worker": worker_status_view(&worker, false),
+                    "reused": reused,
+                    "routing_note": routing_note,
+                },
             }))
             .unwrap_or_else(|_| action.to_string());
-            let output = match dispatch_routing_line(mode, worker.routing.as_ref()) {
-                Some(line) => format!("{output}\n{line}"),
-                None => output,
+            let mut lines = Vec::new();
+            if let Some(line) = dispatch_routing_line(mode, routing) {
+                lines.push(line);
+            }
+            if let Some(note) = &routing_note {
+                lines.push(note.clone());
+            }
+            let output = if lines.is_empty() {
+                output
+            } else {
+                format!("{output}\n{}", lines.join("\n"))
             };
             let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
-            ToolResult::success(output).with_data(json!({"worker": data, "reused": reused}))
+            ToolResult::success(output).with_data(
+                json!({"worker": data, "reused": reused, "routing_note": routing_note}),
+            )
         }
         Err(err) => team_tool_error(err),
     }
@@ -9798,7 +10160,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         worker.model_id = Some("scripted-a".to_string());
         worker.plan_id = Some("plan0001".to_string());
         worker.plan_step = Some(2);
-        worker.tier = Some("average".to_string());
+        worker.tier = Some("routine".to_string());
         worker.status = WorkerStatus::InReview;
         worker.error = Some("a recorded error".to_string());
         worker.cost_micros = Some(1234);
@@ -9896,7 +10258,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(entry["id"], "00000001000000000001");
         assert_eq!(entry["status"], "in_review");
         assert_eq!(entry["kind"], "implementation");
-        assert_eq!(entry["tier"], "average");
+        assert_eq!(entry["tier"], "routine");
         assert_eq!(entry["model"], "scripted-a");
         assert_eq!(entry["plan_id"], "plan0001");
         assert_eq!(entry["plan_step"], 2);
@@ -10441,6 +10803,23 @@ models = [\"scripted-a\", \"scripted-b\"]
             .await
             .expect_err("message refuses a finished audit");
         assert_eq!(error, refusal);
+        team.set_catalog(
+            vec![lead_model("scripted-difficult")],
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: Vec::new(),
+                simple: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let result = team
+            .handle_lead_host_tool(
+                "team_resume",
+                json!({"worker_id": "auditworker1", "tier": "high"}),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains(refusal), "{}", result.output);
         team.shutdown().await;
     }
 
@@ -11030,7 +11409,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ]])
             .collect::<Vec<_>>();
         let (fixture, mut notices) = nudge_fixture(responses).await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         let row = eventually(|| async {
             fixture
@@ -11049,8 +11428,8 @@ models = [\"scripted-a\", \"scripted-b\"]
                     detail,
                     ..
                 } if reason == "strikes"
-                    && from_tier == "average"
-                    && to_tier == "difficult"
+                    && from_tier == "routine"
+                    && to_tier == "high"
                     && detail == "looks stuck (3 failing tool calls in a row)"
             ),
             "the strike nudge row: {row:?}"
@@ -11058,12 +11437,12 @@ models = [\"scripted-a\", \"scripted-b\"]
         let notice = wait_nudge_notice(&mut notices, "routingworker").await;
         assert_eq!(
             notice,
-            "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier difficult."
+            "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier high."
         );
         let settled = wait_worker_settled(&fixture.team, "routingworker").await;
         assert_eq!(
             settled.routing.as_ref().expect("routed at dispatch").nudged.as_deref(),
-            Some("difficult"),
+            Some("high"),
             "the nudge is marked on the record: {settled:?}"
         );
         // Three consecutive real failures also trip the session's own
@@ -11121,7 +11500,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             })
             .collect::<Vec<_>>();
         let (fixture, _notices) = nudge_fixture(responses).await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         // The terminal failure row is the deterministic marker that the
         // pump has fully processed the worker's failure; the nudge row
@@ -11133,7 +11512,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         })
         .await;
         assert!(
-            matches!(&outcome, DispatchRoutingRow::Outcome { final_tier, .. } if final_tier == "average"),
+            matches!(&outcome, DispatchRoutingRow::Outcome { final_tier, .. } if final_tier == "routine"),
             "the failure outcome: {outcome:?}"
         );
         assert!(
@@ -11169,7 +11548,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             })
             .collect::<Vec<_>>();
         let (fixture, _notices) = nudge_fixture(responses).await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         // The strike nudge fires and the doom guard fails the worker.
         let failed = eventually(|| async {
@@ -11207,7 +11586,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 [..,
                  DispatchRoutingRow::Outcome { status, .. },
                  DispatchRoutingRow::NudgeIgnored { tier, .. }
-                ] if status == "stopped" && tier == "average"
+                ] if status == "stopped" && tier == "routine"
             ),
             "the stopped outcome plus the ignored nudge: {:?}",
             fixture.rows()
@@ -11247,7 +11626,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ],
         ];
         let (fixture, _notices) = nudge_fixture(responses).await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         let row = eventually(|| async {
             fixture
@@ -11262,7 +11641,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 DispatchRoutingRow::Nudge { reason, detail, to_tier, .. }
                     if reason == "circles"
                         && detail == "looks stuck (going in circles)"
-                        && to_tier == "difficult"
+                        && to_tier == "high"
             ),
             "the circles nudge row: {row:?}"
         );
@@ -11285,7 +11664,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ],
         ];
         let (fixture, mut notices) = nudge_fixture(responses).await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         let settled = wait_worker_settled(&fixture.team, "routingworker").await;
         assert!(
@@ -11323,10 +11702,10 @@ models = [\"scripted-a\", \"scripted-b\"]
             ]])
             .collect::<Vec<_>>();
         let (fixture, _notices) = nudge_fixture(responses).await;
-        let result = fixture.dispatch(Some("difficult"), None).await;
+        let result = fixture.dispatch(Some("high"), None).await;
         assert!(result.success, "{}", result.output);
         let settled = wait_worker_settled(&fixture.team, "routingworker").await;
-        assert_eq!(settled.tier.as_deref(), Some("difficult"), "{settled:?}");
+        assert_eq!(settled.tier.as_deref(), Some("high"), "{settled:?}");
         assert!(
             fixture
                 .rows()
@@ -11359,7 +11738,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ]],
         )
         .await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         wait_worker_settled(&fixture.team, "routingworker").await;
         let record = fixture
@@ -11379,14 +11758,14 @@ models = [\"scripted-a\", \"scripted-b\"]
             matches!(
                 &row,
                 DispatchRoutingRow::Nudge { reason, from_tier, to_tier, .. }
-                    if reason == "drift" && from_tier == "average" && to_tier == "difficult"
+                    if reason == "drift" && from_tier == "routine" && to_tier == "high"
             ),
             "the drift nudge row: {row:?}"
         );
         let notice = wait_nudge_notice(&mut notices, "routingworker").await;
         assert_eq!(
             notice,
-            "worker_id=routingworker Laya nudge: routingworker this got harder (Laya reads the message as hard, 0.91); consider team_resume with tier difficult."
+            "worker_id=routingworker Laya nudge: routingworker this got harder (Laya reads the message as hard, 0.91); consider team_resume with tier high."
         );
         assert_eq!(
             fixture.classifier.calls(),
@@ -11413,7 +11792,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ]],
         )
         .await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         wait_worker_settled(&fixture.team, "routingworker").await;
         let started = std::time::Instant::now();
@@ -11465,14 +11844,14 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .expect("save routing settings");
         let mut record = worker(root.path(), "nudgereview001");
-        record.tier = Some("average".into());
+        record.tier = Some("routine".into());
         record.routing = Some(WorkerRouting {
-            laya_tier: Some("average".into()),
+            laya_tier: Some("routine".into()),
             confidence: Some(0.62),
             cleared: true,
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             routed_by: "lead".into(),
-            ran_tier: Some("average".into()),
+            ran_tier: Some("routine".into()),
             nudged: None,
         });
         provision_agent_worktree(
@@ -11525,7 +11904,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(second.review_rounds, 2, "{second:?}");
         assert_eq!(
             second.routing.as_ref().expect("routed").nudged.as_deref(),
-            Some("difficult"),
+            Some("high"),
             "the second high review round nudged: {second:?}"
         );
         let rows = std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
@@ -11538,8 +11917,8 @@ models = [\"scripted-a\", \"scripted-b\"]
                 rows.as_slice(),
                 [DispatchRoutingRow::Nudge { reason, from_tier, to_tier, detail, .. }]
                     if reason == "review"
-                        && from_tier == "average"
-                        && to_tier == "difficult"
+                        && from_tier == "routine"
+                        && to_tier == "high"
                         && detail == "keeps a high finding after 2 review rounds"
             ),
             "the review nudge row: {rows:?}"
@@ -11559,18 +11938,18 @@ models = [\"scripted-a\", \"scripted-b\"]
         worker.status = WorkerStatus::InReview;
         worker.plan_id = Some("plan0001".into());
         worker.plan_step = Some(0);
-        worker.tier = Some("average".into());
+        worker.tier = Some("routine".into());
         worker.model = Some("test/scripted-average".into());
         worker.routing = Some(WorkerRouting {
-            laya_tier: Some("average".into()),
+            laya_tier: Some("routine".into()),
             confidence: Some(0.62),
             cleared: true,
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             routed_by: "lead".into(),
-            ran_tier: Some("average".into()),
+            ran_tier: Some("routine".into()),
             // Laya nudged difficult while the worker sat on average, and
             // no reroute ever took it.
-            nudged: Some("difficult".into()),
+            nudged: Some("high".into()),
         });
         provision_agent_worktree(
             root.path().to_path_buf(),
@@ -11609,7 +11988,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 rows.as_slice(),
                 [DispatchRoutingRow::Outcome { status, final_tier, .. },
                  DispatchRoutingRow::NudgeIgnored { tier, .. }]
-                    if status == "merged" && final_tier == "average" && tier == "average"
+                    if status == "merged" && final_tier == "routine" && tier == "routine"
             ),
             "the merged outcome plus the ignored nudge: {rows:?}"
         );
@@ -11641,7 +12020,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             responses,
         )
         .await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         let settled = wait_worker_settled(&fixture.team, "routingworker").await;
         assert!(
@@ -11686,14 +12065,14 @@ models = [\"scripted-a\", \"scripted-b\"]
         init_git(root.path());
         save_routing_settings(config.path(), &settings).expect("save routing settings");
         let mut record = worker(root.path(), "nudgesoff0001");
-        record.tier = Some("average".into());
+        record.tier = Some("routine".into());
         record.routing = Some(WorkerRouting {
-            laya_tier: Some("average".into()),
+            laya_tier: Some("routine".into()),
             confidence: Some(0.62),
             cleared: true,
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             routed_by: "lead".into(),
-            ran_tier: Some("average".into()),
+            ran_tier: Some("routine".into()),
             nudged: None,
         });
         provision_agent_worktree(
@@ -11795,7 +12174,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
         assert_eq!(fixture.classifier.calls(), 0);
         assert!(!fixture.log_path().exists());
@@ -11817,14 +12196,14 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("Laya would pick average (0.62)."));
+        assert!(result.output.contains("Laya would pick routine (0.62)."));
         let worker = fixture.team.worker("routingworker").await.expect("worker");
-        assert_eq!(worker.tier.as_deref(), Some("average"));
+        assert_eq!(worker.tier.as_deref(), Some("routine"));
         let routing = worker.routing.expect("routing metadata");
-        assert_eq!(routing.laya_tier.as_deref(), Some("average"));
-        assert_eq!(routing.lead_tier.as_deref(), Some("average"));
+        assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("routine"));
         assert_eq!(routing.routed_by, "lead");
         assert_eq!(routing.confidence, Some(0.62));
         assert!(routing.cleared);
@@ -11836,10 +12215,10 @@ models = [\"scripted-a\", \"scripted-b\"]
                 tier: Some(tier),
                 ran_tier: Some(ran),
                 ..
-            } if tier == "average" && ran == "average"
+            } if tier == "routine" && ran == "routine"
         ));
         let status = team_status_answer(&fixture.team, json!({})).await;
-        assert_eq!(status["result"][0]["routing"]["laya_tier"], "average");
+        assert_eq!(status["result"][0]["routing"]["laya_tier"], "routine");
         fixture.team.shutdown().await;
     }
 
@@ -11851,7 +12230,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
         assert_eq!(fixture.classifier.calls(), 1);
         let rows = fixture.rows();
         assert_eq!(rows.len(), 2, "{rows:?}");
@@ -11861,7 +12240,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 laya_tier: Some(laya),
                 lead_tier,
                 ..
-            } if laya == "difficult" && lead_tier == "average"
+            } if laya == "high" && lead_tier == "routine"
         ));
         assert_eq!(
             fixture
@@ -11888,7 +12267,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         let result = fixture.dispatch(Some("auto"), None).await;
         assert!(result.success, "{}", result.output);
         let worker = fixture.team.worker("routingworker").await.expect("worker");
-        assert_eq!(worker.tier.as_deref(), Some("difficult"));
+        assert_eq!(worker.tier.as_deref(), Some("high"));
         assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
         assert_eq!(worker.routing.expect("routing").routed_by, "laya");
         fixture.team.shutdown().await;
@@ -11950,7 +12329,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(result.success, "{}", result.output);
         assert!(result.output.contains("Laya: unsure (0.41)."));
         let worker = fixture.team.worker("routingworker").await.expect("worker");
-        assert_eq!(worker.tier.as_deref(), Some("average"));
+        assert_eq!(worker.tier.as_deref(), Some("routine"));
         assert_eq!(worker.routing.expect("routing").routed_by, "lead");
         assert!(matches!(
             fixture.rows().as_slice(),
@@ -11958,7 +12337,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 skip: None,
                 ran_tier: Some(ran),
                 ..
-            }] if ran == "average"
+            }] if ran == "routine"
         ));
         fixture.team.shutdown().await;
     }
@@ -11975,7 +12354,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(result.success, "{}", result.output);
         let worker = fixture.team.worker("routingworker").await.expect("worker");
         assert_eq!(worker.model.as_deref(), Some("test/scripted-simple"));
-        assert_eq!(worker.tier.as_deref(), Some("simple"));
+        assert_eq!(worker.tier.as_deref(), Some("trivial"));
         assert_eq!(worker.routing.expect("routing").routed_by, "lead_override");
         assert_eq!(fixture.rows().len(), 2);
         fixture.team.shutdown().await;
@@ -12018,8 +12397,8 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        assert!(fixture.dispatch(Some("average"), None).await.success);
-        let reused = fixture.dispatch(Some("average"), None).await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        let reused = fixture.dispatch(Some("routine"), None).await;
         assert!(reused.success, "{}", reused.output);
         assert!(reused.output.contains("\"reused\":true"));
         assert_eq!(fixture.classifier.calls(), 1);
@@ -12046,13 +12425,13 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
         // A pending nudge travels with the reroute row and leaves the record.
         fixture
             .team
             .update_worker("routingworker", |worker| {
                 if let Some(routing) = worker.routing.as_mut() {
-                    routing.nudged = Some("difficult".into());
+                    routing.nudged = Some("high".into());
                 }
             })
             .await;
@@ -12079,8 +12458,8 @@ models = [\"scripted-a\", \"scripted-b\"]
                 ..
             } => {
                 assert_eq!(worker_id, "routingworker");
-                assert_eq!(from_tier, "average");
-                assert_eq!(to_tier, "difficult");
+                assert_eq!(from_tier, "routine");
+                assert_eq!(to_tier, "high");
                 assert_eq!(from_model.as_deref(), Some("test/scripted-average"));
                 assert_eq!(to_model.as_deref(), Some("test/scripted-difficult"));
                 assert!(*nudged, "the pending nudge rides the row");
@@ -12107,17 +12486,17 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
         let resumed = fixture
             .team
             .handle_lead_host_tool(
                 "team_resume",
-                json!({"worker_id": "routingworker", "tier": "difficult"}),
+                json!({"worker_id": "routingworker", "tier": "high"}),
             )
             .await;
         assert!(resumed.success, "{}", resumed.output);
         let worker = fixture.team.worker("routingworker").await.expect("worker");
-        assert_eq!(worker.tier.as_deref(), Some("difficult"), "{worker:?}");
+        assert_eq!(worker.tier.as_deref(), Some("high"), "{worker:?}");
         let rows = fixture.rows();
         assert_eq!(rows.len(), 2, "{rows:?}");
         match &rows[1] {
@@ -12129,8 +12508,8 @@ models = [\"scripted-a\", \"scripted-b\"]
                 ..
             } => {
                 assert_eq!(worker_id, "routingworker");
-                assert_eq!(from_tier, "average");
-                assert_eq!(to_tier, "difficult");
+                assert_eq!(from_tier, "routine");
+                assert_eq!(to_tier, "high");
                 assert!(!*nudged);
             }
             other => panic!("a lead reroute row is logged: {other:?}"),
@@ -12164,7 +12543,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             },
             Vec::new(),
         );
-        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
         fixture
             .team
             .change_model(
@@ -12178,9 +12557,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         let rows = fixture.rows();
         match &rows[1] {
             DispatchRoutingRow::UserReroute { from_tier, to_tier, .. } => {
-                assert_eq!(from_tier, "average");
+                assert_eq!(from_tier, "routine");
                 assert_eq!(
-                    to_tier, "average",
+                    to_tier, "routine",
                     "a same-tier switch logs equal tiers"
                 );
             }
@@ -12191,9 +12570,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         // no-reroute rule (the tier above, weak) instead of the reroute
         // rule (average, strong).
         let worker = fixture.team.worker("routingworker").await.expect("worker");
-        let (label, weak) = outcome_label(&worker.reroutes, "merged", "average", 2, 0)
+        let (label, weak) = outcome_label(&worker.reroutes, "merged", "routine", 2, 0)
             .expect("a label still derives");
-        assert_eq!(label, "difficult");
+        assert_eq!(label, "medium");
         assert!(weak);
         fixture.team.shutdown().await;
     }
@@ -12208,15 +12587,15 @@ models = [\"scripted-a\", \"scripted-b\"]
         worker.status = WorkerStatus::InReview;
         worker.plan_id = Some("plan0001".into());
         worker.plan_step = Some(0);
-        worker.tier = Some("average".into());
+        worker.tier = Some("routine".into());
         worker.model = Some("test/scripted-average".into());
         worker.routing = Some(WorkerRouting {
-            laya_tier: Some("average".into()),
+            laya_tier: Some("routine".into()),
             confidence: Some(0.62),
             cleared: true,
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             routed_by: "lead".into(),
-            ran_tier: Some("average".into()),
+            ran_tier: Some("routine".into()),
             nudged: None,
         });
         // The worker was rerouted up to difficult before its review closed.
@@ -12225,8 +12604,8 @@ models = [\"scripted-a\", \"scripted-b\"]
             worker_id: worker.id.clone(),
             plan_id: "plan0001".into(),
             step: 1,
-            from_tier: "average".into(),
-            to_tier: "difficult".into(),
+            from_tier: "routine".into(),
+            to_tier: "high".into(),
             from_model: Some("test/scripted-average".into()),
             to_model: Some("test/scripted-difficult".into()),
             status: "idle".into(),
@@ -12284,8 +12663,8 @@ models = [\"scripted-a\", \"scripted-b\"]
                     if worker_id == "00000002000000000002"
                         && plan_id == "plan0001"
                         && status == "merged"
-                        && final_tier == "difficult"
-                        && label == "difficult"
+                        && final_tier == "high"
+                        && label == "high"
                         && *review_rounds == 0
                         && *fix_rounds == 0
             ),
@@ -12319,7 +12698,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             mnemo::headless::TiersDto::default(),
             Vec::new(),
         );
-        let result = fixture.dispatch(Some("average"), Some("broken")).await;
+        let result = fixture.dispatch(Some("routine"), Some("broken")).await;
         assert!(!result.success, "{result:?}");
         let worker = fixture
             .team
@@ -12360,12 +12739,12 @@ models = [\"scripted-a\", \"scripted-b\"]
         .await;
         // Laya clears difficult, the lead passes average: an override that
         // runs average.
-        let first = fixture.dispatch(Some("average"), None).await;
+        let first = fixture.dispatch(Some("routine"), None).await;
         assert!(first.success, "{}", first.output);
         assert!(
             first
                 .output
-                .contains("you chose average; logged as an override."),
+                .contains("you chose routine; logged as an override."),
             "{}",
             first.output
         );
@@ -12375,18 +12754,18 @@ models = [\"scripted-a\", \"scripted-b\"]
         // reuse guard, correctly — only the tier moved here.)
         fixture
             .team
-            .record_tier("routingworker", "difficult")
+            .record_tier("routingworker", "high")
             .await;
         let worker = fixture.team.worker("routingworker").await.expect("worker");
-        assert_eq!(worker.tier.as_deref(), Some("difficult"), "{worker:?}");
+        assert_eq!(worker.tier.as_deref(), Some("high"), "{worker:?}");
         // An idempotent re-dispatch reports the dispatch-time ran tier, not
         // the tier the worker was rerouted onto (audit finding M1).
-        let reused = fixture.dispatch(Some("average"), None).await;
+        let reused = fixture.dispatch(Some("routine"), None).await;
         assert!(reused.success, "{}", reused.output);
         assert!(
             reused
                 .output
-                .contains("you chose average; logged as an override."),
+                .contains("you chose routine; logged as an override."),
             "the reused dispatch keeps the dispatch-time tier: {}",
             reused.output
         );
@@ -12406,7 +12785,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             false,
         )
         .await;
-        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
         // No hand reroute yet: off mode keeps the log absent.
         assert!(!fixture.log_path().exists());
         fixture
@@ -12435,8 +12814,8 @@ models = [\"scripted-a\", \"scripted-b\"]
                 ..
             } => {
                 assert_eq!(worker_id, "routingworker");
-                assert_eq!(from_tier, "average");
-                assert_eq!(to_tier, "difficult");
+                assert_eq!(from_tier, "routine");
+                assert_eq!(to_tier, "high");
                 assert_eq!(from_model.as_deref(), Some("test/scripted-average"));
                 assert_eq!(to_model.as_deref(), Some("test/scripted-difficult"));
             }
@@ -12444,10 +12823,10 @@ models = [\"scripted-a\", \"scripted-b\"]
         }
         let worker = fixture.team.worker("routingworker").await.expect("worker");
         assert_eq!(worker.reroutes.len(), 1, "{worker:?}");
-        assert_eq!(worker.tier.as_deref(), Some("difficult"), "{worker:?}");
-        assert_eq!(final_tier(&worker), "difficult");
+        assert_eq!(worker.tier.as_deref(), Some("high"), "{worker:?}");
+        assert_eq!(final_tier(&worker), "high");
         let status = team_status_answer(&fixture.team, json!({})).await;
-        assert_eq!(status["result"][0]["tier"], "difficult");
+        assert_eq!(status["result"][0]["tier"], "high");
         fixture.team.shutdown().await;
     }
 
@@ -12461,7 +12840,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         worker.status = WorkerStatus::InReview;
         worker.plan_id = Some("plan0001".into());
         worker.plan_step = Some(0);
-        worker.tier = Some("average".into());
+        worker.tier = Some("routine".into());
         worker.model = Some("test/scripted-average".into());
         // No dispatch decision and no hand reroute: this worker ran with
         // routing off and was never moved by a hand, so it stays off the
@@ -12510,7 +12889,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         worker.status = WorkerStatus::InReview;
         worker.plan_id = Some("plan0001".into());
         worker.plan_step = Some(0);
-        worker.tier = Some("average".into());
+        worker.tier = Some("routine".into());
         worker.model = Some("test/scripted-average".into());
         // No dispatch decision: this worker ran with routing off — but the
         // user moved it to difficult by hand, and a hand reroute is a
@@ -12522,8 +12901,8 @@ models = [\"scripted-a\", \"scripted-b\"]
             worker_id: worker.id.clone(),
             plan_id: "plan0001".into(),
             step: 1,
-            from_tier: "average".into(),
-            to_tier: "difficult".into(),
+            from_tier: "routine".into(),
+            to_tier: "high".into(),
             from_model: Some("test/scripted-average".into()),
             to_model: Some("test/scripted-difficult".into()),
             status: "idle".into(),
@@ -12578,8 +12957,8 @@ models = [\"scripted-a\", \"scripted-b\"]
                 }]
                     if worker_id == "00000002000000000004"
                         && status == "merged"
-                        && final_tier == "difficult"
-                        && label == "difficult"
+                        && final_tier == "high"
+                        && label == "high"
             ),
             "the rerouted worker's outcome row: {rows:?}"
         );
@@ -12594,7 +12973,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
         // Routing is switched off after the worker was routed: the worker's
         // own decision still makes it calibration data.
         *fixture.team.routing.write().unwrap_or_else(|e| e.into_inner()) =
@@ -12629,7 +13008,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
         fixture
             .team
             .stop("routingworker")
@@ -12776,7 +13155,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         let merge_guard = fixture.team.merge_lock.lock().await;
         let dispatch_fixture = std::sync::Arc::clone(&fixture);
         let dispatch = tokio::spawn(async move {
-            dispatch_fixture.dispatch(Some("average"), None).await
+            dispatch_fixture.dispatch(Some("routine"), None).await
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while fixture.classifier.calls() == 0 {
@@ -12827,7 +13206,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         .await
         .expect("the permit wait is inside Laya's 3 s timeout")
         .expect("routing decision");
-        assert_eq!(routed.tier.as_deref(), Some("average"));
+        assert_eq!(routed.tier.as_deref(), Some("routine"));
         assert_eq!(fixture.classifier.calls(), 0);
         assert!(matches!(
             routed.rows.as_slice(),
@@ -12869,7 +13248,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             false,
         )
         .await;
-        assert!(fixture.dispatch(Some("average"), None).await.success);
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
         let compact = team_status_answer(&fixture.team, json!({})).await;
         assert!(compact["result"][0].get("routing").is_none());
         let detailed = team_status_answer(&fixture.team, json!({"detail": true})).await;
@@ -12879,7 +13258,7 @@ models = [\"scripted-a\", \"scripted-b\"]
 
 
     #[tokio::test]
-    async fn auto_fallback_without_that_tier_uses_the_default_model() {
+    async fn auto_fallback_without_that_tier_folds_down() {
         let fixture = routing_fixture(
             crate::mnemo2::dispatch_routing::RoutingMode::Auto,
             routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
@@ -12897,18 +13276,23 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
         let result = fixture.dispatch(None, None).await;
         assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("routine has no model; ran on trivial"));
         let worker = fixture.team.worker("routingworker").await.expect("worker");
-        assert_eq!(worker.model, None);
-        assert_eq!(worker.tier, None);
-        assert_eq!(worker.routing.expect("routing").routed_by, "lead");
+        assert_eq!(worker.model.as_deref(), Some("test/scripted-model"));
+        assert_eq!(worker.tier.as_deref(), Some("trivial"));
+        let routing = worker.routing.expect("routing");
+        assert_eq!(routing.routed_by, "lead");
+        assert_eq!(routing.lead_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.ran_tier.as_deref(), Some("trivial"));
         assert_eq!(fixture.classifier.calls(), 1);
         assert!(matches!(
             fixture.rows().as_slice(),
             [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
                 skip: None,
-                ran_tier: None,
+                lead_tier: Some(lead_tier),
+                ran_tier: Some(ran_tier),
                 ..
-            }]
+            }] if lead_tier == "routine" && ran_tier == "trivial"
         ));
         fixture.team.shutdown().await;
     }
@@ -12926,8 +13310,8 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .await;
         let (first, second) = tokio::join!(
-            fixture.dispatch(Some("average"), None),
-            fixture.dispatch(Some("average"), None)
+            fixture.dispatch(Some("routine"), None),
+            fixture.dispatch(Some("routine"), None)
         );
         assert!(first.success, "{}", first.output);
         assert!(second.success, "{}", second.output);
@@ -12950,7 +13334,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             .persistence
             .slots
             .store(0, Ordering::SeqCst);
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(!result.success);
         assert_eq!(result.output, "all 0 worker slots are busy");
         assert_eq!(fixture.classifier.calls(), 1);
@@ -12969,7 +13353,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         let git = fixture._root.path().join(".git");
         let parked = fixture._root.path().join(".git-parked");
         std::fs::rename(&git, &parked).expect("park git metadata");
-        let result = fixture.dispatch(Some("average"), None).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
         assert!(!result.success);
         assert!(result.output.contains("not a usable Git checkout"));
         assert_eq!(fixture.classifier.calls(), 1);
@@ -12982,44 +13366,44 @@ models = [\"scripted-a\", \"scripted-b\"]
     #[test]
     fn dispatch_routing_line_truth_table() {
         let routing = WorkerRouting {
-            laya_tier: Some("difficult".into()),
+            laya_tier: Some("high".into()),
             confidence: Some(0.71),
             cleared: true,
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             routed_by: "lead_override".into(),
-            ran_tier: Some("average".into()),
+            ran_tier: Some("routine".into()),
             nudged: None,
         };
         assert_eq!(
             dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
-            Some("Laya: difficult (0.71) — you chose average; logged as an override.")
+            Some("Laya: high (0.71) — you chose routine; logged as an override.")
         );
         // The dispatch-time ran tier decides the override line (audit finding
         // M1): a reroute after dispatch never rewrites what this reports.
         let routing = WorkerRouting {
-            ran_tier: Some("difficult".into()),
+            ran_tier: Some("high".into()),
             ..routing
         };
         assert_eq!(
             dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
             Some(
-                "Laya: difficult (0.71) — you ran difficult (requested average); logged as an override."
+                "Laya: high (0.71) — you ran high (requested routine); logged as an override."
             )
         );
         let routing = WorkerRouting {
-            laya_tier: Some("average".into()),
+            laya_tier: Some("routine".into()),
             confidence: Some(0.62),
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             routed_by: "lead".into(),
             ..routing
         };
         assert_eq!(
             dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
-            Some("Laya would pick average (0.62).")
+            Some("Laya would pick routine (0.62).")
         );
         assert_eq!(
             dispatch_routing_line(RoutingMode::Suggest, Some(&routing)).as_deref(),
-            Some("Laya: average (0.62) — matches your tier.")
+            Some("Laya: routine (0.62) — matches your tier.")
         );
         assert_eq!(dispatch_routing_line(RoutingMode::Off, Some(&routing)), None);
         let routing = WorkerRouting {
@@ -13029,13 +13413,13 @@ models = [\"scripted-a\", \"scripted-b\"]
         };
         assert_eq!(
             dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
-            Some("Laya: routed to average (0.62).")
+            Some("Laya: routed to routine (0.62).")
         );
         let routing = WorkerRouting {
             confidence: Some(0.41),
             cleared: false,
             routed_by: "lead".into(),
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             ..routing
         };
         assert_eq!(
@@ -13096,7 +13480,7 @@ models = [\"scripted-a\", \"scripted-b\"]
     }
 
     #[tokio::test]
-    async fn off_mode_schema_is_unchanged() {
+    async fn off_mode_schema_uses_the_ladder_without_auto() {
         let root = tempfile::tempdir().expect("workspace");
         let state = tempfile::tempdir().expect("state");
         init_git(root.path());
@@ -13112,35 +13496,26 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
         let tools = team.lead_host_tools();
         let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
-        let expected = json!({
-            "type": "object",
-            "properties": {
-                "worker_id": {"type": "string", "minLength": 8, "maxLength": 64, "pattern": "^[A-Za-z0-9]+$"},
-                "plan_id": {"type": "string", "description": "The board plan this task belongs to (from plan_create or plan_list). Required."},
-                "step": {"type": "integer", "minimum": 1, "description": "The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},
-                "brief": {"type": "string", "description": "Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},
-                "tier": {
-                    "type": "string",
-                    "enum": ["difficult", "average", "simple"],
-                    "description": "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\ndifficult - design, debugging, bug_fixing plans, cross-cutting work, steps touching shared contracts: test/scripted-model\naverage - typical implementation steps: test/scripted-model\nsimple - single-file mechanical edits, checks, lookups, scaffolding: test/scripted-model"
-                },
-                "model": {
-                    "type": "string",
-                    "description": "A specific model from the tiers, only when the tier's first model does not fit; it overrides `tier`. Prefer `tier`; models outside the tiers are refused.",
-                    "enum": ["test/scripted-model"]
-                },
-                "reasoning_effort": {
-                    "type": "string",
-                    "description": "The worker's reasoning effort, chosen with its model: higher for hard design or debugging, lower for mechanical work. Applies to the model `tier` or `model` picks; a value that model does not support is rejected with its allowed list. Omit to use the model's configured default."
-                },
-                "read_back": {
-                    "type": "boolean",
-                    "description": "Optional. When true, the worker's first turn only reads its spec and the files it names, then messages the lead with numbered questions (ambiguities, contradictions with the code, open decisions) or exactly 'No questions.', and waits for the lead's reply before changing files. Use it for large or subtle specs."
-                }
-            },
-            "required": ["worker_id", "plan_id", "step", "brief", "tier"]
-        });
-        assert_eq!(&dispatch.parameters, &expected);
+        let tier = &dispatch.parameters["properties"]["tier"];
+        assert_eq!(
+            tier["enum"],
+            json!(["trivial", "routine", "medium", "high", "escalate"])
+        );
+        let description = tier["description"].as_str().expect("tier description");
+        assert!(description.contains("trivial (Trivial)"));
+        assert!(description.contains("routine (Routine)"));
+        assert!(description.contains("medium (Medium)"));
+        assert!(description.contains("no model; folds down to routine"));
+        assert!(description.contains("high (High)"));
+        assert!(description.contains("escalation only, never a first pick"));
+        assert!(!description.contains("\nauto -"));
+        assert_eq!(
+            dispatch.parameters["properties"]["model"]["enum"],
+            json!(["test/scripted-model"])
+        );
+        assert!(dispatch.parameters["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("tier"))));
     }
 
 
@@ -13170,26 +13545,203 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(fixture.classifier.calls(), 1);
         assert_eq!(fixture.rows().len(), 1);
         let routing = worker.routing.expect("IPC worker routing");
-        assert_eq!(routing.laya_tier.as_deref(), Some("average"));
-        assert_eq!(routing.lead_tier.as_deref(), Some("average"));
+        assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("routine"));
         assert_eq!(routing.routed_by, "lead");
         fixture.team.shutdown().await;
     }
 
 
     #[tokio::test]
+    async fn dispatch_uses_every_ladder_tier_and_refuses_legacy_ids() {
+        for (tier, model, ran_tier, fold_note) in [
+            ("trivial", "test/scripted-simple", "trivial", None),
+            ("routine", "test/scripted-average", "routine", None),
+            (
+                "medium",
+                "test/scripted-average",
+                "routine",
+                Some("medium has no model; ran on routine"),
+            ),
+            ("high", "test/scripted-difficult", "high", None),
+            (
+                "escalate",
+                "test/scripted-difficult",
+                "high",
+                Some("escalate has no model; ran on high"),
+            ),
+        ] {
+            let fixture = routing_fixture(
+                crate::mnemo2::dispatch_routing::RoutingMode::Off,
+                None,
+                false,
+            )
+            .await;
+            let result = fixture.dispatch(Some(tier), None).await;
+            assert!(result.success, "tier {tier}: {}", result.output);
+            if let Some(note) = fold_note {
+                assert!(result.output.contains(note), "{}", result.output);
+            }
+            let worker = fixture.team.worker("routingworker").await.expect("worker");
+            assert_eq!(worker.model.as_deref(), Some(model), "tier {tier}");
+            assert_eq!(worker.tier.as_deref(), Some(ran_tier), "tier {tier}");
+            fixture.team.shutdown().await;
+        }
+
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            None,
+            false,
+        )
+        .await;
+        for old_id in ["simple", "average", "difficult"] {
+            let result = fixture.dispatch(Some(old_id), None).await;
+            assert!(!result.success, "legacy tier {old_id} was accepted");
+            assert!(result.output.contains(old_id), "{}", result.output);
+            assert!(
+                result
+                    .output
+                    .contains("trivial, routine, medium, high, escalate"),
+                "{}",
+                result.output
+            );
+        }
+        fixture.team.shutdown().await;
+    }
+
+    #[test]
+    fn legacy_team_tier_ids_convert_once_with_a_preserved_backup() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let mut legacy = worker(root.path(), "legacyworker1");
+        legacy.tier = Some("simple".into());
+        legacy.routing = Some(WorkerRouting {
+            laya_tier: Some("average".into()),
+            confidence: Some(0.9),
+            cleared: true,
+            lead_tier: Some("simple".into()),
+            routed_by: "lead_override".into(),
+            ran_tier: Some("difficult".into()),
+            nudged: Some("average".into()),
+        });
+        legacy.reroutes = vec![DispatchRoutingRow::UserReroute {
+            ts: 1,
+            worker_id: legacy.id.clone(),
+            plan_id: "plan0001".into(),
+            step: 1,
+            from_tier: "simple".into(),
+            to_tier: "difficult".into(),
+            from_model: None,
+            to_model: None,
+            status: "idle".into(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }];
+        let persisted = PersistedTeam {
+            workers: vec![legacy],
+            ..PersistedTeam::default()
+        };
+        let original = serde_json::to_vec_pretty(&persisted).expect("legacy JSON");
+        let path = state.path().join(TEAM_STATE_FILE);
+        std::fs::write(&path, &original).expect("write legacy team");
+        let persistence = TeamPersistence::new(state.path());
+
+        let converted = persistence
+            .load()
+            .expect("load legacy team")
+            .expect("legacy team exists");
+        let converted_worker = &converted.workers[0];
+        assert_eq!(converted_worker.tier.as_deref(), Some("trivial"));
+        let routing = converted_worker.routing.as_ref().expect("routing");
+        assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("trivial"));
+        assert_eq!(routing.ran_tier.as_deref(), Some("high"));
+        assert_eq!(routing.nudged.as_deref(), Some("routine"));
+        assert!(matches!(
+            &converted_worker.reroutes[0],
+            DispatchRoutingRow::UserReroute { from_tier, to_tier, .. }
+                if from_tier == "trivial" && to_tier == "high"
+        ));
+        let backup = state.path().join(TEAM_PRE_TIERS_BACKUP);
+        assert_eq!(std::fs::read(&backup).expect("pre-tier backup"), original);
+
+        // A second legacy load converts the live file but never replaces the
+        // first backup's original bytes.
+        std::fs::write(&path, &original).expect("write legacy team again");
+        persistence.load().expect("second conversion").expect("team");
+        assert_eq!(std::fs::read(&backup).expect("backup remains"), original);
+    }
+
+    #[tokio::test]
+    async fn audit_defaults_to_high_and_unreported_audits_switch_tiers() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            None,
+            false,
+        )
+        .await;
+        let team = &fixture.team;
+        let mut target = worker(fixture._root.path(), "audittarget1");
+        target.plan_id = Some(fixture.plan_id.clone());
+        target.plan_step = Some(1);
+        provision_agent_worktree(
+            fixture._root.path().to_path_buf(),
+            target.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision audit target");
+        team.records.lock().await.push(target.clone());
+
+        let (audit, reused) = team
+            .audit_dispatch(&target.id, "auditdefault1", None, None, None)
+            .await
+            .expect("default-tier audit");
+        assert!(!reused);
+        assert_eq!(audit.tier.as_deref(), Some("high"));
+        assert_eq!(audit.model.as_deref(), Some("test/scripted-difficult"));
+        let immediate = worker_status_view(&audit, false);
+        assert_eq!(immediate["tier"], json!("high"));
+        assert_eq!(immediate["model"], json!("test/scripted-difficult"));
+
+        let switched = team
+            .change_model(
+                &audit.id,
+                Some("test/scripted-average".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("unreported audit model switch");
+        assert_eq!(switched.tier.as_deref(), Some("routine"));
+        assert_eq!(switched.model.as_deref(), Some("test/scripted-average"));
+
+        let resumed = team
+            .handle_lead_host_tool(
+                "team_resume",
+                json!({"worker_id": audit.id, "tier": "high"}),
+            )
+            .await;
+        assert!(resumed.success, "{}", resumed.output);
+        let switched = team.worker(&audit.id).await.expect("switched audit");
+        assert_eq!(switched.tier.as_deref(), Some("high"));
+        assert_eq!(switched.model.as_deref(), Some("test/scripted-difficult"));
+        assert!(!switched.report_delivered);
+        assert!(switched.reroutes.len() >= 2, "audit switches stay in its ledger");
+        assert!(fixture.rows().is_empty(), "audit switches are not training labels");
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn tier_plus_cross_tier_model_logs_the_ran_tier() {
         for (requested, ran, laya_label, expected_effort) in [
-            ("simple", "difficult", mnemo::agent::route_question::LABEL_TRIVIAL, "high"),
-            ("difficult", "simple", mnemo::agent::route_question::LABEL_HARD, "low"),
+            ("trivial", "high", mnemo::agent::route_question::LABEL_TRIVIAL, "high"),
+            ("high", "trivial", mnemo::agent::route_question::LABEL_HARD, "low"),
         ] {
             let fixture = routing_fixture_with(
                 crate::mnemo2::dispatch_routing::RoutingSettings {
                     mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
-                    effort: std::collections::BTreeMap::from([
-                        ("difficult".into(), "high".into()),
-                        ("simple".into(), "low".into()),
-                    ]),
                     ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
                 },
                 routing_answer(laya_label, 0.91),
@@ -13197,19 +13749,22 @@ models = [\"scripted-a\", \"scripted-b\"]
                 std::time::Duration::ZERO,
             )
             .await;
+            let mut tiers = tiers_dto! {
+                difficult: vec!["test/scripted-high".into()],
+                average: vec!["test/scripted-routine".into()],
+                simple: vec!["test/scripted-trivial".into()],
+            };
+            tiers.tiers[0].effort = Some("low".into());
+            tiers.tiers[3].effort = Some("high".into());
             fixture.team.set_catalog(
-                ["difficult", "average", "simple"]
+                ["high", "routine", "trivial"]
                     .into_iter()
                     .map(|tier| LeadModel {
                         reasoning_efforts: vec!["low".into(), "high".into()],
                         ..lead_model(&format!("scripted-{tier}"))
                     })
                     .collect(),
-                tiers_dto! {
-                    difficult: vec!["test/scripted-difficult".into()],
-                    average: vec!["test/scripted-average".into()],
-                    simple: vec!["test/scripted-simple".into()],
-                },
+                tiers,
                 Vec::new(),
             );
             let model = format!("test/scripted-{ran}");
@@ -13253,7 +13808,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         let fixture = routing_fixture_with(
             crate::mnemo2::dispatch_routing::RoutingSettings {
                 mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
-                fallback_tier: "difficult".into(),
+                fallback_tier: "high".into(),
                 ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
             },
             routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.41),
@@ -13266,7 +13821,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(result.output.contains("Laya: unsure (0.41)."));
         assert!(!result.output.contains("routed to difficult"));
         let worker = fixture.team.worker("routingworker").await.expect("worker");
-        assert_eq!(worker.tier.as_deref(), Some("difficult"));
+        assert_eq!(worker.tier.as_deref(), Some("high"));
         fixture.team.shutdown().await;
     }
 
@@ -13337,7 +13892,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(fixture.classifier.calls(), 1);
         assert_eq!(fixture.rows().len(), 1);
         let routing = worker.routing.expect("routing");
-        assert_eq!(routing.laya_tier.as_deref(), Some("difficult"));
+        assert_eq!(routing.laya_tier.as_deref(), Some("high"));
         assert_eq!(routing.routed_by, "lead");
 
         let lead_tool = fixture.dispatch(None, None).await;

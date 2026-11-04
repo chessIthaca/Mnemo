@@ -645,12 +645,12 @@ mod tests {
         let mut lead_pick = worker("w1", "merged", Some("p1"), Some(0));
         lead_pick.merge = Some(merge_record());
         lead_pick.routing = Some(WorkerRouting {
-            laya_tier: Some("average".into()),
+            laya_tier: Some("routine".into()),
             confidence: Some(0.62),
             cleared: true,
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             routed_by: "lead".into(),
-            ran_tier: Some("average".into()),
+            ran_tier: Some("routine".into()),
             nudged: None,
         });
         lead_pick.reroutes = vec![DispatchRoutingRow::UserReroute {
@@ -658,8 +658,8 @@ mod tests {
             worker_id: "w1".into(),
             plan_id: "p1".into(),
             step: 1,
-            from_tier: "average".into(),
-            to_tier: "difficult".into(),
+            from_tier: "routine".into(),
+            to_tier: "high".into(),
             from_model: Some("test/scripted-a".into()),
             to_model: Some("test/scripted-difficult".into()),
             status: "idle".into(),
@@ -670,7 +670,7 @@ mod tests {
         let mut laya_pick = worker("w2", "merged", Some("p1"), Some(1));
         laya_pick.merge = Some(merge_record());
         laya_pick.routing = Some(WorkerRouting {
-            laya_tier: Some("difficult".into()),
+            laya_tier: Some("high".into()),
             confidence: Some(0.41),
             cleared: false,
             lead_tier: None,
@@ -681,12 +681,12 @@ mod tests {
         let mut override_pick = worker("w3", "merged", Some("p1"), Some(2));
         override_pick.merge = Some(merge_record());
         override_pick.routing = Some(WorkerRouting {
-            laya_tier: Some("difficult".into()),
+            laya_tier: Some("high".into()),
             confidence: Some(0.91),
             cleared: true,
-            lead_tier: Some("average".into()),
+            lead_tier: Some("routine".into()),
             routed_by: "lead_override".into(),
-            ran_tier: Some("average".into()),
+            ran_tier: Some("routine".into()),
             nudged: None,
         });
         override_pick.reroutes = vec![DispatchRoutingRow::LeadReroute {
@@ -694,8 +694,8 @@ mod tests {
             worker_id: "w3".into(),
             plan_id: "p1".into(),
             step: 3,
-            from_tier: "average".into(),
-            to_tier: "difficult".into(),
+            from_tier: "routine".into(),
+            to_tier: "high".into(),
             from_model: Some("test/scripted-a".into()),
             to_model: Some("test/scripted-difficult".into()),
             status: "idle".into(),
@@ -710,7 +710,7 @@ mod tests {
         };
         assert!(
             report.contains(
-                "| `w1` | 1 | test/scripted-a | average 0.62 | lead + user reroute | 0 | 0 | 0 (0) | 0 |"
+                "| `w1` | 1 | test/scripted-a | routine 0.62 | lead + user reroute | 0 | 0 | 0 (0) | 0 |"
             ),
             "{report}"
         );
@@ -720,7 +720,7 @@ mod tests {
         );
         assert!(
             report.contains(
-                "| `w3` | 3 | test/scripted-a | difficult 0.91 | lead (override) + lead reroute | 0 | 0 | 0 (0) | 0 |"
+                "| `w3` | 3 | test/scripted-a | high 0.91 | lead (override) + lead reroute | 0 | 0 | 0 (0) | 0 |"
             ),
             "{report}"
         );

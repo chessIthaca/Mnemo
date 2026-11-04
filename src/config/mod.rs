@@ -143,6 +143,9 @@ impl ConfigWriteLock {
                     if let Some(hook) = on_contended {
                         hook();
                     }
+                    // Observe the stale owner's identity together with its
+                    // mtime so a fresh lock moved by our rename can be restored.
+                    let observed_stale_token = fs::read_to_string(&path).unwrap_or_default();
                     let stale = fs::metadata(&path)
                         .and_then(|metadata| metadata.modified())
                         .ok()
@@ -152,9 +155,8 @@ impl ConfigWriteLock {
                         if let Some(hook) = before_stale_rename {
                             hook();
                         }
-                        // Renaming, rather than unlinking, makes stale takeover
-                        // a single-winner operation. A loser cannot remove a
-                        // lock subsequently created by the winner.
+                        // Quarantine first, then verify that the file we moved
+                        // is still the stale lock rather than a fresh successor.
                         let quarantine = config_dir.join(format!("config.write.lock.stale-{token}"));
                         let renamed = fs::rename(&path, &quarantine);
                         if let Some(hook) = after_stale_rename {
@@ -162,8 +164,18 @@ impl ConfigWriteLock {
                         }
                         match renamed {
                             Ok(()) => {
+                                let quarantined_token =
+                                    fs::read_to_string(&quarantine).unwrap_or_default();
+                                if quarantined_token == observed_stale_token {
+                                    let _ = fs::remove_file(quarantine);
+                                    continue;
+                                }
+                                // A fresh owner was installed between our
+                                // staleness check and rename. Restore its lock
+                                // without replacing any lock that may exist now,
+                                // then keep waiting instead of acquiring.
+                                let _ = fs::hard_link(&quarantine, &path);
                                 let _ = fs::remove_file(quarantine);
-                                continue;
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                             Err(_) => {
@@ -1824,7 +1836,6 @@ reasoning_effort = "minimal"
 #[cfg(test)]
 mod config_write_lock_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
@@ -1839,34 +1850,33 @@ mod config_write_lock_tests {
         let mut ladder_b = TierLadder::default();
         ladder_b.tiers[0].models = vec!["ep/b".into()];
 
-        let read = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let contended = Arc::new(Barrier::new(2));
-        let first_contention = Arc::new(AtomicBool::new(true));
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
         let save = {
             let dir = dir.path().to_path_buf();
-            let read = read.clone();
-            let release = release.clone();
+            let release_rx = release_rx.clone();
             std::thread::spawn(move || {
                 let hook = move || {
-                    read.wait();
-                    release.wait();
+                    read_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
                 };
                 cached.save_all_inner(&dir, Some(&hook))
             })
         };
-        read.wait();
+        read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
         let writer_ladder = ladder_b.clone();
         let writer = {
             let dir = dir.path().to_path_buf();
-            let contended = contended.clone();
-            let first_contention = first_contention.clone();
             std::thread::spawn(move || {
                 let hook = move || {
-                    if first_contention.swap(false, Ordering::SeqCst) {
-                        contended.wait();
-                    }
+                    let _ = contended_tx.send(());
                 };
                 endpoints::save_tier_ladder_with_hook(
                     &dir.join("endpoints.toml"),
@@ -1877,8 +1887,8 @@ mod config_write_lock_tests {
         };
         // The tier writer has observed the cached save's lock and cannot pass
         // its read-preserve-commit critical section.
-        contended.wait();
-        release.wait();
+        contended_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_tx.send(()).unwrap();
         save.join().unwrap().unwrap();
         writer.join().unwrap().unwrap();
         assert_eq!(endpoints::load_tier_ladder(&endpoints_path, None).unwrap(), ladder_b);
@@ -1942,6 +1952,83 @@ mod config_write_lock_tests {
         for handle in handles {
             handle.join().unwrap();
         }
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn fresh_lock_is_restored_when_stale_takeover_races_a_new_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("config.write.lock");
+        fs::write(&lock_path, "stale-owner").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+
+        let (before_tx, before_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let (after_tx, after_rx) = std::sync::mpsc::channel();
+        let (contention_tx, contention_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let dir = dir.path().to_path_buf();
+            let release_rx = release_rx.clone();
+            std::thread::spawn(move || {
+                let before_hook = move || {
+                    before_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                };
+                let after_hook = move || {
+                    let _ = after_tx.send(());
+                };
+                let contention_hook = move || {
+                    let _ = contention_tx.send(());
+                };
+                let guard = ConfigWriteLock::acquire_with_hooks(
+                    &dir,
+                    Some(&before_hook),
+                    Some(&contention_hook),
+                    Some(&after_hook),
+                )
+                .unwrap();
+                acquired_tx.send(guard).unwrap();
+            })
+        };
+
+        // The waiter has observed the stale token and paused before rename.
+        contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        before_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Simulate another waiter completing takeover and installing a fresh
+        // owner before our waiter performs its rename.
+        let first_quarantine = dir.path().join("first-stale-quarantine");
+        fs::rename(&lock_path, &first_quarantine).unwrap();
+        let fresh_owner = ConfigWriteLock::acquire(dir.path()).unwrap();
+        let fresh_token = fresh_owner.token.clone();
+        fs::remove_file(first_quarantine).unwrap();
+        release_tx.send(()).unwrap();
+
+        // Our waiter moves the fresh lock, detects the token mismatch, and
+        // restores it. Its next contention proves restoration has completed.
+        after_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        contention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), fresh_token);
+        assert!(
+            acquired_rx.try_recv().is_err(),
+            "the waiter acquired while the fresh owner was alive"
+        );
+
+        drop(fresh_owner);
+        let waiter_guard = acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_ne!(waiter_guard.token, fresh_token);
+        waiter.join().unwrap();
+        drop(waiter_guard);
         assert!(!lock_path.exists());
     }
 

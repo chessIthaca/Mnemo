@@ -1650,6 +1650,57 @@ mod tests {
     use futures::stream::BoxStream;
     use tempfile::tempdir;
 
+    /// Overall budget for one test's event drain. It is an upper bound, not a
+    /// wait: every drain loop exits the moment its own terminal event arrives.
+    ///
+    /// 30s rather than the old 5s because these tests run inside the full
+    /// parallel `cargo test --lib` suite (3000+ tests): one stretch of work
+    /// between two fan-in events — tokenizing a 60k-token prompt, say — can
+    /// take seconds on a loaded box. The bound stays: a real regression must
+    /// still fail the test rather than hang the suite.
+    const TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Wait for the next `(agent id, event)` on the fan-in channel until the
+    /// turn's overall `deadline`.
+    ///
+    /// `None` means the deadline passed or the channel closed — never a quiet
+    /// gap between two events. The pre-fix drain loops wrapped `recv` in a
+    /// 500ms `timeout` and broke on the timeout, so any >500ms stretch of work
+    /// between two events (tokenizing the ~60k-token prompt of
+    /// `rate_limit_429_high_fill_rate_does_not_regress_window_viability` under
+    /// full-suite load) ended the drain before the turn's terminal event and
+    /// failed the turn's assertions (plan a4837353).
+    async fn next_event(
+        rx: &mut mpsc::Receiver<(u64, AgentEvent)>,
+        deadline: tokio::time::Instant,
+    ) -> Option<AgentEvent> {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some((_agent_id, event))) => Some(event),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// Regression (plan a4837353): an event that arrives 800ms after the
+    /// previous one must still be delivered. The old drain loops broke on the
+    /// first 500ms gap between fan-in events — exactly the flake this helper
+    /// removes — so this test fails against the pre-fix wait.
+    #[tokio::test]
+    async fn next_event_waits_out_a_gap_longer_than_the_old_idle_break() {
+        let (tx, mut rx) = mpsc::channel::<(u64, AgentEvent)>(8);
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            assert!(tx.send((1, AgentEvent::Started)).await.is_ok());
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let event = next_event(&mut rx, deadline).await;
+        assert!(
+            matches!(event, Some(AgentEvent::Started)),
+            "an event arriving 800ms after the previous one must still be received"
+        );
+        sender.await.expect("the sender task must not panic");
+    }
+
     /// A mock provider that returns a simple text response.
     struct MockProvider {
         caps: Capabilities,
@@ -1736,11 +1787,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         cmd_tx.send(AgentCommand::Cancel).await.unwrap();
 
-        // Collect events.
+        // Collect events until the run ends (Cancel ends it, closing the
+        // channel) — bounded by the overall deadline.
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
         let mut events = Vec::new();
-        while let Ok(Some((_id, event))) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-        {
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
             events.push(event);
             if events.len() > 20 {
                 break;
@@ -1881,13 +1932,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Collect events until the agent goes idle (Finished/Exited/Error).
+        // Collect events until the agent goes idle (Finished/Exited/terminal
+        // Error). The task stays alive afterwards, so the drain ends on that
+        // terminal event — never on a quiet gap between two events.
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
         let mut events = Vec::new();
-        while let Ok(Some((_id, event))) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-        {
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            let terminal = matches!(
+                event,
+                AgentEvent::Finished { .. }
+                    | AgentEvent::Exited
+                    | AgentEvent::Error {
+                        retrying: false,
+                        ..
+                    }
+            );
             events.push(event);
-            if events.len() > 20 {
+            if terminal || events.len() > 20 {
                 break;
             }
         }
@@ -2206,27 +2267,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2347,32 +2404,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Drain the event fan-in until the turn finishes on the fallback
-        // (the 5s deadline bounds the wait). A recv TIMEOUT must NOT break
-        // the loop — under a fully loaded parallel test suite a 500ms
-        // scheduling gap is possible mid-turn, and bailing early would
-        // drop cmd_tx before the fallback request ever runs (a flake the
-        // first full-suite run caught). Keep waiting until the Finished /
-        // Exited event, the channel closes, or the deadline passes.
+        // Drain the event fan-in until the turn finishes on the fallback, the
+        // channel closes, or the overall deadline passes. A quiet gap between
+        // two events must NOT break the loop — under a fully loaded parallel
+        // test suite a >500ms gap is possible mid-turn, and bailing early would
+        // drop cmd_tx before the fallback request ever runs (a flake the first
+        // full-suite run caught). `next_event` waits any such gap out, up to
+        // the deadline.
         let mut saw_finished = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                fanin_rx.recv(),
-            )
-            .await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
-                    }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                Ok(None) => break,
-                Err(_elapsed) => {}
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2511,22 +2559,18 @@ mod tests {
             .unwrap();
 
         let mut terminal_error_text: Option<String> = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error {
-                        error,
-                        retrying: false,
-                    } => {
-                        terminal_error_text = Some(error);
-                        break;
-                    }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error {
+                    error,
+                    retrying: false,
+                } => {
+                    terminal_error_text = Some(error);
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2633,27 +2677,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2764,24 +2804,20 @@ mod tests {
 
         let mut terminal_error_text: Option<String> = None;
         let mut saw_switching = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            terminal_error_text = Some(error);
-                            break;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } | AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                    if !retrying {
+                        terminal_error_text = Some(error);
+                        break;
+                    }
+                }
+                AgentEvent::Finished { .. } | AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2978,27 +3014,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -3100,22 +3132,18 @@ mod tests {
             .unwrap();
 
         let mut terminal_error_text: Option<String> = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error {
-                        error,
-                        retrying: false,
-                    } => {
-                        terminal_error_text = Some(error);
-                        break;
-                    }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error {
+                    error,
+                    retrying: false,
+                } => {
+                    terminal_error_text = Some(error);
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -3264,27 +3292,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -3324,27 +3348,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut *fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         (saw_finished, saw_terminal_error, saw_switching)

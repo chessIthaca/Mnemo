@@ -672,6 +672,7 @@ mod tests {
                 ..Endpoint::test_default()
             }],
             pricing: vec![],
+            tiers: Default::default(),
             keys: Default::default(),
             mcp: Vec::new(),
             projects: Default::default(),
@@ -715,6 +716,7 @@ mod tests {
                 ..Endpoint::test_default()
             }],
             pricing: vec![],
+            tiers: Default::default(),
             keys: Default::default(),
             mcp: Vec::new(),
             projects: Default::default(),
@@ -817,6 +819,7 @@ mod tests {
                 ..Endpoint::test_default()
             }],
             pricing: vec![],
+            tiers: Default::default(),
             keys: Default::default(),
             mcp: Vec::new(),
             projects: Default::default(),

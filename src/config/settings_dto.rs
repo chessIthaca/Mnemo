@@ -92,44 +92,16 @@ pub struct ModelsConfigDto {
     pub skill: Option<std::collections::HashMap<String, ModelRefDto>>,
 }
 
-/// The `[general.routing]` section patch (pre-prompt model routing, backlog
-/// 091e694d). When present, the fields it carries replace the stored values;
-/// each is optional so the dialog can send only what it manages. For the two
-/// targets the outer `None` keeps the existing override and an explicit
-/// `null` clears it (the double-Option semantics of [`ModelsConfigDto`]);
-/// `threshold` / `enforce` absent = keep.
+/// The `[general.routing]` section patch. Model lanes have moved to the
+/// shared tier ladder; only the routing gates and enforce flag remain.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RoutingConfigDto {
-    /// The model a confidently-TRIVIAL task routes to.
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub cheap: Option<Option<ModelRefDto>>,
-    /// The model a confidently-ROUTINE first prompt routes to — the middle
-    /// rung of the shared three-label question (plan 2ba2168a, design §4.3).
-    /// Same double-Option semantics as the other targets.
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub routine: Option<Option<ModelRefDto>>,
-    /// The model a confidently-ARCHITECTURAL task routes to.
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub capable: Option<Option<ModelRefDto>>,
-    /// The model a medium-complexity plan step routes to (escalation-lane
-    /// rung `medium`, backlog ad56c7bd). Same double-Option semantics as the
-    /// other targets.
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub lane_medium: Option<Option<ModelRefDto>>,
-    /// The model a high-complexity plan step routes to (rung `high`). Same
-    /// semantics.
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub lane_high: Option<Option<ModelRefDto>>,
-    /// The model the escalate rung routes to. Same semantics.
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub escalate: Option<Option<ModelRefDto>>,
     /// The calibrated-probability gate (`0.0..=1.0`; validated) for the
     /// step-lane ladder.
     #[serde(default)]
     pub threshold: Option<f64>,
     /// The first-prompt gate (`0.0..=1.0`; validated). Outer `None` keeps the
-    /// stored value; an explicit `null` clears it back to the kernel's
-    /// calibrated default for the offered label count (design §4.4).
+    /// stored value; an explicit `null` clears it back to the kernel default.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub first_prompt_min_confidence: Option<Option<f64>>,
     /// Whether a confident decision actually switches the turn's model.
@@ -650,26 +622,6 @@ pub fn validate_and_apply_settings_patch(
                 ));
             }
         }
-        let check = |m: &ModelRefDto| -> Result<(), String> {
-            let ep = m.endpoint.trim();
-            if ep.is_empty() {
-                return Err("routing target endpoint must not be empty".into());
-            }
-            if m.model.trim().is_empty() {
-                return Err("routing target model must not be empty".into());
-            }
-            if has_endpoints && !current.endpoints.iter().any(|e| e.name == ep) {
-                return Err(format!(
-                    "routing target endpoint '{ep}' does not match any configured endpoint"
-                ));
-            }
-            Ok(())
-        };
-        for field in [&routing.cheap, &routing.routine, &routing.capable] {
-            if let Some(Some(m)) = field {
-                check(m)?;
-            }
-        }
     }
 
     // ── 3. Apply patch into a new Config ──────────────────────────────────
@@ -873,24 +825,6 @@ pub fn validate_and_apply_settings_patch(
     }
 
     if let Some(routing) = &patch.routing {
-        if let Some(cheap) = &routing.cheap {
-            general.general.routing.cheap = cheap.as_ref().map(to_ref);
-        }
-        if let Some(routine) = &routing.routine {
-            general.general.routing.routine = routine.as_ref().map(to_ref);
-        }
-        if let Some(capable) = &routing.capable {
-            general.general.routing.capable = capable.as_ref().map(to_ref);
-        }
-        if let Some(lane) = &routing.lane_medium {
-            general.general.routing.lane_medium = lane.as_ref().map(to_ref);
-        }
-        if let Some(lane) = &routing.lane_high {
-            general.general.routing.lane_high = lane.as_ref().map(to_ref);
-        }
-        if let Some(lane) = &routing.escalate {
-            general.general.routing.escalate = lane.as_ref().map(to_ref);
-        }
         if let Some(threshold) = routing.threshold {
             general.general.routing.threshold = threshold;
         }
@@ -950,6 +884,7 @@ pub fn validate_and_apply_settings_patch(
         general,
         endpoints: current.endpoints.clone(),
         pricing,
+        tiers: current.tiers.clone(),
         keys: current.keys.clone(),
         mcp: current.mcp.clone(),
         projects: current.projects.clone(),
@@ -1415,39 +1350,10 @@ mod tests {
 
     #[test]
     fn routing_patch_set_clear_keep_and_threshold_validation() {
-        // The [general.routing] patch mirrors the [models] double-Option
-        // semantics for its two targets, plain Option for the scalars, and
-        // rejects an out-of-range threshold rather than clamping it.
         let current = Config::default();
         let patch = SettingsSaveDto {
             laya_routing: Some(true),
             routing: Some(RoutingConfigDto {
-                cheap: Some(Some(ModelRefDto {
-                    endpoint: "  ep  ".into(),
-                    model: "  tiny  ".into(),
-                    reasoning_effort: Some(" minimal ".into()),
-                })),
-                capable: Some(Some(ModelRefDto {
-                    endpoint: "ep".into(),
-                    model: "big".into(),
-                    reasoning_effort: None,
-                })),
-                routine: Some(Some(ModelRefDto {
-                    endpoint: "ep".into(),
-                    model: "small".into(),
-                    reasoning_effort: None,
-                })),
-                lane_medium: Some(Some(ModelRefDto {
-                    endpoint: "ep".into(),
-                    model: "mid".into(),
-                    reasoning_effort: None,
-                })),
-                lane_high: None,
-                escalate: Some(Some(ModelRefDto {
-                    endpoint: "ep".into(),
-                    model: "top".into(),
-                    reasoning_effort: None,
-                })),
                 threshold: Some(0.9),
                 first_prompt_min_confidence: Some(Some(0.55)),
                 enforce: Some(true),
@@ -1458,93 +1364,31 @@ mod tests {
         assert!(next.general.general.laya.routing);
         assert!(next.general.general.routing.enforce);
         assert!((next.general.general.routing.threshold - 0.9).abs() < 1e-9);
-        let cheap = next.general.general.routing.cheap.clone().expect("cheap set");
-        assert_eq!(cheap.endpoint, "ep");
-        assert_eq!(cheap.model, "tiny");
-        assert_eq!(cheap.reasoning_effort.as_deref(), Some("minimal"));
-        assert_eq!(
-            next.general
-                .general
-                .routing
-                .capable
-                .as_ref()
-                .expect("capable set")
-                .model,
-            "big"
-        );
-        let lane = next
-            .general
-            .general
-            .routing
-            .lane_medium
-            .clone()
-            .expect("lane_medium set");
-        assert_eq!(lane.model, "mid");
-        assert_eq!(
-            next.general
-                .general
-                .routing
-                .escalate
-                .as_ref()
-                .expect("escalate set")
-                .model,
-            "top"
-        );
-        assert!(next.general.general.routing.lane_high.is_none());
+        assert_eq!(next.general.general.routing.first_prompt_min_confidence, Some(0.55));
 
-        assert_eq!(
-            next.general
-                .general
-                .routing
-                .routine
-                .as_ref()
-                .expect("routine set")
-                .model,
-            "small"
-        );
-        assert_eq!(
-            next.general.general.routing.first_prompt_min_confidence,
-            Some(0.55)
-        );
-
-        // Clear: Some(None) empties the slot; fields absent from the patch
-        // keep their stored values.
         let patch = SettingsSaveDto {
             routing: Some(RoutingConfigDto {
-                cheap: Some(None),
-                escalate: Some(None),
-                routine: Some(None),
                 first_prompt_min_confidence: Some(None),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert!(next.general.general.routing.cheap.is_none());
-        assert!(next.general.general.routing.escalate.is_none());
-        assert!(next.general.general.routing.routine.is_none());
-        assert!(next
-            .general
-            .general
-            .routing
-            .first_prompt_min_confidence
-            .is_none());
-        assert!(next.general.general.routing.lane_medium.is_some());
-        assert!(next.general.general.routing.lane_high.is_none());
-        assert!(next.general.general.routing.capable.is_some());
+        assert!(next.general.general.routing.first_prompt_min_confidence.is_none());
+        assert!(next.general.general.routing.enforce);
+        assert!((next.general.general.routing.threshold - 0.9).abs() < 1e-9);
+
+        let next = validate_and_apply_settings_patch(
+            &next,
+            &SettingsSaveDto {
+                routing: Some(RoutingConfigDto::default()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(next.general.general.laya.routing);
         assert!(next.general.general.routing.enforce);
 
-        // Keep: an all-default patch changes nothing at all.
-        let patch = SettingsSaveDto {
-            routing: Some(RoutingConfigDto::default()),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert!(next.general.general.routing.capable.is_some());
-        assert!(next.general.general.laya.routing);
-
-        // Validation: an out-of-range threshold is an error, and the stored
-        // config is left untouched.
         for bad in [-0.1_f64, 1.5_f64] {
             let patch = SettingsSaveDto {
                 routing: Some(RoutingConfigDto {
@@ -1637,35 +1481,18 @@ mod tests {
 
     #[test]
     fn routing_patch_distinguishes_absent_from_null() {
-        // The wire contract the dialog relies on: an absent target keeps the
-        // stored override, an explicit null clears it.
-        let dto: SettingsSaveDto = serde_json::from_str(
-            r#"{"routing":{"cheap":null,"capable":{"endpoint":"ep","model":"m"}}}"#,
-        )
-        .expect("patch parses");
+        let dto: SettingsSaveDto =
+            serde_json::from_str(r#"{"routing":{"first_prompt_min_confidence":null}}"#)
+                .expect("patch parses");
         let routing = dto.routing.expect("routing present");
-        assert!(matches!(routing.cheap, Some(None)));
-        assert!(matches!(routing.capable, Some(Some(_))));
-        assert!(routing.lane_medium.is_none());
-        assert!(routing.lane_high.is_none());
-        assert!(routing.escalate.is_none());
+        assert!(matches!(routing.first_prompt_min_confidence, Some(None)));
         assert!(routing.threshold.is_none());
         assert!(routing.enforce.is_none());
-
-        // The lane targets use the same absent/null/set contract.
-        let dto: SettingsSaveDto = serde_json::from_str(
-            r#"{"routing":{"lane_medium":{"endpoint":"ep","model":"m"},"lane_high":null}}"#,
-        )
-        .expect("patch parses");
-        let routing = dto.routing.expect("routing present");
-        assert!(matches!(routing.lane_medium, Some(Some(_))));
-        assert!(matches!(routing.lane_high, Some(None)));
-        assert!(routing.escalate.is_none());
 
         let dto: SettingsSaveDto =
             serde_json::from_str(r#"{"routing":{"threshold":0.75}}"#).expect("patch parses");
         let routing = dto.routing.expect("routing present");
-        assert!(routing.cheap.is_none()); // absent = keep
+        assert!(routing.first_prompt_min_confidence.is_none());
         assert!(matches!(routing.threshold, Some(t) if (t - 0.75).abs() < 1e-9));
     }
 }

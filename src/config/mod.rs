@@ -22,7 +22,7 @@ pub mod patch;
 pub mod projects;
 pub mod settings_dto;
 
-pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, Tiers, kind_wire};
+pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, Tier, TierLadder, kind_wire};
 pub use general::{
     BudgetConfig, EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig,
     MarkdownConfig, ModelRef, ModelsConfig, OptimizerConfig, RoutingConfig, SafetyMode,
@@ -47,6 +47,8 @@ pub struct Config {
     pub endpoints: Vec<Endpoint>,
     /// Per-model pricing from `endpoints.toml` (`[[pricing]]`).
     pub pricing: Vec<PricingEntry>,
+    /// The unified five-tier model ladder from `endpoints.toml` (`[[tier]]`).
+    pub tiers: TierLadder,
     /// API keys from `keys.toml`. Kept separate so it is never accidentally logged.
     pub keys: KeyStore,
     /// MCP server definitions from `mcp.toml` (names + transports; env-var
@@ -54,6 +56,17 @@ pub struct Config {
     pub mcp: Vec<McpServerDef>,
     /// Known-projects registry from `projects.toml`.
     pub projects: ProjectRegistry,
+}
+
+fn configured_default_model(general: &GeneralConfig, endpoints: &[Endpoint]) -> Option<String> {
+    let model = general.general.default_model.as_ref()?;
+    let endpoint = general
+        .general
+        .default_provider
+        .as_ref()
+        .and_then(|name| endpoints.iter().find(|endpoint| endpoint.name == *name))
+        .or_else(|| endpoints.first())?;
+    Some(format!("{}/{}", endpoint.name, model))
 }
 
 impl Config {
@@ -69,8 +82,27 @@ impl Config {
         for name in ["config.toml", "endpoints.toml", "keys.toml", "mcp.toml"] {
             recover_interrupted_write(&config_dir.join(name));
         }
-        let general = GeneralConfig::load_or_default(&config_dir.join("config.toml"))?;
-        let (endpoints, pricing) = endpoints::load_or_default(&config_dir.join("endpoints.toml"))?;
+        let config_path = config_dir.join("config.toml");
+        let endpoints_path = config_dir.join("endpoints.toml");
+        let general = GeneralConfig::load_or_default(&config_path)?;
+        let (endpoints, pricing) = endpoints::load_or_default(&endpoints_path)?;
+        let default_model = configured_default_model(&general, &endpoints);
+        let mut tiers = endpoints::load_tier_ladder(&endpoints_path, default_model.as_deref())?;
+        let lanes_migrated = general::merge_legacy_lanes(&config_path, &mut tiers)?;
+        if lanes_migrated {
+            tiers.fill_default_model(default_model.as_deref());
+        }
+        let tiers_migrated = endpoints::tier_file_needs_migration(&endpoints_path)?;
+        if lanes_migrated {
+            // Keep the original lane-bearing file even after the successful save.
+            fs::copy(&config_path, backup_path(&config_path))?;
+        }
+        if lanes_migrated || tiers_migrated {
+            endpoints::save_tier_ladder(&endpoints_path, &tiers)?;
+        }
+        if lanes_migrated {
+            general.save(&config_path)?;
+        }
         let keys = KeyStore::load_or_default(&config_dir.join("keys.toml"))?;
         let mcp = mcp::load_or_default(&config_dir.join("mcp.toml"))?;
         let projects = ProjectRegistry::load_or_default(&config_dir.join("projects.toml"))?;
@@ -78,6 +110,7 @@ impl Config {
             general,
             endpoints,
             pricing,
+            tiers,
             keys,
             mcp,
             projects,
@@ -153,9 +186,8 @@ impl Config {
             let file = endpoints::EndpointsFile {
                 endpoint: self.endpoints.clone(),
                 pricing: self.pricing.clone(),
-                // `[tiers]` is not part of the in-memory Config: carry the
-                // on-disk table through every Mnemo1 save.
-                tiers: endpoints::load_tiers(&config_dir.join("endpoints.toml")),
+                tier: self.tiers.tiers.clone(),
+                legacy_tiers: None,
             };
             toml::to_string_pretty(&file)?
         };
@@ -1294,5 +1326,140 @@ api_key = "sk-x"
         assert!(msg.contains("config.toml"), "{msg}");
         assert!(msg.contains("device full"), "{msg}");
         assert!(msg.contains("half-committed"), "{msg}");
+    }
+}
+
+
+#[cfg(test)]
+mod unified_tier_migration_tests {
+    use super::*;
+
+    fn endpoint_table() -> &'static str {
+        r#"
+[[endpoint]]
+name = "ep"
+kind = "openai"
+base_url = "http://localhost/"
+models = ["default", "legacy-tiny", "tiny", "legacy-routine", "routine", "medium", "legacy-hard", "capable", "high", "top"]
+"#
+    }
+
+    #[test]
+    fn legacy_lanes_migrate_with_backup_and_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let original = r#"[general]
+default_provider = "ep"
+default_model = "default"
+
+[general.routing]
+threshold = 0.7
+enforce = true
+
+[general.routing.cheap]
+endpoint = "ep"
+model = "tiny"
+
+[general.routing.routine]
+endpoint = "ep"
+model = "routine"
+
+[general.routing.lane_medium]
+endpoint = "ep"
+model = "medium"
+
+[general.routing.capable]
+endpoint = "ep"
+model = "capable"
+
+[general.routing.lane_high]
+endpoint = "ep"
+model = "high"
+
+[general.routing.escalate]
+endpoint = "ep"
+model = "top"
+"#;
+        fs::write(&config_path, original).unwrap();
+        fs::write(
+            dir.path().join("endpoints.toml"),
+            format!(
+                "{}\n[tiers]\nsimple = [\"ep/legacy-tiny\"]\naverage = [\"ep/legacy-routine\"]\ndifficult = [\"ep/legacy-hard\"]\n",
+                endpoint_table()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        let expected = [
+            ("trivial", vec!["ep/legacy-tiny", "ep/tiny"]),
+            ("routine", vec!["ep/legacy-routine", "ep/routine"]),
+            ("medium", vec!["ep/medium"]),
+            ("high", vec!["ep/legacy-hard", "ep/capable", "ep/high"]),
+            ("escalate", vec!["ep/top"]),
+        ];
+        for (id, models) in expected {
+            assert_eq!(config.tiers.get(id).unwrap().models, models, "{id}");
+        }
+        assert!((config.general.general.routing.threshold - 0.7).abs() < 1e-9);
+        assert!(config.general.general.routing.enforce);
+
+        let backup = dir.path().join("config.toml.bak");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        let migrated = fs::read_to_string(&config_path).unwrap();
+        for lane in ["cheap", "routine", "capable", "lane_medium", "lane_high", "escalate"] {
+            assert!(!migrated.contains(lane), "saved config still contains {lane}");
+        }
+        assert!(migrated.contains("threshold"));
+        assert!(migrated.contains("enforce"));
+        let endpoints = fs::read_to_string(dir.path().join("endpoints.toml")).unwrap();
+        assert!(endpoints.contains("[[tier]]"));
+        assert!(!endpoints.contains("[tiers]"));
+
+        let reloaded = Config::load(dir.path()).unwrap();
+        assert_eq!(reloaded.tiers, config.tiers);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+    }
+
+    #[test]
+    fn lane_migration_is_safe_when_endpoints_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[general.routing.cheap]
+endpoint = "ep"
+model = "tiny"
+"#,
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.tiers.get("trivial").unwrap().models, vec!["ep/tiny"]);
+        assert!(dir.path().join("endpoints.toml").exists());
+        assert!(dir.path().join("config.toml.bak").exists());
+        assert_eq!(Config::load(dir.path()).unwrap().tiers, config.tiers);
+    }
+
+    #[test]
+    fn legacy_empty_simple_uses_the_configured_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "[general]\ndefault_provider = \"ep\"\ndefault_model = \"default\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("endpoints.toml"),
+            format!("{}
+[tiers]
+average = [\"ep/routine\"]
+", endpoint_table()),
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.tiers.first_model("trivial"), Some("ep/default"));
+        let text = fs::read_to_string(dir.path().join("endpoints.toml")).unwrap();
+        assert!(text.contains("ep/default"));
+        assert!(!text.contains("[tiers]"));
     }
 }

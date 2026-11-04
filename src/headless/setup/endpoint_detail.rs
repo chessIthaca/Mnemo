@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Setup;
 use crate::config::keys::Secret;
-use crate::config::{Config, Endpoint, ModelSpec, PricingEntry, Tiers};
+use crate::config::{Config, Endpoint, ModelSpec, PricingEntry, Tier, TierLadder};
 use crate::headless::error::EngineError;
 
 /// Per-1M-token model prices (USD).
@@ -106,38 +106,84 @@ pub struct EndpointDetailDto {
     pub models: Vec<ModelDetailDto>,
 }
 
-/// The three Mnemo2 model tiers: ordered `endpoint/model` specs, first =
-/// default.
+/// One rung in the settings wire representation of the unified ladder.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TiersDto {
-    /// Design-heavy, cross-cutting, debugging work.
+pub struct TierDto {
+    /// Stable tier id.
+    pub id: String,
+    /// Editable display name.
+    pub name: String,
+    /// Editable routing definition.
+    pub definition: String,
+    /// Ordered `endpoint/model` specs, first = default.
     #[serde(default)]
-    pub difficult: Vec<String>,
-    /// Typical implementation steps.
+    pub models: Vec<String>,
+    /// Optional reasoning-effort override.
     #[serde(default)]
-    pub average: Vec<String>,
-    /// Mechanical single-file edits, checks, lookups ("Simple and tools").
+    pub effort: Option<String>,
+    /// `"escalate"` on the escalation-only rung, otherwise `null`.
     #[serde(default)]
-    pub simple: Vec<String>,
+    pub role: Option<String>,
+    /// The rung this tier currently folds down to (output-only).
+    #[serde(default)]
+    pub resolves_to: String,
 }
 
-impl From<Tiers> for TiersDto {
-    fn from(t: Tiers) -> Self {
-        Self {
-            difficult: t.difficult,
-            average: t.average,
-            simple: t.simple,
-        }
+/// The five-tier ladder in cheapest-first order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TiersDto {
+    /// Exactly `trivial`, `routine`, `medium`, `high`, `escalate`, in that order.
+    pub tiers: Vec<TierDto>,
+}
+
+impl Default for TiersDto {
+    fn default() -> Self {
+        TierLadder::default().into()
     }
 }
 
-impl From<TiersDto> for Tiers {
-    fn from(t: TiersDto) -> Self {
-        Self {
-            difficult: t.difficult,
-            average: t.average,
-            simple: t.simple,
-        }
+impl From<TierLadder> for TiersDto {
+    fn from(ladder: TierLadder) -> Self {
+        let tiers = ladder
+            .ordered()
+            .iter()
+            .map(|tier| TierDto {
+                id: tier.id.clone(),
+                name: tier.name.clone(),
+                definition: tier.definition.clone(),
+                models: tier.models.clone(),
+                effort: tier.effort.clone(),
+                role: tier.role.clone(),
+                resolves_to: ladder
+                    .resolve(&tier.id)
+                    .map(|(ran_tier, _)| ran_tier)
+                    .unwrap_or_default(),
+            })
+            .collect();
+        Self { tiers }
+    }
+}
+
+impl TryFrom<TiersDto> for TierLadder {
+    type Error = EngineError;
+
+    fn try_from(dto: TiersDto) -> Result<Self, Self::Error> {
+        let ladder = Self {
+            tiers: dto
+                .tiers
+                .into_iter()
+                .map(|tier| Tier {
+                    id: tier.id,
+                    name: tier.name,
+                    definition: tier.definition,
+                    models: tier.models,
+                    effort: tier.effort,
+                    role: tier.role,
+                })
+                .collect(),
+        };
+        ladder.validate().map_err(err)?;
+        Ok(ladder)
     }
 }
 
@@ -450,9 +496,11 @@ impl Setup {
         }
 
         // Tier entries follow renames and drop removed models.
-        let old_tiers = crate::config::endpoints::load_tiers(&self.endpoints_path());
+        let old_tiers = crate::config::endpoints::load_tier_ladder(&self.endpoints_path(), None)
+            .map_err(|e| err(e.to_string()))?;
         let mut tiers = old_tiers.clone();
-        for list in tiers.lists_mut() {
+        for tier in &mut tiers.tiers {
+            let list = &mut tier.models;
             let mut out: Vec<String> = Vec::new();
             for spec in list.iter() {
                 let rewritten = match resolve_spec(&current.endpoints, spec) {
@@ -490,7 +538,7 @@ impl Setup {
             .save_all(&self.config_dir)
             .map_err(|e| err(e.to_string()))?;
         if tiers != old_tiers {
-            crate::config::endpoints::save_tiers(&self.endpoints_path(), &tiers)
+            crate::config::endpoints::save_tier_ladder(&self.endpoints_path(), &tiers)
                 .map_err(|e| err(e.to_string()))?;
         }
         self.refresh_live().await;
@@ -568,19 +616,17 @@ impl Setup {
 
     /// The configured tiers.
     pub fn tiers(&self) -> Result<TiersDto, EngineError> {
-        self.load_config()?;
-        Ok(crate::config::endpoints::load_tiers(&self.endpoints_path()).into())
+        Ok(self.load_config()?.tiers.into())
     }
 
     /// Validate and persist the tiers: every spec must resolve to a
     /// configured `endpoint/model`. Blank entries and duplicates are dropped.
     pub async fn set_tiers(&self, tiers: TiersDto) -> Result<TiersDto, EngineError> {
-        let cfg = self.load_config()?;
-        let mut tiers: Tiers = tiers.into();
-        for (name, list) in ["difficult", "average", "simple"]
-            .into_iter()
-            .zip(tiers.lists_mut())
-        {
+        let mut cfg = self.load_config()?;
+        let mut tiers: TierLadder = tiers.try_into()?;
+        for tier in &mut tiers.tiers {
+            let name = &tier.id;
+            let list = &mut tier.models;
             let mut out: Vec<String> = Vec::new();
             for spec in list.iter() {
                 let spec = spec.trim();
@@ -598,9 +644,9 @@ impl Setup {
             }
             *list = out;
         }
-        crate::config::endpoints::save_tiers(&self.endpoints_path(), &tiers)
-            .map_err(|e| err(e.to_string()))?;
-        Ok(tiers.into())
+        cfg.tiers = tiers;
+        cfg.save_all(&self.config_dir).map_err(|e| err(e.to_string()))?;
+        Ok(cfg.tiers.into())
     }
 
     /// What still references an endpoint: tier entries and the configured
@@ -608,11 +654,10 @@ impl Setup {
     pub fn endpoint_usage(&self, name: &str) -> Result<Vec<String>, EngineError> {
         let cfg = self.load_config()?;
         let mut out = Vec::new();
-        let tiers = crate::config::endpoints::load_tiers(&self.endpoints_path());
         let prefix = format!("{name}/");
-        for (tier, list) in tiers.named() {
-            for spec in list.iter().filter(|s| s.starts_with(&prefix)) {
-                out.push(format!("tier {tier}: {spec}"));
+        for tier in cfg.tiers.ordered() {
+            for spec in tier.models.iter().filter(|s| s.starts_with(&prefix)) {
+                out.push(format!("tier {}: {spec}", tier.id));
             }
         }
         let g = &cfg.general.general;
@@ -648,6 +693,20 @@ mod tests {
         (dir, setup)
     }
 
+    fn models<'a>(dto: &'a TiersDto, id: &str) -> &'a Vec<String> {
+        &dto.tiers
+            .iter()
+            .find(|tier| tier.id == id)
+            .expect("tier")
+            .models
+    }
+
+    fn valid_dto() -> TiersDto {
+        let mut dto = TiersDto::default();
+        dto.tiers[0].models = vec!["a/m2".into()];
+        dto
+    }
+
     const BASE: &str = r#"
 [[endpoint]]
 name = "a"
@@ -678,19 +737,19 @@ simple = ["a/m2"]
     fn tiers_round_trip_and_absence() {
         let (dir, setup) = setup_with(BASE);
         let t = setup.tiers().unwrap();
-        assert_eq!(t.difficult, vec!["a/m1", "b/x"]);
-        assert!(t.average.is_empty());
+        assert_eq!(models(&t, "high").as_slice(), ["a/m1", "b/x"]);
+        assert!(models(&t, "routine").is_empty());
         std::fs::write(
             dir.path().join("endpoints.toml"),
             "[[endpoint]]\nname = \"a\"\nkind = \"openai\"\nbase_url = \"http://h/\"\nmodels = [\"m1\"]\n",
         )
         .unwrap();
         assert_eq!(setup.tiers().unwrap(), TiersDto::default());
-        // An empty table is not serialized back.
         let cfg = Config::load(dir.path()).unwrap();
         cfg.save_all(dir.path()).unwrap();
         let text = std::fs::read_to_string(dir.path().join("endpoints.toml")).unwrap();
-        assert!(!text.contains("tiers"));
+        assert!(text.contains("[[tier]]"));
+        assert!(!text.contains("[tiers]"));
     }
 
     #[test]
@@ -706,27 +765,34 @@ simple = ["a/m2"]
             &HashMap::new(),
         );
         new.save_all(dir.path()).unwrap();
-        let tiers = crate::config::endpoints::load_tiers(&dir.path().join("endpoints.toml"));
-        assert_eq!(tiers.difficult, vec!["a/m1", "b/x"]);
-        assert_eq!(tiers.simple, vec!["a/m2"]);
+        let tiers = crate::config::endpoints::load_tier_ladder(
+            &dir.path().join("endpoints.toml"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tiers.get("high").unwrap().models, vec!["a/m1", "b/x"]);
+        assert_eq!(tiers.get("trivial").unwrap().models, vec!["a/m2"]);
     }
 
     #[tokio::test]
     async fn set_tiers_rejects_unknown_specs() {
         let (_dir, setup) = setup_with(BASE);
-        let bad = TiersDto {
-            average: vec!["a/nope".into()],
-            ..Default::default()
-        };
+        let empty = setup.set_tiers(TiersDto::default()).await.unwrap_err().to_string();
+        assert!(empty.contains("lowest tier 'trivial'"), "{empty}");
+
+        let mut bad = valid_dto();
+        bad.tiers[1].models = vec!["a/nope".into()];
         let e = setup.set_tiers(bad).await.unwrap_err().to_string();
-        assert!(e.contains("a/nope") && e.contains("average"), "{e}");
-        let ok = TiersDto {
-            average: vec![" b/x ".into(), "b/x".into(), "".into()],
-            ..Default::default()
-        };
+        assert!(e.contains("a/nope") && e.contains("routine"), "{e}");
+        let mut ok = valid_dto();
+        ok.tiers[1].models = vec![" b/x ".into(), "b/x".into(), "".into()];
         let saved = setup.set_tiers(ok).await.unwrap();
-        assert_eq!(saved.average, vec!["b/x"]);
-        assert_eq!(setup.tiers().unwrap().average, vec!["b/x"]);
+        assert_eq!(models(&saved, "routine").as_slice(), ["b/x"]);
+        assert_eq!(
+            saved.tiers.iter().find(|tier| tier.id == "high").unwrap().resolves_to,
+            "routine"
+        );
+        assert_eq!(models(&setup.tiers().unwrap(), "routine").as_slice(), ["b/x"]);
     }
 
     #[tokio::test]
@@ -760,8 +826,8 @@ simple = ["a/m2"]
         assert!(cfg.pricing_for("m1").is_none());
         assert_eq!(cfg.pricing_for("m1-new").unwrap().output_per_1m, 4.0);
         let t = setup.tiers().unwrap();
-        assert_eq!(t.difficult, vec!["alpha/m1-new", "b/x"]);
-        assert_eq!(t.simple, vec!["alpha/m2"]);
+        assert_eq!(models(&t, "high").as_slice(), ["alpha/m1-new", "b/x"]);
+        assert_eq!(models(&t, "trivial").as_slice(), ["alpha/m2"]);
     }
 
     #[tokio::test]
@@ -785,18 +851,18 @@ simple = ["a/m2"]
         let mut dto = setup.endpoints_detail().unwrap().remove(1);
         dto.models.retain(|m| m.id != "x");
         setup.upsert_endpoint_detail(dto, None).await.unwrap();
-        assert_eq!(setup.tiers().unwrap().difficult, vec!["a/m1"]);
+        assert_eq!(models(&setup.tiers().unwrap(), "high").as_slice(), ["a/m1"]);
     }
 
     #[tokio::test]
     async fn remove_drops_tier_entries_and_reports_usage() {
         let (_dir, setup) = setup_with(BASE);
         let usage = setup.endpoint_usage("b").unwrap();
-        assert_eq!(usage, vec!["tier difficult: b/x"]);
+        assert_eq!(usage, vec!["tier high: b/x"]);
         let usage = setup.endpoint_usage("a").unwrap();
         assert!(usage.iter().any(|u| u == "default model: a/m1"), "{usage:?}");
         setup.remove_endpoint_applied("b").await.unwrap();
-        assert_eq!(setup.tiers().unwrap().difficult, vec!["a/m1"]);
+        assert_eq!(models(&setup.tiers().unwrap(), "high").as_slice(), ["a/m1"]);
         assert!(setup.endpoint_usage("b").unwrap().is_empty());
     }
 

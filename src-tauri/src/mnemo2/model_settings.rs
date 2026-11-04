@@ -785,8 +785,12 @@ simple = ["ep1/exec-model"]
         assert_eq!(config.general.ui.theme, "dark");
         assert_eq!(config.general.markdown.skip_dirs, vec!["target".to_string()]);
         // And so does the [tiers] table save_all carries through.
-        let tiers = mnemo::config::endpoints::load_tiers(&dir.path().join("endpoints.toml"));
-        assert_eq!(tiers.difficult, vec!["ep1/plan-model".to_string()]);
+        let tiers = mnemo::config::endpoints::load_tier_ladder(
+            &dir.path().join("endpoints.toml"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tiers.get("high").unwrap().models, vec!["ep1/plan-model".to_string()]);
 
         // Clearing the slot keeps them too.
         model_settings_apply(&setup, "models", json!({ "summarize": null }))
@@ -947,8 +951,12 @@ simple = ["ep1/exec-model"]
         .expect_err("negative rate");
         assert!(err.contains("non-negative rates"), "{err}");
         // …and the endpoints.toml rewrite carries [tiers] through.
-        let tiers = mnemo::config::endpoints::load_tiers(&dir.path().join("endpoints.toml"));
-        assert_eq!(tiers.average, vec!["ep1/exec-model".to_string()]);
+        let tiers = mnemo::config::endpoints::load_tier_ladder(
+            &dir.path().join("endpoints.toml"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tiers.get("routine").unwrap().models, vec!["ep1/exec-model".to_string()]);
         let config = Config::load(dir.path()).expect("reload");
         assert_eq!(config.endpoints.len(), 1, "the endpoint survives the rewrite");
     }

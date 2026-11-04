@@ -1977,6 +1977,21 @@ mod trace_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! tiers_dto {
+        (simple: $simple:expr, average: $average:expr, difficult: $difficult:expr $(,)?) => {{
+            let mut dto = mnemo::headless::TiersDto::default();
+            dto.tiers[0].models = $simple;
+            dto.tiers[1].models = $average;
+            dto.tiers[3].models = $difficult;
+            dto
+        }};
+        (average: $average:expr, ..Default::default() $(,)?) => {{
+            let mut dto = mnemo::headless::TiersDto::default();
+            dto.tiers[1].models = $average;
+            dto
+        }};
+    }
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -2610,7 +2625,7 @@ mod tests {
                 reasoning_efforts: Vec::new(),
                 default_effort: None,
             }],
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 simple: vec!["test/model-a".into()],
                 average: vec!["test/model-a".into()],
                 difficult: vec!["test/model-a".into()],
@@ -5977,7 +5992,7 @@ mod tests {
         // A settings save refreshes tiers for new dispatches.
         team.set_catalog(
             lead.models(),
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 average: vec!["test/scripted-b".into()],
                 ..Default::default()
             },

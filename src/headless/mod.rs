@@ -56,7 +56,7 @@ pub use crate::host::runtime::{
     SessionOptions, SpawnHost, WorktreeBinding,
 };
 pub use setup::{
-    EndpointDetailDto, EndpointTestDto, ModelDetailDto, PriceDto, ProviderModelDto, TiersDto,
+    EndpointDetailDto, EndpointTestDto, ModelDetailDto, PriceDto, ProviderModelDto, TierDto, TiersDto,
     EmbedderReadiness, EmbeddingModelDto, EndpointDto, EndpointReadiness, EngineConfig,
     InitProjectOptions, McpTestResult, ProjectInfo, ProjectReadiness, SafetyRuleDto,
     SafetyRulesDto, Scope, Setup, SetupEvent, SetupStatus, SetupStep,

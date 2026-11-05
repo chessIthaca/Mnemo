@@ -37,9 +37,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use mnemo::agent::failure_triage::training_log_dir;
-use mnemo::agent::route_knn::RouteKnn;
-use mnemo::agent::route_question;
+use mnemo::training_log_dir;
+use mnemo::RouteKnn;
+use mnemo::route_question;
 use mnemo::config::endpoints::TierLadder;
 use mnemo::memory::classifier::{Answer, Classifier, Question};
 

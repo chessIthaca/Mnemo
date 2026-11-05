@@ -21,7 +21,7 @@ use mnemo::app::team_ledger::TeamLedger;
 use mnemo::app::worktrees::{
     agent_branch, agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
 };
-use mnemo::agent::route_question;
+use mnemo::route_question;
 use mnemo::config::endpoints::{Tier, TierLadder};
 use mnemo::headless::{
     AgentSession, Engine, EventReceiver, GateRule, GateVerdict, Guardrails, HostToolSpec,
@@ -30,8 +30,8 @@ use mnemo::headless::{
 };
 use mnemo::headless::session::ModelSwitch;
 use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
-use mnemo::agent::failure_triage_knn::EmbedderGetter;
-use mnemo::agent::route_knn::RouteKnn;
+use mnemo::EmbedderGetter;
+use mnemo::RouteKnn;
 use mnemo::memory::classifier::ClassifierSlot;
 use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
@@ -1331,7 +1331,7 @@ fn deliver_nudge(
         ),
     });
     if claim.logs {
-        mnemo::agent::model_routing::append_row(
+        mnemo::model_routing::append_row(
             routing_log_path,
             &DispatchRoutingRow::Nudge {
                 ts: unix_ms(),
@@ -1435,7 +1435,7 @@ fn append_reroute_metadata(
             object.insert("finding_closed".into(), closed.into());
         }
     }
-    mnemo::agent::model_routing::append_row(path, &value);
+    mnemo::model_routing::append_row(path, &value);
 }
 
 /// The unreviewed model downshift on this routed fix, if any. `nudged` is the
@@ -2230,7 +2230,7 @@ impl TeamRuntime {
                 pending.enabled,
                 &pending.settings,
             );
-            mnemo::agent::model_routing::append_row(&routing_log_path, &row);
+            mnemo::model_routing::append_row(&routing_log_path, &row);
             // The override row an explicit choice logs when Laya cleared a
             // different tier — the same condition the inline path's
             // `routed_by` computation applies to an explicit choice.
@@ -2262,7 +2262,7 @@ impl TeamRuntime {
                             .as_deref(),
                         decision.as_ref().map_or(0.0, |decision| decision.confidence),
                     );
-                    mnemo::agent::model_routing::append_row(&routing_log_path, &row);
+                    mnemo::model_routing::append_row(&routing_log_path, &row);
                 }
             }
             // Attach the label to the live record; a record gone to cleanup
@@ -2330,7 +2330,7 @@ impl TeamRuntime {
     }
 
     fn append_dispatch_routing_row(&self, row: &DispatchRoutingRow) {
-        mnemo::agent::model_routing::append_row(&self.routing_log_path, row);
+        mnemo::model_routing::append_row(&self.routing_log_path, row);
     }
 
     /// Append a reroute with the step-6 metadata kept outside the legacy typed
@@ -8234,7 +8234,7 @@ async fn pump_worker(
             break;
         }
         if let Some(row) = pending_outcome.take() {
-            mnemo::agent::model_routing::append_row(&routing_log_path, &row);
+            mnemo::model_routing::append_row(&routing_log_path, &row);
         }
         if let Some(repeated) = strike_fired.take() {
             let settings = routing
@@ -8689,7 +8689,7 @@ pub async fn cleanup_workspace(
             .collect::<Vec<_>>();
         persistence.save(&ledger)?;
         for row in rows {
-            mnemo::agent::model_routing::append_row(routing_log_path, &row);
+            mnemo::model_routing::append_row(routing_log_path, &row);
         }
     }
     Ok(report)

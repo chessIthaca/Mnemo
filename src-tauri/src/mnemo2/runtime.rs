@@ -6384,12 +6384,10 @@ mod tests {
         // The audit never merges and is never itself reviewable.
         let merge_audit = team.merge("auditor01").await;
         assert!(merge_audit.is_err(), "an audit worker must never merge");
+        let merge_audit_error = merge_audit.err().unwrap_or_default();
         assert!(
-            merge_audit
-                .err()
-                .unwrap_or_default()
-                .contains("never merged"),
-            "the audit merge refusal names the reviewer"
+            merge_audit_error.contains("never merged"),
+            "the audit merge refusal names the reviewer: {merge_audit_error}"
         );
         let review_audit = team
             .review(

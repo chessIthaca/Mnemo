@@ -21,7 +21,7 @@ use mnemo::app::team_ledger::TeamLedger;
 use mnemo::app::worktrees::{
     agent_branch, agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
 };
-use mnemo::agent::route_question;
+use mnemo::route_question;
 use mnemo::config::endpoints::{Tier, TierLadder};
 use mnemo::headless::{
     AgentSession, Engine, EventReceiver, GateRule, GateVerdict, Guardrails, HostToolSpec,
@@ -30,8 +30,8 @@ use mnemo::headless::{
 };
 use mnemo::headless::session::ModelSwitch;
 use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
-use mnemo::agent::failure_triage_knn::EmbedderGetter;
-use mnemo::agent::route_knn::RouteKnn;
+use mnemo::EmbedderGetter;
+use mnemo::RouteKnn;
 use mnemo::memory::classifier::ClassifierSlot;
 use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
@@ -1291,7 +1291,7 @@ fn deliver_nudge(
         ),
     });
     if claim.logs {
-        mnemo::agent::model_routing::append_row(
+        mnemo::model_routing::append_row(
             routing_log_path,
             &DispatchRoutingRow::Nudge {
                 ts: unix_ms(),
@@ -1395,7 +1395,7 @@ fn append_reroute_metadata(
             object.insert("finding_closed".into(), closed.into());
         }
     }
-    mnemo::agent::model_routing::append_row(path, &value);
+    mnemo::model_routing::append_row(path, &value);
 }
 
 /// The unreviewed model downshift on this routed fix, if any. `nudged` is the
@@ -2130,7 +2130,7 @@ impl TeamRuntime {
     }
 
     fn append_dispatch_routing_row(&self, row: &DispatchRoutingRow) {
-        mnemo::agent::model_routing::append_row(&self.routing_log_path, row);
+        mnemo::model_routing::append_row(&self.routing_log_path, row);
     }
 
     /// Append a reroute with the step-6 metadata kept outside the legacy typed
@@ -5978,6 +5978,15 @@ impl TeamRuntime {
 
     async fn merge_locked(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        // An audit worker is a read-only reviewer: it is never mergeable in ANY
+        // state, so this refusal comes before every other gate. A still-running
+        // audit (or a differently-named lead branch) must not mask the reason.
+        let worker = self.worker(worker_id).await?;
+        if worker.kind == "audit" {
+            return Err(
+                "an audit worker is a read-only reviewer and is never merged; adjudicate it on its implementation worker's review".to_string(),
+            );
+        }
         if !by_lead && self.lead_busy.load(Ordering::SeqCst) {
             return Err("the lead must be idle before merge".to_string());
         }
@@ -5990,12 +5999,6 @@ impl TeamRuntime {
             return Err("Mnemo2 never merges a worker directly into main".to_string());
         }
         phase3::require_clean_lead(&self.workspace_root, "lead").await?;
-        let worker = self.worker(worker_id).await?;
-        if worker.kind == "audit" {
-            return Err(
-                "an audit worker is a read-only reviewer and is never merged; adjudicate it on its implementation worker's review".to_string(),
-            );
-        }
         phase3::require_clean(&worker.worktree, "worker").await?;
         let tip = phase3::tip(&worker.worktree).await?;
         let records = self.records.lock().await.clone();
@@ -8018,7 +8021,7 @@ async fn pump_worker(
             break;
         }
         if let Some(row) = pending_outcome.take() {
-            mnemo::agent::model_routing::append_row(&routing_log_path, &row);
+            mnemo::model_routing::append_row(&routing_log_path, &row);
         }
         if let Some(repeated) = strike_fired.take() {
             let settings = routing
@@ -8473,7 +8476,7 @@ pub async fn cleanup_workspace(
             .collect::<Vec<_>>();
         persistence.save(&ledger)?;
         for row in rows {
-            mnemo::agent::model_routing::append_row(routing_log_path, &row);
+            mnemo::model_routing::append_row(routing_log_path, &row);
         }
     }
     Ok(report)
@@ -10584,6 +10587,50 @@ models = [\"scripted-a\", \"scripted-b\"]
             .expect("load persisted team")
             .expect("saved team");
         assert_eq!(persisted.workers[0].error, None);
+    }
+
+    /// An audit worker is never mergeable — in particular, a still-running
+    /// (busy) audit must be refused with the audit reason, not the generic
+    /// "worker must be idle" gate, which would hide what it actually is.
+    #[tokio::test]
+    async fn audit_merge_is_refused_even_while_the_audit_is_busy() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut audit = worker(root.path(), "00000001000000000002");
+        audit.kind = "audit".to_string();
+        audit.audit_target = Some("00000001000000000001".to_string());
+        audit.status = WorkerStatus::Working;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            audit.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the audit checkout");
+        let team = open_test_team(root.path(), state.path(), vec![audit.clone()]).await;
+        spawn_live_worker(&team, &audit).await;
+        team.live
+            .lock()
+            .await
+            .get(&audit.id)
+            .expect("the audit is live")
+            .busy
+            .store(true, Ordering::SeqCst);
+        assert!(team.worker_is_busy(&audit.id).await, "the audit is running");
+        let before = team.worker(&audit.id).await.expect("audit record").status;
+
+        let refused = team
+            .merge(&audit.id)
+            .await
+            .expect_err("an audit worker never merges, busy or not");
+        assert!(refused.contains("never merged"), "{refused}");
+        assert_eq!(
+            team.worker(&audit.id).await.expect("audit record").status,
+            before
+        );
+        assert!(team.live.lock().await.contains_key(&audit.id));
     }
 
     #[test]

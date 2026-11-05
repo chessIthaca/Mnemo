@@ -46,7 +46,7 @@ use tauri::{AppHandle, Emitter};
 
 use mnemo::{read_rows, training_log_path, FailureLogRow};
 #[cfg(feature = "mnemo2")]
-use mnemo::agent::failure_triage::training_log_dir;
+use mnemo::training_log_dir;
 use mnemo::config::Config;
 use mnemo::config::general::LayaConfig;
 use mnemo::memory::classifier::{Classifier, ClassifierStatus};

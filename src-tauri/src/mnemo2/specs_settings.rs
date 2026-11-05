@@ -378,6 +378,48 @@ pub fn status(root: &Path) -> SpecsStatus {
     }
 }
 
+// ── Current spec ─────────────────────────────────────────────────────────────
+
+/// A capability name in the canonical kebab-case shape
+/// `^[a-z0-9]+(-[a-z0-9]+)*$`: ASCII lowercase letters, digits and `-` —
+/// never empty, never a leading or trailing `-`, never a double `--`.
+/// Nothing that could traverse a path (`/`, `\`, `.`) survives it.
+fn valid_capability_name(capability: &str) -> bool {
+    !capability.is_empty()
+        && !capability.starts_with('-')
+        && !capability.ends_with('-')
+        && !capability.contains("--")
+        && capability.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+}
+
+/// The current spec of one capability, or None when it has none yet.
+/// The read refuses links — a linked capability folder or `spec.md`
+/// whose target sits outside the project would serve bytes the project
+/// never held.
+fn capability_spec(root: &Path, capability: &str) -> Result<Option<String>, String> {
+    if !valid_capability_name(capability) {
+        return Err(format!("invalid capability name '{capability}'"));
+    }
+    let folder = openspec_dir(root).join("specs").join(capability);
+    let path = folder.join("spec.md");
+    let is_link = |candidate: &Path| {
+        std::fs::symlink_metadata(candidate)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    };
+    if is_link(&folder) || is_link(&path) {
+        return Err(format!(
+            "capability spec '{capability}' is a link; Mnemo does not follow links"
+        ));
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("could not read {}: {e}", path.display())),
+    }
+}
+
 // ── Schema list and activation ───────────────────────────────────────────────
 
 /// Every schema the project can pick, with where it resolves and which
@@ -1298,6 +1340,17 @@ pub async fn specs_status(state: State<'_, Mnemo2State>) -> Result<SpecsStatus, 
     Ok(status(&root))
 }
 
+/// The current spec of one capability — `None` when the capability has
+/// no spec yet.
+#[tauri::command]
+pub async fn read_capability_spec(
+    state: State<'_, Mnemo2State>,
+    capability: String,
+) -> Result<Option<String>, String> {
+    let root = project_root(&state).await?;
+    capability_spec(&root, &capability)
+}
+
 /// Every schema the project can pick, with the active one.
 #[tauri::command]
 pub async fn list_schemas(state: State<'_, Mnemo2State>) -> Result<SchemaList, String> {
@@ -1818,6 +1871,52 @@ mod tests {
         assert_eq!(status.pending_plans.len(), 1, "only the plan with deltas");
         assert_eq!(status.pending_plans[0].title, "Rate limit");
         assert_eq!(status.pending_plans[0].capabilities, vec!["auth".to_string()]);
+    }
+
+    #[test]
+    fn capability_spec_reads_the_current_spec() {
+        let project = project();
+        let folder = openspec_dir(project.path()).join("specs").join("tier-ladder");
+        fs::create_dir_all(&folder).expect("spec folder");
+        fs::write(folder.join("spec.md"), "# Tier ladder\n").expect("spec.md");
+        assert_eq!(
+            capability_spec(project.path(), "tier-ladder"),
+            Ok(Some("# Tier ladder\n".to_string()))
+        );
+    }
+
+    #[test]
+    fn capability_spec_is_none_without_a_spec() {
+        let project = project();
+        assert_eq!(capability_spec(project.path(), "tier-ladder"), Ok(None));
+    }
+
+    #[test]
+    fn capability_spec_refuses_bad_names() {
+        let project = project();
+        for name in ["../x", "a/b", "Tier", "-a", "a-", "a--b", ""] {
+            let error = capability_spec(project.path(), name).unwrap_err();
+            assert!(error.contains("invalid capability name"), "{name}: {error}");
+        }
+    }
+
+    // A spec.md linked outside the specs tree would serve another file's
+    // bytes as the capability's current spec, so the read must refuse it.
+    // Unix only — the link creation needs the OS's unprivileged symlink.
+    #[test]
+    #[cfg(unix)]
+    fn capability_spec_refuses_a_linked_spec() {
+        let project = project();
+        let folder = openspec_dir(project.path()).join("specs").join("tier-ladder");
+        fs::create_dir_all(&folder).expect("spec folder");
+        let secret = project.path().join("secret.md");
+        fs::write(&secret, "a private file\n").expect("secret");
+        if let Err(error) = make_file_symlink(&secret, &folder.join("spec.md")) {
+            eprintln!("skipped: the OS refused to create the symlink: {error}");
+            return;
+        }
+        let error = capability_spec(project.path(), "tier-ladder").unwrap_err();
+        assert!(error.contains("link"), "{error}");
     }
 
     #[test]

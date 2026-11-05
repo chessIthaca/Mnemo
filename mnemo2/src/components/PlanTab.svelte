@@ -210,7 +210,7 @@
   .all-plans { display: inline-flex; align-items: center; gap: 4px; padding: 2px 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-body); font-weight: 650; cursor: pointer; }
   .all-plans:hover { text-decoration: underline; }
   .all-plans:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
-  .plan { margin-bottom: 20px; }
+  .plan { max-width: 920px; margin-bottom: 14px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / 0.04); }
   .plan[data-status="closed"], .plan[data-status="abandoned"] { opacity: 0.8; }
   .plan-header p { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .kind { padding: 2px 6px; border-radius: 6px; background: var(--surface-soft); text-transform: uppercase; }
@@ -221,7 +221,7 @@
   .details-toggle:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 1px; }
   .details-toggle :global(svg) { transition: transform 120ms ease; }
   .details-toggle[aria-expanded="true"] :global(svg) { transform: rotate(180deg); }
-  .plan-details { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  .plan-details { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--canvas); }
   .plan-details :global(.markdown) { font-size: var(--text-body); line-height: 1.55; }
   .plan-details :global(.markdown h2) { margin: 16px 0 6px; font-size: var(--text-title); font-weight: 620; }
   .plan-details :global(.markdown h2:first-child) { margin-top: 0; }
@@ -249,7 +249,7 @@
   .chip small { color: var(--muted); font-size: var(--text-meta); }
   .chip[data-status="merged"] small { color: var(--accent-strong); }
   .chip[data-status="failed"] small, .chip[data-status="conflict"] small { color: var(--danger); }
-  .closed > summary { display: flex; align-items: center; gap: 5px; margin-bottom: 14px; color: var(--muted); font-size: var(--text-body); cursor: pointer; list-style: none; }
+  .closed > summary { display: flex; align-items: center; gap: 5px; margin-bottom: 14px; color: var(--muted); font-size: var(--text-meta); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; list-style: none; }
   .closed > summary::-webkit-details-marker { display: none; }
   .closed[open] > summary :global(svg) { transform: rotate(90deg); }
 </style>

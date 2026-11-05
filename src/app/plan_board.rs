@@ -15,6 +15,7 @@
 //! records and the [`TeamLedger`] use them (`tick`, `untick`); each method
 //! says which.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,7 +27,9 @@ use crate::app::tool::workflow::plan::{
     bug_fixing_gate, collapse_whitespace, context_issue, escape_section_markers,
     resumability_gate_error, step_issue,
 };
+use crate::app::workflow::plan_file::render_spec_changes;
 use crate::app::workflow::{PlanFile, PlanKind};
+use crate::openspec::{apply, Capability, Delta, Spec};
 use crate::codegraph::CodeGraph;
 use crate::memory::knowledge::KnowledgeStore;
 use crate::memory::{plan_scope, Memory, MemoryFilter, MemoryRecordType, MemoryStoreTrait};
@@ -88,6 +91,9 @@ pub struct BoardPlan {
     pub closed_at_ms: Option<u64>,
     /// The closing review report (absolute path), once closed.
     pub report_path: Option<String>,
+    /// Structured OpenSpec changes, also rendered into the plan markdown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_deltas: Vec<Delta>,
     pub steps: Vec<BoardStep>,
 }
 
@@ -108,6 +114,8 @@ pub struct PlanDraft {
     /// Observable acceptance scenarios, one per entry, recorded as bullets
     /// in `## Acceptance scenarios` (high-risk dispatch requires one).
     pub acceptance: Vec<String>,
+    /// OpenSpec changes to validate, store, and render with this plan.
+    pub spec_deltas: Vec<Delta>,
 }
 
 /// What `plan_update` takes. Nothing already recorded is rewritten.
@@ -128,6 +136,8 @@ pub struct PlanEdit {
     /// Acceptance scenarios appended to `## Acceptance scenarios`; one
     /// already recorded is not repeated.
     pub add_acceptance: Vec<String>,
+    /// OpenSpec changes appended to the plan's existing deltas.
+    pub spec_deltas: Vec<Delta>,
     /// The regression test of a `bug_fixing` plan.
     pub regression_test: Option<String>,
     /// Declare the fix feature-scale (the close then needs a "Landed design"
@@ -163,6 +173,8 @@ struct BoardEntry {
     report_path: Option<String>,
     #[serde(default)]
     abandon_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spec_deltas: Vec<Delta>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -266,6 +278,41 @@ impl PlanBoard {
             .map_err(|e| format!("could not read plan {id}: {e}"))
     }
 
+    /// Advisory OpenSpec reminders for capabilities touched by the plan's
+    /// steps but absent from its deltas. Metadata problems suppress only the
+    /// reminder; they never refuse plan creation or update.
+    pub fn spec_reminders(&self, plan: &BoardPlan) -> Vec<String> {
+        let specs_dir = self.specs_dir();
+        let capabilities = Capability::load_all(&specs_dir).unwrap_or_default();
+        let paths: Vec<String> = plan
+            .steps
+            .iter()
+            .flat_map(|step| step_paths(&step.text))
+            .collect();
+        capabilities
+            .into_iter()
+            .filter(|capability| {
+                specs_dir
+                    .join(&capability.name)
+                    .join("spec.md")
+                    .is_file()
+            })
+            .filter(|capability| {
+                paths.iter().any(|path| capability.matches(path))
+                    && !plan
+                        .spec_deltas
+                        .iter()
+                        .any(|delta| delta.capability == capability.name)
+            })
+            .map(|capability| {
+                format!(
+                    "Spec reminder: this plan touches {} (.coding/openspec/specs/{}/spec.md) but changes none of its requirements.",
+                    capability.name, capability.name
+                )
+            })
+            .collect()
+    }
+
     /// Create an open plan and write its plan file. An `## Acceptance
     /// scenarios` section written into the context joins the plan's
     /// acceptance scenarios instead of being escaped into the context.
@@ -301,6 +348,8 @@ impl PlanBoard {
                 &issues,
             ));
         }
+        self.validate_spec_deltas(&draft.spec_deltas)?;
+        let delta_acceptance = delta_acceptance_scenarios(&draft.spec_deltas);
         let _guard = self.guard();
         let mut board = self.load_board()?;
         let id = self.fresh_id(&board);
@@ -317,10 +366,17 @@ impl PlanBoard {
                 push_line(&mut plan.interfaces, format!("- {}: {interface}", today()));
             }
         }
-        add_scenarios(&mut plan, draft.acceptance.iter().chain(&lifted));
+        add_scenarios(
+            &mut plan,
+            draft
+                .acceptance
+                .iter()
+                .chain(&lifted)
+                .chain(&delta_acceptance),
+        );
         plan.bug_symptom = bug.filter(|_| draft.kind == PlanKind::BugFixing);
         std::fs::create_dir_all(&self.plans_dir).map_err(|e| e.to_string())?;
-        self.save_plan(&id, &plan)?;
+        self.save_plan(&id, &plan, &draft.spec_deltas)?;
         let entry = BoardEntry {
             id,
             status: BoardStatus::Open,
@@ -328,6 +384,7 @@ impl PlanBoard {
             closed_at_ms: None,
             report_path: None,
             abandon_reason: None,
+            spec_deltas: draft.spec_deltas,
         };
         let view = board_plan(&entry, &plan);
         board.plans.push(entry);
@@ -335,19 +392,31 @@ impl PlanBoard {
         Ok(view)
     }
 
-    /// Edit an open plan: append context, record a decision, add steps or
-    /// acceptance scenarios, set the regression test or the landed-design
+    /// Edit an open plan: append context, record a decision, add steps,
+    /// acceptance scenarios, or OpenSpec deltas, set the regression test or the landed-design
     /// flag. As in [`create`](Self::create), an `## Acceptance scenarios`
     /// section in the appended context joins the acceptance scenarios.
-    pub fn update(&self, id: &str, edit: PlanEdit) -> Result<BoardPlan, String> {
+    pub fn update(&self, id: &str, mut edit: PlanEdit) -> Result<BoardPlan, String> {
         let _guard = self.guard();
-        let (entry, mut plan) = self.load(id)?;
+        let (mut entry, mut plan) = self.load(id)?;
         require_open(&entry)?;
+        if !edit.spec_deltas.is_empty() {
+            let mut combined = entry.spec_deltas.clone();
+            combined.extend(edit.spec_deltas.iter().cloned());
+            self.validate_spec_deltas(&combined)?;
+        }
+        let delta_acceptance = delta_acceptance_scenarios(&edit.spec_deltas);
         let (extra, lifted) = lift_acceptance(edit.context_append.as_deref().unwrap_or(""));
         if !extra.is_empty() {
             plan.context = format!("{}\n\n{}", plan.context, escape_section_markers(&extra));
         }
-        add_scenarios(&mut plan, edit.add_acceptance.iter().chain(&lifted));
+        add_scenarios(
+            &mut plan,
+            edit.add_acceptance
+                .iter()
+                .chain(&lifted)
+                .chain(&delta_acceptance),
+        );
         if let Some(decision) = edit.decision.as_deref().map(collapse_whitespace) {
             if !decision.is_empty() {
                 push_line(&mut plan.decisions, format!("- {}: {decision}", today()));
@@ -380,13 +449,25 @@ impl PlanBoard {
         if edit.landed_design {
             plan.landed_design = true;
         }
-        self.save_plan(id, &plan)?;
+        let deltas_changed = !edit.spec_deltas.is_empty();
+        entry.spec_deltas.append(&mut edit.spec_deltas);
+        self.save_plan(id, &plan, &entry.spec_deltas)?;
+        if deltas_changed {
+            let mut board = self.load_board()?;
+            let stored = board
+                .plans
+                .iter_mut()
+                .find(|candidate| candidate.id == id)
+                .ok_or_else(|| unknown(id))?;
+            stored.spec_deltas = entry.spec_deltas.clone();
+            self.save_board(&board)?;
+        }
         Ok(board_plan(&entry, &plan))
     }
 
     /// The worker brief header for `step` (1-based): the plan's title, goal,
-    /// kind, bug, context, decisions, interfaces, acceptance scenarios, a
-    /// step list, and the assigned step's full text. Refuses an unknown,
+    /// kind, bug, context, decisions, interfaces, acceptance scenarios, spec
+    /// changes, a step list, and the assigned step's full text. Refuses an unknown,
     /// closed, or abandoned plan, a missing step, and a step that is already
     /// done.
     pub fn brief_for(&self, id: &str, step: usize) -> Result<String, String> {
@@ -426,6 +507,7 @@ impl PlanBoard {
                 "\nThe lead verifies these observable outcomes on the integrated result.\n",
             );
         }
+        out.push_str(&render_spec_changes(&entry.spec_deltas));
         out.push_str("\n## Steps\n");
         for s in &plan.steps {
             let mark = if s.done { 'x' } else { ' ' };
@@ -544,7 +626,7 @@ impl PlanBoard {
                 numbers.join(" and ")
             ),
         );
-        self.save_plan(id, &plan)?;
+        self.save_plan(id, &plan, &entry.spec_deltas)?;
         Ok(true)
     }
 
@@ -567,7 +649,7 @@ impl PlanBoard {
             &mut plan.progress,
             format!("- {} step {number} done: {outcome}", today()),
         );
-        self.save_plan(id, &plan)?;
+        self.save_plan(id, &plan, &entry.spec_deltas)?;
         Ok(true)
     }
 
@@ -596,7 +678,7 @@ impl PlanBoard {
             &mut plan.progress,
             format!("- {} step {number} reopened: {note}", today()),
         );
-        self.save_plan(id, &plan)?;
+        self.save_plan(id, &plan, &entry.spec_deltas)?;
         if entry.status == BoardStatus::Closed {
             entry.status = BoardStatus::Open;
             entry.closed_at_ms = None;
@@ -760,7 +842,7 @@ impl PlanBoard {
             &mut plan.progress,
             format!("- {} abandoned: {}", today(), collapse_whitespace(reason)),
         );
-        self.save_plan(id, &plan)?;
+        self.save_plan(id, &plan, &entry.spec_deltas)?;
         let view = board_plan(entry, &plan);
         self.save_board(&board)?;
         Ok(view)
@@ -897,10 +979,37 @@ impl PlanBoard {
             .map_err(|e| format!("could not read plan {id}: {e}"))
     }
 
-    fn save_plan(&self, id: &str, plan: &PlanFile) -> Result<(), String> {
-        plan.write_to_dir(&self.plans_dir, id)
+    fn save_plan(&self, id: &str, plan: &PlanFile, spec_deltas: &[Delta]) -> Result<(), String> {
+        plan.write_to_dir_with_spec_deltas(&self.plans_dir, id, spec_deltas)
             .map(|_| ())
             .map_err(|e| format!("could not write plan {id}: {e}"))
+    }
+
+    fn specs_dir(&self) -> PathBuf {
+        self.plans_dir
+            .parent()
+            .unwrap_or(&self.plans_dir)
+            .join("openspec")
+            .join("specs")
+    }
+
+    fn validate_spec_deltas(&self, deltas: &[Delta]) -> Result<(), String> {
+        let specs_dir = self.specs_dir();
+        let mut current: BTreeMap<String, Option<Spec>> = BTreeMap::new();
+        for delta in deltas {
+            if !current.contains_key(&delta.capability) {
+                current.insert(
+                    delta.capability.clone(),
+                    load_current_spec(&specs_dir, &delta.capability)?,
+                );
+            }
+            let base = current
+                .get(&delta.capability)
+                .expect("the capability spec was just loaded");
+            let next = apply(base.as_ref(), delta).map_err(|error| error.to_string())?;
+            current.insert(delta.capability.clone(), Some(next));
+        }
+        Ok(())
     }
 
     fn load(&self, id: &str) -> Result<(BoardEntry, PlanFile), String> {
@@ -991,6 +1100,48 @@ impl PlanBoard {
     }
 }
 
+/// Load the current spec for a capability, if one has been written.
+fn load_current_spec(specs_dir: &Path, capability: &str) -> Result<Option<Spec>, String> {
+    let path = specs_dir.join(capability).join("spec.md");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not read spec for capability '{capability}' at '{}': {error}",
+                path.display()
+            ));
+        }
+    };
+    Spec::parse(&text)
+        .map(Some)
+        .map_err(|error| format!("invalid spec for capability '{capability}': {error}"))
+}
+
+/// Project OpenSpec scenarios into the plan's observable acceptance bullets.
+fn delta_acceptance_scenarios(deltas: &[Delta]) -> Vec<String> {
+    let mut scenarios = Vec::new();
+    for delta in deltas {
+        for requirement in delta.added.iter().chain(&delta.modified) {
+            for scenario in &requirement.scenarios {
+                let mut text = format!(
+                    "OpenSpec {}/{} — {}: WHEN {} THEN {}",
+                    delta.capability,
+                    requirement.name,
+                    scenario.name,
+                    scenario.when.join(" AND "),
+                    scenario.then.join(" AND ")
+                );
+                if !scenario.and.is_empty() {
+                    text.push_str(&format!(" AND {}", scenario.and.join(" AND ")));
+                }
+                scenarios.push(text);
+            }
+        }
+    }
+    scenarios
+}
+
 fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
     BoardPlan {
         id: entry.id.clone(),
@@ -1000,6 +1151,7 @@ fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
         status: entry.status,
         closed_at_ms: entry.closed_at_ms,
         report_path: entry.report_path.clone(),
+        spec_deltas: entry.spec_deltas.clone(),
         steps: plan
             .steps
             .iter()
@@ -1195,6 +1347,7 @@ fn report_stamp(secs: i64) -> String {
 mod tests {
     use super::*;
     use crate::app::team_ledger::fake::FakeLedger;
+    use crate::openspec::{Requirement, Scenario};
 
     const CONTEXT: &str =
         "Why: the importer drops rows (src/import.rs).\n## Not a section\nConstraint: keep the CLI flags. Verify: cargo test.";
@@ -1218,6 +1371,38 @@ mod tests {
 
     fn create(board: &PlanBoard, title: &str) -> BoardPlan {
         board.create(draft(title)).expect("create")
+    }
+
+    fn requirement(name: &str) -> Requirement {
+        Requirement::new(
+            name,
+            "The system SHALL keep the observable contract.",
+            vec![Scenario::new(
+                "Contract exercised",
+                vec!["the contract is exercised".to_string()],
+                vec!["the behavior is observable".to_string()],
+                vec![],
+            )],
+        )
+    }
+
+    fn added_delta(capability: &str, requirement_name: &str) -> Delta {
+        let mut delta = Delta {
+            capability: capability.to_string(),
+            ..Delta::default()
+        };
+        delta.added.push(requirement(requirement_name));
+        delta
+    }
+
+    fn write_spec(dir: &Path, capability: &str, requirements: &[&str]) {
+        let folder = dir.join("openspec").join("specs").join(capability);
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut spec = Spec::new(capability);
+        for name in requirements {
+            spec.add_requirement(requirement(name));
+        }
+        std::fs::write(folder.join("spec.md"), spec.render()).unwrap();
     }
 
     #[test]
@@ -1970,6 +2155,185 @@ mod tests {
             board.try_close(&plan.id, &ledger).await,
             CloseOutcome::Closed { .. }
         ));
+    }
+
+    #[test]
+    fn spec_delta_refuses_modified_requirement_missing_from_the_current_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        write_spec(dir.path(), "importer", &["Existing"]);
+        let board = board(dir.path());
+        let mut delta = Delta {
+            capability: "importer".to_string(),
+            ..Delta::default()
+        };
+        delta.modified.push(requirement("Missing requirement"));
+        let error = board
+            .create(PlanDraft {
+                spec_deltas: vec![delta],
+                ..draft("Invalid delta")
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("MODIFIED requirement 'Missing requirement' does not exist"),
+            "{error}"
+        );
+        assert!(board.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spec_delta_refuses_a_duplicate_added_requirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let mut delta = added_delta("importer", "Duplicate");
+        delta.added.push(requirement("Duplicate"));
+        let error = board
+            .create(PlanDraft {
+                spec_deltas: vec![delta],
+                ..draft("Duplicate delta")
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("ADDED requirement 'Duplicate' already exists"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn spec_delta_refuses_non_normative_text_and_incomplete_scenarios() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let mut delta = added_delta("importer", "Invalid");
+        delta.added[0].text = "The system keeps the contract.".to_string();
+        let error = board
+            .create(PlanDraft {
+                spec_deltas: vec![delta.clone()],
+                ..draft("Non normative")
+            })
+            .unwrap_err();
+        assert!(error.contains("must contain SHALL or MUST"), "{error}");
+
+        let mut delta = added_delta("importer", "Invalid");
+        delta.added[0].scenarios = vec![Scenario::new(
+            "Missing condition",
+            vec![],
+            vec!["a result".to_string()],
+            vec![],
+        )];
+        let error = board
+            .create(PlanDraft {
+                spec_deltas: vec![delta.clone()],
+                ..draft("Missing when")
+            })
+            .unwrap_err();
+        assert!(error.contains("is missing WHEN"), "{error}");
+
+        delta.added[0].scenarios[0].when = vec!["a condition".to_string()];
+        delta.added[0].scenarios[0].then.clear();
+        let error = board
+            .create(PlanDraft {
+                spec_deltas: vec![delta],
+                ..draft("Missing then")
+            })
+            .unwrap_err();
+        assert!(error.contains("is missing THEN"), "{error}");
+    }
+
+    #[test]
+    fn plan_update_can_modify_a_requirement_added_by_an_earlier_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                spec_deltas: vec![added_delta("importer", "Rows survive")],
+                ..draft("Sequential deltas")
+            })
+            .unwrap();
+        let mut modified = Delta {
+            capability: "importer".to_string(),
+            ..Delta::default()
+        };
+        modified.modified.push(requirement("Rows survive"));
+        modified.modified[0].text = "The system MUST retain every imported row.".to_string();
+        let updated = board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    spec_deltas: vec![modified],
+                    ..PlanEdit::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.spec_deltas.len(), 2);
+        let markdown = board.read_markdown(&plan.id).unwrap();
+        assert!(markdown.contains("#### ADDED Requirements"), "{markdown}");
+        assert!(markdown.contains("#### MODIFIED Requirements"), "{markdown}");
+        assert!(markdown.contains("MUST retain every imported row"), "{markdown}");
+    }
+
+    #[test]
+    fn delta_scenarios_alone_satisfy_the_high_risk_acceptance_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                acceptance: vec![],
+                spec_deltas: vec![added_delta("importer", "Rows survive")],
+                ..draft("Delta acceptance")
+            })
+            .unwrap();
+        let markdown = board.read_markdown(&plan.id).unwrap();
+        let acceptance = markdown
+            .split("## Acceptance scenarios\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("acceptance section");
+        assert!(
+            acceptance.lines().any(|line| {
+                let bullet = line.trim().strip_prefix("- ").unwrap_or("");
+                bullet.len() > 8 && bullet.contains("Contract exercised")
+            }),
+            "{markdown}"
+        );
+        let brief = board.brief_for(&plan.id, 1).unwrap();
+        assert!(brief.contains("## Acceptance scenarios"), "{brief}");
+        assert!(brief.contains("Contract exercised"), "{brief}");
+        assert!(brief.contains("## Spec changes"), "{brief}");
+    }
+
+    #[test]
+    fn board_json_round_trips_deltas_and_plan_rewrites_keep_spec_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                spec_deltas: vec![added_delta("importer", "Rows survive")],
+                ..draft("Persistent deltas")
+            })
+            .unwrap();
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    progress_note: Some("implemented".to_string()),
+                    ..PlanEdit::default()
+                },
+            )
+            .unwrap();
+        let stored: BoardFile = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("plans").join(BOARD_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.plans[0].spec_deltas, plan.spec_deltas);
+        let markdown = board.read_markdown(&plan.id).unwrap();
+        assert_eq!(markdown.matches("## Spec changes").count(), 1, "{markdown}");
+        let reopened = PlanBoard::new(dir.path().join("plans"), dir.path().join("reviews"))
+            .get(&plan.id)
+            .unwrap();
+        assert_eq!(reopened.spec_deltas, plan.spec_deltas);
+        assert_eq!(
+            reopened.spec_deltas[0].added[0].scenarios[0].when,
+            vec!["the contract is exercised".to_string()]
+        );
     }
 
     #[tokio::test]

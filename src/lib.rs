@@ -48,16 +48,22 @@ pub mod workspace;
 // any second consumer) reaches it on BARE `mnemo::` paths — never
 // through the kernel module tree. `tests/boundary.rs::
 // tauri_uses_only_public_api` enforces the app side; this block is the
-// lib side of the same contract. Types only — no blanket re-exports —
-// plus the NINE NAMED MODULE ALIASES in the second block below (each
-// one name deep, consumer-named, exposing zero new items — the modules
-// are already `pub` under `mnemo::host::*`/`mnemo::runtime`); add
-// deliberately, with the consumer named.
+// lib side of the same contract. Named items and module aliases only —
+// no blanket re-exports — each alias one name deep, consumer-named,
+// exposing zero new items (the modules are already `pub` under
+// `mnemo::host::*`/`mnemo::runtime`/`mnemo::agent`); add deliberately,
+// with the consumer named.
 pub use crate::agent::approval::needs_approval;
 pub use crate::agent::context::ContextManager;
 pub use crate::agent::factory::AgentLoopFactory;
-pub use crate::agent::failure_triage::{read_rows, training_log_path, FailureLogRow};
+pub use crate::agent::failure_triage::{
+    read_rows, training_log_dir, training_log_path, FailureLogRow,
+};
+pub use crate::agent::failure_triage_knn::EmbedderGetter;
+pub use crate::agent::model_routing;
 pub use crate::agent::policy::{AgentPolicyFactory, PermissionPolicy, RouteKey};
+pub use crate::agent::route_knn::RouteKnn;
+pub use crate::agent::route_question::{self, OfferedLabels};
 pub use crate::agent::steering_stats::{SteeringStats, SteeringStatsSnapshot};
 pub use crate::agent::workflow_handle::{capitalize_token, AgentWorkflowHandle};
 pub use crate::runtime::channels::{

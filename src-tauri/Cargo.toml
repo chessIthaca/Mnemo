@@ -1,10 +1,9 @@
 [package]
 name = "mnemo-app"
 version = "2.0.0"
-# The extra [[bin]] targets below (mnemo2, mnemo2-mcp, mnemo2_route_eval) are
-# feature-gated helpers; without this, `tauri build` cannot tell which binary
-# is the app and fails with "failed to find main binary".
+# Select the desktop app explicitly; it is this package's only binary.
 default-run = "mnemo-app"
+autobins = false
 edition = "2021"
 description = "The Mnemo Tauri app shell"
 license = "MIT"
@@ -60,24 +59,8 @@ custom-protocol = ["tauri/custom-protocol"]
 mnemo2 = []
 
 [[bin]]
-name = "mnemo2"
-path = "src/bin/mnemo2.rs"
-required-features = ["mnemo2"]
-
-# The stdio helper the "mnemo" Claude Code plugin runs: a console binary that
-# bridges MCP to a running Mnemo2 (or starts one) and answers the plugin hooks.
-[[bin]]
-name = "mnemo2-mcp"
-path = "src/bin/mnemo2_mcp.rs"
-required-features = ["mnemo2"]
-# The routing eval (plan 2ba2168a, design §4.8): asks a running Laya the
-# hand-set and mined corpora, one prompt at a time, and prints the threshold
-# sweep with the suggested `min_confidence_3` / `min_confidence_2`.
-[[bin]]
-name = "mnemo2_route_eval"
-path = "src/bin/mnemo2_route_eval.rs"
-required-features = ["mnemo2"]
-
+name = "mnemo-app"
+path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3"

@@ -618,8 +618,9 @@ fn is_git_source(source: &str) -> bool {
 /// Add a schema from a folder path or a git URL (cloned shallowly into a
 /// temp dir). The schema must load and validate — a missing template or
 /// malformed `schema.yaml` is an error and copies nothing — and it lands
-/// under `.coding/openspec/schemas/<schema name>/`. Returns the refreshed
-/// list.
+/// under `.coding/openspec/schemas/<schema name>/`. A source holding a
+/// symbolic link (its target may sit anywhere on disk) is refused the
+/// same way. Returns the refreshed list.
 pub fn add_schema_from(openspec_dir: &Path, source: &str) -> Result<SchemaList, String> {
     let source = source.trim();
     if source.is_empty() {
@@ -639,6 +640,7 @@ pub fn add_schema_from(openspec_dir: &Path, source: &str) -> Result<SchemaList, 
     };
     let schema_folder = locate_schema_folder(staged.path())?;
     let schema = Schema::load(&schema_folder)?;
+    refuse_symlinked_schema(&schema_folder, &schema)?;
     let name = schema.name.trim().to_string();
     if name.eq_ignore_ascii_case("spec-driven") {
         return Err("'spec-driven' is the built-in schema; fork it under a new name".to_string());
@@ -656,11 +658,48 @@ pub fn add_schema_from(openspec_dir: &Path, source: &str) -> Result<SchemaList, 
     Ok(schemas(openspec_dir))
 }
 
-/// Clone `url` shallowly into `target` with git; a refusal is reported
-/// with git's own stderr.
+/// The refusal message for a symbolic link at `path`, naming it.
+fn symlink_refused(path: &Path) -> String {
+    format!(
+        "schema sources may not contain symbolic links: '{}'",
+        path.display()
+    )
+}
+
+/// Refuse a schema source whose located folder, its `schema.yaml`, or
+/// any artifact template is a symbolic link. `Schema::load`'s reads
+/// follow links, so without this check a link whose target sits
+/// outside the source — a private key posing as a template — would
+/// load, and the copy would bring the target's bytes into the project.
+fn refuse_symlinked_schema(folder: &Path, schema: &Schema) -> Result<(), String> {
+    let refuse = |path: &Path| {
+        if std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            Err(symlink_refused(path))
+        } else {
+            Ok(())
+        }
+    };
+    refuse(folder)?;
+    refuse(&folder.join("schema.yaml"))?;
+    for artifact in &schema.artifacts {
+        // `Schema::load` already rejected unsafe template paths.
+        if let Some(template) = safe_relative(&artifact.template) {
+            refuse(&folder.join("templates").join(template))?;
+        }
+    }
+    Ok(())
+}
+
+/// Clone `url` shallowly into `target` with git, with
+/// `core.symlinks=false` so a crafted repository cannot check a
+/// symbolic link out; a refusal is reported with git's own stderr.
 fn clone_repo(url: &str, target: &Path) -> Result<(), String> {
     let output = Command::new("git")
         .arg("clone")
+        .arg("-c")
+        .arg("core.symlinks=false")
         .arg("--depth")
         .arg("1")
         .arg("--")
@@ -725,10 +764,60 @@ fn locate_schema_folder(root: &Path) -> Result<PathBuf, String> {
     ))
 }
 
-/// Copy a schema folder tree into a fresh `dest`, skipping `.git`. Any
-/// failure aborts with an error; only the `dest` (which never existed
-/// before) is left partial, and re-adding after deleting it starts clean.
+/// Walk the whole copy source and refuse anything whose link would be
+/// followed: a symbolic link (file or directory), or an entry that is
+/// neither a file nor a folder. `entry.file_type()` reads the link
+/// itself, never its target, and `.git` is skipped exactly as the copy
+/// skips it. The walk runs before `copy_tree` writes anything, so a
+/// refused source copies nothing.
+fn check_copyable(from: &Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(from)
+        .map_err(|error| format!("could not read '{}': {error}", from.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("could not read '{}': {error}", from.display()))?;
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let source = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("could not read '{}': {error}", source.display()))?;
+        if file_type.is_symlink() {
+            return Err(symlink_refused(&source));
+        }
+        if file_type.is_dir() {
+            check_copyable(&source)?;
+        } else if !file_type.is_file() {
+            return Err(format!(
+                "schema sources may only contain files and folders, not '{}'",
+                source.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Copy a schema folder tree into a fresh `dest`, skipping `.git`. The
+/// whole source is walked for links first ([`check_copyable`]), so a
+/// refused source copies nothing at all; any failure aborts with an
+/// error, only the `dest` (which never existed before) is left partial,
+/// and re-adding after deleting it starts clean.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    if std::fs::symlink_metadata(from)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(symlink_refused(from));
+    }
+    check_copyable(from)?;
+    copy_tree_entries(from, to)
+}
+
+/// The recursive copy half of [`copy_tree`], guarded by its link walk.
+/// `entry.file_type()` re-refuses a link per entry, so one that
+/// appeared between the walk and the copy is not followed either.
+fn copy_tree_entries(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::create_dir_all(to)
         .map_err(|error| format!("could not create '{}': {error}", to.display()))?;
     for entry in std::fs::read_dir(from)
@@ -742,9 +831,15 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
         }
         let source = entry.path();
         let target = to.join(&name);
-        if source.is_dir() {
-            copy_tree(&source, &target)?;
-        } else {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("could not read '{}': {error}", source.display()))?;
+        if file_type.is_symlink() {
+            return Err(symlink_refused(&source));
+        }
+        if file_type.is_dir() {
+            copy_tree_entries(&source, &target)?;
+        } else if file_type.is_file() {
             std::fs::copy(&source, &target).map_err(|error| {
                 format!(
                     "could not copy '{}' to '{}': {error}",
@@ -752,6 +847,11 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
                     target.display()
                 )
             })?;
+        } else {
+            return Err(format!(
+                "schema sources may only contain files and folders, not '{}'",
+                source.display()
+            ));
         }
     }
     Ok(())
@@ -1432,6 +1532,98 @@ mod tests {
         // The added schema resolves under its new key.
         let resolved = Schema::resolve(&dir, Some("custom")).expect("resolve");
         assert_eq!(resolved.schema.name, "custom");
+    }
+
+    /// Create the file symlink `link` pointing at `target`. Errors when
+    /// the OS refuses to create links (Windows without developer mode
+    /// or the SeCreateSymbolicLink privilege); the caller then skips
+    /// the test instead of failing it.
+    fn make_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "symlinks are not supported on this platform",
+            ))
+        }
+    }
+
+    /// Create the directory symlink `link` pointing at the directory
+    /// `target` — on Windows a directory link needs its own reparse
+    /// point kind, so `symlink_file` would not resolve as a folder.
+    fn make_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "symlinks are not supported on this platform",
+            ))
+        }
+    }
+
+    #[test]
+    fn add_schema_refuses_a_symlinked_template_and_copies_nothing() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        let source = project.path().join("incoming");
+        write_schema(&source);
+        // The template becomes a link to a file outside the source, so
+        // following it would copy bytes the source never contained.
+        let secret = project.path().join("secret.md");
+        fs::write(&secret, "a private file\n").expect("secret");
+        let template = source.join("templates").join("research.md");
+        fs::remove_file(&template).expect("remove the real template");
+        if let Err(error) = make_file_symlink(&secret, &template) {
+            eprintln!("skipped: the OS refused to create the symlink: {error}");
+            return;
+        }
+        let error = add_schema_from(&dir, source.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("symbolic links"), "{error}");
+        assert!(error.contains("research.md"), "{error}");
+        assert!(
+            !dir.join("schemas").exists(),
+            "a refused source must copy nothing"
+        );
+    }
+
+    #[test]
+    fn add_schema_refuses_a_symlinked_schema_folder() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        let real = project.path().join("real-schema");
+        write_schema(&real);
+        let source = project.path().join("repo");
+        fs::create_dir_all(source.join("schemas")).expect("schemas dir");
+        let linked = source.join("schemas").join("custom");
+        if let Err(error) = make_dir_symlink(&real, &linked) {
+            eprintln!("skipped: the OS refused to create the symlink: {error}");
+            return;
+        }
+        let error = add_schema_from(&dir, source.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("symbolic links"), "{error}");
+        assert!(error.contains("custom"), "{error}");
+        assert!(
+            !dir.join("schemas").exists(),
+            "a refused source must copy nothing"
+        );
     }
 
     #[test]

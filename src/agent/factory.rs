@@ -3758,9 +3758,17 @@ mod tests {
             );
         }
         let count = registry_len(&factory, &dir);
-        // The browser family is feature-gated (10 offscreen + 6 on-screen);
-        // the git pair is repo-gated (2c.3) — the tempdir is not a repo.
-        let expected = if cfg!(feature = "browser") { 42 } else { 26 };
+        // The browser family is feature-gated: 10 offscreen tools on EVERY
+        // platform plus 6 on-screen WebView2 tools that register only on
+        // Windows (the `#[cfg(windows)]` block in `build_registry` — a user
+        // decision of 2026-09-20). The git pair is repo-gated (2c.3) — the
+        // tempdir is not a repo.
+        let browser = if cfg!(feature = "browser") {
+            10 + if cfg!(windows) { 6 } else { 0 }
+        } else {
+            0
+        };
+        let expected = 26 + browser;
         assert_eq!(
             count,
             expected,
@@ -3851,9 +3859,17 @@ mod tests {
             "the rest of the Memory group stays"
         );
         let count = registry.iter().count();
-        // The browser family is feature-gated (10 offscreen + 6 on-screen);
-        // the git pair is repo-gated (2c.3) — the tempdir is not a repo.
-        let expected = if cfg!(feature = "browser") { 41 } else { 25 };
+        // The browser family is feature-gated: 10 offscreen tools on EVERY
+        // platform plus 6 on-screen WebView2 tools that register only on
+        // Windows (the `#[cfg(windows)]` block in `build_registry` — a user
+        // decision of 2026-09-20). The git pair is repo-gated (2c.3) — the
+        // tempdir is not a repo.
+        let browser = if cfg!(feature = "browser") {
+            10 + if cfg!(windows) { 6 } else { 0 }
+        } else {
+            0
+        };
+        let expected = 25 + browser;
         assert_eq!(
             count,
             expected,

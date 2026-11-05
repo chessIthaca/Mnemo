@@ -269,10 +269,15 @@ pub async fn require_clean(root: &Path, label: &str) -> Result<(), String> {
 
 /// The bookkeeping the lead keeps in the project, shared with Mnemo1: plan
 /// files (`.coding/plans/`), the closing team review reports
-/// (`.coding/reviews/`), and memory knowledge records (`.coding/knowledge/`),
-/// all committed with the lead's own work.
-const LEAD_BOOKKEEPING_PREFIXES: [&str; 3] =
-    [".coding/plans/", ".coding/reviews/", ".coding/knowledge/"];
+/// (`.coding/reviews/`), memory knowledge records (`.coding/knowledge/`), and
+/// OpenSpec current-state specs and archives (`.coding/openspec/`), all
+/// committed with the lead's own work.
+const LEAD_BOOKKEEPING_PREFIXES: [&str; 4] = [
+    ".coding/plans/",
+    ".coding/reviews/",
+    ".coding/knowledge/",
+    ".coding/openspec/",
+];
 
 fn is_lead_bookkeeping(path: &str) -> bool {
     LEAD_BOOKKEEPING_PREFIXES

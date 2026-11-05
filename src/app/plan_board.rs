@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::openspec::archive;
 use crate::app::openspec::schema::{ResolvedSchema, Schema};
 use crate::app::team_ledger::{PlanReview, TeamLedger};
 use crate::app::tool::workflow::plan::{
@@ -1306,6 +1307,20 @@ impl PlanBoard {
             }
             BoardStatus::Abandoned => return Err(format!("plan {id} was abandoned")),
         }
+        if !entry.spec_deltas.is_empty() {
+            let plan = self.load_plan(id)?;
+            let resolved = Schema::resolve(&self.openspec_dir(), Some(&entry.schema))?;
+            let prepared = archive::prepare_close(
+                &self.openspec_dir(),
+                id,
+                &plan,
+                &resolved,
+                &entry.spec_deltas,
+                &entry.sections,
+                &today(),
+            )?;
+            prepared.write()?;
+        }
         let now = now_ms();
         let name = format!("team-{id}-{}.md", report_stamp((now / 1000) as i64));
         let path = self.reviews_dir.join(name);
@@ -1677,6 +1692,20 @@ mod tests {
             spec.add_requirement(requirement(name));
         }
         std::fs::write(folder.join("spec.md"), spec.render()).unwrap();
+    }
+
+    fn complete_steps(board: &PlanBoard, id: &str) {
+        let step_count = board.get(id).unwrap().steps.len();
+        for index in 0..step_count {
+            board.tick(id, index, "done").unwrap();
+        }
+    }
+
+    fn archive_dir(dir: &Path, id: &str, title_slug: &str) -> PathBuf {
+        dir.join("openspec")
+            .join("changes")
+            .join("archive")
+            .join(format!("{}-{id}-{title_slug}", today()))
     }
 
     #[test]
@@ -2629,6 +2658,213 @@ mod tests {
         let markdown = board.read_markdown(&plan.id).unwrap();
         assert!(!markdown.contains("## Project context"));
         assert!(markdown.contains("## Steps"));
+    }
+
+    #[tokio::test]
+    async fn close_with_added_delta_merges_the_spec_and_writes_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                title: "Added capability".to_string(),
+                goal: "Keep imports lossless".to_string(),
+                context: "Why: imported rows must retain their source data.".to_string(),
+                spec_deltas: vec![added_delta("importer", "Preserve source rows")],
+                ..draft("Added capability")
+            })
+            .unwrap();
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    decision: Some("Use the existing parser".to_string()),
+                    interface: Some("src/import.rs keeps its public API".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        complete_steps(&board, &plan.id);
+
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+        let spec = std::fs::read_to_string(
+            dir.path().join("openspec/specs/importer/spec.md"),
+        )
+        .unwrap();
+        assert!(spec.contains("### Requirement: Preserve source rows"), "{spec}");
+
+        let archive = archive_dir(dir.path(), &plan.id, "added-capability");
+        for relative in [
+            "proposal.md",
+            "design.md",
+            "tasks.md",
+            "specs/importer/spec.md",
+            ".openspec.yaml",
+        ] {
+            assert!(archive.join(relative).is_file(), "missing {relative}");
+        }
+        let proposal = std::fs::read_to_string(archive.join("proposal.md")).unwrap();
+        assert!(proposal.contains("Keep imports lossless"), "{proposal}");
+        assert!(proposal.contains("Why: imported rows"), "{proposal}");
+        let design = std::fs::read_to_string(archive.join("design.md")).unwrap();
+        assert!(design.contains("Use the existing parser"), "{design}");
+        assert!(design.contains("src/import.rs keeps its public API"), "{design}");
+        let tasks = std::fs::read_to_string(archive.join("tasks.md")).unwrap();
+        assert_eq!(tasks.matches("- [x]").count(), 2, "{tasks}");
+        assert!(!tasks.contains("- [ ]"), "{tasks}");
+        let delta = std::fs::read_to_string(archive.join("specs/importer/spec.md")).unwrap();
+        assert!(delta.starts_with("## ADDED Requirements\n"), "{delta}");
+        assert!(delta.contains("### Requirement: Preserve source rows"), "{delta}");
+        let metadata: BTreeMap<String, String> = serde_norway::from_str(
+            &std::fs::read_to_string(archive.join(".openspec.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata.get("schema").map(String::as_str), Some("spec-driven"));
+        assert_eq!(metadata.get("mnemo_plan"), Some(&plan.id));
+    }
+
+    #[tokio::test]
+    async fn close_applies_modified_removed_and_renamed_requirements() {
+        let dir = tempfile::tempdir().unwrap();
+        write_spec(dir.path(), "importer", &["Modify me", "Remove me", "Rename me"]);
+        let board = board(dir.path());
+        let mut modified = requirement("Modify me");
+        modified.text = "The system MUST retain every imported row.".to_string();
+        let delta = Delta {
+            capability: "importer".to_string(),
+            modified: vec![modified],
+            removed: vec![crate::openspec::RemovedRequirement {
+                requirement: "Remove me".to_string(),
+                reason: "The legacy behavior is obsolete.".to_string(),
+            }],
+            renamed: vec![crate::openspec::RenamedRequirement {
+                from: "Rename me".to_string(),
+                to: "Renamed requirement".to_string(),
+            }],
+            ..Default::default()
+        };
+        let plan = board
+            .create(PlanDraft {
+                spec_deltas: vec![delta],
+                ..draft("Update capability")
+            })
+            .unwrap();
+        complete_steps(&board, &plan.id);
+
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+        let spec = std::fs::read_to_string(
+            dir.path().join("openspec/specs/importer/spec.md"),
+        )
+        .unwrap();
+        assert!(spec.contains("The system MUST retain every imported row."), "{spec}");
+        assert!(!spec.contains("### Requirement: Remove me"), "{spec}");
+        assert!(!spec.contains("### Requirement: Rename me\n"), "{spec}");
+        assert!(spec.contains("### Requirement: Renamed requirement"), "{spec}");
+        let delta = std::fs::read_to_string(
+            archive_dir(dir.path(), &plan.id, "update-capability")
+                .join("specs/importer/spec.md"),
+        )
+        .unwrap();
+        assert!(delta.contains("## MODIFIED Requirements"), "{delta}");
+        assert!(delta.contains("## REMOVED Requirements"), "{delta}");
+        assert!(delta.contains("The legacy behavior is obsolete."), "{delta}");
+        assert!(delta.contains("## RENAMED Requirements"), "{delta}");
+        assert!(delta.contains("FROM: Rename me\nTO: Renamed requirement"), "{delta}");
+    }
+
+    #[tokio::test]
+    async fn conflicting_delta_blocks_close_and_writes_no_openspec_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_spec(dir.path(), "importer", &["Original requirement"]);
+        let board = board(dir.path());
+        let delta = Delta {
+            capability: "importer".to_string(),
+            modified: vec![requirement("Original requirement")],
+            ..Default::default()
+        };
+        let plan = board
+            .create(PlanDraft {
+                spec_deltas: vec![delta],
+                ..draft("Conflicting delta")
+            })
+            .unwrap();
+        complete_steps(&board, &plan.id);
+        write_spec(dir.path(), "importer", &["Replacement requirement"]);
+        let spec_path = dir.path().join("openspec/specs/importer/spec.md");
+        let before = std::fs::read(&spec_path).unwrap();
+
+        let CloseOutcome::Blocked { reasons } =
+            board.try_close(&plan.id, &FakeLedger::passing()).await
+        else {
+            panic!("a stale delta must block the close");
+        };
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        for expected in ["importer", "MODIFIED", "Original requirement", "plan_update"] {
+            assert!(reasons[0].contains(expected), "missing {expected}: {reasons:?}");
+        }
+        assert_eq!(std::fs::read(&spec_path).unwrap(), before);
+        assert!(!dir.path().join("openspec/changes").exists());
+        assert_eq!(board.get(&plan.id).unwrap().status, BoardStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn close_without_deltas_writes_no_openspec_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = create(&board, "Ordinary plan");
+        complete_steps(&board, &plan.id);
+
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+        assert!(!dir.path().join("openspec").exists());
+    }
+
+    #[tokio::test]
+    async fn close_with_custom_schema_archives_its_plan_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        research_schema(dir.path(), true);
+        let board = board(dir.path());
+        let plan = board
+            .create_with_sections(
+                PlanDraft {
+                    spec_deltas: vec![added_delta("importer", "Preserve source rows")],
+                    ..draft("Custom archive")
+                },
+                research_section("Inspected src/import.rs: rows retain their source order."),
+            )
+            .unwrap();
+        complete_steps(&board, &plan.id);
+
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+        let archive = archive_dir(dir.path(), &plan.id, "custom-archive");
+        let research = std::fs::read_to_string(archive.join("research.md")).unwrap();
+        assert_eq!(
+            research,
+            "Inspected src/import.rs: rows retain their source order.\n"
+        );
+        assert!(archive.join("proposal.md").is_file());
+        assert!(archive.join("tasks.md").is_file());
+        let metadata: BTreeMap<String, String> = serde_norway::from_str(
+            &std::fs::read_to_string(archive.join(".openspec.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata.get("schema").map(String::as_str), Some("custom"));
+        assert_eq!(metadata.get("mnemo_plan"), Some(&plan.id));
+        assert!(!archive.join("specs").exists());
+        assert!(dir
+            .path()
+            .join("openspec/specs/importer/spec.md")
+            .is_file());
     }
 
     #[test]

@@ -1,8 +1,9 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { get } from "svelte/store";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { app } from "../lib/store";
 import type { Worker } from "../lib/types";
-import { createWorkers, fixtureState } from "../test/fixtures";
+import { createAuditWorker, createWorkers, fixtureState } from "../test/fixtures";
 import WorkerDetail from "./WorkerDetail.svelte";
 
 const longBrief = [
@@ -93,6 +94,48 @@ describe("WorkerDetail brief", () => {
     await waitFor(() => expect(measure).toHaveBeenCalled());
     expect(screen.queryByRole("button", { name: /Show (more|less) brief/ })).toBeNull();
   });
+
+  it("opens a repository path named in the brief where it points", async () => {
+    const brief = [
+      "Goal: fix `.coding/design/unified-tiers.md` and `.coding/plans/abc12345.md`.",
+      "Then re-read `src/a.rs:42`.",
+      "",
+      "```text",
+      ".coding/design/fenced-only.md",
+      "```",
+    ].join("\n");
+    const { container } = render(WorkerDetail, {
+      worker: { ...worker(), task: brief },
+      measureBriefOverflow: () => false,
+    });
+    const markdown = container.querySelector(".worker-brief .markdown") as HTMLElement;
+    const pathButton = (text: string) =>
+      [...markdown.querySelectorAll<HTMLButtonElement>("button.md-path")].find(
+        (button) => button.textContent === text,
+      );
+
+    const design = await waitFor(() => {
+      const found = pathButton(".coding/design/unified-tiers.md");
+      expect(found).toBeTruthy();
+      return found as HTMLButtonElement;
+    });
+    await fireEvent.click(design);
+    expect(get(app).workbenchOpen).toBe(true);
+    expect(get(app).workbenchTab).toBe("files");
+    expect(get(app).workbenchFile).toEqual({ path: ".coding/design/unified-tiers.md", line: null });
+
+    await fireEvent.click(pathButton(".coding/plans/abc12345.md") as HTMLButtonElement);
+    expect(get(app).route).toBe("plans");
+    expect(get(app).planDocumentId).toBe("abc12345");
+
+    await fireEvent.click(pathButton("src/a.rs:42") as HTMLButtonElement);
+    expect(get(app).workbenchTab).toBe("files");
+    expect(get(app).workbenchFile).toEqual({ path: "src/a.rs", line: 42 });
+
+    const fence = markdown.querySelector(".code-block pre") as HTMLElement;
+    expect(fence.textContent).toContain(".coding/design/fenced-only.md");
+    expect(fence.querySelector("button.md-path")).toBeNull();
+  });
 });
 
 describe("WorkerDetail compact header", () => {
@@ -151,5 +194,89 @@ describe("WorkerDetail received messages", () => {
     const { container } = render(WorkerDetail, { worker: createWorkers()[0] });
 
     expect(container.querySelector(".inbox-panel")).toBeNull();
+  });
+});
+
+describe("worker thread model-switch note", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  it("renders the muted note in the thread, pending then confirmed", () => {
+    const worker: Worker = {
+      ...createWorkers()[0],
+      messages: [
+        { id: "m1", from: "worker", body: "Implementing the parser.", time: "now" },
+        {
+          id: "note-pending",
+          kind: "model_switch",
+          model: "test/deep",
+          body: "Model changed to deep by you; it takes effect on the next call",
+          time: "now",
+          applied: false,
+        },
+        {
+          id: "note-applied",
+          kind: "model_switch",
+          model: "test/fast",
+          body: "Now running on fast",
+          time: "now",
+          applied: true,
+        },
+      ],
+    };
+
+    const { container } = render(WorkerDetail, { worker });
+
+    // The notes render as muted status rows — not as worker messages with authors.
+    const notes = [...container.querySelectorAll(".thread-model-note")];
+    expect(notes.map((note) => note.getAttribute("role"))).toEqual(["status", "status"]);
+    expect(notes.map((note) => note.textContent)).toEqual([
+      "Model changed to deep by you; it takes effect on the next call",
+      "Now running on fast",
+    ]);
+  });
+});
+
+describe("WorkerDetail finished audit", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  it("hides Resume, Compact and Steer for a finished audit and points the lead at its report", () => {
+    const audit = createAuditWorker();
+    render(WorkerDetail, { worker: audit });
+
+    expect(screen.getByText("Audit finished; its report is with the lead.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Steer" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Compact" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    // Delete stays: the lead can still clean the finished audit up.
+    expect(screen.getByRole("button", { name: "Delete Ada" })).toBeTruthy();
+  });
+
+  it("keeps Resume for an audit that failed before reporting", () => {
+    const audit: Worker = { ...createAuditWorker(), status: "failed", reportDelivered: false };
+    render(WorkerDetail, { worker: audit });
+
+    expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();
+    expect(screen.queryByText("Audit finished; its report is with the lead.")).toBeNull();
+  });
+});
+
+describe("WorkerDetail plan tab", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  it("shows the Plan tab for a worker on a plan and renders the plan header", async () => {
+    const worker: Worker = { ...createWorkers()[0], planId: "bfa3a622", planStep: 1 };
+    render(WorkerDetail, { worker });
+
+    const tabs = screen.getByRole("navigation", { name: "Worker detail sections" });
+    await fireEvent.click(within(tabs).getByRole("button", { name: "Plan" }));
+
+    expect(await screen.findByText("Plan bfa3a622 · step 2")).toBeTruthy();
+  });
+
+  it("shows no Plan tab for a worker without a plan", () => {
+    render(WorkerDetail, { worker: createWorkers()[0] });
+
+    const tabs = screen.getByRole("navigation", { name: "Worker detail sections" });
+    expect(within(tabs).queryByRole("button", { name: "Plan" })).toBeNull();
   });
 });

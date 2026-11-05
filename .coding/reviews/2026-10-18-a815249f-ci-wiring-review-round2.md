@@ -10,7 +10,7 @@ Round-2 delta review of plan a815249f (backlog c96a96ca — the second-consumer 
 - README.md :56-73 — the fixed "~280-line proof" paragraph.
 - examples/second_consumer.rs, full 284 lines (header + `main`) — to verify the paragraph's claims and the line count.
 - .github/workflows/build.yml :230-253 — the `examples` job (round-1-verified carry-over, read for the README cross-check).
-- .coding/specs/headless-free-agent/job-05-final-acceptance.md :185-226 — the spec §F 5.2 CI-wiring hunk.
+- .coding/design/headless-free-agent/job-05-final-acceptance.md :185-226 — the spec §F 5.2 CI-wiring hunk.
 - .coding/backlog.jsonl :75 — the c96a96ca row, for bookkeeping accuracy.
 
 ## L1 closed — the README paragraph is accurate

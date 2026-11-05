@@ -1,5 +1,5 @@
-import { render } from "@testing-library/svelte";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, waitFor } from "@testing-library/svelte";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LeadEntry } from "../lib/types";
 import ToolActivity from "./ToolActivity.svelte";
 
@@ -51,5 +51,260 @@ describe("ToolActivity live preview", () => {
       (span) => span.textContent === "✓",
     );
     expect(check?.getAttribute("style")).toContain("color");
+  });
+});
+describe("ToolActivity expanded bodies", () => {
+  /** One tool entry, overridable per test. */
+  function entry(overrides: Partial<ToolEntry> = {}): ToolEntry {
+    return {
+      id: "tool-1",
+      kind: "tool",
+      time: "now",
+      toolCallId: "call-1",
+      toolName: "file_edit",
+      arguments: "{}",
+      liveOutput: "",
+      result: null,
+      ...overrides,
+    } as ToolEntry;
+  }
+
+  async function expand(container: HTMLElement) {
+    const summary = container.querySelector<HTMLElement>("summary");
+    if (summary === null) throw new Error("the tool row has no summary");
+    await fireEvent.click(summary);
+    await waitFor(() => expect(container.querySelector("details")?.open).toBe(true));
+  }
+
+  it("renders an edit's structured diff, keeping the raw call behind the toggle", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "file_edit",
+        arguments: '{"path":"a.rs","old_string":"old text","new_string":"new text"}',
+        result: {
+          success: true,
+          output: "Edited a.rs",
+          data: { diff: "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old text\n+new text" },
+        },
+      }),
+    });
+    await expand(container);
+    await waitFor(() => expect(container.querySelectorAll(".tool-diff-line").length).toBeGreaterThan(0));
+    expect(
+      [...container.querySelectorAll('.tool-diff-line[data-type="remove"]')].map((node) => node.textContent),
+    ).toEqual(["−old text"]);
+    expect(
+      [...container.querySelectorAll('.tool-diff-line[data-type="add"]')].map((node) => node.textContent),
+    ).toEqual(["+new text"]);
+    // the Arguments JSON is no longer the body…
+    expect(container.textContent).not.toContain("old_string");
+    // …but it stays reachable behind the Show raw call toggle
+    const toggle = container.querySelector<HTMLButtonElement>(".tool-raw-toggle");
+    expect(toggle).toBeTruthy();
+    await fireEvent.click(toggle!);
+    await waitFor(() => expect(container.textContent).toContain("old_string"));
+    expect(container.textContent).toContain("Edited a.rs");
+  });
+
+  it("reconstructs an edit's diff from its arguments when no payload exists", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "file_edit",
+        arguments: '{"path":"a.rs","old_string":"old text","new_string":"new text"}',
+        // a replayed transcript rebuilds results from the message text — no data
+        result: { success: true, output: "Edited a.rs" },
+      }),
+    });
+    await expand(container);
+    await waitFor(() => expect(container.querySelector(".tool-diff")).toBeTruthy());
+    expect(container.textContent).toContain("a.rs");
+    expect(container.textContent).toContain("Reconstructed from the call arguments");
+    expect(
+      [...container.querySelectorAll('.tool-diff-line[data-type="remove"]')].map((node) => node.textContent),
+    ).toEqual(["−old text"]);
+  });
+
+  it("renders a write's content as added lines under its path", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "file_write",
+        arguments: '{"path":"src/greet.ts","content":"export const hi = 1;"}',
+        result: { success: true, output: "Wrote src/greet.ts" },
+      }),
+    });
+    await expand(container);
+    await waitFor(() => expect(container.querySelector(".tool-diff")).toBeTruthy());
+    expect(container.querySelector(".tool-diff-file code")?.textContent).toBe("src/greet.ts");
+    expect(container.querySelectorAll('.tool-diff-line[data-type="remove"]').length).toBe(0);
+    expect(
+      [...container.querySelectorAll('.tool-diff-line[data-type="add"]')].map((node) => node.textContent),
+    ).toEqual(["+export const hi = 1;"]);
+  });
+
+  it("lists the files and line ranges a read returned, with the output behind the toggle", async () => {
+    const output = [
+      "=== mnemo2/src/lib/toolSummary.ts (lines 1-44 of 65) ===",
+      "1  import { toolHeadline } from …",
+      "",
+      "=== mnemo2/src/lib/types.ts (lines 272-284 of 316) ===",
+      "272  export interface LeadToolResult …",
+      "",
+      "=== mnemo2/missing.rs (error) ===",
+      "not found",
+    ].join("\n");
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "read_files",
+        arguments:
+          '{"files":[{"path":"mnemo2/src/lib/toolSummary.ts","start_line":1,"max_lines":44},{"path":"mnemo2/src/lib/types.ts","start_line":272,"max_lines":13}]}',
+        result: { success: true, output },
+      }),
+    });
+    await expand(container);
+    await waitFor(() => expect(container.querySelectorAll(".tool-reads li").length).toBe(3));
+    const rows = [...container.querySelectorAll(".tool-reads li")].map((li) => li.textContent ?? "");
+    expect(rows[0]).toContain("mnemo2/src/lib/toolSummary.ts");
+    expect(rows[0]).toContain("lines 1–44 of 65");
+    expect(rows[1]).toContain("mnemo2/src/lib/types.ts");
+    expect(rows[1]).toContain("lines 272–284 of 316");
+    expect(rows[2]).toContain("not found");
+    // the raw numbered content is not the body — it stays behind the toggle
+    expect(container.textContent).not.toContain("272  export interface");
+    await fireEvent.click(container.querySelector<HTMLButtonElement>(".tool-raw-toggle")!);
+    await waitFor(() => expect(container.textContent).toContain("272  export interface"));
+  });
+
+  it("renders a shell call as a command block with split output and its exit code", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "shell",
+        arguments: '{"command":"cargo test","purpose":"running tests"}',
+        result: {
+          success: true,
+          output: "test result: ok. 4 passed\n[stderr]\nwarning: unused import\n[exit code: 0]",
+        },
+      }),
+    });
+    await expand(container);
+    await waitFor(() => expect(container.querySelector(".tool-command")?.textContent).toBe("cargo test"));
+    expect(container.textContent).toContain("purpose: running tests");
+    expect(container.textContent).toContain("test result: ok. 4 passed");
+    expect(container.querySelector(".tool-shell-err")?.textContent).toContain("warning: unused import");
+    expect(container.querySelector(".tool-exit")?.getAttribute("data-ok")).toBe("true");
+    // the raw JSON call moved behind the Show raw call toggle
+    expect(container.textContent).not.toContain('"command": "cargo test"');
+    await fireEvent.click(container.querySelector<HTMLButtonElement>(".tool-raw-toggle")!);
+    await waitFor(() => expect(container.textContent).toContain('"command": "cargo test"'));
+  });
+
+  it("shows a failed shell's error output with its exit code", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "shell",
+        arguments: '{"command":"cargo build"}',
+        result: { success: false, output: "error: could not compile\n[stderr]\ncargo: not found\n[exit code: 101]" },
+      }),
+    });
+    await expand(container);
+    await waitFor(() => expect(container.querySelector(".tool-shell-err")?.textContent).toContain("cargo: not found"));
+    expect(container.textContent).toContain("Error");
+    expect(container.querySelector(".tool-exit")?.getAttribute("data-ok")).toBe("false");
+  });
+
+  it("keeps the generic Arguments/Result view for other tools", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "git_read",
+        arguments: '{"op":"log"}',
+        result: { success: true, output: "abc123 fix: parser\n" },
+      }),
+    });
+    await expand(container);
+    await waitFor(() => expect(container.textContent).toContain("abc123 fix: parser"));
+    expect(container.textContent).toContain('"op": "log"');
+    expect(container.querySelector(".tool-raw-toggle")).toBeNull();
+    expect(container.querySelector(".tool-diff")).toBeNull();
+  });
+
+  it("keeps a failed write's error text in view without a content diff", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "file_write",
+        arguments: '{"path":"a.ts","content":"x"}',
+        result: { success: false, output: "permission denied" },
+      }),
+    });
+    await expand(container);
+    // "Error" exists only in the expanded body — waiting for it bridges
+    // jsdom's asynchronous details-toggle event.
+    await waitFor(() => expect(container.textContent).toContain("Error"));
+    expect(container.textContent).toContain("permission denied");
+    expect(container.querySelector(".tool-diff")).toBeNull();
+  });
+});
+describe("ToolActivity turn time", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** A finished read call, overridable per test. */
+  function card(overrides: Partial<ToolEntry> = {}): ToolEntry {
+    return {
+      id: "tool-1",
+      kind: "tool",
+      time: "now",
+      toolCallId: "call-1",
+      toolName: "read_files",
+      arguments: '{"files":["README.md"]}',
+      liveOutput: "",
+      result: { success: true, output: "read 42 lines" },
+      ...overrides,
+    } as ToolEntry;
+  }
+
+  function statusText(container: HTMLElement): string {
+    return container.querySelector<HTMLElement>(".tool-status")?.textContent?.trim() ?? "";
+  }
+
+  function timeTitle(container: HTMLElement): string | null {
+    return container.querySelector<HTMLElement>(".elapsed-time")?.getAttribute("title") ?? null;
+  }
+
+  it("a completed card shows only the turn time", () => {
+    const { container } = render(ToolActivity, {
+      entry: card({ startedAtMs: 61_000, endedAtMs: 61_400 }),
+      turnStartedAtMs: 0,
+    });
+    // 61.4 s into the turn — not the call's own 0.4 s.
+    expect(statusText(container)).toBe("1:01");
+    expect(statusText(container)).not.toContain("Completed");
+    // The status word stays reachable for screen readers on the card's label.
+    expect(container.querySelector("article")?.getAttribute("aria-label")).toContain("Completed");
+  });
+
+  it("a failed card keeps the word", () => {
+    const { container } = render(ToolActivity, {
+      entry: card({ startedAtMs: 61_000, endedAtMs: 61_400, result: { success: false, output: "boom" } }),
+      turnStartedAtMs: 0,
+    });
+    expect(statusText(container)).toBe("Failed · 1:01");
+  });
+
+  it("the tooltip names turn and call time", () => {
+    const { container } = render(ToolActivity, {
+      entry: card({ startedAtMs: 61_000, endedAtMs: 61_400 }),
+      turnStartedAtMs: 0,
+    });
+    expect(timeTitle(container)).toBe("Turn time 1:01 · this call 0:00");
+  });
+
+  it("a running card counts from the turn start and says so in its tooltip", () => {
+    vi.spyOn(Date, "now").mockReturnValue(63_000);
+    const { container } = render(ToolActivity, {
+      entry: card({ startedAtMs: 61_000, result: null }),
+      turnStartedAtMs: 60_000,
+    });
+    expect(statusText(container)).toBe("0:03");
+    expect(timeTitle(container)).toBe("Turn time 0:03 · running 0:02");
   });
 });

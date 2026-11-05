@@ -121,17 +121,18 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain("checked={autoFinetune}");
   });
 
-  it("renders the pre-prompt routing block (opt-in + shadow + targets + gate)", () => {
+  it("renders the pre-prompt routing block (opt-in + shadow + gates)", () => {
     expect(classifierSource).toContain("Route turns by task complexity");
     expect(classifierSource).toContain(
       "Switch the model on a confident decision",
     );
-    expect(classifierSource).toContain("Confidence gate");
-    expect(classifierSource).toContain("Trivial tasks");
-    expect(classifierSource).toContain("Architectural tasks");
-    // The target pickers reuse the Models section's endpoint/model/effort
-    // control; the shadow-first contract is spelled out in the block.
-    expect(classifierSource).toContain("ModelPickerBody");
+    expect(classifierSource).toContain("Step-lane gate");
+    // The per-tier models moved to the one shared ladder (plan 87932c46): the
+    // block points there instead of carrying its own pickers.
+    expect(classifierSource).toContain(
+      "Models per tier are set in Mnemo2: Settings &gt; Tiers.",
+    );
+    expect(classifierSource).not.toContain("ModelPickerBody");
     expect(classifierSource).toContain("routing.jsonl");
     expect(classifierSource).toContain("Shadow-first");
   });
@@ -215,12 +216,8 @@ describe("serializeClassifier", () => {
     autoFinetune: false,
     routing: false,
     routingEnforce: false,
-    routingCheap: null,
-    routingCapable: null,
-    routingLaneMedium: null,
-    routingLaneHigh: null,
-    routingEscalate: null,
     routingThreshold: 0.8,
+    routingFirstPromptMinConfidence: null,
     budgetEnabled: false,
     budgetMaxTokensPerPlan: 0,
     budgetMaxEscalationsPerPlan: 1,
@@ -257,31 +254,10 @@ describe("serializeClassifier", () => {
       serializeClassifier({ ...base, routingEnforce: true }),
     );
     expect(serializeClassifier(base)).not.toBe(
-      serializeClassifier({
-        ...base,
-        routingCheap: { endpoint: "local", model: "tiny" },
-      }),
+      serializeClassifier({ ...base, routingFirstPromptMinConfidence: 0.5 }),
     );
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, routingThreshold: 0.9 }),
-    );
-    expect(serializeClassifier(base)).not.toBe(
-      serializeClassifier({
-        ...base,
-        routingLaneMedium: { endpoint: "local", model: "medium" },
-      }),
-    );
-    expect(serializeClassifier(base)).not.toBe(
-      serializeClassifier({
-        ...base,
-        routingLaneHigh: { endpoint: "local", model: "high" },
-      }),
-    );
-    expect(serializeClassifier(base)).not.toBe(
-      serializeClassifier({
-        ...base,
-        routingEscalate: { endpoint: "stub", model: "top" },
-      }),
     );
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, budgetEnabled: true }),
@@ -307,12 +283,8 @@ describe("serializeClassifier", () => {
       autoFinetune: false,
       routing: false,
       routingEnforce: false,
-      routingCheap: null,
-      routingCapable: null,
-      routingLaneMedium: null,
-      routingLaneHigh: null,
-      routingEscalate: null,
       routingThreshold: 0.8,
+      routingFirstPromptMinConfidence: null,
       budgetEnabled: false,
       budgetMaxTokensPerPlan: 0,
       budgetMaxEscalationsPerPlan: 1,
@@ -320,21 +292,33 @@ describe("serializeClassifier", () => {
     });
   });
 
-  it("carries the escalation-lane targets through the saved patch (backlog ad56c7bd)", () => {
-    // The three lane pickers ride the same [general.routing] patch: the draft
-    // round-trips them, the payload sends the snake_case wire names (null
-    // clears, exactly like cheap/capable), and the bindings carry both the
-    // read type and the save patch.
-    expect(classifierSource).toContain("Lane ladder (per plan step)");
-    expect(classifierSource).toContain("lane_medium: routingLaneMedium,");
-    expect(classifierSource).toContain("lane_high: routingLaneHigh,");
-    expect(classifierSource).toContain("escalate: routingEscalate,");
-    expect(tauriSource).toContain("lane_medium: ModelRefConfig | null;");
-    expect(tauriSource).toContain("lane_high: ModelRefConfig | null;");
-    expect(tauriSource).toContain("escalate: ModelRefConfig | null;");
-    expect(tauriSource).toContain("lane_medium?: ModelRefConfig | null;");
-    expect(tauriSource).toContain("lane_high?: ModelRefConfig | null;");
-    expect(tauriSource).toContain("escalate?: ModelRefConfig | null;");
+  it("no longer carries per-tier model targets in the classifier block (plan 87932c46)", () => {
+    // The six per-lane targets moved to the one shared tier ladder
+    // (Settings > Tiers): the section renders no model pickers and the
+    // bindings declare no lane field on either the read type or the save
+    // patch, so a stale field cannot silently come back.
+    expect(classifierSource).not.toContain("ModelPickerBody");
+    for (const field of [
+      "routingCheap",
+      "routingRoutine",
+      "routingCapable",
+      "routingLaneMedium",
+      "routingLaneHigh",
+      "routingEscalate",
+    ]) {
+      expect(classifierSource).not.toContain(field);
+    }
+    for (const field of [
+      "cheap",
+      "routine",
+      "capable",
+      "lane_medium",
+      "lane_high",
+      "escalate",
+    ]) {
+      expect(tauriSource).not.toContain(`${field}: ModelRefConfig | null;`);
+      expect(tauriSource).not.toContain(`${field}?: ModelRefConfig | null;`);
+    }
   });
 
   it("carries the budget caps through the saved patch (backlog a25a5323)", () => {
@@ -377,5 +361,42 @@ describe("routing block guards its two unsafe edits (review L3/L4)", () => {
       'disabled={status !== "ready" && !routingEnforce}',
     );
     expect(classifierSource).toContain("switching it back off always works");
+  });
+});
+
+describe("the shared routing question (plan 2ba2168a, design step 7)", () => {
+  it("points the per-tier models at the shared ladder instead of local pickers", () => {
+    // The routine rung was the shared question's middle label: its picker is
+    // gone with the other five, and the block names the one place the tier
+    // models are set now (plan 87932c46).
+    expect(classifierSource).not.toContain("Routine tasks");
+    expect(classifierSource).not.toContain(
+      "onChange={(v) => setRoutingRoutine(v)}",
+    );
+    expect(classifierSource).toContain(
+      "Models per tier are set in Mnemo2: Settings &gt; Tiers.",
+    );
+  });
+
+  it("round-trips the first-prompt gate and shows the calibrated default when unset", () => {
+    // Unset means "the kernel's calibrated default" — the field shows it and
+    // the save sends null, so the backend falls back to 0.475 / 0.60.
+    expect(classifierSource).toContain("First-prompt gate");
+    expect(classifierSource).toContain("calibrated default 0.475");
+    expect(classifierSource).toContain(
+      "routingFirstPromptMinConfidence: routingWire?.first_prompt_min_confidence ?? null",
+    );
+    expect(classifierSource).toContain(
+      "first_prompt_min_confidence: routingFirstPromptMinConfidence,",
+    );
+    expect(tauriSource).toContain("first_prompt_min_confidence: number | null;");
+    expect(tauriSource).toContain("first_prompt_min_confidence?: number | null;");
+  });
+
+  it("says routing happens once, then only suggests, and relabels the step-lane gate", () => {
+    expect(classifierSource).toContain(
+      "Routes the first prompt of a session once; afterwards Laya only",
+    );
+    expect(classifierSource).toContain("Step-lane gate");
   });
 });

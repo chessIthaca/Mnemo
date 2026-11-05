@@ -575,7 +575,12 @@ pub fn spawn(
                 SerializableAgentEvent::CompactStarted => {
                     compact_in_flight.insert(agent_id);
                 }
+                // A completed compact-then-switch is the paired end of the
+                // CompactStarted this path opened (it emits no Compacted), so
+                // it must resolve the wait exactly like Compacted does —
+                // otherwise the Run-All compact signal stays stale.
                 SerializableAgentEvent::Compacted { .. }
+                | SerializableAgentEvent::ModelSwapSummarized { .. }
                     if compact_in_flight.remove(&agent_id) =>
                 {
                     let is_main =

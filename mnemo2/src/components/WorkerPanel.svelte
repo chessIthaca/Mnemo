@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ArrowLeft, ArrowUpRight, X } from "@lucide/svelte";
+  import { Activity, ArrowLeft, ArrowUpRight, X } from "@lucide/svelte";
   import { workerPlanLabel } from "../lib/boardState";
   import { actions, app } from "../lib/store";
   import { workerStatusText, type Worker, type WorkerStatus } from "../lib/types";
@@ -28,6 +28,13 @@
   const worker = $derived($app.workers.find((item) => item.id === $app.workerPanelId) ?? null);
   const planLabel = $derived(worker ? workerPlanLabel($app.board, worker) : null);
   const blocked = $derived(worker !== null && BLOCKED_STATUSES.includes(worker.status));
+  /** An audit that delivered its report is over: no Continue for it — the
+   * lead adjudicates the report and dispatches a fresh audit instead. */
+  const auditFinished = $derived(
+    worker !== null &&
+      worker.kind === "audit" &&
+      (worker.reportDelivered === true || worker.status === "completed"),
+  );
   // Active and needs-you workers, always keeping the shown worker listed so a
   // finished worker never jumps the panel away on its own.
   const selectable = $derived.by(() => {
@@ -105,6 +112,15 @@
         {#if planLabel}<span class="pill plan">{planLabel}</span>{/if}
       </div>
       <div class="panel-actions">
+        <button
+          class="handoff-button"
+          type="button"
+          aria-label={`Model calls ${worker.name}`}
+          title="Every model call this worker made, in the Trace page"
+          onclick={() => actions.openTrace({ agent: worker.id })}
+        >
+          <Activity size={13} /> Model calls
+        </button>
         <button class="handoff-button" type="button" aria-label="Open in Mission Control" onclick={() => actions.selectWorker(worker.id)}>
           <ArrowUpRight size={13} /> Mission Control
         </button>
@@ -115,8 +131,11 @@
     {#if blocked}
       <div class="panel-banner" role="status" data-status={worker.status}>
         {#if worker.summary.trim()}<p class="banner-error">{worker.summary}</p>{/if}
+        {#if auditFinished}<p class="banner-note">Audit finished; its report is with the lead.</p>{/if}
         <div class="banner-actions">
-          <button class="banner-button continue" type="button" onclick={() => actions.resumeWorker(worker.id)}>Continue</button>
+          {#if !auditFinished}
+            <button class="banner-button continue" type="button" onclick={() => actions.resumeWorker(worker.id)}>Continue</button>
+          {/if}
           <button class="banner-button delete" type="button" aria-label={`Delete ${worker.name}`} onclick={() => actions.requestDeleteWorkers([worker.id])}>Delete</button>
           <button class="banner-button" type="button" onclick={() => actions.selectWorker(worker.id)}>Open in Mission Control</button>
         </div>
@@ -149,6 +168,7 @@
   .panel-body { flex: 1; min-height: 0; display: flex; }
   .panel-banner { display: grid; flex: 0 0 auto; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--warning-soft); }
   .banner-error { margin: 0; color: var(--danger); font-size: var(--text-body); line-height: 1.45; }
+  .banner-note { margin: 0; color: var(--ink-soft); font-size: var(--text-body); line-height: 1.45; }
   .banner-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .banner-button { display: inline-flex; align-items: center; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-body); font-weight: 600; }
   .banner-button:hover { background: var(--surface-soft); color: var(--ink); }

@@ -51,7 +51,9 @@ export interface BacklogTransport {
   remove(id: string): Promise<BacklogItem[]>;
   reorder(ids: string[]): Promise<BacklogItem[]>;
   setDeferred(id: string, deferred: boolean): Promise<BacklogItem[]>;
+  setDone(id: string, done: boolean): Promise<BacklogItem[]>;
   clearFinished(): Promise<BacklogItem[]>;
+  planThis(id: string): Promise<BacklogItem[]>;
   onChanged(handler: () => void): Promise<UnlistenFn>;
 }
 
@@ -78,7 +80,9 @@ export function createTauriBacklogTransport(bindings: BacklogBindings): BacklogT
     reorder: (ids) => bindings.invoke<BacklogItem[]>("backlog_reorder", { ids }),
     setDeferred: (id, deferred) =>
       bindings.invoke<BacklogItem[]>("backlog_set_deferred", { id, deferred }),
+    setDone: (id, done) => bindings.invoke<BacklogItem[]>("backlog_set_done", { id, done }),
     clearFinished: () => bindings.invoke<BacklogItem[]>("backlog_clear_finished"),
+    planThis: (id) => bindings.invoke<BacklogItem[]>("plan_this", { id }),
     onChanged: (handler) => bindings.listen(BACKLOG_EVENT_CHANNEL, () => handler()),
   };
 }
@@ -100,11 +104,21 @@ export function isDeferred(item: BacklogItem): boolean {
   return item.deferred === true;
 }
 
-/** How many finished ideas wait behind "Clear finished". */
-export function finishedCount(items: BacklogItem[]): number {
+/** The ideas the lead is working on right now ("With the lead"), in store order. */
+export function inFlightItems(items: BacklogItem[]): BacklogItem[] {
+  return items.filter((item) => item.status === "in_flight");
+}
+
+/** The finished ideas (done, failed or cant-resolve), in the store's order. */
+export function finishedItems(items: BacklogItem[]): BacklogItem[] {
   return items.filter(
     (item) => item.status === "done" || item.status === "failed" || item.status === "cant_resolve",
-  ).length;
+  );
+}
+
+/** How many finished ideas wait behind "Clear finished". */
+export function finishedCount(items: BacklogItem[]): number {
+  return finishedItems(items).length;
 }
 
 /**

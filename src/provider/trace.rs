@@ -63,7 +63,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::keys::restrict_permissions;
 
@@ -116,7 +116,7 @@ pub const DEFAULT_TRACE_REQUEST_CAP_BYTES: usize = 256 * 1024;
 
 /// Token usage for one request — the fields of [`crate::provider::LlmEvent::Usage`]
 /// that matter for cost/cache analysis.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmUsage {
     /// Input (prompt) tokens.
     pub prompt: u32,
@@ -142,6 +142,245 @@ impl LlmUsage {
     }
 }
 
+/// Who or what made a traced model call — the coarse actor class shown in
+/// the trace list. Stamped on the loop's [`TraceIdentity`] by the spawn
+/// path, never inferred from prompt text (plan c3ba2b58 step A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceActorKind {
+    /// The engine's primary (lead) session.
+    Lead,
+    /// A TeamManager worker session.
+    Worker,
+    /// An agent spawned by the lead or a worker — inherits its parent's
+    /// worker/plan identity with this actor kind.
+    Subagent,
+    /// Engine-level calls with no agent loop (memory maintenance).
+    System,
+}
+
+/// Why a model call was made — stamped at the call site, one value per
+/// production call path (the turn request, compaction, consolidation...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TracePurpose {
+    /// A conversation turn's main model request.
+    Turn,
+    /// Context compaction (summarization).
+    Compaction,
+    /// Memory consolidation (episodic/semantic/procedural extraction).
+    MemoryConsolidation,
+    /// Model routing classification.
+    Routing,
+    /// Anything else — reserved.
+    Other,
+}
+
+/// Who made one model call — stamped on the record at creation, before
+/// any retry, streaming, or ring eviction can reorder things. Snapshotted
+/// per request (never read back from live state), so a deleted Team
+/// worker record can never rewrite history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceAttribution {
+    /// The coarse actor class.
+    pub actor_kind: TraceActorKind,
+    /// Runtime AgentId string (empty for system-level calls).
+    pub agent_id: String,
+    /// Headless SessionId string — may equal the numeric agent id today,
+    /// but remains a separate wire concept.
+    pub session_id: String,
+    /// Display name (the spawn name).
+    pub agent_name: String,
+    /// The TeamManager worker id, when this loop belongs to a worker.
+    pub worker_id: Option<String>,
+    /// The plan this agent is executing a step of, when known.
+    pub plan_id: Option<String>,
+    /// The plan step (1-based), when known.
+    pub plan_step: Option<u32>,
+    /// The existing turn id (`model_routing::new_turn_id`) — groups a
+    /// turn's requests and tool phases. `None` for between-turn calls.
+    pub turn_id: Option<String>,
+    /// Why the call was made.
+    pub purpose: TracePurpose,
+}
+
+/// The identity of one agent loop — what [`TraceAttribution`] is stamped
+/// from. Spawn options carry it with the agent/session ids still empty;
+/// the spawn path fills them with the allocated ids and hands it to
+/// `AgentLoop::set_trace_identity`
+/// (crate::agent::loop_impl). A subagent inherits its parent's
+/// worker/plan labels with [`TraceActorKind::Subagent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceIdentity {
+    /// The coarse actor class.
+    pub actor_kind: TraceActorKind,
+    /// Runtime AgentId string — filled by the spawn path.
+    #[serde(default)]
+    pub agent_id: String,
+    /// Headless SessionId string — filled by the spawn path.
+    #[serde(default)]
+    pub session_id: String,
+    /// Display name (the spawn name).
+    pub agent_name: String,
+    /// The TeamManager worker id, when this loop belongs to a worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// The plan this agent is executing a step of, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// The plan step (1-based), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_step: Option<u32>,
+}
+
+impl TraceIdentity {
+    /// The identity for engine-level calls with no agent loop (memory
+    /// maintenance): system actor, no ids, no labels.
+    pub fn system() -> Self {
+        Self {
+            actor_kind: TraceActorKind::System,
+            agent_id: String::new(),
+            session_id: String::new(),
+            agent_name: String::new(),
+            worker_id: None,
+            plan_id: None,
+            plan_step: None,
+        }
+    }
+
+    /// Fill the runtime-allocated agent/session ids (the spawn path) —
+    /// the headless SessionId is the allocated AgentId today, but it stays
+    /// a separate concept on the wire.
+    pub fn with_runtime_ids(mut self, agent_id: &str, session_id: &str) -> Self {
+        self.agent_id = agent_id.to_string();
+        self.session_id = session_id.to_string();
+        self
+    }
+
+    /// The subagent inheritance: this identity's worker/plan labels with
+    /// the subagent actor kind, the subagent's own allocated ids, and the
+    /// subagent's OWN spawn name (design §2: the display name is the
+    /// session's, never the parent's).
+    pub fn as_subagent(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        agent_name: &str,
+    ) -> Self {
+        Self {
+            actor_kind: TraceActorKind::Subagent,
+            agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_name: agent_name.to_string(),
+            worker_id: self.worker_id.clone(),
+            plan_id: self.plan_id.clone(),
+            plan_step: self.plan_step,
+        }
+    }
+
+    /// Stamp the full attribution for one call from this identity.
+    pub fn attribution(&self, turn_id: Option<&str>, purpose: TracePurpose) -> TraceAttribution {
+        TraceAttribution {
+            actor_kind: self.actor_kind,
+            agent_id: self.agent_id.clone(),
+            session_id: self.session_id.clone(),
+            agent_name: self.agent_name.clone(),
+            worker_id: self.worker_id.clone(),
+            plan_id: self.plan_id.clone(),
+            plan_step: self.plan_step,
+            turn_id: turn_id.map(|s| s.to_string()),
+            purpose,
+        }
+    }
+}
+
+/// Request-scoped context threaded from the call site into the trace
+/// record — the explicit, per-request attribution carrier (never a
+/// mutable "current label" on a shared provider, never a task-local).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LlmRequestContext {
+    /// The attribution stamped at creation; `None` = unattributed (the
+    /// legacy `complete` path).
+    pub attribution: Option<TraceAttribution>,
+}
+
+impl LlmRequestContext {
+    /// The empty context — the legacy `LlmClient::complete` path: records
+    /// stay unattributed.
+    pub fn unattributed() -> Self {
+        Self::default()
+    }
+
+    /// A context carrying attribution.
+    pub fn attributed(attribution: TraceAttribution) -> Self {
+        Self {
+            attribution: Some(attribution),
+        }
+    }
+
+    /// A context for engine-level calls with no agent loop (memory
+    /// maintenance): the system actor, no ids, just the purpose.
+    pub fn system(purpose: TracePurpose) -> Self {
+        Self::attributed(TraceIdentity::system().attribution(None, purpose))
+    }
+
+    /// The same attribution with a replaced purpose — auxiliary call
+    /// sites (compaction, consolidation) share the loop's identity and
+    /// swap only this field.
+    pub fn with_purpose(&self, purpose: TracePurpose) -> Self {
+        let mut ctx = self.clone();
+        if let Some(a) = ctx.attribution.as_mut() {
+            a.purpose = purpose;
+        }
+        ctx
+    }
+}
+
+/// A per-loop shared slot holding that loop's [`TraceIdentity`] — minted
+/// by the factory per build and shared between the loop and the tools it
+/// wires (the `dismissed_recall` pattern), so a tool can stamp its own
+/// LLM calls with the calling agent's identity at call time. Empty (all
+/// calls unattributed) until the spawn path stamps it post-build; a loop
+/// built without a host identity keeps it empty forever (Mnemo1).
+#[derive(Debug, Default)]
+pub struct TraceIdentityHandle {
+    identity: std::sync::RwLock<Option<TraceIdentity>>,
+}
+
+impl TraceIdentityHandle {
+    /// A fresh empty handle (unattributed).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stamp the identity (the spawn path, post-build, pre-registration).
+    pub fn set(&self, identity: TraceIdentity) {
+        *self
+            .identity
+            .write()
+            .expect("trace identity lock poisoned") = Some(identity);
+    }
+
+    /// Snapshot the identity (`None` = unattributed loop).
+    pub fn get(&self) -> Option<TraceIdentity> {
+        self.identity
+            .read()
+            .expect("trace identity lock poisoned")
+            .clone()
+    }
+
+    /// Build the request context for a model call made by this loop's
+    /// agent: identity + turn id + purpose. Unattributed when empty.
+    pub fn context(&self, turn_id: Option<&str>, purpose: TracePurpose) -> LlmRequestContext {
+        match self.get() {
+            Some(identity) => {
+                LlmRequestContext::attributed(identity.attribution(turn_id, purpose))
+            }
+            None => LlmRequestContext::unattributed(),
+        }
+    }
+}
+
 /// Per-call cap for a delivered tool-call's raw arguments string (the
 /// generation-vs-harness discrimination tap, backlog e8b39d72 H1).
 const MAX_RAW_TOOL_CALL_BYTES: usize = 4096;
@@ -154,7 +393,7 @@ const MAX_RAW_TOOL_CALLS: usize = 32;
 /// generation-vs-harness discrimination tap — comparing these against the
 /// executed/normalized args separates model-emission decay from
 /// harness-layer mutation).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawToolCallRecord {
     /// The tool-call id assigned by the model.
     pub id: String,
@@ -169,7 +408,7 @@ pub struct RawToolCallRecord {
 
 /// One recorded request/response pair. Serialized verbatim as the "detail"
 /// wire type (see [`LlmRequestDetail`]).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequestRecord {
     /// Monotonic id — ids increase with request order (the id space is global
     /// across all agents/providers, so `id - 1` is the previous request
@@ -286,6 +525,12 @@ pub struct LlmRequestRecord {
     /// distinguishes a guard-cut turn from a clean empty completion.
     /// Budget-exempt like `raw_tool_calls`: incident evidence.
     pub guard_cut: Option<GuardCutDetails>,
+    /// The run (process) id this record belongs to — request ids restart
+    /// with the process, so the durable key is `run_id:id`.
+    pub run_id: String,
+    /// Attribution stamped at creation (who made this call and why);
+    /// `None` for unattributed/legacy callers.
+    pub attribution: Option<TraceAttribution>,
 }
 
 /// Details of a client-side stream-guard termination (the boundary-cut
@@ -294,7 +539,7 @@ pub struct LlmRequestRecord {
 /// early. Lets the Trace tab and `traces.jsonl` distinguish guard cuts
 /// from natural stops and empty completions — the discriminator behind
 /// the 2026-12-31 empty-output stall diagnosis.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GuardCutDetails {
     /// The stop sequence that matched (a configured stop or a model-family
     /// boundary tag).
@@ -323,7 +568,7 @@ pub type LlmRequestDetail = LlmRequestRecord;
 /// The lightweight list-row wire type: everything the trace list needs to
 /// render one row, without the request/response JSON payloads (which can be
 /// hundreds of KB each and are fetched on demand via `get`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequestSummary {
     /// Monotonic id — ids increase with request order.
     pub id: u64,
@@ -392,6 +637,12 @@ pub struct LlmRequestSummary {
     /// The client-side stream-guard cut, when one fired (see
     /// [`LlmRequestRecord::guard_cut`]) — lets list rows badge cut turns.
     pub guard_cut: Option<GuardCutDetails>,
+    /// The run (process) id this record belongs to — request ids restart
+    /// with the process, so the durable key is `run_id:id`.
+    pub run_id: String,
+    /// Attribution stamped at creation (who made this call and why);
+    /// `None` for unattributed/legacy callers.
+    pub attribution: Option<TraceAttribution>,
 }
 
 impl From<&LlmRequestRecord> for LlmRequestSummary {
@@ -421,6 +672,8 @@ impl From<&LlmRequestRecord> for LlmRequestSummary {
             response_truncated: r.response_truncated,
             response_evicted: r.response_evicted,
             guard_cut: r.guard_cut.clone(),
+            run_id: r.run_id.clone(),
+            attribution: r.attribution.clone(),
         }
     }
 }
@@ -432,6 +685,13 @@ impl From<&LlmRequestRecord> for LlmRequestSummary {
 struct Shared {
     records: Mutex<VecDeque<LlmRequestRecord>>,
     next_id: AtomicU64,
+    /// The run (process) id stamped on every record: request ids restart
+    /// with the process, so the durable key is `run_id:id`. Generated once
+    /// per log (per app run).
+    run_id: String,
+    /// The record ring's capacity — new records past this evict the
+    /// oldest. Default [`MAX_RECORDS`]; Mnemo2 raises it to 128 via
+    /// [`LlmRequestLog::set_ring_capacity`].
     /// Where records are mirrored on disk when file logging is on. The path is
     /// always set at startup (`<coding_dir>/logs/traces.jsonl`); writes are
     /// gated on `log_enabled` so the Trace tab's "Log to file" checkbox can
@@ -480,6 +740,28 @@ struct Shared {
     /// Rotation threshold for `history_log_path` (default
     /// [`HISTORY_ROTATE_BYTES`]; overridable via `set_history_rotate_bytes`).
     history_rotate_bytes: AtomicU64,
+    /// The record ring's current capacity (default [`MAX_RECORDS`]; see
+    /// [`LlmRequestLog::set_ring_capacity`] — loaded on every insert,
+    /// evict-on-shrink handled there).
+    capacity: AtomicUsize,
+}
+
+/// Mint the run (process) id stamped on every record: request ids restart
+/// with the process, so the durable key is `run_id:id`. `<unix-millis>-
+/// <pid>-<seq>` — the sequence counter makes two logs created in the same
+/// process within the same millisecond (tests, a second engine) still get
+/// distinct run ids, so their records can never collide on the key.
+fn next_run_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "r{}-{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 impl Shared {
@@ -488,6 +770,8 @@ impl Shared {
         Self {
             records: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
+            run_id: next_run_id(),
+            capacity: AtomicUsize::new(MAX_RECORDS),
             log_path: Mutex::new(None),
             log_enabled: AtomicBool::new(false),
             error_log_path: Mutex::new(None),
@@ -569,17 +853,41 @@ impl LlmRequestLog {
         tx
     }
 
-    /// Begin a new record for a request about to be POSTed. Returns the
-    /// record id; every later update method takes this id. Evicts the oldest
-    /// record when the ring is full, caps the request body to the configured
-    /// per-record limit (structure-preserving; see [`cap_request_json`]),
-    /// and enforces the global raw-response budget (oldest payloads first).
+    /// Begin a new record for a request about to be POSTed — the legacy
+    /// empty-context path: the record stays unattributed. Mnemo1's entry
+    /// point and the compatibility wrapper for external callers; the
+    /// agent loop uses [`Self::start_with_context`].
     pub fn start(
         &self,
         model: &str,
         base_url: &str,
         provider: &str,
+        request_json: serde_json::Value,
+    ) -> u64 {
+        self.start_with_context(
+            model,
+            base_url,
+            provider,
+            request_json,
+            &LlmRequestContext::unattributed(),
+        )
+    }
+
+    /// Begin a new record for a request about to be POSTed, stamped with
+    /// the call site's trace context (attribution, plan c3ba2b58 step A).
+    /// Returns the record id; every later update method takes this id.
+    /// Evicts the oldest record when the ring is full, caps the request
+    /// body to the configured per-record limit (structure-preserving; see
+    /// [`cap_request_json`]), and enforces the global raw-response budget
+    /// (oldest payloads first). The attribution lands at creation — before
+    /// any retry, streaming, or ring eviction can reorder things.
+    pub fn start_with_context(
+        &self,
+        model: &str,
+        base_url: &str,
+        provider: &str,
         mut request_json: serde_json::Value,
+        context: &LlmRequestContext,
     ) -> u64 {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let ts_ms = SystemTime::now()
@@ -619,6 +927,8 @@ impl LlmRequestLog {
             version: 0,
             raw_tool_calls: None,
             guard_cut: None,
+            run_id: self.shared.run_id.clone(),
+            attribution: context.attribution.clone(),
         };
         let mut records = self
             .shared
@@ -626,7 +936,8 @@ impl LlmRequestLog {
             .lock()
             .expect("LlmRequestLog lock poisoned");
         records.push_back(record);
-        while records.len() > MAX_RECORDS {
+        let capacity = self.shared.capacity.load(Ordering::Relaxed);
+        while records.len() > capacity {
             records.pop_front();
         }
         // Enforce the global raw-response budget: the sum of all records'
@@ -1032,6 +1343,35 @@ impl LlmRequestLog {
     /// destroy history the user may be inspecting).
     pub fn set_request_body_cap(&self, bytes: usize) {
         self.shared.request_body_cap.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Set the record ring's capacity (records kept in memory). The
+    /// default ([`MAX_RECORDS`] = 32) is Mnemo1's; Mnemo2 raises it to 128
+    /// at startup (plan c3ba2b58 step B). Shrinking below the current
+    /// length evicts the oldest records immediately so the bound holds
+    /// without waiting for the next insert; 0 keeps nothing (a degenerate
+    /// but honest setting).
+    pub fn set_ring_capacity(&self, capacity: usize) {
+        self.shared.capacity.store(capacity, Ordering::Relaxed);
+        let mut records = self
+            .shared
+            .records
+            .lock()
+            .expect("LlmRequestLog lock poisoned");
+        while records.len() > capacity {
+            records.pop_front();
+        }
+    }
+
+    /// The record ring's current capacity (see [`Self::set_ring_capacity`]).
+    pub fn ring_capacity(&self) -> usize {
+        self.shared.capacity.load(Ordering::Relaxed)
+    }
+
+    /// The run (process) id stamped on every record — the `run_id` half of
+    /// the durable `run_id:id` key (request ids restart with the process).
+    pub fn run_id(&self) -> &str {
+        &self.shared.run_id
     }
 
     /// Append one compact JSON line per FAILED request to the always-on
@@ -2795,6 +3135,8 @@ mod tests {
             response_evicted: false,
             is_complete: true,
             version: 0,
+            run_id: "run".into(),
+            attribution: None,
         };
         write_records_to_file(&path, &[record]);
 
@@ -3442,5 +3784,253 @@ mod tests {
         assert!(!s.cancelled);
         assert!(s.is_complete);
         assert_eq!(s.http_status, Some(500));
+    }
+
+    // --- Plan c3ba2b58 step A: attribution, run ids, ring capacity ---
+
+    /// A worker [`TraceIdentity`] for the attribution tests: worker label +
+    /// plan/step labels, ids filled by the "runtime" (the test).
+    fn worker_identity(worker: &str, agent_id: &str) -> TraceIdentity {
+        TraceIdentity {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: agent_id.to_string(),
+            session_id: agent_id.to_string(),
+            agent_name: worker.to_string(),
+            worker_id: Some(worker.to_string()),
+            plan_id: Some("plan-9".to_string()),
+            plan_step: Some(2),
+        }
+    }
+
+    #[test]
+    fn start_with_context_stamps_run_id_and_attribution() {
+        // Attribution lands at creation — before any retry, streaming, or
+        // ring eviction can reorder things. The summary (the wire type Mnemo1
+        // renders and Mnemo2 lists) carries it verbatim.
+        let log = LlmRequestLog::new();
+        let identity = worker_identity("wt-alpha", "7");
+        let ctx = LlmRequestContext::attributed(
+            identity.attribution(Some("turn-42"), TracePurpose::Turn),
+        );
+        let id = log.start_with_context(
+            "m",
+            "http://u/v1/",
+            "p",
+            serde_json::json!({"messages": []}),
+            &ctx,
+        );
+        let s = &log.list()[0];
+        assert_eq!(s.id, id);
+        assert_eq!(s.run_id, log.run_id(), "the record carries the run id");
+        assert!(!s.run_id.is_empty());
+        let a = s.attribution.as_ref().expect("attribution stamped");
+        assert_eq!(a.actor_kind, TraceActorKind::Worker);
+        assert_eq!(a.agent_id, "7");
+        assert_eq!(a.session_id, "7");
+        assert_eq!(a.agent_name, "wt-alpha");
+        assert_eq!(a.worker_id.as_deref(), Some("wt-alpha"));
+        assert_eq!(a.plan_id.as_deref(), Some("plan-9"));
+        assert_eq!(a.plan_step, Some(2));
+        assert_eq!(a.turn_id.as_deref(), Some("turn-42"));
+        assert_eq!(a.purpose, TracePurpose::Turn);
+    }
+
+    #[test]
+    fn start_without_context_remains_unattributed() {
+        // The legacy `start` entry point (Mnemo1, external callers, the
+        // provider-fallback paths) must behave exactly as before: a record
+        // with a run id but NO attribution.
+        let log = LlmRequestLog::new();
+        let id = log.start("m", "http://u/v1/", "p", serde_json::json!({}));
+        let s = &log.list()[0];
+        assert_eq!(s.id, id);
+        assert_eq!(s.run_id, log.run_id());
+        assert_eq!(s.attribution, None, "legacy start() stays unattributed");
+    }
+
+    #[test]
+    fn run_ids_differ_between_logs() {
+        // Two logs in one process (tests, a second engine) must never share a
+        // run id — their records would collide on the durable `run_id:id`
+        // key. The sequence counter guarantees it even within one millisecond.
+        let a = LlmRequestLog::new();
+        let b = LlmRequestLog::new();
+        assert_ne!(a.run_id(), b.run_id());
+        let a_id = a.start_with_context(
+            "m",
+            "u",
+            "p",
+            serde_json::json!({}),
+            &LlmRequestContext::unattributed(),
+        );
+        let b_id = b.start_with_context(
+            "m",
+            "u",
+            "p",
+            serde_json::json!({}),
+            &LlmRequestContext::unattributed(),
+        );
+        assert_eq!(a_id, 1, "ids remain per-log");
+        assert_eq!(b_id, 1);
+        assert_ne!(a.list()[0].run_id, b.list()[0].run_id);
+    }
+
+    #[test]
+    fn cancelled_record_keeps_its_attribution() {
+        // A cancel stamp must never lose the attribution the request was
+        // opened with — the cancelled row still names its actor.
+        let log = LlmRequestLog::new();
+        let identity = worker_identity("wt-beta", "9");
+        let ctx = LlmRequestContext::attributed(
+            identity.attribution(Some("turn-43"), TracePurpose::Turn),
+        );
+        let id = log.start_with_context(
+            "m",
+            "http://u/v1/",
+            "p",
+            serde_json::json!({}),
+            &ctx,
+        );
+        log.cancelled(id, 200);
+        let s = &log.list()[0];
+        assert!(s.cancelled);
+        assert!(s.is_complete);
+        let a = s.attribution.as_ref().expect("attribution survives cancel");
+        assert_eq!(a.agent_name, "wt-beta");
+        assert_eq!(a.turn_id.as_deref(), Some("turn-43"));
+        assert_eq!(a.purpose, TracePurpose::Turn);
+    }
+
+    #[test]
+    fn set_ring_capacity_evicts_oldest_immediately() {
+        // Shrinking below the current length trims right away (the memory
+        // bound holds without waiting for the next insert).
+        let log = LlmRequestLog::new();
+        for i in 0..5 {
+            log.start("m", "u", "p", serde_json::json!({"i": i}));
+        }
+        assert_eq!(log.ring_capacity(), MAX_RECORDS);
+        log.set_ring_capacity(3);
+        assert_eq!(log.ring_capacity(), 3);
+        let rows = log.list();
+        assert_eq!(rows.len(), 3, "shrink evicts immediately");
+        assert_eq!(rows[0].id, 3, "the oldest two were evicted");
+        assert_eq!(rows[2].id, 5);
+    }
+
+    #[test]
+    fn ring_capacity_bounds_new_inserts() {
+        // New inserts past the configured capacity evict the oldest;
+        // the default (MAX_RECORDS = 32) is Mnemo1's unchanged ring.
+        let log = LlmRequestLog::new();
+        log.set_ring_capacity(2);
+        for i in 0..4 {
+            log.start("m", "u", "p", serde_json::json!({"i": i}));
+        }
+        let rows = log.list();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 3);
+        assert_eq!(rows[1].id, 4);
+        let fresh = LlmRequestLog::new();
+        assert_eq!(fresh.ring_capacity(), 32, "Mnemo1's default stays 32");
+    }
+
+    #[test]
+    fn trace_attribution_serializes_snake_case() {
+        // The frozen wire contract (plan c3ba2b58): actor kinds and purposes
+        // serialize as the exact snake_case strings the Mnemo2 UI matches.
+        let identity = worker_identity("wt-gamma", "11");
+        let json = serde_json::to_value(identity.attribution(Some("t-1"), TracePurpose::MemoryConsolidation))
+            .unwrap();
+        assert_eq!(json["actor_kind"], "worker");
+        assert_eq!(json["purpose"], "memory_consolidation");
+        assert_eq!(json["agent_id"], "11");
+        assert_eq!(json["session_id"], "11");
+        assert_eq!(json["agent_name"], "wt-gamma");
+        assert_eq!(json["worker_id"], "wt-gamma");
+        assert_eq!(json["plan_id"], "plan-9");
+        assert_eq!(json["plan_step"], 2);
+        assert_eq!(json["turn_id"], "t-1");
+        let lead = serde_json::to_value(
+            TraceIdentity::system().attribution(None, TracePurpose::Compaction),
+        )
+        .unwrap();
+        assert_eq!(lead["actor_kind"], "system");
+        assert_eq!(lead["purpose"], "compaction");
+        assert_eq!(lead["agent_id"], "");
+    }
+
+    #[test]
+    fn subagent_identity_inherits_worker_and_plan_labels() {
+        // A subagent keeps its parent's worker/plan identity but gets the
+        // Subagent actor kind, its own allocated ids, and its OWN spawn
+        // name — the display name is the session's (design §2), never the
+        // parent's.
+        let parent = worker_identity("wt-delta", "21");
+        let child = parent.as_subagent("22", "22", "reviewer-sub");
+        assert_eq!(child.actor_kind, TraceActorKind::Subagent);
+        assert_eq!(child.agent_id, "22");
+        assert_eq!(child.session_id, "22");
+        assert_eq!(child.worker_id.as_deref(), Some("wt-delta"));
+        assert_eq!(child.plan_id.as_deref(), Some("plan-9"));
+        assert_eq!(child.plan_step, Some(2));
+        assert_eq!(
+            child.agent_name, "reviewer-sub",
+            "the child's own spawn name — never the parent's"
+        );
+    }
+
+    #[test]
+    fn with_runtime_ids_fills_the_allocated_ids() {
+        // The spawn-path stamp: seed ids are overwritten by the allocation.
+        let seed = TraceIdentity {
+            actor_kind: TraceActorKind::Lead,
+            agent_id: String::new(),
+            session_id: String::new(),
+            agent_name: "lead".into(),
+            worker_id: None,
+            plan_id: None,
+            plan_step: None,
+        };
+        let stamped = seed.with_runtime_ids("31", "31");
+        assert_eq!(stamped.agent_id, "31");
+        assert_eq!(stamped.session_id, "31");
+        assert_eq!(stamped.actor_kind, TraceActorKind::Lead);
+    }
+
+    #[test]
+    fn with_purpose_swaps_only_the_purpose() {
+        // Auxiliary call sites (compaction, consolidation) share the loop's
+        // identity and replace only the purpose field.
+        let identity = worker_identity("wt-eps", "41");
+        let ctx = LlmRequestContext::attributed(identity.attribution(Some("t-2"), TracePurpose::Turn));
+        let swapped = ctx.with_purpose(TracePurpose::Compaction);
+        let a = swapped.attribution.expect("still attributed");
+        assert_eq!(a.purpose, TracePurpose::Compaction);
+        assert_eq!(a.agent_name, "wt-eps");
+        assert_eq!(a.turn_id.as_deref(), Some("t-2"));
+        assert_eq!(ctx.attribution.expect("source intact").purpose, TracePurpose::Turn);
+        // Swapping the purpose of an unattributed context stays unattributed.
+        assert_eq!(
+            LlmRequestContext::unattributed()
+                .with_purpose(TracePurpose::Other)
+                .attribution,
+            None
+        );
+    }
+
+    #[test]
+    fn empty_identity_handle_context_is_unattributed() {
+        // A loop built without a host identity (Mnemo1) keeps its handle
+        // empty forever — its contexts are unattributed, never mislabelled.
+        let handle = TraceIdentityHandle::new();
+        assert_eq!(handle.get(), None);
+        let ctx = handle.context(Some("t-3"), TracePurpose::Turn);
+        assert_eq!(ctx.attribution, None);
+        handle.set(worker_identity("wt-zeta", "51"));
+        let ctx = handle.context(Some("t-3"), TracePurpose::Turn);
+        let a = ctx.attribution.expect("attributed after the stamp");
+        assert_eq!(a.agent_id, "51");
+        assert_eq!(a.turn_id.as_deref(), Some("t-3"));
     }
 }

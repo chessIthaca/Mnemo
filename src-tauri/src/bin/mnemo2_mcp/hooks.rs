@@ -293,8 +293,18 @@ const DECLARATION_KEYWORDS: [&str; 14] = [
     "func", "function", "interface",
 ];
 
-/// The hint a Grep or Glob call earns: which Mnemo tool answers it better, and
-/// the call to make.
+/// Where a hinted search came from: the hint names the call it rides on, and a
+/// shell search must not be told that a Grep tool call still runs.
+#[derive(Clone, Copy)]
+enum Source {
+    /// A Grep or Glob tool call.
+    Tool,
+    /// A `grep`, `rg`, `git grep`, `findstr` or `Select-String` in a shell.
+    Shell,
+}
+
+/// The hint a search earns: which Mnemo tool answers it better, and the call to
+/// make.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Hint {
     /// A code identifier: the code graph and the content index know it.
@@ -308,23 +318,29 @@ impl Hint {
     /// The `additionalContext` text. It never says the search was wrong: the
     /// call always runs, and the hint only names the better tool and how to
     /// load it.
-    fn context(&self) -> String {
+    fn context(&self, source: Source) -> String {
+        // The search it rides on always runs; name it the way the caller made
+        // it, so a shell search is told its own command still runs.
+        let still = match source {
+            Source::Tool => "Grep still runs.",
+            Source::Shell => "The shell command still runs.",
+        };
         match self {
             Hint::Code(query) => format!(
                 "Mnemo answers this from its code graph: graph_search {{\"query\": \"{query}\"}} \
                  (load with ToolSearch select:{MCP_TOOL_PREFIX}graph_search) or \
                  search {{\"pattern\": \"{query}\"}} (select:{MCP_TOOL_PREFIX}search). \
-                 Grep still runs."
+                 {still}"
             ),
             Hint::Memory(Some(query)) => format!(
                 "Mnemo keeps this project's decisions, bugs and how-tos: memory_search \
                  {{\"query\": \"{query}\"}} (load with ToolSearch \
-                 select:{MCP_TOOL_PREFIX}memory_search). Grep still runs."
+                 select:{MCP_TOOL_PREFIX}memory_search). {still}"
             ),
             Hint::Memory(None) => format!(
                 "Mnemo keeps this project's decisions, bugs and how-tos in {KNOWLEDGE_DIR}/: \
                  memory_search (load with ToolSearch select:{MCP_TOOL_PREFIX}memory_search) \
-                 recalls them. Grep still runs."
+                 recalls them. {still}"
             ),
         }
     }
@@ -387,16 +403,11 @@ fn is_declaration_keyword(word: &str) -> bool {
     DECLARATION_KEYWORDS.contains(&word.to_ascii_lowercase().as_str())
 }
 
-/// The hint one Grep or Glob call earns, or `None` when the pattern is
-/// ordinary text, a regex, a path or a file glob — exactly what Grep and Glob
-/// are for.
-fn classify(tool_input: &Value) -> Option<Hint> {
-    let pattern = tool_input
-        .get("pattern")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let path = tool_input.get("path").and_then(Value::as_str).unwrap_or("");
+/// The hint one search earns, from the pattern it looks for and the path it
+/// searches: `None` when the pattern is ordinary text, a regex, a path or a
+/// file glob — exactly what Grep and Glob are for.
+fn classify(pattern: &str, path: &str) -> Option<Hint> {
+    let pattern = pattern.trim();
     // A typed title (`DECISION: …`) or a search inside the knowledge folder
     // asks about project history, whether the pattern or the path says so.
     if is_knowledge(pattern) || is_knowledge_path(pattern) || is_knowledge_path(path) {
@@ -423,29 +434,365 @@ fn classify(tool_input: &Value) -> Option<Hint> {
     }
 }
 
-/// The `tool_input` of a Grep or Glob call (the two tools Mnemo's search
-/// replaces); `None` for every other tool.
-fn search_input(input: &Value) -> Option<&Value> {
-    let tool = input.get("tool_name").and_then(Value::as_str)?;
-    if !matches!(tool, "Grep" | "Glob") {
-        return None;
+/// The hint one tool call earns and where the search came from; `None` for
+/// every other tool, and for a shell command that is not a confident file
+/// search.
+///
+/// Grep and Glob carry the pattern and the path in their own input. A Bash or
+/// PowerShell call is read out of its command line instead: a `grep`, `rg`,
+/// `git grep`, `findstr` or `Select-String` that searches files earns the same
+/// hint, and one that only filters another command's output stays silent.
+fn search_hint(input: &Value) -> Option<(Hint, Source)> {
+    let tool_input = input.get("tool_input").filter(|value| value.is_object())?;
+    match input.get("tool_name").and_then(Value::as_str)? {
+        "Grep" | "Glob" => {
+            let pattern = tool_input.get("pattern").and_then(Value::as_str).unwrap_or("");
+            let path = tool_input.get("path").and_then(Value::as_str).unwrap_or("");
+            classify(pattern, path).map(|hint| (hint, Source::Tool))
+        }
+        "Bash" | "PowerShell" => {
+            let command = tool_input.get("command").and_then(Value::as_str)?;
+            let (pattern, path) = shell_search(command)?;
+            classify(&pattern, path.as_deref().unwrap_or("")).map(|hint| (hint, Source::Shell))
+        }
+        _ => None,
     }
-    input.get("tool_input").filter(|value| value.is_object())
 }
 
-/// `hint --pre-search`: the PreToolUse context that points a Grep or Glob at
-/// the Mnemo tool that answers it better, when there is one.
+// ---- shell searches --------------------------------------------------------
+
+/// One command in a shell command line: its words with the quoting removed, and
+/// whether a single pipe (`|`) fed it — a command fed by a pipe is an output
+/// filter, not a file search.
+struct ShellCommand {
+    words: Vec<String>,
+    piped: bool,
+}
+
+/// Push the word built so far onto `words` and clear it. `started` marks that a
+/// word was begun, so a quoted empty word (`rg ""`) still counts.
+fn end_word(word: &mut String, words: &mut Vec<String>, started: &mut bool) {
+    if *started || !word.is_empty() {
+        words.push(std::mem::take(word));
+    }
+    *started = false;
+}
+
+/// Split a shell command line into its commands, with the quoting and the
+/// escapes taken out of the words. A command a single `|` fed is marked `piped`;
+/// `||` starts one on the failure of the last, so it is not a pipe.
+///
+/// This reads a command line, it does not understand one: whatever it cannot
+/// split confidently leaves words the caller then declines to read.
+fn shell_commands(command: &str) -> Vec<ShellCommand> {
+    let mut commands = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut piped = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                started = true;
+                for inner in chars.by_ref() {
+                    if inner == c {
+                        break;
+                    }
+                    word.push(inner);
+                }
+            }
+            // A backslash only escapes whitespace, quotes and itself, so a
+            // Windows path keeps its separators (`src\*.rs`).
+            '\\' => {
+                started = true;
+                match chars.peek() {
+                    Some(next) if next.is_whitespace() || matches!(next, '\'' | '"' | '\\') => {
+                        word.push(*next);
+                        chars.next();
+                    }
+                    _ => word.push('\\'),
+                }
+            }
+            c if c.is_whitespace() => end_word(&mut word, &mut words, &mut started),
+            '|' => {
+                end_word(&mut word, &mut words, &mut started);
+                let single = chars.peek() != Some(&'|');
+                if !single {
+                    chars.next();
+                }
+                commands.push(ShellCommand { words: std::mem::take(&mut words), piped });
+                piped = single;
+            }
+            ';' | '\n' | '&' => {
+                end_word(&mut word, &mut words, &mut started);
+                if c == '&' && chars.peek() == Some(&'&') {
+                    chars.next();
+                }
+                commands.push(ShellCommand { words: std::mem::take(&mut words), piped });
+                piped = false;
+            }
+            other => {
+                started = true;
+                word.push(other);
+            }
+        }
+    }
+    end_word(&mut word, &mut words, &mut started);
+    if !words.is_empty() {
+        commands.push(ShellCommand { words, piped });
+    }
+    commands
+}
+
+/// The search a shell command line makes, when it makes a confident file
+/// search: the pattern it looks for and, when given, the path it searches.
+/// Anything else — an output filter, a command this parser cannot read — is
+/// `None`, so the hint stays silent rather than guessing.
+fn shell_search(command: &str) -> Option<(String, Option<String>)> {
+    shell_commands(command)
+        .into_iter()
+        .filter(|command| !command.piped)
+        .find_map(|command| command_search(&command.words))
+}
+
+/// The search one shell command runs, when it is a `grep`, `rg`, `git grep`,
+/// `findstr` or `Select-String` that reads files.
+fn command_search(words: &[String]) -> Option<(String, Option<String>)> {
+    let (name, args) = words.split_first()?;
+    match command_name(name).as_str() {
+        "grep" | "egrep" | "fgrep" => grep_search(args, GrepKind::Grep),
+        "rg" => grep_search(args, GrepKind::Ripgrep),
+        "findstr" => findstr_search(args),
+        "select-string" | "sls" => select_string_search(args),
+        "git" => match args.split_first() {
+            Some((sub, rest)) if command_name(sub) == "grep" => {
+                grep_search(rest, GrepKind::GitGrep)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The command a word names: its base name in lower case, without a Windows
+/// `.exe` suffix, so `/usr/bin/grep` and `grep.exe` both read as `grep`.
+fn command_name(word: &str) -> String {
+    let base = word.rsplit(['/', '\\']).next().unwrap_or(word).to_ascii_lowercase();
+    base.strip_suffix(".exe").unwrap_or(base.as_str()).to_string()
+}
+
+/// Which grep flavour a command runs: they differ in when they search files
+/// rather than the text piped into them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrepKind {
+    /// `grep` reads stdin unless it recurses or is given a file.
+    Grep,
+    /// `rg` searches files by default.
+    Ripgrep,
+    /// `git grep` always searches the working tree or the index.
+    GitGrep,
+}
+
+/// The grep options that take the next word as their value, so that value is
+/// never mistaken for the pattern (`-g X`, `-t rust`, `-A 3`).
+const GREP_VALUE_FLAGS: [&str; 26] = [
+    "-m",
+    "-A",
+    "-B",
+    "-C",
+    "-d",
+    "-g",
+    "-t",
+    "-T",
+    "-j",
+    "-M",
+    "--max-count",
+    "--after-context",
+    "--before-context",
+    "--context",
+    "--include",
+    "--exclude",
+    "--exclude-dir",
+    "--glob",
+    "--type",
+    "--type-not",
+    "--max-depth",
+    "--threads",
+    "--color",
+    "--colour",
+    "--colors",
+    "--encoding",
+];
+
+/// The grep options that put the pattern somewhere else (`-e PATTERN`,
+/// `-f FILE`), so the words after them cannot be read as the pattern.
+const GREP_PATTERN_FLAGS: [&str; 4] = ["-e", "-f", "--regexp", "--file"];
+
+/// True when a short grep flag bundles `-r` or `-R` (`-rn`, `-rni`). Long
+/// options are checked by name, because `--regexp` has an `r` too.
+fn is_recursive_short_flag(arg: &str) -> bool {
+    !arg.starts_with("--") && arg.chars().skip(1).any(|c| matches!(c, 'r' | 'R'))
+}
+
+/// The search one grep command runs: its pattern and, when given, its first
+/// path. `None` when the pattern cannot be read confidently, or when grep
+/// reads stdin rather than files.
+fn grep_search(args: &[String], kind: GrepKind) -> Option<(String, Option<String>)> {
+    let mut pattern: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut recursive = false;
+    let mut options_done = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        index += 1;
+        if !options_done && arg == "--" {
+            options_done = true;
+            continue;
+        }
+        if !options_done && arg.starts_with('-') && arg.len() > 1 {
+            let name = arg.split('=').next().unwrap_or(arg);
+            // `-r` replaces in rg but recurses in grep, and `-e`/`-f` move the
+            // pattern out of reach: none of that can be read confidently.
+            if GREP_PATTERN_FLAGS.contains(&name)
+                || (kind == GrepKind::Ripgrep && (arg == "-r" || arg.starts_with("--replace")))
+            {
+                return None;
+            }
+            recursive |= arg.starts_with("--recursive")
+                || arg.starts_with("--dereference-recursive")
+                || is_recursive_short_flag(arg);
+            let lower = name.to_ascii_lowercase();
+            if !arg.contains('=') && GREP_VALUE_FLAGS.contains(&lower.as_str()) {
+                index += 1; // the flag's value is not the pattern
+            }
+            continue;
+        }
+        if pattern.is_none() {
+            pattern = Some(arg.clone());
+        } else {
+            paths.push(arg.clone());
+        }
+    }
+    // grep reads what is piped into it unless it recurses or is given a file;
+    // rg and git grep search files on their own.
+    let searches_files = kind != GrepKind::Grep || recursive || !paths.is_empty();
+    if !searches_files {
+        return None;
+    }
+    Some((pattern?, paths.first().cloned()))
+}
+
+/// The `findstr` search: it reads stdin unless it is given files, and its
+/// `/C`, `/F` and `/G` switches keep the pattern or the file list inside the
+/// switch.
+fn findstr_search(args: &[String]) -> Option<(String, Option<String>)> {
+    let mut pattern: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
+    for arg in args {
+        if let Some(switch) = arg.strip_prefix('/') {
+            if matches!(switch.chars().next(), Some('C' | 'F' | 'G')) {
+                return None;
+            }
+            continue;
+        }
+        if pattern.is_none() {
+            pattern = Some(arg.clone());
+        } else {
+            paths.push(arg.clone());
+        }
+    }
+    Some((pattern?, Some(paths.first()?.clone())))
+}
+
+/// The `Select-String` parameters that take the word after them.
+const SELECT_STRING_VALUE_PARAMS: [&str; 8] = [
+    "pattern",
+    "path",
+    "literalpath",
+    "include",
+    "exclude",
+    "context",
+    "encoding",
+    "inputobject",
+];
+
+/// The `Select-String` parameters that are switches of their own.
+const SELECT_STRING_SWITCHES: [&str; 7] = [
+    "casesensitive",
+    "notmatch",
+    "simplematch",
+    "allmatches",
+    "list",
+    "quiet",
+    "raw",
+];
+
+/// The `Select-String` search: it reads the pipeline unless it is given a path,
+/// so the pattern is the `-Pattern` value (or the first positional word) and
+/// the path is its `-Path` value (or the next positional word).
+fn select_string_search(args: &[String]) -> Option<(String, Option<String>)> {
+    let mut pattern: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        index += 1;
+        // A positional word: the pattern first, then the paths.
+        let Some(parameter) = arg.strip_prefix('-') else {
+            if pattern.is_none() {
+                pattern = Some(arg.clone());
+            } else {
+                paths.push(arg.clone());
+            }
+            continue;
+        };
+        // `-Pattern Foo` and `-Pattern:Foo` spell the same parameter.
+        let (name, inline) = match parameter.split_once(':') {
+            Some((name, value)) => (name.to_ascii_lowercase(), Some(value.to_string())),
+            None => (parameter.to_ascii_lowercase(), None),
+        };
+        if SELECT_STRING_SWITCHES.contains(&name.as_str()) {
+            continue;
+        }
+        if !SELECT_STRING_VALUE_PARAMS.contains(&name.as_str()) {
+            // An unknown parameter may take the next word with it, so nothing
+            // after it can be read confidently.
+            return None;
+        }
+        let value = match inline {
+            Some(value) => value,
+            None => {
+                let value = args.get(index)?.clone();
+                index += 1;
+                value
+            }
+        };
+        match name.as_str() {
+            "pattern" => pattern = Some(value),
+            "path" | "literalpath" => paths.push(value),
+            _ => {}
+        }
+    }
+    Some((pattern?, Some(paths.first()?.clone())))
+}
+
+/// `hint --pre-search`: the PreToolUse context that points a Grep, Glob or
+/// shell file search at the Mnemo tool that answers it better, when there is
+/// one.
 ///
 /// Silent outside a registered project, for ordinary text, regexes and paths,
-/// and for every other tool. It never blocks and never sets a permission
-/// decision: the search it rides on always runs.
+/// for a shell command that only filters another command's output, and for
+/// every other tool. It never blocks and never sets a permission decision: the
+/// search it rides on always runs.
 pub fn hint(env: &Env, stdin_text: &str) -> Option<String> {
     let input = parse_input(stdin_text);
-    let found = classify(search_input(&input)?)?;
+    let (found, source) = search_hint(&input)?;
     // Registration is the whole check: no `/health` probe, so a hint costs one
     // file read and never delays the search it rides on.
     registered_root(env, &hook_cwd(env, &input)).ok().flatten()?;
-    Some(hook_output("PreToolUse", &found.context()))
+    Some(hook_output("PreToolUse", &found.context(source)))
 }
 
 /// The instance `wait` should listen to: the process cwd first, then

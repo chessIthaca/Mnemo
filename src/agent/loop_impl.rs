@@ -38,6 +38,72 @@ pub(crate) type ExplicitProvider =
 pub(crate) type ServedEffective =
     std::sync::Mutex<Option<(String, Option<String>, Option<String>)>>;
 
+/// The once-per-session first-prompt routing lifecycle.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteOnce {
+    /// No classifiable first prompt has been handled yet.
+    Pending,
+    /// The first prompt was classified; later prompts may only nudge.
+    Settled {
+        /// Laya's answer, when it returned a choice.
+        label: Option<String>,
+        /// The calibrated confidence of that answer.
+        confidence: Option<f64>,
+        /// The model spec installed by an enforced route, if any.
+        model: Option<String>,
+    },
+    /// Routing is permanently off for this session incarnation.
+    Off {
+        /// `too_short`, `offline`, `resumed`, `manual`, or `ended`.
+        reason: &'static str,
+    },
+}
+
+/// All route-once lifecycle fields whose transitions must be atomic with a
+/// manual pick, Clear, or a first-classification commit. One std mutex protects
+/// the complete state; detached drift tasks clone only its `Arc` and lock for
+/// the final nudge claim, never across an await.
+#[derive(Debug)]
+pub(crate) struct RouteSessionState {
+    /// The first-prompt lifecycle.
+    pub(crate) route_once: RouteOnce,
+    /// Invalidates classification/drift answers from an earlier incarnation.
+    pub(crate) epoch: u64,
+    /// Whether the one permitted post-route suggestion has been emitted.
+    pub(crate) nudge_sent: bool,
+    /// The outstanding nudge's target, retained for `nudge_ignored`.
+    pub(crate) nudge_to_label: Option<String>,
+}
+
+impl RouteSessionState {
+    fn new() -> Self {
+        Self {
+            route_once: RouteOnce::Pending,
+            epoch: 0,
+            nudge_sent: false,
+            nudge_to_label: None,
+        }
+    }
+}
+
+/// Everything needed to publish a claimed nudge synchronously while the
+/// route-state lock is still held. Owned so a detached drift task can carry it.
+pub(crate) struct NudgeNotice {
+    /// Agent receiving the notice and owning the log row.
+    pub(crate) agent_id: crate::runtime::AgentId,
+    /// `drift`, `tool_failures`, or `repeat_failure`.
+    pub(crate) reason: &'static str,
+    /// Human-readable model suggestion.
+    pub(crate) text: String,
+    /// Session log destination, when a routing gate is attached.
+    pub(crate) log_path: Option<std::path::PathBuf>,
+    /// Bounded event channel; publication uses `try_send`, never `.await`.
+    pub(crate) fanin_tx: tokio::sync::mpsc::Sender<(
+        crate::runtime::AgentId,
+        crate::runtime::AgentEvent,
+    )>,
+}
+
 /// Per-session state extracted from [`AgentLoop`] (A2: reduce the loop's field
 /// count). Holds the memory session id + the prompt-token cache heuristic.
 /// Both are behind `Mutex` so they can be mutated through a `&AgentLoop`.
@@ -90,10 +156,12 @@ impl SessionState {
 }
 
 /// The agent loop. Drives a conversation turn.
-/// A deferred provider swap: stored when the user switches to a model with a
-/// smaller context window than the current one. The turn loop completes the
-/// swap after summarizing (if needed) using the OLD provider, so the
-/// conversation fits the new (smaller) window.
+/// A deferred provider swap: stored when the user switches to a model whose
+/// context manager cannot hold the LIVE conversation (see
+/// [`AgentLoop::swap_needs_compaction`]). The turn loop completes the swap
+/// after summarizing with the OLD provider, so the conversation fits the new
+/// window. A switch whose conversation already fits swaps at once — no
+/// `PendingSwap`, no summarization.
 pub struct PendingSwap {
     /// The new provider to swap to.
     pub provider: Arc<dyn LlmClient>,
@@ -206,6 +274,22 @@ pub struct AgentLoop {
     /// own preflight/compaction is the backstop. `0` = no count recorded
     /// yet (no request has been built for this loop).
     pub(crate) live_token_count: std::sync::atomic::AtomicUsize,
+    /// The token count of the conversation its owning task last PUBLISHED —
+    /// what every compact-before-switch decision measures (see
+    /// [`swap_needs_compaction`](Self::swap_needs_compaction)). Published when
+    /// a transcript is seeded (a resume, BEFORE any request runs), before and
+    /// after every turn (the turn's final message counts), and at the top of
+    /// every request iteration — the points where a bare request-iteration
+    /// count would be `0` (a resumed session that has not issued a request)
+    /// or stale (after a turn's final message). Only the COUNT is kept: the
+    /// conversation itself is never copied into the loop.
+    pub(crate) live_message_tokens: std::sync::atomic::AtomicUsize,
+    /// The tool-schema overhead (tokens) measured for the request surface of
+    /// the last publish — the second half of the inclusive count the turn
+    /// loop's summarize trigger uses. Seeded at construction from the
+    /// registry's advertised schema block, so even a resumed session's first
+    /// switch decision is measured inclusively rather than as message-only.
+    pub(crate) live_schema_tokens: std::sync::atomic::AtomicUsize,
     pub(crate) tools: Arc<ToolRegistry>,
     /// The steering counters this loop reports to (2c.4/G4): injected by
     /// the factory via `with_steering` so every loop the same factory
@@ -285,6 +369,16 @@ pub struct AgentLoop {
     /// without wiring keeps an empty set, so recall is unfiltered.
     pub(crate) dismissed_recall:
         Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// This loop's trace identity (plan c3ba2b58 step A): who makes the
+    /// loop's model calls, so each trace record can be attributed to the
+    /// lead/worker/subagent it belongs to. The factory mints ONE handle per
+    /// built loop and hands clones to both the loop and the memory tools
+    /// (the `dismissed_recall` pattern) — the spawn path stamps it
+    /// post-build (pre-registration, before any turn can run), and a loop
+    /// built without a host identity keeps it empty forever (Mnemo1:
+    /// records stay unattributed).
+    pub(crate) trace_identity:
+        Arc<crate::provider::trace::TraceIdentityHandle>,
     /// This agent's id in the runtime (`AgentManager`), used so the agent's
     /// `spawn_agent` tool can record itself as the parent of any background
     /// agent it spawns (for the completion-notification feedback loop).
@@ -375,6 +469,10 @@ pub struct AgentLoop {
     /// not silently undo an explicit per-agent choice) — but see
     /// [`pinned_state`](Self::pinned_state) for where it yields.
     pub(crate) explicit_provider: ExplicitProvider,
+    /// Whether `explicit_provider` / `pending_swap` belongs to Laya rather
+    /// than the human picker. External provider changes clear ONLY this pin;
+    /// a human pin keeps its historical global-swap dormancy semantics.
+    routed_pin: std::sync::Mutex<bool>,
     /// The workflow state the picker pin was first SERVED in — the pin's
     /// scope. Lazily stamped by [`resolve_turn_provider`](Self::resolve_turn_provider)
     /// (the pin exists the moment the picker acts; the state is recorded at
@@ -585,6 +683,23 @@ pub struct AgentLoop {
     /// app's WorkflowPolicy for the workflow agent. Nothing consults it until
     /// 2a.3+.
     pub(crate) policy: std::sync::RwLock<Arc<dyn crate::agent::policy::AgentPolicy>>,
+    /// The session's pinned task (plan 40eef714 step 1): the spawn path's
+    /// assignment, kept verbatim in the stable head of every request's
+    /// system message for the whole session — compaction summarizes
+    /// conversation messages only, and a model switch rebuilds the head,
+    /// so the task survives both byte-for-byte. `None` = ordinary session.
+    pub(crate) pinned_task: std::sync::RwLock<Option<String>>,
+    /// Plan 2ba2168a step 1: a session opted out of the pre-prompt routing
+    /// gate at spawn — its turns are never classified and no routing.jsonl
+    /// rows are written for them (Mnemo2 routes once at dispatch instead).
+    /// `false` = the per-turn gate (Mnemo1, unchanged).
+    pub(crate) skip_turn_routing: std::sync::atomic::AtomicBool,
+    /// Mnemo1's route lifecycle, epoch, and nudge claim under ONE lock.
+    pub(crate) route_session: Arc<std::sync::Mutex<RouteSessionState>>,
+    /// Consecutive failed-or-repeated tool calls behind a stuck nudge.
+    pub(crate) strikes: std::sync::Mutex<super::route_question::Strikes>,
+    /// The previous signature, used only to choose the stuck-nudge wording.
+    pub(crate) last_route_tool_signature: std::sync::Mutex<Option<String>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -1053,6 +1168,19 @@ impl AgentLoop {
             )),
             compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
+            live_message_tokens: std::sync::atomic::AtomicUsize::new(0),
+            // Baseline schema overhead for a session that has not issued a
+            // request yet (a resumed transcript): the advertised surface of a
+            // normal working state. Each request iteration replaces it with the
+            // exact measured value.
+            live_schema_tokens: std::sync::atomic::AtomicUsize::new(
+                crate::provider::estimate_tools_tokens(
+                    &tools.schemas(
+                        &crate::provider::Capabilities::openai(),
+                        &crate::tool::ToolFilter::Executing,
+                    ),
+                ),
+            ),
             steering: Arc::new(crate::agent::steering_stats::SteeringStats::new()),
             permission: std::sync::RwLock::new(
                 crate::agent::policy::PermissionPolicy::ApproveViaApi {
@@ -1074,6 +1202,7 @@ impl AgentLoop {
             dismissed_recall: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            trace_identity: Arc::new(crate::provider::trace::TraceIdentityHandle::new()),
             agent_id: std::sync::Mutex::new(None),
             event_fanin: std::sync::Mutex::new(None),
             plan_mutations_allowed: std::sync::Mutex::new(true),
@@ -1085,6 +1214,7 @@ impl AgentLoop {
             fill_rate: 0.5,
             forced_model: std::sync::Mutex::new(None),
             explicit_provider: Arc::new(RwLock::new(None)),
+            routed_pin: std::sync::Mutex::new(false),
             pinned_state: std::sync::Mutex::new(None),
             fallback_endpoints: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_swap: Arc::new(std::sync::Mutex::new(None)),
@@ -1117,6 +1247,17 @@ impl AgentLoop {
             policy: std::sync::RwLock::new(Arc::new(
                 crate::agent::policy::NoPolicy::with_coding_default(),
             )),
+            // Plan 40eef714 step 1: unset until the spawn path stamps the
+            // session's task (`set_pinned_task`) — every constructor starts
+            // pinned-free.
+            pinned_task: std::sync::RwLock::new(None),
+            // Plan 2ba2168a step 1: false until the spawn path opts the
+            // session out (`set_skip_turn_routing`) — every constructor
+            // starts with the per-turn gate in force.
+            skip_turn_routing: std::sync::atomic::AtomicBool::new(false),
+            route_session: Arc::new(std::sync::Mutex::new(RouteSessionState::new())),
+            strikes: std::sync::Mutex::new(super::route_question::Strikes::new(3)),
+            last_route_tool_signature: std::sync::Mutex::new(None),
         }
     }
 
@@ -1132,6 +1273,85 @@ impl AgentLoop {
     ) -> Self {
         self.dismissed_recall = dismissed;
         self
+    }
+
+    /// Wire the per-loop trace identity handle (plan c3ba2b58 step A): the
+    /// factory mints ONE handle per built loop and shares it with the
+    /// memory tools registered for the same loop, so a tool can stamp its
+    /// own LLM calls with the calling agent's identity. Directly-built
+    /// loops keep the fresh empty handle from `from_config` (unattributed).
+    pub fn with_trace_identity(
+        mut self,
+        identity: Arc<crate::provider::trace::TraceIdentityHandle>,
+    ) -> Self {
+        self.trace_identity = identity;
+        self
+    }
+
+    /// Stamp the loop's trace identity — called ONCE by the spawn path
+    /// post-build (pre-registration, before any turn can run, so no
+    /// request can race the stamp) with the spawn options' identity (or
+    /// the parent's, for a subagent) and the runtime-allocated agent and
+    /// session ids filled in. The identity is snapshotted per request
+    /// from the handle, never read back from live state.
+    pub fn set_trace_identity(&self, identity: crate::provider::trace::TraceIdentity) {
+        self.trace_identity.set(identity);
+    }
+
+    /// Snapshot the loop's trace identity (`None` = unattributed loop —
+    /// Mnemo1 paths, or a spawn without host identity).
+    pub fn trace_identity(&self) -> Option<crate::provider::trace::TraceIdentity> {
+        self.trace_identity.get()
+    }
+
+    /// Stamp the session's pinned task (plan 40eef714 step 1) — called
+    /// ONCE by the spawn path post-build (pre-registration, before any
+    /// turn can run, so no request can race the stamp). A whitespace-only
+    /// task is stored as `None` (unset); otherwise the text is stored with
+    /// trailing whitespace trimmed, and the stable-head builder renders
+    /// it verbatim under `## Your task (pinned)` on every request.
+    pub fn set_pinned_task(&self, task: Option<String>) {
+        let task = task.filter(|t| !t.trim().is_empty());
+        *self.pinned_task.write().expect("pinned task lock poisoned") =
+            task.map(|t| t.trim_end().to_string());
+    }
+
+    /// The session's pinned task (`None` = ordinary session — Mnemo1, or a
+    /// spawn without a task).
+    pub fn pinned_task(&self) -> Option<String> {
+        self.pinned_task
+            .read()
+            .expect("pinned task lock poisoned")
+            .clone()
+    }
+
+    /// Stamp the loop's per-turn-routing skip (plan 2ba2168a step 1) —
+    /// called ONCE by the spawn path post-build (pre-registration, before
+    /// any turn can run, so no request can race the stamp). `true` marks a
+    /// session that routes once at dispatch (Mnemo2 workers and leads);
+    /// `false` keeps the per-turn gate (Mnemo1).
+    pub fn set_skip_turn_routing(&self, skip: bool) {
+        self.skip_turn_routing
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this session's turns skip the pre-prompt routing gate
+    /// (`false` = the per-turn gate Mnemo1 runs).
+    pub fn skip_turn_routing(&self) -> bool {
+        self.skip_turn_routing
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Build the request-scoped trace context for a model call made by
+    /// this loop's agent: identity + turn id + purpose, stamped at the
+    /// call site (the turn request, compaction, consolidation...).
+    /// Unattributed when no identity was stamped.
+    pub fn llm_request_context(
+        &self,
+        turn_id: Option<&str>,
+        purpose: crate::provider::trace::TracePurpose,
+    ) -> crate::provider::trace::LlmRequestContext {
+        self.trace_identity.context(turn_id, purpose)
     }
 
     /// Attach the project's plans dir so consolidation can digest the
@@ -1213,6 +1433,288 @@ impl AgentLoop {
     pub fn with_routing_gate(mut self, gate: model_routing::RoutingGate) -> Self {
         self.routing = Some(gate);
         self
+    }
+
+    /// Return a snapshot of this session's first-prompt routing state.
+    pub fn route_once(&self) -> RouteOnce {
+        self.route_once_with_epoch().0
+    }
+
+    /// Snapshot the lifecycle and its epoch from the same critical section.
+    pub(crate) fn route_once_with_epoch(&self) -> (RouteOnce, u64) {
+        let state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        (state.route_once.clone(), state.epoch)
+    }
+
+    /// Whether the live `[general.laya] routing` opt-in currently exposes a
+    /// first-prompt policy FOR THIS LOOP. Subagents and sessions that opted out
+    /// of turn routing (Mnemo2 leads/workers route at dispatch) must not write
+    /// Mnemo1 session rows from an external model change.
+    pub fn session_routing_enabled(&self) -> bool {
+        !self.is_subagent()
+            && !self.skip_turn_routing()
+            && self
+                .model_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.routing_policy())
+                .is_some()
+    }
+
+    /// Transition to manual in one critical section. With `only_if_active`, an
+    /// already Off/ended session is left untouched and returns `None`, which
+    /// prevents duplicate reroutes when two external surfaces race.
+    fn transition_to_manual_inner(
+        &self,
+        only_if_active: bool,
+    ) -> Option<(Option<String>, bool)> {
+        let (previous, nudged) = {
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            if only_if_active
+                && !matches!(
+                    state.route_once,
+                    RouteOnce::Pending | RouteOnce::Settled { .. }
+                )
+            {
+                return None;
+            }
+            let previous = match &state.route_once {
+                RouteOnce::Settled { model, .. } => model.clone(),
+                _ => None,
+            };
+            let nudged = state.nudge_sent;
+            state.route_once = RouteOnce::Off { reason: "manual" };
+            state.epoch = state.epoch.wrapping_add(1);
+            state.nudge_sent = false;
+            state.nudge_to_label = None;
+            (previous, nudged)
+        };
+        self.strikes.lock().expect("route strikes lock poisoned").reset();
+        *self
+            .last_route_tool_signature
+            .lock()
+            .expect("last tool signature lock poisoned") = None;
+        Some((previous, nudged))
+    }
+
+    fn transition_to_manual(&self) -> (Option<String>, bool) {
+        self.transition_to_manual_inner(false)
+            .unwrap_or((None, false))
+    }
+
+    /// Record a human model pick without appending a reroute row. Used by the
+    /// race tests and by callers that only need the previous routed model.
+    pub fn note_manual_model_choice(&self, _to: &str) -> Option<String> {
+        self.transition_to_manual().0
+    }
+
+    /// Mark a human pick and append its reroute row through the SAME kernel
+    /// path used by IPC and tests. Routing-off or already-final picks remain
+    /// byte-identical. Returns `(previously routed model, nudge outstanding)`.
+    pub fn record_manual_model_choice(&self, to: &str) -> (Option<String>, bool) {
+        if !self.session_routing_enabled() {
+            return (None, false);
+        }
+        let Some((from, nudged)) = self.transition_to_manual_inner(true) else {
+            return (None, false);
+        };
+        self.append_session_routing_row(&model_routing::SessionRoutingRow::Reroute {
+            ts: model_routing::now_millis(),
+            agent_id: self.agent_id().unwrap_or(0).to_string(),
+            from: from.clone(),
+            to: to.to_string(),
+            nudged,
+        });
+        (from, nudged)
+    }
+
+
+    /// Whether a routing nudge is currently awaiting a human response.
+    pub fn routing_nudged(&self) -> bool {
+        self.route_session
+            .lock()
+            .expect("route-session lock poisoned")
+            .nudge_sent
+    }
+
+    /// Append one route-once event to this loop's redirected session log.
+    /// Logging is best-effort and never changes the model pick.
+    pub fn append_session_routing_row(&self, row: &model_routing::SessionRoutingRow) {
+        if let Some(gate) = &self.routing {
+            model_routing::append_row(gate.session_log_path(), row);
+        }
+    }
+
+    /// Atomically return any outstanding nudge and restore the initial route
+    /// state. A drift claim either wins first and is returned for logging, or
+    /// loses to the epoch/Pending transition and can never be lost between two
+    /// separate locks.
+    pub(crate) fn clear_route_session(&self) -> Option<String> {
+        let outstanding = {
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            let outstanding = if state.nudge_sent {
+                state.nudge_to_label.take()
+            } else {
+                state.nudge_to_label = None;
+                None
+            };
+            state.route_once = RouteOnce::Pending;
+            state.epoch = state.epoch.wrapping_add(1);
+            state.nudge_sent = false;
+            outstanding
+        };
+        self.strikes.lock().expect("route strikes lock poisoned").reset();
+        *self
+            .last_route_tool_signature
+            .lock()
+            .expect("last tool signature lock poisoned") = None;
+        outstanding
+    }
+
+    /// Atomically invalidate all in-flight drift work and return any nudge
+    /// still outstanding at session termination. Off prevents a new claim;
+    /// the epoch bump rejects a task that snapshotted the old Settled state.
+    pub(crate) fn end_route_session(&self) -> Option<String> {
+        let mut state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        let outstanding = if state.nudge_sent {
+            state.nudge_to_label.take()
+        } else {
+            state.nudge_to_label = None;
+            None
+        };
+        state.route_once = RouteOnce::Off { reason: "ended" };
+        state.epoch = state.epoch.wrapping_add(1);
+        state.nudge_sent = false;
+        outstanding
+    }
+
+    /// Mark a resumed session as ineligible for first-prompt routing.
+    pub(crate) fn mark_route_once_resumed(&self) {
+        let mut state = self
+            .route_session
+            .lock()
+            .expect("route-session lock poisoned");
+        state.route_once = RouteOnce::Off { reason: "resumed" };
+        state.epoch = state.epoch.wrapping_add(1);
+        state.nudge_sent = false;
+        state.nudge_to_label = None;
+    }
+
+    /// Validate and claim a nudge while the caller holds `route_session`.
+    fn claim_nudge_locked(
+        state: &mut RouteSessionState,
+        to_label: &str,
+        expected_epoch: Option<u64>,
+    ) -> bool {
+        if (super::route_question::tier_for_label(to_label).is_none()
+            && to_label != model_routing::RouteTarget::Escalate.label())
+            || !matches!(state.route_once, RouteOnce::Settled { .. })
+            || expected_epoch.is_some_and(|epoch| epoch != state.epoch)
+            || state.nudge_sent
+        {
+            return false;
+        }
+        state.nudge_sent = true;
+        state.nudge_to_label = Some(to_label.to_string());
+        true
+    }
+
+    /// Test-only bare claim used to race the state linearization point without
+    /// constructing a notice. Production nudges use `claim_and_publish_nudge`.
+    #[cfg(test)]
+    pub(crate) fn claim_nudge(
+        session: &Arc<std::sync::Mutex<RouteSessionState>>,
+        to_label: &str,
+        expected_epoch: Option<u64>,
+    ) -> bool {
+        let mut state = session.lock().expect("route-session lock poisoned");
+        Self::claim_nudge_locked(&mut state, to_label, expected_epoch)
+    }
+
+    /// Claim and publish a nudge without ever consuming it unobservably.
+    ///
+    /// Capacity is reserved BEFORE the critical section, so a full channel
+    /// waits instead of dropping the notice; a CLOSED channel publishes
+    /// nothing, so the nudge is left unclaimed for a later attempt. Once the
+    /// permit is held, the claim, the synchronous row append and the
+    /// infallible `Permit::send` all happen inside one critical section — no
+    /// await is ever held under the route-state lock.
+    pub(crate) async fn claim_and_publish_nudge(
+        session: &Arc<std::sync::Mutex<RouteSessionState>>,
+        to_label: &str,
+        expected_epoch: Option<u64>,
+        publication: NudgeNotice,
+    ) -> bool {
+        let NudgeNotice {
+            agent_id,
+            reason,
+            text,
+            log_path,
+            fanin_tx,
+        } = publication;
+        // Reserve capacity OUTSIDE the lock. A full channel therefore WAITS
+        // instead of silencing the one nudge the session may ever send; a
+        // CLOSED channel returns early so nothing is claimed or logged.
+        let Ok(permit) = fanin_tx.reserve().await else {
+            return false;
+        };
+        let mut state = session.lock().expect("route-session lock poisoned");
+        if !Self::claim_nudge_locked(&mut state, to_label, expected_epoch) {
+            drop(permit);
+            return false;
+        }
+        if let Some(path) = log_path {
+            model_routing::append_row(
+                &path,
+                &model_routing::SessionRoutingRow::Nudge {
+                    ts: model_routing::now_millis(),
+                    agent_id: agent_id.to_string(),
+                    reason: reason.to_string(),
+                    to_label: to_label.to_string(),
+                },
+            );
+        }
+        // The reserved permit cannot fail, so the claim just taken is always
+        // observable. `send` is synchronous: no await under the lock.
+        permit.send((
+            agent_id,
+            crate::runtime::AgentEvent::RoutingNotice {
+                kind: "nudge".to_string(),
+                text,
+            },
+        ));
+        true
+    }
+
+    /// Append the nudge returned by [`clear_route_session`](Self::clear_route_session)
+    /// or [`end_route_session`](Self::end_route_session). Those methods consume
+    /// the outstanding claim atomically, so this shared row helper is called at
+    /// most once for clear-then-end and repeated termination cleanup alike.
+    pub(crate) fn log_nudge_ignored(
+        &self,
+        agent_id: crate::runtime::AgentId,
+        outstanding: Option<String>,
+    ) {
+        if let Some(to_label) = outstanding {
+            self.append_session_routing_row(
+                &model_routing::SessionRoutingRow::NudgeIgnored {
+                    ts: model_routing::now_millis(),
+                    agent_id: agent_id.to_string(),
+                    to_label,
+                },
+            );
+        }
     }
 
     /// Attach the compound-reflex handle (the Laya classifier's compound
@@ -1750,7 +2252,9 @@ impl AgentLoop {
     ///    `[models.planning]` etc.), while in any OTHER state it holds only
     ///    until a configured `[models.*]` model takes over (2026-12-20) —
     ///    with nothing configured for the new state the pin keeps serving.
-    ///    The pin is never deleted by a swap; it goes dormant instead.
+    ///    A human pin is never deleted by a global swap; it goes dormant.
+    ///    Laya's routed pin is the exception: an external provider change
+    ///    clears it in `note_external_model_change` so the human model serves.
     /// 3. **Forced model** — when [`forced_model`](Self::forced_model) is set
     ///    (a `spawn_agent` call passed a `model` argument), it's used
     ///    directly — the subagent/state resolution chain is skipped.
@@ -2262,6 +2766,17 @@ impl AgentLoop {
             .clone()
     }
 
+    /// The live provider's `endpoint/model` spec (or its bare model for test
+    /// doubles without an endpoint name).
+    pub fn current_model_spec(&self) -> String {
+        let provider = self.provider();
+        if provider.provider_name().is_empty() {
+            provider.model().to_string()
+        } else {
+            format!("{}/{}", provider.provider_name(), provider.model())
+        }
+    }
+
     /// A handle to the context manager, for manual compaction (`/compact`).
     /// Clones the `ContextManager` (cheap — two `usize`s) so the caller can
     /// call `summarize_with_interrupt` without holding the lock. The clone
@@ -2298,8 +2813,65 @@ impl AgentLoop {
     /// [`set_explicit_provider`] for where it yields to a configured
     /// `[models.*]` slot on a workflow-state change. Plain `set_provider`
     /// remains the *default* slot swap (factory rebuilds, global console
-    /// switches) and never pins anything.
+    /// switches) and never creates a pin; it clears Laya's prior routed pin so
+    /// the external default can serve.
     pub fn set_provider(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+    ) {
+        let new_spec = Self::provider_spec(provider.as_ref());
+        let _ = self.note_external_model_change(&new_spec);
+        self.set_provider_internal(provider, context_manager);
+    }
+
+    fn provider_spec(provider: &dyn LlmClient) -> String {
+        if provider.provider_name().is_empty() {
+            provider.model().to_string()
+        } else {
+            format!("{}/{}", provider.provider_name(), provider.model())
+        }
+    }
+
+    /// External provider changes are human model choices only when routing is
+    /// active and the spec actually changes. The reroute is recorded BEFORE
+    /// the new provider is installed; every such change also clears Laya's
+    /// explicit pin so the external model can really serve.
+    fn note_external_model_change(&self, new_spec: &str) -> (Option<String>, bool) {
+        let outcome = if self.current_model_spec() != new_spec && self.session_routing_enabled() {
+            self.record_manual_model_choice(new_spec)
+        } else {
+            (None, false)
+        };
+        self.clear_routed_pin();
+        outcome
+    }
+
+    fn clear_routed_pin(&self) {
+        let routed = std::mem::take(
+            &mut *self
+                .routed_pin
+                .lock()
+                .expect("routed-pin lock poisoned"),
+        );
+        if routed {
+            *self
+                .explicit_provider
+                .write()
+                .expect("explicit_provider lock poisoned") = None;
+            *self
+                .pinned_state
+                .lock()
+                .expect("pinned_state lock poisoned") = None;
+            *self
+                .pending_swap
+                .lock()
+                .expect("pending_swap lock poisoned") = None;
+        }
+    }
+
+    /// Internal default-provider swap: never a human routing decision.
+    pub(crate) fn set_provider_internal(
         &self,
         provider: Arc<dyn LlmClient>,
         context_manager: super::context::ContextManager,
@@ -2310,10 +2882,94 @@ impl AgentLoop {
             .write()
             .expect("context_manager lock poisoned") = context_manager
             .with_compaction_raise(Arc::clone(&self.compaction_raise));
-        // A different model means a different window and a different
-        // trigger — the ladder restarts at 1.0 (it is recomputed against the
-        // new window's cap on the next failed compaction).
         self.compaction_raise.reset();
+    }
+
+
+    /// Publish the conversation's token COUNT to the loop — the measure every
+    /// compact-before-switch decision uses. The conversation itself is never
+    /// copied into the loop (it carries base64 images and this runs on every
+    /// request iteration): [`ContextManager::count_tokens`] is computed right
+    /// here, at publish time, and only the resulting number is kept.
+    ///
+    /// Called when a transcript is seeded (a resume, before the first
+    /// request), before and after every turn, and at the top of every request
+    /// iteration — the points where a request-iteration count is `0` (a resumed
+    /// session that has not issued a request) or stale (after a turn's final
+    /// message).
+    pub fn publish_message_tokens(&self, messages: &[crate::provider::Message]) {
+        self.live_message_tokens.store(
+            super::context::ContextManager::count_tokens(messages),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Publish the tool-schema overhead (tokens) measured for the current
+    /// request surface — the second half of the inclusive count the turn
+    /// loop's summarize trigger compares.
+    pub fn publish_schema_tokens(&self, tokens: usize) {
+        self.live_schema_tokens
+            .store(tokens, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// THE compact-before-switch rule, shared by all three call sites — the pin
+    /// ([`set_explicit_provider`](Self::set_explicit_provider)), the deferred
+    /// completion's summary gate in `run_turn`, and
+    /// [`AgentSession::set_model`](crate::headless::AgentSession::set_model)
+    /// (via [`swap_needs_compaction`](Self::swap_needs_compaction)) — given the
+    /// conversation's token count: do those tokens PLUS the tool-schema
+    /// overhead reach `context_manager`'s own compaction trigger?
+    ///
+    /// This is the turn loop's trigger expression
+    /// (`message_tokens + schema_tokens >= effective_limit`) applied to the
+    /// target manager, so a switch summarizes exactly when the next request on
+    /// the new model would itself summarize. `effective_limit` carries the raise
+    /// ladder; the incoming manager is freshly built (no raise installed) and
+    /// [`set_provider`](Self::set_provider) resets the ladder on every swap
+    /// anyway, so this reads exactly the trigger the new model would apply.
+    fn tokens_need_compaction(
+        &self,
+        message_tokens: usize,
+        context_manager: &super::context::ContextManager,
+    ) -> bool {
+        let schema_tokens = self
+            .live_schema_tokens
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // An EMPTY conversation has nothing to summarize: compacting first would
+        // only delay the swap and burn a summarization call that cannot reduce
+        // anything (the irreducible system/schema block is measured separately
+        // below and is not the conversation's to shrink).
+        message_tokens > 0 && message_tokens + schema_tokens >= context_manager.effective_limit()
+    }
+
+    /// [`tokens_need_compaction`](Self::tokens_need_compaction) over an explicit
+    /// conversation — the deferred completion's summary gate, which holds the
+    /// real `messages` and must count them inclusively (tool overhead too).
+    pub fn conversation_needs_compaction(
+        &self,
+        context_manager: &super::context::ContextManager,
+        messages: &[crate::provider::Message],
+    ) -> bool {
+        self.tokens_need_compaction(
+            super::context::ContextManager::count_tokens(messages),
+            context_manager,
+        )
+    }
+
+    /// [`tokens_need_compaction`](Self::tokens_need_compaction) over the count
+    /// its task last [`published`](Self::publish_message_tokens).
+    ///
+    /// A model switch compacts first ONLY when this is `true`. A new window
+    /// that is merely smaller than the old one is not, by itself, a reason to
+    /// summarize a conversation that already fits: the 2027-11-02 bug (plan
+    /// 1238e0de) summarized — and reported — a switch that needed no
+    /// summarization, which made Mnemo2 mark a healthy worker failed.
+    pub fn swap_needs_compaction(&self, context_manager: &super::context::ContextManager) -> bool {
+        self.tokens_need_compaction(
+            self.live_message_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            context_manager,
+        )
     }
 
     /// Pin an explicit provider + context manager for THIS agent — the
@@ -2334,11 +2990,16 @@ impl AgentLoop {
     /// [`set_provider`]) — an explicit per-agent choice is not silently
     /// undone.
     ///
-    /// **Deferral:** when the new provider's `max_context` is SMALLER than the
-    /// current one, the swap is deferred — stored in [`pending_swap`](Self::pending_swap)
-    /// — so the turn loop can summarize the conversation using the OLD provider
-    /// before completing the swap. This prevents a too-large conversation from
-    /// being sent to a smaller-context model (which would fail with a 400/502).
+    /// **Deferral:** when the LIVE conversation exceeds what the new
+    /// context manager allows ([`swap_needs_compaction`](Self::swap_needs_compaction)
+    /// — the turn loop's own compaction trigger measured on the new model),
+    /// the swap is deferred — stored in [`pending_swap`](Self::pending_swap)
+    /// — so the turn loop can summarize the conversation using the OLD
+    /// provider before completing the swap. This prevents a too-large
+    /// conversation from being sent to a smaller-context model (which would
+    /// fail with a 400/502). A new window that is merely smaller is NOT
+    /// enough: when the conversation fits, the swap lands immediately and
+    /// nothing is summarized (2027-11-02 bug, plan 1238e0de).
     /// The turn loop completes it via [`take_pending_swap`](Self::take_pending_swap)
     /// both at the top of `run_turn` and at the top of every loop iteration —
     /// a deferred pick made mid-run therefore lands before the next request of
@@ -2348,24 +3009,47 @@ impl AgentLoop {
         provider: Arc<dyn LlmClient>,
         context_manager: super::context::ContextManager,
     ) {
-        // A fresh pick discards the old stamp: the new pin is re-stamped
-        // with the state of its first serve (see `pinned_state`). Placed at
-        // the top so it covers both the immediate path and the deferred
-        // path — the deferred swap completes by writing `explicit_provider`
-        // directly in `run_turn` (same pick), and its first serve re-stamps.
+        let new_spec = Self::provider_spec(provider.as_ref());
+        let _ = self.note_external_model_change(&new_spec);
+        self.set_explicit_provider_internal(provider, context_manager, false);
+    }
+
+    /// Install an explicit pin without treating it as an external model pick.
+    /// `routed` distinguishes Laya's clearable pin from the human picker's.
+    fn set_explicit_provider_internal(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+        routed: bool,
+    ) {
+        *self
+            .routed_pin
+            .lock()
+            .expect("routed-pin lock poisoned") = routed;
         *self
             .pinned_state
             .lock()
             .expect("pinned_state lock poisoned") = None;
-        let current_max = self
-            .context_manager
-            .read()
-            .expect("context_manager lock poisoned")
-            .max_tokens();
-        let new_max = provider.capabilities().max_context;
-        if new_max < current_max {
-            // Smaller context — defer the swap so the turn loop can summarize
-            // using the OLD provider first.
+        if routed {
+            // First-prompt routing NEVER defers: a pending routed swap could
+            // complete after a later manual pick and reinstall Laya's model.
+            debug_assert!(
+                !self.swap_needs_compaction(&context_manager),
+                "pin_routed_provider must not be called when compaction is needed"
+            );
+            self.set_provider_internal(provider.clone(), context_manager.clone());
+            *self
+                .pending_swap
+                .lock()
+                .expect("pending_swap lock poisoned") = None;
+            *self
+                .explicit_provider
+                .write()
+                .expect("explicit_provider lock poisoned") =
+                Some((provider, context_manager));
+            return;
+        }
+        if self.swap_needs_compaction(&context_manager) {
             *self
                 .pending_swap
                 .lock()
@@ -2376,9 +3060,7 @@ impl AgentLoop {
             });
             return;
         }
-        self.set_provider(provider.clone(), context_manager.clone());
-        // Clear any stale deferred swap — a later immediate swap must not be
-        // overridden by a previously-deferred one the user superseded.
+        self.set_provider_internal(provider.clone(), context_manager.clone());
         *self
             .pending_swap
             .lock()
@@ -2389,10 +3071,22 @@ impl AgentLoop {
             .expect("explicit_provider lock poisoned") = Some((provider, context_manager));
     }
 
+    /// The ONLY provider-pin path used by Laya's first-prompt commit. It must
+    /// not count as an external manual choice or emit a reroute row.
+    pub(crate) fn pin_routed_provider(
+        &self,
+        provider: Arc<dyn LlmClient>,
+        context_manager: super::context::ContextManager,
+    ) {
+        self.set_explicit_provider_internal(provider, context_manager, true);
+    }
+
     /// Whether a deferred provider swap is pending (set by
-    /// [`set_explicit_provider`](Self::set_explicit_provider) when the new
-    /// model has a smaller context window). Checked by the IPC layer so it can
-    /// emit a user-facing note instead of `ModelChanged`.
+    /// [`set_explicit_provider`](Self::set_explicit_provider) when the live
+    /// conversation exceeds what the new model's context manager allows —
+    /// [`swap_needs_compaction`](Self::swap_needs_compaction); a smaller window
+    /// alone no longer defers). Checked by the IPC layer so it can
+    /// report the switch as pending instead of immediately serving.
     pub fn has_pending_swap(&self) -> bool {
         self.pending_swap
             .lock()

@@ -1009,6 +1009,7 @@ pub async fn get_session_list(state: State<'_, IpcState>) -> Result<serde_json::
 #[cfg(test)]
 mod tests {
     use crate::ipc::contract_fixtures::normalize_lf;
+
     /// Regression (run-all dispatches the next backlog item into the main
     /// agent during steering, 2026-08-31): `send_suggestion` must halt an
     /// active run-all BEFORE sending the steer command. Without the halt, the

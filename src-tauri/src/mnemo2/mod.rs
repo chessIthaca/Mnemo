@@ -22,11 +22,23 @@ pub mod indexing;
 /// The real worker team runtime.
 pub mod team;
 
+/// Laya's dispatch-time routing decision: the classified text, the shared
+/// gate, and the dispatch routing log's rows (design
+/// `.coding/design/mnemo2-laya-routing.md` §4.2–§4.8).
+pub mod dispatch_routing;
+
+/// The routing eval's core (corpora, threshold table, `route_eval.json`) —
+/// shared by the `mnemo2_route_eval` CLI and the Laya page's Run-eval button.
+pub mod route_eval;
+
 /// Best-effort naming of the processes holding a worker checkout's files.
 pub mod lock_holders;
 
 /// Durable per-project usage and cost accounting.
 pub mod usage;
+
+/// Mnemo2's one model-pricing rule (Cost, team telemetry, and Trace share it).
+pub mod pricing;
 
 /// The Cost tab's spend and savings insight commands.
 pub mod insights;
@@ -94,6 +106,17 @@ pub mod mcp_settings;
 /// Appearance page (plan f1bd54e5).
 pub mod appearance_settings;
 
+/// The Specs settings commands (OpenSpec schema list/resolve/add/fork,
+/// artifact templates and instructions, the project `config.yaml`, the
+/// plan preview, the specs status and the optional `openspec validate`)
+/// — the backend of the Settings dialog's Specs page (plan 3ec1abde).
+pub mod specs_settings;
+
+/// The `[window] close` behaviour: what closing the main window does
+/// (hide to the tray, quit, or today's automatic rule), its `mnemo2.toml`
+/// table and the once-per-run tray notification (plan c5b76b54).
+pub mod window_settings;
+
 /// The local endpoint for an external lead (Claude Code over MCP).
 pub mod mcp_server;
 
@@ -109,6 +132,13 @@ pub mod model_settings;
 /// records and memories, one record's Markdown with its backlinks, and the
 /// Diagnostics card (embedder status, per-tier counts, recall test).
 pub mod memory_view;
+
+/// The UI log: every popup and every uncaught frontend error, appended to
+/// `<project>/.coding/logs/mnemo2-ui.jsonl` (or the config dir's `logs/` when no
+/// project is open) so a popup that vanished before it could be read can still
+/// be looked up.
+pub mod ui_log;
+
 
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
@@ -149,8 +179,9 @@ fn workers_label(running: usize) -> String {
     format!("Workers: {running} running")
 }
 
-/// How many worker turns are running on the open project.
-async fn running_workers(app: &tauri::AppHandle) -> usize {
+/// How many worker turns are running on the open project. Also what the
+/// external lead's `/app/quit` route reports and refuses on.
+pub(crate) async fn running_workers(app: &tauri::AppHandle) -> usize {
     use tauri::Manager as _;
 
     let Some(state) = app.try_state::<ipc::Mnemo2State>() else {
@@ -298,7 +329,12 @@ fn starts_hidden(hidden: bool, tray_ok: bool) -> bool {
     hidden && tray_ok
 }
 
-fn install_shell(app: &tauri::AppHandle, hidden: bool) -> tauri::Result<()> {
+fn install_shell(
+    app: &tauri::AppHandle,
+    started_hidden: bool,
+    tray_ok: bool,
+) -> tauri::Result<()> {
+    use tauri::Manager as _;
     use tauri::{PhysicalPosition, PhysicalSize, WebviewBuilder, WebviewUrl, WindowBuilder};
 
     let window = WindowBuilder::new(app, "main")
@@ -306,7 +342,7 @@ fn install_shell(app: &tauri::AppHandle, hidden: bool) -> tauri::Result<()> {
         .inner_size(1440.0, 900.0)
         .min_inner_size(360.0, 540.0)
         .center()
-        .visible(!hidden)
+        .visible(!started_hidden)
         .build()?;
     crate::webview_udf::install_default_data_dir(app, std::process::id());
     let shell = window.add_child(
@@ -323,16 +359,61 @@ fn install_shell(app: &tauri::AppHandle, hidden: bool) -> tauri::Result<()> {
         let _ = resize_sink.set_size(size);
     });
     let hider = window.clone();
+    let closer = app.clone();
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Resized(size) => resize_worker.submit(*size),
-        // A hidden-start Mnemo2 lives in the tray: closing only hides it.
-        tauri::WindowEvent::CloseRequested { api, .. } if hidden => {
-            api.prevent_close();
-            let _ = hider.hide();
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            // Closing follows the stored `[window] close` behaviour, read
+            // live from the managed state so an Appearance save applies
+            // without a restart. The default (`auto`) keeps today's rule:
+            // a hidden-start Mnemo2 parks in the tray; a visible one
+            // closes and exits.
+            let live = closer.try_state::<window_settings::WindowBehavior>();
+            let behavior = live
+                .as_ref()
+                .map(|state| state.close_behavior())
+                .unwrap_or_default();
+            match window_settings::close_action(behavior, started_hidden, tray_ok) {
+                window_settings::CloseAction::HideToTray => {
+                    api.prevent_close();
+                    let _ = hider.hide();
+                    // Say where the window went — once per run.
+                    if live.is_some_and(|state| state.take_tray_notice()) {
+                        show_tray_notice(&closer);
+                    }
+                }
+                // Quit goes through the tray-quit path, so running
+                // workers still get their confirmation dialog.
+                window_settings::CloseAction::Quit => {
+                    api.prevent_close();
+                    request_quit(&closer);
+                }
+                window_settings::CloseAction::CloseNormally => {}
+            }
         }
         _ => {}
     });
     Ok(())
+}
+
+/// The once-per-run OS notification that explains where a closed window
+/// went. A failure is logged and ignored: the hide already happened, and
+/// the tray's Quit menu carries the same way out.
+fn show_tray_notice(app: &tauri::AppHandle) {
+    use tauri_plugin_notification::NotificationExt as _;
+
+    if let Err(error) = app
+        .notification()
+        .builder()
+        .title("Mnemo2 is still running")
+        .body(
+            "It keeps running in the tray. Use Quit in the tray menu to exit, \
+             or change this in Settings > Appearance.",
+        )
+        .show()
+    {
+        eprintln!("mnemo2: could not show the tray notice: {error}");
+    }
 }
 
 const EXIT_RUNNING: u8 = 0;
@@ -432,6 +513,8 @@ pub fn run() {
         .manage(state)
         .manage(browser::BrowserController::default())
         .setup(move |app| {
+            use tauri::Manager as _;
+
             // The tray comes first: whether it exists decides whether the
             // window may start hidden and hide on close.
             let tray_ok = match install_tray(app.handle()) {
@@ -441,7 +524,14 @@ pub fn run() {
                     false
                 }
             };
-            install_shell(app.handle(), starts_hidden(hidden, tray_ok))?;
+            // The close behaviour is read live on every close; load it once
+            // here into the managed state an Appearance save updates.
+            let config_dir = mnemo::config::resolve_config_dir(None);
+            app.manage(window_settings::WindowBehavior::new(
+                window_settings::load_close_behavior(&config_dir),
+            ));
+            let started_hidden = starts_hidden(hidden, tray_ok);
+            install_shell(app.handle(), started_hidden, tray_ok)?;
             start_endpoint(app.handle());
             Ok(())
         })
@@ -460,9 +550,27 @@ pub fn run() {
             ipc::external_open_failed,
             ipc::lead_open,
             laya_settings::laya_status,
+            laya_settings::routing_settings_status,
+            laya_settings::save_routing_settings,
+            laya_settings::routing_log_summary,
+            laya_settings::run_routing_eval,
             laya_settings::laya_setup,
             laya_settings::laya_disable,
             laya_settings::save_laya_settings,
+            laya_settings::tiers_top_control_status,
+            laya_settings::save_tiers_top_control,
+            specs_settings::specs_status,
+            specs_settings::read_capability_spec,
+            specs_settings::list_schemas,
+            specs_settings::set_active_schema,
+            specs_settings::add_schema,
+            specs_settings::fork_schema,
+            specs_settings::read_artifacts,
+            specs_settings::save_artifact,
+            specs_settings::read_config,
+            specs_settings::save_config,
+            specs_settings::plan_preview,
+            specs_settings::run_openspec_validate,
             safety_settings::safety_settings_get,
             safety_settings::save_safety_mode,
             safety_settings::save_safety_rules,
@@ -489,7 +597,9 @@ pub fn run() {
             backlog::backlog_remove,
             backlog::backlog_reorder,
             backlog::backlog_set_deferred,
+            backlog::backlog_set_done,
             backlog::backlog_clear_finished,
+            backlog::plan_this,
             ipc::settings_endpoints,
             ipc::settings_upsert_endpoint,
             ipc::settings_remove_endpoint,
@@ -538,7 +648,12 @@ pub fn run() {
             files_view::files_find,
             trace_view::trace_list,
             trace_view::trace_detail,
-            trace_view::trace_clear,
+            trace_view::trace_settings,
+            trace_view::trace_set_log_bodies,
+            trace_view::trace_clear_live,
+            trace_view::trace_delete_history,
+            trace_view::trace_export,
+            trace_view::trace_reveal_export,
             git_view::git_overview,
             git_view::git_move_main,
             browser::browser_supported,
@@ -560,6 +675,7 @@ pub fn run() {
             memory_view::memory_backlinks,
             memory_view::memory_overview,
             memory_view::memory_recall_test,
+            ui_log::ui_log,
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to build the Mnemo2 desktop host")

@@ -16,6 +16,7 @@ use std::path::Path;
 use crate::error::Result;
 use crate::memory::types::{EpisodicData, Memory, MemoryData, MemoryTier};
 use crate::memory::MemoryStoreTrait;
+use crate::provider::trace::LlmRequestContext;
 use crate::provider::{LlmClient, Message};
 
 /// How many files are read from each of the plans + reviews dirs when
@@ -109,6 +110,7 @@ pub async fn consolidate_session(
     session_id: &str,
     provider: Option<&dyn LlmClient>,
     corpus: &str,
+    llm_context: &LlmRequestContext,
 ) -> Result<String> {
     // 1. Gather this session's working-memory events.
     let working = store.list_by_tier(MemoryTier::Working).await?;
@@ -117,7 +119,15 @@ pub async fn consolidate_session(
         .filter(|m| m.source_session_ids.iter().any(|s| s == session_id))
         .collect();
 
-    consolidate_session_with_events(store, session_id, &session_events, provider, corpus).await
+    consolidate_session_with_events(
+        store,
+        session_id,
+        &session_events,
+        provider,
+        corpus,
+        llm_context,
+    )
+    .await
 }
 
 /// The consolidation core, fed a pre-filtered event list.
@@ -136,6 +146,7 @@ pub(crate) async fn consolidate_session_with_events(
     events: &[&Memory],
     provider: Option<&dyn LlmClient>,
     corpus: &str,
+    llm_context: &LlmRequestContext,
 ) -> Result<String> {
     if events.is_empty() {
         return Ok(String::new());
@@ -144,7 +155,7 @@ pub(crate) async fn consolidate_session_with_events(
 
     // 2. Generate the episodic summary (synthetic or LLM-assisted).
     let (narrative, key_decisions, files_modified, concepts) = if let Some(llm) = provider {
-        synthesize_with_llm(session_events, llm)
+        synthesize_with_llm(session_events, llm, llm_context)
             .await
             .unwrap_or_else(|_| synthesize_synthetic(session_events))
     } else {
@@ -183,13 +194,29 @@ pub(crate) async fn consolidate_session_with_events(
         // consolidation — the episodic summary is already durable), but a
         // failed distillation must not vanish silently — log it (quality
         // review LOW 6, class-closure).
-        if let Err(e) =
-            extract_semantic_facts(store, &narrative, session_id, now, corpus, llm).await
+        if let Err(e) = extract_semantic_facts(
+            store,
+            &narrative,
+            session_id,
+            now,
+            corpus,
+            llm,
+            llm_context,
+        )
+        .await
         {
             eprintln!("mnemo: semantic fact extraction failed: {e}");
         }
-        if let Err(e) =
-            extract_procedural_workflows(store, &narrative, session_id, now, corpus, llm).await
+        if let Err(e) = extract_procedural_workflows(
+            store,
+            &narrative,
+            session_id,
+            now,
+            corpus,
+            llm,
+            llm_context,
+        )
+        .await
         {
             eprintln!("mnemo: procedural workflow extraction failed: {e}");
         }
@@ -279,6 +306,7 @@ pub(crate) fn synthesize_synthetic(
 async fn synthesize_with_llm(
     events: &[&Memory],
     llm: &dyn LlmClient,
+    llm_context: &LlmRequestContext,
 ) -> Result<(String, Vec<String>, Vec<String>, Vec<String>)> {
     let events_text = events
         .iter()
@@ -312,7 +340,9 @@ async fn synthesize_with_llm(
 
     let messages = vec![Message::user_text(prompt)];
 
-    let stream = llm.complete(&messages, &[], None).await?;
+    let stream = llm
+        .complete_with_context(&messages, &[], None, llm_context)
+        .await?;
     use futures::StreamExt;
     let mut text = String::new();
     tokio::pin!(stream);
@@ -351,6 +381,7 @@ async fn extract_semantic_facts(
     now: i64,
     corpus: &str,
     llm: &dyn LlmClient,
+    llm_context: &LlmRequestContext,
 ) -> Result<()> {
     let corpus_section = if corpus.is_empty() {
         String::new()
@@ -384,7 +415,9 @@ async fn extract_semantic_facts(
         "Extract distinct, reusable facts about this project from the session summary. Return a JSON array of objects with a 'fact' field, a 'confidence' field (0-1), and optionally an 'id' field — the id of the existing fact this entry refines or corrects. Omit 'id' for genuinely new facts.\n\nSummary:\n{narrative}{corpus_section}{existing_section}"
     );
     let messages = vec![Message::user_text(prompt)];
-    let stream = llm.complete(&messages, &[], None).await?;
+    let stream = llm
+        .complete_with_context(&messages, &[], None, llm_context)
+        .await?;
     use futures::StreamExt;
     let mut text = String::new();
     tokio::pin!(stream);
@@ -467,6 +500,7 @@ async fn extract_procedural_workflows(
     now: i64,
     corpus: &str,
     llm: &dyn LlmClient,
+    llm_context: &LlmRequestContext,
 ) -> Result<()> {
     let corpus_section = if corpus.is_empty() {
         String::new()
@@ -479,7 +513,9 @@ async fn extract_procedural_workflows(
         "Identify any recurring workflow or procedure from this session summary — a named sequence of steps with a trigger condition and expected outcome. Return a JSON array of objects with fields: name, steps (array), trigger_condition, expected_outcome, frequency (integer). If none, return [].\n\nSummary:\n{narrative}{corpus_section}"
     );
     let messages = vec![Message::user_text(prompt)];
-    let stream = llm.complete(&messages, &[], None).await?;
+    let stream = llm
+        .complete_with_context(&messages, &[], None, llm_context)
+        .await?;
     use futures::StreamExt;
     let mut text = String::new();
     tokio::pin!(stream);
@@ -584,6 +620,7 @@ mod tests {
     use super::*;
     use crate::memory::embedder::HashEmbedder;
     use crate::memory::MemoryStore;
+    use crate::provider::trace::{TraceActorKind, TraceIdentity, TracePurpose};
     use crate::provider::{Capabilities, LlmEvent, ProviderKind, ToolChoice, ToolSchema};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
@@ -599,6 +636,9 @@ mod tests {
     struct MockLlm {
         responses: Arc<Mutex<std::collections::VecDeque<String>>>,
         prompts: Arc<Mutex<Vec<String>>>,
+        /// The trace contexts received via `complete_with_context` (plan
+        /// c3ba2b58 step A), in call order.
+        contexts: Arc<Mutex<Vec<LlmRequestContext>>>,
         caps: Capabilities,
     }
 
@@ -608,6 +648,7 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(responses.into())),
                 prompts: Arc::new(Mutex::new(Vec::new())),
+                contexts: Arc::new(Mutex::new(Vec::new())),
                 caps: Capabilities::openai(),
             }
         }
@@ -615,6 +656,12 @@ mod tests {
         /// The prompts received so far, in call order.
         async fn prompts(&self) -> Vec<String> {
             self.prompts.lock().await.clone()
+        }
+
+        /// The trace contexts received so far, in call order (plan
+        /// c3ba2b58 step A attribution threading).
+        async fn contexts(&self) -> Vec<LlmRequestContext> {
+            self.contexts.lock().await.clone()
         }
     }
 
@@ -648,6 +695,20 @@ mod tests {
                 },
             ];
             Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn complete_with_context(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            tool_choice: Option<ToolChoice>,
+            context: &LlmRequestContext,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            // Plan c3ba2b58 step A: record the trace context, then behave
+            // exactly like `complete` (the pipeline must thread the context
+            // through every one of its three calls).
+            self.contexts.lock().await.push(context.clone());
+            self.complete(messages, tools, tool_choice).await
         }
     }
 
@@ -733,7 +794,7 @@ mod tests {
             .to_string(),
         ]);
 
-        let id = consolidate_session(&store, "sess-llm", Some(&llm), "")
+        let id = consolidate_session(&store, "sess-llm", Some(&llm), "", &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(!id.is_empty());
@@ -774,6 +835,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consolidation_threads_attribution_to_every_llm_call() {
+        // Plan c3ba2b58 step A: all three pipeline LLM calls (synthesize,
+        // semantic extraction, procedural extraction) carry the caller's
+        // context with the memory_consolidation purpose — never
+        // unattributed, never another purpose, even though each call is a
+        // separate provider request.
+        let embedder: Arc<dyn crate::memory::embedder::Embedder> = Arc::new(HashEmbedder::new());
+        let store = MemoryStore::open_in_memory(embedder).unwrap();
+        store
+            .record_tool_event(
+                Some("sess-ctx"),
+                "file_write",
+                serde_json::json!({"path": "src/lib.rs"}),
+                "written",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "The agent wrote src/lib.rs.",
+                "key_decisions": [],
+                "files_modified": ["src/lib.rs"],
+                "concepts": ["rust"]
+            })
+            .to_string(),
+            serde_json::json!([]).to_string(),
+            serde_json::json!([]).to_string(),
+        ]);
+        let identity = TraceIdentity {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: "88".into(),
+            session_id: "88".into(),
+            agent_name: "wt-consol".into(),
+            worker_id: Some("wt-consol".into()),
+            plan_id: None,
+            plan_step: None,
+        };
+        let ctx = LlmRequestContext::attributed(
+            identity.attribution(None, TracePurpose::MemoryConsolidation),
+        );
+        let _ = consolidate_session(&store, "sess-ctx", Some(&llm), "", &ctx)
+            .await
+            .unwrap();
+
+        let contexts = llm.contexts().await;
+        assert_eq!(
+            contexts.len(),
+            3,
+            "synthesis + semantic + procedural must all report the context"
+        );
+        for c in &contexts {
+            let a = c.attribution.as_ref().expect("every call attributed");
+            assert_eq!(a.purpose, TracePurpose::MemoryConsolidation);
+            assert_eq!(a.actor_kind, TraceActorKind::Worker);
+            assert_eq!(a.agent_id, "88");
+            assert_eq!(a.worker_id.as_deref(), Some("wt-consol"));
+            assert_eq!(a.turn_id, None);
+        }
+    }
+
+    #[tokio::test]
     async fn consolidates_with_llm_falls_back_on_bad_json() {
         // If the LLM returns non-JSON for the synthesis, consolidation falls
         // back to synthetic compression (the narrative is the raw text) rather
@@ -799,7 +923,7 @@ mod tests {
             "nope".to_string(),
         ]);
 
-        let id = consolidate_session(&store, "sess-bad", Some(&llm), "")
+        let id = consolidate_session(&store, "sess-bad", Some(&llm), "", &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(!id.is_empty());
@@ -848,7 +972,7 @@ mod tests {
             .unwrap();
 
         // Consolidate without an LLM.
-        let id = consolidate_session(&store, "sess-1", None, "")
+        let id = consolidate_session(&store, "sess-1", None, "", &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(!id.is_empty());
@@ -903,7 +1027,7 @@ mod tests {
             .unwrap();
 
         // Consolidate only sess-1.
-        consolidate_session(&store, "sess-1", None, "")
+        consolidate_session(&store, "sess-1", None, "", &LlmRequestContext::unattributed())
             .await
             .unwrap();
 
@@ -927,7 +1051,7 @@ mod tests {
     async fn consolidate_empty_session_is_noop() {
         let embedder: Arc<dyn crate::memory::embedder::Embedder> = Arc::new(HashEmbedder::new());
         let store = MemoryStore::open_in_memory(embedder).unwrap();
-        let id = consolidate_session(&store, "empty", None, "")
+        let id = consolidate_session(&store, "empty", None, "", &LlmRequestContext::unattributed())
             .await
             .unwrap();
         assert!(id.is_empty());
@@ -990,7 +1114,7 @@ mod tests {
             "[]".to_string(),
         ]);
         let corpus = "=== PLAN: earlier.md ===\nGOAL: learn from plans.";
-        consolidate_session(&store, "sess-corpus", Some(&llm), corpus)
+        consolidate_session(&store, "sess-corpus", Some(&llm), corpus, &LlmRequestContext::unattributed())
             .await
             .unwrap();
 
@@ -1062,7 +1186,7 @@ mod tests {
             .to_string(),
             "[]".to_string(),
         ]);
-        consolidate_session(&store, "sess-merge", Some(&llm), "")
+        consolidate_session(&store, "sess-merge", Some(&llm), "", &LlmRequestContext::unattributed())
             .await
             .unwrap();
 
@@ -1162,7 +1286,7 @@ mod tests {
             ])
             .to_string(),
         ]);
-        consolidate_session(&store, "sess-proc", Some(&llm), "")
+        consolidate_session(&store, "sess-proc", Some(&llm), "", &LlmRequestContext::unattributed())
             .await
             .unwrap();
 
@@ -1337,9 +1461,15 @@ mod tests {
         let llm = FailingLlm {
             caps: Capabilities::openai(),
         };
-        let id = consolidate_session(&store, "sess-fail", Some(&llm), "")
-            .await
-            .unwrap();
+        let id = consolidate_session(
+            &store,
+            "sess-fail",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
         assert!(!id.is_empty(), "consolidation must succeed");
 
         // Synthetic episodic summary exists (the LLM synthesis failed →

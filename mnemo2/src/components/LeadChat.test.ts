@@ -228,7 +228,7 @@ describe("LeadChat", () => {
         arguments: '{"command":"cargo test"}',
         liveOutput: "running tests",
         result: null,
-        startedAtMs: 7000,
+        startedAtMs: 1000,
       },
       {
         id: "tool-done",
@@ -259,12 +259,15 @@ describe("LeadChat", () => {
 
     const shellSummary = screen.getByText("Running a command").closest("summary")!;
     expect(shellSummary.textContent).not.toContain("shell");
-    expect(shellSummary.textContent).toContain("0:03");
+    expect(shellSummary.textContent).toContain("0:09");
     expect(shellSummary.textContent).not.toContain("now");
-    expect(screen.getByText("Reading a file").closest("summary")?.textContent).toContain("0:04");
-    expect(screen.getByText("Writing files")).toBeTruthy();
-    expect(screen.getByText("Running")).toBeTruthy();
-    expect(screen.getByText("Completed")).toBeTruthy();
+    expect(screen.getByText("Reading README.md").closest("summary")?.textContent).toContain("0:04");
+    expect(screen.getByText("Writing README.md")).toBeTruthy();
+    // The status cell carries no status word now — the card's own label still does.
+    expect(shellSummary.querySelector(".tool-status")?.textContent?.trim()).toBe("0:09");
+    expect(screen.getByLabelText("Running a command — Running")).toBeTruthy();
+    expect(screen.getByText("Reading README.md").closest("summary")?.textContent).not.toContain("Completed");
+    expect(screen.getByLabelText("Reading README.md — Completed")).toBeTruthy();
     expect(screen.getByText("Failed")).toBeTruthy();
     expect(screen.getByText("running tests")).toBeTruthy();
     expect(screen.getByText("permission denied")).toBeTruthy();
@@ -274,13 +277,16 @@ describe("LeadChat", () => {
     const shellCard = screen.getByLabelText("Running a command — Running");
     expect(shellCard.querySelector("details")?.open).toBe(true);
     expect(await within(shellCard).findByText("shell")).toBeTruthy();
-    expect(shellCard.textContent).toContain('"command": "cargo test"');
+    // the command block is the body now; the raw JSON call sits behind the toggle
+    expect(shellCard.querySelector(".tool-command")?.textContent).toBe("cargo test");
     expect(within(shellCard).getByText("running tests")).toBeTruthy();
+    await fireEvent.click(within(shellCard).getByText("Show raw call"));
+    expect(await within(shellCard).findByText(/"command": "cargo test"/)).toBeTruthy();
 
-    await fireEvent.click(screen.getByText("Reading a file"));
+    await fireEvent.click(screen.getByText("Reading README.md"));
     expect(await screen.findByText("read_files")).toBeTruthy();
     expect(await screen.findByText("read 42 lines")).toBeTruthy();
-    await fireEvent.click(screen.getByText("Writing files"));
+    await fireEvent.click(screen.getByText("Writing README.md"));
     expect(await screen.findByText("write_file")).toBeTruthy();
   });
 
@@ -307,7 +313,7 @@ describe("LeadChat", () => {
     now.mockRestore();
   });
 
-  it("shows each batched tool's own elapsed suffix instead of cumulative queue time", () => {
+  it("keeps each batched tool's own duration in its tooltip, under the turn's clock", () => {
     const now = vi.spyOn(Date, "now").mockReturnValue(9000);
     setRuntime({ busy: true });
     setLeadEntries([
@@ -332,12 +338,17 @@ describe("LeadChat", () => {
       }),
     ]);
     render(LeadChat);
-    const finished = screen.getByText("Reading a file").closest("summary")!;
+    // One clock for the batch: both cards run from the turn's first call at 2000.
+    const finished = screen.getByText("Reading README.md").closest("summary")!;
     expect(finished.textContent).toContain("0:04");
     expect(finished.textContent).not.toContain("0:05");
+    const finishedTime = finished.querySelector<HTMLElement>(".elapsed-time")!;
+    expect(finishedTime.getAttribute("title")).toBe("Turn time 0:04 · this call 0:04");
     const running = screen.getByText("Running a command").closest("summary")!;
-    expect(running.textContent).toContain("0:03");
-    expect(running.textContent).not.toContain("0:08");
+    expect(running.textContent).toContain("0:07");
+    // The call's own 3 s (6000 → 9000), not the 8 s wait since the batch was announced.
+    const runningTime = running.querySelector<HTMLElement>(".elapsed-time")!;
+    expect(runningTime.getAttribute("title")).toBe("Turn time 0:07 · running 0:03");
     now.mockRestore();
   });
 
@@ -405,7 +416,9 @@ describe("LeadChat", () => {
     render(LeadChat);
 
     const completed = screen.getByLabelText("Using Noop — Completed");
-    expect(within(completed).getByText("Completed")).toBeTruthy();
+    // No stamps, no time — and the word survives only in the card's label.
+    expect(within(completed).queryByText("Completed")).toBeNull();
+    expect(completed.querySelector(".tool-status")?.textContent?.trim()).toBe("");
     expect(within(completed).queryByText("Result")).toBeNull();
 
     const failed = screen.getByLabelText("Using Guard — Failed");

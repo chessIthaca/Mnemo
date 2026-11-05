@@ -75,14 +75,6 @@ pub(crate) struct StatsRow {
     pub purpose: Option<String>,
 }
 
-/// Fill-rate threshold for the pre-swap summarization: summarize with the
-/// OLD provider when the conversation exceeds this fraction of the NEW
-/// (smaller) context window. Tied to the ContextManager fill-rate policy
-/// (the same concept `effective_summarize_at` applies), but tighter — a
-/// provider swap is a one-shot window shrink, and the regular trigger only
-/// re-fires on the next turn, too late for the smaller window.
-const SWAP_SUMMARIZE_FILL: f64 = 0.8;
-
 /// Keep-recent message count for the pre-swap summarization — the same
 /// keep-recent count as the regular auto-compaction path's normal tier (the
 /// preflight hard-ceiling tier uses 3).
@@ -115,17 +107,16 @@ pub(crate) const CORRECTION_SCHEMA_CAP: usize = 1536;
 /// query lookup so the correction never hijacks the recall query.
 pub(crate) const HARNESS_CORRECTION_PREFIX: &str = "[harness tool-call correction";
 
-/// The pre-prompt routing state for one `run_turn` call (backlog 091e694d):
-/// the target an enforced classification selected, plus the counters its
-/// outcome row needs.
+/// The pre-prompt routing state for one classified `run_turn` call (backlog
+/// 091e694d): the counters its outcome row needs. `target` is reserved for the
+/// legacy per-iteration arm and is always `None` for route-once.
 ///
 /// `Drop` writes the outcome row, so every exit path of `run_turn` lands it:
 /// a normal return, any of the early returns, and a `?` unwind alike. The
 /// write is best-effort (a log failure never affects a turn).
 pub(crate) struct TurnRoute {
-    /// The target an ENFORCED decision selected -- read by every iteration's
-    /// provider resolution. `None` in shadow mode, below the confidence
-    /// threshold, or for a label the question never offered.
+    /// Legacy per-iteration arm. First-prompt routing installs the picker's
+    /// state-scoped pin instead and ALWAYS leaves this `None`.
     target: Option<model_routing::RouteTarget>,
     /// Joins the decision row this turn already wrote.
     turn_id: String,
@@ -423,9 +414,17 @@ impl AgentLoop {
         // ends the turn here.
         // The pre-swap summary's rewrite marker needs no handling here: this
         // call runs before `TurnState::fresh()`, so the accounting starts
-        // empty anyway.
+        // empty anyway. `turn_id` is `None` here too — this call runs before
+        // the turn id is minted.
         let swap = self
-            .handle_pending_swap(messages, fanin_tx, agent_id, session_id, cmd_rx)
+            .handle_pending_swap(
+                messages,
+                fanin_tx,
+                agent_id,
+                session_id,
+                cmd_rx,
+                None,
+            )
             .await;
         if let Some(outcome) = swap.early {
             return Ok(outcome);
@@ -462,7 +461,7 @@ impl AgentLoop {
         // re-classifying per iteration would thrash models mid-turn. The
         // decision lives in `state.route`; each iteration's provider
         // resolution reads its target.
-        state.route = self.route_turn_start(messages, agent_id).await;
+        state.route = self.route_turn_start(messages, agent_id, fanin_tx).await;
         // The budget layer's turn identity (backlog a25a5323): minted once
         // per turn, stamped on every spend row this turn writes.
         state.spend_turn_id = Some(model_routing::new_turn_id(&agent_id.to_string()));
@@ -474,7 +473,14 @@ impl AgentLoop {
             // run, not the next turn. The turn-top call above covers swaps
             // deferred between turns. Cheap no-op when nothing is pending.
             let swap = self
-                .handle_pending_swap(messages, fanin_tx, agent_id, session_id, cmd_rx)
+                .handle_pending_swap(
+                    messages,
+                    fanin_tx,
+                    agent_id,
+                    session_id,
+                    cmd_rx,
+                    state.spend_turn_id.as_deref(),
+                )
                 .await;
             if let Some(outcome) = swap.early {
                 return Ok(outcome);
@@ -679,8 +685,15 @@ impl AgentLoop {
             // saw 0 — the value landed after the reads and each loop-back's
             // reset() zeroed it again, so the schema block never reached a
             // live emission or trigger).
-            state.token_accounting
-                .set_tools_tokens(crate::provider::estimate_tools_tokens(&tool_schemas) as u32);
+            let schema_tokens = crate::provider::estimate_tools_tokens(&tool_schemas);
+            state.token_accounting.set_tools_tokens(schema_tokens as u32);
+            // Publish the SAME inclusive measure for the
+            // compact-before-switch decision (`AgentLoop::conversation_needs_compaction`):
+            // the real conversation plus this exact schema block. A cached
+            // token count cannot serve — it is stale after the turn's final
+            // message and 0 before a resumed session's first request.
+            self.publish_schema_tokens(schema_tokens);
+            self.publish_message_tokens(messages);
 
             // Exact incremental token count + per-role breakdown in one pass
             // (see `TokenAccounting`). Summarization resets the accounting
@@ -1212,57 +1225,223 @@ impl AgentLoop {
         }
     }
 
-    /// Classify this turn's task text for pre-prompt routing (backlog
-    /// 091e694d) and return the turn's routing state.
+    /// Classify a session's first prompt, or schedule its later drift nudge
+    /// (backlog 091e694d), and return the classified turn's outcome state.
     ///
-    /// Runs ONCE per turn, before the first request is built. All gates must
+    /// Runs before the first request is built. All gates must
     /// hold: the loop carries a routing gate with a live classifier in the
     /// shared slot, the `[general.laya] routing` opt-in is on (the resolver's
     /// live policy), and the conversation has a user message to classify. The
     /// decision row is written here; the outcome row is written by the
     /// returned state's `Drop`.
     ///
-    /// `None` -- no classification, no row -- when any gate is off or the
-    /// classifier gives no usable answer. Never fails or blocks a turn: the
-    /// classifier call answers `None` on every failure path and the log write
-    /// is best-effort.
-    async fn route_turn_start(&self, messages: &[Message], agent_id: AgentId) -> Option<TurnRoute> {
-        // Never classify a spawned agent's turn: subagents, reviewers and
-        // compaction calls are not routed, and a spawned task text is not a
-        // user turn — the corpus stays user-task text. The resolver's own
-        // guard would refuse the model switch anyway; this keeps the LOG clean
-        // too (no decision/outcome rows for spawned turns).
-        if self.is_subagent() {
+    /// `None` -- no new first-prompt row -- when routing is settled/off, any
+    /// gate is off, or the classifier gives no usable answer. The classifier
+    /// call answers `None` on every failure path and the log write is
+    /// best-effort.
+    async fn route_turn_start(
+        &self,
+        messages: &[Message],
+        agent_id: AgentId,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+    ) -> Option<TurnRoute> {
+        // Spawned sessions and Mnemo2 workers/leads never enter Mnemo1's
+        // session router. In particular they write no routing.jsonl rows.
+        if self.is_subagent()
+            || self
+                .skip_turn_routing
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return None;
         }
-        let policy = self.model_resolver.as_ref()?.routing_policy()?;
-        let gate = self.routing.as_ref()?;
-        let classifier = gate.classifier()?;
-        let log_path = gate.log_path().to_path_buf();
+        let resolver = Arc::clone(self.model_resolver.as_ref()?);
+        let policy = resolver.routing_policy()?;
         let text = messages
             .iter()
             .rev()
             .find(|m| m.role == Role::User)
-            .map(|m| m.content.as_text())?;
-        let decision =
-            model_routing::classify_task_text(classifier.as_ref(), &text, policy.threshold).await?;
-        let shadow = !policy.enforce;
-        // Shadow mode never selects a target: the decision is logged, the
-        // model is untouched. Enforce mode resolves the target NOW so the
-        // decision row can name the model this turn is routed onto; the
-        // per-iteration arm re-resolves (and re-guards) with the same
-        // resolver call, so a context change mid-turn still wins.
-        let routed = match (shadow, decision.target) {
-            (false, Some(target)) => self.resolve_routed_model(target).await,
-            _ => None,
+            .map(|m| m.content.as_text())
+            .unwrap_or_default();
+
+        let (route_state, classification_epoch) = self.route_once_with_epoch();
+        match route_state {
+            super::loop_impl::RouteOnce::Off { .. } => return None,
+            super::loop_impl::RouteOnce::Settled { label, .. } => {
+                self.spawn_drift_check(
+                    text,
+                    label,
+                    policy,
+                    agent_id,
+                    fanin_tx,
+                    classification_epoch,
+                )
+                .await;
+                return None;
+            }
+            super::loop_impl::RouteOnce::Pending => {}
+        }
+
+        if text.split_whitespace().count() < 3 {
+            self.route_session
+                .lock()
+                .expect("route-session lock poisoned")
+                .route_once = super::loop_impl::RouteOnce::Off { reason: "too_short" };
+            return None;
+        }
+        let Some(gate) = self.routing.as_ref() else {
+            self.route_session
+                .lock()
+                .expect("route-session lock poisoned")
+                .route_once = super::loop_impl::RouteOnce::Off { reason: "offline" };
+            return None;
         };
-        // Memoize the MISS (review L2): a target that does not resolve at turn
-        // start is not armed at all, so a Settings save mid-turn cannot route
-        // the remaining iterations onto a model the decision row already
-        // recorded as not applying (`enforced: false, model: None`).
-        let arm_target = if routed.is_some() { decision.target } else { None };
+        let Some(classifier) = gate.classifier() else {
+            self.route_session
+                .lock()
+                .expect("route-session lock poisoned")
+                .route_once = super::loop_impl::RouteOnce::Off { reason: "offline" };
+            return None;
+        };
+        let log_path = gate.log_path().to_path_buf();
+        let session_log_path = gate.session_log_path().to_path_buf();
+        let Some(decision) = model_routing::classify_task_text(
+            classifier.as_ref(),
+            &text,
+            policy.offered,
+            policy.first_prompt_min_confidence,
+        )
+        .await
+        else {
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            if state.epoch == classification_epoch
+                && matches!(state.route_once, super::loop_impl::RouteOnce::Pending)
+            {
+                state.route_once = super::loop_impl::RouteOnce::Off { reason: "offline" };
+            }
+            return None;
+        };
+
+        let shadow = !policy.enforce;
+        let resolved = match decision.target {
+            Some(target) => self.resolve_routed_model(target).await,
+            None => None,
+        };
+        let mut enforced_model = None;
+        let mut model_changed = None;
+        let mut notice = None;
+        let mut skip = if decision.confidence < policy.first_prompt_min_confidence {
+            Some("below_gate")
+        } else if decision.target.is_none() {
+            Some("unknown_label")
+        } else {
+            None
+        };
+        let mut superseded = false;
+
+        {
+            // F1: the classifier and target-resolution awaits are over. Commit
+            // the provider pin AND Settled only if this is still the same
+            // Pending session. Both are synchronous under this one lock; the
+            // event sends happen after releasing it, so no guard crosses await.
+            let mut state = self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned");
+            if state.epoch != classification_epoch
+                || !matches!(state.route_once, super::loop_impl::RouteOnce::Pending)
+            {
+                superseded = true;
+                skip = Some("superseded");
+            } else {
+                if decision.target.is_some() {
+                    if let Some(model_ref) = resolved.clone() {
+                        if shadow {
+                            skip = Some("shadow");
+                            notice = Some(format!(
+                                "Laya would pick {} ({:.2})",
+                                model_ref.model, decision.confidence
+                            ));
+                        } else if let Some((provider, context_manager)) =
+                            resolver.build_turn_provider(&model_ref, self.fill_rate)
+                        {
+                            if self.swap_needs_compaction(&context_manager) {
+                                // First-prompt routing never defers: a pending
+                                // routed swap could reinstall Laya's model after
+                                // a later manual pick. Keep the session model.
+                                skip = Some("needs_compaction");
+                            } else {
+                                let spec =
+                                    format!("{}/{}", model_ref.endpoint, model_ref.model);
+                                let effort = resolver.display_effort_for(&model_ref);
+                                let endpoint = Some(model_ref.endpoint.clone());
+                                self.pin_routed_provider(provider, context_manager);
+                                // The route itself announces the change. Seed the
+                                // served-effective deduper so the first request
+                                // does not emit a second identical ModelChanged.
+                                self.note_served_effective(
+                                    &model_ref.model,
+                                    endpoint.as_deref(),
+                                    effort.as_deref(),
+                                );
+                                model_changed = Some(AgentEvent::ModelChanged {
+                                    model: model_ref.model.clone(),
+                                    provider: endpoint,
+                                    reasoning_effort: effort,
+                                });
+                                notice = Some(format!(
+                                    "Laya → {} ({:.2})",
+                                    model_ref.model, decision.confidence
+                                ));
+                                enforced_model = Some(spec);
+                                skip = None;
+                            }
+                        } else {
+                            skip = Some("no_target");
+                        }
+                    } else {
+                        skip = if decision.target == Some(model_routing::RouteTarget::Routine) {
+                            Some("kept")
+                        } else {
+                            Some("no_target")
+                        };
+                    }
+                }
+
+                state.route_once = super::loop_impl::RouteOnce::Settled {
+                    label: Some(decision.label.clone()),
+                    confidence: Some(decision.confidence),
+                    model: enforced_model.clone(),
+                };
+            }
+        }
+
+        if let Some(event) = model_changed {
+            let _ = fanin_tx.send((agent_id, event)).await;
+        }
+        if let Some(text) = notice {
+            let _ = fanin_tx
+                .send((
+                    agent_id,
+                    AgentEvent::RoutingNotice {
+                        kind: "routed".to_string(),
+                        text,
+                    },
+                ))
+                .await;
+        }
+
         let agent = agent_id.to_string();
         let turn_id = model_routing::new_turn_id(&agent);
+        let selected_spec = if superseded || skip == Some("needs_compaction") {
+            None
+        } else {
+            resolved
+                .as_ref()
+                .map(|m| format!("{}/{}", m.endpoint, m.model))
+        };
         model_routing::append_row(
             &log_path,
             &model_routing::RouteDecisionRow {
@@ -1272,20 +1451,34 @@ impl AgentLoop {
                 shadow,
                 label: decision.label.clone(),
                 confidence: decision.confidence,
-                threshold: policy.threshold,
+                threshold: policy.first_prompt_min_confidence,
                 target: decision.target.map(|t| t.label().to_string()),
                 lane: None,
                 step_index: None,
-                enforced: routed.is_some(),
-                model: routed
-                    .as_ref()
-                    .map(|m| format!("{}/{}", m.endpoint, m.model)),
+                enforced: enforced_model.is_some(),
+                model: selected_spec.clone(),
                 task_text: model_routing::cap_task_text(&text),
                 probabilities: decision.probabilities.clone(),
             },
         );
+        model_routing::append_row(
+            &session_log_path,
+            &model_routing::SessionRoutingRow::Route {
+                ts: model_routing::now_millis(),
+                agent_id: agent.clone(),
+                label: decision.label.clone(),
+                confidence: decision.confidence,
+                threshold: policy.first_prompt_min_confidence,
+                cleared: decision.target.is_some(),
+                enforced: enforced_model.is_some(),
+                model: selected_spec,
+                skip: skip.map(str::to_string),
+            },
+        );
         Some(TurnRoute {
-            target: arm_target,
+            // Route-once installs a state-scoped picker pin above. Never arm
+            // the legacy per-iteration routed branch for a first prompt.
+            target: None,
             turn_id,
             agent_id: agent,
             iterations: 0,
@@ -1294,6 +1487,99 @@ impl AgentLoop {
             failure: None,
             log_path,
         })
+    }
+
+    /// Spawn the one-shot background drift check for an already settled
+    /// session. The task owns only snapshots and atomics — never the loop or
+    /// its RouteOnce mutex — so the provider turn finishes without waiting.
+    async fn spawn_drift_check(
+        &self,
+        text: String,
+        settled_label: Option<String>,
+        policy: model_routing::RoutingPolicy,
+        agent_id: AgentId,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+        settled_epoch: u64,
+    ) {
+        if text.split_whitespace().count() < 3
+            || self
+                .route_session
+                .lock()
+                .expect("route-session lock poisoned")
+                .nudge_sent
+        {
+            return;
+        }
+        let Some(settled_label) = settled_label else {
+            return;
+        };
+        if super::route_question::label_above(&settled_label, policy.offered).is_none() {
+            return;
+        }
+        let Some(gate) = self.routing.as_ref() else {
+            return;
+        };
+        let Some(classifier) = gate.classifier() else {
+            return;
+        };
+        let Some(resolver) = self.model_resolver.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let context = crate::model_resolver::ModelContext {
+            route: self.policy().route().await,
+            is_subagent: false,
+        };
+        let session_log_path = gate.session_log_path().to_path_buf();
+        let route_session = Arc::clone(&self.route_session);
+        let fanin_tx = fanin_tx.clone();
+        tokio::spawn(async move {
+            let Some(decision) = model_routing::classify_task_text(
+                classifier.as_ref(),
+                &text,
+                policy.offered,
+                policy.first_prompt_min_confidence,
+            )
+            .await
+            else {
+                return;
+            };
+            let Some(target) = decision.target else {
+                return;
+            };
+            // Any offered higher label counts, not merely the immediately next
+            // rung (trivial → hard must work when routine is offered too).
+            let mut cursor = settled_label.as_str();
+            let mut harder = false;
+            while let Some(next) = super::route_question::label_above(cursor, policy.offered) {
+                if next == decision.label {
+                    harder = true;
+                    break;
+                }
+                cursor = next;
+            }
+            if !harder {
+                return;
+            }
+            let Some(model_ref) = resolver.resolve_routed(target, context) else {
+                return;
+            };
+            // Reserve channel capacity first, then claim + append + send under
+            // one lock; no stale task can publish after Clear, and a full
+            // channel never swallows the one nudge.
+            let _ = AgentLoop::claim_and_publish_nudge(
+                &route_session,
+                &decision.label,
+                Some(settled_epoch),
+                super::loop_impl::NudgeNotice {
+                    agent_id,
+                    reason: "drift",
+                    text: format!("this got harder; consider {}", model_ref.model),
+                    log_path: Some(session_log_path),
+                    fanin_tx,
+                },
+            )
+            .await;
+        });
     }
 
     /// Resolve a routing target against the CURRENT workflow context (backlog
@@ -1645,6 +1931,7 @@ impl AgentLoop {
         agent_id: AgentId,
         session_id: Option<&str>,
         cmd_rx: &mut mpsc::Receiver<AgentCommand>,
+        turn_id: Option<&str>,
     ) -> PendingSwapOutcome {
         // Set when the pre-swap summary replaced `messages` — reported to the
         // caller so it can reset its incremental token accounting.
@@ -1664,11 +1951,13 @@ impl AgentLoop {
                 .read()
                 .expect("context_manager lock poisoned")
                 .clone();
-            let new_max = pending.provider.capabilities().max_context;
-            let token_count = context::ContextManager::count_tokens(messages);
-            if token_count > (new_max as f64 * SWAP_SUMMARIZE_FILL) as usize {
-                // Conversation is too large for the new (smaller) window —
-                // summarize using the OLD provider before completing the swap.
+            if self.conversation_needs_compaction(&pending.context_manager, messages) {
+                // The conversation does not fit the new model's own compaction
+                // trigger — summarize using the OLD provider before completing
+                // the swap. Same measure as the pin's deferral
+                // (`AgentLoop::swap_needs_compaction`) and the turn loop's
+                // regular trigger; a switch whose conversation fits swaps
+                // silently (2027-11-02 bug, plan 1238e0de).
                 let _ = fanin_tx
                     .send((
                         agent_id,
@@ -1681,15 +1970,25 @@ impl AgentLoop {
                 // [models.summarize] routes the summary to the dedicated slot
                 // when set; unset rides the old provider (today's behavior).
                 let summary_provider = self.summarize_provider(&old_provider);
+                // Plan c3ba2b58 step A: the pre-swap summary is compaction —
+                // same turn id as the turn it serves when that turn is
+                // already running.
+                let compaction_context = self.llm_request_context(
+                    turn_id,
+                    crate::provider::trace::TracePurpose::Compaction,
+                );
                 let summarize_result = old_context_manager
                     .summarize_with_interrupt(
                         messages,
-                        KEEP_RECENT_ON_SWAP,
-                        // The result must fit the window it is being swapped
-                        // TO — the new model is what will receive it.
-                        context::sendable_budget(pending.provider.capabilities()),
                         summary_provider.as_ref(),
                         cmd_rx,
+                        // The result must fit the window it is being swapped
+                        // TO — the new model is what will receive it.
+                        context::SummarizeRequest::new(
+                            KEEP_RECENT_ON_SWAP,
+                            context::sendable_budget(pending.provider.capabilities()),
+                            &compaction_context,
+                        ),
                     )
                     .await;
                 // The summary path (Ok) rewrote `messages`; the failure path
@@ -1835,6 +2134,12 @@ impl AgentLoop {
                         }
                     }
                 }
+                // Publish the FINAL count of the deferred rewrite: the summary,
+                // the digest and every re-injected buffered command are the
+                // conversation the post-swap requests carry — a switch landing
+                // before them must measure that, not the pre-compaction count
+                // published at the top of the loop.
+                self.publish_message_tokens(messages);
                 if let Some(stop) = stop_reason {
                     // Interrupt/Cancel during summarization — emit a paired
                     // end event for the CompactStarted above (mirrors the main
@@ -1851,7 +2156,7 @@ impl AgentLoop {
                             },
                         ))
                         .await;
-                    self.set_provider(pending.provider.clone(), pending.context_manager.clone());
+                    self.set_provider_internal(pending.provider.clone(), pending.context_manager.clone());
                     *self
                         .explicit_provider
                         .write()
@@ -1869,24 +2174,28 @@ impl AgentLoop {
                 }
             }
             // Complete the deferred swap.
-            self.set_provider(pending.provider.clone(), pending.context_manager.clone());
+            self.set_provider_internal(pending.provider.clone(), pending.context_manager.clone());
             *self
                 .explicit_provider
                 .write()
                 .expect("explicit_provider lock poisoned") =
                 Some((pending.provider, pending.context_manager));
-            let _ = fanin_tx
-                .send((
-                    agent_id,
-                    AgentEvent::Error {
-                        error: format!(
-                            "Switched to '{}' (summarized for smaller context)",
-                            pending.model
-                        ),
-                        retrying: false,
-                    },
-                ))
-                .await;
+            // Informational, never `AgentEvent::Error` (bug 2026-11-02, plan
+            // 1238e0de): the swap SUCCEEDED and the turn continues on the new
+            // model, so a consumer that treats a final error as a terminal
+            // failure (Mnemo2's worker pump) must not see one. Emitted only
+            // when the conversation was actually rewritten — a deferred swap
+            // whose conversation turned out to fit swaps silently.
+            if rewrote {
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::ModelSwapSummarized {
+                            model: pending.model,
+                        },
+                    ))
+                    .await;
+            }
         }
         PendingSwapOutcome {
             rewrote,
@@ -2587,6 +2896,108 @@ impl AgentLoop {
             };
             messages.push(tool_message);
 
+            // Route-once stuck signal (main Mnemo1 session only): three
+            // consecutive failed-or-repeated calls may produce ONE suggestion.
+            // They never arm a provider switch. The separate previous signature
+            // only selects the wording; Strikes owns the exactly-once streak.
+            if !self.is_subagent() {
+                let signature =
+                    super::route_question::call_signature(
+                        &tc.name,
+                        &serde_json::from_str(&tc.arguments)
+                            .unwrap_or_else(|_| serde_json::Value::String(tc.arguments.clone())),
+                    );
+                let (trigger, repeated) = {
+                    let mut previous = self
+                        .last_route_tool_signature
+                        .lock()
+                        .expect("last tool signature lock poisoned");
+                    let repeated = previous.as_deref() == Some(signature.as_str());
+                    let trigger = self
+                        .strikes
+                        .lock()
+                        .expect("route strikes lock poisoned")
+                        .observe(signature.clone(), !result.success);
+                    *previous = Some(signature);
+                    (trigger, repeated)
+                };
+                if trigger {
+                    let (route_state, route_epoch) = self.route_once_with_epoch();
+                    let (settled_label, settled_model) = match route_state {
+                        super::loop_impl::RouteOnce::Settled {
+                            label: Some(label),
+                            model,
+                            ..
+                        } => (Some(label), model),
+                        _ => (None, None),
+                    };
+                    let policy = self
+                        .model_resolver
+                        .as_ref()
+                        .and_then(|resolver| resolver.routing_policy());
+                    if let (Some(settled), Some(policy)) = (settled_label, policy) {
+                        let above = super::route_question::label_above(&settled, policy.offered);
+                        // `escalate` has no Laya label. A strike on the highest
+                        // ordinary tier therefore carries the ladder tier id
+                        // itself through the otherwise unchanged nudge path.
+                        let top_escalation = above.is_none()
+                            && super::route_question::tier_for_label(&settled) == Some("high");
+                        let to_label = above.or(top_escalation.then_some("escalate"));
+                        let target = to_label.and_then(|to_label| {
+                            if top_escalation {
+                                Some(model_routing::RouteTarget::Escalate)
+                            } else {
+                                super::route_question::tier_for_label(to_label)
+                                    .and_then(model_routing::RouteTarget::from_tier_id)
+                            }
+                        });
+                        if let (Some(to_label), Some(target)) = (to_label, target) {
+                            if let Some(model_ref) = self.resolve_routed_model(target).await {
+                                let target_spec = if model_ref.endpoint.is_empty() {
+                                    model_ref.model.clone()
+                                } else {
+                                    format!("{}/{}", model_ref.endpoint, model_ref.model)
+                                };
+                                let current_spec = self.current_model_spec();
+                                let folded_onto_current = top_escalation
+                                    && (settled_model.as_deref() == Some(target_spec.as_str())
+                                        || current_spec == target_spec
+                                        || current_spec == model_ref.model);
+                                if !folded_onto_current {
+                                    let reason = if repeated {
+                                        "repeat_failure"
+                                    } else {
+                                        "tool_failures"
+                                    };
+                                    let text = if repeated {
+                                        format!("going in circles; consider {}", model_ref.model)
+                                    } else {
+                                        format!("tools keep failing; consider {}", model_ref.model)
+                                    };
+                                    let log_path = self
+                                        .routing
+                                        .as_ref()
+                                        .map(|gate| gate.session_log_path().to_path_buf());
+                                    let _ = AgentLoop::claim_and_publish_nudge(
+                                        &self.route_session,
+                                        to_label,
+                                        Some(route_epoch),
+                                        super::loop_impl::NudgeNotice {
+                                            agent_id,
+                                            reason,
+                                            text,
+                                            log_path,
+                                            fanin_tx: fanin_tx.clone(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let _ = fanin_tx
                 .send((
                     agent_id,
@@ -3027,16 +3438,25 @@ impl AgentLoop {
         } else {
             None
         };
+        // Plan c3ba2b58 step A: auto-compaction carries the loop's identity
+        // + the compaction purpose, grouped under the current turn id.
+        let compaction_context = self.llm_request_context(
+            state.spend_turn_id.as_deref(),
+            crate::provider::trace::TracePurpose::Compaction,
+        );
         let summarize_result = context_manager
             .summarize_with_interrupt_opts(
                 messages,
-                keep_recent,
                 // The compacted result is what the TURN provider sends next, so
                 // its window is the one that has to fit — not the summarizer's.
-                context::sendable_budget(provider.capabilities()),
                 summary_provider.as_ref(),
-                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
+                context::SummarizeRequest::new(
+                    keep_recent,
+                    context::sendable_budget(provider.capabilities()),
+                    &compaction_context,
+                ),
+                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
             )
             .await;
         // Park the compaction time on the provider — the request's
@@ -3249,6 +3669,12 @@ impl AgentLoop {
                 }
             }
         }
+        // Publish the FINAL count of the IN-TURN rewrite: the summary, the
+        // survival digest and every re-injected buffered command are the
+        // conversation that exists now. Without this, a switch landing on the
+        // request that follows would measure the stale pre-compaction count
+        // published at the top of the loop and needlessly defer.
+        self.publish_message_tokens(messages);
         // Summarization (and any re-injected suggestions) changed the
         // messages, so the pre-summary accounting is stale — reset and
         // recompute once for an accurate ContextUsage event.
@@ -3743,6 +4169,16 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
 "
                 ));
             }
+        }
+        // The pinned task (plan 40eef714 step 1): the session's assignment,
+        // rendered verbatim between the tool groups and the session primer —
+        // part of the STABLE head, never the volatile tail, so the provider's
+        // prefix cache keeps working and every request (before and after a
+        // compaction or model switch) carries it byte-for-byte.
+        if let Some(task) = self.pinned_task() {
+            head_content.push_str("\n\n## Your task (pinned)\nThis is your assignment for this whole session. It stays here verbatim and is never summarized; after compaction or a model change, re-read it here.\n\n");
+            head_content.push_str(&task);
+            head_content.push('\n');
         }
         match self.session_primer() {
             Some(Some(primer)) => {
@@ -4319,6 +4755,15 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // record gets stamped with it as `prep_ms`. Deliberately excludes
         // the POST + retries (that's `connect_ms`).
         provider.record_prep_ms(prep_started.elapsed().as_millis() as u32);
+        // Plan c3ba2b58 step A: the turn request's trace context — the
+        // loop's identity + the current turn id + the turn purpose, so
+        // every attempt of this request (inner retries, the turn-level
+        // endpoint-fallback ladder) carries the same attribution on its
+        // own record.
+        let llm_context = self.llm_request_context(
+            state.spend_turn_id.as_deref(),
+            crate::provider::trace::TracePurpose::Turn,
+        );
         // We have handed off to the network — TCP/TLS connect, POST upload,
         // time-to-first-token, AND any retry backoff sleeps are all
         // "waiting" (the user sees "waiting for response…"), not "sending"
@@ -4361,9 +4806,12 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 provider,
                 messages,
                 tool_schemas,
-                fanin_tx,
-                agent_id,
-                session_id,
+                super::dispatch::TurnRequest {
+                    fanin_tx,
+                    agent_id,
+                    session_id,
+                    llm_context: &llm_context,
+                },
             );
             // G5 (3a.6): the pre-request history snapshot — a mid-request
             // ExportHistory answers from this (the pinned future holds the

@@ -3,8 +3,8 @@
 // See LICENSE in the repository root.
 
 //! Phase 2 derived-record indexer — scans the project's `.coding/` corpus
-//! (plans, review reports, backlog, and the knowledge corpus of typed
-//! semantic records) and emits budgeted typed digest memories
+//! (plans, review reports, backlog, OpenSpec requirements, and the knowledge
+//! corpus of typed semantic records) and emits budgeted typed digest memories
 //! (`record_class = Derived`) that point back at the on-disk truth.
 //!
 //! Design invariants:
@@ -40,11 +40,13 @@ use crate::memory::{Memory, MemoryClass, MemorySearchConfig, MemoryStoreTrait, M
 
 mod backlog;
 mod knowledge;
+mod openspec;
 mod plans;
 mod reviews;
 
 use backlog::scan_backlog;
 use knowledge::{build_knowledge_metas, scan_knowledge};
+use openspec::scan_openspec;
 use plans::scan_plans;
 use reviews::scan_reviews;
 
@@ -275,12 +277,15 @@ fn scan_sources(
     if let Some(knowledge_dir) = knowledge_dir {
         scan_knowledge(knowledge_dir, &mut out, &mut knowledge, &mut errors, config);
     }
+    if let Some(specs_dir) = plans_dir.parent().map(|p| p.join("openspec/specs")) {
+        scan_openspec(&specs_dir, &mut out, &mut errors, config);
+    }
     scan_backlog(backlog_path, &mut out, &mut errors, config);
     (out, knowledge, errors)
 }
 
 /// Cheap staleness pre-check for the startup reconciliation: does the
-/// on-disk corpus (plans, reviews, knowledge records, backlog) differ from
+/// on-disk corpus (plans, reviews, knowledge, OpenSpec requirements, backlog) differ from
 /// what the derived index state already covers? Walks the same sources the
 /// indexer scans, compares content hashes against `derived_index_state`,
 /// and includes removal detection (a state key with no on-disk source is a

@@ -26,7 +26,16 @@ import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } f
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedFilesPreview, type FileEntry } from "../lib/files";
-import { seedTracePreview, type TraceDetail, type TraceRow } from "../lib/trace";
+import {
+  seedTracePagePreview,
+  type TraceAttribution,
+  type TraceDetail,
+  type TraceListPage,
+  type TraceListQuery,
+  type TracePageTransport,
+  type TraceRow,
+  type TraceSettings,
+} from "../lib/trace";
 import { seedGitPreview, type GitOverview } from "../lib/git";
 import { seedCostPreview, type CostInsights } from "../lib/cost";
 import {
@@ -60,7 +69,7 @@ function liveActivity(phase: WorkerActivity["phase"], agoMs: number, toolName: s
   };
 }
 
-/** The open plan the dispatch bar shows above the worker list. */
+/** The open plan on the sample board (and the plan id a sample lead entry names). */
 const PREVIEW_PLAN: BoardPlan = {
   id: "plan-preview-thread",
   title: "Render the worker thread as Markdown",
@@ -481,9 +490,10 @@ const SAMPLE_SYMBOL_BY_ID = new Map(SAMPLE_SYMBOLS.map((symbol) => [symbol.id, s
 
 const toSymbol = ({ id, name, kind, file, line }: SampleSymbol): GraphSymbol => ({ id, name, kind, file, line });
 
-/** A tiny in-memory answer service over the sample symbols, so the preview's search, focus and refocus all work. */
+/** A tiny in-memory answer service over the sample symbols, so the preview's search, focus and refocus all work.
+ *  The graph scene opens mid-pass (see `graphScene`), so this starts out indexing. */
 function sampleGraphTransport(): GraphTransport {
-  let indexing = false;
+  let indexing = true;
   let pollsLeft = 0;
 
   const status = (): GraphStatus => ({
@@ -642,6 +652,13 @@ function graphScene(): AppState {
     workerPanelId: null,
     workbenchOpen: false,
     workerDeletion: null,
+    // The scene opens on a rebuild in progress: the notice shows 1,200/2,400 files.
+    indexing: {
+      revision: 1,
+      firstRun: false,
+      code: { state: "running", done: 1200, total: 2400, detail: null },
+      memory: null,
+    },
   };
 }
 
@@ -771,8 +788,41 @@ function previewTraceRow(
     response_truncated: false,
     response_evicted: false,
     guard_cut: null,
+    run_id: "preview-run",
+    attribution: null,
+    cost_micros: null,
+    priced: false,
+    retained: false,
     ...fields,
   };
+}
+
+/** A trace attribution with the preview session's defaults. */
+function previewTraceAttribution(
+  fields: Pick<TraceAttribution, "actor_kind" | "agent_id" | "agent_name"> & Partial<TraceAttribution>,
+): TraceAttribution {
+  return {
+    session_id: "session-preview",
+    worker_id: null,
+    plan_id: null,
+    plan_step: null,
+    turn_id: null,
+    purpose: "turn",
+    ...fields,
+  };
+}
+
+/** The implementation worker the preview's running calls belong to. */
+function previewTraceWorkerAttribution(): TraceAttribution {
+  return previewTraceAttribution({
+    actor_kind: "worker",
+    agent_id: "agent-kai",
+    agent_name: "Kai",
+    worker_id: RICH_WORKER_ID,
+    plan_id: "c3ba2b58",
+    plan_step: 5,
+    purpose: "turn",
+  });
 }
 
 /** The tool declarations every preview request carries. */
@@ -864,6 +914,14 @@ const PREVIEW_TRACE_ROWS: TraceRow[] = [
     finish_reason: "tool_calls",
     ttft_ms: 640,
     generation_ms: 3_400,
+    attribution: previewTraceAttribution({
+      actor_kind: "lead",
+      agent_id: "agent-lead",
+      agent_name: "Lead",
+      turn_id: "turn-4f2a",
+    }),
+    cost_micros: 84_000,
+    priced: true,
   }),
   previewTraceRow({
     id: 102,
@@ -876,6 +934,9 @@ const PREVIEW_TRACE_ROWS: TraceRow[] = [
     finish_reason: "stop",
     ttft_ms: 410,
     generation_ms: 1_800,
+    attribution: previewTraceWorkerAttribution(),
+    cost_micros: 11_200,
+    priced: true,
   }),
   previewTraceRow({
     id: 103,
@@ -890,6 +951,9 @@ const PREVIEW_TRACE_ROWS: TraceRow[] = [
     generation_ms: 120,
     error:
       "Invalid schema for response_format 'turn': In context=(), 'additionalProperties' is required to be supplied and to be false.",
+    attribution: previewTraceWorkerAttribution(),
+    cost_micros: null,
+    priced: true,
   }),
   previewTraceRow({
     id: 104,
@@ -902,6 +966,41 @@ const PREVIEW_TRACE_ROWS: TraceRow[] = [
     version: 3,
     ttft_ms: 520,
     generation_ms: 1_200,
+    attribution: previewTraceAttribution({
+      actor_kind: "lead",
+      agent_id: "agent-lead",
+      agent_name: "Lead",
+      purpose: "turn",
+      turn_id: "turn-91bc",
+    }),
+    cost_micros: 52_000,
+    priced: true,
+  }),
+  // Retained metadata from an earlier session: the model has no configured
+  // price and the bodies are gone, so the row shows a dash and the archive mark.
+  previewTraceRow({
+    id: 105,
+    ts_ms: NOW_MS - 26 * 60_000,
+    model: "legacy-model",
+    provider: "secondary",
+    base_url: "https://secondary.example.invalid/v1",
+    http_status: 200,
+    usage: { prompt: 4_200, completion: 180, reasoning: 0, cached: 0 },
+    finish_reason: "stop",
+    ttft_ms: 300,
+    generation_ms: 900,
+    attribution: previewTraceAttribution({
+      actor_kind: "worker",
+      agent_id: "agent-noa",
+      agent_name: "Noa",
+      worker_id: "noa",
+      plan_id: "c3ba2b58",
+      plan_step: 2,
+      purpose: "turn",
+    }),
+    cost_micros: null,
+    priced: false,
+    retained: true,
   }),
 ];
 
@@ -946,15 +1045,101 @@ const PREVIEW_TRACE_DETAILS: Record<number, TraceDetail> = Object.fromEntries(
   }),
 );
 
-/** The Trace tab: the shared request log, with the strict-mode refusal in it. */
-function traceTab(): AppState {
-  seedTracePreview({
-    list: async () => ({ requests: PREVIEW_TRACE_ROWS, capacity: 32 }),
-    detail: async (id) => PREVIEW_TRACE_DETAILS[id] ?? null,
-    clear: async () => undefined,
-  });
-  return { ...baseState(), workbenchOpen: true, workbenchTab: "trace", workbenchWidth: 460 };
+/** The page the preview's trace transport answers with, newest first. */
+function previewTraceListPage(query: TraceListQuery, rows: TraceRow[]): TraceListPage {
+  const matching = rows
+    .filter((row) => {
+      if (query.agent === undefined) return true;
+      if (query.agent === "unattributed") return row.attribution === null;
+      if (query.agent === "lead") return row.attribution?.actor_kind === "lead";
+      return row.attribution?.worker_id === query.agent || row.attribution?.agent_id === query.agent;
+    })
+    .sort((left, right) => right.ts_ms - left.ts_ms);
+  const limit = Math.min(query.limit ?? matching.length, matching.length);
+  return {
+    rows: matching.slice(0, limit),
+    total: matching.length,
+    unpriced: matching.filter((row) => !row.priced).length,
+    has_more: matching.length > limit,
+    next_cursor: null,
+    capped: false,
+  };
 }
+
+/**
+ * The Trace view model's transport over the preview rows. Every data control
+ * answers, so the export, settings and clear/delete states are previewable.
+ */
+function previewTraceTransport(rows: TraceRow[]): TracePageTransport {
+  const settings = (logBodies: boolean): TraceSettings => ({
+    log_bodies: logBodies,
+    ring_capacity: 128,
+    journal_bytes: 18_432,
+    history_bytes: 96_256,
+  });
+  let logBodies = false;
+  return {
+    list: async (query) => previewTraceListPage(query, rows),
+    detail: async (_runId, id) => {
+      const row = rows.find((entry) => entry.id === id);
+      // A retained row kept its metadata only; its bodies are gone.
+      if (row === undefined || row.retained) return null;
+      return PREVIEW_TRACE_DETAILS[id] ?? null;
+    },
+    settings: async () => settings(logBodies),
+    setLogBodies: async (on) => {
+      logBodies = on;
+      return settings(logBodies);
+    },
+    clearLive: async () => undefined,
+    deleteHistory: async () => ({ deleted_files: 2, bytes: 96_256 }),
+    exportCalls: async (request) => ({
+      path: ".coding/logs/trace-exports/trace-20261102-140000.jsonl",
+      count: request.keys?.length ?? rows.length,
+      includes_bodies: logBodies,
+    }),
+    revealExport: async () => undefined,
+  };
+}
+
+/** The full Trace route: streaming, failed, unpriced and retained calls in one list. */
+function traceScene(): AppState {
+  seedTracePagePreview(previewTraceTransport(PREVIEW_TRACE_ROWS));
+  return { ...baseState(), route: "trace", selectedWorkerId: RICH_WORKER_ID, workerPanelId: null };
+}
+
+/** The Trace route before any model call was recorded. */
+function traceEmpty(): AppState {
+  seedTracePagePreview(previewTraceTransport([]));
+  return { ...baseState(), route: "trace", selectedWorkerId: RICH_WORKER_ID, workerPanelId: null };
+}
+
+/** The compact side tab: the newest calls and the actor filters. */
+function traceTab(): AppState {
+  seedTracePagePreview(previewTraceTransport(PREVIEW_TRACE_ROWS));
+  return {
+    ...baseState(),
+    workbenchOpen: true,
+    workbenchTab: "trace",
+    workbenchWidth: 460,
+    selectedWorkerId: RICH_WORKER_ID,
+    workerPanelId: null,
+  };
+}
+
+/** The compact side tab before any model call was recorded. */
+function traceTabEmpty(): AppState {
+  seedTracePagePreview(previewTraceTransport([]));
+  return {
+    ...baseState(),
+    workbenchOpen: true,
+    workbenchTab: "trace",
+    workbenchWidth: 460,
+    selectedWorkerId: RICH_WORKER_ID,
+    workerPanelId: null,
+  };
+}
+
 
 /** The Git tab: branches at different distances from main, and the newest commits on one lane. */
 function gitTab(): AppState {
@@ -1365,6 +1550,13 @@ const PREVIEW_BACKLOG: BacklogItem[] = [
     created_at: 0,
   },
   {
+    id: "idea-preview-embedded",
+    text: "Let each worker's panel scroll its own log without moving the thread.",
+    images: [],
+    status: "in_flight",
+    created_at: 0,
+  },
+  {
     id: "idea-preview-burndown",
     text: "Show the plan board's steps as a burn-down per worker.",
     images: [],
@@ -1405,8 +1597,27 @@ function previewBacklog(initial: BacklogItem[]): BacklogTransport {
       items = items.map((item) => (item.id === id ? { ...item, deferred } : item));
       return copy();
     },
+    setDone: async (id, done) => {
+      items = items.map((item) => {
+        if (item.id !== id) return item;
+        if (done && item.status === "pending") return { ...item, status: "done" };
+        if (!done && item.status !== "pending" && item.status !== "in_flight") {
+          return { ...item, status: "pending" };
+        }
+        return item;
+      });
+      return copy();
+    },
     clearFinished: async () => {
       items = items.filter((item) => item.status === "pending");
+      return copy();
+    },
+    planThis: async (id) => {
+      items = items.map((item) =>
+        item.id === id
+          ? { ...item, status: "in_flight", note: "handed to the lead" }
+          : item,
+      );
       return copy();
     },
     onChanged: async () => () => {},
@@ -1867,6 +2078,139 @@ function memoryTab(): AppState {
   return { ...baseState(), route: "memory" };
 }
 
+/** The lead chat with the tool-row bodies: named-file headlines, the expanded
+ *  edit row showing its coloured diff, a replayed multi_edit rebuilt from
+ *  its arguments, a write's added lines, the read row's file-and-range list,
+ *  and the shell's command with split output. */
+function leadToolRows(): AppState {
+  const row = (id: string, toolName: string, args: Record<string, unknown>, result: ToolEntry["result"]): ToolEntry => ({
+    id,
+    kind: "tool",
+    time: "10:04",
+    toolCallId: `call-${id}`,
+    toolName,
+    arguments: JSON.stringify(args),
+    liveOutput: "",
+    result,
+  });
+  const readOutput = [
+    "=== mnemo2/src/lib/toolSummary.ts (lines 1-65 of 65) ===",
+    "1  import { actionPhrase, argPaths, basename, dedupePaths, prettyToolName } from …",
+    "",
+    "=== mnemo2/src/lib/types.ts (lines 272-276 of 316) ===",
+    "272  export interface LeadToolResult {",
+    "273    success: boolean;",
+    "274    output: string;",
+    "275    data?: unknown;",
+    "276  }",
+    "",
+  ].join("\n");
+  return {
+    ...baseState(),
+    route: "lead",
+    selectedWorkerId: null,
+    workerPanelId: null,
+    workbenchOpen: false,
+    workerDeletion: null,
+    leadEntries: [
+      {
+        id: "preview-lead-tools-intro",
+        kind: "message",
+        author: "lead",
+        time: "10:03",
+        body: "Expanding a tool row now shows what it did — the diff an edit applied, the content a write produced, the files and line ranges a read returned — instead of raw Arguments JSON. Every rich row keeps the raw call behind its Show raw call toggle.",
+      },
+      row(
+        "preview-lead-tools-read",
+        "read_files",
+        {
+          files: [
+            { path: "mnemo2/src/lib/toolSummary.ts" },
+            { path: "mnemo2/src/lib/types.ts", start_line: 272, max_lines: 5 },
+          ],
+        },
+        { success: true, output: readOutput },
+      ),
+      row(
+        "preview-lead-tools-edit",
+        "file_edit",
+        {
+          path: "mnemo2/src/lib/toolSummary.ts",
+          old_string: "export function toolSummary(",
+          new_string: "export function toolHeadline(",
+        },
+        {
+          success: true,
+          output: "Edited mnemo2/src/lib/toolSummary.ts",
+          data: {
+            diff: [
+              "--- a/mnemo2/src/lib/toolSummary.ts",
+              "+++ b/mnemo2/src/lib/toolSummary.ts",
+              "@@ -54,6 +54,7 @@",
+              " /** A compact human headline derived from the actual call, never its outcome. */",
+              "-export function toolSummary(",
+              "+export function toolHeadline(",
+              "   toolName: string,",
+              "   args: string,",
+              "   nameOf: (workerId: string) => string = (workerId) => workerId,",
+              "-): string {",
+              "+): { text: string; title: string } {",
+            ].join("\n"),
+          },
+        },
+      ),
+      row(
+        "preview-lead-tools-multi",
+        "multi_edit",
+        {
+          files: [
+            {
+              path: "mnemo2/src/components/ToolActivity.svelte",
+              ops: [
+                {
+                  old_string: "toolSummary(entry.toolName, entry.arguments, nameOf)",
+                  new_string: "toolHeadline(entry.toolName, entry.arguments, nameOf)",
+                },
+              ],
+            },
+            { path: "mnemo2/src/components/ToolDiff.svelte" },
+            { path: "mnemo2/src/components/ToolShellOutput.svelte" },
+            { path: "mnemo2/src/lib/toolDiff.ts" },
+            { path: "mnemo2/src/lib/toolDiff.test.ts" },
+          ],
+        },
+        // A replayed transcript rebuilds results from the message text: no
+        // structured diff, so the row reconstructs one from its arguments.
+        { success: true, output: "Edited 1 file" },
+      ),
+      row(
+        "preview-lead-tools-write",
+        "file_write",
+        {
+          path: "mnemo2/src/components/ToolShellOutput.svelte",
+          content: '<script lang="ts">\n  import TerminalText from "./TerminalText.svelte";\n</script>\n',
+        },
+        { success: true, output: "Wrote mnemo2/src/components/ToolShellOutput.svelte" },
+      ),
+      row(
+        "preview-lead-tools-shell",
+        "shell",
+        { command: "npx vitest run src/lib src/components", purpose: "running tests", cwd: "mnemo2" },
+        {
+          success: true,
+          output: "Test Files  1 passed (1)\n[stderr]\nnpm notice run mnemo@1.3.0\n[exit code: 0]",
+        },
+      ),
+      row(
+        "preview-lead-tools-git",
+        "git_read",
+        { op: "status" },
+        { success: true, output: "## wt/agent-toolRows\nM mnemo2/src/components/ToolActivity.svelte\n" },
+      ),
+    ],
+  };
+}
+
 /** Every scene the preview page renders, in index order. */
 export const previewScenes: PreviewScene[] = [
   {
@@ -1886,13 +2230,6 @@ export const previewScenes: PreviewScene[] = [
     title: "Files",
     description: "The Files tab: the project tree, a path filter, and one file read-only with syntax highlighting.",
     build: filesTab,
-  },
-  {
-    name: "trace",
-    title: "Trace",
-    description:
-      "The Trace tab: the shared request log — lead and worker rows, tokens and durations, and one refused strict-mode request.",
-    build: traceTab,
   },
   {
     name: "git",
@@ -1932,21 +2269,21 @@ export const previewScenes: PreviewScene[] = [
     },
   },
   {
-    name: "settings-laya",
-    title: "Settings: Decisions",
+    name: "settings-tiers",
+    title: "Settings: Tiers",
     description:
-      "The settings dialog's Decisions page: the Laya status block with Enable/Disable and install progress, the seven opt-in switches, and the routing lanes with the confidence threshold and enforce switch.",
+      "The settings dialog's Tiers page: the top control (does Laya help pick the tier?) with its readiness line and kNN count, the five-rung ladder editor with fold hints and Laya labels, the dispatch tier-text preview, the collapsed routing details and the Laya section at the bottom.",
     // Same mount pattern as settings-models; the rail click opens the
-    // Decisions page directly so the scene shows the page it names.
+    // Tiers page directly so the scene shows the page it names.
     build: missionControl,
     mount: (target) => {
       const restoreSettings = seedPreviewSettings();
       const restoreLaya = seedPreviewLaya();
       const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {} } });
-      const decisions = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
-        (button) => button.textContent === "Decisions",
+      const tiers = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
+        (button) => button.textContent === "Tiers",
       );
-      decisions?.click();
+      tiers?.click();
       return () => {
         unmount(dialog);
         restoreLaya();
@@ -2019,6 +2356,25 @@ export const previewScenes: PreviewScene[] = [
       return () => {
         unmount(dialog);
         restoreAppearance();
+        restoreSettings();
+      };
+    },
+  },
+  {
+    name: "settings-project",
+    title: "Settings: Project",
+    description:
+      "The settings dialog's Project page — the page the top bar's gear opens: the open project's worker slots, lead model and merge policy, under the rail's This project / All projects groups.",
+    // Same mount pattern as settings-appearance, plus the app state the page
+    // reads from: the project is seeded open, and the dialog is asked for the
+    // Project page exactly as the gear asks for it.
+    build: missionControl,
+    mount: (target) => {
+      app.set(missionControl());
+      const restoreSettings = seedPreviewSettings();
+      const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {}, initialPage: "project" } });
+      return () => {
+        unmount(dialog);
         restoreSettings();
       };
     },
@@ -2104,7 +2460,53 @@ export const previewScenes: PreviewScene[] = [
       return () => unmount(shell);
     },
   },
+  {
+    name: "trace",
+    title: "Trace",
+    description:
+      "The full Trace route: the filter bar, the export/retention controls, and a list with a streaming lead call, a failed worker call, an unpriced call and retained metadata, plus the charts and the call detail.",
+    build: traceScene,
+  },
+  {
+    name: "trace-empty",
+    title: "Trace (empty)",
+    description: "The Trace route before any model call was recorded: the empty state, the filters and the data controls.",
+    build: traceEmpty,
+  },
+  {
+    name: "trace-tab",
+    title: "Trace tab",
+    description:
+      "The compact side Trace tab: the newest calls with All agents / This lead / worker filters, tokens, cache reuse, cost and status.",
+    build: traceTab,
+  },
+  {
+    name: "trace-tab-empty",
+    title: "Trace tab (empty)",
+    description: "The compact side Trace tab before any model call was recorded.",
+    build: traceTabEmpty,
+  },
+  {
+    name: "lead-tool-rows",
+    title: "Lead tool rows",
+    description:
+      "The lead chat's tool rows with file-named headlines: the expanded edit row shows its coloured diff, a replayed multi_edit reconstructs one from its arguments, a write shows its added lines, a read lists its files and line ranges, and the shell row keeps its command and split output.",
+    build: leadToolRows,
+    // The rows' bodies are component-local state, so the scene opens the edit
+    // row after mounting — its diff is the body this scene is about; the
+    // other rows stay collapsed for the index click-through.
+    mount: (target) => {
+      app.set(leadToolRows());
+      const shell = svelteMount(App, { target });
+      const editRow = target.querySelector<HTMLDetailsElement>(
+        'article[aria-label^="Editing"] .tool-disclosure',
+      );
+      if (editRow !== null) editRow.open = true;
+      return () => unmount(shell);
+    },
+  },
 ];
+
 
 /** The scene an empty `?scene=` parameter falls back to. */
 export const defaultPreviewScene = "mission-control";

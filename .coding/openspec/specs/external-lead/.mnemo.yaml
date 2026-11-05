@@ -1,0 +1,4 @@
+paths:
+  - src-tauri/src/mnemo2/mcp_server.rs
+  - src-tauri/src/bin/mnemo2_mcp/serve.rs
+  - src-tauri/src/mnemo2/team.rs

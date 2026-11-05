@@ -35,6 +35,8 @@
 //! status is `FineTuning { label }` — restored to `Ready` on any skip (only
 //! a still-own `FineTuning` is ever overwritten).
 
+#[cfg(feature = "mnemo2")]
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,9 +45,20 @@ use std::sync::{Arc, RwLock};
 use tauri::{AppHandle, Emitter};
 
 use mnemo::{read_rows, training_log_path, FailureLogRow};
+#[cfg(feature = "mnemo2")]
+use mnemo::agent::failure_triage::training_log_dir;
 use mnemo::config::Config;
 use mnemo::config::general::LayaConfig;
 use mnemo::memory::classifier::{Classifier, ClassifierStatus};
+
+
+// Mnemo2's dispatch routing log is the route dataset's source; the module is
+// feature-gated in the lib, so these imports — and everything below that
+// touches them — are too: the Mnemo1-only build never compiles the export.
+#[cfg(feature = "mnemo2")]
+use mnemo_app::mnemo2::dispatch_routing::{dispatch_routing_log_path, DispatchRoutingRow};
+#[cfg(feature = "mnemo2")]
+use mnemo_app::mnemo2::route_eval::{logged_tier_label, parse_hand_set, HAND_SET_JSONL};
 
 use super::laya::{
     build_managed_classifier, english_checkpoint, hide_console_window, start_managed_server,
@@ -189,6 +202,137 @@ pub fn export_dataset(rows: &[FailureLogRow], path: &Path) -> std::io::Result<us
     }
     std::fs::write(path, body)?;
     Ok(rows.len())
+}
+
+/// One exported route-dataset row: the same neutral `{ text, label }` JSONL
+/// shape as [`DatasetRow`] — `text` is the step spec a dispatch classified,
+/// `label` the Laya routing label it ran under (never a tier id).
+#[cfg(feature = "mnemo2")]
+#[derive(Debug, serde::Serialize)]
+struct RouteDatasetRow {
+    text: String,
+    label: String,
+}
+
+/// `<training_dir>/route-dataset.jsonl` (design §5.1): the labelled routing
+/// dataset exported for retraining. Laya 0.3.20 ships no training surface, so
+/// the startup fine-tune gate does not consume it — the file exists so the
+/// moment one ships, the data is already there.
+#[cfg(feature = "mnemo2")]
+pub fn route_dataset_path() -> PathBuf {
+    training_log_dir().join("route-dataset.jsonl")
+}
+
+/// The routing dataset's rows (design §5.1): one per labelled worker from the
+/// dispatch routing log — the LATEST label-bearing row per worker, outcome
+/// labels and lead/user reroutes only — plus the eval corpus's labelled
+/// cases.
+///
+/// Never training labels: an audit worker (marked by its `route` row's
+/// `skip: "audit"` — a reviewer is never a routing judgement), an escalation
+/// (a reroute onto `escalate`, which maps to no label), a `custom` model
+/// choice, and a `lead_override` (the lead disagreeing with Laya records a
+/// decision, not a routing). Legacy tier ids are converted when read
+/// ([`logged_tier_label`]).
+#[cfg(feature = "mnemo2")]
+fn route_dataset_rows(rows: &[DispatchRoutingRow]) -> Result<Vec<RouteDatasetRow>, String> {
+    // The classifiable text per worker, and which workers are audits.
+    let mut texts: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut audits: BTreeMap<&str, ()> = BTreeMap::new();
+    for row in rows {
+        if let DispatchRoutingRow::Route { worker_id, text, skip, .. } = row {
+            if skip.as_deref() == Some("audit") {
+                audits.insert(worker_id.as_str(), ());
+            } else if skip.is_none() {
+                texts.insert(worker_id.as_str(), text.as_str());
+            }
+        }
+    }
+    // The latest label per worker: later rows overwrite earlier ones.
+    let mut labels: BTreeMap<&str, &'static str> = BTreeMap::new();
+    for row in rows {
+        let (worker_id, tier) = match row {
+            DispatchRoutingRow::Outcome { worker_id, label: Some(label), .. } => {
+                (worker_id, label.as_str())
+            }
+            DispatchRoutingRow::LeadReroute { worker_id, to_tier, .. }
+            | DispatchRoutingRow::UserReroute { worker_id, to_tier, .. } => {
+                (worker_id, to_tier.as_str())
+            }
+            _ => continue,
+        };
+        if let Some(label) = logged_tier_label(tier) {
+            labels.insert(worker_id.as_str(), label);
+        }
+    }
+    let mut dataset = Vec::new();
+    for (worker_id, label) in &labels {
+        if audits.contains_key(worker_id) {
+            continue;
+        }
+        if let Some(text) = texts.get(worker_id) {
+            dataset.push(RouteDatasetRow {
+                text: (*text).to_string(),
+                label: (*label).to_string(),
+            });
+        }
+    }
+    // Plus the eval corpus's labelled cases — the hand set the routing
+    // question is calibrated on (its vague cases carry no label).
+    for case in parse_hand_set(HAND_SET_JSONL)? {
+        if let Some(label) = case.expected {
+            dataset.push(RouteDatasetRow { text: case.text, label });
+        }
+    }
+    Ok(dataset)
+}
+
+/// Write the routing dataset at `path` (its parent created as needed), the
+/// way [`export_dataset`] writes the failure-triage one: one JSON object per
+/// line. Returns the exported row count.
+#[cfg(feature = "mnemo2")]
+fn write_route_dataset(path: &Path, rows: &[RouteDatasetRow]) -> std::io::Result<usize> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut body = String::new();
+    for row in rows {
+        let line =
+            serde_json::to_string(row).expect("a two-string row always serializes");
+        body.push_str(&line);
+        body.push('\n');
+    }
+    std::fs::write(path, body)?;
+    Ok(rows.len())
+}
+
+/// Export the routing dataset (design §5.1): read `log`, write `out`. A
+/// missing log is a no-op — `Ok(0)`, nothing written — so a fresh install
+/// leaves the disk untouched.
+#[cfg(feature = "mnemo2")]
+fn export_route_dataset_at(log: &Path, out: &Path) -> Result<usize, String> {
+    // A missing log is a no-op, not an error.
+    let Ok(contents) = std::fs::read_to_string(log) else {
+        return Ok(0);
+    };
+    let rows: Vec<DispatchRoutingRow> = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let dataset = route_dataset_rows(&rows)?;
+    write_route_dataset(out, &dataset)
+        .map_err(|error| format!("cannot write the route dataset: {error}"))
+}
+
+/// The startup hook's route-dataset export (design §5.1): the dispatch
+/// routing log becomes `<training_dir>/route-dataset.jsonl`, one
+/// `{ text, label }` row per labelled worker plus the eval corpus. Called
+/// beside the startup fine-tune ([`run_startup_finetune`]) at every startup,
+/// before the gate — the dataset must exist before a laya with a training
+/// surface can pick it up.
+#[cfg(feature = "mnemo2")]
+pub fn export_route_dataset() -> Result<usize, String> {
+    export_route_dataset_at(&dispatch_routing_log_path(), &route_dataset_path())
 }
 
 /// The python args for the fine-tune run (`python -m laya.finetune
@@ -461,10 +605,21 @@ pub async fn run_startup_finetune(
     status: Arc<RwLock<ClassifierStatus>>,
     config: Arc<tokio::sync::Mutex<Config>>,
 ) {
+    // The route-dataset export (design §5.1) first: it runs at every
+    // startup, before the gate, so a future laya training surface always
+    // finds a fresh dataset. A missing dispatch routing log is a no-op and
+    // any error only logs — this path must never block startup.
+    #[cfg(feature = "mnemo2")]
+    {
+        if let Err(error) = export_route_dataset() {
+            eprintln!("error: route-dataset export skipped — {error}");
+        }
+    }
+
     // The gate, read from the LIVE shared config (the same handle settings
     // saves go through): enabled + `auto_finetune` + the
     // managed runtime and checkpoint installed. Anything else is a no-op —
-    // byte-identical startup.
+    // a startup identical except for the route dataset above.
     let laya_cfg = config.lock().await.general.general.laya.clone();
     let Some(checkpoint_id) = startup_finetune_checkpoint(&laya_cfg, &manager) else {
         return;
@@ -610,6 +765,8 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "mnemo2")]
+    use mnemo_app::mnemo2::dispatch_routing::RoutingMode;
 
     fn row(ts: u64, class: &str, disposition: Option<&str>) -> FailureLogRow {
         FailureLogRow {
@@ -758,5 +915,186 @@ mod tests {
             startup_finetune_checkpoint(&laya, &manager),
             Some("english".to_string())
         );
+    }
+
+    /// One routing-log `route` row — the text side of the dataset.
+    #[cfg(feature = "mnemo2")]
+    fn route_log_row(worker: &str, text: &str, skip: Option<&str>) -> DispatchRoutingRow {
+        DispatchRoutingRow::Route {
+            ts: 1,
+            worker_id: worker.to_string(),
+            plan_id: "plan".to_string(),
+            step: 1,
+            mode: RoutingMode::Shadow,
+            label: "routine".to_string(),
+            tier: Some("average".to_string()),
+            confidence: 0.6,
+            probabilities: BTreeMap::new(),
+            threshold: 0.475,
+            cleared: true,
+            lead_tier: Some("average".to_string()),
+            ran_tier: Some("average".to_string()),
+            ran_model: None,
+            text_sha256: String::new(),
+            text: text.to_string(),
+            skip: skip.map(str::to_string),
+            source: Some("laya".to_string()),
+            knn_label: None,
+            knn_share: None,
+            knn_k: None,
+        }
+    }
+
+    /// One routing-log `outcome` row — the label a merged worker proved.
+    #[cfg(feature = "mnemo2")]
+    fn outcome_log_row(worker: &str, label: Option<&str>) -> DispatchRoutingRow {
+        DispatchRoutingRow::Outcome {
+            ts: 2,
+            worker_id: worker.to_string(),
+            plan_id: "plan".to_string(),
+            step: 1,
+            status: "merged".to_string(),
+            final_tier: "average".to_string(),
+            models_used: vec![],
+            review_rounds: 1,
+            fix_rounds: 0,
+            findings: 0,
+            findings_high: 0,
+            audits: 0,
+            cost_micros: 0,
+            label: label.map(str::to_string),
+        }
+    }
+
+    /// One routing-log `user_reroute` row — a mission-control model change.
+    #[cfg(feature = "mnemo2")]
+    fn user_reroute_log_row(worker: &str, to_tier: &str) -> DispatchRoutingRow {
+        DispatchRoutingRow::UserReroute {
+            ts: 3,
+            worker_id: worker.to_string(),
+            plan_id: "plan".to_string(),
+            step: 1,
+            from_tier: "simple".to_string(),
+            to_tier: to_tier.to_string(),
+            from_model: None,
+            to_model: None,
+            status: "running".to_string(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }
+    }
+
+    /// One routing-log `lead_override` row — the lead disagreeing with Laya.
+    #[cfg(feature = "mnemo2")]
+    fn lead_override_log_row(worker: &str, lead_tier: &str) -> DispatchRoutingRow {
+        DispatchRoutingRow::LeadOverride {
+            ts: 4,
+            worker_id: worker.to_string(),
+            plan_id: "plan".to_string(),
+            step: 1,
+            laya_tier: Some("average".to_string()),
+            lead_tier: lead_tier.to_string(),
+            requested_tier: None,
+            confidence: 0.9,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "mnemo2")]
+    fn route_dataset_takes_the_latest_label_per_worker_and_converts_old_ids() {
+        let rows = vec![
+            route_log_row("w1", "Wire the picker through the save path", None),
+            outcome_log_row("w1", Some("average")),
+            user_reroute_log_row("w1", "difficult"),
+            route_log_row("w2", "Add the endpoint with its tests", None),
+            outcome_log_row("w2", Some("medium")),
+            route_log_row("w3", "Too short to classify", Some("too_short")),
+            outcome_log_row("w3", Some("average")),
+        ];
+        let dataset = route_dataset_rows(&rows).expect("the rows export");
+        let by_text: BTreeMap<&str, &str> = dataset
+            .iter()
+            .map(|row| (row.text.as_str(), row.label.as_str()))
+            .collect();
+        // w1's LATEST label is the user reroute onto the legacy `difficult` id,
+        // converted to the `hard` label on read.
+        assert_eq!(
+            by_text.get("Wire the picker through the save path"),
+            Some(&"hard"),
+            "the latest label per worker wins and legacy ids convert"
+        );
+        // w2's new-id `medium` outcome is the `involved` label.
+        assert_eq!(by_text.get("Add the endpoint with its tests"), Some(&"involved"));
+        // w3 has no classifiable route row, so its label never becomes a row.
+        assert!(!by_text.contains_key("Too short to classify"));
+        // The eval corpus rides along, labelled (design §5.1).
+        let labelled = parse_hand_set(HAND_SET_JSONL)
+            .expect("the shipped hand set parses")
+            .into_iter()
+            .filter(|case| case.expected.is_some())
+            .count();
+        assert_eq!(dataset.len(), 2 + labelled);
+    }
+
+    #[test]
+    #[cfg(feature = "mnemo2")]
+    fn route_dataset_excludes_audits_escalations_and_overrides() {
+        let rows = vec![
+            route_log_row("auditor", "Review the merged worker", Some("audit")),
+            user_reroute_log_row("auditor", "difficult"),
+            route_log_row("escalated", "Handle the crash", None),
+            user_reroute_log_row("escalated", "escalate"),
+            route_log_row("overridden", "Classify me", None),
+            lead_override_log_row("overridden", "simple"),
+            route_log_row("custom", "Pick a custom model", None),
+            user_reroute_log_row("custom", "custom"),
+        ];
+        let dataset = route_dataset_rows(&rows).expect("the rows export");
+        // An audit is a reviewer, never a training label; an escalation and a
+        // custom choice carry no label; a lead override is not a routing
+        // judgement — none of them may appear as a worker row.
+        for excluded in [
+            "Review the merged worker",
+            "Handle the crash",
+            "Classify me",
+            "Pick a custom model",
+        ] {
+            assert!(
+                !dataset.iter().any(|row| row.text == excluded),
+                "{excluded} must not be a training row"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "mnemo2")]
+    fn route_dataset_export_writes_rows_and_no_ops_on_a_missing_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-log.jsonl");
+        let out = dir.path().join("nested").join("route-dataset.jsonl");
+        // A missing log is a no-op: nothing is written.
+        assert_eq!(export_route_dataset_at(&missing, &out).unwrap(), 0);
+        assert!(!out.exists());
+        // A real log exports one row per labelled worker first, then the
+        // corpus — the legacy `simple` outcome converted to `trivial`.
+        let log = dir.path().join("log.jsonl");
+        let mut body = String::new();
+        for row in [
+            route_log_row("w1", "Wire the picker through the save path", None),
+            outcome_log_row("w1", Some("simple")),
+        ] {
+            body.push_str(&serde_json::to_string(&row).expect("a routing row serializes"));
+            body.push('\n');
+        }
+        std::fs::write(&log, body).unwrap();
+        let written = export_route_dataset_at(&log, &out).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text.lines().count(), written);
+        let first: serde_json::Value =
+            serde_json::from_str(text.lines().next().expect("the worker rows come first"))
+                .unwrap();
+        assert_eq!(first["text"], "Wire the picker through the save path");
+        assert_eq!(first["label"], "trivial");
     }
 }

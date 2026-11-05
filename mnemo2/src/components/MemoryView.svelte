@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
-  import { Brain, Search } from "@lucide/svelte";
+  import { onDestroy, untrack } from "svelte";
+  import { Brain, LoaderCircle, Search } from "@lucide/svelte";
   import {
     createMemoryTransport,
     displayTitle,
@@ -9,6 +9,7 @@
     formatScore,
     kindLabel,
     isHit,
+    isEngineStarting,
     KIND_CHIPS,
     LIST_PAGE_SIZE,
     mergePage,
@@ -17,6 +18,9 @@
     type MemoryOverview,
     type MemoryRow,
   } from "../lib/memoryView";
+  import { parseRepoPath, repoPathTarget } from "../lib/repoPaths";
+  import { actions } from "../lib/store";
+  import ElapsedTime from "./ElapsedTime.svelte";
   import Markdown from "./Markdown.svelte";
 
   const transport = createMemoryTransport();
@@ -27,12 +31,44 @@
   const SEARCH_LIMIT = 40;
   /** How many recall-test rows the Diagnostics box asks for. */
   const RECALL_LIMIT = 8;
+  /** How long a retry waits while the project engine is still starting. */
+  const ENGINE_RETRY_MS = 250;
+  /** How long a load runs before its elapsed counter appears. */
+  const ELAPSED_AFTER_MS = 1000;
+
+  /** The three surfaces that wait on their first load. */
+  type Surface = "list" | "detail" | "overview";
+
+  /** One surface's first-load state (plan d49ea4a6). */
+  interface WaitState {
+    /** When the wait began — what the elapsed counter counts from. */
+    startedAtMs: number;
+    /** True after a second: a fast load never flashes a counter. */
+    elapsedVisible: boolean;
+    /** True while the backend says the project engine is still starting. */
+    engineStarting: boolean;
+  }
+
+  function quietWait(): WaitState {
+    return { startedAtMs: 0, elapsedVisible: false, engineStarting: false };
+  }
+
+  let waits = $state<Record<Surface, WaitState>>({
+    list: quietWait(),
+    detail: quietWait(),
+    overview: quietWait(),
+  });
+  let loading = $state<Record<Surface, boolean>>({ list: false, detail: false, overview: false });
+
+  /** Every timer the tab armed; cleared when it unmounts. */
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  /** True once the tab is gone: the engine-start retry loop stops there. */
+  let disposed = false;
 
   let rows = $state<MemoryRow[]>([]);
   let offset = $state(0);
   let hasMore = $state(false);
   let kind = $state("all");
-  let loadingList = $state(false);
   let listError = $state("");
 
   let query = $state("");
@@ -54,27 +90,88 @@
     return value instanceof Error ? value.message : "Reading the project's memory failed.";
   }
 
+  /** Start a surface's wait: spinner now, elapsed counter after a second. */
+  function beginWait(surface: Surface): void {
+    loading[surface] = true;
+    waits[surface].startedAtMs = Date.now();
+    waits[surface].elapsedVisible = false;
+    waits[surface].engineStarting = false;
+    timers.push(
+      setTimeout(() => {
+        waits[surface].elapsedVisible = true;
+      }, ELAPSED_AFTER_MS),
+    );
+  }
+
+  /** End a surface's wait: it loaded, or it failed with a real error. */
+  function endWait(surface: Surface): void {
+    loading[surface] = false;
+    waits[surface].engineStarting = false;
+  }
+
+  /** Resolve after `ms` — the gap between two tries at a starting engine. */
+  function pause(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      timers.push(setTimeout(resolve, ms));
+    });
+  }
+
+  /**
+   * Run one memory read. While the backend says the project engine is still
+   * starting (a project open is in flight, so its runtime is not installed
+   * yet), the surface keeps its spinner up and the read is retried — the wait
+   * is a state, not an error. A real failure still surfaces exactly as before.
+   */
+  async function readWhenReady<T>(surface: Surface, run: () => Promise<T>): Promise<T> {
+    for (;;) {
+      try {
+        return await run();
+      } catch (failure) {
+        if (!isEngineStarting(failure)) throw failure;
+        waits[surface].engineStarting = true;
+        await pause(ENGINE_RETRY_MS);
+        if (disposed) throw failure;
+      }
+    }
+  }
+
   /** One record in the reader, or the error that kept it out. */
   async function selectRecord(id: string): Promise<void> {
     if (!transport) return;
+    const api = transport;
+    // The newest record's body is part of the tab-open load, so it waits out
+    // an engine start like the list does; a later click swaps the body in
+    // place, keeping the record already on screen until the new one arrives.
+    const first = detail === null;
+    if (first) beginWait("detail");
     try {
-      detail = await transport.read(id);
+      detail = await readWhenReady("detail", () => api.read(id));
       detailError = "";
     } catch (failure) {
       detailError = errorMessage(failure);
+    } finally {
+      if (first) endWait("detail");
     }
   }
 
   /** The list's first page (reset) or its next page (append). */
   async function loadList(reset: boolean): Promise<void> {
     if (!transport) return;
-    loadingList = true;
+    const api = transport;
+    // Only the first page waits with a spinner of its own; "Load more" keeps
+    // the rows it is extending on screen. `untrack`: this runs from the mount
+    // effect, and reading `rows` there would make writing it re-run the load.
+    const firstPage = reset && untrack(() => rows.length === 0);
+    if (firstPage) beginWait("list");
+    else loading.list = true;
     try {
-      const page = await transport.list({
-        kind,
-        offset: reset ? 0 : offset,
-        limit: LIST_PAGE_SIZE,
-      });
+      const page = await readWhenReady("list", () =>
+        api.list({
+          kind,
+          offset: reset ? 0 : offset,
+          limit: LIST_PAGE_SIZE,
+        }),
+      );
       rows = reset ? page.rows : mergePage(rows, page);
       offset = page.offset + page.rows.length;
       hasMore = page.has_more;
@@ -86,7 +183,8 @@
     } catch (failure) {
       listError = errorMessage(failure);
     } finally {
-      loadingList = false;
+      if (firstPage) endWait("list");
+      else loading.list = false;
     }
   }
 
@@ -138,11 +236,15 @@
   /** The Diagnostics card: embedder, counts, index bookkeeping. */
   async function loadOverview(): Promise<void> {
     if (!transport) return;
+    const api = transport;
+    beginWait("overview");
     try {
-      overview = await transport.overview();
+      overview = await readWhenReady("overview", () => api.overview());
       overviewError = "";
     } catch (failure) {
       overviewError = errorMessage(failure);
+    } finally {
+      endWait("overview");
     }
   }
 
@@ -168,7 +270,11 @@
     void loadOverview();
   });
 
-  onDestroy(() => clearTimeout(searchTimer));
+  onDestroy(() => {
+    disposed = true;
+    clearTimeout(searchTimer);
+    for (const timer of timers) clearTimeout(timer);
+  });
 
   /** The rows the list renders: search hits when a query ran, else the page. */
   const listed = $derived(hits ?? rows);
@@ -227,7 +333,19 @@
         {/if}
 
         <div class="list-scroll">
-          {#if listed.length === 0 && !loadingList}
+          {#if loading.list && listed.length === 0}
+            <div class="memory-loading" role="status">
+              <span class="spin"><LoaderCircle size={15} /></span>
+              <span class="memory-loading-text">
+                {waits.list.engineStarting
+                  ? "Waiting for the project engine to start…"
+                  : "Loading the project's memory…"}
+              </span>
+              {#if waits.list.elapsedVisible}
+                <ElapsedTime startedAtMs={waits.list.startedAtMs} />
+              {/if}
+            </div>
+          {:else if listed.length === 0}
             <p class="list-empty">
               {listIsSearch ? "No record matches that text." : "No record matches this filter."}
             </p>
@@ -253,8 +371,8 @@
             {/each}
           </ul>
           {#if !listIsSearch && hasMore}
-            <button class="load-more" disabled={loadingList} onclick={() => void loadList(false)}>
-              {loadingList ? "Loading …" : "Load more"}
+            <button class="load-more" disabled={loading.list} onclick={() => void loadList(false)}>
+              {loading.list ? "Loading …" : "Load more"}
             </button>
           {/if}
         </div>
@@ -265,7 +383,17 @@
             {#if overviewError !== ""}
               <p class="list-error" role="alert">{overviewError}</p>
             {:else if overview === null}
-              <p class="diag-quiet">Reading the memory store …</p>
+              <div class="memory-loading" role="status">
+                <span class="spin"><LoaderCircle size={13} /></span>
+                <span class="memory-loading-text">
+                  {waits.overview.engineStarting
+                    ? "Waiting for the project engine to start…"
+                    : "Loading the project's memory…"}
+                </span>
+                {#if waits.overview.elapsedVisible}
+                  <ElapsedTime startedAtMs={waits.overview.startedAtMs} />
+                {/if}
+              </div>
             {:else if !overview.available}
               <p class="diag-quiet">{overview.reason}</p>
             {:else}
@@ -343,6 +471,18 @@
           <div class="memory-placeholder">
             <p role="alert">{detailError}</p>
           </div>
+        {:else if detail === null && loading.detail}
+          <div class="memory-placeholder" role="status">
+            <span class="spin"><LoaderCircle size={22} /></span>
+            <p>
+              {waits.detail.engineStarting
+                ? "Waiting for the project engine to start…"
+                : "Loading the project's memory…"}
+            </p>
+            {#if waits.detail.elapsedVisible}
+              <ElapsedTime startedAtMs={waits.detail.startedAtMs} />
+            {/if}
+          </div>
         {:else if detail === null}
           <div class="memory-placeholder">
             <Brain size={22} />
@@ -363,20 +503,34 @@
               </p>
               <h2>{displayTitle(detail.title)}</h2>
               <p class="record-meta">
-                {#if detail.path}<code>{detail.path}</code>{/if}
+                {#if detail.path}
+                  {@const pathRef = parseRepoPath(detail.path)}
+                  {#if pathRef}
+                    <button class="path-link" title={repoPathTarget(pathRef)} onclick={() => actions.openRepoPath(pathRef)}><code>{detail.path}</code></button>
+                  {:else}
+                    <code>{detail.path}</code>
+                  {/if}
+                {/if}
                 <span>{detail.created ?? formatRecordDate(detail.created_at)}</span>
                 <span>{detail.access_count} {detail.access_count === 1 ? "recall" : "recalls"}</span>
               </p>
             </header>
 
-            <Markdown source={detail.markdown} />
+            <Markdown source={detail.markdown} onOpenPath={actions.openRepoPath} />
 
             {#if detail.links.length > 0}
               <section class="record-links" aria-label="Links">
                 <h3>Links</h3>
                 <ul>
                   {#each detail.links as link (link)}
-                    <li><code>{link}</code></li>
+                    {@const linkRef = parseRepoPath(link)}
+                    <li>
+                      {#if linkRef}
+                        <button class="path-link" title={repoPathTarget(linkRef)} onclick={() => actions.openRepoPath(linkRef)}><code>{link}</code></button>
+                      {:else}
+                        <code>{link}</code>
+                      {/if}
+                    </li>
                   {/each}
                 </ul>
               </section>
@@ -427,6 +581,13 @@
   .list-status { margin: 10px 12px 0; color: var(--muted); font-size: var(--text-meta); text-transform: uppercase; letter-spacing: 0.05em; }
   .list-error { margin: 8px 12px 0; color: var(--danger); font-size: var(--text-body); }
   .list-empty { margin: 10px 12px; color: var(--muted); font-size: var(--text-body); }
+
+  /* The first-load wait (plan d49ea4a6): a spinner, what it is waiting for,
+     and — after a second — how long it has been waiting. */
+  .memory-loading { display: flex; align-items: center; gap: 7px; margin: 10px 12px; color: var(--muted); font-size: var(--text-body); }
+  .memory-loading-text { color: var(--ink-soft); }
+  .spin { display: inline-flex; animation: spin 0.9s linear infinite; }
+  @keyframes spin { from { rotate: 0deg; } to { rotate: 360deg; } }
 
   .list-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 0 12px; }
   .record-list { margin: 0; padding: 0; list-style: none; }
@@ -479,6 +640,10 @@
   .record-links ul { margin: 0; padding: 0; list-style: none; }
   .record-links li { margin: 3px 0; }
   .record-links code { padding: 1px 5px; border-radius: 4px; background: var(--surface-soft); font-family: var(--font-mono); font-size: var(--text-meta); }
+  .path-link { display: inline-flex; padding: 0; border: 0; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+  .path-link code { color: var(--accent-strong); }
+  .path-link:hover code { text-decoration: underline; }
+  .path-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 5px; }
   .backlink { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-body); text-align: left; cursor: pointer; }
   .backlink:hover { text-decoration: underline; }
 </style>

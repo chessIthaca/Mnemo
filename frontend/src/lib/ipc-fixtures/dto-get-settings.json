@@ -40,12 +40,8 @@
       "nudge_cooldown_requests": 10
     },
     "routing": {
-      "capable": null,
-      "cheap": null,
       "enforce": false,
-      "escalate": null,
-      "lane_high": null,
-      "lane_medium": null,
+      "first_prompt_min_confidence": null,
       "threshold": 0.8
     },
     "safety": "approve-each-action",

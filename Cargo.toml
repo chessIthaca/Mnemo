@@ -1,6 +1,6 @@
 [package]
 name = "mnemo"
-version = "1.3.0"
+version = "2.0.0"
 edition = "2021"
 description = "Mnemo — a coding-first agentic harness in Rust with persistent memory"
 license = "MIT"
@@ -54,6 +54,7 @@ similar = "3"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+serde_norway = "0.9"
 toml = "1"
 
 # Errors
@@ -104,7 +105,7 @@ base64 = "0.23"
 # Managed-Laya setup pipeline (job 4 D5, §5.1 :168 — the Tauri-free core in
 # src/host/laya.rs): the uv release asset extraction (zip on Windows,
 # tar/flate2 elsewhere). Small pure-Rust crates.
-zip = "8"
+zip = "9"
 tar = "0.4"
 flate2 = "1"
 

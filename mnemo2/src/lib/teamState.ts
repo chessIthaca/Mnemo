@@ -8,6 +8,7 @@ import type {
   ReviewEvidence,
   ReviewRisk,
   WorkerKind,
+  WorkerRouting,
 } from "./types";
 import { messageText } from "./leadState";
 
@@ -132,6 +133,8 @@ export interface TeamWorkerRecord {
   fixer_finding_id: string | null;
   /** The board plan this task belongs to, and its 0-based step. */
   plan_id?: string | null;
+  /** True once an audit worker delivered its report; its job is over. */
+  report_delivered?: boolean;
   plan_step?: number | null;
   /** The model tier the lead dispatched by, when it used one. */
   tier?: string | null;
@@ -145,6 +148,8 @@ export interface TeamWorkerRecord {
   audit_target?: string | null;
   /** Set on audit workers: the exact implementation tip the audit inspected. */
   audit_tip?: string | null;
+  /** The one dispatch-time routing decision, when the dispatch recorded one. */
+  routing?: WorkerRouting | null;
   /**
    * Every message this worker received, oldest first: sender, delivery form,
    * text, time. Absent in ledgers saved before senders were recorded.
@@ -291,6 +296,8 @@ export interface TeamWorkerView {
   reviewRisk: ReviewRisk;
   auditTarget: string | null;
   auditTip: string | null;
+  reportDelivered: boolean;
+  routing: WorkerRouting | null;
 }
 
 export interface TeamViewState {
@@ -527,6 +534,8 @@ function toView(record: TeamWorkerRecord): TeamWorkerView {
     reviewRisk: reviewRiskFrom(record.review_risk),
     auditTarget: record.audit_target ?? null,
     auditTip: record.audit_tip ?? null,
+    reportDelivered: record.report_delivered === true,
+    routing: record.routing ?? null,
   };
 }
 

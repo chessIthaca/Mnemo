@@ -45,14 +45,45 @@ export interface EndpointDetailDto {
   models: ModelDetailDto[];
 }
 
-export type TierName = "difficult" | "average" | "simple";
-export const TIER_NAMES: readonly TierName[] = ["difficult", "average", "simple"];
+/** One rung of the unified tier ladder — the Rust `TierDto` (wire fields are snake_case). */
+export interface TierDto {
+  /** Stable tier id: one of the five ladder ids, never renamed by edits. */
+  id: string;
+  /** Editable display name. */
+  name: string;
+  /** Editable routing definition (multi-line). */
+  definition: string;
+  /** Ordered `endpoint/model` specs; the first is the tier default. */
+  models: string[];
+  /** Default effort for the tier's model, or `null` for none. */
+  effort: string | null;
+  /** `escalate` for the rung only the escalation path ever picks, else `null`. */
+  role: string | null;
+  /** What this rung runs on when it has no model — the tier it folds down to. */
+  resolves_to: string;
+}
 
-/** Ordered `endpoint/model` specs per tier; the first is the tier default. */
+/** The tier ladder — the Rust `TiersDto`: five rungs, cheapest first. */
 export interface TiersDto {
-  difficult: string[];
-  average: string[];
-  simple: string[];
+  tiers: TierDto[];
+}
+
+/** The ladder's five ids, cheapest first — the order is fixed by the design. */
+export const TIER_IDS: readonly string[] = ["trivial", "routine", "medium", "high", "escalate"];
+
+/** The canonical empty draft, before the first load lands. */
+export function emptyTiers(): TiersDto {
+  return {
+    tiers: TIER_IDS.map((id, index) => ({
+      id,
+      name: id[0].toUpperCase() + id.slice(1),
+      definition: "",
+      models: [],
+      effort: null,
+      role: id === "escalate" ? "escalate" : null,
+      resolves_to: TIER_IDS[Math.max(0, index - 1)],
+    })),
+  };
 }
 
 export interface EndpointTestDto {
@@ -89,7 +120,7 @@ export interface SettingsTransport {
   setApiKey(endpointName: string, apiKey: string): Promise<void>;
   testEndpoint(endpointName: string, options?: ProbeOptions): Promise<EndpointTestDto>;
   listProviderModels(endpointName: string, options?: ProbeOptions): Promise<ProviderModelDto[]>;
-  /** What references the endpoint, e.g. "tier difficult: a/m1" or "default model: a/m1". */
+  /** What references the endpoint, e.g. "tier high: a/m1" or "default model: a/m1". */
   endpointUsage(name: string): Promise<string[]>;
   tiers(): Promise<TiersDto>;
   /** Resolves to the stored (trimmed, de-duplicated) tiers; rejects unknown specs. */

@@ -2,10 +2,20 @@ import type { ExternalLeadState } from "./externalLeadEngine";
 import type { IndexingSnapshot } from "./indexingEngine";
 import type { BoardPlan } from "./boardState";
 import type { WorkerDeletionPreview } from "./teamState";
+import type { TraceEntry } from "./trace";
 
-export type Route = "start" | "lead" | "team" | "cost" | "graph" | "plans" | "memory";
+export type Route = "start" | "lead" | "team" | "cost" | "trace" | "graph" | "plans" | "memory";
 
 export type WorkbenchTab = "browser" | "diff" | "plan" | "files" | "trace" | "git";
+
+/** One "open this file" request handed from another view to the Files tab. */
+export interface WorkbenchFileRequest {
+  /** The project-relative path to read. */
+  path: string;
+  /** The 1-based line to reveal, or null to open the file at the top. */
+  line: number | null;
+}
+
 export type TeamFilter = "all" | "needs" | "active" | "done";
 
 export type WorkerStatus =
@@ -166,8 +176,36 @@ export interface WorkerMessage {
   time: string;
 }
 
-/** One item of a worker's thread: a Markdown message or a tool activity. */
-export type WorkerThreadEntry = WorkerMessage | Extract<LeadEntry, { kind: "tool" }>;
+/** A provider or runtime error in a worker's live stream, shown in its thread. */
+export interface WorkerErrorEntry {
+  id: string;
+  kind: "error";
+  time: string;
+  /** The provider's or runtime's error text. */
+  body: string;
+  /** True while the worker retries the request: a muted note that clears once the stream resumes. */
+  retrying: boolean;
+}
+
+/** A muted note recording a live model switch the user made mid-run. */
+export interface WorkerModelSwitchEntry {
+  id: string;
+  kind: "model_switch";
+  time: string;
+  /** The `endpoint/model` spec the user moved this worker to. */
+  model: string;
+  /** The note's text; "Now running on …" once the switched model serves a request. */
+  body: string;
+  /** True once the kernel's model_changed event reports this model serving. */
+  applied: boolean;
+}
+
+/** One item of a worker's thread: a Markdown message, a tool activity, a live error, or a model-switch note. */
+export type WorkerThreadEntry =
+  | WorkerMessage
+  | WorkerErrorEntry
+  | WorkerModelSwitchEntry
+  | Extract<LeadEntry, { kind: "tool" }>;
 
 export interface DiffStats {
   files: number;
@@ -208,6 +246,28 @@ export interface InboxEntry {
   atMs: number;
 }
 
+/**
+ * The one dispatch-time routing decision persisted with a worker (plan
+ * 2ba2168a, design §4.7): what Laya picked, at what confidence, whether it
+ * cleared the gate, who chose the tier that ran, and the one nudge sent.
+ */
+export interface WorkerRouting {
+  /** The tier Laya selected, when it returned a known label. */
+  laya_tier: string | null;
+  /** Laya's confidence, when it answered. */
+  confidence: number | null;
+  /** Whether the answer cleared the configured gate. */
+  cleared: boolean;
+  /** The tier the lead passed or the mode fell back to, when one was used. */
+  lead_tier: string | null;
+  /** Who selected the running tier: `lead`, `laya`, or `lead_override`. */
+  routed_by: string;
+  /** The tier the worker actually started on at dispatch. */
+  ran_tier: string | null;
+  /** The tier the one nudge suggested, if any. */
+  nudged: string | null;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -216,6 +276,8 @@ export interface Worker {
   task: string;
   summary: string;
   status: WorkerStatus;
+  /** The failure text from the worker's record, shown when it failed; null otherwise. */
+  error: string | null;
   model: string;
   /** The `endpoint/model` spec the worker was given; null = the configured default. */
   modelSpec?: string | null;
@@ -223,6 +285,8 @@ export interface Worker {
   tier?: string;
   /** The worker's chosen reasoning effort, when one was set. */
   reasoningEffort?: string;
+  /** The dispatch-time routing decision, when the dispatch recorded one. */
+  routing?: WorkerRouting | null;
   branch: string;
   worktree: string;
   files: string[];
@@ -246,6 +310,8 @@ export interface Worker {
   auditTarget?: string;
   /** For an audit worker: the exact implementation tip it inspected. */
   auditTip?: string;
+  /** True once an audit worker delivered its report; its job is over. */
+  reportDelivered?: boolean;
   fixerFindingId?: string;
   /** The board plan this worker's task belongs to. */
   planId?: string | null;
@@ -391,9 +457,22 @@ export interface DiffSnapshot {
   truncated: boolean;
 }
 
+/**
+ * How loud a popup is: `error` for something that failed or was refused — an
+ * exception, a missing host or runtime, an unknown target, an invalid value —
+ * and `info` for a confirmation, a neutral notice, or a hint about doing
+ * something first.
+ *
+ * An error toast stays until it is dismissed or 12 s pass (and pauses while the
+ * pointer rests on it); an info toast clears itself after 4.2 s. Both kinds are
+ * appended to the UI log, so nothing is lost when one disappears.
+ */
+export type ToastLevel = "info" | "error";
+
 export interface ToastMessage {
   id: number;
   message: string;
+  level: ToastLevel;
 }
 
 /** One configured lead model, as returned by the native runtime. */
@@ -638,4 +717,10 @@ export interface AppState {
   toast: ToastMessage | null;
   /** Saved mission-control worker-list width; null keeps the default split. */
   boardWidth: number | null;
+  /** Filter hand-over planted by openTrace for the Trace route to consume. */
+  traceEntry: TraceEntry | null;
+  /** Plan hand-over planted by openPlanDocument for the Plans tab to consume. */
+  planDocumentId: string | null;
+  /** File hand-over planted by openFileInWorkbench for the Files tab. */
+  workbenchFile: WorkbenchFileRequest | null;
 }

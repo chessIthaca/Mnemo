@@ -23,6 +23,7 @@
   import ReviewEvidence from "./ReviewEvidence.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
   import WorkerInbox from "./WorkerInbox.svelte";
+  import WorkerPlanTab from "./WorkerPlanTab.svelte";
   import WorkerThread from "./WorkerThread.svelte";
 
   const BRIEF_MAX_HEIGHT = 42;
@@ -36,7 +37,7 @@
     measureBriefOverflow?: (element: HTMLElement) => boolean;
   } = $props();
 
-  let tab = $state<"review" | "thread" | "timeline">("thread");
+  let tab = $state<"review" | "thread" | "timeline" | "plan">("thread");
   let lastWorkerId = "";
   let briefContent = $state<HTMLDivElement>();
   let briefExpanded = $state(false);
@@ -49,16 +50,26 @@
   const workflow = $derived(deriveTaskWorkflow(worker));
   const mergeEligibility = $derived(canMerge(worker));
   const audit = $derived(isAuditWorker(worker));
+  /** An audit that delivered its report is over: it cannot be steered,
+   * compacted, resumed or messaged — the lead adjudicates the report. */
+  const auditFinished = $derived(
+    audit && (worker.reportDelivered === true || worker.status === "completed"),
+  );
   const highRisk = $derived(worker.reviewRisk === "high");
   const models = $derived($app.leadRuntime.models);
   /** The model the worker was given: its spec, else the configured default. */
   const modelSpec = $derived(
     worker.modelSpec ?? models.find((model) => model.is_default)?.spec ?? "",
   );
-  /** A worker can move to another model unless it is mid-turn or its task is over. */
+  /**
+   * A worker can move to another model unless its task is over or it only
+   * reviews (an audit's model is never user-switchable). A worker mid-run
+   * switches live: the current call finishes, the next one uses the new model.
+   */
   const modelChangeable = $derived(
-    models.some((model) => model.spec === modelSpec) &&
-      !["working", "dispatching", "merging", "merged", "cancelled"].includes(worker.status),
+    !audit &&
+      models.some((model) => model.spec === modelSpec) &&
+      !["merging", "merged", "cancelled"].includes(worker.status),
   );
 
   $effect(() => {
@@ -67,6 +78,13 @@
     lastWorkerId = id;
     tab = "thread";
     briefExpanded = false;
+  });
+
+  // The Plan tab needs a plan: when the selected worker's plan stamp
+  // disappears in place (its record updated without switching workers),
+  // fall back to the thread instead of showing an empty plan panel.
+  $effect(() => {
+    if (tab === "plan" && !worker.planId) tab = "thread";
   });
 
   $effect(() => {
@@ -135,7 +153,10 @@
                   onchange={(spec, effort) => actions.setWorkerModel(worker.id, spec, effort)}
                 />
               {:else}
-                <span class="model-locked" title="Pause or stop the worker to change its model"><ModelBadge model={worker.model} /></span>
+                <span
+                  class="model-locked"
+                  title={audit ? "An audit worker's model is not user-switchable" : "This worker's task is over, so its model cannot change"}
+                ><ModelBadge model={worker.model} /></span>
               {/if}
             </span>
             {#if !modelChangeable && worker.reasoningEffort}<span class="effort-pill" title="Reasoning effort">effort: {worker.reasoningEffort}</span>{/if}
@@ -147,11 +168,18 @@
 
       <div class="worker-actions" role="toolbar" aria-label="Worker actions">
         <button class="toolbar-button" type="button" aria-label="Diff" title="Open worker diff" onclick={() => actions.openWorkerDiff(worker.id)}>Diff</button>
-        <button class="toolbar-button" type="button" aria-label="Steer" title="Steer worker" disabled={worker.status === "cancelled"} onclick={() => actions.steerWorker(worker.id)}>Steer</button>
-        <button class="toolbar-button" type="button" aria-label="Compact" title="Compact worker context" disabled={worker.compacting || !["completed", "idle", "needs_you", "paused", "stopped", "interrupted", "failed"].includes(worker.status)} onclick={() => actions.compactWorker(worker.id)}>Compact</button>
+        <button
+          class="toolbar-button"
+          type="button"
+          aria-label={`Model calls ${worker.name}`}
+          title="Every model call this worker made, in the Trace page"
+          onclick={() => actions.openTrace({ agent: worker.id })}
+        >Model calls</button>
+        {#if !auditFinished}<button class="toolbar-button" type="button" aria-label="Steer" title="Steer worker" disabled={worker.status === "cancelled"} onclick={() => actions.steerWorker(worker.id)}>Steer</button>{/if}
+        {#if !auditFinished}<button class="toolbar-button" type="button" aria-label="Compact" title="Compact worker context" disabled={worker.compacting || !["completed", "idle", "needs_you", "paused", "stopped", "interrupted", "failed"].includes(worker.status)} onclick={() => actions.compactWorker(worker.id)}>Compact</button>{/if}
         {#if worker.status === "working" || worker.status === "dispatching"}
           <button class="toolbar-button" type="button" aria-label="Pause" title="Pause worker" onclick={() => actions.pauseWorker(worker.id)}><Pause size={10} /> Pause</button>
-        {:else if worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted"}
+        {:else if !auditFinished && (worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted" || (audit && worker.status === "failed"))}
           <button class="toolbar-button" type="button" aria-label="Resume" title="Resume worker" onclick={() => actions.resumeWorker(worker.id)}><Play size={10} /> Resume</button>
         {/if}
         <button class="toolbar-button" type="button" aria-label="Stop" title="Stop worker" disabled={["stopped", "merging", "merged", "cancelled"].includes(worker.status)} onclick={() => actions.stopWorker(worker.id)}><Square size={10} /> Stop</button>
@@ -180,7 +208,7 @@
         style:overflow-y={briefExpanded ? "auto" : "hidden"}
         bind:this={briefContent}
       >
-        <Markdown source={worker.task} onOpenLink={actions.openBrowser} />
+        <Markdown source={worker.task} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} />
       </div>
     </section>
 
@@ -189,6 +217,9 @@
         <p class="audit-scope">
           Read-only audit{#if worker.auditTarget} of <code>{worker.auditTarget}</code>{/if}{#if worker.auditTip} at <code>{worker.auditTip}</code>{/if} · no plan step, no merge
         </p>
+        {#if auditFinished}
+          <p class="audit-scope">Audit finished; its report is with the lead.</p>
+        {/if}
       {:else}
         <TaskWorkflow {workflow} onselect={selectWorkflowStep} />
       {/if}
@@ -199,6 +230,9 @@
       <button class:active={tab === "thread"} type="button" aria-pressed={tab === "thread"} onclick={() => { tab = "thread"; }}>Thread <span>{threadMessages}</span></button>
       <button class:active={tab === "review"} type="button" aria-pressed={tab === "review"} onclick={() => { tab = "review"; }}>Review {#if openFindings > 0}<span>{openFindings}</span>{/if}</button>
       <button class:active={tab === "timeline"} type="button" aria-pressed={tab === "timeline"} onclick={() => { tab = "timeline"; }}>Timeline</button>
+      {#if worker.planId}
+        <button class:active={tab === "plan"} type="button" aria-pressed={tab === "plan"} onclick={() => { tab = "plan"; }}>Plan</button>
+      {/if}
     </nav>
   </header>
 
@@ -261,6 +295,8 @@
     {:else if tab === "thread"}
       <WorkerInbox {worker} />
       <WorkerThread {worker} />
+    {:else if tab === "plan" && worker.planId}
+      <WorkerPlanTab planId={worker.planId} planStep={worker.planStep ?? null} />
     {:else}
       <section class="timeline-panel" aria-label={`${worker.name} timeline`}>
         {#each worker.timeline as step (step.id)}

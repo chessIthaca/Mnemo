@@ -7,7 +7,7 @@ Execute step 2a.6: ModelContext becomes {route: RouteKey, is_subagent} — (1) m
 implementation
 
 ## Context
-Step 2a.6 of .coding/specs/headless-free-agent/job-02a-agent-policy-seam.md :703-747 (the CURRENT STEP of master 694f5a97 — sub-plan pushes under it). The riskiest step (master-spec :957): ModelContext becomes {route: RouteKey, is_subagent}; WorkflowPolicy emits today's chain; [models.free] added.
+Step 2a.6 of .coding/design/headless-free-agent/job-02a-agent-policy-seam.md :703-747 (the CURRENT STEP of master 694f5a97 — sub-plan pushes under it). The riskiest step (master-spec :957): ModelContext becomes {route: RouteKey, is_subagent}; WorkflowPolicy emits today's chain; [models.free] added.
 
 Verified anchors (probed this session, tree = wt/mnemo @fc2b37d):
 - verified: read model_resolver.rs :309-385 — ConfigModelResolver::resolve's walk: arm 1 skill.get(name) (:317-323), arm 2 models.subagent when ctx.is_subagent (:326-330), arm 3 bug_fixing when plan_kind==Some(BugFixing) && state ∈ {Executing, Reviewing} (:343-352), arm 4 the state match (:364-383): Planning→planning, Executing→executing, Reviewing→executing (:372 — the reviewing slot is reviewer-spawn-only, 2026-12-06), Complete→complete, Skill→None (covered by arm 1 or default), Subagent→None (arm 2 or default); then default. THIS ORDER is build_route_key's slot order.

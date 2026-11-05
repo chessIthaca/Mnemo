@@ -14,7 +14,8 @@
 //! - `/mcp`: one JSON-RPC message (`initialize`, `tools/list`, `tools/call`,
 //!   `ping`, notifications). The `X-Mnemo-Root` header names the project the
 //!   Claude session works in; `X-Mnemo-Helper` the helper executable, which
-//!   the lead instructions use as the waiter command.
+//!   the lead instructions use as the waiter command; `X-Mnemo-Bridge` one
+//!   helper process's random id, fixed for that process's lifetime.
 //! - `/lead/notices`, `/lead/wait`, `/lead/gate-agent`, `/lead/detach`: what
 //!   the plugin's hooks and the background waiter need.
 //!
@@ -23,8 +24,14 @@
 //! then on worker notices queue for it and ride the next tool result under
 //! "Since your last call:". Merely opening Claude Code in a project
 //! (`initialize`, `tools/list`, `ping`) or reading `/lead/notices` never
-//! attaches, so it cannot take worker notices from the in-app lead. An
-//! external lead that makes no call for 10 minutes is detached; whatever it
+//! attaches, so it cannot take worker notices from the in-app lead.
+//!
+//! A `tools/call` with a valid `X-Mnemo-Bridge` id remembers that helper while
+//! the lead is attached. `/lead/detach` with a `bridge` forgets only that
+//! helper and releases the lead when no remembered helper remains; a detach
+//! without a valid id keeps the older helpers' behaviour and releases at once.
+//! Every release forgets all helper ids. An external lead that makes no call
+//! for 10 minutes is detached regardless of remembered helpers; whatever it
 //! never read goes to the in-app lead (see
 //! [`LeadRuntime::release_external_lead`]).
 //!
@@ -67,7 +74,7 @@ pub const EXTERNAL_LEAD_CHANNEL: &str = "mnemo2://external-lead";
 
 /// The short lead brief MCP `initialize` returns. `{helper}` becomes the
 /// helper executable's path, so the lead can start the waiter without PATH.
-pub const LEAD_INSTRUCTIONS: &str = "You lead a Mnemo2 team for this project: workers run on the user's own endpoints in tiers (difficult/average/simple); you plan, dispatch, review and merge with the team_* tools.\n\
+pub const LEAD_INSTRUCTIONS: &str = "You lead a Mnemo2 team for this project: workers run on the user's own endpoints in tiers (trivial/routine/medium/high/escalate); you plan, dispatch, review and merge with the team_* tools.\n\
 - Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs; memory_write SPEC:/DECISION:/HOW: learnings before close (see mnemo-lead skill).\n\
 - For code use search (or search_read) and graph_* before Grep or Glob; for project history and decisions use memory_search first.\n\
 - Plan first: plan_create (then plan_show, plan_update, plan_step_done). Each team_dispatch needs a plan_id and step; one worker per step with a precise brief and `tier` (tier beats model).\n\
@@ -108,6 +115,8 @@ const OPEN_MISSION_CONTROL: &str = "open_mission_control";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Give the quit response time to reach the helper before the event loop exits.
+const QUIT_RESPONSE_DELAY: Duration = Duration::from_millis(300);
 const DEFAULT_WAIT_S: u64 = 1800;
 const MAX_WAIT_S: u64 = 3600;
 const IDLE_SWEEP_EVERY: Duration = Duration::from_secs(30);
@@ -124,6 +133,10 @@ pub trait LeadHost: Send + Sync + 'static {
     async fn lead(&self) -> Option<Arc<LeadRuntime>>;
     /// The Mnemo config directory (registered projects, `config.toml`).
     fn config_dir(&self) -> PathBuf;
+    /// The number of worker turns currently running in the app.
+    async fn running_workers(&self) -> usize;
+    /// Leave through Mnemo2's orderly shutdown (the tray's quit path).
+    fn quit(&self);
     /// Ask the UI to open the registered project at `root`.
     fn request_open(&self, root: &Path);
     /// An external lead attached to or detached from the project at `root`.
@@ -623,6 +636,7 @@ impl Shared {
         }
         match request.path.as_str() {
             "/health" => self.health(&request.body).await,
+            "/app/quit" => self.app_quit(&request.body).await,
             "/mcp" => self.mcp(request).await,
             "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach" => {
                 self.lead_route(request).await
@@ -659,6 +673,40 @@ impl Shared {
                 "open_error_age_ms": age_ms,
             }),
         )
+    }
+
+    /// Answer a rebuild helper's quit request, then leave through the same
+    /// orderly shutdown path as the tray. The short delay lets the response
+    /// reach the helper before the process exits.
+    async fn app_quit(&self, body: &[u8]) -> Response {
+        #[derive(serde::Deserialize)]
+        struct QuitBody {
+            #[serde(default)]
+            force: bool,
+        }
+
+        let body: QuitBody = match serde_json::from_slice(body) {
+            Ok(body) => body,
+            Err(err) => return Response::error(400, &format!("invalid JSON body: {err}")),
+        };
+        let running = self.host.running_workers().await;
+        if running > 0 && !body.force {
+            return Response::json(
+                409,
+                &json!({
+                    "error": format!(
+                        "{running} worker(s) are running; quit with force to interrupt them"
+                    ),
+                    "running": running,
+                }),
+            );
+        }
+        let host = Arc::clone(&self.host);
+        tokio::spawn(async move {
+            tokio::time::sleep(QUIT_RESPONSE_DELAY).await;
+            host.quit();
+        });
+        Response::json(200, &json!({ "quitting": true, "pid": std::process::id() }))
     }
 
     /// Ask the UI to try opening the registered project at `root` again: the
@@ -725,7 +773,7 @@ impl Shared {
             "/lead/gate-agent" => Response::json(200, &self.gate_agent(target, body).await),
             "/lead/summary" => self.summary(target).await,
             "/lead/show-worker" => self.show_worker(target, body).await,
-            _ => Response::json(200, &self.detach(target).await),
+            _ => Response::json(200, &self.detach(target, body).await),
         }
     }
 
@@ -932,15 +980,37 @@ impl Shared {
     }
 
     /// Hand the project back to the in-app lead (with the notices the
-    /// external lead never read) and wake any waiter.
-    async fn detach(&self, target: Option<Target>) -> Value {
-        if let Some(target) = target {
-            let was_idle = target.team.clear_external_lead_idle();
-            if target.lead.release_external_lead().await || was_idle {
-                self.host.lead_changed(false, Some(&target.root));
+    /// external lead never read) and wake any waiter. A named helper closes
+    /// without releasing while another helper that made a tool call remains.
+    async fn detach(&self, target: Option<Target>, body: Value) -> Value {
+        let Some(target) = target else {
+            return json!({ "released": false });
+        };
+        if let Some(bridge) = body
+            .get("bridge")
+            .and_then(Value::as_str)
+            .and_then(Self::valid_bridge_id)
+        {
+            if target.team.forget_external_bridge(bridge) > 0 {
+                return json!({ "released": false });
             }
         }
-        json!({})
+        let was_idle = target.team.clear_external_lead_idle();
+        let released = target.lead.release_external_lead().await;
+        if released || was_idle {
+            self.host.lead_changed(false, Some(&target.root));
+        }
+        json!({ "released": released })
+    }
+
+    /// The helper id wire format: lowercase hexadecimal, bounded so an
+    /// arbitrary request cannot grow a team's bridge set without limit.
+    fn valid_bridge_id(value: &str) -> Option<&str> {
+        let id = value.trim();
+        (!id.is_empty()
+            && id.len() <= 64
+            && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+        .then_some(id)
     }
 
     /// Attach the external lead to `target` and report a new attachment.
@@ -999,6 +1069,12 @@ impl Shared {
                         // Code does not tell its MCP servers the session id.
                         if method == "tools/call" {
                             self.attach(&target, None);
+                            if let Some(bridge) = request
+                                .header("x-mnemo-bridge")
+                                .and_then(Self::valid_bridge_id)
+                            {
+                                target.team.note_external_bridge(bridge);
+                            }
                         }
                         target.team.touch_external_lead();
                         self.dispatch(method, params, request, &target).await
@@ -1378,6 +1454,14 @@ impl LeadHost for AppLeadHost {
         mnemo::config::resolve_config_dir(None)
     }
 
+    async fn running_workers(&self) -> usize {
+        crate::mnemo2::running_workers(&self.app).await
+    }
+
+    fn quit(&self) {
+        self.app.exit(0);
+    }
+
     fn open_failure(&self, root: &Path) -> Option<OpenFailure> {
         let state = self.app.try_state::<crate::mnemo2::ipc::Mnemo2State>()?;
         state.open_failure(root)
@@ -1483,6 +1567,10 @@ mod tests {
         opened_workers: Mutex<Vec<(PathBuf, String)>>,
         changes: Mutex<Vec<(bool, Option<PathBuf>)>>,
         shown: AtomicUsize,
+        /// Worker turns the fake UI reports as running.
+        running: AtomicUsize,
+        /// How often the fake UI was asked to leave.
+        quits: AtomicUsize,
         /// A reported open failure: the canonical root and what was reported.
         failure: Mutex<Option<(PathBuf, OpenFailure)>>,
     }
@@ -1495,6 +1583,14 @@ mod tests {
 
         fn config_dir(&self) -> PathBuf {
             self.config.clone()
+        }
+
+        async fn running_workers(&self) -> usize {
+            self.running.load(Ordering::SeqCst)
+        }
+
+        fn quit(&self) {
+            self.quits.fetch_add(1, Ordering::SeqCst);
         }
 
         fn request_open(&self, root: &Path) {
@@ -1695,6 +1791,30 @@ mod tests {
             assert_eq!(reply["result"]["isError"], false, "{reply}");
         }
 
+        /// A `team_status` call from the helper process `bridge`, the way the
+        /// helper identifies itself once per process (header `X-Mnemo-Bridge`).
+        async fn call_as(&self, id: u64, bridge: &str) -> Value {
+            let root = self.root.to_string_lossy().into_owned();
+            let (status, body) = self
+                .post(
+                    "/mcp",
+                    Some("tok-123"),
+                    &[
+                        ("X-Mnemo-Root", &root),
+                        ("X-Mnemo-Helper", HELPER),
+                        ("X-Mnemo-Bridge", bridge),
+                    ],
+                    &json!({
+                        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                        "params": { "name": "team_status", "arguments": {} }
+                    })
+                    .to_string(),
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str(&body).expect("json reply")
+        }
+
         /// The request a `tools/call` for `name` would arrive as, for driving
         /// the router without a socket.
         fn tool_request(&self, name: &str) -> Request {
@@ -1881,7 +2001,7 @@ mod tests {
     #[tokio::test]
     async fn every_route_needs_the_bearer_token() {
         let fixture = Fixture::new(true, true, ServerOptions::default()).await;
-        for path in ["/health", "/mcp", "/lead/notices", "/lead/wait", "/nope"] {
+        for path in ["/health", "/app/quit", "/mcp", "/lead/notices", "/lead/wait", "/nope"] {
             let (status, _) = fixture.post(path, None, &[], "{}").await;
             assert_eq!(status, 401, "{path} without a token");
             let (status, _) = fixture.post(path, Some("wrong"), &[], "{}").await;
@@ -1897,6 +2017,61 @@ mod tests {
         assert!(health["open_error_age_ms"].is_null());
         let (status, _) = fixture.post("/nope", Some("tok-123"), &[], "{}").await;
         assert_eq!(status, 404);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn app_quit_refuses_busy_teams_and_defers_the_orderly_exit() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let shared = Arc::clone(&fixture.server.shared);
+        let request = |body: Value| Request {
+            method: "POST".into(),
+            path: "/app/quit".into(),
+            headers: vec![("Authorization".into(), "Bearer tok-123".into())],
+            body: body.to_string().into_bytes(),
+        };
+        fixture.host.running.store(2, Ordering::SeqCst);
+
+        let response = shared.handle(&request(json!({}))).await;
+        assert_eq!(response.status, 409);
+        let body: Value = serde_json::from_slice(&response.body).expect("409 json");
+        assert_eq!(body["running"], 2);
+        assert_eq!(
+            body["error"],
+            "2 worker(s) are running; quit with force to interrupt them"
+        );
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 0);
+
+        fixture.host.running.store(0, Ordering::SeqCst);
+        let response = shared.handle(&request(json!({}))).await;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).expect("200 json");
+        assert_eq!(body["quitting"], true);
+        assert_eq!(body["pid"], std::process::id());
+        // The response existed before the host was asked to quit. Let the
+        // spawned quit task start its delay, so its deadline is fixed on the
+        // paused clock, and show that nothing happens before it is over.
+        tokio::task::yield_now().await;
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 0);
+        tokio::time::advance(QUIT_RESPONSE_DELAY - Duration::from_millis(1)).await;
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 1);
+
+        // A busy team quits too when the caller insists.
+        fixture.host.running.store(2, Ordering::SeqCst);
+        let response = shared.handle(&request(json!({ "force": true }))).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 1);
+        tokio::task::yield_now().await;
+        tokio::time::advance(QUIT_RESPONSE_DELAY).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fixture.host.quits.load(Ordering::SeqCst), 2);
         fixture.shutdown().await;
     }
 
@@ -3152,6 +3327,79 @@ mod tests {
             .lead_post("/lead/gate-agent", json!({ "root": "/elsewhere", "subagent_type": "x" }))
             .await;
         assert_eq!(reply["decision"], "allow");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_closing_helper_keeps_the_lead_while_another_helper_led() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        for (id, bridge) in [(70, "a"), (71, "b")] {
+            let reply = fixture.call_as(id, bridge).await;
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+        }
+        assert!(team.external_lead_attached());
+
+        let closing = fixture
+            .lead_post("/lead/detach", json!({ "root": root, "bridge": "b" }))
+            .await;
+        assert!(
+            team.external_lead_attached(),
+            "helper a still leads after helper b closes"
+        );
+        assert_eq!(closing, json!({ "released": false }));
+
+        let closing = fixture
+            .lead_post("/lead/detach", json!({ "root": root, "bridge": "a" }))
+            .await;
+        assert!(!team.external_lead_attached());
+        assert_eq!(closing, json!({ "released": true }));
+        assert_eq!(fixture.host.changes(), vec![true, false]);
+        fixture.shutdown().await;
+    }
+
+    /// A helper that names no bridge is anonymous (the pre-bridge contract):
+    /// its detach releases the lead at once, even when another helper led too.
+    #[tokio::test]
+    async fn detach_without_a_bridge_still_releases() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        let reply = fixture.call_as(70, "a").await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert!(team.external_lead_attached());
+
+        let closing = fixture.lead_post("/lead/detach", json!({ "root": root })).await;
+        assert_eq!(closing, json!({ "released": true }));
+        assert!(!team.external_lead_attached());
+        assert_eq!(fixture.host.changes(), vec![true, false]);
+        fixture.shutdown().await;
+    }
+
+    /// The idle sweep releases the lead even though a remembered helper
+    /// never closed (it crashed), and the release forgets it: its own later
+    /// detach finds nothing left to release.
+    #[tokio::test]
+    async fn idle_sweep_releases_even_with_bridges_left() {
+        let options = ServerOptions {
+            idle_detach_ms: 10 * 60 * 1000,
+            ..ServerOptions::default()
+        };
+        let fixture = Fixture::new(true, true, options).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        let reply = fixture.call_as(70, "a").await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert!(team.external_lead_attached());
+        let now = run_file::now_ms();
+        assert!(!fixture.server.sweep_idle(now + 9 * 60 * 1000).await, "still within the window");
+        assert!(fixture.server.sweep_idle(now + 11 * 60 * 1000).await);
+        assert!(!team.external_lead_attached(), "the crashed helper idled out");
+        let closing = fixture
+            .lead_post("/lead/detach", json!({ "root": root, "bridge": "a" }))
+            .await;
+        assert_eq!(closing, json!({ "released": false }), "the sweep already forgot it");
         fixture.shutdown().await;
     }
 

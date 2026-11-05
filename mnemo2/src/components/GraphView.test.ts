@@ -11,6 +11,7 @@ import {
   type GraphSymbol,
   type GraphTransport,
 } from "../lib/graph";
+import { app } from "../lib/store";
 import GraphView from "./GraphView.svelte";
 
 const mocks = vi.hoisted(() => ({ transport: null as unknown }));
@@ -54,6 +55,19 @@ const GENERATE: GraphSymbol = {
 function status(overrides: Partial<GraphStatus> = {}): GraphStatus {
   const now = Math.floor(Date.now() / 1000) - 7 * 60;
   return { available: true, indexing: false, files: 3945, symbols: 12840, edges: 34210, last_indexed_at: now, ...overrides };
+}
+
+/** Seed the host's indexing snapshot: one code pass at `done`/`total` files. */
+function seedCodePass(state: "running" | "done", done = 1200, total = 2400) {
+  app.update((current) => ({
+    ...current,
+    indexing: {
+      revision: (current.indexing?.revision ?? 0) + 1,
+      firstRun: false,
+      code: { state, done, total, detail: null },
+      memory: null,
+    },
+  }));
 }
 
 function makeTransport(overrides: Partial<GraphTransport> = {}): GraphTransport {
@@ -171,6 +185,7 @@ async function renderFocused(transport: GraphTransport = makeTransport()) {
 describe("GraphView", () => {
   beforeEach(() => {
     mocks.transport = null;
+    app.update((current) => ({ ...current, indexing: null }));
   });
 
   afterEach(() => {
@@ -392,5 +407,84 @@ describe("GraphView", () => {
     expect(transport.neighbourhood).toHaveBeenCalled();
     await fireEvent.click(screen.getByRole("button", { name: "Whole graph" }));
     await screen.findByRole("img", { name: "Code graph overview" });
+  });
+
+  it("says the code index is rebuilding, with file progress", async () => {
+    seedCodePass("running");
+    makeTransport({ status: vi.fn(async () => status({ indexing: true })) });
+    render(GraphView);
+    expect(await screen.findByText(/Rebuilding the code index/)).toBeTruthy();
+    expect(screen.getByText("1,200/2,400 files")).toBeTruthy();
+  });
+
+  it("counts symbols, not files, when the host has no total yet", async () => {
+    makeTransport({ status: vi.fn(async () => status({ indexing: true })) });
+    render(GraphView);
+    expect(await screen.findByText("12,840 symbols so far")).toBeTruthy();
+  });
+
+  it("reloads the map, the search and the selection once the pass ends", async () => {
+    vi.useFakeTimers();
+    let indexing = true;
+    const transport = makeTransport({ status: vi.fn(async () => status({ indexing })) });
+    render(GraphView);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await screen.findByText(/Rebuilding the code index/)).toBeTruthy();
+    // A search and a focused symbol, both answered while the pass was running.
+    await fireEvent.input(screen.getByLabelText("Search symbols by name"), { target: { value: "eng" } });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(transport.search).toHaveBeenCalledTimes(1);
+    await fireEvent.click(screen.getByRole("button", { name: /Engine::stats/ }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(screen.getByRole("img", { name: "Neighbourhood of Engine::stats" })).toBeTruthy();
+    indexing = false;
+    vi.mocked(transport.search).mockClear();
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(0);
+    // Nothing waited for the user: the map, the query and the ring all reloaded.
+    expect(transport.overview).toHaveBeenCalledTimes(2);
+    expect(transport.neighbourhood).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Rebuilding the code index/)).toBeNull();
+    expect(transport.search).toHaveBeenLastCalledWith("eng", null);
+  });
+
+  it("calls a symbol missing mid-rebuild 'not indexed yet' and retries when the pass ends", async () => {
+    vi.useFakeTimers();
+    let indexing = true;
+    const transport = makeTransport({ status: vi.fn(async () => status({ indexing })) });
+    vi.mocked(transport.neighbourhood).mockRejectedValueOnce(new Error("unknown symbol src/headless/engine.rs::Engine::stats::680"));
+    render(GraphView);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await screen.findByText("Most connected")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: /Engine::stats/ }));
+    expect(await screen.findByText(/Not indexed yet/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    indexing = false;
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(0);
+    // The completion pass retried the symbol once, and the ring appeared.
+    expect(transport.neighbourhood).toHaveBeenCalledTimes(2);
+    expect(await screen.findByRole("img", { name: "Neighbourhood of Engine::stats" })).toBeTruthy();
+    expect(screen.queryByText(/Not indexed yet/)).toBeNull();
+  });
+
+  it("keeps the panel with a note when the finished pass dropped the symbol", async () => {
+    vi.useFakeTimers();
+    let indexing = true;
+    const transport = makeTransport({ status: vi.fn(async () => status({ indexing })) });
+    render(GraphView);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await screen.findByText("Most connected")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: /Engine::stats/ }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(screen.getByRole("img", { name: "Neighbourhood of Engine::stats" })).toBeTruthy();
+    // The rebuilt index no longer has the symbol: the retry misses, the panel stays.
+    vi.mocked(transport.neighbourhood).mockRejectedValue(new Error("unknown symbol src/headless/engine.rs::Engine::stats::680"));
+    indexing = false;
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await screen.findByText(/moved or was removed/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Engine::stats" })).toBeTruthy();
   });
 });

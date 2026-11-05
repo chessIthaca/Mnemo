@@ -1,0 +1,6 @@
++++
+title = "Mnemo2 helper bridge-id protocol keeps a closing helper from dropping the external lead"
+created = "2026-11-05"
++++
+
+Mnemo2's stdio helper (src-tauri/src/bin/mnemo2_mcp/serve.rs) identifies itself to the local Mnemo2 server with one random id per process (uuid v4 simple → 32 lowercase hex chars), fixed for that process's lifetime. The id travels as header `X-Mnemo-Bridge: <id>` on every forwarded `/mcp` request and as `"bridge": <id>` in the `/lead/detach` JSON body (alongside `"root"`) posted when stdin closes after the helper forwarded a tools/call. The server treats a missing header/field as an anonymous/older helper, which detaches exactly as before. This exists so a short-lived second helper (e.g. a one-off `mnemo2-mcp serve` probe) cannot release the external lead that the main Claude Code session's helper still holds: the server releases the lead only when the last helper that led detaches, with the 10-minute idle sweep (no call, no waiter) as the crash fallback. Regression tests: `forwarded_calls_carry_a_stable_bridge_id` and `detach_on_close_names_the_bridge` in src-tauri/src/bin/mnemo2_mcp/serve_tests.rs; both are red with the header or the body field removed.

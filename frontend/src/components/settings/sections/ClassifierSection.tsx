@@ -16,9 +16,7 @@ import {
 } from "../../../lib/tauri";
 import type {
   ClassifierStatusWire,
-  EndpointInfo,
   LayaCheckpointInfo,
-  ModelRefConfig,
 } from "../../../lib/tauri";
 import { useAgentStore } from "../../../hooks/useAgentStore";
 import {
@@ -26,10 +24,6 @@ import {
   type ClassifierDraft,
   type SettingsSectionHandle,
 } from "../types";
-import { ModelPickerBody } from "./ModelsSection";
-
-
-
 /** Short chip label for a status (the downloading payload collapses to a %). */
 function statusLabel(status: ClassifierStatusWire): string {
   if (typeof status === "object") {
@@ -144,16 +138,11 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   // enforce), the two targets, and the confidence gate.
   const [routing, setRouting] = useState(false);
   const [routingEnforce, setRoutingEnforce] = useState(false);
-  const [routingCheap, setRoutingCheap] = useState<ModelRefConfig | null>(null);
-  const [routingCapable, setRoutingCapable] = useState<ModelRefConfig | null>(null);
-  // The escalation-lane targets (backlog ad56c7bd): plan-step-granular routing
-  // on top of the pre-prompt decision — at each plan step the compound reflex
-  // call classifies the step and the ladder resolves cheap → default → medium
-  // → high → escalate. Unset = the step keeps the configured model.
-  const [routingLaneMedium, setRoutingLaneMedium] = useState<ModelRefConfig | null>(null);
-  const [routingLaneHigh, setRoutingLaneHigh] = useState<ModelRefConfig | null>(null);
-  const [routingEscalate, setRoutingEscalate] = useState<ModelRefConfig | null>(null);
   const [routingThreshold, setRoutingThreshold] = useState(0.8);
+  // The first-prompt gate (design §4.4): null = the kernel's calibrated
+  // default for the offered label count.
+  const [routingFirstPromptMinConfidence, setRoutingFirstPromptMinConfidence] =
+    useState<number | null>(null);
   // The deterministic budget layer (backlog a25a5323, `[general.budget]`):
   // spend caps the model can never override — a reached cap pauses the plan
   // through a pending question (continue for this plan / double the cap /
@@ -162,8 +151,6 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   const [budgetMaxTokensPerPlan, setBudgetMaxTokensPerPlan] = useState(0);
   const [budgetMaxEscalationsPerPlan, setBudgetMaxEscalationsPerPlan] = useState(1);
   const [budgetMaxRetriesPerLane, setBudgetMaxRetriesPerLane] = useState(3);
-  // Endpoint catalog for the target pickers (rides the settings payload).
-  const [endpoints, setEndpoints] = useState<EndpointInfo[]>([]);
   const [catalog, setCatalog] = useState<LayaCheckpointInfo[]>([]);
   const [snapshot, setSnapshot] = useState<string>("");
   const [status, setStatus] = useState<ClassifierStatusWire>("disabled");
@@ -194,12 +181,8 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         autoFinetune: laya?.auto_finetune ?? false,
         routing: laya?.routing ?? false,
         routingEnforce: routingWire?.enforce ?? false,
-        routingCheap: routingWire?.cheap ?? null,
-        routingCapable: routingWire?.capable ?? null,
-        routingLaneMedium: routingWire?.lane_medium ?? null,
-        routingLaneHigh: routingWire?.lane_high ?? null,
-        routingEscalate: routingWire?.escalate ?? null,
         routingThreshold: routingWire?.threshold ?? 0.8,
+        routingFirstPromptMinConfidence: routingWire?.first_prompt_min_confidence ?? null,
         budgetEnabled: budgetWire?.enabled ?? false,
         budgetMaxTokensPerPlan: budgetWire?.max_tokens_per_plan ?? 0,
         budgetMaxEscalationsPerPlan: budgetWire?.max_escalations_per_plan ?? 1,
@@ -213,17 +196,12 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setAutoFinetune(next.autoFinetune);
       setRouting(next.routing);
       setRoutingEnforce(next.routingEnforce);
-      setRoutingCheap(next.routingCheap);
-      setRoutingCapable(next.routingCapable);
-      setRoutingLaneMedium(next.routingLaneMedium);
-      setRoutingLaneHigh(next.routingLaneHigh);
-      setRoutingEscalate(next.routingEscalate);
       setRoutingThreshold(next.routingThreshold);
+      setRoutingFirstPromptMinConfidence(next.routingFirstPromptMinConfidence);
       setBudgetEnabled(next.budgetEnabled);
       setBudgetMaxTokensPerPlan(next.budgetMaxTokensPerPlan);
       setBudgetMaxEscalationsPerPlan(next.budgetMaxEscalationsPerPlan);
       setBudgetMaxRetriesPerLane(next.budgetMaxRetriesPerLane);
-      setEndpoints(s.endpoints ?? []);
       setSnapshot(serializeClassifier(next));
       setCatalog(await listLayaCheckpoints());
       // Read the live status directly (not from the startup snapshot) so the
@@ -278,12 +256,8 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     autoFinetune,
     routing,
     routingEnforce,
-    routingCheap,
-    routingCapable,
-    routingLaneMedium,
-    routingLaneHigh,
-    routingEscalate,
     routingThreshold,
+    routingFirstPromptMinConfidence,
     budgetEnabled,
     budgetMaxTokensPerPlan,
     budgetMaxEscalationsPerPlan,
@@ -326,19 +300,14 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
           laya_failure_triage_knn: failureTriageKnn,
           laya_auto_finetune: autoFinetune,
           // Pre-prompt model routing (backlog 091e694d): the opt-in flag plus
-          // the [general.routing] targets + policy. A target sent as null
-          // clears the stored one — the draft mirrors what the section shows,
-          // so an untouched block round-trips its loaded values.
+          // the [general.routing] policy — the per-tier models live on the
+          // shared tier ladder, not here. The draft mirrors what the section
+          // shows, so an untouched block round-trips its loaded values.
           laya_routing: routing,
           routing: {
-            cheap: routingCheap,
-            capable: routingCapable,
-            // The escalation-lane targets (backlog ad56c7bd) ride the same
-            // null-clears contract as the other two.
-            lane_medium: routingLaneMedium,
-            lane_high: routingLaneHigh,
-            escalate: routingEscalate,
             threshold: routingThreshold,
+            // null = the kernel's calibrated default; the field below shows it.
+            first_prompt_min_confidence: routingFirstPromptMinConfidence,
             enforce: routingEnforce,
           },
           // The deterministic budget layer (backlog a25a5323): the enable
@@ -514,13 +483,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
           <span>
             Route turns by task complexity
             <span className="ml-1 text-[0.7rem] text-(--text-muted)">
-              — the task text of every main-agent turn is classified
-              (trivial / architectural) and, once enforcement is on, a
-              confident answer runs the turn on the matching model below.
-              Below-threshold answers, unknown labels and unset targets keep
-              today's model; skills, subagents and the bug-fixing slot are
-              never overridden. Enable only against a fine-tuned checkpoint —
-              base models are near-chance on this task.
+              — the task text of every main-agent turn is classified on the
+              shared four-label question (trivial / routine / involved / hard)
+              and, once enforcement is on, a confident answer runs the turn on
+              that tier's model (Settings &gt; Tiers). Below-threshold answers
+              and unknown labels keep today's model; skills, subagents and the
+              bug-fixing slot are never overridden. Enable only against a
+              fine-tuned checkpoint — base models are near-chance on this task.
             </span>
           </span>
         </label>
@@ -550,114 +519,12 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
                 </span>
               </span>
             </label>
-            <div className="space-y-1">
-              <div className="text-xs font-medium text-(--text-primary)">
-                Trivial tasks
-              </div>
-              <ModelPickerBody
-                endpoints={endpoints}
-                value={
-                  routingCheap ?? {
-                    endpoint: "",
-                    model: "",
-                    reasoning_effort: null,
-                  }
-                }
-                onChange={(v) => setRoutingCheap(v)}
-              />
-              <div className="text-[0.7rem] text-(--text-muted)">
-                A small, local, mechanical change — typo, rename, version
-                bump, one-line fix. Leave it unset to keep today's model.
-              </div>
-            </div>
-            <div className="space-y-1">
-              <div className="text-xs font-medium text-(--text-primary)">
-                Architectural tasks
-              </div>
-              <ModelPickerBody
-                endpoints={endpoints}
-                value={
-                  routingCapable ?? {
-                    endpoint: "",
-                    model: "",
-                    reasoning_effort: null,
-                  }
-                }
-                onChange={(v) => setRoutingCapable(v)}
-              />
-              <div className="text-[0.7rem] text-(--text-muted)">
-                Design-level work — a new feature, a cross-module refactor, a
-                new dependency, a data-model or concurrency change.
-              </div>
-            </div>
-            <div className="space-y-3 border-t border-border pt-3">
-              <div className="text-xs font-medium text-(--text-primary)">
-                Lane ladder (per plan step)
-              </div>
-              <div className="text-[0.7rem] text-(--text-muted)">
-                Needs the compound reflex opt-in plus a live classifier: at
-                each plan step the step text is classified in ONE call and the
-                matching lane serves that step. A step keeps its configured
-                model while a lane target is unset, the ladder re-asks only
-                after a failed cycle, and it stays shadow-first until
-                enforcement is on above.
-              </div>
-              <div className="space-y-1">
-                <div className="text-xs font-medium text-(--text-primary)">
-                  Medium-complexity steps
-                </div>
-                <ModelPickerBody
-                  endpoints={endpoints}
-                  value={
-                    routingLaneMedium ?? {
-                      endpoint: "",
-                      model: "",
-                      reasoning_effort: null,
-                    }
-                  }
-                  onChange={(v) => setRoutingLaneMedium(v)}
-                />
-              </div>
-              <div className="space-y-1">
-                <div className="text-xs font-medium text-(--text-primary)">
-                  High-complexity steps
-                </div>
-                <ModelPickerBody
-                  endpoints={endpoints}
-                  value={
-                    routingLaneHigh ?? {
-                      endpoint: "",
-                      model: "",
-                      reasoning_effort: null,
-                    }
-                  }
-                  onChange={(v) => setRoutingLaneHigh(v)}
-                />
-              </div>
-              <div className="space-y-1">
-                <div className="text-xs font-medium text-(--text-primary)">
-                  Escalate after a failed cycle
-                </div>
-                <ModelPickerBody
-                  endpoints={endpoints}
-                  value={
-                    routingEscalate ?? {
-                      endpoint: "",
-                      model: "",
-                      reasoning_effort: null,
-                    }
-                  }
-                  onChange={(v) => setRoutingEscalate(v)}
-                />
-                <div className="text-[0.7rem] text-(--text-muted)">
-                  Served once a step has failed a cycle (a permanent or
-                  flaky-test failure verdict) and the re-ask answers escalate.
-                </div>
-              </div>
+            <div className="text-[0.7rem] text-(--text-muted)">
+              Models per tier are set in Mnemo2: Settings &gt; Tiers.
             </div>
             <div className="flex items-center gap-2">
               <label className="text-[0.7rem] text-(--text-muted)">
-                Confidence gate
+                Step-lane gate
               </label>
               <input
                 type="number"
@@ -680,8 +547,48 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
                 className="w-20 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
               <span className="text-[0.7rem] text-(--text-muted)">
-                a decision routes only at or above it (default 0.80)
+                the per-step lane ladder routes only at or above it (default
+                0.80)
               </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-[0.7rem] text-(--text-muted)">
+                First-prompt gate
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={1}
+                step={0.025}
+                value={routingFirstPromptMinConfidence ?? ""}
+                placeholder="calibrated default 0.475"
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  // An empty field means "use the calibrated default", never 0
+                  // (which would route every first prompt).
+                  if (raw === "") {
+                    setRoutingFirstPromptMinConfidence(null);
+                    return;
+                  }
+                  const next = Number(raw);
+                  if (!Number.isFinite(next) || next < 0 || next > 1) {
+                    e.target.value = String(routingFirstPromptMinConfidence ?? "");
+                    return;
+                  }
+                  setRoutingFirstPromptMinConfidence(next);
+                }}
+                className="w-32 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
+              />
+              <span className="text-[0.7rem] text-(--text-muted)">
+                {routingFirstPromptMinConfidence === null
+                  ? "calibrated default 0.475 (0.60 with two labels) — the routing eval replaces it"
+                  : "a first-prompt route only at or above it"}
+              </span>
+            </div>
+            <div className="text-[0.7rem] text-(--text-muted)">
+              Routes the first prompt of a session once; afterwards Laya only
+              suggests. A manual model pick turns routing off for that session
+              and is logged.
             </div>
           </div>
         )}

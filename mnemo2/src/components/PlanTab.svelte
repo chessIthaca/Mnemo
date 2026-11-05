@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { ArrowUpRight, Check, ChevronDown, ChevronRight, Circle } from "@lucide/svelte";
   import { createBoardTransport } from "../lib/boardEngine";
   import { closedPlans, openPlans, planProgress, type BoardPlan } from "../lib/boardState";
@@ -34,6 +34,10 @@
   const transport = createBoardTransport();
   let expanded = $state<Record<string, boolean>>({});
   let details = $state<Record<string, PlanDetails>>({});
+  /** A handed-over plan id the board does not list, for the not-found note. */
+  let missingPlan = $state("");
+  /** The tab's root, used to bring a handed-over plan's card into view. */
+  let tabSection = $state<HTMLElement | null>(null);
 
   const isExpanded = (plan: BoardPlan) => expanded[plan.id] === true;
 
@@ -69,6 +73,36 @@
     if (opening && !details[plan.id]?.markdown) void loadDetails(plan);
   }
 
+  /**
+   * A plan id the Memory tab handed over: expand it, read its document and
+   * scroll it into view once the board lists it. An id the board never lists
+   * shows a short note instead, so the click is never a silent no-op.
+   */
+  $effect(() => {
+    const id = $app.planDocumentId;
+    if (id === null || scope !== "all") return;
+    const plan = $app.board.find((entry) => entry.id === id);
+    if (!plan) {
+      // The board syncs when a project opens: an empty one is not proof.
+      if ($app.board.length === 0) return;
+      actions.clearPlanDocument();
+      missingPlan = id;
+      return;
+    }
+    actions.clearPlanDocument();
+    missingPlan = "";
+    expanded[plan.id] = true;
+    if (!details[plan.id]?.markdown) void loadDetails(plan);
+    void scrollToPlan(plan.id);
+  });
+
+  /** Bring an expanded plan's card into view, after its details render. */
+  async function scrollToPlan(planId: string) {
+    await tick();
+    const card = tabSection?.querySelector<HTMLElement>(`[data-plan-id="${planId}"]`);
+    card?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+  }
+
   // An open card re-reads its document on the board change, so the details
   // follow edits the lead makes while the tab stays open.
   onMount(() => {
@@ -92,7 +126,7 @@
 
 {#snippet planCard(plan: BoardPlan)}
   {@const progress = planProgress(plan)}
-  <article class="plan" data-status={plan.status} aria-label={plan.title}>
+  <article class="plan" data-plan-id={plan.id} data-status={plan.status} aria-label={plan.title}>
     <header class="plan-header">
       <p>
         <span class="kind">{plan.kind}</span>
@@ -106,7 +140,7 @@
         ><ChevronDown size={11} /> Details</button>
       </p>
       <h2>{plan.title}</h2>
-      {#if plan.goal}<Collapsible maxHeight={60} label={`${plan.title} goal`}><Markdown source={plan.goal} onOpenLink={actions.openBrowser} /></Collapsible>{/if}
+      {#if plan.goal}<Collapsible maxHeight={60} label={`${plan.title} goal`}><Markdown source={plan.goal} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} /></Collapsible>{/if}
       {#if plan.report_path}<code class="report">{plan.report_path}</code>{/if}
     </header>
     <ol class="steps">
@@ -138,18 +172,22 @@
         {:else if details[plan.id]?.error}
           <p class="details-note details-error">{details[plan.id].error}</p>
         {:else}
-          <Markdown source={detailSource(plan)} onOpenLink={actions.openBrowser} />
+          <Markdown source={detailSource(plan)} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} />
         {/if}
       </section>
     {/if}
   </article>
 {/snippet}
 
-<section class="plan-tab" aria-label="Plan">
+<section class="plan-tab" aria-label="Plan" bind:this={tabSection}>
   {#if scope === "open"}
     <p class="scope-header">
       <button class="all-plans" type="button" onclick={actions.openPlans}>All plans <ArrowUpRight size={11} /></button>
     </p>
+  {/if}
+
+  {#if missingPlan !== ""}
+    <p class="plan-missing" role="status">Plan “{missingPlan}” is not on this project's board.</p>
   {/if}
 
   {#each open as plan (plan.id)}{@render planCard(plan)}{/each}
@@ -172,7 +210,7 @@
   .all-plans { display: inline-flex; align-items: center; gap: 4px; padding: 2px 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-body); font-weight: 650; cursor: pointer; }
   .all-plans:hover { text-decoration: underline; }
   .all-plans:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
-  .plan { margin-bottom: 20px; }
+  .plan { max-width: 920px; margin-bottom: 14px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / 0.04); }
   .plan[data-status="closed"], .plan[data-status="abandoned"] { opacity: 0.8; }
   .plan-header p { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .kind { padding: 2px 6px; border-radius: 6px; background: var(--surface-soft); text-transform: uppercase; }
@@ -183,7 +221,7 @@
   .details-toggle:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 1px; }
   .details-toggle :global(svg) { transition: transform 120ms ease; }
   .details-toggle[aria-expanded="true"] :global(svg) { transform: rotate(180deg); }
-  .plan-details { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  .plan-details { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--canvas); }
   .plan-details :global(.markdown) { font-size: var(--text-body); line-height: 1.55; }
   .plan-details :global(.markdown h2) { margin: 16px 0 6px; font-size: var(--text-title); font-weight: 620; }
   .plan-details :global(.markdown h2:first-child) { margin-top: 0; }
@@ -196,6 +234,7 @@
   .plan-header :global(.markdown h4), .plan-header :global(.markdown h5), .plan-header :global(.markdown h6) { font-size: var(--text-body); }
   .report { display: block; margin-top: 6px; color: var(--muted); font-size: var(--text-body); }
   .plan-empty { padding: 40px 4px; color: var(--muted); }
+  .plan-missing { margin: 0 0 14px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--warning-soft); color: var(--warning); font-size: var(--text-body); }
   .plan-empty h2 { margin: 0; color: var(--ink); font-family: var(--font-prose); font-size: var(--text-page); font-weight: 550; }
   .steps { margin: 10px 0 0; padding: 0; list-style: none; }
   .step { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
@@ -210,7 +249,7 @@
   .chip small { color: var(--muted); font-size: var(--text-meta); }
   .chip[data-status="merged"] small { color: var(--accent-strong); }
   .chip[data-status="failed"] small, .chip[data-status="conflict"] small { color: var(--danger); }
-  .closed > summary { display: flex; align-items: center; gap: 5px; margin-bottom: 14px; color: var(--muted); font-size: var(--text-body); cursor: pointer; list-style: none; }
+  .closed > summary { display: flex; align-items: center; gap: 5px; margin-bottom: 14px; color: var(--muted); font-size: var(--text-meta); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; list-style: none; }
   .closed > summary::-webkit-details-marker { display: none; }
   .closed[open] > summary :global(svg) { transform: rotate(90deg); }
 </style>

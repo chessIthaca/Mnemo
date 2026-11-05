@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::mnemo2::ledger::LeadTeamLedger;
 use crate::mnemo2::team::{BoardSignal, MessageSender, TeamRuntime, TeamRuntimeOptions};
+use crate::mnemo2::trace_view::TraceSupport;
 use crate::mnemo2::usage::event_session;
 
 /// The Tauri event channel name used by the IPC layer.
@@ -271,6 +272,11 @@ pub struct LeadRuntime {
     /// explicit stop in [`LeadRuntime::shutdown`] is the primary path,
     /// the manager's Drop is only the safety net.
     laya: std::sync::Mutex<Option<Arc<LayaManager>>>,
+    /// The trace backend for the current engine (plan c3ba2b58 step B):
+    /// the ring raised to 128 records, the metadata journal at
+    /// `.coding/logs/`, and its background writer. `None` before the first
+    /// engine start and after [`LeadRuntime::shutdown`].
+    trace_support: std::sync::Mutex<Option<Arc<TraceSupport>>>,
 }
 
 /// The project stores the engine wired into its own agent registries. The
@@ -365,22 +371,33 @@ impl LeadRuntime {
             stores: std::sync::Mutex::new(None),
             indexing: crate::mnemo2::indexing::IndexingTracker::new(),
             laya: std::sync::Mutex::new(None),
+            trace_support: std::sync::Mutex::new(None),
         };
         runtime.start_engine(provider).await?;
+        let engine = runtime.engine_handle().await?;
+        let classifier = mnemo::headless::Setup::open(Some(runtime.config_dir.clone()))
+            .map_err(|error| format!("open the lead settings: {error}"))?
+            .for_engine(&engine)
+            .classifier_slot();
         let team = TeamRuntime::open(TeamRuntimeOptions {
-            engine: runtime.engine_handle().await?,
+            engine,
             workspace_root: runtime.workspace_root.clone(),
             state_dir: runtime.state_dir.clone(),
+            config_dir: runtime.config_dir.clone(),
+            classifier,
+            routing_log_path: cfg!(test)
+                .then(|| runtime.state_dir.join("dispatch_routing.jsonl")),
             slots: None,
             models: runtime.models(),
             pricing: runtime.pricing()?,
         })
         .await?;
+        let team = Arc::new(team);
         team.set_tiers(runtime.tiers());
         if let Some(board) = runtime.board_handle() {
             team.attach_board(board);
         }
-        *runtime.team.lock().await = Some(Arc::new(team));
+        *runtime.team.lock().await = Some(team);
         let live = runtime
             .spawn_live(1, selected, spawn_model, spawn_effort, persisted.transcript)
             .await?;
@@ -569,6 +586,16 @@ impl LeadRuntime {
             .map_err(|err| format!("could not load model pricing: {err}"))
     }
 
+    /// The trace backend for the current engine — the raised ring, the
+    /// metadata journal, and its writer. `None` when no engine is running.
+    pub(crate) fn trace_support(&self) -> Option<Arc<TraceSupport>> {
+        self.trace_support
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The shared team runtime for this lead.
     /// The shared team runtime for this lead.
     pub(crate) async fn team_handle(&self) -> Result<Arc<TeamRuntime>, String> {
         self.team
@@ -889,6 +916,10 @@ impl LeadRuntime {
         if let Some(team) = self.team.lock().await.take() {
             team.shutdown().await;
         }
+        // Stop the trace journal's background writer before the engine
+        // drops: it polls the engine's shared trace log (plan c3ba2b58
+        // step B).
+        self.trace_support.lock().unwrap_or_else(|e| e.into_inner()).take();
         // Stop the managed Laya sidecar BEFORE the engine drops: every
         // classifier consumer (routing, auto-typing, triage) reads the
         // shared slot at call time, and the manager's Drop kill is only
@@ -991,6 +1022,12 @@ impl LeadRuntime {
         // The classifier attach is last and never gates the start: the
         // fill is I/O-free and every failure only logs.
         self.attach_laya(&engine).await;
+        // Plan c3ba2b58 step B: the trace backend per engine — the ring
+        // raised to 128 records and the metadata journal's background
+        // writer. A restarted engine replaces the slot (dropping the old
+        // support aborts its writer).
+        *self.trace_support.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::new(TraceSupport::start(&engine)));
         *self.engine.lock().await = Some(engine);
         Ok(())
     }
@@ -1110,6 +1147,26 @@ impl LeadRuntime {
                 host_tools,
                 external_policy: None,
                 guardrails: None,
+                // Plan c3ba2b58 step B: the lead's trace identity — the
+                // spawn path fills the allocated agent/session ids and
+                // stamps it on the loop, so every lead call's record
+                // carries `actor_kind: lead` and the display name.
+                trace_identity: Some(mnemo::provider::trace::TraceIdentity {
+                    actor_kind: mnemo::provider::trace::TraceActorKind::Lead,
+                    agent_id: String::new(),
+                    session_id: String::new(),
+                    agent_name: "Lead".to_string(),
+                    worker_id: None,
+                    plan_id: None,
+                    plan_step: None,
+                }),
+                // Plan 40eef714 step 1: the lead session carries no
+                // pinned task.
+                pinned_task: None,
+                // Plan 2ba2168a step 1: the lead session's turns are never
+                // classified by the per-prompt gate — Mnemo2 routes at
+                // dispatch instead.
+                skip_turn_routing: true,
             })
             .await
             .map_err(|err| format!("could not spawn the lead session: {err}"))?;
@@ -1559,6 +1616,13 @@ async fn pump_events(
                 }
                 false
             }
+            // A deferred compact-then-switch completed on the lead's own
+            // session: informational — the turn continues on the new model, so
+            // the lead stays busy and no error is recorded (bug 2026-11-02,
+            // plan 1238e0de: this used to arrive as an `Error`).
+            SerializableAgentEvent::ModelSwapSummarized { .. } => false,
+            // Mnemo1-only informational notice; the lead pump ignores it.
+            SerializableAgentEvent::RoutingNotice { .. } => false,
             SerializableAgentEvent::ModelChanged { model: changed, .. } => {
                 // The engine's bus is engine-wide: only OUR session's
                 // model change may re-point the lead's observed model
@@ -1716,10 +1780,219 @@ fn configured_default(config: &Config) -> Option<String> {
         .find(|endpoint| endpoint.models.iter().any(|spec| spec.id == model))
         .map(|endpoint| format!("{}/{}", endpoint.name, model))
 }
+/// Trace identity tests (plan c3ba2b58 step B) — in their own module so the
+/// append-heavy `mod tests` below stays untouched by concurrent work.
+#[cfg(test)]
+mod trace_tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
 
+    use super::*;
+    use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerSessionSpec};
+    use mnemo::headless::{Engine, EngineOptions, SessionCommand, TraceApi};
+    use mnemo::provider::trace::{TraceActorKind, TraceIdentity, LlmRequestSummary};
+
+    /// A minimal worker identity for tests that spawn worker sessions
+    /// without a full WorkerRecord (the tool-profile tests reuse it).
+    pub(super) fn worker_identity(name: &str) -> TraceIdentity {
+        TraceIdentity {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: String::new(),
+            session_id: String::new(),
+            agent_name: name.to_string(),
+            worker_id: Some("w-trace".to_string()),
+            plan_id: Some("plan-trace".to_string()),
+            plan_step: Some(1),
+        }
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git(root: &Path) {
+        run_git(root, &["init", "-b", "main"]);
+        run_git(root, &["config", "user.name", "Mnemo2 Test"]);
+        run_git(root, &["config", "user.email", "mnemo2@example.invalid"]);
+        std::fs::write(root.join("README.md"), "seed\n").expect("seed file");
+        std::fs::write(root.join(".gitignore"), ".worktrees/\n.coding/\n")
+            .expect("ignore worktrees and state");
+        run_git(root, &["add", "README.md", ".gitignore"]);
+        run_git(root, &["commit", "-m", "seed"]);
+    }
+
+    /// A config whose only endpoint is unreachable (port 9), so the first
+    /// provider call fails fast and lands in the trace log with its
+    /// stamped identity — no scripted provider needed.
+    fn write_unreachable_config(config: &Path) {
+        std::fs::create_dir_all(config).expect("config dir");
+        std::fs::write(
+            config.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            config.join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"scripted-a\"]\n",
+        )
+        .expect("endpoints.toml");
+    }
+
+    /// Wait until the trace log holds a terminal record, then return the
+    /// newest one: the first model call over the unreachable endpoint is
+    /// terminal the moment its connect fails.
+    async fn wait_for_terminal_record(
+        trace: &TraceApi,
+        budget_ms: u64,
+    ) -> Option<LlmRequestSummary> {
+        let deadline = Instant::now() + Duration::from_millis(budget_ms);
+        while Instant::now() < deadline {
+            if let Some(record) = trace.list().into_iter().rev().find(|s| s.is_complete) {
+                return Some(record);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn lead_calls_carry_the_lead_identity() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_unreachable_config(config.path());
+        let lead = LeadRuntime::open(LeadRuntimeOptions {
+            workspace_root: root.path().to_path_buf(),
+            config_dir: Some(config.path().to_path_buf()),
+            state_dir: state.path().to_path_buf(),
+            model: None,
+        })
+        .await
+        .expect("open the lead");
+
+        // One prompt: the provider call fails fast (connection refused) but
+        // its trace record carries the identity stamped at spawn.
+        lead.send_prompt("hello".to_string(), Vec::new())
+            .await
+            .expect("send the prompt");
+        let engine = lead.engine_handle().await.expect("the engine");
+        let trace = engine.trace();
+        let record =
+            wait_for_terminal_record(&trace, 15_000).await.expect("a terminal lead record");
+
+        assert_eq!(trace.run_id(), record.run_id, "the record names its run");
+        let attribution = record.attribution.expect("the lead call is attributed");
+        assert_eq!(attribution.actor_kind, TraceActorKind::Lead);
+        assert_eq!(attribution.agent_name, "Lead");
+        assert_eq!(attribution.worker_id, None);
+        assert_eq!(attribution.plan_id, None);
+        assert_eq!(attribution.plan_step, None);
+        assert!(
+            !attribution.agent_id.is_empty(),
+            "the spawn path filled the agent id"
+        );
+        assert!(
+            !attribution.session_id.is_empty(),
+            "the spawn path filled the session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_calls_carry_worker_plan_and_step() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_unreachable_config(config.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: mnemo::workspace::Workspace::new(root.path()),
+            config_dir: Some(config.path().to_path_buf()),
+            permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+            memory: mnemo::headless::MemoryBackend::Disabled,
+            index_codegraph: false,
+            require_git: true,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("start the engine");
+        let engine = std::sync::Arc::new(engine);
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: engine.clone(),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+            slots: Some(2),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("open the team runtime");
+
+        let session = team
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: root.path().to_path_buf(),
+                resume: None,
+                kind: "implementation".to_string(),
+                trace_identity: worker_identity("Trace worker"),
+                pinned_task: None,
+            })
+            .await
+            .expect("spawn the worker session");
+        session
+            .send(SessionCommand::Prompt {
+                text: "hello from the worker".to_string(),
+                images: Vec::new(),
+            })
+            .await
+            .expect("prompt the worker");
+        let trace = engine.trace();
+        let record =
+            wait_for_terminal_record(&trace, 15_000).await.expect("a terminal worker record");
+
+        assert_eq!(trace.run_id(), record.run_id, "one shared log, one run");
+        let attribution = record.attribution.expect("the worker call is attributed");
+        assert_eq!(attribution.actor_kind, TraceActorKind::Worker);
+        assert_eq!(attribution.agent_name, "Trace worker");
+        assert_eq!(attribution.worker_id.as_deref(), Some("w-trace"));
+        assert_eq!(attribution.plan_id.as_deref(), Some("plan-trace"));
+        assert_eq!(attribution.plan_step, Some(1));
+        assert!(!attribution.session_id.is_empty(), "ids filled at spawn");
+    }
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! tiers_dto {
+        (simple: $simple:expr, average: $average:expr, difficult: $difficult:expr $(,)?) => {{
+            let mut dto = mnemo::headless::TiersDto::default();
+            dto.tiers[0].models = $simple;
+            dto.tiers[1].models = $average;
+            dto.tiers[3].models = $difficult;
+            dto
+        }};
+        (average: $average:expr, ..Default::default() $(,)?) => {{
+            let mut dto = mnemo::headless::TiersDto::default();
+            dto.tiers[1].models = $average;
+            dto
+        }};
+    }
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -1730,6 +2003,8 @@ mod tests {
         ToolChoice, ToolSchema,
     };
     use tempfile::TempDir;
+
+    use crate::mnemo2::team::{KICKOFF, READ_BACK_KICKOFF, WorkerSessionSpec};
 
     /// One scripted turn: the events to emit, optionally held inside
     /// `complete` until the test releases a gate.
@@ -2033,6 +2308,16 @@ mod tests {
         std::fs::write(&path, text).expect("writing config.toml");
     }
 
+    /// Append Mnemo1's per-state `[models]` section to the fixture config —
+    /// the shared-config shape plan 7f0b3848 tests against: the slots belong
+    /// to Mnemo1's workflow and live in the same config.toml Mnemo2 reads.
+    fn enable_per_state_models_in_config(dir: &Path) {
+        let path = dir.join("config.toml");
+        let mut text = std::fs::read_to_string(&path).expect("fixture config.toml");
+        text.push_str("\n[models.executing]\nendpoint = \"test\"\nmodel = \"scripted-b\"\n");
+        std::fs::write(&path, text).expect("writing config.toml");
+    }
+
     /// Doctor a PRETEND-installed managed runtime under `<config_dir>/laya`
     /// — the same fake the kernel seam's tests plant (setup.rs's
     /// `doctor_installed_laya`): exactly the two files
@@ -2073,7 +2358,7 @@ mod tests {
         config: &TempDir,
         state: &TempDir,
         llm: Arc<dyn LlmClient>,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         open_git_team_with_pricing(root, config, state, llm, Vec::new()).await
     }
 
@@ -2083,7 +2368,7 @@ mod tests {
         state: &TempDir,
         llm: Arc<dyn LlmClient>,
         pricing: Vec<mnemo::config::PricingEntry>,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         open_git_team_slots(root, config, state, llm, pricing, 1).await
     }
 
@@ -2094,7 +2379,7 @@ mod tests {
         llm: Arc<dyn LlmClient>,
         pricing: Vec<mnemo::config::PricingEntry>,
         slots: usize,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_config(config.path(), &["scripted-a"]);
@@ -2106,12 +2391,16 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
                 slots: Some(slots),
                 models: lead.models(),
                 pricing,
             })
             .await
             .expect("team opens");
+        let team = Arc::new(team);
         team.attach_board(lead.board_handle().expect("the lead's plan board"));
         (lead, team)
     }
@@ -2124,7 +2413,7 @@ mod tests {
         state: &TempDir,
         llm: Arc<dyn LlmClient>,
         slots: usize,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_config(config.path(), &["scripted-a"]);
@@ -2136,12 +2425,16 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
                 slots: Some(slots),
                 models: lead.models(),
                 pricing: Vec::new(),
             })
             .await
             .expect("team opens");
+        let team = Arc::new(team);
         team.attach_board(lead.board_handle().expect("the lead's plan board"));
         (lead, team)
     }
@@ -2260,6 +2553,140 @@ mod tests {
             .await
             .expect("check");
         worker
+    }
+
+
+    struct DispatchRoutingClassifier;
+
+    #[async_trait::async_trait]
+    impl mnemo::memory::Classifier for DispatchRoutingClassifier {
+        async fn classify(
+            &self,
+            _state: &str,
+            _question: &mnemo::memory::Question,
+        ) -> Option<mnemo::memory::Answer> {
+            Some(mnemo::memory::Answer::Choice {
+                label: mnemo::agent::route_question::LABEL_HARD.into(),
+                confidence: 0.71,
+                probabilities: std::collections::BTreeMap::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routing_survives_a_real_worker_start() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        crate::mnemo2::dispatch_routing::save_routing_settings(
+            config.path(),
+            &crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+        )
+        .expect("save shadow routing mode");
+        let mut server = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("routing worker started"),
+            gate: None,
+        }])
+        .await;
+        write_stub_config(config.path(), server.addr);
+        let engine = std::sync::Arc::new(
+            Engine::start(EngineOptions {
+                workspace: mnemo::workspace::Workspace::new(root.path()),
+                config_dir: Some(config.path().to_path_buf()),
+                permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+                memory: mnemo::headless::MemoryBackend::Disabled,
+                index_codegraph: false,
+                require_git: true,
+                auto_install_embedder: false,
+            })
+            .await
+            .expect("start the engine"),
+        );
+        let mut team = TeamRuntime::open(TeamRuntimeOptions {
+            engine,
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            config_dir: config.path().to_path_buf(),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+            slots: Some(1),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("open the team runtime");
+        team.set_catalog(
+            vec![LeadModel {
+                endpoint: "test".into(),
+                model: "model-a".into(),
+                spec: "test/model-a".into(),
+                is_default: true,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            tiers_dto! {
+                simple: vec!["test/model-a".into()],
+                average: vec!["test/model-a".into()],
+                difficult: vec!["test/model-a".into()],
+            },
+            Vec::new(),
+        );
+        let classifier: std::sync::Arc<dyn mnemo::memory::Classifier> =
+            std::sync::Arc::new(DispatchRoutingClassifier);
+        team.set_classifier_for_test(std::sync::Arc::new(std::sync::RwLock::new(Some(
+            classifier,
+        ))));
+        let board = std::sync::Arc::new(mnemo::app::plan_board::PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        ));
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Real dispatch routing".into(),
+                goal: "Verify routing metadata survives an actual worker session start".into(),
+                context: "The stub server must receive the first request from the routed worker.".into(),
+                steps: vec!["Implement the complete routing behavior in src-tauri/src/mnemo2/team.rs and verify the result with focused tests".into()],
+                ..mnemo::app::plan_board::PlanDraft::default()
+            })
+            .expect("create plan");
+        let team = Arc::new(team);
+        team.attach_board(board);
+
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "routingworker",
+                    "plan_id": plan.id,
+                    "step": 1,
+                    "brief": "Implement the assigned step and report the checks that were run.",
+                    "tier": "routine",
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        assert!(dispatched.output.contains(
+            "Laya: high (0.71) — you chose routine; logged as an override."
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), server.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        let status = team.handle_lead_host_tool("team_status", serde_json::json!({})).await;
+        assert!(status.success, "{}", status.output);
+        let status: serde_json::Value = serde_json::from_str(&status.output).expect("status JSON");
+        let workers = status["result"].as_array().expect("workers");
+        let worker = workers
+            .iter()
+            .find(|worker| worker["id"] == "routingworker")
+            .expect("routing worker status");
+        assert_eq!(worker["routing"]["laya_tier"], "high");
+        assert_eq!(worker["routing"]["routed_by"], "lead_override");
+        team.shutdown().await;
+
     }
 
     fn drain_notices(
@@ -2551,6 +2978,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_lead_open_wires_the_live_classifier_slot() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        enable_laya_in_config(config.path());
+        doctor_installed_laya(config.path());
+        crate::mnemo2::dispatch_routing::save_routing_settings(
+            config.path(),
+            &crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+        )
+        .expect("save the lead's Mnemo2 routing settings");
+        let runtime = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+        )
+        .await
+        .expect("open the lead through the production team path");
+        let engine = runtime.engine_handle().await.expect("engine handle");
+        let setup = mnemo::headless::Setup::open(Some(config.path().to_path_buf()))
+            .expect("open setup")
+            .for_engine(&engine);
+        let engine_slot = setup
+            .classifier_slot()
+            .expect("engine-backed classifier slot");
+        let team = runtime.team_handle().await.expect("production team");
+        let team_slot = team
+            .classifier_slot_for_test()
+            .expect("the team shares the live classifier slot");
+        assert!(Arc::ptr_eq(&engine_slot, &team_slot));
+        assert_eq!(
+            team.routing_settings_for_test().mode,
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            "mnemo2.toml is loaded from the lead's config directory"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn streams_a_real_engine_turn_and_persists_the_transcript() {
         let root = tempfile::tempdir().expect("workspace");
         let config = tempfile::tempdir().expect("config");
@@ -2785,6 +3254,110 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// Plan 7f0b3848: the lead's model is the picker's choice (or the
+    /// default model) in every workflow state. With Mnemo1's
+    /// `[models.executing]` configured in the shared config — the shape
+    /// the user's real config.toml has — a Planning → Executing move must
+    /// NOT hand the lead's next request to that slot. The protection is
+    /// the TeamLead policy's stateless route (`WorkflowPolicy::route()`
+    /// emits `["lead"]` for TeamLead mode, pinned kernel-side by the route
+    /// test in workflow_policy.rs; `ModelsConfig` has no `lead` slot, so
+    /// the resolver's walk resolves nothing for the lead). This test pins
+    /// the end-to-end outcome at the runtime seam: both turns serve on the
+    /// lead's own scripted provider and no model switch is announced —
+    /// if per-state routing ever returns for the lead, this goes red.
+    #[tokio::test]
+    async fn lead_ignores_the_mnemo1_per_state_models_across_a_state_change() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a", "scripted-b"]);
+        enable_per_state_models_in_config(config.path());
+        // Non-vacuous guard: prove the fixture's `[models.executing]` slot
+        // is live under Mnemo's own parse path — it parses and resolves
+        // against the fixture endpoint. If the section ever stopped
+        // parsing, the lead-turn assertions below would pass vacuously.
+        let loaded =
+            mnemo::config::Config::load(config.path()).expect("the fixture config parses");
+        let executing = loaded
+            .general
+            .models
+            .executing
+            .as_ref()
+            .expect("[models.executing] parsed");
+        assert!(
+            loaded.resolve_model_ref(Some(executing)).is_some(),
+            "the fixture's [models.executing] resolves against the fixture endpoint"
+        );
+        let scripted = std::sync::Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["first"]),
+            text_turn(&["second"]),
+        ]));
+        let runtime = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(scripted.clone()),
+        )
+        .await
+        .expect("the lead opens");
+        let mut rx = runtime.subscribe();
+        runtime
+            .send_prompt("first turn".to_string(), Vec::new())
+            .await
+            .expect("prompt");
+        drain_turn(&mut rx).await;
+        assert_eq!(
+            scripted.calls(),
+            1,
+            "the Planning turn serves on the lead's own provider"
+        );
+
+        // Planning → Executing, the transition the lead's create_plan
+        // drives in production.
+        let session_id = {
+            let live = runtime.live.lock().await;
+            live.as_ref().expect("live lead").session.id()
+        };
+        let engine = runtime.engine_handle().await.expect("engine");
+        let agent_loop = engine
+            .host()
+            .agent_loops
+            .lock()
+            .await
+            .get(&session_id.agent_id())
+            .cloned()
+            .expect("the lead loop is registered");
+        let workflow = agent_loop
+            .workflow_handle()
+            .as_any_arc()
+            .downcast::<std::sync::Arc<tokio::sync::Mutex<mnemo::app::workflow::Workflow>>>()
+            .expect("the lead's workflow is the concrete app workflow");
+        workflow
+            .lock()
+            .await
+            .create_plan("Lead plan", "goal", "ctx", vec!["step".into()])
+            .expect("create_plan");
+
+        // The Executing turn: still the lead's own provider (scripted-a) —
+        // `[models.executing]` (scripted-b) must never take it over.
+        runtime
+            .send_prompt("second turn".to_string(), Vec::new())
+            .await
+            .expect("prompt");
+        drain_turn(&mut rx).await;
+        assert_eq!(
+            scripted.calls(),
+            2,
+            "the Executing turn stays on the lead's own model, not [models.executing]"
+        );
+        let snapshot = runtime.snapshot().await.expect("snapshot");
+        assert_ne!(
+            snapshot.model_id.as_deref(),
+            Some("scripted-b"),
+            "the lead never announces [models.executing]'s model"
+        );
+        runtime.shutdown().await;
+    }
+
     /// The model inventory names every model by its explicit spec and lists
     /// the reasoning efforts it accepts, so the picker is never ambiguous.
     #[tokio::test]
@@ -2960,7 +3533,6 @@ mod tests {
         // Install the test's TeamRuntime as the lead handle. The production
         // pump keeps its original handle; this test isolates send_prompt's
         // gate arms instead of reproducing that cross-handle interleave.
-        let team = Arc::new(team);
         *runtime.team.lock().await = Some(team.clone());
         assert!(
             !team.lead_is_busy(),
@@ -3017,7 +3589,6 @@ mod tests {
         let (runtime, team) = open_git_team_spawns(&root, &config, &state, llm, 1).await;
         // The production pump keeps its original TeamRuntime handle; this
         // replacement isolates send_prompt's arms and the test's gate writes.
-        let team = Arc::new(team);
         *runtime.team.lock().await = Some(team.clone());
         runtime
             .send_prompt("first".to_string(), Vec::new())
@@ -3428,6 +3999,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: lead.models(),
             pricing: Vec::new(),
@@ -3525,6 +4099,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: lead.models(),
             pricing: Vec::new(),
@@ -3968,6 +4545,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4019,6 +4599,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(5),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4073,6 +4656,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4111,6 +4697,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4128,6 +4717,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4167,6 +4759,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4287,6 +4882,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4694,6 +5292,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4752,6 +5353,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4834,6 +5438,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -4882,6 +5489,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: {
                 let mut models = lead.models();
@@ -5055,6 +5665,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -5192,6 +5805,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -5233,8 +5849,8 @@ mod tests {
         .expect("lead opens");
         let team = lead.team_handle().await.expect("team");
 
-        // The schema: a `tier` enum whose description carries purpose, models
-        // and prices; an unconfigured tier is left out.
+        // The schema: five ladder ids whose generated descriptions carry
+        // editable definitions, models, prices and fold-down destinations.
         let dispatch = team
             .lead_host_tools()
             .into_iter()
@@ -5243,17 +5859,18 @@ mod tests {
         let tier = &dispatch.parameters["properties"]["tier"];
         assert_eq!(
             tier["enum"],
-            serde_json::json!(["difficult", "average", "simple"])
+            serde_json::json!(["trivial", "routine", "medium", "high", "escalate"])
         );
         let description = tier["description"].as_str().expect("tier description");
         assert!(
-            description.contains("difficult - design, debugging, bug_fixing plans")
+            description.contains("high (High) - Subtle bugs")
                 && description.contains(": test/scripted-a ($15/$75)"),
             "{description}"
         );
-        assert!(description.contains("simple - single-file mechanical edits"));
+        assert!(description.contains("trivial (Trivial)"));
         assert!(description.contains(": test/scripted-b"));
-        assert!(!description.contains("average -"), "{description}");
+        assert!(description.contains("routine (Routine)"), "{description}");
+        assert!(description.contains("no model; folds down to trivial"), "{description}");
         assert!(!description.contains("test/missing"), "{description}");
         assert!(dispatch.parameters["properties"]["model"]["description"]
             .as_str()
@@ -5262,7 +5879,7 @@ mod tests {
         // and a tier is required.
         assert_eq!(
             dispatch.parameters["properties"]["model"]["enum"],
-            serde_json::json!(["test/scripted-a", "test/scripted-b"])
+            serde_json::json!(["test/scripted-b", "test/scripted-a"])
         );
         assert!(dispatch.parameters["required"]
             .as_array()
@@ -5309,33 +5926,35 @@ mod tests {
                     "plan_id": plan,
                     "step": 1,
                     "brief": "tiered task",
-                    "tier": "difficult"
+                    "tier": "high"
                 }),
             )
             .await;
         assert!(result.success, "{}", result.output);
         let worker = team.worker("worker0001").await.expect("worker");
         assert_eq!(worker.model.as_deref(), Some("test/scripted-a"));
-        assert_eq!(worker.tier.as_deref(), Some("difficult"));
+        assert_eq!(worker.tier.as_deref(), Some("high"));
 
-        // An unconfigured tier is refused with guidance.
+        // An empty tier folds down to the nearest tier below with a model.
         let empty = team
             .handle_lead_host_tool(
                 "team_dispatch",
                 serde_json::json!({
-                    "worker_id": "worker0002",
+                    "worker_id": "worker1002",
                     "plan_id": plan,
                     "step": 1,
                     "brief": "tiered task",
-                    "tier": "average"
+                    "tier": "routine"
                 }),
             )
             .await;
-        assert!(!empty.success);
+        assert!(empty.success, "{}", empty.output);
         assert!(empty
             .output
-            .contains("tier 'average' has no available models"));
-        assert!(team.worker("worker0002").await.is_err());
+            .contains("routine has no model; ran on trivial"));
+        let folded = team.worker("worker1002").await.expect("folded worker");
+        assert_eq!(folded.model.as_deref(), Some("test/scripted-b"));
+        assert_eq!(folded.tier.as_deref(), Some("trivial"));
 
         // The lead moves a worker to another tier with team_resume: the
         // record takes the tier's model and comes back idle. A model outside
@@ -5352,19 +5971,24 @@ mod tests {
         let moved = team
             .handle_lead_host_tool(
                 "team_resume",
-                serde_json::json!({"worker_id": "worker0001", "tier": "simple"}),
+                serde_json::json!({"worker_id": "worker0001", "tier": "trivial"}),
             )
             .await;
         assert!(moved.success, "{}", moved.output);
         let worker = team.worker("worker0001").await.expect("worker");
         assert_eq!(worker.model.as_deref(), Some("test/scripted-b"));
-        assert_eq!(worker.tier.as_deref(), Some("simple"));
+        assert_eq!(worker.tier.as_deref(), Some("trivial"));
         assert_eq!(worker.status, crate::mnemo2::team::WorkerStatus::Idle);
         // The user's own change (Settings-free, any configured model) clears
         // the tier.
         team.stop("worker0001").await.expect("stop");
         let changed = team
-            .change_model("worker0001", Some("test/scripted-c".into()), None)
+            .change_model(
+                "worker0001",
+                Some("test/scripted-c".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
             .await
             .expect("change model");
         assert_eq!(changed.model.as_deref(), Some("test/scripted-c"));
@@ -5373,14 +5997,14 @@ mod tests {
         // A settings save refreshes tiers for new dispatches.
         team.set_catalog(
             lead.models(),
-            mnemo::headless::TiersDto {
+            tiers_dto! {
                 average: vec!["test/scripted-b".into()],
                 ..Default::default()
             },
             Vec::new(),
         );
-        assert_eq!(team.tier_models("average")[0].spec, "test/scripted-b");
-        assert!(team.tier_models("difficult").is_empty());
+        assert_eq!(team.tier_models("routine")[0].spec, "test/scripted-b");
+        assert!(team.tier_models("high").is_empty());
 
         let _ = team.stop("worker0001").await;
         team.shutdown().await;
@@ -5989,6 +6613,7 @@ mod tests {
                 None,
                 Some("stalesk01".into()),
                 Some("high".into()),
+                false,
                 &plan,
                 1,
             )
@@ -6096,6 +6721,7 @@ mod tests {
                 None,
                 Some("auditsk01".into()),
                 None,
+                false,
                 &plan,
                 1,
             )
@@ -6234,6 +6860,9 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
+            config_dir: state.path().join("config"),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
             slots: Some(1),
             models: lead.models(),
             pricing: Vec::new(),
@@ -6540,16 +7169,12 @@ mod tests {
             .stop("stamped001")
             .await
             .expect("stop snapshots the transcript");
-        let first_message = done
-            .transcript
-            .messages
-            .iter()
-            .map(|message| message.content.as_text())
-            .find(|text| text.contains("## Your step (2)"))
-            .expect("the worker's first prompt carries the plan brief");
         assert!(
-            first_message.trim_end().ends_with("do the second thing"),
-            "{first_message}"
+            done.transcript
+                .messages
+                .iter()
+                .any(|message| message.content.as_text() == KICKOFF),
+            "the worker's first prompt is the kickoff; the task rides the pinned system head"
         );
 
         let again = team.handle_lead_host_tool("team_dispatch", args).await;
@@ -6596,6 +7221,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                     plan_id,
                     step,
                 )
@@ -6612,6 +7238,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 &plan,
                 2,
             )
@@ -6674,6 +7301,7 @@ mod tests {
                 None,
                 Some("logic0001".into()),
                 None,
+                false,
                 &plan,
                 1,
             )
@@ -6692,6 +7320,7 @@ mod tests {
                 None,
                 Some("ui000001".into()),
                 None,
+                false,
                 &plan,
                 2,
             )
@@ -6725,6 +7354,7 @@ mod tests {
                 None,
                 Some("ui000001".into()),
                 None,
+                false,
                 &plan,
                 2,
             )
@@ -6741,6 +7371,7 @@ mod tests {
             None,
             Some("ui000001".into()),
             None,
+            false,
             &plan,
             2,
         )
@@ -7531,6 +8162,7 @@ mod tests {
                 None,
                 Some("notice0002".into()),
                 None,
+                false,
                 &plan,
                 1,
             )
@@ -7607,11 +8239,18 @@ mod tests {
             .expect("dispatch");
         let stopped = team.stop(&worker.id).await.expect("stop active worker");
         assert_eq!(stopped.status, crate::mnemo2::team::WorkerStatus::Stopped);
-        assert!(stopped
-            .transcript
-            .messages
-            .iter()
-            .any(|message| { message.content.as_text() == "retain the running brief" }));
+        assert_eq!(
+            stopped.brief, "retain the running brief",
+            "the record keeps the lead's brief"
+        );
+        assert!(
+            stopped
+                .transcript
+                .messages
+                .iter()
+                .any(|message| message.content.as_text() == KICKOFF),
+            "the fallback transcript records the kickoff the session was sent"
+        );
 
         team.shutdown().await;
         lead.shutdown().await;
@@ -7795,6 +8434,9 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
                 slots: None,
                 models: lead.models(),
                 pricing: Vec::new(),
@@ -8392,14 +9034,15 @@ mod tests {
         let (lead, team) =
             open_git_team(&root, &config, &state, Arc::new(ScriptedLlm::new(vec![]))).await;
         let session = team
-            .spawn_worker_session(
-                "Executor test".to_string(),
-                None,
-                None,
-                root.path().to_path_buf(),
-                None,
-                "implementation",
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: root.path().to_path_buf(),
+                resume: None,
+                kind: "implementation".to_string(),
+                trace_identity: super::trace_tests::worker_identity("Executor test"),
+                pinned_task: None,
+            })
             .await
             .expect("spawn executor");
         let tools = session.tool_names().await.expect("registered tool names");
@@ -8436,7 +9079,15 @@ mod tests {
         // The audit profile is the read-only counterpart: every mutation
         // surface is gone, and the identity forbids lifecycle actions.
         let audit = team
-            .spawn_worker_session("Audit test".to_string(), None, None, root.path().to_path_buf(), None, "audit")
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: root.path().to_path_buf(),
+                resume: None,
+                kind: "audit".to_string(),
+                trace_identity: super::trace_tests::worker_identity("Audit test"),
+                pinned_task: None,
+            })
             .await
             .expect("spawn audit");
         let audit_tools = audit.tool_names().await.expect("registered audit tools");
@@ -8475,6 +9126,1076 @@ mod tests {
         assert!(audit_head.contains("independent audit worker"));
         assert!(audit_head.contains("read-only by construction"));
         assert!(audit_head.contains("Never merge"));
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // change_model's live switch on a working worker (plan 1586c6c7): these
+    // fixtures run WITHOUT an injected transport — a real config-resolved
+    // provider against a local SSE stub server — so the tests observe which
+    // model actually serves each worker request.
+    // ---------------------------------------------------------------------
+
+    /// One scripted SSE response, optionally held behind a gate so the test
+    /// can switch the model while the worker's request is in flight.
+    struct StubTurn {
+        body: String,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    /// A one-request-per-connection SSE server: the i-th request gets the
+    /// i-th scripted turn and every request body's `model` field is
+    /// recorded. The repo has no mock-HTTP crate; like the provider tests
+    /// this speaks just enough HTTP/1.1.
+    struct StubServer {
+        addr: std::net::SocketAddr,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+    }
+
+    impl StubServer {
+        /// Start the server. The test must make exactly as many requests as
+        /// scripted turns (the accept task ends after the last one).
+        async fn start(mut turns: Vec<StubTurn>) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the stub listener");
+            let addr = listener.local_addr().expect("the stub address");
+            let (arrivals_tx, arrivals_rx) = tokio::sync::mpsc::unbounded_channel();
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&bodies);
+            tokio::spawn(async move {
+                for turn in turns.drain(..) {
+                    let (mut socket, _) = listener.accept().await.expect("accept a request");
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let head_end = loop {
+                        let mut chunk = [0u8; 4096];
+                        let read = socket.read(&mut chunk).await.expect("read the head");
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .expect("the request carries content-length");
+                    let mut body = buffer[head_end..].to_vec();
+                    while body.len() < content_length {
+                        let mut chunk = [0u8; 4096];
+                        let read = socket.read(&mut chunk).await.expect("read the body");
+                        body.extend_from_slice(&chunk[..read]);
+                    }
+                    body.truncate(content_length);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body).expect("a JSON request body");
+                    recorded.lock().expect("the request log").push(body);
+                    arrivals_tx.send(()).expect("the arrival channel");
+                    if let Some(gate) = turn.gate {
+                        let _ = gate.await;
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                        turn.body.len(),
+                        turn.body
+                    );
+                    socket
+                        .write_all(reply.as_bytes())
+                        .await
+                        .expect("write the scripted reply");
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                addr,
+                bodies,
+                arrivals: arrivals_rx,
+            }
+        }
+
+        /// Wait for the next request to arrive (still in flight while its
+        /// response is gated).
+        async fn next_arrival(&mut self) {
+            self.arrivals.recv().await.expect("a request arrives");
+        }
+
+        /// The `model` field of every request so far, in order.
+        fn models(&self) -> Vec<String> {
+            self.bodies
+                .lock()
+                .expect("the request log")
+                .iter()
+                .map(|body| {
+                    body["model"]
+                        .as_str()
+                        .expect("the request names its model")
+                        .to_string()
+                })
+                .collect()
+        }
+
+        /// One recorded request body, cloned out so no lock guard outlives
+        /// the call.
+        fn body(&self, index: usize) -> serde_json::Value {
+            self.bodies
+                .lock()
+                .expect("the request log")
+                .get(index)
+                .cloned()
+                .expect("a recorded request")
+        }
+
+        /// How many requests the stub has recorded.
+        fn bodies_len(&self) -> usize {
+            self.bodies.lock().expect("the request log").len()
+        }
+    }
+
+    /// Concatenate SSE `data:` chunks plus the `[DONE]` terminator.
+    fn stub_sse(chunks: &[serde_json::Value]) -> String {
+        chunks
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+            .collect()
+    }
+
+    /// An SSE turn answering with `text` and ending the turn.
+    fn stub_text_turn(text: &str) -> String {
+        stub_sse(&[
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
+        ])
+    }
+
+    /// An SSE turn calling a tool the worker does not have: the loop
+    /// records the "unknown tool" result and issues the next request — the
+    /// second provider call in the SAME turn the live switch pins across.
+    fn stub_unknown_tool_turn() -> String {
+        stub_sse(&[
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"definitely_not_a_tool","arguments":"{}"}}]},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
+        ])
+    }
+
+    /// An SSE turn calling the worker's `message_parent` host tool — a
+    /// SUCCESSFUL tool interaction (the team answers it), so each iteration
+    /// grows the conversation by a call + a result without tripping the
+    /// consecutive-tool-error cap that ends a turn after three failures.
+    fn stub_message_parent_turn(index: usize) -> String {
+        let arguments = format!("{{\"text\":\"progress {index}\"}}");
+        stub_sse(&[
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("call_{index}"),"type":"function","function":{"name":"message_parent","arguments":arguments}}]},"finish_reason":null}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
+        ])
+    }
+
+    /// The two-model fixture config over a stub server: `model-a` (the
+    /// worker's first model) and `model-b` (the switch target).
+    fn write_stub_config(dir: &Path, addr: std::net::SocketAddr) {
+        std::fs::create_dir_all(dir).expect("config dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"model-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            format!(
+                "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://{addr}/v1/\"\nmodels = [\"model-a\", \"model-b\"]\n"
+            ),
+        )
+        .expect("endpoints.toml");
+    }
+
+    /// [`write_stub_config`] with EXPLICIT per-model windows — the
+    /// compact-then-switch regression needs a switch target (`model-b`) whose
+    /// window genuinely cannot hold the worker's conversation, so the deferred
+    /// summarize-then-swap path runs for real.
+    fn write_stub_config_windows(
+        dir: &Path,
+        addr: std::net::SocketAddr,
+        model_a_max_context: usize,
+        model_b_max_context: usize,
+    ) {
+        std::fs::create_dir_all(dir).expect("config dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"model-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            format!(
+                "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://{addr}/v1/\"\n\n[[endpoint.models]]\nid = \"model-a\"\nmax_context = {model_a_max_context}\n\n[[endpoint.models]]\nid = \"model-b\"\nmax_context = {model_b_max_context}\n"
+            ),
+        )
+        .expect("endpoints.toml");
+    }
+
+    /// open_git_team's shape WITHOUT the injected transport: the engine
+    /// resolves providers from the fixture config (kind local pointing at
+    /// the stub server), so the live model-switch tests observe which model
+    /// actually serves each worker request.
+    async fn open_stub_team(
+        root: &TempDir,
+        config: &TempDir,
+        state: &TempDir,
+        addr: std::net::SocketAddr,
+        slots: usize,
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_stub_config(config.path(), addr);
+        let lead = LeadRuntime::open_inner(options(root, config, state), None)
+            .await
+            .expect("lead opens");
+        let team =
+            crate::mnemo2::team::TeamRuntime::open(crate::mnemo2::team::TeamRuntimeOptions {
+                engine: lead.engine_handle().await.expect("engine"),
+                workspace_root: root.path().to_path_buf(),
+                state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+                slots: Some(slots),
+                models: lead.models(),
+                pricing: Vec::new(),
+            })
+            .await
+            .expect("team opens");
+        let team = Arc::new(team);
+        team.attach_board(lead.board_handle().expect("the lead's plan board"));
+        (lead, team)
+    }
+
+    /// [`open_stub_team`] over [`write_stub_config_windows`]: the worker's
+    /// first model gets a large window, the switch target a small one.
+    async fn open_stub_team_with_windows(
+        root: &TempDir,
+        config: &TempDir,
+        state: &TempDir,
+        addr: std::net::SocketAddr,
+        slots: usize,
+        model_a_max_context: usize,
+        model_b_max_context: usize,
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_stub_config_windows(
+            config.path(),
+            addr,
+            model_a_max_context,
+            model_b_max_context,
+        );
+        let lead = LeadRuntime::open_inner(options(root, config, state), None)
+            .await
+            .expect("lead opens");
+        let team =
+            crate::mnemo2::team::TeamRuntime::open(crate::mnemo2::team::TeamRuntimeOptions {
+                engine: lead.engine_handle().await.expect("engine"),
+                workspace_root: root.path().to_path_buf(),
+                state_dir: state.path().to_path_buf(),
+                config_dir: state.path().join("config"),
+                classifier: None,
+                routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+                slots: Some(slots),
+                models: lead.models(),
+                pricing: Vec::new(),
+            })
+            .await
+            .expect("team opens");
+        let team = Arc::new(team);
+        team.attach_board(lead.board_handle().expect("the lead's plan board"));
+        (lead, team)
+    }
+
+    /// A working worker switches models LIVE: the provider request in
+    /// flight finishes on the old model, the worker's next request serves
+    /// on the new one, and no stop/resume happens — the record is updated
+    /// and persisted, the status stays Working, the session generation does
+    /// not advance, and the kernel's model_changed re-points the observed
+    /// model id once the new model serves.
+    #[tokio::test]
+    async fn change_model_switches_a_working_worker_live() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = StubServer::start(vec![
+            StubTurn {
+                body: stub_unknown_tool_turn(),
+                gate: Some(gate),
+            },
+            StubTurn {
+                body: stub_text_turn("done on the new model"),
+                gate: None,
+            },
+        ])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        let worker = team
+            .dispatch_with_id(
+                "implement the counting feature".into(),
+                Some("test/model-a".into()),
+                Some("worker0001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.model, Some("test/model-a".into()));
+        assert_eq!(worker.generation, 1);
+        let generation_before = worker.generation;
+
+        // Request 1 is in flight on the old model — hold it there.
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the first worker request arrives");
+        assert_eq!(stub.models(), ["model-a"]);
+
+        // The switch applies while the worker is working: it returns at once
+        // with the record updated and the status STILL Working — no stop,
+        // no restart.
+        let switched = team
+            .change_model(
+                "worker0001",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
+            .await
+            .expect("the live switch is applied");
+        assert_eq!(switched.model, Some("test/model-b".into()));
+        assert_eq!(switched.generation, generation_before);
+        assert!(
+            matches!(switched.status, crate::mnemo2::team::WorkerStatus::Working),
+            "the worker keeps working through the switch: {switched:?}"
+        );
+        release.send(()).expect("release the held response");
+
+        // The follow-up request serves on the new model, the turn ends, and
+        // the kernel's model_changed re-points the observed model id.
+        wait_for_worker_model(&team, "worker0001", "model-b").await;
+        let settled =
+            wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+                .await;
+        assert_eq!(
+            settled.generation,
+            generation_before,
+            "no stop/resume: the session generation did not advance: {settled:?}"
+        );
+        assert_eq!(
+            stub.models(),
+            ["model-a", "model-b"],
+            "the in-flight request finished on the old model, the next one served on the new one"
+        );
+        // The record change persisted to the team ledger.
+        let ledger = std::fs::read_to_string(state.path().join("team.json")).expect("ledger");
+        assert!(
+            ledger.contains("test/model-b"),
+            "the switch persisted: {ledger}"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// Regression (bug 2026-11-02, plan 1238e0de): switching a WORKING worker
+    /// to a model whose window cannot hold the conversation summarizes on the
+    /// OLD model and then completes the swap. That completion is INFORMATION,
+    /// never an error: the worker keeps working, records NO error, and its next
+    /// request serves on the new model. Before the fix the kernel emitted
+    /// `Error { retrying: false }` for the completed swap and the pump failed
+    /// the worker for a switch that had actually succeeded.
+    #[tokio::test]
+    async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        // model-a 200K (trigger 100K) holds the conversation; model-b 32K
+        // (trigger 16K) cannot, so the switch defers and the OLD model
+        // summarizes first.
+        let (release1, gate1) = tokio::sync::oneshot::channel();
+        let (release4, gate4) = tokio::sync::oneshot::channel();
+        let (release_last, gate_last) = tokio::sync::oneshot::channel();
+        let mut turns = vec![StubTurn {
+            body: stub_message_parent_turn(1),
+            gate: Some(gate1),
+        }];
+        // Three more SUCCESSFUL tool turns grow the conversation past
+        // keep_recent, so the pre-swap summary actually rewrites it (the
+        // oversized brief is summarized away instead of surviving into the new
+        // window). A successful call never trips the consecutive-error cap.
+        for index in 2..=3 {
+            turns.push(StubTurn {
+                body: stub_message_parent_turn(index),
+                gate: None,
+            });
+        }
+        turns.push(StubTurn {
+            body: stub_message_parent_turn(4),
+            gate: Some(gate4),
+        });
+        // The deferred swap's summarization call, served by the OLD model.
+        turns.push(StubTurn {
+            body: stub_text_turn("Summary of the earlier work."),
+            gate: None,
+        });
+        // The post-swap request, held so the record is inspected while the
+        // worker is genuinely working on the new model.
+        turns.push(StubTurn {
+            body: stub_text_turn("done on the new model"),
+            gate: Some(gate_last),
+        });
+        let mut stub = StubServer::start(turns).await;
+        let (lead, team) =
+            open_stub_team_with_windows(&root, &config, &state, stub.addr, 1, 200_000, 32_000)
+                .await;
+
+        // ~120K chars ≈ 30K tokens of brief: over model-b's 16K trigger.
+        let brief = format!(
+            "implement the counting feature. Context: {}",
+            "context detail ".repeat(8_000)
+        );
+        let worker = team
+            .dispatch_with_id(
+                brief,
+                Some("test/model-a".into()),
+                Some("worker0001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.generation, 1);
+
+        // Request 1 arrives on model-a; release it so the tool loop runs on
+        // through request 4, which stays in flight (the worker is busy).
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("request 1 arrives");
+        release1.send(()).expect("release request 1");
+        for request in 2..=4 {
+            tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+                .await
+                .unwrap_or_else(|_| panic!("request {request} arrives"));
+        }
+        assert_eq!(
+            stub.models(),
+            vec!["model-a".to_string(); 4],
+            "the tool loop ran on the old model"
+        );
+
+        // The switch lands while the worker is working: the conversation
+        // exceeds model-b's trigger, so it DEFERS — no restart, still Working.
+        let switched = team
+            .change_model(
+                "worker0001",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
+            .await
+            .expect("the deferred switch is accepted");
+        assert_eq!(switched.generation, 1, "no stop/resume");
+        assert!(
+            matches!(switched.status, crate::mnemo2::team::WorkerStatus::Working),
+            "the worker keeps working through the deferred switch: {switched:?}"
+        );
+
+        // Release request 4: when the deferred swap decided the conversation
+        // needs one, the turn loop first sends a summarization request to the
+        // OLD model; either way the next request then serves the NEW model and
+        // is held (the test's last stub turn) so the record can be inspected
+        // while the worker is genuinely working on the new model.
+        release4.send(()).expect("release request 4");
+        for _ in 0..2 {
+            if stub.models().last().map(String::as_str) == Some("model-b") {
+                break;
+            }
+            tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+                .await
+                .expect("a request arrives after the switch");
+        }
+        assert_eq!(
+            stub.models().last().map(String::as_str),
+            Some("model-b"),
+            "the next request serves on the new model (models={:?})",
+            stub.models()
+        );
+
+        // The regression: the completed swap is informational. Poll until the
+        // pump folded it (the badge the CompactStarted raised is cleared), then
+        // assert the record never went Failed and carries no error.
+        let mut observed = team.worker("worker0001").await.expect("worker record");
+        for _ in 0..250 {
+            if !observed.compacting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            observed = team.worker("worker0001").await.expect("worker record");
+        }
+        assert!(
+            !observed.compacting,
+            "the compacting badge ended with the swap: status={:?} error={:?} compacting={} models={:?}",
+            observed.status,
+            observed.error,
+            observed.compacting,
+            stub.models()
+        );
+        assert_eq!(
+            observed.error, None,
+            "a summarized switch is not an error: status={:?}",
+            observed.status
+        );
+        // The worker is still WORKING the turn on the new model — the
+        // informational event never fails it and never idles it (a mid-turn
+        // compaction's Compacted must not flip a live turn to Idle either).
+        assert!(
+            matches!(
+                observed.status,
+                crate::mnemo2::team::WorkerStatus::Working
+            ),
+            "the worker keeps working after the summarized switch: status={:?} error={:?} compacting={} models={:?}",
+            observed.status,
+            observed.error,
+            observed.compacting,
+            stub.models()
+        );
+
+        release_last.send(()).expect("release the final response");
+        let settled = wait_for_worker_status(
+            &team,
+            "worker0001",
+            crate::mnemo2::team::WorkerStatus::Completed,
+        )
+        .await;
+        assert_eq!(
+            settled.error, None,
+            "the turn completed cleanly: status={:?}",
+            settled.status
+        );
+        assert_eq!(
+            settled.generation, 1,
+            "the live switch never restarted the session"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// Idle and stopped workers keep the restart path: the record is
+    /// updated the same way, but the session is restarted (the generation
+    /// ADVANCES) — the live switch must not hijack a non-working worker.
+    #[tokio::test]
+    async fn change_model_still_restarts_idle_and_stopped_workers() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("done"),
+            gate: None,
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        let worker = team
+            .dispatch_with_id(
+                "implement the counting feature".into(),
+                Some("test/model-a".into()),
+                Some("worker0001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.generation, 1);
+
+        // The turn finishes on its own: the worker is live but not busy.
+        let finished =
+            wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+                .await;
+        assert_eq!(finished.model_id.as_deref(), Some("model-a"));
+
+        // Today's idle path: restart on the new model — the generation
+        // advances (a NEW session), the worker comes back idle.
+        let restarted = team
+            .change_model(
+                "worker0001",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
+            .await
+            .expect("the idle path restarts on the new model");
+        assert_eq!(restarted.model, Some("test/model-b".into()));
+        assert_eq!(restarted.generation, 2, "the idle path restarts the session");
+        assert!(
+            matches!(restarted.status, crate::mnemo2::team::WorkerStatus::Idle),
+            "the restarted worker idles: {restarted:?}"
+        );
+        assert_eq!(
+            stub.models(),
+            ["model-a"],
+            "the restarted session idles without a request"
+        );
+
+        // Stopped path: stop, then change — resumed idle on the new model,
+        // again through a new session.
+        team.stop("worker0001").await.expect("stop the worker");
+        wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Stopped)
+            .await;
+        let resumed = team
+            .change_model(
+                "worker0001",
+                Some("test/model-a".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
+            .await
+            .expect("the stopped path resumes on the new model");
+        assert_eq!(resumed.model, Some("test/model-a".into()));
+        assert_eq!(resumed.generation, 3, "the stopped path resumes in a new session");
+        assert!(
+            matches!(resumed.status, crate::mnemo2::team::WorkerStatus::Idle),
+            "the resumed worker idles: {resumed:?}"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// Plan 2ba2168a step 1: Mnemo2 worker and lead sessions opt out of
+    /// the pre-prompt routing gate at spawn — Laya routes a worker once at
+    /// dispatch instead, so no turn is ever classified per prompt and no
+    /// routing.jsonl rows are written for the team's sessions.
+    #[tokio::test]
+    async fn mnemo2_worker_sessions_skip_turn_routing() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("done"),
+            gate: None,
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        team.dispatch_with_id(
+            "implement the counting feature".into(),
+            Some("test/model-a".into()),
+            Some("worker0001".into()),
+            None,
+        )
+        .await
+        .expect("dispatch the worker");
+
+        // The dispatch spawns the worker's session on the lead's engine;
+        // both loops are registered under the identities stamped at
+        // spawn, so the skip is observable on each before the worker's
+        // turn even finishes.
+        let engine = lead.engine_handle().await.expect("the engine");
+        let loops = engine.host().agent_loops.lock().await;
+        let worker_loop = loops
+            .values()
+            .find(|loopy| {
+                loopy
+                    .trace_identity()
+                    .map(|identity| identity.worker_id.as_deref() == Some("worker0001"))
+                    .unwrap_or(false)
+            })
+            .expect("the worker loop is registered");
+        assert!(
+            worker_loop.skip_turn_routing(),
+            "a Mnemo2 worker session skips the per-turn gate"
+        );
+        let lead_loop = loops
+            .values()
+            .find(|loopy| {
+                loopy
+                    .trace_identity()
+                    .map(|identity| {
+                        matches!(
+                            identity.actor_kind,
+                            mnemo::provider::trace::TraceActorKind::Lead
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("the lead loop is registered");
+        assert!(
+            lead_loop.skip_turn_routing(),
+            "the Mnemo2 lead session skips the per-turn gate"
+        );
+        drop(loops);
+
+        wait_for_worker_status(
+            &team,
+            "worker0001",
+            crate::mnemo2::team::WorkerStatus::Completed,
+        )
+        .await;
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// The live switch must never erase an already-observed model id that
+    /// already matches the new model: the new model's events can be pumped
+    /// before change_model's record update (the pin landed mid-turn, or the
+    /// target was already serving) — an unconditional clear would leave
+    /// the record without its correct id, with no later event to repair it.
+    #[tokio::test]
+    async fn change_model_keeps_the_already_observed_model_id() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("done on the switch target"),
+            gate: Some(gate),
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        // The worker runs ON the switch target from the start: its first
+        // request is held in flight, so the new model's model_changed event
+        // is pumped BEFORE the switch runs.
+        let worker = team
+            .dispatch_with_id(
+                "implement the counting feature".into(),
+                Some("test/model-b".into()),
+                Some("worker0001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.model, Some("test/model-b".into()));
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        wait_for_worker_model(&team, "worker0001", "model-b").await;
+        let generation = worker.generation;
+
+        // Switch to the model already serving: the observed id must survive
+        // the record update — the returned record still carries it.
+        let switched = team
+            .change_model(
+                "worker0001",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
+            .await
+            .expect("the live switch is applied");
+        assert_eq!(
+            switched.model_id.as_deref(),
+            Some("model-b"),
+            "the already-observed id for the new model is kept: {switched:?}"
+        );
+        assert_eq!(switched.generation, generation);
+        release.send(()).expect("release the held response");
+
+        // The turn ends on the target model with the id intact — no further
+        // event was needed to repair it.
+        let settled =
+            wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+                .await;
+        assert_eq!(settled.model_id.as_deref(), Some("model-b"));
+        assert_eq!(settled.generation, generation);
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// An audit worker's model is not user-switchable: the busy-path switch
+    /// refuses an audit worker outright, and the refusal leaves its record
+    /// and its session untouched.
+    #[tokio::test]
+    async fn change_model_switches_a_busy_unreported_audit() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stub = StubServer::start(vec![
+            StubTurn {
+                body: stub_text_turn("implementation done"),
+                gate: None,
+            },
+            StubTurn {
+                body: stub_text_turn("audit done"),
+                gate: Some(gate),
+            },
+        ])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 2).await;
+        let plan = new_audited_plan(
+            &lead,
+            "Ship the counting feature",
+            "A step's implementation can be audited while the audit runs.",
+        );
+        let (worker, _) = team
+            .dispatch_on_plan(
+                "implement the counting feature".into(),
+                Some("test/model-a".into()),
+                None,
+                Some("worker0001".into()),
+                None,
+                false,
+                &plan,
+                1,
+            )
+            .await
+            .expect("dispatch the worker");
+        assert_eq!(worker.generation, 1);
+        // The implementation turn finishes so the audit can be dispatched;
+        // stop the worker and move its tip so there is something to audit.
+        wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+            .await;
+        team.stop("worker0001").await.expect("stop the worker");
+        std::fs::write(worker.worktree.join("feature.rs"), "pub fn feature() {}\n")
+            .expect("worker source");
+        run_git(&worker.worktree, &["add", "feature.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "feature"]);
+
+        // The audit worker runs on model-a with its request held in flight —
+        // busy.
+        team.audit_dispatch(
+            "worker0001",
+            "auditor1",
+            Some("test/model-a".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("dispatch the audit worker");
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the audit worker's first request arrives");
+        let audit = team.worker("auditor1").await.expect("the audit record");
+        assert_eq!(audit.kind, "audit");
+        let generation = audit.generation;
+
+        // An unreported audit switches live: its in-flight request finishes
+        // on the old model, its next request uses the new one, and the session
+        // is not stopped or restarted.
+        let switched = team
+            .change_model(
+                "auditor1",
+                Some("test/model-b".into()),
+                None,
+                crate::mnemo2::team::ChangeSource::User,
+            )
+            .await
+            .expect("switch the unreported audit");
+        assert_eq!(switched.model, Some("test/model-b".into()));
+        assert_eq!(switched.generation, generation);
+        assert!(!switched.report_delivered);
+        release.send(()).expect("release the held response");
+
+        let settled =
+            wait_for_worker_status(&team, "auditor1", crate::mnemo2::team::WorkerStatus::Completed)
+                .await;
+        assert_eq!(settled.model, Some("test/model-b".into()));
+        assert_eq!(settled.generation, generation);
+        assert_eq!(stub.models(), ["model-a", "model-b"]);
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// Plan 40eef714 step 2: dispatch pins the whole task — the plan header,
+    /// the step's spec and the lead's brief — into the stable system head,
+    /// and the first user message is the short kickoff instead of the task.
+    #[tokio::test]
+    async fn dispatch_pins_the_task_and_sends_the_kickoff() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let mut stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("done"),
+            gate: None,
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        let plan = new_plan(&lead, &["**Change** - implement src/lib.rs"]);
+        team.begin_lead_turn();
+        team.set_lead_busy(false);
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "worker0001",
+                    "plan_id": plan,
+                    "step": 1,
+                    "brief": "BRIEF-91x implement the counting feature",
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        let body = stub.body(0);
+        let messages = body["messages"]
+            .as_array()
+            .expect("the request messages");
+        assert_eq!(messages[0]["role"], "system", "{messages:?}");
+        let system = messages[0]["content"].as_str().expect("the system text");
+        assert!(
+            system.contains("# Plan: Board plan"),
+            "the plan header is pinned: {system}"
+        );
+        assert!(
+            system.contains("BRIEF-91x"),
+            "the lead's brief is pinned: {system}"
+        );
+        assert!(
+            system.contains("## Your step (1)") && system.contains("**Change** - implement src/lib.rs"),
+            "the step's full spec is pinned: {system}"
+        );
+        assert!(
+            system.contains("## Your task (pinned)"),
+            "the pinned heading renders: {system}"
+        );
+        let first_user = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("the first user message");
+        assert_eq!(first_user, KICKOFF);
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// A read-back dispatch sends the read-back kickoff and remembers the
+    /// choice on the durable record.
+    #[tokio::test]
+    async fn read_back_dispatch_sends_the_read_back_kickoff() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let mut stub = StubServer::start(vec![StubTurn {
+            body: stub_text_turn("No questions."),
+            gate: None,
+        }])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        let plan = new_plan(&lead, &["**Change** - implement src/lib.rs"]);
+        team.begin_lead_turn();
+        team.set_lead_busy(false);
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "worker0001",
+                    "plan_id": plan,
+                    "step": 1,
+                    "brief": "BRIEF-91x implement the counting feature",
+                    "read_back": true,
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+
+        let worker = team.worker("worker0001").await.expect("the worker record");
+        assert!(
+            worker.read_back,
+            "the record remembers the read-back first turn: {worker:?}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        let body = stub.body(0);
+        let first_user = body["messages"]
+            .as_array()
+            .expect("the request messages")
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("the first user message");
+        assert_eq!(first_user, READ_BACK_KICKOFF);
+
+        let ledger = std::fs::read_to_string(state.path().join("team.json")).expect("the ledger");
+        assert!(
+            ledger.contains("\"read_back\": true"),
+            "the read-back flag persisted: {ledger}"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// A worker stopped and resumed on its transcript keeps the task pinned in
+    /// its new session's system head.
+    #[tokio::test]
+    async fn resumed_worker_keeps_its_pinned_task() {
+        let root = tempfile::tempdir().expect("root");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let mut stub = StubServer::start(vec![
+            StubTurn {
+                body: stub_text_turn("done"),
+                gate: None,
+            },
+            StubTurn {
+                body: stub_text_turn("resumed"),
+                gate: None,
+            },
+        ])
+        .await;
+        let (lead, team) = open_stub_team(&root, &config, &state, stub.addr, 1).await;
+        let plan = new_plan(&lead, &["**Change** - implement src/lib.rs"]);
+        team.begin_lead_turn();
+        team.set_lead_busy(false);
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "worker0001",
+                    "plan_id": plan,
+                    "step": 1,
+                    "brief": "BRIEF-91x implement the counting feature",
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the worker's first request arrives");
+        wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
+            .await;
+
+        team.stop("worker0001").await.expect("stop the worker");
+        team.resume("worker0001")
+            .await
+            .expect("resume the worker on its transcript");
+        team.message(
+            "worker0001",
+            "carry on".to_string(),
+            crate::mnemo2::team::MessageSender::Lead,
+        )
+        .await
+        .expect("message the resumed worker");
+
+        tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+            .await
+            .expect("the resumed session's first request arrives");
+        assert_eq!(stub.bodies_len(), 2);
+        let body = stub.body(1);
+        let system = body["messages"][0]["content"]
+            .as_str()
+            .expect("the resumed system text");
+        assert!(
+            system.contains("BRIEF-91x"),
+            "the resumed session keeps its pinned task: {system}"
+        );
+        assert!(
+            system.contains("## Your task (pinned)"),
+            "the resumed session keeps the pinned heading: {system}"
+        );
         team.shutdown().await;
         lead.shutdown().await;
     }

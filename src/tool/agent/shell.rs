@@ -54,6 +54,8 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::config::{OptimizerConfig, ShellFilterConfig};
+#[cfg(windows)]
+use crate::process_tree::KillOnCloseJob;
 use crate::provider::ToolSchema;
 use crate::tool::agent::read_files::truncate_to_boundary;
 use crate::tool::agent::sandbox::Sandbox;
@@ -852,22 +854,10 @@ impl Drop for ReaderGuard {
 /// failing every command.
 struct TreeKillGuard {
     #[cfg(windows)]
-    job: OwnedJobHandle,
+    job: Option<KillOnCloseJob>,
     #[cfg(unix)]
     pid: u32,
 }
-
-/// Owned job-object handle. A newtype because windows-sys' `HANDLE` is a
-/// raw pointer (not `Send`), while the guard must live inside the tool
-/// future — `async_trait` requires `Send`.
-#[cfg(windows)]
-struct OwnedJobHandle(windows_sys::Win32::Foundation::HANDLE);
-
-// SAFETY: an owned kernel handle is a plain kernel-object reference with
-// no thread affinity — moving it between threads is as sound as moving
-// the guard that owns it, and access stays single-threaded (drop).
-#[cfg(windows)]
-unsafe impl Send for OwnedJobHandle {}
 
 impl TreeKillGuard {
     /// Attach to the freshly spawned shell so its whole tree dies with
@@ -876,52 +866,13 @@ impl TreeKillGuard {
     fn attach(child: &tokio::process::Child) -> Self {
         #[cfg(windows)]
         {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW,
-                JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, SetInformationJobObject,
-            };
-
-            let inert = Self {
-                job: OwnedJobHandle(std::ptr::null_mut()),
-            };
             // The child's raw handle exists only while it is not reaped;
             // right after spawn it is always present. If it were not, the
-            // process is already gone and there is nothing to own.
-            let Some(handle) = child.raw_handle() else {
-                return inert;
-            };
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            // Kill every process in the job when the LAST handle to it
-            // closes — the handle this guard owns, so the tree dies on
-            // drop on every exit path. Descendants inherit job
-            // membership, and breakaway is not granted.
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            // SAFETY: a plain Win32 call sequence on objects created and
-            // owned here.
-            unsafe {
-                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if job.is_null() {
-                    return inert;
-                }
-                let configured = SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const core::ffi::c_void,
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                );
-                let assigned = configured != 0 && AssignProcessToJobObject(job, handle) != 0;
-                if !assigned {
-                    // SAFETY: the handle comes from CreateJobObjectW above
-                    // and is no longer used.
-                    CloseHandle(job);
-                    return inert;
-                }
-                Self {
-                    job: OwnedJobHandle(job),
-                }
-            }
+            // process is already gone and there is nothing to own. A failed
+            // job setup leaves the guard inert, preserving the pre-fix
+            // behaviour (only kill_on_drop of the shell).
+            let job = child.raw_handle().and_then(KillOnCloseJob::assign);
+            Self { job }
         }
         #[cfg(unix)]
         {
@@ -940,13 +891,11 @@ impl Drop for TreeKillGuard {
     fn drop(&mut self) {
         #[cfg(windows)]
         {
-            if !self.job.0.is_null() {
-                // SAFETY: the handle was created by CreateJobObjectW in
-                // `attach` and is owned here exclusively; closing the last
-                // handle terminates the job (KILL_ON_JOB_CLOSE was set
-                // at attach) — every process the command started.
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job.0) };
-            }
+            // Dropping the job closes the handle owned here exclusively;
+            // closing the last handle terminates the job
+            // (KILL_ON_JOB_CLOSE was set at attach) — every process the
+            // command started.
+            drop(self.job.take());
         }
         #[cfg(unix)]
         {

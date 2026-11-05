@@ -36,7 +36,7 @@
       </header>
       <div class="prompt-scroll">
         {#if pending.question}
-          <div class="prompt-question"><Markdown source={pending.question} onOpenLink={actions.openBrowser} /></div>
+          <div class="prompt-question"><Markdown source={pending.question} onOpenLink={actions.openBrowser} onOpenPath={actions.openRepoPath} /></div>
         {:else}
           <p class="prompt-text">The lead asked a question, but its text did not reach this view.</p>
         {/if}

@@ -8,7 +8,9 @@ import {
   createBacklogTransport,
   createTauriBacklogTransport,
   finishedCount,
+  finishedItems,
   ideaTitle,
+  inFlightItems,
   isDeferred,
   movePending,
   pendingItems,
@@ -45,7 +47,9 @@ describe("backlog transport", () => {
       remove: vi.fn(async () => []),
       reorder: vi.fn(async () => [item("a")]),
       setDeferred: vi.fn(async () => [item("a")]),
+      setDone: vi.fn(async () => [item("a")]),
       clearFinished: vi.fn(async () => [item("a")]),
+      planThis: vi.fn(async () => [item("a")]),
       onChanged: vi.fn(async () => () => {}),
     };
     seedBacklogPreview(planted);
@@ -80,7 +84,9 @@ describe("backlog transport", () => {
     await transport.remove("a");
     await transport.reorder(["b", "a"]);
     await transport.setDeferred("a", true);
+    await transport.setDone("a", true);
     await transport.clearFinished();
+    await transport.planThis("a");
     const changed = vi.fn();
     await transport.onChanged(changed);
 
@@ -91,7 +97,9 @@ describe("backlog transport", () => {
       { command: "backlog_remove", args: { id: "a" } },
       { command: "backlog_reorder", args: { ids: ["b", "a"] } },
       { command: "backlog_set_deferred", args: { id: "a", deferred: true } },
+      { command: "backlog_set_done", args: { id: "a", done: true } },
       { command: "backlog_clear_finished", args: undefined },
+      { command: "plan_this", args: { id: "a" } },
     ]);
     expect(listen.mock.calls[0][0]).toBe(BACKLOG_EVENT_CHANNEL);
     expect(changed).toHaveBeenCalledTimes(1);
@@ -119,6 +127,29 @@ describe("backlog helpers", () => {
       item("cant", { status: "cant_resolve" }),
     ];
     expect(finishedCount(items)).toBe(3);
+  });
+
+  it("keeps only in-flight ideas in the With the lead group", () => {
+    const items = [
+      item("a"),
+      item("running", { status: "in_flight" }),
+      item("also-running", { status: "in_flight" }),
+      item("done", { status: "done" }),
+    ];
+    expect(inFlightItems(items).map((row) => row.id)).toEqual(["running", "also-running"]);
+    expect(inFlightItems([item("a")])).toEqual([]);
+  });
+
+  it("lists done, failed and cant-resolve ideas in the store's order", () => {
+    const items = [
+      item("cant", { status: "cant_resolve" }),
+      item("a"),
+      item("done", { status: "done" }),
+      item("running", { status: "in_flight" }),
+      item("failed", { status: "failed" }),
+    ];
+    expect(finishedItems(items).map((row) => row.id)).toEqual(["cant", "done", "failed"]);
+    expect(finishedItems(items)).toHaveLength(finishedCount(items));
   });
 
   it("treats an absent deferred flag as not deferred", () => {

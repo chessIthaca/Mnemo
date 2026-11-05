@@ -1,6 +1,6 @@
 [package]
 name = "mnemo-app"
-version = "1.3.0"
+version = "2.0.0"
 edition = "2021"
 description = "The Mnemo Tauri app shell"
 license = "MIT"
@@ -17,6 +17,14 @@ tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# OpenSpec schema/config YAML editing (mnemo2/specs_settings.rs) — same
+# version the mnemo lib pins for the OpenSpec format layer, so the crate
+# unifies.
+serde_norway = "0.9"
+# Git-clone staging for schema adds (mnemo2/specs_settings.rs): the shallow
+# clone lands in a TempDir removed when dropped. Same version as the
+# dev-dependency below, so the crate unifies.
+tempfile = "3"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.23"
@@ -28,7 +36,7 @@ log = "0.4"
 # and the uv release archives extract via zip (Windows asset) + tar/flate2
 # (unix assets).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate", "stream"] }
-zip = "8"
+zip = "9"
 tar = "0.4"
 flate2 = "1"
 # uv release-asset digest verification (ipc/laya.rs verify_sha256) — same
@@ -58,6 +66,14 @@ required-features = ["mnemo2"]
 name = "mnemo2-mcp"
 path = "src/bin/mnemo2_mcp.rs"
 required-features = ["mnemo2"]
+# The routing eval (plan 2ba2168a, design §4.8): asks a running Laya the
+# hand-set and mined corpora, one prompt at a time, and prints the threshold
+# sweep with the suggested `min_confidence_3` / `min_confidence_2`.
+[[bin]]
+name = "mnemo2_route_eval"
+path = "src/bin/mnemo2_route_eval.rs"
+required-features = ["mnemo2"]
+
 
 [dev-dependencies]
 tempfile = "3"

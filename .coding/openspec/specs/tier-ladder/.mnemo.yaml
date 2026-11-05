@@ -1,0 +1,4 @@
+paths:
+  - src/config/endpoints.rs
+  - src/config/mod.rs
+  - mnemo2/src/components/TiersPage.svelte

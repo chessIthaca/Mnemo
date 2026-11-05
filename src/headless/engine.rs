@@ -214,6 +214,19 @@ impl Engine {
     pub(crate) fn brain(&self) -> &Brain {
         &self.brain
     }
+
+    /// The app's live shared embedder, when this engine owns a concrete memory
+    /// store. The handle is the store's current embedder — the same one recall
+    /// and ingestion use — so an online-learning overlay (the dispatch-route
+    /// kNN) never spins up a second embedding backend. `None` when memory is
+    /// disabled or the store was injected as a trait object: the caller then
+    /// degrades to the baseline classifier (Laya).
+    pub fn embedder_handle(&self) -> Option<Arc<dyn crate::memory::embedder::Embedder>> {
+        self.brain
+            .own_memory_store
+            .as_ref()
+            .map(|store| store.embedder_handle())
+    }
     /// Start an engine on an EXPLICIT workspace + config (§5.3 :297).
     /// Never blocks and never shows a picker (§7 row 9): an unusable
     /// workspace — the root missing, or `require_git` unmet on a non-repo
@@ -425,6 +438,21 @@ impl Engine {
                 limits: effective_limits,
                 // 3c/G2 (§5.9.2): the session's host tools.
                 host_tools,
+                // Plan c3ba2b58 step A: the session's trace identity
+                // (lead/worker/subagent/system + worker/plan labels) —
+                // the host spawn path fills the allocated ids and stamps
+                // it on the loop. `None` keeps records unattributed.
+                trace_identity: opts.trace_identity.clone(),
+                // Plan 40eef714 step 1: the session's pinned task — the
+                // host spawn path stamps it on the loop, and every
+                // request's stable head carries it verbatim for the
+                // whole session. `None` = ordinary session.
+                pinned_task: opts.pinned_task.clone(),
+                // Plan 2ba2168a step 1: the session's per-turn-routing
+                // skip — the host spawn path stamps it on the loop, so a
+                // Mnemo2 session's turns are never classified by the
+                // per-prompt gate. `false` = the gate (Mnemo1, unchanged).
+                skip_turn_routing: opts.skip_turn_routing,
             },
         )
         .await
@@ -863,6 +891,7 @@ async fn start_inner(
     let (bus, _) = broadcast::channel(1024);
     let inner = Arc::new(EngineInner {
         host,
+        model_resolver: brain.model_resolver.clone(),
         sessions: Mutex::new(HashMap::new()),
         pending_approvals: Mutex::new(HashMap::new()),
         pending_questions: Mutex::new(HashMap::new()),
@@ -940,7 +969,10 @@ fn parse_model_ref(spec: &str) -> Result<crate::config::ModelRef, String> {
 
 /// The spawn's forced model with its optional reasoning effort. An effort
 /// needs a model to apply to — it is refused rather than silently dropped.
-fn forced_model_ref(
+/// [`AgentSession::set_model`](crate::headless::session::AgentSession::set_model)
+/// reuses this parse, so a live model switch validates a spec exactly like
+/// a spawn-time pin.
+pub(crate) fn forced_model_ref(
     spec: Option<&str>,
     reasoning_effort: Option<String>,
 ) -> Result<Option<crate::config::ModelRef>, String> {

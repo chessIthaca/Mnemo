@@ -336,6 +336,15 @@ export type SerializableAgentEvent =
        *  in UI vocabulary (backlog 51dab4da). */
       reasoning_effort?: string | null;
     }
+  /**
+   * A DEFERRED model switch completed: the OLD model summarized the
+   * conversation so it fits the new, smaller window. Informational — the
+   * swap succeeded and the turn continues — so it is a neutral notice and
+   * never an `error` (a final error would stop the agent and mark it failed;
+   * bug 2026-11-02, plan 1238e0de).
+   */
+  | { kind: "model_swap_summarized"; model: string }
+  | { kind: "routing_notice"; routing_kind: string; text: string }
   | { kind: "memory_recalled"; hits: { tier: string; title: string }[] }
   | {
       kind: "user_question";

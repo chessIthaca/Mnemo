@@ -22,16 +22,24 @@
 //! local copy, and emits [`BACKLOG_CHANGED_CHANNEL`] so any other open view
 //! refreshes.
 //!
-//! The section is the plan inbox only — add / edit / reorder / defer / remove.
-//! Mnemo2's work runs on the plan board, so nothing here dispatches: a later
-//! plan may add "Plan this" (the lead turns an idea into a plan).
+//! The section is the plan inbox — add / edit / reorder / defer / remove —
+//! and hands one idea to the lead with [`plan_this`] ("Plan this"): the
+//! item becomes `in_flight` (note: "handed to the lead") and the lead
+//! receives a notice asking for a plan created with `backlog_id=<id>`,
+//! which marks the item done with the plan — marked
+//! [`TEAM_NOTICE_PREFIX`] with the idea quoted for an attached external
+//! lead, a plain user message for the in-app one. Nothing else dispatches:
+//! the plan board stays the one home of in-flight work.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use mnemo::app::backlog::{BacklogItem, BacklogStore};
+use mnemo::app::backlog::{BacklogItem, BacklogStatus, BacklogStore};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::mnemo2::ipc::Mnemo2State;
+use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
+use crate::mnemo2::team::TeamRuntime;
 
 /// The payload-less event emitted after every successful backlog write, so
 /// every open view re-reads the file.
@@ -146,6 +154,33 @@ fn set_deferred(path: &Path, id: &str, deferred: bool) -> Result<Vec<BacklogItem
     Ok(store.items())
 }
 
+/// Mark one idea done (checked) or put a finished one back in the queue
+/// (unchecked) and return the new list.
+///
+/// The store decides what is legal: checked goes through the guarded
+/// `transition` to `Done`, unchecked through the stricter `requeue`, which only
+/// accepts a done / failed / cant-resolve item. A refused change comes back as
+/// an error naming the item — but the view disables the box for an in-flight
+/// idea, so a running one is never toggled from there.
+fn set_done(path: &Path, id: &str, done: bool) -> Result<Vec<BacklogItem>, String> {
+    let mut store = BacklogStore::open(path.to_path_buf());
+    let moved = if done {
+        store.transition(id, BacklogStatus::Done, None)
+    } else {
+        store.requeue(id)
+    };
+    if !moved {
+        if !store.items().iter().any(|item| item.id == id) {
+            return Err(unknown_item(id));
+        }
+        return Err(format!(
+            "backlog item {id} cannot be marked {}",
+            if done { "done" } else { "not done" }
+        ));
+    }
+    Ok(store.items())
+}
+
 /// Soft-delete every finished (done / failed / cant-resolve) idea and return
 /// the new list.
 fn clear_finished(path: &Path) -> Vec<BacklogItem> {
@@ -222,6 +257,19 @@ pub async fn backlog_set_deferred(
     Ok(items)
 }
 
+/// Mark one idea done (checked) or put it back in the queue (unchecked); returns the new list.
+#[tauri::command]
+pub async fn backlog_set_done(
+    state: State<'_, Mnemo2State>,
+    app: AppHandle,
+    id: String,
+    done: bool,
+) -> Result<Vec<BacklogItem>, String> {
+    let items = set_done(&backlog_path(&state).await?, &id, done)?;
+    let _ = app.emit(BACKLOG_CHANGED_CHANNEL, ());
+    Ok(items)
+}
+
 /// Soft-delete every finished idea; returns the new list.
 #[tauri::command]
 pub async fn backlog_clear_finished(
@@ -231,6 +279,114 @@ pub async fn backlog_clear_finished(
     let items = clear_finished(&backlog_path(&state).await?);
     let _ = app.emit(BACKLOG_CHANGED_CHANNEL, ());
     Ok(items)
+}
+
+/// The "Plan this" handoff: the refreshed live list (the item is now
+/// `in_flight`) plus the notice in each delivery shape. `external` is
+/// what an attached external lead's queue receives — the
+/// [`TEAM_NOTICE_PREFIX`] marker, the handoff line, the idea quoted line by
+/// line — because notice text is data, never a direct instruction.
+/// `in_app` is the plain user message the in-app lead receives: the user
+/// clicked the button there, so the request is theirs, unmarked and
+/// unquoted.
+#[derive(Debug)]
+struct PlanThisHandoff {
+    items: Vec<BacklogItem>,
+    external: String,
+    in_app: String,
+}
+
+/// Hand one pending backlog idea to the lead ("Plan this"): the item moves
+/// to `in_flight` with a "handed to the lead" note — the transition table's
+/// dispatch entry, so a second click on a stale view refuses instead of
+/// double-queueing — and the handoff carries the notice in both delivery
+/// shapes ([`PlanThisHandoff`]).
+fn plan_this_item(path: &Path, id: &str) -> Result<PlanThisHandoff, String> {
+    let mut store = BacklogStore::open(path.to_path_buf());
+    let Some(item) = store.items().into_iter().find(|item| item.id == id) else {
+        return Err(unknown_item(id));
+    };
+    if !store.transition(id, BacklogStatus::InFlight, Some("handed to the lead".to_string())) {
+        return Err(format!(
+            "backlog item {id} is not pending — only a pending idea can be handed to the lead"
+        ));
+    }
+    let headline = item.text.lines().next().unwrap_or_default().trim();
+    let quoted = item
+        .text
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let in_app = format!(
+        "Plan this backlog item {id}: {headline}\n\n{}\n\nWrite a plan with plan_create and pass backlog_id={id}.",
+        item.text
+    );
+    let external = format!(
+        "{TEAM_NOTICE_PREFIX}\n\
+         Plan this backlog item {id} (the user clicked Plan this in mission control): {headline}\n\n\
+         {quoted}\n\n\
+         Write a plan with plan_create and pass backlog_id={id}."
+    );
+    Ok(PlanThisHandoff {
+        items: store.items(),
+        external,
+        in_app,
+    })
+}
+
+/// Deliver the "Plan this" handoff to whichever lead is active: the
+/// external lead's queue when one is attached
+/// ([`TeamRuntime::push_external_notice`], the same queue every lead notice
+/// rides) receives the marked `external_notice`, else the in-app lead
+/// receives `in_app_message` as a user message — the composer's
+/// [`send_prompt`](crate::mnemo2::runtime::LeadRuntime::send_prompt) path,
+/// handed in as `prompt_lead` so the tests can intercept it. Returns `true`
+/// when the notice was queued for an external lead.
+async fn deliver_plan_this_notice<F, Fut>(
+    team: &TeamRuntime,
+    external_notice: String,
+    in_app_message: String,
+    prompt_lead: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if team.push_external_notice(external_notice) {
+        return Ok(true);
+    }
+    prompt_lead(in_app_message).await?;
+    Ok(false)
+}
+
+/// Hand one backlog idea to the lead to plan ("Plan this"): the item becomes
+/// `in_flight` (note: "handed to the lead") and the lead receives the
+/// notice — "Plan this backlog item <id>", the idea, then "Write a plan
+/// with plan_create and pass backlog_id=<id>." — queued for the external
+/// lead when one is attached (marked as a TeamManager notice, the idea
+/// quoted), else sent to the in-app lead as a plain user message. The
+/// plan_create that carries `backlog_id` then marks the item done with the
+/// plan. Returns the new list.
+#[tauri::command]
+pub async fn plan_this(
+    state: State<'_, Mnemo2State>,
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<BacklogItem>, String> {
+    let lead = state
+        .open_lead()
+        .await
+        .ok_or_else(|| "Mnemo2 has no open lead; call lead_open first".to_string())?;
+    let team = lead.team_handle().await?;
+    let handoff = plan_this_item(&backlog_file(lead.workspace_root()), &id)?;
+    let prompt = {
+        let lead = Arc::clone(&lead);
+        move |text: String| async move { lead.send_prompt(text, Vec::new()).await }
+    };
+    deliver_plan_this_notice(&team, handoff.external, handoff.in_app, prompt).await?;
+    let _ = app.emit(BACKLOG_CHANGED_CHANNEL, ());
+    Ok(handoff.items)
 }
 
 #[cfg(test)]
@@ -479,6 +635,56 @@ mod tests {
     }
 
     #[test]
+    fn set_done_checks_and_unchecks_an_idea() {
+        let project = project();
+        let path = file(&project);
+        add_item(&path, "Finished by hand").expect("add");
+        let id = id_of(&path, "Finished by hand");
+
+        let items = set_done(&path, &id, true).expect("check");
+        assert_eq!(items[0].status, BacklogStatus::Done);
+        assert_eq!(
+            read_items(&path)[0].status,
+            BacklogStatus::Done,
+            "the check is persisted, not just returned"
+        );
+
+        let items = set_done(&path, &id, false).expect("uncheck");
+        assert_eq!(items[0].status, BacklogStatus::Pending);
+        assert_eq!(read_items(&path)[0].status, BacklogStatus::Pending);
+    }
+
+    #[test]
+    fn set_done_refuses_an_in_flight_idea() {
+        let project = project();
+        let path = file(&project);
+        add_item(&path, "Being planned").expect("add");
+        let id = id_of(&path, "Being planned");
+        let mut store = BacklogStore::open(path.clone());
+        assert!(store.transition(&id, BacklogStatus::InFlight, None));
+
+        let error = set_done(&path, &id, false).expect_err("an in-flight idea is not finished");
+        assert!(error.contains("cannot be marked"), "{error}");
+
+        assert_eq!(
+            read_items(&path)[0].status,
+            BacklogStatus::InFlight,
+            "a refused checkbox leaves the item alone"
+        );
+    }
+
+    #[test]
+    fn set_done_names_an_unknown_id() {
+        let project = project();
+        let path = file(&project);
+
+        let error = set_done(&path, "nope", true).expect_err("unknown id");
+        assert_eq!(error, unknown_item("nope"));
+        let error = set_done(&path, "nope", false).expect_err("unknown id");
+        assert_eq!(error, unknown_item("nope"));
+    }
+
+    #[test]
     fn clear_finished_drops_finished_ideas_and_keeps_pending_ones() {
         let project = project();
         let path = file(&project);
@@ -492,5 +698,243 @@ mod tests {
             stored.contains("Finished idea"),
             "the cleared line stays as a soft delete: {stored}"
         );
+    }
+
+    #[test]
+    fn plan_this_marks_the_item_in_flight_and_builds_both_notice_shapes() {
+        let project = project();
+        let path = file(&project);
+        add_item(&path, "Fix the importer\nKeep the CLI flags").expect("add");
+
+        let id = id_of(&path, "Fix the importer\nKeep the CLI flags");
+        let handoff = plan_this_item(&path, &id).expect("hand the idea to the lead");
+        let item = handoff
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .expect("the handed item");
+        assert_eq!(item.status, BacklogStatus::InFlight);
+        assert_eq!(item.note.as_deref(), Some("handed to the lead"));
+
+        // The in-app lead receives the user's request unmarked: the user
+        // clicked the button there, so the plan ask is theirs.
+        assert_eq!(
+            handoff.in_app,
+            format!(
+                "Plan this backlog item {id}: Fix the importer\n\n\
+                 Fix the importer\nKeep the CLI flags\n\n\
+                 Write a plan with plan_create and pass backlog_id={id}."
+            )
+        );
+
+        // The external lead's queue entry carries the notice marker, says
+        // who asked, and quotes the idea line by line — notice text is data,
+        // never a direct instruction.
+        assert_eq!(
+            handoff.external,
+            format!(
+                "{TEAM_NOTICE_PREFIX}\n\
+                 Plan this backlog item {id} (the user clicked Plan this in mission control): Fix the importer\n\n\
+                 > Fix the importer\n> Keep the CLI flags\n\n\
+                 Write a plan with plan_create and pass backlog_id={id}."
+            )
+        );
+    }
+
+    #[test]
+    fn plan_this_refuses_an_unknown_or_not_pending_item() {
+        let project = project();
+        let path = file(&project);
+
+        let error = plan_this_item(&path, "missing").expect_err("unknown id");
+        assert!(error.contains("no backlog item"), "{error}");
+
+        add_item(&path, "Finished idea").expect("add");
+        let id = id_of(&path, "Finished idea");
+        let mut store = BacklogStore::open(path.clone());
+        assert!(store.transition(&id, BacklogStatus::Done, None));
+        let error = plan_this_item(&path, &id).expect_err("not pending");
+        assert!(error.contains("is not pending"), "{error}");
+    }
+
+    /// A do-nothing LLM client: the delivery tests' engine never runs a
+    /// session turn — they only open the runtime and exercise the notice
+    /// queue — so every `complete` just stops. (The team module's
+    /// ScriptedLlm seam, minus its scripted batches.)
+    struct NullLlm;
+
+    #[async_trait::async_trait]
+    impl mnemo::provider::LlmClient for NullLlm {
+        fn capabilities(&self) -> &mnemo::provider::Capabilities {
+            static CAPS: std::sync::OnceLock<mnemo::provider::Capabilities> =
+                std::sync::OnceLock::new();
+            CAPS.get_or_init(mnemo::provider::Capabilities::openai)
+        }
+
+        fn kind(&self) -> mnemo::provider::ProviderKind {
+            mnemo::provider::ProviderKind::OpenAI
+        }
+
+        fn model(&self) -> &str {
+            "null"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[mnemo::provider::Message],
+            _tools: &[mnemo::provider::ToolSchema],
+            _tool_choice: Option<mnemo::provider::ToolChoice>,
+        ) -> mnemo::error::Result<
+            futures::stream::BoxStream<'_, mnemo::provider::LlmEvent>,
+        > {
+            Ok(Box::pin(futures::stream::iter(vec![
+                mnemo::provider::LlmEvent::TextDelta {
+                    text: "done".to_string(),
+                },
+                mnemo::provider::LlmEvent::Finish {
+                    reason: mnemo::provider::FinishReason::Stop,
+                },
+            ])))
+        }
+    }
+
+    /// A minimal live team for the delivery tests: an engine over a throwaway
+    /// workspace (no git, no memory, the null LLM — nothing here runs a
+    /// session) plus the runtime's own state and config dirs, all kept alive
+    /// for the test's length. Mirrors the team module's fixtures, minus their
+    /// dispatch machinery.
+    struct LiveTeam {
+        root: TempDir,
+        _state: TempDir,
+        _config: TempDir,
+        team: TeamRuntime,
+    }
+
+    async fn live_team() -> LiveTeam {
+        use crate::mnemo2::team::TeamRuntimeOptions;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        std::fs::write(
+            config.path().join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"null\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            config.path().join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"null\"]\n",
+        )
+        .expect("endpoints.toml");
+        let engine = mnemo::headless::EngineBuilder::new(mnemo::headless::EngineOptions {
+            workspace: mnemo::workspace::Workspace::new(root.path()),
+            config_dir: Some(config.path().to_path_buf()),
+            permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+            memory: mnemo::headless::MemoryBackend::Disabled,
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .provider(Arc::new(NullLlm))
+        .start()
+        .await
+        .expect("start the engine");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: Arc::new(engine),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            config_dir: config.path().to_path_buf(),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+            slots: Some(1),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("open the team");
+        LiveTeam {
+            root,
+            _state: state,
+            _config: config,
+            team,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_this_queues_the_notice_for_an_attached_external_lead() {
+        let live = live_team().await;
+        let path = backlog_file(live.root.path());
+        add_item(&path, "Fix the importer").expect("add the idea");
+        let id = id_of(&path, "Fix the importer");
+        let handoff = plan_this_item(&path, &id).expect("hand the idea to the lead");
+
+        assert!(live.team.attach_external_lead());
+        let queued = deliver_plan_this_notice(
+            &live.team,
+            handoff.external.clone(),
+            handoff.in_app.clone(),
+            |text| async move {
+                Err::<(), String>(format!(
+                    "the in-app lead must not be prompted while an external lead is attached: {text}"
+                ))
+            },
+        )
+        .await
+        .expect("the notice is delivered");
+
+        assert!(queued, "the notice belongs to the external lead");
+        let drained = live.team.drain_external_notices();
+        assert_eq!(drained.len(), 1, "exactly one queued notice: {drained:?}");
+        let text = drained[0].as_str();
+        assert_eq!(
+            text,
+            handoff.external.as_str(),
+            "the queue holds the marked handoff notice"
+        );
+        assert!(text.starts_with(TEAM_NOTICE_PREFIX), "the marker: {text}");
+        assert!(
+            text.contains("the user clicked Plan this in mission control"),
+            "the ask names the user: {text}"
+        );
+        assert!(text.contains("\n> Fix the importer"), "the idea is quoted: {text}");
+    }
+
+    #[tokio::test]
+    async fn plan_this_prompts_the_in_app_lead_when_no_external_lead_is_attached() {
+        let live = live_team().await;
+        let path = backlog_file(live.root.path());
+        add_item(&path, "Fix the importer").expect("add the idea");
+        let id = id_of(&path, "Fix the importer");
+        let handoff = plan_this_item(&path, &id).expect("hand the idea to the lead");
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&sent);
+        let queued = deliver_plan_this_notice(
+            &live.team,
+            handoff.external.clone(),
+            handoff.in_app.clone(),
+            move |text| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().expect("sink").push(text);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("the notice is delivered");
+
+        assert!(!queued, "the notice belongs to the in-app lead");
+        assert!(live.team.drain_external_notices().is_empty());
+        let sent = sent.lock().expect("sent").clone();
+        assert_eq!(sent.len(), 1, "exactly one prompted message: {sent:?}");
+        let text = sent[0].as_str();
+        assert_eq!(
+            text,
+            handoff.in_app.as_str(),
+            "the in-app lead gets the user's unmarked request"
+        );
+        assert!(!text.starts_with(TEAM_NOTICE_PREFIX), "a user message, not a notice: {text}");
+        assert!(!text.contains("\n> "), "the idea is not quoted in a user message: {text}");
     }
 }

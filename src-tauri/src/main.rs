@@ -595,6 +595,18 @@ fn main() {
                                 limits: None,
                                 // 3c (G2): the main agent registers no host tools
                                 host_tools: vec![],
+                                // Plan c3ba2b58 step A: Mnemo1's main agent
+                                // passes no trace identity — records stay
+                                // unattributed, exactly today's behavior.
+                                trace_identity: None,
+                                // Plan 40eef714 step 1: Mnemo1's main agent
+                                // passes no pinned task — the head bytes stay
+                                // unchanged, exactly today's behavior.
+                                pinned_task: None,
+                                // Plan 2ba2168a step 1: Mnemo1's main agent
+                                // keeps the per-turn routing gate, exactly
+                                // today's behavior.
+                                skip_turn_routing: false,
                             },
                         )
                         .await

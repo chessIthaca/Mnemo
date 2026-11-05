@@ -1,11 +1,11 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EmbedderEvent, ModelSettings, ModelSettingsSection, ModelSettingsTransport, TaskModels } from "../lib/modelSettings";
 import { emptyModel, type EndpointDetailDto } from "../lib/settingsEngine";
 import ModelsPage from "./ModelsPage.svelte";
 
 /**
- * ModelsPage — the per-task, vision, code-indexing and budget sections of
+ * ModelsPage — the compaction, vision, code-indexing and budget sections of
  * the Models settings page, each with its own save button. The transport is
  * a prop, so the tests hand the page a fake directly.
  */
@@ -13,10 +13,6 @@ import ModelsPage from "./ModelsPage.svelte";
 function sampleSettings(): ModelSettings {
   return {
     task_models: {
-      planning: "openrouter/glm-5.3-flash",
-      executing: null,
-      bug_fixing: null,
-      reviewing: "openrouter/gpt-5.2",
       summarize: null,
     },
     vision_model: "openrouter/gpt-5.2",
@@ -117,10 +113,9 @@ describe("ModelsPage", () => {
     vi.clearAllMocks();
   });
 
-  it("renders the task slots, vision, code-indexing list and budget from the snapshot", async () => {
+  it("renders the compaction model, vision, code-indexing list and budget from the snapshot", async () => {
     page();
-    expect((await screen.findByLabelText("Planning") as HTMLInputElement).value).toBe("openrouter/glm-5.3-flash");
-    expect((screen.getByLabelText("Executing") as HTMLInputElement).value).toBe("");
+    expect((await screen.findByLabelText("Compaction model") as HTMLInputElement).value).toBe("");
     expect((screen.getByLabelText("Vision model") as HTMLInputElement).value).toBe("openrouter/gpt-5.2");
     expect((screen.getByLabelText("Tokens per plan") as HTMLInputElement).value).toBe("2000000");
     expect(screen.getByRole("radio", { name: "MiniLM — default 90 MB" })).toBeTruthy();
@@ -129,37 +124,47 @@ describe("ModelsPage", () => {
     expect(screen.getByText("Status: Not installed")).toBeTruthy();
   });
 
-  it("saves task models and shows the reopen note", async () => {
+  it("shows only what Mnemo2 uses and says where Mnemo1's per-task models live", async () => {
+    page();
+    const compaction = await screen.findByRole("region", { name: "Compaction" });
+    expect(within(compaction).getByLabelText("Compaction model")).toBeTruthy();
+    for (const gone of ["Planning", "Executing", "Bug fixing", "Reviewing"]) {
+      expect(screen.queryByLabelText(gone)).toBeNull();
+    }
+    expect(screen.getByText(/stay in the shared config\.toml; Mnemo2 doesn't use them/)).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Vision" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Code indexing" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Budget" })).toBeTruthy();
+  });
+
+  it("saves the compaction model and shows the reopen note", async () => {
     const made = page();
-    await screen.findByLabelText("Planning");
-    await fireEvent.input(screen.getByLabelText("Planning"), { target: { value: "lmstudio/qwen3-30b-a3b" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Save models" }));
+    await screen.findByLabelText("Compaction model");
+    await fireEvent.input(screen.getByLabelText("Compaction model"), { target: { value: "lmstudio/qwen3-30b-a3b" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save compaction model" }));
     await waitFor(() => expect(made.transport.save).toHaveBeenCalledWith("models", {
-      planning: "lmstudio/qwen3-30b-a3b",
-      executing: null,
-      bug_fixing: null,
-      reviewing: "openrouter/gpt-5.2",
-      summarize: null,
+      summarize: "lmstudio/qwen3-30b-a3b",
     }));
     expect(await screen.findByText("Applies after reopening the project.")).toBeTruthy();
   });
 
-  it("sends null for a cleared slot", async () => {
+  it("sends null for a cleared compaction model", async () => {
     const made = page();
-    await screen.findByLabelText("Planning");
-    await fireEvent.click(screen.getByRole("button", { name: "Use the default for Planning" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Save models" }));
+    await screen.findByLabelText("Compaction model");
+    await fireEvent.input(screen.getByLabelText("Compaction model"), { target: { value: "openrouter/gpt-5.2" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Use the default for the compaction model" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Save compaction model" }));
     await waitFor(() => expect(made.transport.save).toHaveBeenCalled());
     const payload = made.transport.save.mock.calls[0][1] as TaskModels;
-    expect(payload.planning).toBeNull();
+    expect(payload.summarize).toBeNull();
   });
 
   it("rejects a malformed model ref inline without saving", async () => {
     const made = page();
-    await screen.findByLabelText("Planning");
-    await fireEvent.input(screen.getByLabelText("Planning"), { target: { value: "no-slash" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Save models" }));
-    expect(screen.getByText('Planning model must be "endpoint/model"')).toBeTruthy();
+    await screen.findByLabelText("Compaction model");
+    await fireEvent.input(screen.getByLabelText("Compaction model"), { target: { value: "no-slash" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save compaction model" }));
+    expect(screen.getByText('Compaction model must be "endpoint/model"')).toBeTruthy();
     expect(made.transport.save).not.toHaveBeenCalled();
   });
 
@@ -199,15 +204,15 @@ describe("ModelsPage", () => {
     expect(screen.queryByRole("progressbar")).toBeNull();
   });
 
-  it("keeps an unsaved task edit across the install refresh", async () => {
+  it("keeps an unsaved compaction edit across the install refresh", async () => {
     const made = page();
-    await screen.findByLabelText("Planning");
-    await fireEvent.input(screen.getByLabelText("Planning"), { target: { value: "lmstudio/qwen3-30b-a3b" } });
+    await screen.findByLabelText("Compaction model");
+    await fireEvent.input(screen.getByLabelText("Compaction model"), { target: { value: "lmstudio/qwen3-30b-a3b" } });
     made.settings.embedding.status = "ready";
     made.settings.embedding.options[1].installed = true;
     made.handlers[0]({ type: "done", step: "embedder_model" });
     await screen.findByText("Status: Ready");
-    expect((screen.getByLabelText("Planning") as HTMLInputElement).value).toBe("lmstudio/qwen3-30b-a3b");
+    expect((screen.getByLabelText("Compaction model") as HTMLInputElement).value).toBe("lmstudio/qwen3-30b-a3b");
   });
 
   it("shows a failed install inline", async () => {

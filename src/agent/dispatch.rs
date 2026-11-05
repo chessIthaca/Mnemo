@@ -181,6 +181,25 @@ pub(crate) struct DispatchCtx<'a> {
     pub(crate) buffered: &'a mut Vec<AgentCommand>,
 }
 
+/// The turn request's plumbing passed to
+/// [`AgentLoop::complete_with_retry`] — grouped (the `DispatchCtx`
+/// pattern) to keep the entry point under clippy's arity threshold: this
+/// repo forbids new `#[allow]`, and plan c3ba2b58 step A added the trace
+/// context. The helper destructures it at its head into plain locals.
+pub(crate) struct TurnRequest<'a> {
+    /// The event fan-in — every failed attempt emits a transient
+    /// `Error { retrying: true }` through it.
+    pub(crate) fanin_tx: &'a mpsc::Sender<(AgentId, AgentEvent)>,
+    /// The calling agent's runtime id (labels the retrying events and the
+    /// stats rows).
+    pub(crate) agent_id: AgentId,
+    /// The memory-session id, when known (labels the stats rows).
+    pub(crate) session_id: Option<&'a str>,
+    /// The trace context stamped on every attempt's record (plan
+    /// c3ba2b58 step A: the loop's identity + turn id + purpose).
+    pub(crate) llm_context: &'a crate::provider::trace::LlmRequestContext,
+}
+
 impl AgentLoop {
     /// Execute a single tool call, handling approval + retries.
     ///
@@ -1240,18 +1259,27 @@ impl AgentLoop {
     /// "sending" window (user report 2026-08-22). The frontend keeps
     /// `running = true` for retrying errors and shows the note in the
     /// activity log.
-    pub(super) async fn complete_with_retry<'a>(
+    pub(super) async fn complete_with_retry<'a, 'req>(
         &self,
         provider: &'a Arc<dyn LlmClient>,
         messages: &[Message],
         tool_schemas: &[crate::provider::ToolSchema],
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        session_id: Option<&str>,
+        request: TurnRequest<'req>,
     ) -> Result<futures::stream::BoxStream<'a, LlmEvent>> {
+        let TurnRequest {
+            fanin_tx,
+            agent_id,
+            session_id,
+            llm_context,
+        } = request;
         let mut last_err = None;
         for attempt in 0..3 {
-            match provider.complete(messages, tool_schemas, None).await {
+            // Plan c3ba2b58 step A: every attempt (retry, backoff) opens its
+            // own trace record, all stamped with the same per-call context.
+            match provider
+                .complete_with_context(messages, tool_schemas, None, llm_context)
+                .await
+            {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     // R21: every failed attempt re-sent the full prompt —

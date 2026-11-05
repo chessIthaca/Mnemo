@@ -4369,6 +4369,372 @@ async fn local_provider_tail_rides_as_user_messages_no_trailing_system_block() {
     );
 }
 
+#[tokio::test]
+async fn pinned_task_rides_the_system_head() {
+    // Plan 40eef714 step 1: the pinned task rides the STABLE HEAD
+    // (messages[0]) of every request for the session's whole life —
+    // never a conversation message, never the volatile tail — so
+    // compaction (which summarizes messages[1..]) and a model switch
+    // (which rebuilds messages[0]) can never eat it.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::single(vec![
+        LlmEvent::TextDelta {
+            text: "done".into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    agent.set_pinned_task(Some("TASK-7f3 do the thing".into()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("go")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let requests = recorder.requests.lock().expect("the request capture");
+    assert_eq!(requests.len(), 1, "one request serves the turn");
+    let request = &requests[0];
+    assert_eq!(request[0].role, Role::System, "the head is messages[0]");
+    let head = request[0].content.as_text();
+    assert!(
+        head.contains("## Your task (pinned)"),
+        "the pinned block rides the stable head: {head}"
+    );
+    assert!(
+        head.contains("TASK-7f3 do the thing"),
+        "the task text is verbatim in the head: {head}"
+    );
+    for message in &request[1..] {
+        assert!(
+            !message.content.as_text().contains("TASK-7f3"),
+            "the pinned task must not leak into any other message: {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pinned_task_survives_compaction() {
+    // Compaction summarizes conversation messages only and rebuilds
+    // every request's messages[0] from the stable head — so the request
+    // AFTER the summary still carries the pinned task byte-for-byte in
+    // the head, and the summarizer never sees the task at all.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![
+        // First the summarizer's call...
+        vec![
+            LlmEvent::TextDelta {
+                text: "summary of the conversation".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // ...then the main request after the summary replaced the
+        // history.
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let task = "TASK-7f3 do the thing — verbatim through compaction";
+    agent.set_pinned_task(Some(task.into()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    // ~400KB of text ≈ 80K tiktoken tokens ("word " is one BPE token) —
+    // past the 64K summarize threshold (128_000 * 0.5), triggering
+    // compaction before the main request. Nine messages so
+    // summarize_with_interrupt has something to summarize (it
+    // early-returns when len <= keep_recent + 1).
+    let mut messages = vec![Message::user_text("start")];
+    for i in 0..3 {
+        messages.push(Message::assistant_text(format!("ack {i}")));
+        messages.push(Message::user_text(format!("turn {i}")));
+    }
+    messages.push(Message::user_text("word ".repeat(80_000)));
+    messages.push(Message::assistant_text("done"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let requests = recorder.requests.lock().expect("the request capture");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the summarizer's request, then the main request"
+    );
+    // The summarizer summarizes the CONVERSATION — the pinned task lives
+    // in the head, so it never enters its prompt.
+    assert!(
+        !requests[0]
+            .iter()
+            .any(|m| m.content.as_text().contains("TASK-7f3")),
+        "the summary prompt must be built from the conversation, not the head"
+    );
+    // The MAIN request — the one after compaction replaced the history —
+    // still carries the full pinned task byte-for-byte in messages[0].
+    assert_eq!(
+        requests[1][0].role, Role::System,
+        "the compacted request still leads with the head"
+    );
+    let head = requests[1][0].content.as_text();
+    assert!(
+        head.contains(task),
+        "the pinned task survives compaction verbatim in messages[0]"
+    );
+}
+
+#[tokio::test]
+async fn pinned_task_survives_compaction_after_the_head_is_installed() {
+    // Review F2 (plan 40eef714 step 1): the sibling test above compacts
+    // on the FIRST turn — before any request has installed the head into
+    // the persistent history — so a production bug that fed messages[0]
+    // to the summarizer would go uncaught there. Here the head is
+    // already installed: turn 1 completes (its request build inserts
+    // the pinned head as messages[0]), the history then grows past the
+    // threshold, and turn 2 auto-compacts a history whose messages[0]
+    // IS the head. Assertions: no request carries the pinned task
+    // outside its own system head (the summary prompt is built from the
+    // conversation, never from messages[0]), and the post-compaction
+    // request's messages[0] carries the task byte-for-byte.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![
+        // Turn 1's response — its request build installs the head.
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // The summarizer's call on turn 2...
+        vec![
+            LlmEvent::TextDelta {
+                text: "summary of the conversation".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // ...then turn 2's main request after the summary replaced the
+        // history.
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let task = "TASK-7f3 do the thing — verbatim through a later compaction";
+    agent.set_pinned_task(Some(task.into()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    // Turn 1: a small exchange — its request build installs the pinned
+    // head as messages[0] of the PERSISTENT history, so the compaction
+    // below runs on a history that starts with the head.
+    let mut messages = vec![Message::user_text("go")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages[0].role, Role::System,
+        "turn 1's request build installed the head in the history"
+    );
+    assert!(
+        messages[0].content.as_text().contains(task),
+        "the installed head carries the pinned task"
+    );
+
+    // The conversation grows: one ~400KB message (≈ 80K tokens — past
+    // the 64K summarize threshold, under the 96K hard ceiling) followed
+    // by a small recent tail. Eleven messages in total, so the
+    // summarizer has something to summarize (it early-returns when
+    // len <= keep_recent + 1) and the big message lands INSIDE the
+    // summarized range, not in the keep-recent window.
+    messages.push(Message::user_text(format!(
+        "BIG-FILLER {}",
+        "word ".repeat(80_000)
+    )));
+    messages.push(Message::assistant_text("done"));
+    for i in 0..3 {
+        messages.push(Message::user_text(format!("turn {i}")));
+        messages.push(Message::assistant_text(format!("ack {i}")));
+    }
+    // Turn 2: auto-compaction runs BEFORE the main request — on the
+    // head-installed history.
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let requests = recorder.requests.lock().expect("the request capture");
+    assert_eq!(
+        requests.len(),
+        3,
+        "turn 1's request, the summarizer's request, then turn 2's main request"
+    );
+    // Proof the middle request is the summarizer's, and that its
+    // summarize region was real: the big conversation message was fed
+    // to it.
+    assert!(
+        requests[1]
+            .iter()
+            .any(|m| m.content.as_text().contains("BIG-FILLER")),
+        "the summarizer's request carries the summarized conversation"
+    );
+    // F2's core: the pinned task may ride a request's SYSTEM head, but
+    // no non-system message may carry it — the summary prompt is a user
+    // message built from the conversation (messages[1..cut]); if
+    // production fed it messages[0] (the installed head), the task
+    // would appear here and its survival would depend on the summary
+    // echoing it back.
+    for (i, request) in requests.iter().enumerate() {
+        for message in request {
+            if message.role == Role::System {
+                continue;
+            }
+            assert!(
+                !message.content.as_text().contains("TASK-7f3"),
+                "request {i} carries the pinned task outside its system head: {message:?}"
+            );
+        }
+    }
+    // The post-compaction main request still leads with the head, and
+    // the head carries the full pinned task byte-for-byte.
+    assert_eq!(
+        requests[2][0].role, Role::System,
+        "the compacted request still leads with the head"
+    );
+    let head = requests[2][0].content.as_text();
+    assert!(
+        head.contains(task),
+        "the pinned task survives the later compaction verbatim in messages[0]"
+    );
+}
+
+#[tokio::test]
+async fn blank_pinned_task_leaves_the_head_unchanged() {
+    // A whitespace-only pinned task is None (stored as unset), and with
+    // no pinned task the head bytes are exactly as before — the pinned
+    // block must not appear (Mnemo1 unchanged, prefix-cache stable).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let (provider, captured) = CapturingProvider::new();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: Arc::new(provider),
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    agent.set_pinned_task(Some("   ".into()));
+    assert_eq!(
+        agent.pinned_task(),
+        None,
+        "a whitespace-only task is stored as None"
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("hi")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let prompts = captured.lock().await;
+    assert_eq!(prompts.len(), 1, "one request serves the turn");
+    assert!(
+        !prompts[0].contains("## Your task (pinned)"),
+        "a blank pinned task must leave the head bytes unchanged"
+    );
+}
+
 /// A mock provider whose `complete` fails the first `fail_times` calls,
 /// then returns a minimal stop stream. Used to verify that
 /// `complete_with_retry` surfaces every failed attempt as a transient
@@ -4455,7 +4821,17 @@ async fn complete_with_retry_emits_one_retrying_error_per_failure() {
 
     let (fanin_tx, mut fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    crate::agent::dispatch::TurnRequest {
+                        fanin_tx: &fanin_tx,
+                        agent_id: 1,
+                        session_id: None,
+                        llm_context: &crate::provider::trace::LlmRequestContext::unattributed(),
+                    },
+                )
         .await;
     assert!(result.is_ok(), "the third attempt must succeed");
 
@@ -4482,6 +4858,310 @@ async fn complete_with_retry_emits_one_retrying_error_per_failure() {
         3,
         "fail twice, then succeed on the third call"
     );
+}
+
+/// A provider that records every `complete_with_context` call's trace
+/// context (plan c3ba2b58 step A) and fails the first `fail_times` calls
+/// before succeeding — the retry path must see the SAME attributed
+/// context on every attempt, never a neighbouring agent's.
+struct ContextRecordingFlakyProvider {
+    caps: Capabilities,
+    /// The trace contexts received, in call order.
+    contexts: Arc<std::sync::Mutex<Vec<crate::provider::trace::LlmRequestContext>>>,
+    fail_times: u32,
+}
+
+#[async_trait]
+impl LlmClient for ContextRecordingFlakyProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "mock-context-recording"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        // The attribution threading must go through complete_with_context;
+        // a plain `complete` reaching this mock means the threading broke.
+        panic!("complete_with_retry must call complete_with_context");
+    }
+    async fn complete_with_context(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+        context: &crate::provider::trace::LlmRequestContext,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        let mut seen = self
+            .contexts
+            .lock()
+            .expect("ContextRecordingFlakyProvider lock poisoned");
+        seen.push(context.clone());
+        if seen.len() as u32 <= self.fail_times {
+            return Err(crate::error::Error::Provider("flaky failure".into()));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }])))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn complete_with_retry_keeps_attribution_across_attempts() {
+    // Plan c3ba2b58 step A: attribution travels with the request, so every
+    // attempt of a retried request — and every attempt of a request running
+    // beside others on the SAME shared provider — carries the calling
+    // agent's identity and the turn purpose. A mutable "current label" on
+    // the provider (the forbidden design) would cross-label exactly here.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let recorded: Arc<
+        std::sync::Mutex<Vec<crate::provider::trace::LlmRequestContext>>,
+    > = Arc::default();
+    let provider: Arc<dyn LlmClient> = Arc::new(ContextRecordingFlakyProvider {
+        caps: Capabilities::openai(),
+        contexts: Arc::clone(&recorded),
+        fail_times: 2,
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+    let provider = agent.provider();
+
+    let identity = crate::provider::trace::TraceIdentity {
+        actor_kind: crate::provider::trace::TraceActorKind::Worker,
+        agent_id: "55".into(),
+        session_id: "55".into(),
+        agent_name: "wt-retry".into(),
+        worker_id: Some("wt-retry".into()),
+        plan_id: Some("plan-2".into()),
+        plan_step: Some(3),
+    };
+    let ctx = crate::provider::trace::LlmRequestContext::attributed(
+        identity.attribution(Some("turn-r"), crate::provider::trace::TracePurpose::Turn),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let result = agent
+        .complete_with_retry(
+            &provider,
+            &[],
+            &[],
+            crate::agent::dispatch::TurnRequest {
+                fanin_tx: &fanin_tx,
+                agent_id: 1,
+                session_id: None,
+                llm_context: &ctx,
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "the third attempt must succeed");
+
+    let recorded = recorded.lock().expect("recorded lock poisoned");
+    assert_eq!(recorded.len(), 3, "one context per attempt (2 failures + 1 success)");
+    for attempt_ctx in recorded.iter() {
+        let a = attempt_ctx
+            .attribution
+            .as_ref()
+            .expect("every attempt carries the attribution");
+        assert_eq!(a.actor_kind, crate::provider::trace::TraceActorKind::Worker);
+        assert_eq!(a.agent_id, "55");
+        assert_eq!(a.worker_id.as_deref(), Some("wt-retry"));
+        assert_eq!(a.plan_step, Some(3));
+        assert_eq!(a.turn_id.as_deref(), Some("turn-r"));
+        assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
+    }
+}
+/// A provider that behaves like the real OpenAI/Anthropic clients for the
+/// attribution tests (plan c3ba2b58 step A review: twoLoopTest): every
+/// `complete_with_context` call FIRST waits at a shared barrier (two
+/// loops' requests are thereby guaranteed in flight together — the
+/// interleaving under test), THEN opens a record in the SHARED
+/// [`crate::provider::trace::LlmRequestLog`] stamped with the received
+/// context — exactly what a real client does at request-preparation
+/// time — and streams the reply. `complete` panics: the turn path must
+/// reach this provider through `complete_with_context`; that wiring is
+/// what this mock exists to pin.
+struct BarrierTracedProvider {
+    log: Arc<crate::provider::trace::LlmRequestLog>,
+    barrier: Arc<tokio::sync::Barrier>,
+    caps: Capabilities,
+}
+
+#[async_trait]
+impl LlmClient for BarrierTracedProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "mock-barrier-traced"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        panic!("the turn path must call complete_with_context");
+    }
+    async fn complete_with_context(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+        context: &crate::provider::trace::LlmRequestContext,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        // Interleaving guarantee: neither record opens until BOTH loops'
+        // requests are in flight (the barrier count is 2).
+        self.barrier.wait().await;
+        let rec_id = self.log.start_with_context(
+            self.model(),
+            "http://mock/v1/",
+            "mock",
+            serde_json::json!({"shared": true}),
+            context,
+        );
+        self.log.set_status(rec_id, 200);
+        self.log.append_response(rec_id, "done");
+        self.log.finish(rec_id, "stop");
+        Ok(Box::pin(futures::stream::iter(vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn two_loops_over_one_shared_provider_keep_their_own_attribution() {
+    // Review finding twoLoopTest (plan c3ba2b58 step A): TWO real loops,
+    // each with its own identity on its own TraceIdentityHandle, driving
+    // REAL run_turn turns concurrently over ONE shared provider and ONE
+    // LlmRequestLog — the full wiring path (per-loop handle → run_turn →
+    // llm_request_context → complete_with_retry → complete_with_context →
+    // start_with_context). The provider's barrier forces both requests
+    // in flight together before either record opens (interleaved). Every
+    // record must carry its OWN loop's attribution — nothing
+    // cross-labelled, nothing unattributed — so a wiring regression
+    // anywhere on that path goes red HERE (driving the provider
+    // directly, as the openai-level interleaving test does, stays green
+    // through a turn.rs regression).
+    let dir = tempdir().unwrap();
+    let log = Arc::new(crate::provider::trace::LlmRequestLog::new());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let provider: Arc<dyn LlmClient> = Arc::new(BarrierTracedProvider {
+        log: Arc::clone(&log),
+        barrier: Arc::clone(&barrier),
+        caps: Capabilities::openai(),
+    });
+
+    let identity = |name: &'static str, id: &'static str| crate::provider::trace::TraceIdentity {
+        actor_kind: crate::provider::trace::TraceActorKind::Worker,
+        agent_id: id.into(),
+        session_id: id.into(),
+        agent_name: name.into(),
+        worker_id: Some(name.into()),
+        plan_id: Some("plan-shared".into()),
+        plan_step: Some(1),
+    };
+
+    // Two loops: fresh per-loop state (workflow/registry/sandbox), ONE
+    // shared provider — the sharing shape Mnemo2 runs (one engine, lead
+    // + workers).
+    let build_loop = |identity: crate::provider::trace::TraceIdentity| -> AgentLoop {
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+        let registry = make_registry((*sandbox).clone(), workflow.clone());
+        let agent = AgentLoop::new(
+            test_config(Arc::clone(&provider), registry, workflow, sandbox),
+            crate::project::Constitution::default(),
+        );
+        agent.set_trace_identity(identity);
+        agent
+    };
+    let agent_a = build_loop(identity("wt-loop-a", "1"));
+    let agent_b = build_loop(identity("wt-loop-b", "2"));
+
+    let (fanin_tx_a, _fanin_rx_a) = mpsc::channel(64);
+    let (fanin_tx_b, _fanin_rx_b) = mpsc::channel(64);
+    let (_cmd_tx_a, mut cmd_rx_a) = mpsc::channel(8);
+    let (_cmd_tx_b, mut cmd_rx_b) = mpsc::channel(8);
+    let mut messages_a = vec![Message::user_text("from loop A")];
+    let mut messages_b = vec![Message::user_text("from loop B")];
+
+    let (out_a, out_b) = tokio::join!(
+        agent_a.run_turn(&mut messages_a, &fanin_tx_a, 1, &mut cmd_rx_a, None),
+        agent_b.run_turn(&mut messages_b, &fanin_tx_b, 2, &mut cmd_rx_b, None),
+    );
+    assert_eq!(out_a.unwrap().text, "done", "loop A's turn completed");
+    assert_eq!(out_b.unwrap().text, "done", "loop B's turn completed");
+
+    let rows = log.list();
+    assert_eq!(rows.len(), 2, "one record per loop's request — nothing more");
+    let mut names: Vec<&str> = rows
+        .iter()
+        .map(|r| {
+            r.attribution
+                .as_ref()
+                .map(|a| a.agent_name.as_str())
+                .unwrap_or("<unattributed>")
+        })
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["wt-loop-a", "wt-loop-b"],
+        "each record keeps its OWN loop's actor — nothing cross-labelled"
+    );
+    let mut turn_ids: Vec<&str> = rows
+        .iter()
+        .map(|r| {
+            r.attribution
+                .as_ref()
+                .and_then(|a| a.turn_id.as_deref())
+                .unwrap_or("<none>")
+        })
+        .collect();
+    turn_ids.sort_unstable();
+    assert_ne!(
+        turn_ids[0], turn_ids[1],
+        "each turn minted its own turn id under the shared provider"
+    );
+    for row in &rows {
+        let a = row.attribution.as_ref().expect("attribution on every record");
+        assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
+        assert_eq!(
+            a.actor_kind,
+            crate::provider::trace::TraceActorKind::Worker
+        );
+        assert_eq!(a.worker_id.as_deref(), Some(a.agent_name.as_str()));
+        assert_eq!(a.plan_id.as_deref(), Some("plan-shared"));
+        assert_eq!(a.session_id, a.agent_id);
+        let expected_id = if a.agent_name == "wt-loop-a" { "1" } else { "2" };
+        assert_eq!(a.agent_id, expected_id);
+        assert!(row.is_complete, "the mock stamped every record complete");
+        assert_eq!(row.http_status, Some(200));
+    }
+    assert_eq!(rows[0].run_id, rows[1].run_id, "one log, one run");
 }
 
 #[tokio::test(start_paused = true)]
@@ -4604,7 +5284,17 @@ async fn complete_with_retry_attributes_backoff_sleeps_to_next_attempt() {
 
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    crate::agent::dispatch::TurnRequest {
+                        fanin_tx: &fanin_tx,
+                        agent_id: 1,
+                        session_id: None,
+                        llm_context: &crate::provider::trace::LlmRequestContext::unattributed(),
+                    },
+                )
         .await;
     assert!(result.is_ok(), "the third attempt must succeed");
 
@@ -4844,7 +5534,17 @@ async fn complete_with_retry_returns_err_not_panic() {
     let provider = agent.provider();
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    crate::agent::dispatch::TurnRequest {
+                        fanin_tx: &fanin_tx,
+                        agent_id: 1,
+                        session_id: None,
+                        llm_context: &crate::provider::trace::LlmRequestContext::unattributed(),
+                    },
+                )
         .await;
 
     // Must be an error, not a panic.
@@ -4984,7 +5684,17 @@ async fn complete_with_retry_does_not_retry_context_overflow() {
     let provider = agent.provider();
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    crate::agent::dispatch::TurnRequest {
+                        fanin_tx: &fanin_tx,
+                        agent_id: 1,
+                        session_id: None,
+                        llm_context: &crate::provider::trace::LlmRequestContext::unattributed(),
+                    },
+                )
         .await;
     assert!(result.is_err(), "context overflow must produce Err");
     assert_eq!(
@@ -5052,7 +5762,17 @@ async fn complete_with_retry_does_not_retry_rate_limit() {
     let provider = agent.provider();
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    crate::agent::dispatch::TurnRequest {
+                        fanin_tx: &fanin_tx,
+                        agent_id: 1,
+                        session_id: None,
+                        llm_context: &crate::provider::trace::LlmRequestContext::unattributed(),
+                    },
+                )
         .await;
     assert!(result.is_err(), "429 must produce Err");
     assert_eq!(
@@ -5124,7 +5844,17 @@ async fn complete_with_retry_does_not_retry_deterministic_4xx() {
     let provider = agent.provider();
     let (fanin_tx, _fanin_rx) = mpsc::channel(8);
     let result = agent
-        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .complete_with_retry(
+                    &provider,
+                    &[],
+                    &[],
+                    crate::agent::dispatch::TurnRequest {
+                        fanin_tx: &fanin_tx,
+                        agent_id: 1,
+                        session_id: None,
+                        llm_context: &crate::provider::trace::LlmRequestContext::unattributed(),
+                    },
+                )
         .await;
     assert!(result.is_err(), "a deterministic 400 must produce Err");
     assert_eq!(
@@ -9146,6 +9876,7 @@ async fn resolve_turn_provider_uses_override_when_configured() {
             ..Endpoint::test_default()
         }],
         pricing: vec![],
+        tiers: Default::default(),
         keys: Default::default(),
         mcp: Vec::new(),
         projects: Default::default(),
@@ -9245,6 +9976,7 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
             ..Endpoint::test_default()
         }],
         pricing: vec![],
+        tiers: Default::default(),
         keys: Default::default(),
         mcp: Vec::new(),
         projects: Default::default(),
@@ -9381,6 +10113,7 @@ async fn summarize_provider_routes_through_the_summarize_slot() {
                 ..Endpoint::test_default()
             }],
             pricing: vec![],
+        tiers: Default::default(),
             keys: Default::default(),
             mcp: Vec::new(),
             projects: Default::default(),
@@ -9510,6 +10243,7 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
             ..Endpoint::test_default()
         }],
         pricing: vec![],
+        tiers: Default::default(),
         keys: Default::default(),
         mcp: Vec::new(),
         projects: Default::default(),
@@ -10210,9 +10944,11 @@ async fn set_explicit_provider_immediate_when_context_same_or_larger() {
 }
 
 #[tokio::test]
-async fn set_explicit_provider_deferred_when_context_smaller() {
-    // When the new provider's max_context < the current one, the swap is
-    // deferred. has_pending_swap() is true, provider unchanged, take clears it.
+async fn set_explicit_provider_smaller_window_swaps_at_once_when_it_fits() {
+    // A merely SMALLER window is NOT a reason to summarize (bug 2027-11-02,
+    // plan 1238e0de). With no live count recorded the conversation is empty
+    // (it trivially fits), so the swap lands at once: no pending swap, no
+    // summarization, the new provider active immediately.
     struct CtxProvider {
         model: &'static str,
         max_ctx: usize,
@@ -10275,16 +11011,239 @@ async fn set_explicit_provider_deferred_when_context_smaller() {
         max_ctx: 64_000,
     });
     agent.set_explicit_provider(small_provider, context::ContextManager::new(64_000, 0.5));
-    assert!(agent.has_pending_swap(), "smaller context → deferred swap");
+    assert!(
+        !agent.has_pending_swap(),
+        "a conversation that fits the new window swaps at once — no deferral"
+    );
     assert_eq!(
         agent.provider().model(),
-        "big-model",
-        "provider unchanged after deferral"
+        "small-model",
+        "the new provider is active immediately"
     );
-    let pending = agent.take_pending_swap();
-    assert!(pending.is_some(), "take returns the pending swap");
-    assert_eq!(pending.unwrap().model, "small-model");
+    assert!(
+        agent.take_pending_swap().is_none(),
+        "nothing was deferred, so there is nothing to take"
+    );
+}
+
+#[tokio::test]
+async fn set_explicit_provider_defers_when_the_conversation_exceeds_the_new_window() {
+    // The compact-then-switch path is still there for a conversation that does
+    // NOT fit: the live count (100K) exceeds the new model's own compaction
+    // trigger (64_000 × 0.5 = 32K), so the pin defers for the OLD model to
+    // summarize first. Provider unchanged; take returns the pending swap.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let big: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 200_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: big,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(200_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    // The real conversation the owning task publishes: over the new window's
+    // trigger (32K), under the old one's (100K).
+    let history: Vec<Message> = (0..40)
+        .map(|_| Message::text(Role::User, "y".repeat(4_000)))
+        .collect();
+    agent.publish_message_tokens(&history);
+    let small: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 64_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    agent.set_explicit_provider(small, context::ContextManager::new(64_000, 0.5));
+    assert!(
+        agent.has_pending_swap(),
+        "a conversation over the new window's trigger defers the swap"
+    );
+    assert_eq!(
+        agent.provider().capabilities().max_context,
+        200_000,
+        "the OLD provider stays active until the turn loop summarizes"
+    );
+    let pending = agent.take_pending_swap().expect("the pending swap");
+    assert_eq!(
+        pending.context_manager.max_tokens(),
+        64_000,
+        "the pending swap carries the new window"
+    );
     assert!(!agent.has_pending_swap(), "take clears the pending swap");
+}
+
+#[tokio::test]
+async fn a_resumed_transcript_too_big_for_the_new_window_compacts_first() {
+    // A session spawned with a RESUMED transcript has issued no request, so
+    // there is no live token count at all — the old decision read 0 and skipped
+    // compact-first. The rule now measures the published conversation itself
+    // plus the tool-schema overhead.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let old: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 200_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: old,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(200_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    // The resumed history — `seed_messages` publishes exactly this before the
+    // first request exists.
+    let history: Vec<Message> = (0..20)
+        .map(|i| {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            Message::text(role, "z".repeat(800))
+        })
+        .collect();
+    agent.publish_message_tokens(&history);
+    let new: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 4_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    // 4_000 × 0.5 = a 2K trigger; the 16K-char transcript is far over it.
+    agent.set_explicit_provider(new, context::ContextManager::new(4_000, 0.5));
+    assert!(
+        agent.has_pending_swap(),
+        "a resumed history too big for the new window must compact first"
+    );
+    assert_eq!(
+        agent.provider().capabilities().max_context,
+        200_000,
+        "the old provider keeps serving until the turn loop summarizes"
+    );
+}
+
+#[tokio::test]
+async fn a_switch_that_fits_swaps_at_once_with_the_full_history() {
+    // NONZERO usage below the target's own trigger: the swap lands at once — no
+    // summarization and no informational event — and the next request serves on
+    // the new model with the full history intact.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let old: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 200_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![])
+    });
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: old,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(200_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let mut messages = vec![
+        Message::text(Role::User, "first question with real content to count"),
+        Message::text(Role::Assistant, "first answer with real content to count"),
+    ];
+    agent.publish_message_tokens(&messages);
+    let new: Arc<dyn LlmClient> = Arc::new(MockProvider {
+        caps: Capabilities {
+            max_context: 64_000,
+            ..Capabilities::openai()
+        },
+        ..MockProvider::single(vec![
+            LlmEvent::TextDelta {
+                text: "served by the new model".to_string(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])
+    });
+    agent.set_explicit_provider(new, context::ContextManager::new(64_000, 0.5));
+    assert!(
+        !agent.has_pending_swap(),
+        "a conversation below the new window's trigger swaps at once"
+    );
+    assert_eq!(
+        agent.provider().capabilities().max_context,
+        64_000,
+        "the new provider is active immediately"
+    );
+
+    // The next request serves on the new model — full history included.
+    messages.push(Message::text(Role::User, "second question"));
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("the turn runs on the new model");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.as_text().contains("first question")),
+        "the full history is still in the conversation"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.as_text().contains("served by the new model")),
+        "the new provider served the request"
+    );
+    let mut events = Vec::new();
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ModelSwapSummarized { .. })),
+        "a fitting switch summarizes nothing — no informational event"
+    );
+    assert!(
+        !events.iter().any(|ev| matches!(ev, AgentEvent::Error { .. })),
+        "a fitting switch is not an error either"
+    );
 }
 
 #[tokio::test]
@@ -10351,6 +11310,14 @@ async fn set_explicit_provider_clears_stale_deferred_swap_on_immediate() {
         crate::project::Constitution::default(),
     );
 
+    // A live conversation over the SMALLER model's trigger (64_000 × 0.5 =
+    // 32K) but under the larger model's (400_000 × 0.5 = 200K): B defers, C
+    // lands at once — so the stale-deferral clear is genuinely exercised.
+    let history: Vec<Message> = (0..40)
+        .map(|_| Message::text(Role::User, "y".repeat(4_000)))
+        .collect();
+    agent.publish_message_tokens(&history);
+
     // Step 1: defer a swap to a smaller-context model B.
     let small_b: Arc<dyn crate::provider::LlmClient> = Arc::new(CtxProvider {
         model: "small-B",
@@ -10362,9 +11329,9 @@ async fn set_explicit_provider_clears_stale_deferred_swap_on_immediate() {
     // Step 2: supersede with an immediate swap to a larger-context model C.
     let large_c: Arc<dyn crate::provider::LlmClient> = Arc::new(CtxProvider {
         model: "large-C",
-        max_ctx: 200_000,
+        max_ctx: 400_000,
     });
-    agent.set_explicit_provider(large_c, context::ContextManager::new(200_000, 0.5));
+    agent.set_explicit_provider(large_c, context::ContextManager::new(400_000, 0.5));
 
     // The stale deferred swap must be cleared — C is the active provider.
     assert!(
@@ -10390,8 +11357,9 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
     // (3) complete the swap, (4) run the turn with the NEW provider.
     //
     // Sizing: new context = 2_000 (summarize_at = 1_000). The conversation
-    // must be > 80% of 2_000 = 1_600 tokens to trigger model-switch
-    // summarization, but after summarization (keep 6) it must be < 1_000 to
+    // must exceed the new manager's own trigger (2_000 × 0.5 = 1_000 tokens)
+    // to trigger model-switch summarization, but after summarization (keep 6)
+    // it must be < 1_000 to
     // avoid the regular summarization triggering again on the new provider.
     // Using diverse English text (~4 chars/token for tiktoken): 20 messages
     // × ~400 chars = ~8_000 chars = ~2_000 tokens > 1_600. After keep-6:
@@ -10491,7 +11459,12 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
         messages.push(Message::text(role, msg_text.clone()));
     }
 
-    // Defer the swap: new provider has smaller context (2_000 < 200_000).
+    // Defer the swap: the inclusive count (the published conversation plus the
+    // tool-schema overhead) exceeds the new model's own compaction trigger
+    // (2_000 × 0.5 = 1_000), so the pin defers for the OLD provider to
+    // summarize first. Publishing is what the owning task does at turn
+    // boundaries — the decision never reads a cached count.
+    agent.publish_message_tokens(&messages);
     agent.set_explicit_provider(
         new_provider.clone(),
         context::ContextManager::new(2_000, 0.5),
@@ -10504,7 +11477,7 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
     );
 
     // Run the turn — should summarize with old provider, then complete swap.
-    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let outcome = agent
         .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
@@ -10525,6 +11498,24 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
             .iter()
             .any(|m| { m.content.as_text().contains("## Conversation summary") }),
         "messages should contain the conversation summary after model-switch summarization"
+    );
+    // The completion is INFORMATIONAL (bug 2027-11-02, plan 1238e0de): the
+    // summarized swap reports a model_swap_summarized note and never an Error
+    // — a final error made consumers that treat it as terminal (Mnemo2's
+    // worker pump) mark a healthy worker failed.
+    let mut events = Vec::new();
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ModelSwapSummarized { model } if model == "mock")),
+        "the completed deferred swap must report a model_swap_summarized event"
+    );
+    assert!(
+        !events.iter().any(|ev| matches!(ev, AgentEvent::Error { .. })),
+        "a completed deferred swap must not emit an Error"
     );
     // No pending swap after the turn.
     assert!(
@@ -10649,7 +11640,9 @@ async fn run_turn_model_switch_interrupt_emits_paired_compact_event() {
         messages.push(Message::text(role, msg_text.clone()));
     }
 
-    // Defer the swap (smaller context).
+    // Defer the swap: the inclusive count (published conversation + tool-schema
+    // overhead) exceeds the new model's trigger (2_000 × 0.5 = 1_000).
+    agent.publish_message_tokens(&messages);
     agent.set_explicit_provider(
         new_provider.clone(),
         context::ContextManager::new(2_000, 0.5),
@@ -11514,6 +12507,7 @@ async fn skill_override_beats_explicit_picker_pin() {
             ..Endpoint::test_default()
         }],
         pricing: vec![],
+        tiers: Default::default(),
         keys: Default::default(),
         mcp: Vec::new(),
         projects: Default::default(),
@@ -14698,10 +15692,10 @@ async fn mid_run_model_swap_lands_on_the_next_request() {
 
 #[tokio::test]
 async fn mid_run_deferred_pick_lands_on_the_next_request() {
-    // The per-agent picker path with a SMALLER context window: the swap is
-    // deferred so the old provider could summarize an oversized conversation
-    // first — but a mid-run pick may not wait for the next turn, so the turn
-    // loop must complete it at the next iteration boundary.
+    // The per-agent picker path with a SMALLER context window and a live
+    // conversation over its trigger: the swap is deferred so the old provider
+    // could summarize first — but a mid-run pick may not wait for the next
+    // turn, so the turn loop must complete it at the next iteration boundary.
     let dir = tempdir().unwrap();
     let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
     let small_caps = Capabilities {
@@ -14717,6 +15711,10 @@ async fn mid_run_deferred_pick_lands_on_the_next_request() {
         &dir,
         workflow,
         Box::new(move |agent: &AgentLoop| {
+            // The pin defers on the INCLUSIVE count (conversation + tool-schema
+            // overhead) against the new model's own trigger (2_000 × 0.5 =
+            // 1_000), not on a window comparison — even a fresh, empty
+            // conversation carries the tool schemas.
             agent.set_explicit_provider(
                 swap_target.clone(),
                 context::ContextManager::new(2_000, 0.5),
@@ -14969,12 +15967,229 @@ fn routing_gate(
         .with_log_path(log_path)
 }
 
+/// A classifier that signals its first call, then waits for a test-controlled
+/// release before answering `hard`. Used to interleave a human model pick with
+/// the first-prompt classification await.
+struct BlockingRoutingClassifier {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait::async_trait]
+impl Classifier for BlockingRoutingClassifier {
+    async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+        if let Some(entered) = self
+            .entered
+            .lock()
+            .expect("blocking-classifier entered lock poisoned")
+            .take()
+        {
+            let _ = entered.send(());
+        }
+        let release = self
+            .release
+            .lock()
+            .expect("blocking-classifier release lock poisoned")
+            .take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        Some(Answer::Choice {
+            label: "hard".to_string(),
+            confidence: 0.99,
+            probabilities: std::collections::BTreeMap::new(),
+        })
+    }
+}
+
+/// First answer is routine; the later drift answer blocks before returning
+/// hard, allowing a manual pick to invalidate that detached check.
+struct StaleDriftClassifier {
+    calls: std::sync::Mutex<u32>,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait::async_trait]
+impl Classifier for StaleDriftClassifier {
+    async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+        let call = {
+            let mut calls = self.calls.lock().expect("stale-drift calls lock poisoned");
+            *calls += 1;
+            *calls
+        };
+        if call > 1 {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .expect("stale-drift entered lock poisoned")
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            let release = self
+                .release
+                .lock()
+                .expect("stale-drift release lock poisoned")
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+        Some(Answer::Choice {
+            label: if call == 1 { "routine" } else { "hard" }.to_string(),
+            confidence: 0.95,
+            probabilities: std::collections::BTreeMap::new(),
+        })
+    }
+}
+
+/// Resolver that blocks only the medium target used by a tool-strike nudge
+/// (a `routine` session now strikes toward `involved`, plan 87932c46). The
+/// routine first-prompt probe stays immediate, so the test can Clear while
+/// the strike path is resolving its post-snapshot target.
+struct BlockingMediumResolver {
+    inner: RoutingStubResolver,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl crate::model_resolver::ModelResolver for BlockingMediumResolver {
+    fn resolve(
+        &self,
+        _context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        if target == model_routing::RouteTarget::Medium {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .expect("blocking-resolver entered lock poisoned")
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            let release = self
+                .release
+                .lock()
+                .expect("blocking-resolver release lock poisoned")
+                .take();
+            if let Some(release) = release {
+                let _ = release.recv();
+            }
+        }
+        self.inner.resolve_routed(target, context)
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.inner.routing_policy()
+    }
+
+    fn build_turn_provider(
+        &self,
+        model_ref: &crate::config::ModelRef,
+        fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        self.inner.build_turn_provider(model_ref, fill_rate)
+    }
+}
+
+/// A classifier with a scripted sequence of answers and an optional per-answer
+/// delay. The delay makes the background drift check observably outlive the
+/// provider turn without a network or a real classifier.
+struct ScriptedRoutingClassifier {
+    answers: std::sync::Mutex<
+        std::collections::VecDeque<(Option<Answer>, std::time::Duration)>,
+    >,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Classifier for ScriptedRoutingClassifier {
+    async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (answer, delay) = self
+            .answers
+            .lock()
+            .expect("scripted answers lock poisoned")
+            .pop_front()
+            .unwrap_or((None, std::time::Duration::ZERO));
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        answer
+    }
+}
+
+/// Build a gate whose classifier consumes `answers` in order. Each item is an
+/// optional `(label, confidence)` answer and its artificial latency in ms.
+fn scripted_routing_gate(
+    answers: Vec<(Option<(&str, f64)>, u64)>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    log_path: std::path::PathBuf,
+) -> model_routing::RoutingGate {
+    let answers = answers
+        .into_iter()
+        .map(|(answer, delay_ms)| {
+            let answer = answer.map(|(label, confidence)| Answer::Choice {
+                label: label.to_string(),
+                confidence,
+                probabilities: std::collections::BTreeMap::new(),
+            });
+            (answer, std::time::Duration::from_millis(delay_ms))
+        })
+        .collect();
+    let classifier: Arc<dyn Classifier> = Arc::new(ScriptedRoutingClassifier {
+        answers: std::sync::Mutex::new(answers),
+        calls,
+    });
+    model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(classifier))))
+        .with_log_path(log_path)
+}
+
+/// A policy with a caller-selected drift threshold, offered as the full
+/// four-label set (plan 87932c46): `trivial` / `routine` / `involved` /
+/// `hard`, one per pickable tier. The first-prompt gate defaults to the
+/// four-label calibration.
+fn routing_policy_with_threshold(
+    threshold: f64,
+    enforce: bool,
+) -> model_routing::RoutingPolicy {
+    let offered = crate::agent::route_question::OfferedLabels {
+        trivial: true,
+        routine: true,
+        involved: true,
+        hard: true,
+    };
+    model_routing::RoutingPolicy {
+        threshold,
+        enforce,
+        offered,
+        first_prompt_min_confidence:
+            crate::agent::route_question::default_min_confidence(offered.count()),
+    }
+}
+
+/// The normal four-label first-prompt policy used by the route-once tests.
+fn session_routing_policy(enforce: bool) -> model_routing::RoutingPolicy {
+    routing_policy_with_threshold(0.80, enforce)
+}
+
 /// A routing target's provider stand-in: streams one text naming the model it
 /// represents, then stops. Never touches the network.
 struct RoutedProvider {
     model: String,
     text: String,
     caps: Capabilities,
+    endpoint: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -14987,6 +16202,9 @@ impl LlmClient for RoutedProvider {
     }
     fn model(&self) -> &str {
         &self.model
+    }
+    fn provider_name(&self) -> &str {
+        self.endpoint.as_deref().unwrap_or("")
     }
     async fn complete(
         &self,
@@ -15011,7 +16229,120 @@ fn routed_provider(model: &str, text: &str) -> Arc<dyn LlmClient> {
         model: model.to_string(),
         text: text.to_string(),
         caps: Capabilities::openai(),
+        endpoint: None,
     })
+}
+
+/// A routed provider with a real endpoint identity for 429-fallback tests.
+fn endpoint_routed_provider(
+    endpoint: &str,
+    model: &str,
+    text: &str,
+) -> Arc<dyn LlmClient> {
+    Arc::new(RoutedProvider {
+        model: model.to_string(),
+        text: text.to_string(),
+        caps: Capabilities::openai(),
+        endpoint: Some(endpoint.to_string()),
+    })
+}
+
+/// A routing resolver with an alternate endpoint for the high-tier model. The
+struct FallbackRoutingResolver {
+    inner: RoutingStubResolver,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for FallbackRoutingResolver {
+    fn resolve(
+        &self,
+        _context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        self.inner.resolve_routed(target, context)
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.inner.routing_policy()
+    }
+
+    fn build_turn_provider(
+        &self,
+        model_ref: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            endpoint_routed_provider(
+                &model_ref.endpoint,
+                &model_ref.model,
+                &format!("from-{}", model_ref.endpoint),
+            ),
+            context::ContextManager::new(128_000, 0.5),
+        ))
+    }
+
+    fn find_alternate_endpoint(
+        &self,
+        model_id: &str,
+        exclude_endpoint: &str,
+    ) -> Option<crate::config::ModelRef> {
+        if model_id == "high-model" && exclude_endpoint == "stub" {
+            Some(crate::config::ModelRef {
+                endpoint: "alternate".into(),
+            model: "high-model".into(),
+                reasoning_effort: None,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// A routing resolver whose routed target advertises a tiny context window.
+/// Exercises the first-prompt "needs compaction" refusal, which must never
+/// create a deferred routed swap.
+struct SmallWindowRoutingResolver {
+    inner: RoutingStubResolver,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for SmallWindowRoutingResolver {
+    fn resolve(
+        &self,
+        _context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        context: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        self.inner.resolve_routed(target, context)
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.inner.routing_policy()
+    }
+
+    fn build_turn_provider(
+        &self,
+        model_ref: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            routed_provider(&model_ref.model, "from-small-window"),
+            context::ContextManager::new(1_000, 0.5),
+        ))
+    }
 }
 
 /// A model ref on the stub endpoint the routing tests configure.
@@ -15028,8 +16359,9 @@ fn stub_model_ref(model: &str) -> crate::config::ModelRef {
 /// answers with the configured target. No HTTP client is ever built.
 struct RoutingStubResolver {
     policy: Option<model_routing::RoutingPolicy>,
-    cheap: Option<crate::config::ModelRef>,
-    capable: Option<crate::config::ModelRef>,
+    trivial: Option<crate::config::ModelRef>,
+    medium: Option<crate::config::ModelRef>,
+    high: Option<crate::config::ModelRef>,
     /// When set, every routed target builds THIS provider (a scripted mock for
     /// multi-iteration turns); otherwise a one-shot provider naming the model.
     routed_provider: Option<Arc<dyn LlmClient>>,
@@ -15054,13 +16386,15 @@ impl crate::model_resolver::ModelResolver for RoutingStubResolver {
         _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         match target {
-            model_routing::RouteTarget::Cheap => self.cheap.clone(),
-            model_routing::RouteTarget::Capable => self.capable.clone(),
-            // The lane rungs get canned targets with the lane tests (backlog
-            // ad56c7bd); until then a rung resolves to nothing here.
-            model_routing::RouteTarget::Medium
-            | model_routing::RouteTarget::High
-            | model_routing::RouteTarget::Escalate => None,
+            model_routing::RouteTarget::Trivial => self.trivial.clone(),
+            // A routine pick keeps the session's model (the first-prompt
+            // behaviour these tests pin).
+            model_routing::RouteTarget::Routine => None,
+            model_routing::RouteTarget::Medium => self.medium.clone(),
+            model_routing::RouteTarget::High => self.high.clone(),
+            // The escalate rung has no canned target here; a step-lane test
+            // that needs one builds its own resolver.
+            model_routing::RouteTarget::Escalate => None,
         }
     }
 
@@ -15074,6 +16408,52 @@ impl crate::model_resolver::ModelResolver for RoutingStubResolver {
             None => routed_provider(&model.model, &format!("from-{}", model.model)),
         };
         Some((provider, context::ContextManager::new(128_000, 0.5)))
+    }
+}
+
+/// A strike-test resolver whose targets use the real five-tier fold-down.
+/// The session is settled directly by the test, so no provider is rebuilt.
+struct StrikeLadderResolver {
+    policy: Option<model_routing::RoutingPolicy>,
+    ladder: crate::config::TierLadder,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for StrikeLadderResolver {
+    fn resolve(
+        &self,
+        _ctx: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.policy
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        _ctx: crate::model_resolver::ModelContext,
+    ) -> Option<crate::config::ModelRef> {
+        let (_, spec) = self.ladder.resolve(target.label())?;
+        let (endpoint, model) = spec.split_once('/')?;
+        Some(crate::config::ModelRef {
+            endpoint: endpoint.into(),
+            model: model.into(),
+            reasoning_effort: None,
+        })
+    }
+
+    fn build_turn_provider(
+        &self,
+        model_ref: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            routed_provider(&model_ref.model, "from-strike-ladder"),
+            context::ContextManager::new(128_000, 0.5),
+        ))
     }
 }
 
@@ -15129,6 +16509,77 @@ async fn run_routing_turn(agent: &AgentLoop, prompt: &str) -> TurnOutcome {
         .expect("turn completes")
 }
 
+/// Drive one prompt while retaining its event stream, including notices sent by
+/// a detached drift check after the provider turn has finished.
+async fn run_routing_turn_observed(
+    agent: &AgentLoop,
+    prompt: &str,
+) -> (
+    TurnOutcome,
+    mpsc::Receiver<(crate::runtime::AgentId, AgentEvent)>,
+) {
+    let (fanin_tx, fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text(prompt)];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("turn completes");
+    (outcome, fanin_rx)
+}
+
+fn drain_routing_events(
+    rx: &mut mpsc::Receiver<(crate::runtime::AgentId, AgentEvent)>,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Ok((_id, event)) = rx.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+fn session_log_path(routing_log: &std::path::Path) -> std::path::PathBuf {
+    routing_log.with_file_name("session_routing.jsonl")
+}
+
+/// Build a session settled on a routine first prompt with NO nudge yet, plus
+/// its redirected session-routing log.
+async fn settled_route_agent(
+    dir: &std::path::Path,
+) -> (Arc<AgentLoop>, std::path::PathBuf) {
+    let log_path = dir.join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let session_path = gate.session_log_path().to_path_buf();
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir,
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    assert_eq!(
+        run_routing_turn(&agent, "implement this routine change").await.text,
+        "from-default"
+    );
+    (agent, session_path)
+}
+
+fn read_session_routing_log(path: &std::path::Path) -> Vec<model_routing::SessionRoutingRow> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("valid session-routing row"))
+        .collect()
+}
+
 #[tokio::test]
 async fn routing_disabled_never_classifies_and_keeps_todays_model() {
     // The regression pin for the whole feature: with the `[general.laya]
@@ -15140,8 +16591,9 @@ async fn routing_disabled_never_classifies_and_keeps_todays_model() {
     let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
         policy: None,
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -15166,6 +16618,87 @@ async fn routing_disabled_never_classifies_and_keeps_todays_model() {
 }
 
 #[tokio::test]
+async fn skip_turn_routing_writes_no_routing_rows() {
+    // Plan 2ba2168a step 1: a session stamped with the skip (a Mnemo2
+    // worker or lead, routed once at dispatch) never runs the per-turn
+    // gate — no classification, no rows, and today's model.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    agent.set_skip_turn_routing(true);
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(
+        outcome.text, "from-default",
+        "a skipped session keeps today's model"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the turn is never classified"
+    );
+    let rows = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        rows.trim().is_empty(),
+        "a skipped session writes no routing rows: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn turn_routing_still_runs_by_default() {
+    // The Mnemo1 regression pin (plan 2ba2168a step 1): without the skip
+    // stamp the per-turn gate behaves exactly as before — one
+    // classification, one decision row.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(
+        outcome.text, "from-trivial-model",
+        "the default session still routes to the trivial tier's model"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "classified exactly once"
+    );
+    let (decisions, outcomes) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1, "one decision row");
+    assert_eq!(outcomes.len(), 1, "one outcome row");
+}
+
+#[tokio::test]
 async fn routing_with_an_empty_classifier_slot_keeps_todays_model() {
     // Laya disabled / unconfigured = an EMPTY shared slot. Routing is opted in
     // and a target is configured, but with no classifier the turn must not
@@ -15175,12 +16708,10 @@ async fn routing_with_an_empty_classifier_slot_keeps_todays_model() {
     let empty_slot = Arc::new(std::sync::RwLock::new(None));
     let gate = model_routing::RoutingGate::new(empty_slot).with_log_path(log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -15197,21 +16728,19 @@ async fn routing_with_an_empty_classifier_slot_keeps_todays_model() {
 }
 
 #[tokio::test]
-async fn routing_enforced_trivial_runs_the_turn_on_the_cheap_model() {
+async fn routing_enforced_trivial_runs_the_turn_on_the_trivial_model() {
     // The acceptance path: routing on, enforcement on, a stub classifier
-    // answering a confident "trivial", and a configured cheap target -> the
-    // turn runs on the cheap model, and both log rows land.
+    // answering a confident "trivial", and a configured trivial tier -> the
+    // turn runs on the trivial tier's model, and both log rows land.
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("routing.jsonl");
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -15224,8 +16753,8 @@ async fn routing_enforced_trivial_runs_the_turn_on_the_cheap_model() {
     let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
 
     assert_eq!(
-        outcome.text, "from-cheap-model",
-        "the routed cheap target served the turn"
+        outcome.text, "from-trivial-model",
+        "the routed trivial tier served the turn"
     );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -15239,11 +16768,11 @@ async fn routing_enforced_trivial_runs_the_turn_on_the_cheap_model() {
     let d = &decisions[0];
     assert_eq!(d.label, "trivial");
     assert!((d.confidence - 0.93).abs() < 1e-9);
-    assert!((d.threshold - 0.80).abs() < 1e-9);
-    assert_eq!(d.target.as_deref(), Some("cheap"));
+    assert!((d.threshold - 0.40).abs() < 1e-9);
+    assert_eq!(d.target.as_deref(), Some("trivial"));
     assert!(d.enforced, "enforcement was in effect");
     assert!(!d.shadow);
-    assert_eq!(d.model.as_deref(), Some("stub/cheap-model"));
+    assert_eq!(d.model.as_deref(), Some("stub/trivial-model"));
     assert_eq!(d.task_text, "bump the version to 1.1.1");
     assert_eq!(outcomes[0].turn_id, d.turn_id, "rows join on turn_id");
     assert_eq!(outcomes[0].outcome, "ok");
@@ -15257,14 +16786,12 @@ async fn routing_below_threshold_keeps_the_default_model_but_logs_the_answer() {
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("routing.jsonl");
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let gate = routing_gate(Some(("trivial", 0.50)), calls.clone(), log_path.clone());
+    let gate = routing_gate(Some(("trivial", 0.30)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -15282,7 +16809,7 @@ async fn routing_below_threshold_keeps_the_default_model_but_logs_the_answer() {
     assert_eq!(outcomes.len(), 1);
     let d = &decisions[0];
     assert_eq!(d.label, "trivial");
-    assert!((d.confidence - 0.50).abs() < 1e-9);
+    assert!((d.confidence - 0.30).abs() < 1e-9);
     assert_eq!(d.target, None, "below the gate no target is selected");
     assert!(!d.enforced);
     assert_eq!(d.model, None);
@@ -15298,12 +16825,10 @@ async fn routing_no_answer_writes_nothing_and_keeps_todays_model() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gate = routing_gate(None, calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -15333,12 +16858,10 @@ async fn routing_shadow_logs_the_decision_but_never_switches_the_model() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: false,
-        }),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        policy: Some(routing_policy_with_threshold(0.80, false)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -15357,10 +16880,10 @@ async fn routing_shadow_logs_the_decision_but_never_switches_the_model() {
     let d = &decisions[0];
     assert!(d.shadow);
     assert!(!d.enforced);
-    assert_eq!(d.model, None);
+    assert_eq!(d.model.as_deref(), Some("stub/trivial-model"));
     assert_eq!(
         d.target.as_deref(),
-        Some("cheap"),
+        Some("trivial"),
         "the log records what shadow WOULD have used"
     );
     assert_eq!(outcomes[0].turn_id, d.turn_id);
@@ -15380,15 +16903,13 @@ async fn routing_classifies_once_per_turn_across_iterations() {
     let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
     let scripted: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(vec![
         one_call_batch("call_1", "read_files"),
-        text_stop("from-cheap-model"),
+        text_stop("from-trivial-model"),
     ]));
     let resolver = Arc::new(RoutingStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: Some(scripted),
     });
     let agent = routing_agent(
@@ -15400,7 +16921,7 @@ async fn routing_classifies_once_per_turn_across_iterations() {
 
     let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
 
-    assert_eq!(outcome.text, "from-cheap-model");
+    assert_eq!(outcome.text, "from-trivial-model");
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
         1,
@@ -15428,12 +16949,10 @@ async fn routing_never_classifies_a_subagent_turn() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(RoutingStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        cheap: Some(stub_model_ref("cheap-model")),
-        capable: Some(stub_model_ref("capable-model")),
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
         routed_provider: None,
     });
     let agent = routing_agent(
@@ -15461,14 +16980,1563 @@ async fn routing_never_classifies_a_subagent_turn() {
     );
 }
 
+#[tokio::test]
+async fn first_prompt_routes_once_and_pins_the_model() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.90)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let (first, mut rx) = run_routing_turn_observed(&agent, "design the routing architecture").await;
+    assert_eq!(first.text, "from-high-model");
+    let events = drain_routing_events(&mut rx);
+    let changed = events.iter().position(|event| matches!(
+        event,
+        AgentEvent::ModelChanged { model, provider, .. }
+            if model == "high-model" && provider.as_deref() == Some("stub")
+    )).expect("the routed model is announced");
+    let noticed = events.iter().position(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, text }
+            if kind == "routed" && text.contains("high-model") && text.contains("0.90")
+    )).expect("the route notice is emitted");
+    assert!(changed < noticed, "the model change precedes its explanation");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Settled { model: Some(model), .. }
+            if model == "stub/high-model"
+    ));
+
+    let second = run_routing_turn(&agent, "now implement the approved design").await;
+    assert_eq!(second.text, "from-high-model", "the state-scoped pin persists");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1,
+        "a top-label route has no higher drift target and classifies only once");
+    let (decisions, outcomes) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(outcomes.len(), 1, "the classified first turn still writes its outcome row");
+    assert_eq!(read_session_routing_log(&session_log_path(&log_path)).len(), 1);
+}
+
+#[tokio::test]
+async fn routed_target_needing_compaction_is_not_applied() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls, log_path.clone());
+    let resolver = Arc::new(SmallWindowRoutingResolver {
+        inner: RoutingStubResolver {
+            policy: Some(session_routing_policy(true)),
+            trivial: Some(stub_model_ref("trivial-model")),
+            medium: None,
+            high: Some(stub_model_ref("high-model")),
+            routed_provider: None,
+        },
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    let mut messages = Vec::new();
+    for index in 0..20 {
+        messages.push(Message::user_text(format!(
+            "history {index}: {}",
+            "lorem ipsum dolor sit amet ".repeat(20)
+        )));
+        messages.push(Message::assistant_text("acknowledged"));
+    }
+    messages.push(Message::user_text("design the routing architecture"));
+    agent.publish_message_tokens(&messages);
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("turn completes");
+
+    assert_eq!(outcome.text, "from-default", "no under-window route is applied");
+    assert_eq!(agent.current_model_spec(), "default-model");
+    assert!(
+        !agent.has_pending_swap(),
+        "first-prompt routing never creates a deferred swap"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Settled { model: None, .. }
+    ));
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelChanged { model, .. } if model == "high-model"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "routed"
+    )));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Route {
+            skip: Some(skip),
+            model: None,
+            enforced: false,
+            ..
+        } if skip == "needs_compaction"
+    )), "{rows:?}");
+}
+
+#[tokio::test]
+async fn later_turns_never_switch() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = scripted_routing_gate(
+        vec![(Some(("trivial", 0.95)), 0), (Some(("hard", 0.99)), 0)],
+        calls.clone(),
+        log_path,
+    );
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(), routed_provider("default-model", "from-default"), resolver, gate,
+    );
+    assert_eq!(run_routing_turn(&agent, "bump the package version").await.text, "from-trivial-model");
+    assert_eq!(run_routing_turn(&agent, "redesign the whole persistence layer").await.text,
+        "from-trivial-model", "a later harder answer may nudge but never switches");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while calls.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the detached drift check ran");
+    assert_eq!(agent.current_model_spec(), "trivial-model");
+}
+
+#[tokio::test]
+async fn shadow_first_prompt_notices_but_keeps_the_model() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.93)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(false)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    let (outcome, mut rx) = run_routing_turn_observed(&agent, "rename one local variable").await;
+    assert_eq!(outcome.text, "from-default");
+    let events = drain_routing_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::RoutingNotice { kind, text }
+            if kind == "routed" && text.contains("would pick trivial-model"))));
+    assert!(!events.iter().any(|event| matches!(event, AgentEvent::ModelChanged { .. })));
+    assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Settled { model: None, .. }));
+}
+
+#[tokio::test]
+async fn short_first_prompt_turns_routing_off() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls.clone(), log_path);
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    assert_eq!(run_routing_turn(&agent, "hi").await.text, "from-default");
+    assert_eq!(run_routing_turn(&agent, "a later full prompt").await.text, "from-default");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Off { reason: "too_short" }));
+}
+
+#[tokio::test]
+async fn below_gate_settles_without_a_model() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.30)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    assert_eq!(run_routing_turn(&agent, "rename this local variable").await.text, "from-default");
+    assert!(matches!(agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Settled { label: Some(label), confidence: Some(confidence), model: None }
+            if label == "trivial" && (confidence - 0.30).abs() < 1e-9));
+    let (decisions, _) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1);
+    // The first-prompt gate is now the four-label default (0.40), so the
+    // scripted 0.30 answer settles below it with no model switch.
+    assert!((decisions[0].threshold - 0.40).abs() < 1e-9);
+    let session_rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(matches!(&session_rows[0], model_routing::SessionRoutingRow::Route { cleared: false, model: None, .. }));
+}
+
+#[tokio::test]
+async fn routine_without_a_target_keeps_the_model() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    assert_eq!(run_routing_turn(&agent, "implement this focused routine change").await.text, "from-default");
+    assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Settled { model: None, .. }));
+    let (decisions, _) = read_routing_log(&log_path);
+    assert_eq!(decisions[0].target.as_deref(), Some("routine"));
+    assert!(!decisions[0].enforced);
+    let session_rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(matches!(
+        &session_rows[0],
+        model_routing::SessionRoutingRow::Route {
+            label,
+            cleared: true,
+            enforced: false,
+            model: None,
+            skip: Some(skip),
+            ..
+        } if label == "routine" && skip == "kept"
+    ));
+}
+
+#[tokio::test]
+async fn resumed_session_is_never_routed() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls.clone(), log_path);
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(), routed_provider("default-model", "from-default"), resolver, gate,
+    ));
+    let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent.clone());
+    task.seed_messages(vec![Message::user_text("earlier question"), Message::assistant_text("earlier answer")]);
+    drop(task);
+    assert_eq!(run_routing_turn(&agent, "a new full length prompt").await.text, "from-default");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Off { reason: "resumed" }));
+}
+
+#[tokio::test]
+async fn claimed_nudge_is_published_before_clear_can_run() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let session_path = gate.session_log_path().to_path_buf();
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    assert_eq!(
+        run_routing_turn(&agent, "implement this routine change").await.text,
+        "from-default"
+    );
+    let (_, epoch) = agent.route_once_with_epoch();
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(8);
+    assert!(
+        AgentLoop::claim_and_publish_nudge(
+            &agent.route_session,
+            crate::agent::route_question::LABEL_HARD,
+            Some(epoch),
+            crate::agent::loop_impl::NudgeNotice {
+                agent_id: 1,
+                reason: "drift",
+                text: "this got harder; consider high-model".into(),
+                log_path: Some(session_path.clone()),
+                fanin_tx: fanin_tx.clone(),
+            },
+        )
+        .await
+    );
+
+    // Publication is complete before Clear is even called: the nudge is the
+    // first event, and its row precedes Clear's nudge_ignored row.
+    let (_, event) = fanin_rx.recv().await.expect("published nudge");
+    assert!(matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    ));
+    let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent.clone());
+    task.clear_context(&fanin_tx).await;
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )), "no nudge may arrive during or after Clear: {events:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(fanin_rx.try_recv().is_err(), "nothing arrives after Clear returns");
+
+    let rows = read_session_routing_log(&session_path);
+    let nudge = rows
+        .iter()
+        .position(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. }))
+        .expect("nudge row");
+    let ignored = rows
+        .iter()
+        .position(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
+        .expect("nudge_ignored row");
+    assert!(nudge < ignored, "nudge must be durable before Clear's ignored row: {rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_event_channel_never_consumes_the_nudge_silently() {
+    let dir = tempdir().unwrap();
+    let (agent, session_path) = settled_route_agent(dir.path()).await;
+    let (_, epoch) = agent.route_once_with_epoch();
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(1);
+    fanin_tx
+        .try_send((1, AgentEvent::Started))
+        .expect("pre-fill the capacity-1 channel");
+
+    let claim_agent = agent.clone();
+    let claim_tx = fanin_tx.clone();
+    let path = session_path.clone();
+    let claim = tokio::spawn(async move {
+        AgentLoop::claim_and_publish_nudge(
+            &claim_agent.route_session,
+            crate::agent::route_question::LABEL_HARD,
+            Some(epoch),
+            crate::agent::loop_impl::NudgeNotice {
+                agent_id: 1,
+                reason: "drift",
+                text: "this got harder; consider high-model".into(),
+                log_path: Some(path),
+                fanin_tx: claim_tx,
+            },
+        )
+        .await
+    });
+
+    // While no capacity exists the nudge stays UNCLAIMED and unlogged.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !agent.routing_nudged(),
+        "a full channel must not consume the one nudge"
+    );
+    assert!(!read_session_routing_log(&session_path)
+        .iter()
+        .any(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. })));
+
+    // Draining one slot lets the reserved permit publish exactly once.
+    let (_, prefill) = fanin_rx.recv().await.expect("the pre-filled event");
+    assert!(matches!(prefill, AgentEvent::Started));
+    assert!(claim.await.expect("claim task joins"));
+    let (_, event) = fanin_rx.recv().await.expect("the published nudge");
+    assert!(matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    ));
+    assert!(agent.routing_nudged());
+    let nudge_rows = |rows: &Vec<model_routing::SessionRoutingRow>| {
+        rows.iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. }))
+            .count()
+    };
+    assert_eq!(nudge_rows(&read_session_routing_log(&session_path)), 1);
+
+    // A CLOSED channel can never publish, so that attempt claims nothing.
+    {
+        let mut state = agent.route_session.lock().expect("route-session lock");
+        let epoch = state.epoch + 1;
+        state.epoch = epoch;
+        state.route_once = crate::agent::loop_impl::RouteOnce::Settled {
+            label: Some("routine".into()),
+            confidence: Some(0.95),
+            model: None,
+        };
+        state.nudge_sent = false;
+        state.nudge_to_label = None;
+    }
+    let (_, closed_epoch) = agent.route_once_with_epoch();
+    let (closed_tx, closed_rx) = mpsc::channel(4);
+    drop(closed_rx);
+    assert!(
+        !AgentLoop::claim_and_publish_nudge(
+            &agent.route_session,
+            crate::agent::route_question::LABEL_HARD,
+            Some(closed_epoch),
+            crate::agent::loop_impl::NudgeNotice {
+                agent_id: 1,
+                reason: "drift",
+                text: "closed channel".into(),
+                log_path: Some(session_path.clone()),
+                fanin_tx: closed_tx,
+            },
+        )
+        .await,
+        "a closed channel cannot publish, so the nudge is not consumed"
+    );
+    assert!(!agent.routing_nudged());
+    assert_eq!(nudge_rows(&read_session_routing_log(&session_path)), 1);
+}
+
+#[tokio::test]
+async fn clear_makes_the_next_prompt_routable() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = scripted_routing_gate(
+        vec![(Some(("trivial", 0.95)), 0), (Some(("hard", 0.95)), 0)],
+        calls.clone(), log_path,
+    );
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(), routed_provider("default-model", "from-default"), resolver, gate,
+    ));
+    assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-trivial-model");
+    let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent.clone());
+    let (fanin_tx, _fanin_rx) = mpsc::channel(16);
+    task.clear_context(&fanin_tx).await;
+    assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Pending));
+    assert_eq!(run_routing_turn(&agent, "design a new storage engine").await.text, "from-high-model");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn manual_pick_turns_routing_off_and_logs_a_reroute() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.95)), calls.clone(), log_path.clone());
+    let session_path = gate.session_log_path().to_path_buf();
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    assert_eq!(run_routing_turn(&agent, "rename one local variable").await.text, "from-trivial-model");
+    let (_, epoch) = agent.route_once_with_epoch();
+    assert!(AgentLoop::claim_nudge(
+        &agent.route_session,
+        crate::agent::route_question::LABEL_HARD,
+        Some(epoch),
+    ));
+    let (from, nudged) = agent.record_manual_model_choice("stub/manual-model");
+    assert_eq!(from.as_deref(), Some("stub/trivial-model"));
+    assert!(nudged, "H3: the reroute captures the outstanding nudge");
+    assert!(matches!(agent.route_once(), crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }));
+    let rows = read_session_routing_log(&session_path);
+    assert!(rows.iter().any(|row| matches!(row,
+        model_routing::SessionRoutingRow::Reroute { from: Some(from), to, nudged: true, .. }
+            if from == "stub/trivial-model" && to == "stub/manual-model")));
+    assert_eq!(run_routing_turn(&agent, "classify this later prompt").await.text, "from-trivial-model");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "a manual choice is final");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_pick_during_first_classification_wins() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(BlockingRoutingClassifier {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("design the routing architecture")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the first classifier call started");
+
+    // This is the picker path's ordering: install the human pin, then mark the
+    // route-once session manual while Laya is still awaiting its answer.
+    agent.set_explicit_provider(
+        routed_provider("manual-model", "from-manual"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    agent.note_manual_model_choice("stub/manual-model");
+    release_tx.send(()).expect("release the classifier");
+    let outcome = turn.await.expect("turn task joins");
+
+    assert_eq!(outcome.text, "from-manual");
+    assert_eq!(agent.current_model_spec(), "manual-model");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelChanged { model, .. } if model == "high-model"
+    )), "the superseded route must not announce or serve its model: {events:?}");
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "routed"
+    )));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Route { skip: Some(skip), .. }
+            if skip == "superseded"
+    )));
+}
+
+#[tokio::test]
+async fn manual_mark_before_human_pin_wins() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(BlockingRoutingClassifier {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("design the routing architecture")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the first classifier call started");
+
+    // Production H1 order: Off{manual}/epoch is committed FIRST. Only then is
+    // the classifier released, and the human pin installed before the test
+    // yields back to the turn on this current-thread runtime.
+    let _ = agent.record_manual_model_choice("stub/manual-model");
+    release_tx.send(()).expect("release the classifier after the manual mark");
+    agent.set_explicit_provider(
+        routed_provider("manual-model", "from-manual"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    let outcome = turn.await.expect("turn task joins");
+
+    assert_eq!(outcome.text, "from-manual");
+    assert_eq!(agent.current_model_spec(), "manual-model");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelChanged { model, .. } if model == "high-model"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "routed"
+    )));
+    assert!(read_session_routing_log(&session_log_path(&log_path))
+        .iter()
+        .any(|row| matches!(
+            row,
+            model_routing::SessionRoutingRow::Route { skip: Some(skip), .. }
+                if skip == "superseded"
+        )));
+}
+
+#[tokio::test]
+async fn global_set_provider_after_routing_serves_the_human_model() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "design the routing architecture").await.text,
+        "from-high-model"
+    );
+
+    // This is the GLOBAL set_model / Engine::swap_model surface: plain
+    // set_provider, not the per-agent explicit-pin picker.
+    agent.set_provider(
+        routed_provider("human-model", "from-human"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "serve the next full prompt").await.text,
+        "from-human",
+        "the external default swap clears Laya's explicit routed pin"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::Reroute { .. }))
+            .count(),
+        1,
+        "the kernel records exactly one reroute for the external pick: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn engine_swap_model_counts_as_manual() {
+    let dir = tempdir().unwrap();
+    let engine_config = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(BlockingRoutingClassifier {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    let engine = crate::headless::Engine::builder(crate::headless::EngineOptions {
+        workspace: crate::workspace::Workspace::new(dir.path()),
+        config_dir: Some(engine_config.path().to_path_buf()),
+        permissions: crate::agent::policy::PermissionPolicy::OverridePermissions,
+        memory: crate::headless::MemoryBackend::Disabled,
+        index_codegraph: false,
+        require_git: false,
+        auto_install_embedder: false,
+    })
+    .provider(routed_provider("engine-default", "engine-default"))
+    .start()
+    .await
+    .expect("start headless engine");
+    engine
+        .host()
+        .agent_loops
+        .lock()
+        .await
+        .insert(42, agent.clone());
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("design the routing architecture")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the gated first classification started");
+    let switched = engine
+        .swap_model(routed_provider("human-model", "from-human"), None)
+        .await;
+    assert!(switched.contains(&42));
+    release_tx.send(()).expect("release the classifier after the engine swap");
+    let outcome = turn.await.expect("turn joins");
+    assert_eq!(outcome.text, "from-human");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    assert!(read_session_routing_log(&session_log_path(&log_path))
+        .iter()
+        .any(|row| matches!(
+            row,
+            model_routing::SessionRoutingRow::Route { skip: Some(skip), .. }
+                if skip == "superseded"
+        )));
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelChanged { model, .. } if model == "high-model"
+    )));
+    engine.shutdown().await.expect("engine shutdown");
+}
+
+#[tokio::test]
+async fn skip_turn_routing_session_model_change_writes_no_session_row() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    agent.set_skip_turn_routing(true);
+
+    agent.set_explicit_provider(
+        routed_provider("human-model", "from-human"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "serve this short prompt").await.text,
+        "from-human",
+        "the external provider change must still take effect"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Pending
+    ));
+    assert!(
+        !session_log_path(&log_path).exists(),
+        "a skip-turn-routing session writes no Mnemo1 session rows"
+    );
+}
+
+#[tokio::test]
+async fn subagent_model_change_writes_no_session_row() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    agent.set_is_subagent(true);
+
+    agent.set_explicit_provider(
+        routed_provider("human-model", "from-human"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "serve this short prompt").await.text,
+        "from-human",
+        "the external provider change must still take effect"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Pending
+    ));
+    assert!(
+        !session_log_path(&log_path).exists(),
+        "a subagent writes no Mnemo1 session rows"
+    );
+}
+
+#[tokio::test]
+async fn same_spec_or_effort_only_change_is_not_manual() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "design the routing architecture").await.text,
+        "from-high-model"
+    );
+    agent.set_provider(
+        routed_provider("high-model", "from-same-default"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    agent.set_explicit_provider(
+        routed_provider("high-model", "from-same-pin"),
+        context::ContextManager::new(128_000, 0.5),
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "serve the next full prompt").await.text,
+        "from-same-pin"
+    );
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Settled { .. }
+    ));
+    assert!(!read_session_routing_log(&session_log_path(&log_path))
+        .iter()
+        .any(|row| matches!(row, model_routing::SessionRoutingRow::Reroute { .. })));
+}
+
+#[tokio::test]
+async fn internal_429_fallback_is_not_a_manual_pick() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(FallbackRoutingResolver {
+        inner: RoutingStubResolver {
+            policy: Some(session_routing_policy(true)),
+            trivial: Some(stub_model_ref("trivial-model")),
+            medium: None,
+        high: Some(stub_model_ref("high-model")),
+            routed_provider: None,
+        },
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    assert_eq!(
+        run_routing_turn(&agent, "design the routing architecture").await.text,
+        "from-stub"
+    );
+    let info = agent.try_429_fallback().expect("alternate endpoint");
+    assert_eq!(info.to_endpoint, "alternate");
+    let (provider, _context_manager) = agent
+        .resolve_turn_provider(None)
+        .await
+        .expect("routed provider after fallback");
+    assert_eq!(provider.provider_name(), "alternate");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Settled { .. }
+    ));
+    assert!(!read_session_routing_log(&session_log_path(&log_path))
+        .iter()
+        .any(|row| matches!(row, model_routing::SessionRoutingRow::Reroute { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_drift_nudge_is_dropped_after_manual_pick() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(StaleDriftClassifier {
+        calls: std::sync::Mutex::new(0),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    assert_eq!(
+        run_routing_turn(&agent, "implement this routine change").await.text,
+        "from-default"
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("now design the concurrent protocol")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the drift classifier started");
+    turn.await.expect("provider turn joins");
+    let _ = drain_routing_events(&mut fanin_rx);
+
+    agent.note_manual_model_choice("stub/manual-model");
+    release_tx.send(()).expect("release the stale drift answer");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )), "a stale drift answer must not nudge after the manual pick: {events:?}");
+    assert!(!agent.routing_nudged());
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Off { reason: "manual" }
+    ));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(!rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Nudge { reason, .. } if reason == "drift"
+    )));
+}
+
+#[tokio::test]
+async fn three_failing_tool_calls_nudge_once() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: Some(stub_model_ref("medium-model")),
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let mut rounds = Vec::new();
+    for index in 0..6u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart { index, id: format!("failure-{index}"), name: format!("missing_tool_{index}") },
+            LlmEvent::ToolCallArgumentDelta { index, fragment: "{}".into() },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let agent = routing_agent(dir.path(), provider, resolver, gate);
+    let (_outcome, mut rx) = run_routing_turn_observed(&agent, "exercise the failing tools").await;
+    let events = drain_routing_events(&mut rx);
+    let nudges: Vec<_> = events.iter().filter_map(|event| match event {
+        AgentEvent::RoutingNotice { kind, text } if kind == "nudge" => Some(text),
+        _ => None,
+    }).collect();
+    assert_eq!(nudges.len(), 1, "three failures nudge; three more do not nudge again: {nudges:?}");
+    assert!(nudges[0].contains("tools keep failing") && nudges[0].contains("medium-model"));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert_eq!(rows.iter().filter(|row| matches!(row, model_routing::SessionRoutingRow::Nudge { .. })).count(), 1);
+}
+
+async fn hard_strike_nudges(
+    escalate_model: Option<&str>,
+) -> (Vec<String>, Vec<model_routing::SessionRoutingRow>) {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.95)), calls, log_path.clone());
+    let mut ladder = crate::config::TierLadder::default();
+    for rung in &mut ladder.tiers {
+        rung.models = match rung.id.as_str() {
+            "trivial" => vec!["stub/trivial-model".into()],
+            "routine" => vec!["stub/routine-model".into()],
+            "medium" => vec!["stub/medium-model".into()],
+            "high" => vec!["stub/high-model".into()],
+            "escalate" => escalate_model
+                .map(|model| vec![format!("stub/{model}")])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+    }
+    let resolver = Arc::new(StrikeLadderResolver {
+        policy: Some(session_routing_policy(true)),
+        ladder,
+    });
+    let mut rounds = Vec::new();
+    for index in 0..3u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart {
+                index,
+                id: format!("hard-strike-{index}"),
+                name: format!("missing_tool_{index}"),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index,
+                fragment: "{}".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let agent = routing_agent(dir.path(), provider, resolver, gate);
+    {
+        let mut state = agent.route_session.lock().expect("route-session lock");
+        state.route_once = crate::agent::loop_impl::RouteOnce::Settled {
+            label: Some("hard".into()),
+            confidence: Some(0.95),
+            model: Some("stub/high-model".into()),
+        };
+    }
+    let (_outcome, mut rx) = run_routing_turn_observed(&agent, "exercise the failing tools").await;
+    let events = drain_routing_events(&mut rx);
+    let nudges = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RoutingNotice { kind, text } if kind == "nudge" => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    (nudges, rows)
+}
+
+#[tokio::test]
+async fn a_hard_session_strikes_toward_the_escalate_tier() {
+    let (nudges, rows) = hard_strike_nudges(Some("escalate-model")).await;
+    assert_eq!(nudges.len(), 1, "the top ordinary tier escalates once: {nudges:?}");
+    assert!(nudges[0].contains("escalate-model"), "{nudges:?}");
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(
+                row,
+                model_routing::SessionRoutingRow::Nudge { to_label, .. }
+                    if to_label == "escalate"
+            ))
+            .count(),
+        1,
+        "the escalation tier id is logged like every other nudge: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hard_session_does_not_nudge_when_escalate_folds_to_its_model() {
+    let (nudges, rows) = hard_strike_nudges(None).await;
+    assert!(nudges.is_empty(), "folding back to high is not an escalation: {nudges:?}");
+    assert!(
+        !rows.iter().any(|row| matches!(
+            row,
+            model_routing::SessionRoutingRow::Nudge { .. }
+        )),
+        "a same-model fold must not claim or log a nudge: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_involved_session_strikes_toward_the_high_tier() {
+    // Plan 87932c46: a confidently `involved` first prompt settles the session
+    // on the `medium` tier and runs it there (the first-prompt arm), and
+    // repeated tool failures strike from that rung: `label_above("involved")`
+    // offers `hard`, so the nudge suggests the high tier's model.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("involved", 0.95)), calls, log_path.clone());
+    let mut rounds = Vec::new();
+    for index in 0..3u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart { index, id: format!("involved-strike-{index}"), name: format!("missing_tool_{index}") },
+            LlmEvent::ToolCallArgumentDelta { index, fragment: "{}".into() },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: Some(stub_model_ref("medium-model")),
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: Some(provider),
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    let (_outcome, mut rx) = run_routing_turn_observed(&agent, "wire the feature across modules").await;
+    // Three consecutive tool errors abort the turn (the stuck-model breaker),
+    // but the events still show the whole path: the involved first prompt
+    // served the turn on the medium tier's model, and the strike nudge fired
+    // BEFORE the abort, toward the high tier.
+    let events = drain_routing_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, text } if kind == "routed" && text.contains("medium-model")
+    )), "the involved first prompt ran on the medium tier: {events:?}");
+    let nudges: Vec<_> = events.iter().filter_map(|event| match event {
+        AgentEvent::RoutingNotice { kind, text } if kind == "nudge" => Some(text),
+        _ => None,
+    }).collect();
+    assert_eq!(nudges.len(), 1, "three failures on an involved session nudge once: {nudges:?}");
+    assert!(nudges[0].contains("tools keep failing") && nudges[0].contains("high-model"));
+    // The first prompt itself ran on the medium tier, and the row records the
+    // ladder id.
+    let (decisions, _) = read_routing_log(&log_path);
+    assert_eq!(decisions[0].label, "involved");
+    assert_eq!(decisions[0].target.as_deref(), Some("medium"));
+    assert_eq!(decisions[0].model.as_deref(), Some("stub/medium-model"));
+    assert!(decisions[0].enforced, "enforcement was in effect");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_strike_nudge_is_dropped_after_clear() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let resolver = Arc::new(BlockingMediumResolver {
+        inner: RoutingStubResolver {
+            policy: Some(session_routing_policy(true)),
+            trivial: Some(stub_model_ref("trivial-model")),
+            medium: Some(stub_model_ref("medium-model")),
+            high: Some(stub_model_ref("high-model")),
+            routed_provider: None,
+        },
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let mut rounds = Vec::new();
+    for index in 0..3u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart {
+                index,
+                id: format!("stale-strike-{index}"),
+                name: format!("missing_tool_{index}"),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index,
+                fragment: "{}".into(),
+            },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let agent = Arc::new(routing_agent(dir.path(), provider, resolver, gate));
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("exercise the failing tools")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx
+        .await
+        .expect("strike target resolution started after its Settled/epoch snapshot");
+
+    let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent.clone());
+    let (clear_tx, _clear_rx) = mpsc::channel(8);
+    task.clear_context(&clear_tx).await;
+    release_tx.send(()).expect("release stale strike resolution");
+    turn.await.expect("turn joins after Clear");
+
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )), "the pre-Clear strike must not claim a nudge in the new epoch: {events:?}");
+    assert!(matches!(
+        agent.route_once(),
+        crate::agent::loop_impl::RouteOnce::Pending
+    ));
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(!rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Nudge { .. }
+    )));
+}
+
+#[tokio::test]
+async fn drift_nudges_once_in_the_background() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = scripted_routing_gate(
+        vec![(Some(("routine", 0.95)), 0), (Some(("hard", 0.95)), 2_000)],
+        calls.clone(), log_path.clone(),
+    );
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    assert_eq!(run_routing_turn(&agent, "implement this routine change").await.text, "from-default");
+    let (second, mut rx) = run_routing_turn_observed(&agent, "now redesign the concurrent persistence protocol").await;
+    assert_eq!(second.text, "from-default", "the provider turn never waits for drift classification");
+    assert!(!drain_routing_events(&mut rx).iter().any(|event| matches!(event, AgentEvent::RoutingNotice { kind, .. } if kind == "nudge")),
+        "the delayed answer has not arrived when the turn finishes");
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            let (_, event) = rx.recv().await.expect("the detached sender stays alive");
+            if matches!(&event, AgentEvent::RoutingNotice { kind, .. } if kind == "nudge") {
+                break event;
+            }
+        }
+    }).await.expect("the background nudge arrives after the turn");
+    assert!(matches!(notice, AgentEvent::RoutingNotice { text, .. } if text.contains("this got harder") && text.contains("high-model")));
+    assert_eq!(agent.current_model_spec(), "default-model", "a drift nudge never switches");
+    assert_eq!(run_routing_turn(&agent, "a third full prompt").await.text, "from-default");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2, "the one nudge suppresses later drift calls");
+}
+
+/// Build a settled session with a real three-failure tool nudge outstanding.
+async fn agent_with_tool_nudge(
+    dir: &std::path::Path,
+) -> (Arc<AgentLoop>, std::path::PathBuf) {
+    let log_path = dir.join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: Some(stub_model_ref("medium-model")),
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let mut rounds = Vec::new();
+    for index in 0..3u32 {
+        rounds.push(vec![
+            LlmEvent::ToolCallStart {
+                index,
+                id: format!("end-nudge-{index}"),
+                name: format!("missing_tool_{index}"),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index,
+                fragment: "{}".into(),
+            },
+        ]);
+    }
+    rounds.push(text_stop("done"));
+    let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(rounds));
+    let agent = Arc::new(routing_agent(dir, provider, resolver, gate));
+    let (_outcome, mut rx) = run_routing_turn_observed(&agent, "exercise the failing tools").await;
+    assert!(drain_routing_events(&mut rx).iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )));
+    assert!(agent.routing_nudged());
+    (agent, session_log_path(&log_path))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drift_claim_during_clear_is_never_lost() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("routine", 0.95)), calls, log_path);
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+
+    // Race the drift claim's linearization point directly against Clear. A
+    // winning claim MUST be returned as Clear's outstanding nudge; a Clear
+    // that wins first must make the old-epoch claim fail. Neither may vanish.
+    for _ in 0..64 {
+        let epoch = {
+            let mut state = agent.route_session.lock().expect("route-session lock");
+            state.route_once = crate::agent::loop_impl::RouteOnce::Settled {
+                label: Some("routine".into()),
+                confidence: Some(0.95),
+                model: None,
+            };
+            state.epoch
+        };
+        let claim_agent = agent.clone();
+        let claim = tokio::spawn(async move {
+            AgentLoop::claim_nudge(
+                &claim_agent.route_session,
+                crate::agent::route_question::LABEL_HARD,
+                Some(epoch),
+            )
+        });
+        let clear_agent = agent.clone();
+        let clear = tokio::spawn(async move { clear_agent.clear_route_session() });
+        let (claimed, outstanding) = tokio::join!(claim, clear);
+        let claimed = claimed.expect("claim task joins");
+        let outstanding = outstanding.expect("clear task joins");
+        assert_eq!(
+            claimed,
+            outstanding.is_some(),
+            "a successful drift claim must be handed to Clear for logging"
+        );
+        if claimed {
+            assert_eq!(outstanding.as_deref(), Some("hard"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn nudge_ignored_is_logged_when_a_nudged_session_ends() {
+    let dir = tempdir().unwrap();
+    let (agent, session_path) = agent_with_tool_nudge(dir.path()).await;
+    let task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent);
+    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    drop(cmd_tx);
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    task.run(cmd_rx, fanin_tx).await;
+    let rows = read_session_routing_log(&session_path);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
+            .count(),
+        1,
+        "session termination records the ignored nudge exactly once: {rows:?}"
+    );
+    assert!(rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::NudgeIgnored { agent_id, to_label, .. }
+            if agent_id == "1" && to_label == "involved"
+    )));
+}
+
+#[tokio::test]
+async fn nudge_ignored_is_logged_once_for_clear_then_end() {
+    let dir = tempdir().unwrap();
+    let (agent, session_path) = agent_with_tool_nudge(dir.path()).await;
+    let mut task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent);
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    task.clear_context(&fanin_tx).await;
+    assert_eq!(
+        read_session_routing_log(&session_path)
+            .iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
+            .count(),
+        1
+    );
+    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    drop(cmd_tx);
+    task.run(cmd_rx, fanin_tx).await;
+    let rows = read_session_routing_log(&session_path);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, model_routing::SessionRoutingRow::NudgeIgnored { .. }))
+            .count(),
+        1,
+        "Clear consumes the outstanding nudge, so termination adds no duplicate: {rows:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drift_after_session_end_emits_nothing() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let classifier: Arc<dyn Classifier> = Arc::new(StaleDriftClassifier {
+        calls: std::sync::Mutex::new(0),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let gate = model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(
+        classifier,
+    ))))
+    .with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(session_routing_policy(true)),
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = Arc::new(routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    ));
+    assert_eq!(
+        run_routing_turn(&agent, "implement this routine change").await.text,
+        "from-default"
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let turn_agent = agent.clone();
+    let turn = tokio::spawn(async move {
+        let mut messages = vec![Message::user_text("now design the concurrent protocol")];
+        turn_agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .expect("turn completes")
+    });
+    entered_rx.await.expect("the drift classifier started");
+    turn.await.expect("provider turn joins");
+    let _ = drain_routing_events(&mut fanin_rx);
+
+    let task = crate::runtime::agent::AgentTask::new(1, "main".into(), agent);
+    let (cmd_tx, end_cmd_rx) = mpsc::channel(1);
+    drop(cmd_tx);
+    let (end_tx, _end_rx) = mpsc::channel(8);
+    task.run(end_cmd_rx, end_tx).await;
+    release_tx.send(()).expect("release drift after session termination");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let events = drain_routing_events(&mut fanin_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RoutingNotice { kind, .. } if kind == "nudge"
+    )), "a terminated session must not emit a late drift nudge: {events:?}");
+    let rows = read_session_routing_log(&session_log_path(&log_path));
+    assert!(!rows.iter().any(|row| matches!(
+        row,
+        model_routing::SessionRoutingRow::Nudge { .. }
+    )), "a terminated session must not append a late drift row: {rows:?}");
+}
+
+#[tokio::test]
+async fn routing_off_is_byte_identical() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("hard", 0.99)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: None,
+        trivial: Some(stub_model_ref("trivial-model")),
+        medium: None,
+        high: Some(stub_model_ref("high-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
+    assert!(!agent.session_routing_enabled());
+    let (first, mut rx) = run_routing_turn_observed(&agent, "design the routing architecture").await;
+    let second = run_routing_turn(&agent, "implement the approved architecture").await;
+    assert_eq!((first.text, second.text), ("from-default".into(), "from-default".into()));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(!log_path.exists() && !session_log_path(&log_path).exists(), "routing off writes neither corpus");
+    assert!(!drain_routing_events(&mut rx).iter().any(|event| matches!(event, AgentEvent::RoutingNotice { .. } | AgentEvent::ModelChanged { .. })));
+}
+
 /// A resolver whose routed target only appears AFTER the turn-start probe:
 /// `resolve_routed` answers `None` on its first call (the turn-start
-/// resolution inside `route_turn_start`) and `cheap` on every later call --
-/// the mid-turn Settings save that must not route a turn whose decision row
-/// already recorded `enforced: false, model: None` (review L2).
+/// resolution inside `route_turn_start`) and the trivial tier's model on
+/// every later call -- the mid-turn Settings save that must not route a turn
+/// whose decision row already recorded `enforced: false, model: None`
+/// (review L2).
 struct LateTargetResolver {
     calls: std::sync::atomic::AtomicUsize,
-    cheap: crate::config::ModelRef,
+    trivial: crate::config::ModelRef,
 }
 
 #[async_trait::async_trait]
@@ -15481,10 +18549,7 @@ impl crate::model_resolver::ModelResolver for LateTargetResolver {
     }
 
     fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
-        Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        })
+        Some(routing_policy_with_threshold(0.80, true))
     }
 
     fn resolve_routed(
@@ -15500,7 +18565,7 @@ impl crate::model_resolver::ModelResolver for LateTargetResolver {
         if call == 0 {
             None
         } else {
-            Some(self.cheap.clone())
+            Some(self.trivial.clone())
         }
     }
 
@@ -15529,7 +18594,7 @@ async fn routing_memoizes_an_unresolved_target_so_a_mid_turn_target_cannot_route
     let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
     let resolver = Arc::new(LateTargetResolver {
         calls: std::sync::atomic::AtomicUsize::new(0),
-        cheap: stub_model_ref("cheap-model"),
+        trivial: stub_model_ref("trivial-model"),
     });
     let agent = routing_agent(
         dir.path(),
@@ -15559,7 +18624,7 @@ async fn routing_memoizes_an_unresolved_target_so_a_mid_turn_target_cannot_route
     assert_eq!(decisions.len(), 1, "one decision row");
     assert_eq!(outcomes.len(), 1, "one outcome row");
     let d = &decisions[0];
-    assert_eq!(d.target.as_deref(), Some("cheap"));
+    assert_eq!(d.target.as_deref(), Some("trivial"));
     assert!(!d.enforced, "the row records the miss: nothing was enforced");
     assert_eq!(d.model, None, "no model was routed onto");
     assert_eq!(outcomes[0].outcome, "ok");
@@ -15767,12 +18832,12 @@ fn reflex_handle(
 }
 
 /// A lane-only resolver: the pre-prompt path declines (`resolve` → None, no
-/// cheap/capable targets), while the three escalation rungs answer with the
-/// configured models. No HTTP client is ever built.
+/// first-prompt tier models), while the step-lane rungs answer with the
+/// configured tier models. No HTTP client is ever built.
 struct LaneStubResolver {
     policy: Option<model_routing::RoutingPolicy>,
-    lane_medium: Option<crate::config::ModelRef>,
-    lane_high: Option<crate::config::ModelRef>,
+    medium: Option<crate::config::ModelRef>,
+    high: Option<crate::config::ModelRef>,
     escalate: Option<crate::config::ModelRef>,
 }
 
@@ -15795,10 +18860,10 @@ impl crate::model_resolver::ModelResolver for LaneStubResolver {
         _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         match target {
-            // The lane tests never configure the pre-prompt targets.
-            model_routing::RouteTarget::Cheap | model_routing::RouteTarget::Capable => None,
-            model_routing::RouteTarget::Medium => self.lane_medium.clone(),
-            model_routing::RouteTarget::High => self.lane_high.clone(),
+            // The lane tests never configure the first-prompt tiers.
+            model_routing::RouteTarget::Trivial | model_routing::RouteTarget::Routine => None,
+            model_routing::RouteTarget::Medium => self.medium.clone(),
+            model_routing::RouteTarget::High => self.high.clone(),
             model_routing::RouteTarget::Escalate => self.escalate.clone(),
         }
     }
@@ -16410,12 +19475,9 @@ async fn spend_rows_follow_the_enforced_lane_switch() {
     );
     let resolver = Arc::new(LaneUsageResolver {
         inner: LaneStubResolver {
-            policy: Some(model_routing::RoutingPolicy {
-                threshold: 0.80,
-                enforce: true,
-            }),
-            lane_medium: Some(stub_model_ref("medium-model")),
-            lane_high: None,
+            policy: Some(routing_policy_with_threshold(0.80, true)),
+            medium: Some(stub_model_ref("medium-model")),
+            high: None,
             escalate: None,
         },
         medium_provider: usage_provider(900, 40, 0),
@@ -16508,12 +19570,9 @@ async fn lane_verify_action_re_runs_the_checks_and_rides_the_note_on_the_tail() 
         routing_log.clone(),
     );
     let resolver = Arc::new(LaneStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: false,
-        }),
-        lane_medium: None,
-        lane_high: None,
+        policy: Some(routing_policy_with_threshold(0.80, false)),
+        medium: None,
+        high: None,
         escalate: None,
     });
     let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![vec![
@@ -16570,12 +19629,9 @@ async fn lane_verify_action_without_a_handle_stashes_no_note() {
         routing_log.clone(),
     );
     let resolver = Arc::new(LaneStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: false,
-        }),
-        lane_medium: None,
-        lane_high: None,
+        policy: Some(routing_policy_with_threshold(0.80, false)),
+        medium: None,
+        high: None,
         escalate: None,
     });
     let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![vec![
@@ -16648,12 +19704,9 @@ async fn lane_enforced_medium_serves_the_step_and_announces_the_switch() {
         routing_log.clone(),
     );
     let resolver = Arc::new(LaneStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -16726,12 +19779,9 @@ async fn lane_shadow_logs_the_decision_but_never_switches_the_model() {
         routing_log.clone(),
     );
     let resolver = Arc::new(LaneStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: false,
-        }),
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        policy: Some(routing_policy_with_threshold(0.80, false)),
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -16792,12 +19842,9 @@ async fn lane_reflex_flag_off_never_asks_the_classifier() {
         routing_log.clone(),
     );
     let resolver = Arc::new(LaneStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -16850,8 +19897,8 @@ async fn lane_routing_flag_off_never_asks_the_classifier() {
     );
     let resolver = Arc::new(LaneStubResolver {
         policy: None,
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -16899,12 +19946,9 @@ async fn lane_without_a_target_falls_through_without_error() {
         routing_log.clone(),
     );
     let resolver = Arc::new(LaneStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        lane_medium: None,
-        lane_high: None,
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        medium: None,
+        high: None,
         escalate: None,
     });
     let agent = lane_agent(
@@ -16960,12 +20004,9 @@ async fn lane_memo_is_fresh_for_a_new_plan_that_repeats_the_title() {
         routing_log.clone(),
     );
     let resolver = Arc::new(LaneStubResolver {
-        policy: Some(model_routing::RoutingPolicy {
-            threshold: 0.80,
-            enforce: true,
-        }),
-        lane_medium: Some(stub_model_ref("medium-model")),
-        lane_high: None,
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
         escalate: None,
     });
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
@@ -17608,4 +20649,144 @@ async fn recall_delta_all_elided_set_costs_one_sentinel_line() {
                     .is_some_and(|d| d.contains("sentinel"))),
         "a savings row names the sentinel: {rows:?}"
     );
+}
+/// Serves the in-turn auto-compaction's summarization first, then fires `swap`
+/// on the request that FOLLOWS the rewrite — the moment a stale pre-compaction
+/// count would wrongly defer a switch.
+struct SwapAfterCompactionProvider {
+    agent: Arc<std::sync::OnceLock<Arc<AgentLoop>>>,
+    swap: Box<dyn Fn(&AgentLoop) + Send + Sync>,
+    /// Calls served so far (1 = the summarizer's, 2 = the request).
+    calls: std::sync::atomic::AtomicUsize,
+    caps: Capabilities,
+}
+
+#[async_trait]
+impl LlmClient for SwapAfterCompactionProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "compacting-model"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if call == 1 {
+            // The auto-compaction's summarizer call.
+            return Ok(Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta {
+                    text: "Summary of the earlier work.".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ])));
+        }
+        // The request the compaction left behind: the user switches model right
+        // here, while it is in flight.
+        let agent = self
+            .agent
+            .get()
+            .expect("the test must fill the agent slot before run_turn");
+        (self.swap)(agent);
+        Ok(Box::pin(futures::stream::iter(vec![
+            LlmEvent::TextDelta {
+                text: "served after the compaction".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])))
+    }
+}
+#[tokio::test]
+async fn a_switch_after_an_in_turn_compaction_reports_next_request() {
+    // In-turn rewrites must publish the FINAL conversation: once the
+    // auto-compaction shrinks it, a switch landing on the request that follows
+    // reports NextRequest and sets no pending swap (a stale pre-compaction count
+    // would defer it wrongly).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let slot: Arc<std::sync::OnceLock<Arc<AgentLoop>>> = Arc::new(std::sync::OnceLock::new());
+    let target: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
+        model: "swap-target".into(),
+        text: "from-swap-target".into(),
+        caps: Capabilities::openai(),
+    });
+    let seen: Arc<std::sync::Mutex<(bool, bool)>> =
+        Arc::new(std::sync::Mutex::new((true, true)));
+    let seen_in_swap = seen.clone();
+    let target_in_swap = target.clone();
+    let provider: Arc<dyn LlmClient> = Arc::new(SwapAfterCompactionProvider {
+        agent: slot.clone(),
+        swap: Box::new(move |agent: &AgentLoop| {
+            let next = context::ContextManager::new(80_000, 0.5);
+            agent.set_explicit_provider(target_in_swap.clone(), next.clone());
+            *seen_in_swap.lock().unwrap() =
+                (agent.swap_needs_compaction(&next), agent.has_pending_swap());
+        }),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        caps: Capabilities {
+            max_context: 100_000,
+            ..Capabilities::openai()
+        },
+    });
+    let agent = Arc::new(AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(100_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    ));
+    assert!(slot.set(agent.clone()).is_ok());
+    // ~350K chars of prose ≈ 90K tokens: far over the 50K auto-compaction
+    // trigger, in 60 messages so the summary really rewrites the conversation.
+    let mut messages: Vec<Message> = (0..60)
+        .map(|i| {
+            Message::text(
+                Role::User,
+                format!("{i} {}", "lorem ipsum dolor sit amet ".repeat(220)),
+            )
+        })
+        .collect();
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("the turn runs");
+    drop(fanin_tx);
+    // The auto-compaction really rewrote the conversation (summary + keep-recent).
+    assert!(
+        messages.len() <= 10,
+        "the turn must have auto-compacted the seeded history (got {} messages)",
+        messages.len()
+    );
+    let (deferred, pending) = *seen.lock().unwrap();
+    assert!(
+        !deferred,
+        "the compacted conversation fits — the switch must report NextRequest"
+    );
+    assert!(!pending, "a fitting switch must not set a deferred swap");
+    assert!(!agent.has_pending_swap());
+    while let Ok((_id, _event)) = fanin_rx.try_recv() {}
 }

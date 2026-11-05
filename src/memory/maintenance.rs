@@ -174,11 +174,21 @@ pub async fn cleanup(
     // it). Propagating errors are rare — consolidation swallows
     // extract/delete failures, so only list/write failures abort.
     let completed: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    // Plan c3ba2b58 step A: maintenance is engine-level — no agent loop to
+    // attribute, so its consolidation calls carry the system actor + the
+    // consolidation purpose (rendered "System" in the trace, never mixed up
+    // with a lead/worker's rows).
+    let llm_context = crate::provider::trace::LlmRequestContext::system(
+        crate::provider::trace::TracePurpose::MemoryConsolidation,
+    );
     let episodic_ids = futures::stream::iter(sessions.iter().cloned())
         .map(|sid| {
             let store = store.clone();
             let completed = completed.clone();
             let events = per_session.remove(sid.as_str()).unwrap_or_default();
+            // One clone per session: the async block below moves its context
+            // in, and this closure is FnMut (runs once per session).
+            let llm_context = llm_context.clone();
             async move {
                 let episodic_id = consolidation::consolidate_session_with_events(
                     store.as_ref(),
@@ -186,6 +196,7 @@ pub async fn cleanup(
                     &events,
                     provider,
                     corpus,
+                    &llm_context,
                 )
                 .await?;
                 let n = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;

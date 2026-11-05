@@ -74,6 +74,15 @@ pub async fn spawn_agent(
             limits: None,
             // 3c (G2): the IPC path registers no host tools
             host_tools: vec![],
+            // Plan c3ba2b58 step A: Mnemo1 spawns pass no trace identity —
+            // records stay unattributed, exactly today's behavior.
+            trace_identity: None,
+            // Plan 40eef714 step 1: Mnemo1 spawns pass no pinned task —
+            // the head bytes stay unchanged, exactly today's behavior.
+            pinned_task: None,
+            // Plan 2ba2168a step 1: Mnemo1 spawns keep the per-turn
+            // routing gate, exactly today's behavior.
+            skip_turn_routing: false,
         },
     )
     .await?;
@@ -217,6 +226,15 @@ pub(crate) async fn spawn_run_all_agent(
             limits: None,
             // 3c (G2): the IPC path registers no host tools
             host_tools: vec![],
+            // Plan c3ba2b58 step A: Mnemo1 spawns pass no trace identity —
+            // records stay unattributed, exactly today's behavior.
+            trace_identity: None,
+            // Plan 40eef714 step 1: Mnemo1 spawns pass no pinned task —
+            // the head bytes stay unchanged, exactly today's behavior.
+            pinned_task: None,
+            // Plan 2ba2168a step 1: Mnemo1 spawns keep the per-turn
+            // routing gate, exactly today's behavior.
+            skip_turn_routing: false,
         },
     )
     .await
@@ -324,6 +342,17 @@ impl ParentAwareSpawner for IpcSpawner {
                 limits: None,
                 // 3c (G2): subagents register no host tools
                 host_tools: vec![],
+                // Plan c3ba2b58 step A: no explicit identity — the shared
+                // spawn path inherits the parent's, and an unattributed
+                // Mnemo1 parent stays unattributed (today's behavior).
+                trace_identity: None,
+                // Plan 40eef714 step 1: subagents never pin a task, and
+                // never inherit the parent's.
+                pinned_task: None,
+                // Plan 2ba2168a step 1: subagents already escape the
+                // gate via the is_subagent guard; the flag stays false,
+                // exactly today's behavior.
+                skip_turn_routing: false,
             },
         )
     .await?;

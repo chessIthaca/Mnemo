@@ -1139,7 +1139,14 @@ impl AgentLoopFactory {
 
         // Fresh per-agent tool registry, wired to this agent's workflow and
         // stamped with this agent's id (for the parent-aware spawn_agent tool).
-        let mut registry = self.build_registry(&workflow, agent_id, root, &plans_dir);
+        // Trace identity (plan c3ba2b58 step A): ONE handle per built loop,
+        // shared between the memory tools registered inside build_registry
+        // and the loop itself (with_trace_identity below) — the spawn path
+        // stamps the identity post-build via set_trace_identity.
+        let trace_identity =
+            std::sync::Arc::new(crate::provider::trace::TraceIdentityHandle::new());
+        let mut registry =
+            self.build_registry_with_identity(&workflow, agent_id, root, &plans_dir, &trace_identity);
         // Session dismissal (backlog c68a8c3b): ONE Arc per built loop,
         // shared between the recall_feedback tool registered here and the
         // loop's auto-recall injector (with_dismissed_recall below), so the
@@ -1195,6 +1202,10 @@ impl AgentLoopFactory {
         // Backlog c68a8c3b: share the per-loop dismissal set with the
         // recall_feedback tool registered above.
         .with_dismissed_recall(dismissed_recall)
+        // Plan c3ba2b58 step A: share the per-loop trace identity handle
+        // with the memory tools registered above, so their own LLM calls
+        // carry this loop's attribution.
+        .with_trace_identity(trace_identity)
         // Wire the plans dir so session-end consolidation can digest the
         // accumulated plan/review corpus (learning material). Uses the
         // per-build override (main dir or per-agent dir).
@@ -1374,12 +1385,38 @@ impl AgentLoopFactory {
     /// easy to audit at a glance: agent/file tools, workflow/plan tools, skill
     /// tools, the vision tool, memory tools, and the spawn tool. The exact set
     /// + conditionals (skills/spawner/memory are optional) are unchanged.
+    ///
+    /// Test/legacy entry point (plan c3ba2b58 step A moved production to
+    /// [`Self::build_registry_with_identity`], which threads the per-loop
+    /// trace identity handle): the ~18 test call sites keep this signature —
+    /// an empty identity slot means their memory tools stay unattributed,
+    /// exactly as before.
+    #[cfg(test)]
     fn build_registry(
         &self,
         workflow: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
         agent_id: Option<crate::runtime::AgentId>,
         root: Option<&AgentRootSpec>,
         plans_dir: &Path,
+    ) -> ToolRegistry {
+        // Tests + legacy callers: no trace identity — memory tools stay
+        // unattributed, exactly as before plan c3ba2b58.
+        let identity =
+            std::sync::Arc::new(crate::provider::trace::TraceIdentityHandle::new());
+        self.build_registry_with_identity(workflow, agent_id, root, plans_dir, &identity)
+    }
+
+    /// [`Self::build_registry`] with the per-loop trace identity handle
+    /// threaded through (plan c3ba2b58 step A) — the production path from
+    /// `build_inner`, which mints ONE handle per built loop and shares it
+    /// with both the memory tools and the loop.
+    fn build_registry_with_identity(
+        &self,
+        workflow: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
+        agent_id: Option<crate::runtime::AgentId>,
+        root: Option<&AgentRootSpec>,
+        plans_dir: &Path,
+        trace_identity: &std::sync::Arc<crate::provider::trace::TraceIdentityHandle>,
     ) -> ToolRegistry {
         // 2c.2 (G2): the tool-surface selection — None = every kernel
         // group, today's exact registration order (the byte-golden).
@@ -1415,7 +1452,7 @@ impl AgentLoopFactory {
         // (3a/3c).
         self.register_policy_factory_tools(&mut registry, agent_id, root, plans_dir, &sandbox, workflow);
         self.register_vision_tool(&mut registry, &sandbox, selection);
-        self.register_memory_tools(&mut registry, root, selection);
+        self.register_memory_tools(&mut registry, root, selection, trace_identity);
         self.register_codegraph_tools(&mut registry, root, selection);
         // The reviewer-round scope wiring (backlog 85313a7e) needs the project
         // root the git reads run in — resolved the way `register_agent_tools`
@@ -1787,6 +1824,7 @@ impl AgentLoopFactory {
         registry: &mut ToolRegistry,
         root: Option<&AgentRootSpec>,
         sel: Option<&ToolSelection>,
+        trace_identity: &std::sync::Arc<crate::provider::trace::TraceIdentityHandle>,
     ) {
         if !group_allowed(sel, ToolGroup::Memory) {
             // 2c.2 (G2): the selection excludes the Memory group.
@@ -1828,12 +1866,17 @@ impl AgentLoopFactory {
             // extraction pipeline (semantic + procedural), matching the
             // automatic session-end path. The slot is shared with the factory,
             // so a Settings model swap takes effect on the next call. The
-            // plans dir feeds the plan/review corpus digest.
-            registry.register(Box::new(MemoryConsolidateTool::with_provider(
-                store.clone(),
-                Arc::clone(&self.provider_slot),
-                self.plans_dir.clone(),
-            )));
+            // plans dir feeds the plan/review corpus digest. The trace identity
+            // handle (plan c3ba2b58 step A) is the loop's own, so the
+            // consolidation calls carry the calling agent's attribution.
+            registry.register(Box::new(
+                MemoryConsolidateTool::with_provider(
+                    store.clone(),
+                    Arc::clone(&self.provider_slot),
+                    self.plans_dir.clone(),
+                )
+                .with_trace_identity(std::sync::Arc::clone(trace_identity)),
+            ));
             // Hygiene tools (Phase 1): in-place refine, supersede-not-delete,
             // junk delete, and query-less browsing.
             match &knowledge {

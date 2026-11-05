@@ -685,6 +685,12 @@ pub struct MemoryConsolidateTool {
     /// is built from it (parent dir's `reviews/` subdir) and fed to
     /// consolidation — matching the automatic session-end path.
     plans_dir: std::path::PathBuf,
+    /// The calling loop's trace identity (plan c3ba2b58 step A) — ONE handle
+    /// per built loop, shared with the loop itself (the factory mints it in
+    /// `build_inner`). Read at call time so the consolidation LLM calls carry
+    /// the calling agent's attribution (`memory_consolidation` purpose);
+    /// empty until the spawn path stamps it (unattributed, Mnemo1).
+    trace_identity: Arc<crate::provider::trace::TraceIdentityHandle>,
 }
 
 impl MemoryConsolidateTool {
@@ -695,6 +701,7 @@ impl MemoryConsolidateTool {
             store,
             provider: None,
             plans_dir: std::path::PathBuf::new(),
+            trace_identity: Arc::new(crate::provider::trace::TraceIdentityHandle::new()),
         }
     }
 
@@ -713,7 +720,20 @@ impl MemoryConsolidateTool {
             store,
             provider: Some(provider),
             plans_dir: plans_dir.into(),
+            trace_identity: Arc::new(crate::provider::trace::TraceIdentityHandle::new()),
         }
+    }
+
+    /// Share the calling loop's trace identity handle (plan c3ba2b58 step
+    /// A) so this tool's consolidation LLM calls are attributed to the
+    /// calling agent. The factory wires the loop's own handle; without this
+    /// call the tool stays unattributed (tests).
+    pub fn with_trace_identity(
+        mut self,
+        identity: Arc<crate::provider::trace::TraceIdentityHandle>,
+    ) -> Self {
+        self.trace_identity = identity;
+        self
     }
 }
 
@@ -777,8 +797,19 @@ impl Tool for MemoryConsolidateTool {
         } else {
             crate::memory::consolidation::corpus_digest(&self.plans_dir, &reviews_dir)
         };
-        match consolidate_session(self.store.as_ref(), &args.session_id, provider_ref, &corpus)
-            .await
+        // Plan c3ba2b58 step A: stamp the calling agent's identity + the
+        // consolidation purpose onto the pipeline's LLM calls.
+        let llm_context = self
+            .trace_identity
+            .context(None, crate::provider::trace::TracePurpose::MemoryConsolidation);
+        match consolidate_session(
+            self.store.as_ref(),
+            &args.session_id,
+            provider_ref,
+            &corpus,
+            &llm_context,
+        )
+        .await
         {
             Ok(id) => {
                 if id.is_empty() {

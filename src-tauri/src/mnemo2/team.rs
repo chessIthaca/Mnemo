@@ -21,24 +21,37 @@ use mnemo::app::team_ledger::TeamLedger;
 use mnemo::app::worktrees::{
     agent_branch, agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
 };
+use mnemo::agent::route_question;
+use mnemo::config::endpoints::{Tier, TierLadder};
 use mnemo::headless::{
     AgentSession, Engine, EventReceiver, GateRule, GateVerdict, Guardrails, HostToolSpec,
     PendingInteraction, QuestionPolicy, SessionCommand, SessionEvent, SessionId, SpawnOptions,
     ToolSelection, Transcript, TurnEndPolicy,
 };
+use mnemo::headless::session::ModelSwitch;
 use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
+use mnemo::agent::failure_triage_knn::EmbedderGetter;
+use mnemo::agent::route_knn::RouteKnn;
+use mnemo::memory::classifier::ClassifierSlot;
 use mnemo::tool::{SafetyLevel, ToolResult};
+use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::{PermissionPolicy, SerializableAgentEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::mnemo2::dispatch_routing::{
+    classify_dispatch, load_routing_settings, outcome_label, routing_text, threshold_for,
+    DispatchRoutingDecision, DispatchRoutingRow, EnabledTiers, RoutingMode, RoutingSettings,
+    TEXT_MAX_CHARS,
+};
 use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::lock_holders;
 use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewEvidence, ReviewRecord};
-use crate::mnemo2::runtime::{LeadModel, LeadRuntime};
-use crate::mnemo2::usage::{event_session, usage_model_key, ProjectUsage, ProjectUsageView};
+use crate::mnemo2::runtime::LeadModel;
+use crate::mnemo2::pricing::usage_model_key;
+use crate::mnemo2::usage::{event_session, ProjectUsage, ProjectUsageView};
 
 /// The Tauri event channel emitted by the team runtime.
 pub const TEAM_EVENT_CHANNEL: &str = "mnemo2://team-event";
@@ -49,6 +62,8 @@ pub const DELETION_EVENT_CHANNEL: &str = "mnemo2://worker-deletion";
 
 /// The persisted worker ledger inside the team's state directory.
 const TEAM_STATE_FILE: &str = "team.json";
+/// Original bytes preserved before the one-time legacy tier-id conversion.
+const TEAM_PRE_TIERS_BACKUP: &str = "team.json.pre-tiers.bak";
 
 /// How many transient team events the broadcast bus keeps for a slow consumer.
 const EVENT_BUFFER: usize = 1024;
@@ -168,6 +183,57 @@ pub struct InboxEntry {
     pub at_ms: u128,
 }
 
+/// The one dispatch-time routing decision persisted with a worker.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerRouting {
+    /// The tier Laya selected, when it returned a known label.
+    pub laya_tier: Option<String>,
+    /// Laya's confidence, when it answered.
+    pub confidence: Option<f64>,
+    /// Whether the answer cleared the configured gate.
+    pub cleared: bool,
+    /// The explicit or fallback tier supplied by the lead, when one was used.
+    pub lead_tier: Option<String>,
+    /// Who selected the running tier: `lead`, `laya`, or `lead_override`.
+    pub routed_by: String,
+    /// The tier the worker actually started on at dispatch, frozen beside the
+    /// decision so a later manual reroute cannot rewrite what a re-dispatch
+    /// reports (audit finding M1).
+    #[serde(default)]
+    pub ran_tier: Option<String>,
+    /// The one nudge sent for this worker, if any.
+    pub nudged: Option<String>,
+}
+
+/// Who moved a worker to another model: the lead through `team_resume`, or
+/// the user through mission control. The reroute row logged beside the
+/// switch carries the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeSource {
+    /// A lead-side switch: `team_resume` with a tier or model.
+    Lead,
+    /// The user's model change in mission control.
+    User,
+    /// An automatic switch after a review, audit, or strike-streak nudge.
+    Escalation,
+    /// A fix round deliberately running on a cheaper tier.
+    FixDownshift,
+    /// The restoration of the prior model after a failed fix downshift.
+    FixDownshiftRestore,
+}
+
+impl ChangeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lead => "lead",
+            Self::User => "user",
+            Self::Escalation => "escalation",
+            Self::FixDownshift => "fix_downshift",
+            Self::FixDownshiftRestore => "fix_downshift_restore",
+        }
+    }
+}
+
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -213,6 +279,10 @@ pub struct WorkerRecord {
     /// Whether the initial brief was accepted by a live session.
     #[serde(default)]
     pub brief_sent: bool,
+    /// The worker's first turn is a read-back: it reports questions about
+    /// its spec and waits for the lead before changing files.
+    #[serde(default)]
+    pub read_back: bool,
     /// A real compaction command is running in this session.
     #[serde(default)]
     pub compacting: bool,
@@ -265,7 +335,9 @@ pub struct WorkerRecord {
     /// commit moves the tip and makes this audit stale for the new tip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_tip: Option<String>,
-
+    /// An audit worker delivered its read-only report; its job is over.
+    #[serde(default)]
+    pub report_delivered: bool,
     /// Durable lead findings.
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -275,6 +347,19 @@ pub struct WorkerRecord {
     /// Finding currently routed to the tracked fixer.
     #[serde(default)]
     pub fixer_finding_id: Option<String>,
+    /// Review rounds: `team_review` calls recorded on this worker.
+    #[serde(default)]
+    pub review_rounds: u32,
+    /// Fix rounds: `route_fix` and `review_fix` applications on this worker.
+    #[serde(default)]
+    pub fix_rounds: u32,
+    /// Independent audits dispatched against this worker.
+    #[serde(default)]
+    pub audits: u32,
+    /// The model specs this worker's sessions ran on, in order, with no
+    /// consecutive duplicates.
+    #[serde(default)]
+    pub models_used: Vec<String>,
     /// Successful local merge and optional revert.
     #[serde(default)]
     pub merge: Option<MergeRecord>,
@@ -287,16 +372,61 @@ pub struct WorkerRecord {
     /// The 0-based plan step the task was dispatched under.
     #[serde(default)]
     pub plan_step: Option<usize>,
-    /// The model tier (`difficult`, `average`, `simple`) the lead chose,
-    /// when it dispatched by tier.
+    /// The resolved ladder tier (`trivial`, `routine`, `medium`, `high`, or
+    /// `escalate`) the worker ran on, including later model switches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// The dispatch-time Laya decision, absent for legacy and unrouted workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<WorkerRouting>,
+    /// The `lead_reroute` / `user_reroute` rows this worker logged, in order:
+    /// the reroute half of its routing history, kept beside the record so the
+    /// outcome label and the Effort table read the worker without scanning
+    /// the log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reroutes: Vec<DispatchRoutingRow>,
 }
 
-impl WorkerRecord {
-    /// The first message the worker's session receives.
-    fn first_message(&self) -> &str {
-        self.opening_prompt.as_deref().unwrap_or(&self.brief)
+/// The opening prompt of a worker that implements its pinned task straight
+/// away.
+pub(crate) const KICKOFF: &str = "Your task is pinned in your instructions under \"Your task (pinned)\": the plan, your step's spec and the lead's brief. Implement it exactly as specified. If the spec contradicts the code or leaves a decision open, message the lead (message_parent) before guessing.";
+
+/// The opening prompt of a read-back worker: it reads its pinned task and the
+/// files it names, asks its questions, and changes nothing until the lead
+/// answers.
+pub(crate) const READ_BACK_KICKOFF: &str = "Your task is pinned in your instructions under \"Your task (pinned)\". Before changing any file, read the spec and every file it names. Then send the lead one message (message_parent) listing each ambiguity, contradiction with the code, or decision the spec leaves open, numbered, with file and line, or exactly \"No questions.\" Then stop and wait. Start implementing only after the lead replies.";
+
+/// The first user message a worker's session receives: the short kickoff that
+/// points at the task pinned in the system head.
+fn kickoff_message(record: &WorkerRecord) -> &'static str {
+    if record.read_back {
+        READ_BACK_KICKOFF
+    } else {
+        KICKOFF
+    }
+}
+
+/// The model a worker's session actually runs on: the lead's chosen spec, else
+/// the id the live session resolved, else the routing default.
+fn session_model_spec(worker: &WorkerRecord) -> &str {
+    worker
+        .model
+        .as_deref()
+        .filter(|spec| !spec.trim().is_empty())
+        .or_else(|| {
+            worker
+                .model_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+        })
+        .unwrap_or("default")
+}
+
+/// Record the model a worker's session actually runs on, in order of use and
+/// without consecutive duplicates: a resume on the same model adds nothing.
+fn note_model(worker: &mut WorkerRecord, spec: &str) {
+    if worker.models_used.last().map(String::as_str) != Some(spec) {
+        worker.models_used.push(spec.to_string());
     }
 }
 
@@ -320,6 +450,66 @@ pub enum BoardSignal {
 struct PlanRef {
     plan_id: String,
     step: usize,
+}
+
+struct RoutedDispatch {
+    model: Option<String>,
+    tier: Option<String>,
+    reasoning_effort: Option<String>,
+    routing: Option<WorkerRouting>,
+    rows: Vec<DispatchRoutingRow>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchSource {
+    LeadTool,
+    Ipc,
+}
+
+/// One dispatch request's knobs, threaded through the dispatch path together.
+#[derive(Clone, Debug)]
+struct DispatchRequest {
+    /// The lead's task-specific instructions.
+    brief: String,
+    /// The requested tier, including `auto` where the mode offers it.
+    tier: Option<String>,
+    /// Whether this implementation dispatch uses dispatch-time routing.
+    dispatch_routing: bool,
+    /// Which public entry point supplied the dispatch.
+    source: DispatchSource,
+    /// The exact model spec, when the lead chose one.
+    model: Option<String>,
+    /// The chosen reasoning effort, when the lead chose one.
+    reasoning_effort: Option<String>,
+    /// The stable worker id, when the lead named one.
+    worker_id: Option<String>,
+    /// The plan step the task belongs to, when it is on the board.
+    plan: Option<PlanRef>,
+    /// The lead-assigned review risk.
+    review_risk: Option<String>,
+    /// Whether the first turn reads the spec back and asks questions.
+    read_back: bool,
+}
+
+/// The inputs one live worker session needs: where and on what it runs, its
+/// transcript to resume from, its trace identity, and the task pinned into
+/// its system head.
+pub(crate) struct WorkerSessionSpec {
+    /// The exact model spec, when the lead chose one.
+    pub(crate) model: Option<String>,
+    /// The chosen reasoning effort, when the lead chose one.
+    pub(crate) reasoning_effort: Option<String>,
+    /// The checkout the session is bound to.
+    pub(crate) worktree: PathBuf,
+    /// The saved transcript to resume from.
+    pub(crate) resume: Option<Transcript>,
+    /// `implementation` or `audit`, selecting the guardrails.
+    pub(crate) kind: String,
+    /// The trace identity every model call is attributed to.
+    pub(crate) trace_identity: TraceIdentity,
+    /// The task rendered into the system head for the session's whole life.
+    pub(crate) pinned_task: Option<String>,
 }
 
 /// A worker on a board step, as the Plan tab shows it.
@@ -381,6 +571,22 @@ fn default_worker_kind() -> String {
     "implementation".to_string()
 }
 
+/// Whether an audit worker's job is over: its report was recorded, or a
+/// ledger written before `report_delivered` existed merely records it as
+/// `Completed`. A finished audit is never resumed, compacted, messaged or
+/// model-changed — dispatch a fresh audit instead.
+fn audit_finished(record: &WorkerRecord) -> bool {
+    record.kind == "audit"
+        && (record.report_delivered || record.status == WorkerStatus::Completed)
+}
+
+/// The refusal every finished-audit gate carries.
+fn audit_finished_error(worker_id: &str) -> String {
+    format!(
+        "audit worker '{worker_id}' already delivered its report; dispatch a new audit with team_audit_dispatch"
+    )
+}
+
 /// The team's public snapshot.
 #[derive(Clone, Debug, Serialize)]
 pub struct TeamSnapshot {
@@ -426,6 +632,12 @@ pub struct TeamRuntimeOptions {
     pub workspace_root: PathBuf,
     /// Mnemo2's app-owned state directory (the `team.json` ledger).
     pub state_dir: PathBuf,
+    /// The lead's config directory, which holds Mnemo2's `mnemo2.toml`.
+    pub config_dir: PathBuf,
+    /// The engine's live Laya classifier slot, shared with every session.
+    pub classifier: Option<ClassifierSlot>,
+    /// Test-only routing-log override; production uses the global training log.
+    pub routing_log_path: Option<PathBuf>,
     /// Explicit cap override; `None` restores the saved cap or the default.
     pub slots: Option<usize>,
     /// The configured model inventory: explicit worker models (and their
@@ -478,17 +690,35 @@ impl TeamPersistence {
 
     fn load(&self) -> Result<Option<PersistedTeam>, String> {
         let backup = self.path.with_extension("json.bak");
-        match Self::decode(&self.path) {
-            Ok(Some(team)) => Ok(Some(team)),
-            Ok(None) => Self::decode(&backup),
+        let loaded = match Self::decode(&self.path) {
+            Ok(Some(team)) => Some((team, self.path.clone())),
+            Ok(None) => Self::decode(&backup)?.map(|team| (team, backup.clone())),
             Err(primary_error) => match Self::decode(&backup) {
-                Ok(Some(team)) => Ok(Some(team)),
-                Ok(None) => Err(primary_error),
-                Err(backup_error) => Err(format!(
-                    "{primary_error}; backup also failed: {backup_error}"
-                )),
+                Ok(Some(team)) => Some((team, backup.clone())),
+                Ok(None) => return Err(primary_error),
+                Err(backup_error) => {
+                    return Err(format!(
+                        "{primary_error}; backup also failed: {backup_error}"
+                    ));
+                }
             },
+        };
+        let Some((mut team, source)) = loaded else {
+            return Ok(None);
+        };
+        if convert_legacy_team_tiers(&mut team) {
+            let pre_tiers = self.path.with_file_name(TEAM_PRE_TIERS_BACKUP);
+            if !pre_tiers.exists() {
+                std::fs::copy(&source, &pre_tiers).map_err(|error| {
+                    format!(
+                        "could not preserve legacy team ledger as {}: {error}",
+                        pre_tiers.display()
+                    )
+                })?;
+            }
+            self.save(&team)?;
         }
+        Ok(Some(team))
     }
 
     fn save(&self, team: &PersistedTeam) -> Result<(), String> {
@@ -529,12 +759,108 @@ impl TeamPersistence {
     }
 }
 
+/// Convert one stored tier id, returning whether it changed.
+fn convert_legacy_tier(tier: &mut String) -> bool {
+    let Some(converted) = TierLadder::convert_old_id(tier) else {
+        return false;
+    };
+    *tier = converted.to_string();
+    true
+}
+
+/// Convert an optional stored tier id, returning whether it changed.
+fn convert_legacy_optional_tier(tier: &mut Option<String>) -> bool {
+    tier.as_mut().is_some_and(convert_legacy_tier)
+}
+
+/// Convert every tier id embedded in one historical routing row.
+fn convert_legacy_row_tiers(row: &mut DispatchRoutingRow) -> bool {
+    let mut changed = false;
+    match row {
+        DispatchRoutingRow::Route {
+            tier,
+            lead_tier,
+            ran_tier,
+            ..
+        } => {
+            changed |= convert_legacy_optional_tier(tier);
+            changed |= convert_legacy_optional_tier(lead_tier);
+            changed |= convert_legacy_optional_tier(ran_tier);
+        }
+        DispatchRoutingRow::LeadOverride {
+            laya_tier,
+            lead_tier,
+            requested_tier,
+            ..
+        } => {
+            changed |= convert_legacy_optional_tier(laya_tier);
+            changed |= convert_legacy_tier(lead_tier);
+            changed |= convert_legacy_optional_tier(requested_tier);
+        }
+        DispatchRoutingRow::LeadReroute {
+            from_tier,
+            to_tier,
+            ..
+        }
+        | DispatchRoutingRow::UserReroute {
+            from_tier,
+            to_tier,
+            ..
+        }
+        | DispatchRoutingRow::Nudge {
+            from_tier,
+            to_tier,
+            ..
+        }
+        => {
+            changed |= convert_legacy_tier(from_tier);
+            changed |= convert_legacy_tier(to_tier);
+        }
+        DispatchRoutingRow::NudgeIgnored { tier, .. } => {
+            changed |= convert_legacy_tier(tier);
+        }
+        DispatchRoutingRow::Outcome {
+            final_tier,
+            label,
+            ..
+        } => {
+            changed |= convert_legacy_tier(final_tier);
+            changed |= convert_legacy_optional_tier(label);
+        }
+    }
+    changed
+}
+
+/// Convert legacy ids throughout a decoded ledger. The caller preserves the
+/// original bytes once before saving the converted records.
+fn convert_legacy_team_tiers(team: &mut PersistedTeam) -> bool {
+    let mut changed = false;
+    for worker in &mut team.workers {
+        changed |= worker.tier.as_mut().is_some_and(convert_legacy_tier);
+        if let Some(routing) = &mut worker.routing {
+            changed |= convert_legacy_optional_tier(&mut routing.laya_tier);
+            changed |= convert_legacy_optional_tier(&mut routing.lead_tier);
+            changed |= convert_legacy_optional_tier(&mut routing.ran_tier);
+            changed |= convert_legacy_optional_tier(&mut routing.nudged);
+        }
+        for row in &mut worker.reroutes {
+            changed |= convert_legacy_row_tiers(row);
+        }
+    }
+    changed
+}
+
 struct LiveWorker {
     session: AgentSession,
     busy: Arc<AtomicBool>,
     pump: JoinHandle<()>,
     /// A failed close aborted the pump; only cleanup retries may use this handle.
     cleanup_retry_only: bool,
+    /// The nudge strike counter (design §4.6), shared with the pump: three
+    /// consecutive failed or verbatim-repeated tool calls nudge the lead.
+    /// Beside the session handle, never persisted; a reroute resets it
+    /// ([`TeamRuntime::change_model`]).
+    strikes: Arc<Mutex<route_question::Strikes>>,
 }
 
 impl LiveWorker {
@@ -569,6 +895,9 @@ struct ExternalLead {
     /// (no session to receive them). They wait here, oldest first, for the
     /// in-app lead's next notice or the next external lead.
     undelivered: VecDeque<String>,
+    /// Helper process ids that made a tool call while the lead was attached.
+    /// A named close releases the lead only after the last id has left.
+    bridges: std::collections::BTreeSet<String>,
     /// Its last call (MCP, notices or wait), in Unix epoch milliseconds.
     last_activity_ms: u64,
     /// Successful memory searches in the current plan-creation window.
@@ -643,24 +972,632 @@ fn unix_ms() -> u64 {
     u64::try_from(phase3::now_ms()).unwrap_or(u64::MAX)
 }
 
+/// A worker status as the short string the routing rows log (`working`,
+/// `stopped`, …) — the serde tag of [`WorkerStatus`].
+fn status_name(status: WorkerStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Whether the Laya-derived routing rows (`nudge`, `nudge_ignored`) may be
+/// written for this worker: it was dispatched with routing (its record
+/// carries a decision) or routing is on now. With routing off and an
+/// unrouted worker nothing is appended, so off mode keeps writing exactly
+/// what it wrote before routing existed. Cleanup, which has no settings
+/// handle, passes [`RoutingMode::Off`] and goes by the record alone. Label
+/// rows — a hand's reroute and a rerouted worker's terminal outcome — go
+/// through [`logs_label`] instead.
+fn logs_routing(record: &WorkerRecord, mode: RoutingMode) -> bool {
+    record.routing.is_some() || mode != RoutingMode::Off
+}
+
+/// Whether a *label* row is logged for this worker: every user or lead
+/// model change is a learning (decided 2026-11-04), so a reroute is appended
+/// in every routing mode, and a worker that was rerouted at least once
+/// keeps logging its terminal `outcome` row in every mode too — outcome
+/// labels are what calibration learns from.
+fn logs_label(record: &WorkerRecord, mode: RoutingMode) -> bool {
+    logs_routing(record, mode) || !record.reroutes.is_empty()
+}
+
+/// The tier a worker finished on: the destination of its last reroute, else
+/// its recorded tier, `custom` when it never had one.
+fn final_tier(record: &WorkerRecord) -> String {
+    record
+        .reroutes
+        .iter()
+        .rev()
+        .find_map(|row| match row {
+            DispatchRoutingRow::LeadReroute { to_tier, .. }
+            | DispatchRoutingRow::UserReroute { to_tier, .. } => Some(to_tier.clone()),
+            _ => None,
+        })
+        .or_else(|| record.tier.clone())
+        .unwrap_or_else(|| "custom".to_string())
+}
+
+/// The tier a reroute row moves the worker to — the label the record's
+/// `tier` field tracks after a switch, read from the same row [`final_tier`]
+/// prefers so they (and team_status) agree. `None` when the destination is a
+/// custom model.
+fn reroute_destination(row: &DispatchRoutingRow) -> Option<String> {
+    let to_tier = match row {
+        DispatchRoutingRow::LeadReroute { to_tier, .. }
+        | DispatchRoutingRow::UserReroute { to_tier, .. } => to_tier,
+        _ => return None,
+    };
+    (to_tier != "custom").then(|| to_tier.clone())
+}
+
+/// The `outcome` row for a worker that reached a terminal status (design
+/// §4.7), with the label derived from its own routing history
+/// ([`outcome_label`], design §4.8). An audit worker is a reviewer, never a
+/// routed outcome: `None`.
+fn outcome_row(record: &WorkerRecord, status: &str) -> Option<DispatchRoutingRow> {
+    if record.kind == "audit" {
+        return None;
+    }
+    let final_tier = final_tier(record);
+    let high_findings = record
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == "high")
+        .count();
+    let label = outcome_label(
+        &record.reroutes,
+        status,
+        &final_tier,
+        record.fix_rounds,
+        high_findings,
+    );
+    Some(DispatchRoutingRow::Outcome {
+        ts: unix_ms(),
+        worker_id: record.id.clone(),
+        plan_id: record.plan_id.clone().unwrap_or_default(),
+        step: record.plan_step.map_or(0, |step| step + 1),
+        status: status.to_string(),
+        final_tier,
+        models_used: record.models_used.clone(),
+        review_rounds: record.review_rounds,
+        fix_rounds: record.fix_rounds,
+        findings: record.findings.len(),
+        findings_high: high_findings,
+        audits: record.audits as usize,
+        cost_micros: record.cost_micros.unwrap_or(0),
+        label: label.map(|(label, _)| label.to_string()),
+    })
+}
+
+/// Convert the settings wire shape into the only tier-reading interface.
+/// An entirely empty ladder is allowed here (no models configured yet); the
+/// Settings save path performs the stricter non-empty-`trivial` validation.
+fn tier_ladder_from_dto(tiers: &mnemo::headless::TiersDto) -> TierLadder {
+    TierLadder {
+        tiers: tiers
+            .tiers
+            .iter()
+            .map(|tier| Tier {
+                id: tier.id.clone(),
+                name: tier.name.clone(),
+                definition: tier.definition.clone(),
+                models: tier.models.clone(),
+                effort: tier.effort.clone(),
+                role: tier.role.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Ladder ids in their fixed order, for schemas and diagnostics.
+fn tier_ids(ladder: &TierLadder) -> Vec<&str> {
+    ladder.ordered().iter().map(|tier| tier.id.as_str()).collect()
+}
+
+/// Resolve a requested tier to its nearest available model at or below it.
+fn resolve_tier_over(
+    models: &[LeadModel],
+    ladder: &TierLadder,
+    tier: &str,
+) -> Result<(String, LeadModel), String> {
+    if ladder.get(tier).is_none() {
+        return Err(format!(
+            "unknown tier '{tier}'; expected one of: {}",
+            tier_ids(ladder).join(", ")
+        ));
+    }
+    let (mut ran_tier, _) = ladder.resolve(tier).ok_or_else(|| {
+        format!("tier '{tier}' has no available models; pass a `model` or another tier")
+    })?;
+    loop {
+        if let Some(model) = ladder
+            .get(&ran_tier)
+            .into_iter()
+            .flat_map(|rung| rung.models.iter())
+            .find_map(|spec| models.iter().find(|model| model.spec == *spec))
+        {
+            return Ok((ran_tier.to_string(), model.clone()));
+        }
+        let rank = ladder
+            .ordered()
+            .iter()
+            .position(|candidate| candidate.id == ran_tier)
+            .expect("a resolved tier is on the ladder");
+        if rank == 0 {
+            break;
+        }
+        ran_tier = ladder.ordered()[rank - 1].id.clone();
+    }
+    Err(format!(
+        "tier '{tier}' has no available models; pass a `model` or another tier"
+    ))
+}
+
+/// The tier ladder the nudges climb, lowest first. `escalate` is the
+/// deliberate final destination after the highest ordinary tier fails.
+const NUDGE_LADDER: [&str; 5] = ["trivial", "routine", "medium", "high", "escalate"];
+
+/// Consecutive failed or verbatim-repeated tool calls that fire a nudge
+/// (design §4.6).
+const NUDGE_STRIKE_LIMIT: u32 = 3;
+
+/// The enabled-tier ladder over a model inventory and its tier assignment:
+/// a tier is enabled when at least one of the models the tier names is
+/// available. [`TeamRuntime::enabled_routing_tiers`] over shared handles,
+/// so a worker pump computes the same ladder without the runtime.
+fn enabled_tiers_over(
+    models: &[LeadModel],
+    tiers: &mnemo::headless::TiersDto,
+) -> EnabledTiers {
+    let ladder = tier_ladder_from_dto(tiers);
+    let resolves = |tier| resolve_tier_over(models, &ladder, tier).is_ok();
+    EnabledTiers {
+        trivial: resolves("trivial"),
+        routine: resolves("routine"),
+        medium: resolves("medium"),
+        high: resolves("high"),
+        escalate: resolves("escalate"),
+    }
+}
+
+/// Directly modelled tiers for nudges. Unlike dispatch routing, a nudge must
+/// not target an empty tier that would fold back to the worker's current one.
+fn direct_tiers_over(
+    models: &[LeadModel],
+    tiers: &mnemo::headless::TiersDto,
+) -> EnabledTiers {
+    let ladder = tier_ladder_from_dto(tiers);
+    let direct = |tier| {
+        ladder.get(tier).is_some_and(|rung| {
+            rung.models
+                .iter()
+                .any(|spec| models.iter().any(|model| model.spec == *spec))
+        })
+    };
+    EnabledTiers {
+        trivial: direct("trivial"),
+        routine: direct("routine"),
+        medium: direct("medium"),
+        high: direct("high"),
+        escalate: direct("escalate"),
+    }
+}
+
+/// The lowest enabled tier strictly above `current`: the tier a nudge
+/// suggests. `None` when `current` is not on the ladder or already at its
+/// enabled top — a worker on the top tier is never nudged.
+fn next_tier_above(enabled: EnabledTiers, current: &str) -> Option<&'static str> {
+    let rank = NUDGE_LADDER.iter().position(|tier| *tier == current)?;
+    NUDGE_LADDER
+        .iter()
+        .zip([
+            enabled.trivial,
+            enabled.routine,
+            enabled.medium,
+            enabled.high,
+            enabled.escalate,
+        ])
+        .skip(rank + 1)
+        .find(|(_, offered)| *offered)
+        .map(|(tier, _)| *tier)
+}
+
+/// Whether `candidate` sits strictly above `tier` on the nudge ladder.
+fn tier_is_above(tier: &str, candidate: &str) -> bool {
+    match (
+        NUDGE_LADDER.iter().position(|name| *name == tier),
+        NUDGE_LADDER.iter().position(|name| *name == candidate),
+    ) {
+        (Some(rank), Some(candidate)) => candidate > rank,
+        _ => false,
+    }
+}
+
+/// The one nudge claimed for a worker: what the notice says and the row
+/// logs (design §4.6/§4.7).
+struct ClaimedNudge {
+    /// The worker's display name, for the notice.
+    name: String,
+    /// The tier the worker is on.
+    from_tier: String,
+    /// The tier the nudge suggests.
+    to_tier: String,
+    /// The plan the step belongs to, when known.
+    plan_id: String,
+    /// The 1-based step number in the plan.
+    step: usize,
+    /// Whether the routing rows' `logs_routing` gate passes for this
+    /// worker: the notice may fire without it, the row may not.
+    logs: bool,
+}
+
+/// Claim the worker's one nudge (design §4.6) under the record lock: mark
+/// `routing.nudged` with the tier the nudge suggests, so at most one ever
+/// fires for a worker, and report what the notice and row need. `None`
+/// when the worker is gone, carries no routing record (there is nowhere to
+/// mark the one nudge), was already nudged, or has no enabled tier above
+/// its own. `suggest` names the tier Laya cleared (the drift nudge), which
+/// must still sit above the worker's own; `None` takes the next enabled
+/// tier up. The caller must not hold the records lock.
+async fn claim_nudge(
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    worker_id: &str,
+    enabled: EnabledTiers,
+    mode: RoutingMode,
+    suggest: Option<&str>,
+) -> Option<ClaimedNudge> {
+    let mut records = records.lock().await;
+    let worker = records.iter_mut().find(|worker| worker.id == worker_id)?;
+    let from_tier = final_tier(worker);
+    let logs = logs_routing(worker, mode);
+    let routing = worker.routing.as_mut()?;
+    if routing.nudged.is_some() {
+        return None;
+    }
+    let to_tier = match suggest {
+        Some(tier) if tier_is_above(&from_tier, tier) => tier.to_string(),
+        Some(_) => return None,
+        None => next_tier_above(enabled, &from_tier)?.to_string(),
+    };
+    routing.nudged = Some(to_tier.clone());
+    Some(ClaimedNudge {
+        name: worker.name.clone(),
+        from_tier,
+        to_tier,
+        plan_id: worker.plan_id.clone().unwrap_or_default(),
+        step: worker.plan_step.map_or(0, |step| step + 1),
+        logs,
+    })
+}
+
+/// Deliver a claimed nudge: queue the lead notice on the board-signal bus
+/// (the runtime delivers it prefixed like every TeamManager notice) and
+/// append the `Nudge` row (design §4.7) behind the same `logs_routing`
+/// gate as the reroute rows. Never switches the worker's model.
+fn deliver_nudge(
+    signals: &broadcast::Sender<BoardSignal>,
+    routing_log_path: &Path,
+    worker_id: &str,
+    claim: &ClaimedNudge,
+    reason: &str,
+    detail: &str,
+) {
+    let _ = signals.send(BoardSignal::Notice {
+        key: format!("nudge:{worker_id}"),
+        text: format!(
+            "worker_id={worker_id} Laya nudge: {} {detail}; consider team_resume with tier {}.",
+            claim.name, claim.to_tier
+        ),
+    });
+    if claim.logs {
+        mnemo::agent::model_routing::append_row(
+            routing_log_path,
+            &DispatchRoutingRow::Nudge {
+                ts: unix_ms(),
+                worker_id: worker_id.to_string(),
+                plan_id: claim.plan_id.clone(),
+                step: claim.step,
+                reason: reason.to_string(),
+                from_tier: claim.from_tier.clone(),
+                to_tier: claim.to_tier.clone(),
+                detail: detail.to_string(),
+            },
+        );
+    }
+}
+
+/// The `nudge_ignored` row (design §4.7): a nudged worker reached a
+/// truly terminal status — merged, stopped, or abandoned in cleanup —
+/// still on the tier it was nudged from, so the lead never acted on the
+/// nudge. A failed worker is resumable (`team_resume` on a stronger tier
+/// takes the nudge and logs a reroute), so failure never logs it.
+/// `None` when the worker was not nudged, or ended on the suggested
+/// tier (every reroute clears the nudge, so an acted-on nudge is never
+/// seen here).
+fn nudge_ignored_row(record: &WorkerRecord) -> Option<DispatchRoutingRow> {
+    let nudged = record.routing.as_ref()?.nudged.as_deref()?;
+    let tier = final_tier(record);
+    if tier == nudged {
+        return None;
+    }
+    Some(DispatchRoutingRow::NudgeIgnored {
+        ts: unix_ms(),
+        worker_id: record.id.clone(),
+        plan_id: record.plan_id.clone().unwrap_or_default(),
+        step: record.plan_step.map_or(0, |step| step + 1),
+        tier,
+    })
+}
+
+/// The shared handles a pump-side strike nudge needs (design §4.6): the
+/// records to claim on, the tier-ladder inputs, the notice bus, the routing
+/// log, and the settings in force.
+struct StrikeNudges<'a> {
+    records: &'a Arc<Mutex<Vec<WorkerRecord>>>,
+    models: &'a Arc<std::sync::RwLock<Vec<LeadModel>>>,
+    tiers: &'a Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
+    signals: &'a broadcast::Sender<BoardSignal>,
+    routing_log_path: &'a Path,
+    settings: &'a RoutingSettings,
+}
+
+/// Try the worker's one strike nudge (design §4.6): the pump saw its
+/// third consecutive failed or verbatim-repeated tool call. Claims the
+/// nudge slot, queues the notice, and appends the row; `repeated` says
+/// whether the firing call repeated the previous one verbatim ("going in
+/// circles") or failed anew. No-op when nudges are off, the worker was
+/// already nudged, has no routing record, or sits on the top enabled
+/// tier.
+async fn try_strike_nudge(worker_id: &str, nudges: StrikeNudges<'_>, repeated: bool) {
+    let enabled = direct_tiers_over(
+        &nudges.models.read().unwrap_or_else(|e| e.into_inner()),
+        &nudges.tiers.read().unwrap_or_else(|e| e.into_inner()),
+    );
+    let Some(claim) =
+        claim_nudge(nudges.records, worker_id, enabled, nudges.settings.mode, None).await
+    else {
+        return;
+    };
+    let (reason, detail) = if repeated {
+        ("circles", "looks stuck (going in circles)")
+    } else {
+        ("strikes", "looks stuck (3 failing tool calls in a row)")
+    };
+    deliver_nudge(
+        nudges.signals,
+        nudges.routing_log_path,
+        worker_id,
+        &claim,
+        reason,
+        detail,
+    );
+}
+
+fn append_reroute_metadata(
+    path: &Path,
+    row: &DispatchRoutingRow,
+    source: ChangeSource,
+    finding_closed: Option<bool>,
+) {
+    let mut value = match serde_json::to_value(row) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("failed to serialize dispatch routing row: {error}");
+            return;
+        }
+    };
+    if let Some(object) = value.as_object_mut() {
+        if !matches!(source, ChangeSource::Lead | ChangeSource::User) {
+            object.insert("source".into(), source.as_str().into());
+        }
+        if let Some(closed) = finding_closed {
+            object.insert("finding_closed".into(), closed.into());
+        }
+    }
+    mnemo::agent::model_routing::append_row(path, &value);
+}
+
+/// The unreviewed model downshift on this routed fix, if any. `nudged` is the
+/// durable pending marker on this internal row; settling the review clears it.
+fn pending_fix_downshift(
+    worker: &WorkerRecord,
+    findings: &[Finding],
+) -> Option<(DispatchRoutingRow, bool)> {
+    let finding_id = worker.fixer_finding_id.as_deref()?;
+    let DispatchRoutingRow::LeadReroute {
+        from_tier,
+        to_tier,
+        nudged: true,
+        ..
+    } = worker.reroutes.last()?
+    else {
+        return None;
+    };
+    let from = NUDGE_LADDER.iter().position(|tier| tier == from_tier)?;
+    let to = NUDGE_LADDER.iter().position(|tier| tier == to_tier)?;
+    if from <= to {
+        return None;
+    }
+    let closed = !findings
+        .iter()
+        .any(|finding| finding.id == finding_id && finding.status == "open");
+    Some((worker.reroutes.last()?.clone(), closed))
+}
+
+fn route_fix_brief(worker: &WorkerRecord, routed: &Finding) -> String {
+    // Keep the established routed-finding prefix for callers that display or
+    // match it, then include every OTHER open finding in full as well.
+    let mut brief = format!(
+        "Fix review finding {}: {}\n{}\nFile: {}:{}\n",
+        routed.id, routed.title, routed.detail, routed.file, routed.line
+    );
+    for open in worker
+        .findings
+        .iter()
+        .filter(|candidate| candidate.status == "open" && candidate.id != routed.id)
+    {
+        brief.push_str(&format!(
+            "\nAlso fix open finding {} [{}]: {}\n{}\nFile: {}:{}\n",
+            open.id, open.severity, open.title, open.detail, open.file, open.line
+        ));
+    }
+    brief.push_str(
+        "\nCommit fixes for every finding above, rerun the affected checks, and report evidence for delta review.",
+    );
+    brief
+}
+
+/// The shared state an automatic idle escalation touches. The worker pump and
+/// the lead review path both have these handles already.
+struct AutoEscalation<'a> {
+    records: &'a Arc<Mutex<Vec<WorkerRecord>>>,
+    live: &'a Arc<Mutex<HashMap<String, LiveWorker>>>,
+    models: &'a Arc<std::sync::RwLock<Vec<LeadModel>>>,
+    tiers: &'a Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
+    signals: &'a broadcast::Sender<BoardSignal>,
+    routing_log_path: &'a Path,
+    usage: &'a Arc<Mutex<ProjectUsage>>,
+    save_lock: &'a Arc<Mutex<()>>,
+    persistence: &'a TeamPersistence,
+}
+
+/// Switch a nudged idle worker without stopping its session. `Ok(false)` means
+/// the original suggestion remains in force (busy, already claimed, or no live
+/// session); it is not an error and a later idle event may try again.
+async fn auto_escalate_idle(worker_id: &str, ctx: AutoEscalation<'_>) -> Result<bool, String> {
+    let record = ctx
+        .records
+        .lock()
+        .await
+        .iter()
+        .find(|worker| worker.id == worker_id)
+        .cloned()
+        .ok_or_else(|| format!("worker '{worker_id}' not found"))?;
+    if record.kind == "audit" {
+        return Ok(false);
+    }
+    let Some(to_tier) = record
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.nudged.clone())
+    else {
+        return Ok(false);
+    };
+    let (ran_tier, choice, effort) = {
+        let models = ctx.models.read().unwrap_or_else(|e| e.into_inner());
+        let tiers = ctx.tiers.read().unwrap_or_else(|e| e.into_inner());
+        let ladder = tier_ladder_from_dto(&tiers);
+        let (ran_tier, choice) = resolve_tier_over(&models, &ladder, &to_tier)?;
+        let effort = ladder.get(&ran_tier).and_then(|rung| rung.effort.clone());
+        (ran_tier, choice, effort)
+    };
+    let model = choice.spec.clone();
+    let new_model_id = {
+        let live = ctx.live.lock().await;
+        let Some(live) = live.get(worker_id) else {
+            return Ok(false);
+        };
+        if live.busy.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        live.admit_session_command(worker_id)?;
+        match live.session.set_model(&model, effort.clone()).await {
+            Ok(ModelSwitch::NextRequest { model })
+            | Ok(ModelSwitch::CompactsFirst { model }) => model,
+            Err(error) => {
+                return Err(format!(
+                    "could not switch worker '{worker_id}' to '{model}': {error}"
+                ));
+            }
+        }
+    };
+    let from_model = record.model.clone();
+    let from_tier = final_tier(&record);
+    let row = DispatchRoutingRow::LeadReroute {
+        ts: unix_ms(),
+        worker_id: worker_id.to_string(),
+        plan_id: record.plan_id.clone().unwrap_or_default(),
+        step: record.plan_step.map_or(0, |step| step + 1),
+        from_tier: from_tier.clone(),
+        to_tier: ran_tier.clone(),
+        from_model,
+        to_model: Some(model.clone()),
+        status: status_name(record.status),
+        review_rounds: record.review_rounds,
+        fix_rounds: record.fix_rounds,
+        nudged: true,
+    };
+    let mut records = ctx.records.lock().await;
+    let worker = records
+        .iter_mut()
+        .find(|worker| worker.id == worker_id)
+        .ok_or_else(|| format!("worker '{worker_id}' not found"))?;
+    if worker.routing.as_ref().and_then(|routing| routing.nudged.as_deref())
+        != Some(to_tier.as_str())
+    {
+        return Ok(false);
+    }
+    worker.model = Some(model.clone());
+    if worker.model_id.as_deref() != Some(new_model_id.as_str()) {
+        worker.model_id = None;
+    }
+    worker.reasoning_effort = effort;
+    worker.tier = Some(ran_tier.clone());
+    worker.reroutes.push(row.clone());
+    if let Some(routing) = worker.routing.as_mut() {
+        routing.nudged = None;
+    }
+    note_model(worker, &model);
+    drop(records);
+    if let Some(live) = ctx.live.lock().await.get(worker_id) {
+        live.strikes.lock().await.reset();
+    }
+    save_workers(ctx.records, ctx.usage, ctx.save_lock, ctx.persistence).await?;
+    append_reroute_metadata(ctx.routing_log_path, &row, ChangeSource::Escalation, None);
+    let _ = ctx.signals.send(BoardSignal::Notice {
+        key: format!("escalation:auto:{worker_id}"),
+        text: format!(
+            "Auto escalation switched worker {worker_id} from {from_tier} to {ran_tier} ({model}); its session and transcript were kept."
+        ),
+    });
+    Ok(true)
+}
+
 /// The shared team runtime: one engine, many real worker sessions.
 pub struct TeamRuntime {
     engine: Arc<Engine>,
     workspace_root: PathBuf,
     records: Arc<Mutex<Vec<WorkerRecord>>>,
-    live: Mutex<HashMap<String, LiveWorker>>,
+    live: Arc<Mutex<HashMap<String, LiveWorker>>>,
     messages: Arc<Mutex<Vec<TeamMessage>>>,
     events: broadcast::Sender<TeamEvent>,
     generation: Arc<AtomicU64>,
     next_worker: AtomicU64,
     lead_busy: AtomicBool,
-    #[cfg(test)]
-    fail_next_close: AtomicBool,
+    /// Transition tests flip this to inject a worker-session close
+    /// failure; production never sets it. Shared with every worker pump
+    /// so the audit release closes sessions exactly like `stop_inner`.
+    fail_next_close: Arc<AtomicBool>,
     lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
-    models: std::sync::RwLock<Vec<LeadModel>>,
-    tiers: std::sync::RwLock<mnemo::headless::TiersDto>,
+    config_dir: PathBuf,
+    /// The dispatch-routing settings, shared with every worker pump so a
+    /// failure's `outcome` row follows the mode in force when it happens.
+    routing: Arc<std::sync::RwLock<RoutingSettings>>,
+    classifier: Option<ClassifierSlot>,
+    /// The online-learning overlay over `dispatch_routing.jsonl`, present when
+    /// the engine exposes its shared embedder. Consulted before Laya.
+    route_knn: Option<Arc<RouteKnn>>,
+    /// One classifier call at a time, shared with the drift checks.
+    routing_permit: Arc<tokio::sync::Semaphore>,
+    routing_log_path: PathBuf,
+    /// The model catalog and its tier assignment, shared with the worker
+    /// pumps so a nudge suggests a tier from the catalog in force when the
+    /// worker stuck (design §4.6).
+    models: Arc<std::sync::RwLock<Vec<LeadModel>>>,
+    tiers: Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
     persistence: TeamPersistence,
     /// The durable per-project usage accumulator (lead + workers).
     usage: Arc<Mutex<ProjectUsage>>,
@@ -676,32 +1613,12 @@ pub struct TeamRuntime {
     external_wake: tokio::sync::Notify,
 }
 
-/// The model tiers the lead may dispatch by, with their one-line purpose.
-const TIER_PURPOSES: [(&str, &str); 3] = [
-    (
-        "difficult",
-        "design, debugging, bug_fixing plans, cross-cutting work, steps touching shared contracts",
-    ),
-    ("average", "typical implementation steps"),
-    (
-        "simple",
-        "single-file mechanical edits, checks, lookups, scaffolding",
-    ),
-];
-
 /// Upper bound for concurrently live worker sessions in one project.
 pub const MAX_WORKER_SLOTS: usize = 32;
 
 impl TeamRuntime {
     async fn close_session_for_cleanup(&self, session: &AgentSession) -> Result<(), String> {
-        #[cfg(test)]
-        if self.fail_next_close.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Err("injected close failure for transition tests".to_string());
-        }
-        session
-            .close_and_wait()
-            .await
-            .map_err(|error| error.to_string())
+        close_worker_session(session, &self.fail_next_close).await
     }
 
     #[cfg(test)]
@@ -712,6 +1629,7 @@ impl TeamRuntime {
 
     /// Open the team ledger, recover interrupted workers, and prepare to spawn.
     pub async fn open(options: TeamRuntimeOptions) -> Result<Self, String> {
+        let config_dir = options.config_dir.clone();
         let persistence = TeamPersistence::new(&options.state_dir);
         let persisted = persistence.load()?;
         let slots = options
@@ -730,23 +1648,40 @@ impl TeamRuntime {
         }
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (signals, _) = broadcast::channel(EVENT_BUFFER);
+        let routing_log_path = options.routing_log_path.clone().unwrap_or_else(
+            crate::mnemo2::dispatch_routing::dispatch_routing_log_path,
+        );
+        // The kNN overlay shares the app's live embedder (never a second
+        // backend). With no own memory store there is nothing to embed with,
+        // so the overlay is absent and Laya decides every dispatch.
+        let route_knn = options.engine.embedder_handle().map(|initial| {
+            let engine = Arc::clone(&options.engine);
+            let getter: EmbedderGetter =
+                Arc::new(move || engine.embedder_handle().unwrap_or_else(|| initial.clone()));
+            Arc::new(RouteKnn::new(getter, routing_log_path.clone()))
+        });
         let runtime = Self {
             engine: options.engine,
             workspace_root: options.workspace_root,
             records: Arc::new(Mutex::new(workers)),
-            live: Mutex::new(HashMap::new()),
+            live: Arc::new(Mutex::new(HashMap::new())),
             messages: Arc::new(Mutex::new(Vec::new())),
             events,
             generation: Arc::new(AtomicU64::new(0)),
             next_worker: AtomicU64::new(1),
             lead_busy: AtomicBool::new(false),
-            #[cfg(test)]
-            fail_next_close: AtomicBool::new(false),
+            fail_next_close: Arc::new(AtomicBool::new(false)),
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
-            models: std::sync::RwLock::new(options.models),
-            tiers: std::sync::RwLock::new(mnemo::headless::TiersDto::default()),
+            config_dir: config_dir.clone(),
+            routing: Arc::new(std::sync::RwLock::new(load_routing_settings(&config_dir))),
+            classifier: options.classifier,
+            route_knn,
+            routing_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            routing_log_path,
+            models: Arc::new(std::sync::RwLock::new(options.models)),
+            tiers: Arc::new(std::sync::RwLock::new(mnemo::headless::TiersDto::default())),
             persistence,
             usage: Arc::new(Mutex::new(usage)),
             save_lock: Arc::new(Mutex::new(())),
@@ -762,18 +1697,11 @@ impl TeamRuntime {
         Ok(runtime)
     }
 
-    /// Open the team on the lead's shared engine.
-    pub async fn from_lead(lead: &LeadRuntime, state_dir: PathBuf) -> Result<Self, String> {
-        Self::open(TeamRuntimeOptions {
-            engine: lead.engine_handle().await?,
-            workspace_root: lead.workspace_root().to_path_buf(),
-            state_dir,
-            slots: None,
-            models: lead.models(),
-            pricing: lead.pricing()?,
-        })
-        .await
-        .inspect(|team| team.set_tiers(lead.tiers()))
+    /// The live dispatch-routing kNN overlay, when the engine exposes its
+    /// shared embedder. The eval reads it to report Laya-only and kNN+Laya
+    /// accuracy side by side.
+    pub fn route_knn(&self) -> Option<Arc<RouteKnn>> {
+        self.route_knn.clone()
     }
 
     /// Replace the model tiers new dispatches resolve against.
@@ -790,7 +1718,17 @@ impl TeamRuntime {
     ) {
         *self.models.write().unwrap_or_else(|e| e.into_inner()) = models;
         self.set_tiers(tiers);
+        self.reload_routing_settings();
         *self.pricing.write().expect("pricing lock poisoned") = pricing;
+    }
+
+    /// Re-read the `[routing]` table of `mnemo2.toml` into the live team, so a
+    /// routing-settings save (the Laya page's Save, the eval's Apply) takes
+    /// effect on the next dispatch without a restart. [`Self::set_catalog`] is
+    /// the other reload path — a model-settings save.
+    pub fn reload_routing_settings(&self) {
+        *self.routing.write().unwrap_or_else(|e| e.into_inner()) =
+            load_routing_settings(&self.config_dir);
     }
 
     fn current_models(&self) -> Vec<LeadModel> {
@@ -800,26 +1738,33 @@ impl TeamRuntime {
             .clone()
     }
 
+    /// The live ladder new dispatches and tool descriptions resolve against.
+    fn tier_ladder(&self) -> TierLadder {
+        tier_ladder_from_dto(&self.tiers.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The tier's configured models that are still available, in order.
     pub(crate) fn tier_models(&self, tier: &str) -> Vec<LeadModel> {
-        let tiers = self.tiers.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let specs = match tier {
-            "difficult" => tiers.difficult,
-            "average" => tiers.average,
-            "simple" => tiers.simple,
-            _ => Vec::new(),
-        };
+        let ladder = self.tier_ladder();
         let models = self.current_models();
-        specs
-            .iter()
-            .filter_map(|spec| models.iter().find(|m| &m.spec == spec).cloned())
+        ladder
+            .get(tier)
+            .into_iter()
+            .flat_map(|rung| rung.models.iter())
+            .filter_map(|spec| models.iter().find(|model| model.spec == *spec).cloned())
             .collect()
+    }
+
+    /// Resolve one lead tier through the ladder's fold-down rule.
+    fn resolve_tier_choice(&self, tier: &str) -> Result<(String, LeadModel), String> {
+        resolve_tier_over(&self.current_models(), &self.tier_ladder(), tier)
     }
 
     /// Every available model some tier names, in tier order, once each.
     fn tiered_models(&self) -> Vec<LeadModel> {
         let mut models: Vec<LeadModel> = Vec::new();
-        for (tier, _) in TIER_PURPOSES {
+        let ladder = self.tier_ladder();
+        for tier in tier_ids(&ladder) {
             for model in self.tier_models(tier) {
                 if !models.iter().any(|known| known.spec == model.spec) {
                     models.push(model);
@@ -837,15 +1782,16 @@ impl TeamRuntime {
         tier: Option<&str>,
         model: Option<String>,
     ) -> Result<Option<String>, String> {
+        if let Some(tier) = tier {
+            if self.tier_ladder().get(tier).is_none() {
+                return Err(format!(
+                    "unknown tier '{tier}'; expected one of: {}",
+                    tier_ids(&self.tier_ladder()).join(", ")
+                ));
+            }
+        }
         let model = match (model, tier) {
-            (None, Some(tier)) => match self.tier_models(tier).into_iter().next() {
-                Some(first) => Some(first.spec),
-                None => {
-                    return Err(format!(
-                        "tier '{tier}' has no available models; pass a `model` or another tier"
-                    ));
-                }
-            },
+            (None, Some(tier)) => Some(self.resolve_tier_choice(tier)?.1.spec),
             (model, _) => model,
         };
         let tiered = self.tiered_models();
@@ -858,6 +1804,367 @@ impl TeamRuntime {
             }
             _ => Ok(model),
         }
+    }
+
+    /// Resolve a lead's model/tier choice and retain the tier that actually
+    /// runs (which may be below the requested tier).
+    fn lead_choice_with_tier(
+        &self,
+        tier: Option<&str>,
+        model: Option<String>,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        if model.is_none() {
+            if let Some(tier) = tier {
+                let (ran_tier, choice) = self.resolve_tier_choice(tier)?;
+                return Ok((Some(choice.spec), Some(ran_tier)));
+            }
+        }
+        let model = self.lead_model_choice(tier, model)?;
+        let ran_tier = self.tier_for_model(model.as_deref());
+        Ok((model, ran_tier))
+    }
+
+    async fn route_implementation_dispatch(
+        &self,
+        request: &DispatchRequest,
+        step_text: &str,
+        brief: &str,
+    ) -> Result<RoutedDispatch, String> {
+        let settings = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let requested_tier = request.tier.as_deref();
+        if requested_tier == Some("auto") && matches!(settings.mode, RoutingMode::Off | RoutingMode::Shadow) {
+            return Err("tier auto needs routing mode suggest or auto (Settings > Tiers)".into());
+        }
+        // The escalation rung is never a first pick: fresh work dispatches on
+        // high, and team_resume or team_route_fix moves an existing worker up.
+        if request.source == DispatchSource::LeadTool {
+            let ladder = self.tier_ladder();
+            if let (Some(tier), Some(rung)) = (requested_tier, ladder.escalation()) {
+                if tier == rung.id {
+                    return Err(
+                        "tier escalate is escalation only, never a first pick; dispatch on high, or move an existing worker up with team_resume or team_route_fix and tier escalate"
+                            .into(),
+                    );
+                }
+            }
+        }
+
+        if requested_tier.is_none()
+            && request.model.is_none()
+            && settings.mode != RoutingMode::Auto
+            && request.source == DispatchSource::LeadTool
+        {
+            if let Some(required) = self.tier_required() {
+                return Err(required);
+            }
+        }
+        if settings.mode == RoutingMode::Off {
+            let (model, tier) =
+                self.lead_choice_with_tier(requested_tier, request.model.clone())?;
+            let reasoning_effort = request.reasoning_effort.clone().or_else(|| {
+                tier.as_deref()
+                    .and_then(|tier| self.tier_ladder().get(tier).and_then(|rung| rung.effort.clone()))
+            });
+            return Ok(RoutedDispatch {
+                model,
+                tier,
+                reasoning_effort,
+                routing: None,
+                rows: Vec::new(),
+                error: None,
+            });
+        }
+
+        let explicit_tier = requested_tier.filter(|tier| *tier != "auto");
+        let has_explicit_choice = explicit_tier.is_some() || request.model.is_some();
+        let enabled = self.enabled_routing_tiers();
+        let classified_text = routing_text(step_text, brief).filter(|text| {
+            text.split_whitespace().count() >= settings.min_words
+        });
+        let classifier = self.classifier.as_ref().and_then(|slot| {
+            slot.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        let (decision, skip_reason): (Option<DispatchRoutingDecision>, Option<&'static str>) =
+            if classified_text.is_none() {
+                (None, Some("too_short"))
+            } else if enabled.offered().count() < 2 {
+                (None, Some("one_tier"))
+            } else if let Some(classifier) = classifier {
+                let attempt = async {
+                    let _permit = self
+                        .routing_permit
+                        .acquire()
+                        .await
+                        .map_err(|_| "Laya routing is closed".to_string())?;
+                    Ok::<Option<DispatchRoutingDecision>, String>(
+                        classify_dispatch(
+                            classifier.as_ref(),
+                            self.route_knn.as_deref(),
+                            classified_text.as_deref().unwrap_or(""),
+                            enabled,
+                            &settings,
+                        )
+                        .await,
+                    )
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(3), attempt).await {
+                    Ok(Ok(Some(decision))) => (Some(decision), None),
+                    Ok(Ok(None)) | Err(_) => (None, Some("offline")),
+                    Ok(Err(error)) => return Err(error),
+                }
+            } else {
+                (None, Some("offline"))
+            };
+        let cleared_tier = decision
+            .as_ref()
+            .filter(|decision| decision.cleared)
+            .and_then(|decision| decision.tier);
+
+        let mut refusal = None;
+        let (chosen_model, chosen_tier) = if has_explicit_choice {
+            self.lead_choice_with_tier(explicit_tier, request.model.clone())?
+        } else if let Some(tier) = cleared_tier.filter(|_| {
+            settings.mode == RoutingMode::Auto
+                || (settings.mode == RoutingMode::Suggest && requested_tier == Some("auto"))
+        }) {
+            let (ran_tier, choice) = self.resolve_tier_choice(tier)?;
+            (Some(choice.spec), Some(ran_tier))
+        } else if settings.mode == RoutingMode::Suggest && requested_tier == Some("auto") {
+            refusal = Some(if skip_reason == Some("offline") {
+                "Laya is not running; pass a tier".to_string()
+            } else {
+                format!(
+                    "Laya is unsure ({:.2}); pass a tier",
+                    decision.as_ref().map_or(0.0, |decision| decision.confidence)
+                )
+            });
+            (None, None)
+        } else if settings.mode == RoutingMode::Auto {
+            let tier = settings.fallback_tier.clone();
+            if self.tiered_models().is_empty() {
+                (self.lead_model_choice(None, None)?, None)
+            } else {
+                let (ran_tier, choice) = self.resolve_tier_choice(&tier)?;
+                (Some(choice.spec), Some(ran_tier))
+            }
+        } else {
+            (self.lead_model_choice(None, None)?, None)
+        };
+        let auto_fallback_tier = (!has_explicit_choice
+            && settings.mode == RoutingMode::Auto
+            && cleared_tier.is_none()
+            && chosen_tier.is_some())
+        .then(|| settings.fallback_tier.clone());
+        let routed_by = if has_explicit_choice {
+            let lead_tier = if request.model.is_some() {
+                chosen_tier.as_deref()
+            } else {
+                explicit_tier
+            };
+            if cleared_tier.is_some() && cleared_tier != lead_tier {
+                "lead_override"
+            } else {
+                "lead"
+            }
+        } else if cleared_tier.is_some()
+            && refusal.is_none()
+            && (settings.mode == RoutingMode::Auto
+                || (settings.mode == RoutingMode::Suggest && requested_tier == Some("auto")))
+        {
+            "laya"
+        } else {
+            "lead"
+        };
+        let reasoning_effort = request.reasoning_effort.clone().or_else(|| {
+            chosen_tier.as_deref().and_then(|tier| {
+                self.tier_ladder()
+                    .get(tier)
+                    .and_then(|rung| rung.effort.clone())
+            })
+        });
+        let routing = WorkerRouting {
+            laya_tier: decision
+                .as_ref()
+                .and_then(|decision| decision.tier)
+                .map(str::to_string),
+            confidence: decision.as_ref().map(|decision| decision.confidence),
+            cleared: decision.as_ref().is_some_and(|decision| decision.cleared),
+            lead_tier: (routed_by != "laya")
+                .then(|| {
+                    explicit_tier
+                        .map(str::to_string)
+                        .or_else(|| auto_fallback_tier.clone())
+                        .or_else(|| chosen_tier.clone())
+                })
+                .flatten(),
+            routed_by: routed_by.to_string(),
+            ran_tier: refusal.is_none().then(|| chosen_tier.clone()).flatten(),
+            nudged: None,
+        };
+        let plan_id = request.plan.as_ref().map(|plan| plan.plan_id.clone());
+        let step = request.plan.as_ref().map(|plan| plan.step + 1);
+        let skip = skip_reason;
+        use sha2::Digest as _;
+        let text_sha256 = sha2::Sha256::digest(
+            classified_text.as_deref().unwrap_or("").as_bytes(),
+        )
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+        let ts = unix_ms();
+        let row = DispatchRoutingRow::Route {
+            ts,
+            worker_id: request.worker_id.clone().unwrap_or_default(),
+            plan_id: plan_id.unwrap_or_default(),
+            step: step.unwrap_or_default(),
+            mode: settings.mode,
+            text_sha256,
+            label: decision
+                .as_ref()
+                .map(|decision| decision.label.clone())
+                .unwrap_or_default(),
+            confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
+            probabilities: decision
+                .as_ref()
+                .map(|decision| decision.probabilities.clone())
+                .unwrap_or_default(),
+            tier: routing.laya_tier.clone(),
+            threshold: decision.as_ref().map_or_else(
+                || threshold_for(enabled.offered().count(), &settings),
+                |decision| {
+                    if decision.source == "knn" {
+                        settings.knn_min_share
+                    } else {
+                        threshold_for(enabled.offered().count(), &settings)
+                    }
+                },
+            ),
+            cleared: routing.cleared,
+            lead_tier: routing.lead_tier.clone(),
+            ran_tier: refusal.is_none().then(|| chosen_tier.clone()).flatten(),
+            ran_model: refusal.is_none().then(|| chosen_model.clone()).flatten(),
+            text: classified_text.unwrap_or_default(),
+            skip: skip.map(str::to_string),
+            source: decision.as_ref().map(|decision| decision.source.to_string()),
+            knn_label: decision.as_ref().and_then(|decision| decision.knn_label.clone()),
+            knn_share: decision.as_ref().and_then(|decision| decision.knn_share),
+            knn_k: decision.as_ref().and_then(|decision| decision.knn_k),
+        };
+        let mut rows = vec![row];
+        if routed_by == "lead_override" {
+            if let Some(laya_tier) = routing.laya_tier.clone() {
+                rows.push(DispatchRoutingRow::LeadOverride {
+                    ts,
+                    worker_id: request.worker_id.clone().unwrap_or_default(),
+                    plan_id: request
+                        .plan
+                        .as_ref()
+                        .map(|plan| plan.plan_id.clone())
+                        .unwrap_or_default(),
+                    step: request.plan.as_ref().map_or(0, |plan| plan.step + 1),
+                    laya_tier: Some(laya_tier),
+                    lead_tier: chosen_tier.clone().unwrap_or_else(|| "custom".into()),
+                    requested_tier: explicit_tier
+                        .map(str::to_string)
+                        .filter(|requested| Some(requested.as_str()) != chosen_tier.as_deref()),
+                    confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
+                });
+            }
+        }
+        Ok(RoutedDispatch {
+            model: chosen_model,
+            tier: chosen_tier,
+            reasoning_effort,
+            routing: Some(routing),
+            rows,
+            error: refusal,
+        })
+    }
+
+    /// The tier a model spec belongs to: the first ladder rung whose list
+    /// names an available model.
+    fn tier_of(&self, spec: &str) -> Option<String> {
+        let ladder = self.tier_ladder();
+        let models = self.current_models();
+        tier_ids(&ladder).into_iter().find(|tier| {
+            ladder
+                .get(tier)
+                .into_iter()
+                .flat_map(|rung| rung.models.iter())
+                .any(|candidate| {
+                    candidate == spec && models.iter().any(|model| model.spec == *candidate)
+                })
+        }).map(str::to_string)
+    }
+
+    fn tier_for_model(&self, model: Option<&str>) -> Option<String> {
+        self.tier_of(model?)
+    }
+
+    fn enabled_routing_tiers(&self) -> EnabledTiers {
+        enabled_tiers_over(
+            &self.current_models(),
+            &self.tiers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+
+    /// Nudge destinations have their own models, so a nudge cannot fold back
+    /// onto the tier the worker is already running.
+    fn direct_nudge_tiers(&self) -> EnabledTiers {
+        direct_tiers_over(
+            &self.current_models(),
+            &self.tiers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+
+    fn append_dispatch_routing_row(&self, row: &DispatchRoutingRow) {
+        mnemo::agent::model_routing::append_row(&self.routing_log_path, row);
+    }
+
+    /// Append a reroute with the step-6 metadata kept outside the legacy typed
+    /// row, so old readers and parallel settings code retain their contract.
+    fn append_reroute_row(
+        &self,
+        row: &DispatchRoutingRow,
+        source: ChangeSource,
+        finding_closed: Option<bool>,
+    ) {
+        append_reroute_metadata(&self.routing_log_path, row, source, finding_closed);
+    }
+
+    async fn auto_escalate_worker(&self, worker_id: &str) -> Result<bool, String> {
+        auto_escalate_idle(
+            worker_id,
+            AutoEscalation {
+                records: &self.records,
+                live: &self.live,
+                models: &self.models,
+                tiers: &self.tiers,
+                signals: &self.signals,
+                routing_log_path: &self.routing_log_path,
+                usage: &self.usage,
+                save_lock: &self.save_lock,
+                persistence: &self.persistence,
+            },
+        )
+        .await
+    }
+
+    /// The routing mode in force right now.
+    fn routing_mode(&self) -> RoutingMode {
+        self.routing.read().unwrap_or_else(|e| e.into_inner()).mode
     }
 
     /// The refusal for a dispatch with no tier while tiers are configured.
@@ -876,26 +2183,57 @@ impl TeamRuntime {
             .map(|p| format!("${}/${}", p.input_per_1m, p.output_per_1m))
     }
 
-    /// The tier guidance shown to the lead: each tier with its one-line
-    /// purpose and its models (with prices).
+    /// Generate the lead's tier guidance from the ladder itself: editable
+    /// names and definitions, available models with prices, effort and the
+    /// fold-down destination of an empty tier.
     fn tier_guidance(&self) -> Option<String> {
-        let mut lines = Vec::new();
-        for (tier, purpose) in TIER_PURPOSES {
-            let models = self.tier_models(tier);
-            if models.is_empty() {
-                continue;
-            }
-            let list = models
-                .iter()
-                .map(|m| match self.price_label(m) {
-                    Some(price) => format!("{} ({price})", m.spec),
-                    None => m.spec.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(format!("{tier} - {purpose}: {list}"));
+        if self.tiered_models().is_empty() {
+            return None;
         }
-        (!lines.is_empty()).then(|| lines.join("\n"))
+        let ladder = self.tier_ladder();
+        let mut lines = Vec::new();
+        for rung in ladder.ordered() {
+            let tier = rung.id.as_str();
+            let models = self.tier_models(tier);
+            let list = if models.is_empty() {
+                match self.resolve_tier_choice(tier) {
+                    Ok((ran_tier, _)) if ran_tier != tier => {
+                        format!("no model; folds down to {ran_tier}")
+                    }
+                    _ => "no model".to_string(),
+                }
+            } else {
+                models
+                    .iter()
+                    .map(|model| match self.price_label(model) {
+                        Some(price) => format!("{} ({price})", model.spec),
+                        None => model.spec.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let effort = rung
+                .effort
+                .as_deref()
+                .map(|effort| format!("; effort {effort}"))
+                .unwrap_or_default();
+            let escalation = if rung.role.as_deref() == Some("escalate") {
+                "; escalation only, never a first pick"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "{tier} ({}) - {}: {list}{effort}{escalation}",
+                rung.name, rung.definition
+            ));
+        }
+        if matches!(
+            self.routing.read().unwrap_or_else(|e| e.into_inner()).mode,
+            RoutingMode::Suggest | RoutingMode::Auto
+        ) {
+            lines.push("auto - let Laya choose from the step spec (never escalate)".into());
+        }
+        Some(lines.join("\n"))
     }
 
     /// Subscribe to every worker event.
@@ -917,9 +2255,79 @@ impl TeamRuntime {
         let _ = self.signals.send(BoardSignal::Notice { key, text });
     }
 
-    /// Share the lead's one plan board with the team.
-    pub(crate) fn attach_board(&self, board: Arc<PlanBoard>) {
+    /// Install a stub classifier for runtime integration tests.
+    #[cfg(test)]
+    pub(crate) fn set_classifier_for_test(&mut self, classifier: ClassifierSlot) {
+        self.classifier = Some(classifier);
+    }
+
+    /// Inspect the classifier handle installed at open in integration tests.
+    #[cfg(test)]
+    pub(crate) fn classifier_slot_for_test(&self) -> Option<ClassifierSlot> {
+        self.classifier.clone()
+    }
+
+    /// Inspect the routing settings loaded at open in integration tests.
+    #[cfg(test)]
+    pub(crate) fn routing_settings_for_test(&self) -> RoutingSettings {
+        self.routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Share the lead's one plan board with the team and register the observer
+    /// that tells working workers when the lead records something new.
+    pub(crate) fn attach_board(self: &Arc<Self>, board: Arc<PlanBoard>) {
         board.set_external_lead_attached(self.external_lead_attached());
+        let team = Arc::downgrade(self);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        board.set_edit_observer(Box::new(move |plan_id, kinds| {
+            let Some(team) = team.upgrade() else {
+                return;
+            };
+            let plan_id = plan_id.to_string();
+            let text = format!(
+                "Plan {plan_id} changed: new {}. Call plan_read to re-read it before you continue.",
+                kinds.join(", ")
+            );
+            // The board calls this synchronously after releasing its own
+            // guard, so the observer only hands the work to the runtime.
+            let Some(runtime) = runtime.clone() else {
+                eprintln!(
+                    "team: no runtime is available to tell workers that plan {plan_id} changed"
+                );
+                return;
+            };
+            runtime.spawn(async move {
+                let workers = {
+                    let records = team.records.lock().await;
+                    records
+                        .iter()
+                        .filter(|worker| worker.plan_id.as_deref() == Some(plan_id.as_str()))
+                        .filter(|worker| {
+                            matches!(
+                                worker.status,
+                                WorkerStatus::Working
+                                    | WorkerStatus::Dispatching
+                                    | WorkerStatus::Fixing
+                            )
+                        })
+                        .map(|worker| worker.id.clone())
+                        .collect::<Vec<_>>()
+                };
+                for worker_id in workers {
+                    if let Err(error) = team
+                        .message(&worker_id, text.clone(), MessageSender::Lead)
+                        .await
+                    {
+                        eprintln!(
+                            "team: could not tell worker '{worker_id}' that plan {plan_id} changed: {error}"
+                        );
+                    }
+                }
+            });
+        }));
         *self.board.lock().unwrap_or_else(|e| e.into_inner()) = Some(board);
     }
 
@@ -1075,6 +2483,23 @@ impl TeamRuntime {
         self.attach_external_lead_as(Some(session))
     }
 
+    /// Remember a helper process that made a tool call while this external
+    /// lead was attached. Does nothing while no external lead is attached.
+    pub fn note_external_bridge(&self, bridge: &str) {
+        let mut state = self.external_state();
+        if state.since_ms.is_some() {
+            state.bridges.insert(bridge.to_string());
+        }
+    }
+
+    /// Forget a closing helper process and return how many leading helpers
+    /// remain. The caller releases the lead only when this returns zero.
+    pub fn forget_external_bridge(&self, bridge: &str) -> usize {
+        let mut state = self.external_state();
+        state.bridges.remove(bridge);
+        state.bridges.len()
+    }
+
     /// Hand the team back to the in-app lead and wake blocked waiters.
     /// Returns `true` when an external lead was attached.
     ///
@@ -1092,6 +2517,7 @@ impl TeamRuntime {
             let mut state = self.external_state();
             let was_attached = state.since_ms.take().is_some();
             state.idle_since_ms = None;
+            state.bridges.clear();
             // They are newer than anything already held back.
             let unread = std::mem::take(&mut state.queue);
             state.undelivered.extend(unread);
@@ -1437,7 +2863,8 @@ impl TeamRuntime {
             .parent()
             .map(Path::to_path_buf)
             .ok_or_else(|| "the team ledger has no parent directory".to_string())?;
-        let report = cleanup_workspace(&self.workspace_root, &state_dir).await?;
+        let report = cleanup_workspace(&self.workspace_root, &state_dir, &self.routing_log_path)
+            .await?;
         let restored = self.persistence.load()?.unwrap_or_default();
         *self.records.lock().await = restored.workers;
         Ok(report)
@@ -1520,22 +2947,43 @@ impl TeamRuntime {
         } else {
             self.current_models()
         };
+        let routing_mode = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .mode;
         let model_description = if guidance.is_some() {
             "A specific model from the tiers, only when the tier's first model does not fit; it overrides `tier`. Prefer `tier`; models outside the tiers are refused."
         } else {
             "The exact endpoint/model spec this worker runs on. Choose it per task: a strong reasoning model for design-heavy, cross-cutting, or debugging work; a fast, inexpensive model for mechanical edits, boilerplate, or test scaffolding. Omit to use the configured default."
         };
         let mut model = json!({"type": "string", "description": model_description});
-        let tier_description = match &guidance {
-            Some(text) => format!(
-                "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first model.\n{text}"
+        let tier_description = match (&guidance, routing_mode) {
+            (Some(text), RoutingMode::Off) => format!(
+                "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
-            None => "The model tier. No tiers are configured (Settings > Tiers), so omit it and the default model is used.".to_string(),
+            (Some(text), RoutingMode::Auto) => format!(
+                "Optional: choose the cheapest tier that fits the step, or auto to let Laya choose; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
+            ),
+            (Some(text), _) => format!(
+                "Required: choose the cheapest tier that fits the step, or auto where offered; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
+            ),
+            (None, _) => "The model tier. No tiers are configured (Settings > Tiers), so omit it and the default model is used.".to_string(),
         };
+        let ladder = self.tier_ladder();
+        let mut tier_names = tier_ids(&ladder);
+        if matches!(routing_mode, RoutingMode::Suggest | RoutingMode::Auto) {
+            tier_names.push("auto");
+        }
         let tier = json!({
             "type": "string",
-            "enum": TIER_PURPOSES.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            "enum": tier_names,
             "description": tier_description,
+        });
+        let audit_tier = json!({
+            "type": "string",
+            "enum": tier_ids(&self.tier_ladder()),
+            "description": "The audit's ladder tier; defaults to high. Empty tiers fold down. Audits are never routed by Laya or kNN; an unreported audit may be switched with team_resume, a reported audit is locked.",
         });
         let specs: Vec<&str> = lead_models
             .iter()
@@ -1561,21 +3009,21 @@ impl TeamRuntime {
             reasoning_effort["enum"] = json!(efforts);
         }
         let mut dispatch_required = vec!["worker_id", "plan_id", "step", "brief"];
-        if guidance.is_some() {
+        if guidance.is_some() && routing_mode != RoutingMode::Auto {
             dispatch_required.push("tier");
         }
         vec![
             HostToolSpec {
                 name: "team_dispatch".to_string(),
                 description: "Delegate one implementation task through TeamManager to a full executor worker, under a step of a plan on the plan board (plan first: plan_create, then dispatch with its plan_id and 1-based step). The worker receives the plan and its step automatically, so your brief is only the task-specific instructions. A step is checked off when one of its tasks merges and none is still open. Workers run in their own worktree and branch with file_edit, file_write, shell, git, and tests, and have no token or cost budget: give them whole, self-contained implementation tasks (code, tests, verification, commit), never read-only, content-only, or 'send me the file text' briefs. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. Mark shared contracts, persistence, concurrency, security, or large/cross-cutting work with review_risk='high'; high-risk dispatch requires that plan to declare observable acceptance scenarios (plan_create acceptance_scenarios or plan_update add_acceptance_scenarios). The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"review_risk":{"type":"string","enum":["standard","high"],"description":"Lead-assigned review risk; high risk requires observable acceptance scenarios on this plan and an independent audit before merge."}},"required":dispatch_required}),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"read_back":{"type":"boolean","description":"Optional. When true, the worker's first turn only reads its spec and the files it names, then messages the lead with numbered questions (ambiguities, contradictions with the code, open decisions) or exactly 'No questions.', and waits for the lead's reply before changing files. Use it for large or subtle specs."}},"required":dispatch_required}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
                 name: "team_audit_dispatch".to_string(),
                 description: "Dispatch a fresh read-only independent audit of one implementation worker's current branch/tip for a high-risk review. The reviewer_id is a stable unique 8-64 ASCII letters/digits ID of your choosing; retry a timed-out dispatch with that same identity for the same worker and tip, and choose a new reviewer_id after any fix commit moves the tip. The audit receives the worker's board plan, its intent brief, and the target diff — never the worker's own summary or findings — and cannot edit files, commit, merge, spawn, ask the user, or tick plan steps. When it completes, link it through team_review's evidence.independent_reviewer_id and write an audit_adjudication; never merge the audit worker itself.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"reviewer_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"model":{"type":"string"},"reasoning_effort":{"type":"string","enum":["max","high","medium","low","minimal","none"]},"brief":{"type":"string"}},"required":["worker_id","reviewer_id"]}),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"reviewer_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"tier":audit_tier,"model":{"type":"string"},"reasoning_effort":{"type":"string","enum":["max","high","medium","low","minimal","none"]},"brief":{"type":"string"}},"required":["worker_id","reviewer_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -1606,7 +3054,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_resume".to_string(),
-                description: "Resume a stopped, interrupted, or failed worker from its saved transcript through TeamManager. Returns the same worker ID with a new session generation. To move the worker to another model (it failed, or its model does not fit the work), pass `tier` or `model` (and optionally `reasoning_effort`): an idle worker is restarted on it with its transcript kept; a working one must be stopped first. The resumed worker is idle: send it a team_message to continue.".to_string(),
+                description: "Resume a stopped, interrupted, or failed worker (including an audit that has not reported) from its saved transcript through TeamManager. Returns the same worker ID with a new session generation. To move the worker to another model (it failed, or its model does not fit the work), pass `tier` or `model` (and optionally `reasoning_effort`): an idle worker is restarted on it with its transcript kept; a working one must be stopped first. The resumed worker is idle: send it a team_message to continue.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"tier":tier,"model":model,"reasoning_effort":reasoning_effort},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
@@ -1669,8 +3117,8 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_route_fix".to_string(),
-                description: "Route a larger finding back to its tracked worker for repair and delta review.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"finding_id":{"type":"string"}},"required":["worker_id","finding_id"]}),
+                description: "Route a larger finding back to its tracked worker for repair and delta review. Pass `tier` to run this fix round on a ladder tier, or `auto` to classify the finding; auto never steps down for high-severity findings or shared contracts. The prompt includes every open finding.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"finding_id":{"type":"string"},"tier":{"type":"string","enum":["auto","trivial","routine","medium","high","escalate"]}},"required":["worker_id","finding_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -1698,15 +3146,24 @@ impl TeamRuntime {
         ]
     }
 
-    /// The worker's host tool for reporting back to the lead.
+    /// The worker's host tools: report back to the lead, and re-read the plan.
     pub fn worker_host_tools(&self) -> Vec<HostToolSpec> {
-        vec![HostToolSpec {
-            name: "message_parent".to_string(),
-            description: "Send a short status or question to the lead.".to_string(),
-            parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
-            safety: SafetyLevel::AutoRun,
-            timeout_ms: Some(10_000),
-        }]
+        vec![
+            HostToolSpec {
+                name: "message_parent".to_string(),
+                description: "Send a short status or question to the lead.".to_string(),
+                parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "plan_read".to_string(),
+                description: "Re-read your plan as it stands now (decisions and interfaces the lead added after you started), or with capability, that capability's current OpenSpec spec.".to_string(),
+                parameters: json!({"type":"object","properties":{"capability":{"type":"string","description":"Optional kebab-case capability name, e.g. tier-ladder"}}}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+        ]
     }
 
     /// Execute a built-in lead host-tool call.
@@ -1731,7 +3188,7 @@ impl TeamRuntime {
                     "team_dispatch requires 'brief' and a caller-chosen stable 'worker_id'",
                 );
             };
-            let mut model = args
+            let model = args
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_string);
@@ -1739,15 +3196,11 @@ impl TeamRuntime {
                 .get("review_risk")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let read_back = args
+                .get("read_back")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
-            model = match self.lead_model_choice(tier.as_deref(), model) {
-                Ok(Some(model)) => Some(model),
-                Ok(None) => match self.tier_required() {
-                    Some(required) => return ToolResult::error(required),
-                    None => None,
-                },
-                Err(err) => return ToolResult::error(err),
-            };
             let reasoning_effort = args
                 .get("reasoning_effort")
                 .and_then(Value::as_str)
@@ -1755,32 +3208,49 @@ impl TeamRuntime {
             let plan_id = args
                 .get("plan_id")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .trim();
             let step = args
                 .get("step")
                 .and_then(Value::as_u64)
                 .and_then(|step| usize::try_from(step).ok())
                 .unwrap_or(0);
+            if plan_id.is_empty() || step < 1 {
+                return ToolResult::error(
+                    "team_dispatch requires 'plan_id' (a board plan id) and 'step' (a 1-based integer). Create the plan first with plan_create.",
+                );
+            }
+            let mode = self
+                .routing
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .mode;
+            let explicit_model = model.is_some();
+            let fold_request = if model.is_none() { tier.clone() } else { None };
             let result = self
-                .dispatch_on_plan(
-                    brief.to_string(),
+                .dispatch_request(DispatchRequest {
+                    brief: brief.to_string(),
+                    tier,
+                    dispatch_routing: true,
+                    source: DispatchSource::LeadTool,
                     model,
                     reasoning_effort,
-                    Some(worker_id.to_string()),
+                    worker_id: Some(worker_id.to_string()),
+                    plan: Some(PlanRef {
+                        plan_id: plan_id.to_string(),
+                        step: step - 1,
+                    }),
                     review_risk,
-                    plan_id,
-                    step,
-                )
+                    read_back,
+                })
                 .await;
-            let result = match (result, tier) {
-                (Ok((mut worker, reused)), Some(tier)) => {
-                    self.record_tier(worker_id, &tier).await;
-                    worker.tier = Some(tier);
-                    Ok((worker, reused))
-                }
-                (result, _) => result,
-            };
-            return dispatch_result(result, "team_dispatch");
+            return dispatch_result(
+                result,
+                "team_dispatch",
+                mode,
+                fold_request,
+                explicit_model,
+            );
         }
         if name == "team_audit_dispatch" {
             let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
@@ -1789,13 +3259,10 @@ impl TeamRuntime {
             let Some(reviewer_id) = args.get("reviewer_id").and_then(Value::as_str) else {
                 return ToolResult::error("team_audit_dispatch requires a 'reviewer_id' string");
             };
-            let model = match self.lead_model_choice(
-                None,
-                args.get("model").and_then(Value::as_str).map(str::to_string),
-            ) {
-                Ok(model) => model,
-                Err(err) => return ToolResult::error(err),
-            };
+            let requested_tier = args.get("tier").and_then(Value::as_str).unwrap_or("high");
+            let model = args.get("model").and_then(Value::as_str).map(str::to_string);
+            let explicit_model = model.is_some();
+            let fold_request = model.is_none().then(|| requested_tier.to_string());
             let reasoning_effort = args
                 .get("reasoning_effort")
                 .and_then(Value::as_str)
@@ -1805,15 +3272,22 @@ impl TeamRuntime {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let result = self
-                .audit_dispatch(
+                .audit_dispatch_with_tier(
                     worker_id,
                     reviewer_id,
+                    Some(requested_tier),
                     model,
                     reasoning_effort,
                     brief,
                 )
                 .await;
-            return dispatch_result(result, "team_audit_dispatch");
+            return dispatch_result(
+                result,
+                "team_audit_dispatch",
+                RoutingMode::Off,
+                fold_request,
+                explicit_model,
+            );
         }
         if name == "team_status" {
             let plan_id = args
@@ -1875,8 +3349,9 @@ impl TeamRuntime {
                                 Some(model) => Some(model),
                                 None => self.worker(worker_id).await.ok().and_then(|w| w.model),
                             };
-                            let changed =
-                                self.change_model(worker_id, model, reasoning_effort).await;
+                            let changed = self
+                                .change_model(worker_id, model, reasoning_effort, ChangeSource::Lead)
+                                .await;
                             match (changed, tier) {
                                 (Ok(_), Some(tier)) => {
                                     self.record_tier(worker_id, &tier).await;
@@ -1942,9 +3417,10 @@ impl TeamRuntime {
                 .await
             }
             "team_route_fix" => {
-                self.route_fix(
+                self.route_fix_with_tier(
                     worker_id,
                     args.get("finding_id").and_then(Value::as_str).unwrap_or(""),
+                    args.get("tier").and_then(Value::as_str),
                 )
                 .await
             }
@@ -1996,6 +3472,7 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         worker_id: Option<String>,
         review_risk: Option<String>,
+        read_back: bool,
         plan_id: &str,
         step: usize,
     ) -> Result<(WorkerRecord, bool), String> {
@@ -2010,14 +3487,18 @@ impl TeamRuntime {
             plan_id: plan_id.to_string(),
             step: step - 1,
         };
-        self.dispatch_request(
+        self.dispatch_request(DispatchRequest {
             brief,
+            tier: None,
+            dispatch_routing: true,
+            source: DispatchSource::Ipc,
             model,
             reasoning_effort,
             worker_id,
-            Some(plan),
+            plan: Some(plan),
             review_risk,
-        )
+            read_back,
+        })
         .await
     }
 
@@ -2039,14 +3520,18 @@ impl TeamRuntime {
         worker_id: Option<String>,
         review_risk: Option<String>,
     ) -> Result<WorkerRecord, String> {
-        self.dispatch_request(
+        self.dispatch_request(DispatchRequest {
             brief,
+            tier: None,
+            dispatch_routing: false,
+            source: DispatchSource::Ipc,
             model,
-            None,
+            reasoning_effort: None,
             worker_id,
-            None,
+            plan: None,
             review_risk,
-        )
+            read_back: false,
+        })
         .await
         .map(|(worker, _)| worker)
     }
@@ -2059,52 +3544,83 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         worker_id: Option<String>,
     ) -> Result<WorkerRecord, String> {
-        self.dispatch_request(
+        self.dispatch_request(DispatchRequest {
             brief,
+            tier: None,
+            dispatch_routing: false,
+            source: DispatchSource::Ipc,
             model,
             reasoning_effort,
             worker_id,
-            None,
-            None,
-        )
-            .await
-            .map(|(worker, _)| worker)
+            plan: None,
+            review_risk: None,
+            read_back: false,
+        })
+        .await
+        .map(|(worker, _)| worker)
     }
 
     async fn dispatch_request(
         &self,
-        brief: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        worker_id: Option<String>,
-        plan: Option<PlanRef>,
-        review_risk: Option<String>,
+        request: DispatchRequest,
     ) -> Result<(WorkerRecord, bool), String> {
-        let result = self
-            .dispatch_locked(
-                brief,
-                model,
-                reasoning_effort,
-                worker_id,
-                plan,
-                review_risk,
-            )
-            .await;
+        let routed = self.prepare_dispatch_routing(&request).await?;
+        let result = self.dispatch_locked(request, routed).await;
         if matches!(result, Ok((_, false))) {
             self.signal_board_changed();
         }
         result
     }
 
+    async fn prepare_dispatch_routing(
+        &self,
+        request: &DispatchRequest,
+    ) -> Result<Option<RoutedDispatch>, String> {
+        if !request.dispatch_routing {
+            return Ok(None);
+        }
+        if let Some(worker_id) = request.worker_id.as_deref() {
+            let records = self.records.lock().await;
+            if records.iter().any(|worker| worker.id == worker_id) {
+                return Ok(None);
+            }
+        }
+        let plan = request
+            .plan
+            .as_ref()
+            .ok_or_else(|| "dispatch routing requires a board plan step".to_string())?;
+        let board = self
+            .board()
+            .ok_or_else(|| "the plan board is not available".to_string())?;
+        let step_text = board
+            .get(&plan.plan_id)?
+            .steps
+            .get(plan.step)
+            .ok_or_else(|| format!("plan {} has no step {}", plan.plan_id, plan.step + 1))?
+            .text
+            .clone();
+        self.route_implementation_dispatch(request, &step_text, &request.brief)
+            .await
+            .map(Some)
+    }
+
     async fn dispatch_locked(
         &self,
-        brief: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        worker_id: Option<String>,
-        plan: Option<PlanRef>,
-        review_risk: Option<String>,
+        request: DispatchRequest,
+        routed: Option<RoutedDispatch>,
     ) -> Result<(WorkerRecord, bool), String> {
+        let DispatchRequest {
+            brief,
+            tier,
+            dispatch_routing,
+            source: _,
+            model,
+            reasoning_effort,
+            worker_id,
+            plan,
+            review_risk,
+            read_back,
+        } = request;
         let _guard = self.merge_lock.lock().await;
         if brief.trim().is_empty() {
             return Err("the worker brief is empty".to_string());
@@ -2135,16 +3651,33 @@ impl TeamRuntime {
                 records.iter().find(|worker| worker.id == id).cloned()
             };
             if let Some(existing) = existing {
+                let retry_model = if dispatch_routing {
+                    match tier.as_deref() {
+                        Some("auto") | None if model.is_none() => existing.model.clone(),
+                        _ => self.lead_model_choice(
+                            tier.as_deref().filter(|tier| *tier != "auto"),
+                            model.clone(),
+                        )?,
+                    }
+                } else {
+                    model.clone()
+                };
+                let retry_effort = if dispatch_routing && reasoning_effort.is_none() {
+                    existing.reasoning_effort.clone()
+                } else {
+                    reasoning_effort.clone()
+                };
                 if existing.brief != brief
-                    || existing.model != model
-                    || existing.reasoning_effort != reasoning_effort
+                    || existing.model != retry_model
+                    || existing.reasoning_effort != retry_effort
+                    || existing.read_back != read_back
                     || plan.as_ref().is_some_and(|plan| {
                         existing.plan_id.as_deref() != Some(plan.plan_id.as_str())
                             || existing.plan_step != Some(plan.step)
                     })
                 {
                     return Err(format!(
-                        "worker '{id}' already exists with a different brief, model, reasoning effort, or plan step; use team_status instead of guessing a new ID (to move it to another model, use team_resume with `tier` or `model`)"
+                        "worker '{id}' already exists with a different brief, model, reasoning effort, read_back, or plan step; use team_status instead of guessing a new ID (to move it to another model, use team_resume with `tier` or `model`)"
                     ));
                 }
                 if existing.branch != agent_branch(id) {
@@ -2182,10 +3715,39 @@ impl TeamRuntime {
                 // parallel work, which needs contracts for shared files.
                 let in_flight = self.in_flight_steps(&plan.plan_id, plan.step).await;
                 board.contract_gate(&plan.plan_id, plan.step, &in_flight)?;
+                let blockers = board.dispatch_blockers(&plan.plan_id)?;
+                if !blockers.is_empty() {
+                    return Err(format!(
+                        "plan {} cannot be dispatched until its OpenSpec artifacts are complete:\n\n{}",
+                        plan.plan_id,
+                        blockers.join("\n\n")
+                    ));
+                }
                 Some(format!("{}\n---\n\n{brief}", header.trim_end()))
             }
             None => None,
         };
+        let (model, reasoning_effort, tier, routing, routing_rows, routing_error) =
+            if dispatch_routing {
+                let routed = routed
+                    .ok_or_else(|| "dispatch routing was not prepared".to_string())?;
+                (
+                    routed.model,
+                    routed.reasoning_effort,
+                    routed.tier,
+                    routed.routing,
+                    routed.rows,
+                    routed.error,
+                )
+            } else {
+                (model, reasoning_effort, tier, None, Vec::new(), None)
+            };
+        if let Some(error) = routing_error {
+            for row in &routing_rows {
+                self.append_dispatch_routing_row(row);
+            }
+            return Err(error);
+        }
         self.validate_model(&model, &reasoning_effort)?;
         if let Some(id) = worker_id.as_deref() {
             let branch = agent_branch(id);
@@ -2207,7 +3769,7 @@ impl TeamRuntime {
             return Err(format!("all {slots} worker slots are busy"));
         }
         let placed = plan.as_ref().map(|plan| (plan.plan_id.clone(), plan.step));
-        let result = self
+        let provisioned = self
             .provision_worker(
                 brief,
                 opening,
@@ -2215,9 +3777,34 @@ impl TeamRuntime {
                 reasoning_effort,
                 worker_id,
                 review_risk,
+                tier,
                 plan,
             )
             .await;
+        // Provisioning leaves the worker stopped; the read-back flag lands on
+        // the stored record before its session starts, so the opening kickoff
+        // matches the record the session was started from.
+        let result = match provisioned {
+            Ok(record) => {
+                for mut row in routing_rows {
+                    row.with_worker_id(&record.id);
+                    self.append_dispatch_routing_row(&row);
+                }
+                let routing_for_record = routing.clone();
+                self.update_worker(&record.id, |worker| {
+                    worker.read_back = read_back;
+                    worker.routing = routing_for_record;
+                })
+                .await;
+                self.start_worker(WorkerRecord {
+                    read_back,
+                    routing,
+                    ..record
+                })
+                .await
+            }
+            Err(err) => Err(err),
+        };
         if result.is_ok() {
             if let Some((plan_id, step)) = &placed {
                 // Parallel work: the seams between the steps need a final
@@ -2237,7 +3824,6 @@ impl TeamRuntime {
         }
         result.map(|worker| (worker, false))
     }
-
 
     /// Dispatch one fresh read-only independent audit of an implementation
     /// worker's current branch/tip.
@@ -2259,6 +3845,28 @@ impl TeamRuntime {
         &self,
         worker_id: &str,
         reviewer_id: &str,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        brief: Option<String>,
+    ) -> Result<(WorkerRecord, bool), String> {
+        self.audit_dispatch_with_tier(
+            worker_id,
+            reviewer_id,
+            None,
+            model,
+            reasoning_effort,
+            brief,
+        )
+        .await
+    }
+
+    /// Dispatch an audit on an optional ladder tier (default `high`). The
+    /// resolved model and tier are stored before the worker starts.
+    pub async fn audit_dispatch_with_tier(
+        &self,
+        worker_id: &str,
+        reviewer_id: &str,
+        tier: Option<&str>,
         model: Option<String>,
         reasoning_effort: Option<String>,
         brief: Option<String>,
@@ -2333,6 +3941,29 @@ impl TeamRuntime {
                 return Ok((existing, true));
             }
         }
+        let requested_tier = tier.unwrap_or("high");
+        if self.tier_ladder().get(requested_tier).is_none() {
+            return Err(format!(
+                "unknown tier '{requested_tier}'; expected one of: {}",
+                tier_ids(&self.tier_ladder()).join(", ")
+            ));
+        }
+        let (model, resolved_tier) = if model.is_none() && self.tiered_models().is_empty() {
+            (
+                self.lead_model_choice(None, None)?,
+                Some(requested_tier.to_string()),
+            )
+        } else {
+            self.lead_choice_with_tier(Some(requested_tier), model)?
+        };
+        let resolved_tier = resolved_tier.or_else(|| Some(requested_tier.to_string()));
+        let reasoning_effort = reasoning_effort.or_else(|| {
+            resolved_tier.as_deref().and_then(|tier| {
+                self.tier_ladder()
+                    .get(tier)
+                    .and_then(|rung| rung.effort.clone())
+            })
+        });
         // Without a named model an effort cannot be applied to a session; it
         // stays in the audit brief as the depth the lead asked for.
         let depth_hint = reasoning_effort.clone();
@@ -2396,6 +4027,7 @@ impl TeamRuntime {
             used_tokens: 0,
             max_tokens: 0,
             brief_sent: false,
+            read_back: false,
             compacting: false,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -2412,7 +4044,12 @@ impl TeamRuntime {
             kind: "audit".to_string(),
             audit_target: Some(worker_id.to_string()),
             audit_tip: Some(tip),
+            report_delivered: false,
             reasoning_effort,
+            review_rounds: 0,
+            fix_rounds: 0,
+            audits: 0,
+            models_used: Vec::new(),
             findings: Vec::new(),
             review: None,
             fixer_finding_id: None,
@@ -2421,11 +4058,17 @@ impl TeamRuntime {
             opening_prompt: None,
             plan_id: None,
             plan_step: None,
-            tier: None,
+            tier: resolved_tier,
+            routing: None,
+            reroutes: Vec::new(),
         };
-        self.start_audit_worker(record, base_tip)
-            .await
-            .map(|worker| (worker, false))
+        let audit = self.start_audit_worker(record, base_tip).await?;
+        // One audit per audit worker: retrying the same reviewer at the same
+        // tip reuses its record, so it is not a new round.
+        self.update_worker(worker_id, |worker| worker.audits += 1)
+            .await;
+        self.persist().await?;
+        Ok((audit, false))
     }
 
     /// Provision and start one audit worker record (the audit counterpart of
@@ -2479,13 +4122,17 @@ impl TeamRuntime {
         steps
     }
 
-    /// Stamp the tier the lead dispatched by onto the worker's record.
+    /// Stamp the resolved tier for a lead's explicit tier choice. An empty
+    /// requested tier folds down exactly as it did for model selection.
     async fn record_tier(&self, worker_id: &str, tier: &str) {
+        let Ok((resolved, _)) = self.resolve_tier_choice(tier) else {
+            return;
+        };
         {
             let mut records = self.records.lock().await;
             match records.iter_mut().find(|w| w.id == worker_id) {
-                Some(worker) if worker.tier.as_deref() != Some(tier) => {
-                    worker.tier = Some(tier.to_string());
+                Some(worker) if worker.tier.as_deref() != Some(resolved.as_str()) => {
+                    worker.tier = Some(resolved);
                 }
                 _ => return,
             }
@@ -2548,6 +4195,7 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         worker_id: Option<String>,
         review_risk: String,
+        tier: Option<String>,
         plan: Option<PlanRef>,
     ) -> Result<WorkerRecord, String> {
         let base_ref = current_branch(&self.workspace_root).map_err(|err| {
@@ -2589,6 +4237,7 @@ impl TeamRuntime {
             used_tokens: 0,
             max_tokens: 0,
             brief_sent: false,
+            read_back: false,
             compacting: false,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -2603,10 +4252,15 @@ impl TeamRuntime {
             checks: Vec::new(),
             review_risk,
             review: None,
+            review_rounds: 0,
+            fix_rounds: 0,
+            audits: 0,
+            models_used: Vec::new(),
 
             kind: "implementation".to_string(),
             audit_target: None,
             audit_tip: None,
+            report_delivered: false,
             findings: Vec::new(),
 
             fixer_finding_id: None,
@@ -2614,7 +4268,9 @@ impl TeamRuntime {
             error: None,
             plan_id: plan.as_ref().map(|plan| plan.plan_id.clone()),
             plan_step: plan.map(|plan| plan.step),
-            tier: None,
+            tier,
+            routing: None,
+            reroutes: Vec::new(),
         };
         self.records.lock().await.push(record.clone());
         if let Err(err) = self.persist().await {
@@ -2641,7 +4297,7 @@ impl TeamRuntime {
                 }
             });
         }
-        self.start_worker(record).await
+        Ok(record)
     }
 
     async fn start_worker(&self, record: WorkerRecord) -> Result<WorkerRecord, String> {
@@ -2658,18 +4314,26 @@ impl TeamRuntime {
             worker.pending = None;
             worker.error = None;
             worker.compacting = false;
+            let model = session_model_spec(worker).to_string();
+            note_model(worker, &model);
         })
         .await;
         self.persist().await?;
         let session = match self
-            .spawn_worker_session(
-                record.name.clone(),
-                record.model.clone(),
-                record.reasoning_effort.clone(),
-                record.worktree.clone(),
-                Some(record.transcript.clone()),
-                record.kind.as_str(),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: record.model.clone(),
+                reasoning_effort: record.reasoning_effort.clone(),
+                worktree: record.worktree.clone(),
+                resume: Some(record.transcript.clone()),
+                kind: record.kind.clone(),
+                trace_identity: Self::worker_trace_identity(&record),
+                pinned_task: Some(
+                    record
+                        .opening_prompt
+                        .clone()
+                        .unwrap_or_else(|| record.brief.clone()),
+                ),
+            })
             .await
         {
             Ok(session) => session,
@@ -2684,6 +4348,7 @@ impl TeamRuntime {
         let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(true));
         let receiver = session.events();
+        let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
         let pump = tokio::spawn(pump_worker(
             id.clone(),
             generation,
@@ -2698,10 +4363,19 @@ impl TeamRuntime {
             self.save_lock.clone(),
             self.pricing.clone(),
             self.persistence.clone(),
+            self.routing_log_path.clone(),
+            self.routing.clone(),
+            self.signals.clone(),
+            strikes.clone(),
+            self.models.clone(),
+            self.tiers.clone(),
+            self.live.clone(),
+            self.fail_next_close.clone(),
+            self.board(),
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {
-                text: record.first_message().to_string(),
+                text: kickoff_message(&record).to_string(),
                 images: Vec::new(),
             })
             .await
@@ -2709,7 +4383,7 @@ impl TeamRuntime {
             pump.abort();
             let _ = session.close().await;
             let error = format!(
-                "could not send the brief to worker '{id}': {err}; retry with the same worker ID"
+                "could not send the opening prompt to worker '{id}': {err}; retry with the same worker ID"
             );
             self.fail_worker(&id, error.clone()).await;
             return Err(error);
@@ -2721,6 +4395,7 @@ impl TeamRuntime {
                 busy,
                 pump,
                 cleanup_retry_only: false,
+                strikes,
             },
         );
         self.update_worker(&id, |worker| {
@@ -2739,15 +4414,43 @@ impl TeamRuntime {
         self.worker(&id).await
     }
 
+    /// The trace identity for one worker (plan c3ba2b58 step B): built from
+    /// its record at spawn, so every model call the worker makes is
+    /// attributed to this worker, its plan, and its step. The agent and
+    /// session ids are filled in by the spawn path; the plan step converts
+    /// from the record's 0-based step to the plan's 1-based numbering.
+    fn worker_trace_identity(record: &WorkerRecord) -> TraceIdentity {
+        TraceIdentity {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: String::new(),
+            session_id: String::new(),
+            agent_name: record.name.clone(),
+            worker_id: Some(record.id.clone()),
+            plan_id: record.plan_id.clone(),
+            plan_step: record.plan_step.map(|step| step as u32 + 1),
+        }
+    }
+
+    /// Open one live worker session on this team's engine (the brief's
+    /// spawn path): the guardrails match the worker `kind`, the worktree is
+    /// bound to the session, and the trace identity attributes every model
+    /// call to this worker (plan c3ba2b58 step B). The session's display
+    /// name is the trace identity's `agent_name` — both are the worker
+    /// record's name at every call site.
     pub(crate) async fn spawn_worker_session(
         &self,
-        name: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        worktree: PathBuf,
-        resume: Option<Transcript>,
-        kind: &str,
+        spec: WorkerSessionSpec,
     ) -> Result<AgentSession, String> {
+        let WorkerSessionSpec {
+            model,
+            reasoning_effort,
+            worktree,
+            resume,
+            kind,
+            trace_identity,
+            pinned_task,
+        } = spec;
+        let name = trace_identity.agent_name.clone();
         self.engine
             .spawn(SpawnOptions {
                 name: Some(name),
@@ -2760,12 +4463,28 @@ impl TeamRuntime {
                 limits: None,
                 host_tools: self.worker_host_tools(),
                 external_policy: None,
-                guardrails: Some(guardrails_for(kind)),
+                guardrails: Some(guardrails_for(&kind)),
+                // Plan c3ba2b58 step B: the worker's trace identity, built
+                // from its record — every model call the worker makes is
+                // attributed to this worker, its plan, and its step.
+                trace_identity: Some(trace_identity),
+                // Plan 40eef714 step 2: the worker's whole task — the plan,
+                // its step spec, and the lead's brief — pinned into the
+                // system head so compaction and model switches never
+                // summarize it away.
+                pinned_task,
+                // Plan 2ba2168a step 1: the worker's turns are never
+                // classified by the per-prompt gate — Mnemo2 routes at
+                // dispatch instead.
+                skip_turn_routing: true,
             })
             .await
             .map_err(|err| format!("could not spawn the worker session: {err}"))
     }
 
+    /// Mark a worker failed after its session could not spawn or resume.
+    /// Failed-and-stopped is a terminal status (design §4.7): the worker's
+    /// `outcome` row is appended once the record persists.
     async fn fail_worker(&self, worker_id: &str, error: String) {
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Failed;
@@ -2773,6 +4492,16 @@ impl TeamRuntime {
         })
         .await;
         let _ = self.persist().await;
+        if let Ok(record) = self.worker(worker_id).await {
+            // A failure is not terminal — the worker can still be resumed
+            // on a stronger tier and take its nudge — so only the outcome
+            // row, never nudge_ignored.
+            if logs_label(&record, self.routing_mode()) {
+                if let Some(row) = outcome_row(&record, "failed") {
+                    self.append_dispatch_routing_row(&row);
+                }
+            }
+        }
     }
 
     /// Send a message to a worker with its sender attached. A busy worker gets
@@ -2812,6 +4541,9 @@ impl TeamRuntime {
             return Err(
                 "a cleaned worker cannot accept new work; review its retained branch".to_string(),
             );
+        }
+        if audit_finished(&record) {
+            return Err(audit_finished_error(worker_id));
         }
         if record.compacting {
             return Err(
@@ -2890,7 +4622,103 @@ impl TeamRuntime {
         })
         .await;
         self.persist().await?;
+        self.spawn_drift_check(worker_id, &text).await;
         self.worker(worker_id).await
+    }
+
+    /// The drift nudge (design §4.6): a delivered lead message that Laya
+    /// reads a tier above the worker's own nudges the lead — in the
+    /// background, so it never blocks or fails the message. Off in routing
+    /// mode `off` (no classifier calls) and when nudges are disabled.
+    async fn spawn_drift_check(&self, worker_id: &str, text: &str) {
+        let settings = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if settings.mode == RoutingMode::Off || !settings.nudges {
+            return;
+        }
+        if text.split_whitespace().count() < settings.min_words {
+            return;
+        }
+        let Some(classifier) = self
+            .classifier
+            .as_ref()
+            .and_then(|slot| slot.read().unwrap_or_else(|e| e.into_inner()).clone())
+        else {
+            return;
+        };
+        let enabled = self.direct_nudge_tiers();
+        // The pre-checks run without detaching: a worker without a routing
+        // record, already nudged, or on the top enabled tier never spends
+        // a classifier call on drift.
+        let worth_asking = {
+            let records = self.records.lock().await;
+            let Some(worker) = records.iter().find(|worker| worker.id == worker_id) else {
+                return;
+            };
+            let Some(routing) = worker.routing.as_ref() else {
+                return;
+            };
+            routing.nudged.is_none()
+                && next_tier_above(enabled, &final_tier(worker)).is_some()
+        };
+        if !worth_asking {
+            return;
+        }
+        let records = self.records.clone();
+        let signals = self.signals.clone();
+        let routing_log_path = self.routing_log_path.clone();
+        let permit = self.routing_permit.clone();
+        let route_knn = self.route_knn.clone();
+        let worker_id = worker_id.to_string();
+        let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
+        let mode = settings.mode;
+        tokio::spawn(async move {
+            // The same 3 s timeout and one-at-a-time permit as dispatch,
+            // without holding the merge lock: a message never waits on
+            // Laya.
+            let classified = async {
+                let _permit = permit.acquire().await;
+                classify_dispatch(
+                    classifier.as_ref(),
+                    route_knn.as_deref(),
+                    &text,
+                    enabled,
+                    &settings,
+                )
+                .await
+            };
+            let decision =
+                match tokio::time::timeout(std::time::Duration::from_secs(3), classified).await {
+                    Ok(Some(decision)) => decision,
+                    _ => return,
+                };
+            if !decision.cleared {
+                return;
+            }
+            let Some(to_tier) = decision.tier else {
+                return;
+            };
+            let Some(claim) =
+                claim_nudge(&records, &worker_id, enabled, mode, Some(to_tier)).await
+            else {
+                return;
+            };
+            let detail = format!(
+                "this got harder (Laya reads the message as {}, {:.2})",
+                decision.label, decision.confidence
+            );
+            deliver_nudge(
+                &signals,
+                &routing_log_path,
+                &worker_id,
+                &claim,
+                "drift",
+                &detail,
+            );
+        });
     }
 
 
@@ -2940,10 +4768,29 @@ impl TeamRuntime {
     }
 
     /// Stop and detach a worker. The worktree and `wt/agent-*` branch stay for
-    /// audit; `resume` can reattach the saved transcript later.
+    /// audit; `resume` can reattach the saved transcript later. A worker that
+    /// was not already stopped has reached a terminal status, so its `outcome`
+    /// row (design §4.7) is appended beside the record.
     pub async fn stop(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
-        self.stop_inner(worker_id).await
+        let before = self.worker(worker_id).await?;
+        let record = self.stop_inner(worker_id).await?;
+        if !matches!(before.status, WorkerStatus::Stopped) {
+            // A hand reroute is a learning in every mode, so a rerouted
+            // worker's outcome row is written even off; the nudge row is
+            // Laya-derived and keeps the `logs_routing` gate.
+            if logs_label(&record, self.routing_mode()) {
+                if let Some(row) = outcome_row(&record, "stopped") {
+                    self.append_dispatch_routing_row(&row);
+                }
+            }
+            if logs_routing(&record, self.routing_mode()) {
+                if let Some(row) = nudge_ignored_row(&record) {
+                    self.append_dispatch_routing_row(&row);
+                }
+            }
+        }
+        Ok(record)
     }
 
     async fn stop_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
@@ -2954,10 +4801,24 @@ impl TeamRuntime {
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be stopped".to_string());
         }
+        let preserve_downshift_finding = record.reroutes.last().is_some_and(|row| {
+            matches!(
+                row,
+                DispatchRoutingRow::LeadReroute {
+                    from_tier,
+                    to_tier,
+                    nudged: true,
+                    ..
+                } if NUDGE_LADDER.iter().position(|tier| tier == from_tier)
+                    > NUDGE_LADDER.iter().position(|tier| tier == to_tier)
+            )
+        });
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Stopped;
             worker.pending = None;
-            worker.fixer_finding_id = None;
+            if !preserve_downshift_finding {
+                worker.fixer_finding_id = None;
+            }
             worker.compacting = false;
         })
         .await;
@@ -2977,7 +4838,7 @@ impl TeamRuntime {
                     } else if worker.transcript.messages.is_empty() && worker.brief_sent {
                         worker.transcript = Transcript {
                             messages: vec![mnemo::provider::Message::user_text(
-                                worker.first_message().to_string(),
+                                kickoff_message(worker).to_string(),
                             )],
                         };
                     }
@@ -3028,6 +4889,9 @@ impl TeamRuntime {
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be resumed".to_string());
         }
+        if audit_finished(&record) {
+            return Err(audit_finished_error(worker_id));
+        }
         if !record.worktree.is_dir() {
             return Err(format!(
                 "the worker's worktree is missing: {}",
@@ -3036,18 +4900,25 @@ impl TeamRuntime {
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session = self
-            .spawn_worker_session(
-                record.name.clone(),
-                record.model.clone(),
-                record.reasoning_effort.clone(),
-                record.worktree.clone(),
-                Some(record.transcript.clone()),
-                record.kind.as_str(),
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: record.model.clone(),
+                reasoning_effort: record.reasoning_effort.clone(),
+                worktree: record.worktree.clone(),
+                resume: Some(record.transcript.clone()),
+                kind: record.kind.clone(),
+                trace_identity: Self::worker_trace_identity(&record),
+                pinned_task: Some(
+                    record
+                        .opening_prompt
+                        .clone()
+                        .unwrap_or_else(|| record.brief.clone()),
+                ),
+            })
             .await?;
         let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(false));
         let receiver = session.events();
+        let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
         let pump = tokio::spawn(pump_worker(
             worker_id.to_string(),
             generation,
@@ -3062,6 +4933,15 @@ impl TeamRuntime {
             self.save_lock.clone(),
             self.pricing.clone(),
             self.persistence.clone(),
+            self.routing_log_path.clone(),
+            self.routing.clone(),
+            self.signals.clone(),
+            strikes.clone(),
+            self.models.clone(),
+            self.tiers.clone(),
+            self.live.clone(),
+            self.fail_next_close.clone(),
+            self.board(),
         ));
         self.live.lock().await.insert(
             worker_id.to_string(),
@@ -3070,6 +4950,7 @@ impl TeamRuntime {
                 busy,
                 pump,
                 cleanup_retry_only: false,
+                strikes,
             },
         );
         self.update_worker(worker_id, |worker| {
@@ -3078,24 +4959,120 @@ impl TeamRuntime {
             worker.pending = None;
             worker.error = None;
             worker.compacting = false;
+            let model = session_model_spec(worker).to_string();
+            note_model(worker, &model);
         })
         .await;
         self.persist().await?;
         self.worker(worker_id).await
     }
 
+    /// The reroute row for a model switch (design §4.7): the worker's route
+    /// before and after, the status it was in, the nudge it carried, and who
+    /// moved it. `None` when the switch does not move the model (an
+    /// effort-only change): nothing was rerouted, nothing is logged.
+    fn reroute_row(
+        &self,
+        record: &WorkerRecord,
+        from_spec: &str,
+        to_model: Option<&str>,
+        source: ChangeSource,
+        nudged: Option<&str>,
+    ) -> Option<DispatchRoutingRow> {
+        let to_spec = to_model.unwrap_or("default");
+        if to_spec == from_spec {
+            return None;
+        }
+        let ts = unix_ms();
+        let worker_id = record.id.clone();
+        let plan_id = record.plan_id.clone().unwrap_or_default();
+        let step = record.plan_step.map_or(0, |step| step + 1);
+        let from_tier = self
+            .tier_of(from_spec)
+            .or_else(|| record.tier.clone())
+            .unwrap_or_else(|| "custom".to_string());
+        let to_tier = self
+            .tier_of(to_spec)
+            .unwrap_or_else(|| "custom".to_string());
+        let from_model = record.model.clone().filter(|spec| !spec.trim().is_empty());
+        let to_model = to_model.map(str::to_string);
+        let status = status_name(record.status);
+        let review_rounds = record.review_rounds;
+        let fix_rounds = record.fix_rounds;
+        // A downshift stays marked until its delta review records the outcome;
+        // this is the durable pending marker in team.json.
+        let nudged = nudged.is_some() || source == ChangeSource::FixDownshift;
+        Some(match source {
+            ChangeSource::Lead
+            | ChangeSource::Escalation
+            | ChangeSource::FixDownshift
+            | ChangeSource::FixDownshiftRestore => DispatchRoutingRow::LeadReroute {
+                ts,
+                worker_id,
+                plan_id,
+                step,
+                from_tier,
+                to_tier,
+                from_model,
+                to_model,
+                status,
+                review_rounds,
+                fix_rounds,
+                nudged,
+            },
+            ChangeSource::User => DispatchRoutingRow::UserReroute {
+                ts,
+                worker_id,
+                plan_id,
+                step,
+                from_tier,
+                to_tier,
+                from_model,
+                to_model,
+                status,
+                review_rounds,
+                fix_rounds,
+                nudged,
+            },
+        })
+    }
+
     /// Move a worker to another model (and reasoning effort), keeping its
-    /// transcript, branch, and worktree. An idle live session is restarted
-    /// on the new model; a stopped, interrupted, or failed one is resumed on
-    /// it; a worker whose brief never reached a session is started with it.
-    /// A working worker is refused: stop or pause it first.
+    /// transcript, branch, and worktree. A WORKING worker switches live at
+    /// its next request: the call in flight finishes on the old model, the
+    /// next one serves on the new one — no stop, no restart. An audit
+    /// worker's model is never switchable. An idle live session is
+    /// restarted on the new model; a stopped, interrupted, or failed one
+    /// is resumed on it; a worker whose brief never reached a session is
+    /// started with it.
+    ///
+    /// A switch that moves the model appends a `lead_reroute` or
+    /// `user_reroute` row (design §4.7) — by [`source`] — carrying the
+    /// route before and after, in every routing mode: a hand-moved model is
+    /// always a learning (decided 2026-11-04). It repoints the record's
+    /// tier at the destination tier (`None` for a custom model) and clears
+    /// a pending nudge (the nudge was answered by a hand, not by Laya). A
+    /// same-tier switch logs with `from_tier == to_tier` and never counts
+    /// as an override; an effort-only change logs nothing.
     pub async fn change_model(
         &self,
         worker_id: &str,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        source: ChangeSource,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.change_model_locked(worker_id, model, reasoning_effort, source)
+            .await
+    }
+
+    async fn change_model_locked(
+        &self,
+        worker_id: &str,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        source: ChangeSource,
+    ) -> Result<WorkerRecord, String> {
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Cancelled {
             return Err("a cleaned worker cannot change its model".to_string());
@@ -3103,23 +5080,117 @@ impl TeamRuntime {
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot change its model".to_string());
         }
+        if audit_finished(&record) {
+            return Err(audit_finished_error(worker_id));
+        }
         self.validate_model(&model, &reasoning_effort)?;
+        let from_spec = session_model_spec(&record).to_string();
+        let nudged = record
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.nudged.clone());
+        // The record keeps its reroute either way (team.json bookkeeping),
+        // and the calibration log gets it too: a hand-moved model is a
+        // learning in every routing mode (decided 2026-11-04).
+        let requested = model.as_deref().filter(|spec| !spec.trim().is_empty());
         if self.worker_is_busy(worker_id).await {
-            return Err(format!(
-                "worker '{worker_id}' is working; pause or stop it before changing its model"
-            ));
+            // Live switch — no stop, no restart: the provider request in
+            // flight finishes on the old model; the worker's next request
+            // serves on the new one. The kernel emits its model_changed
+            // agent event once the new model serves, and the pump re-points
+            // `model_id` from it. Moving a working worker to routing
+            // (model: None) needs the restart path below — refuse it.
+            let Some(spec) = model.clone() else {
+                return Err(format!(
+                    "worker '{worker_id}' is working; a live model switch needs a model; stop the worker to move it to routing"
+                ));
+            };
+            let reroute =
+                self.reroute_row(&record, &from_spec, requested, source, nudged.as_deref());
+            let switched = {
+                let live = self.live.lock().await;
+                let live = live
+                    .get(worker_id)
+                    .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+                live.admit_session_command(worker_id)?;
+                live.session
+                    .set_model(&spec, reasoning_effort.clone())
+                    .await
+            };
+            let new_model_id = match switched {
+                Ok(ModelSwitch::NextRequest { model: served })
+                | Ok(ModelSwitch::CompactsFirst { model: served }) => served,
+                Err(error) => {
+                    return Err(format!(
+                        "could not switch worker '{worker_id}' to '{spec}': {error}"
+                    ));
+                }
+            };
+            self.update_worker(worker_id, |worker| {
+                worker.model = model.clone();
+                // Never erase an already-observed id that already matches
+                // the new model: the new model's events may have been
+                // pumped before this update (the pin landed mid-turn, or
+                // the target was already serving) — an unconditional clear
+                // could leave the record without its correct id, with no
+                // later event left to repair it.
+                if worker.model_id.as_deref() != Some(new_model_id.as_str()) {
+                    worker.model_id = None;
+                }
+                worker.reasoning_effort = reasoning_effort.clone();
+                if let Some(row) = &reroute {
+                    worker.tier = reroute_destination(row);
+                    worker.reroutes.push(row.clone());
+                    if let Some(routing) = worker.routing.as_mut() {
+                        routing.nudged = None;
+                    }
+                }
+                let model = session_model_spec(worker).to_string();
+                note_model(worker, &model);
+            })
+            .await;
+            self.persist().await?;
+            if reroute.is_some() {
+                // A reroute resets the nudge budget (design §4.6): the
+                // strike counter starts over on the new tier. The stopped
+                // path below drops the live worker; its replacement on
+                // resume builds a fresh counter.
+                if let Some(live) = self.live.lock().await.get(worker_id) {
+                    live.strikes.lock().await.reset();
+                }
+            }
+            if record.kind != "audit" && source != ChangeSource::FixDownshift {
+                if let Some(row) = reroute.as_ref() {
+                    self.append_reroute_row(row, source, None);
+                }
+            }
+            return self.worker(worker_id).await;
         }
         if self.live.lock().await.contains_key(worker_id) {
             self.stop_inner(worker_id).await?;
         }
+        let reroute = self.reroute_row(&record, &from_spec, requested, source, nudged.as_deref());
         self.update_worker(worker_id, |worker| {
             worker.model = model.clone();
             worker.model_id = None;
             worker.reasoning_effort = reasoning_effort.clone();
-            worker.tier = None;
+            if let Some(row) = &reroute {
+                worker.tier = reroute_destination(row);
+                worker.reroutes.push(row.clone());
+                if let Some(routing) = worker.routing.as_mut() {
+                    routing.nudged = None;
+                }
+            }
+            let model = session_model_spec(worker).to_string();
+            note_model(worker, &model);
         })
         .await;
         self.persist().await?;
+        if record.kind != "audit" && source != ChangeSource::FixDownshift {
+            if let Some(row) = reroute.as_ref() {
+                self.append_reroute_row(row, source, None);
+            }
+        }
         let record = self.worker(worker_id).await?;
         if !record.brief_sent {
             if !record.worktree.is_dir() {
@@ -3136,6 +5207,9 @@ impl TeamRuntime {
         let mut record = self.worker(worker_id).await?;
         if record.compacting {
             return Err(format!("worker '{worker_id}' is already compacting"));
+        }
+        if audit_finished(&record) {
+            return Err(audit_finished_error(worker_id));
         }
         if record.status == WorkerStatus::NeedsYou && self.live.lock().await.contains_key(worker_id)
         {
@@ -3273,6 +5347,41 @@ impl TeamRuntime {
         let records = self.records.lock().await.clone();
         validate_audit_linkage(&records, &evidence, worker_id, &tip)?;
         let was_cancelled = worker.status == WorkerStatus::Cancelled;
+        // Capture every escalation trigger before this review replaces the
+        // previous finding set and clears the routed-finding marker.
+        let rounds = worker.review_rounds.saturating_add(1);
+        let repeated = (rounds >= 2)
+            .then(|| {
+                findings.iter().find(|finding| {
+                    finding.status == "open"
+                        && worker.findings.iter().any(|old| {
+                            old.id == finding.id && old.status == "open"
+                        })
+                })
+            })
+            .flatten()
+            .cloned();
+        let routed = worker.fixer_finding_id.as_deref().and_then(|id| {
+            findings
+                .iter()
+                .find(|finding| finding.id == id && finding.status == "open")
+                .cloned()
+        });
+        let audited = (worker.fix_rounds > 0 && evidence.independent_reviewer_id.is_some())
+            .then(|| {
+                findings
+                    .iter()
+                    .find(|finding| finding.status == "open" && finding.severity == "high")
+                    .cloned()
+            })
+            .flatten();
+        let (escalation_finding, escalation_trigger) = match (routed, repeated, audited) {
+            (Some(finding), _, _) => (Some(finding), "route_fix"),
+            (None, Some(finding), _) => (Some(finding), "review"),
+            (None, None, Some(finding)) => (Some(finding), "audit"),
+            (None, None, None) => (None, "review"),
+        };
+        let downshift = pending_fix_downshift(&worker, &findings);
         self.update_worker(worker_id, |worker| {
             worker.status = if was_cancelled {
                 WorkerStatus::Cancelled
@@ -3286,12 +5395,65 @@ impl TeamRuntime {
                 evidence: Some(evidence),
             });
             worker.findings = findings;
+            worker.review_rounds += 1;
             worker.fixer_finding_id = None;
             worker.error = None;
         })
         .await;
         self.persist().await?;
-        self.worker(worker_id).await
+        let updated = self.worker(worker_id).await?;
+        let updated = match downshift {
+            Some((row, closed)) => self.settle_fix_downshift(worker_id, row, closed).await?,
+            None => updated,
+        };
+        // Off/shadow/suggest leave a lead notice. Auto additionally switches
+        // an idle worker, preserving the live session and transcript.
+        let settings = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if settings.mode != RoutingMode::Off && settings.nudges {
+            if let Some(finding) = escalation_finding {
+                let enabled = self.direct_nudge_tiers();
+                if let Some(claim) =
+                    claim_nudge(&self.records, worker_id, enabled, settings.mode, None).await
+                {
+                    let detail = if escalation_trigger == "audit" {
+                        format!(
+                            "high-severity audit finding {} remains after a fix round",
+                            finding.id
+                        )
+                    } else if finding.severity == "high" && updated.review_rounds >= 2 {
+                        format!(
+                            "keeps a high finding after {} review rounds",
+                            updated.review_rounds
+                        )
+                    } else if escalation_trigger == "route_fix" {
+                        format!("route-fix finding {} is still open", finding.id)
+                    } else {
+                        format!(
+                            "review finding {} stayed open after {} review rounds",
+                            finding.id, updated.review_rounds
+                        )
+                    };
+                    deliver_nudge(
+                        &self.signals,
+                        &self.routing_log_path,
+                        worker_id,
+                        &claim,
+                        "review",
+                        &detail,
+                    );
+                    if settings.mode == RoutingMode::Auto {
+                        self.auto_escalate_worker(worker_id).await?;
+                    }
+                }
+                // The claim (and any auto switch) changed the stored record.
+                return self.worker(worker_id).await;
+            }
+        }
+        Ok(updated)
     }
 
     /// Record a real check outcome against the server-observed worker tip.
@@ -3466,6 +5628,7 @@ impl TeamRuntime {
                 finding.justification = None;
             }
             worker.checks.clear();
+            worker.fix_rounds += 1;
             worker.review = None;
             worker.fixer_finding_id = None;
             worker.error = None;
@@ -3483,14 +5646,255 @@ impl TeamRuntime {
             .is_some_and(|live| live.busy.load(Ordering::SeqCst))
     }
 
+    async fn settle_fix_downshift(
+        &self,
+        worker_id: &str,
+        mut row: DispatchRoutingRow,
+        finding_closed: bool,
+    ) -> Result<WorkerRecord, String> {
+        let (ts, from_tier, from_model) = match &row {
+            DispatchRoutingRow::LeadReroute {
+                ts,
+                from_tier,
+                from_model,
+                ..
+            } => (*ts, from_tier.clone(), from_model.clone()),
+            _ => return self.worker(worker_id).await,
+        };
+        if let DispatchRoutingRow::LeadReroute { nudged, .. } = &mut row {
+            *nudged = false;
+        }
+        self.update_worker(worker_id, |worker| {
+            if let Some(DispatchRoutingRow::LeadReroute { nudged, .. }) = worker
+                .reroutes
+                .iter_mut()
+                .rev()
+                .find(|candidate| {
+                    matches!(
+                        candidate,
+                        DispatchRoutingRow::LeadReroute { ts: candidate_ts, .. }
+                            if *candidate_ts == ts
+                    )
+                })
+            {
+                *nudged = false;
+            }
+        })
+        .await;
+        self.persist().await?;
+        self.append_reroute_row(&row, ChangeSource::FixDownshift, Some(finding_closed));
+        if finding_closed {
+            return self.worker(worker_id).await;
+        }
+
+        // The cheaper round did not close its finding: restore the prior
+        // model now, while idle, so the next fix round starts there.
+        let model = match from_model {
+            Some(model) => Some(model),
+            None if NUDGE_LADDER.contains(&from_tier.as_str()) => self
+                .resolve_tier_choice(&from_tier)
+                .map(|(_, choice)| Some(choice.spec))?,
+            None => None,
+        };
+        let effort = self
+            .tier_ladder()
+            .get(&from_tier)
+            .and_then(|rung| rung.effort.clone());
+        let status = self.worker(worker_id).await?.status;
+        self.change_model_locked(
+            worker_id,
+            model,
+            effort,
+            ChangeSource::FixDownshiftRestore,
+        )
+        .await?;
+        self.update_worker(worker_id, |worker| worker.status = status)
+            .await;
+        self.persist().await?;
+        self.worker(worker_id).await
+    }
+
+    fn finding_is_shared_contract(&self, worker: &WorkerRecord, finding: &Finding) -> bool {
+        let Some(plan_id) = worker.plan_id.as_deref() else {
+            return false;
+        };
+        let Some(board) = self.board() else {
+            return false;
+        };
+        let Ok(markdown) = board.read_markdown(plan_id) else {
+            return false;
+        };
+        let mut interfaces = false;
+        for line in markdown.lines() {
+            if line.starts_with("## ") {
+                interfaces = line.trim() == "## Interfaces";
+            } else if interfaces && line.contains(&finding.file) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Classify a routed finding for `team_route_fix(tier: "auto")`. The
+    /// classification is logged for shadow/gate diagnostics but is not an
+    /// ordinary dispatch-training row (`skip` stays set).
+    async fn classify_fix_tier(
+        &self,
+        worker: &WorkerRecord,
+        finding: &Finding,
+    ) -> Result<Option<(String, LeadModel)>, String> {
+        let settings = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if settings.mode == RoutingMode::Off {
+            return Err("tier 'auto' needs routing mode shadow, suggest, or auto".to_string());
+        }
+        let text = routing_text(
+            &finding.title,
+            &format!("{}\nFile: {}", finding.detail, finding.file),
+        )
+        .unwrap_or_default();
+        let enabled = self.enabled_routing_tiers();
+        let classifier = self.classifier.as_ref().and_then(|slot| {
+            slot.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        let decision = if let Some(classifier) = classifier {
+            let attempt = async {
+                let _permit = self
+                    .routing_permit
+                    .acquire()
+                    .await
+                    .map_err(|_| "Laya routing is closed".to_string())?;
+                Ok::<_, String>(
+                    classify_dispatch(
+                        classifier.as_ref(),
+                        self.route_knn.as_deref(),
+                        &text,
+                        enabled,
+                        &settings,
+                    )
+                    .await,
+                )
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(3), attempt).await {
+                Ok(result) => result?,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let current_tier = worker
+            .tier
+            .clone()
+            .or_else(|| worker.routing.as_ref().and_then(|routing| routing.ran_tier.clone()));
+        let protected = finding.severity == "high" || self.finding_is_shared_contract(worker, finding);
+        let mut selected = None;
+        let skip = if decision.is_none() {
+            "fix_downshift_offline"
+        } else if !decision.as_ref().is_some_and(|decision| decision.cleared) {
+            "fix_downshift_below_gate"
+        } else if settings.mode == RoutingMode::Shadow {
+            "fix_downshift_shadow"
+        } else if protected {
+            "fix_downshift_protected"
+        } else if let Some(tier) = decision.as_ref().and_then(|decision| decision.tier) {
+            let (ran_tier, choice) = self.resolve_tier_choice(tier)?;
+            let cheaper = current_tier.as_deref().is_some_and(|current| {
+                NUDGE_LADDER.iter().position(|candidate| *candidate == ran_tier)
+                    < NUDGE_LADDER.iter().position(|candidate| *candidate == current)
+            });
+            if cheaper {
+                selected = Some((ran_tier, choice));
+                "fix_downshift_selected"
+            } else {
+                "fix_downshift_not_cheaper"
+            }
+        } else {
+            "fix_downshift_unknown_label"
+        };
+        use sha2::Digest as _;
+        let text_sha256 = sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let ran_model = selected
+            .as_ref()
+            .map(|(_, choice)| choice.spec.clone())
+            .or_else(|| worker.model.clone());
+        let row = DispatchRoutingRow::Route {
+            ts: unix_ms(),
+            worker_id: worker.id.clone(),
+            plan_id: worker.plan_id.clone().unwrap_or_default(),
+            step: worker.plan_step.map_or(0, |step| step + 1),
+            mode: settings.mode,
+            text_sha256,
+            label: decision
+                .as_ref()
+                .map(|decision| decision.label.clone())
+                .unwrap_or_default(),
+            confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
+            probabilities: decision
+                .as_ref()
+                .map(|decision| decision.probabilities.clone())
+                .unwrap_or_default(),
+            tier: decision.as_ref().and_then(|decision| decision.tier).map(str::to_string),
+            threshold: decision.as_ref().map_or_else(
+                || threshold_for(enabled.offered().count(), &settings),
+                |decision| {
+                    if decision.source == "knn" {
+                        settings.knn_min_share
+                    } else {
+                        threshold_for(enabled.offered().count(), &settings)
+                    }
+                },
+            ),
+            cleared: decision.as_ref().is_some_and(|decision| decision.cleared),
+            lead_tier: current_tier.clone(),
+            ran_tier: selected
+                .as_ref()
+                .map(|(tier, _)| tier.clone())
+                .or(current_tier),
+            ran_model: ran_model.clone(),
+            text,
+            skip: Some(skip.to_string()),
+            source: decision.as_ref().map(|decision| decision.source.to_string()),
+            knn_label: decision.as_ref().and_then(|decision| decision.knn_label.clone()),
+            knn_share: decision.as_ref().and_then(|decision| decision.knn_share),
+            knn_k: decision.as_ref().and_then(|decision| decision.knn_k),
+        };
+        self.append_dispatch_routing_row(&row);
+        Ok(selected)
+    }
+
     /// Route a non-tiny finding to the original tracked worker.
     pub async fn route_fix(
         &self,
         worker_id: &str,
         finding_id: &str,
     ) -> Result<WorkerRecord, String> {
+        self.route_fix_with_tier(worker_id, finding_id, None).await
+    }
+
+    /// Route a fix on its current model or an explicitly/classifier-selected
+    /// ladder tier. The worker keeps its session and transcript.
+    pub async fn route_fix_with_tier(
+        &self,
+        worker_id: &str,
+        finding_id: &str,
+        tier: Option<&str>,
+    ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         let worker = self.worker(worker_id).await?;
+        // Audits only ever produce findings; they never receive them.
+        debug_assert_ne!(
+            worker.kind,
+            "audit",
+            "route_fix never targets an audit worker"
+        );
         if matches!(worker.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot receive a fixer".to_string());
         }
@@ -3507,18 +5911,46 @@ impl TeamRuntime {
             self.resume_inner(worker_id).await?;
         }
         let previous = self.worker(worker_id).await?;
+        let selected = match tier.map(str::trim).filter(|tier| !tier.is_empty()) {
+            None => None,
+            Some("auto") => self.classify_fix_tier(&previous, &finding).await?,
+            Some(tier) => Some(self.resolve_tier_choice(tier)?),
+        };
+        if let Some((ran_tier, choice)) = selected {
+            let current_tier = previous
+                .tier
+                .as_deref()
+                .or_else(|| previous.routing.as_ref().and_then(|routing| routing.ran_tier.as_deref()));
+            let cheaper = current_tier.is_some_and(|current| {
+                NUDGE_LADDER.iter().position(|candidate| *candidate == ran_tier)
+                    < NUDGE_LADDER.iter().position(|candidate| *candidate == current)
+            });
+            let effort = self
+                .tier_ladder()
+                .get(&ran_tier)
+                .and_then(|rung| rung.effort.clone());
+            self.change_model_locked(
+                worker_id,
+                Some(choice.spec),
+                effort,
+                if cheaper {
+                    ChangeSource::FixDownshift
+                } else {
+                    ChangeSource::Lead
+                },
+            )
+            .await?;
+        }
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Fixing;
             worker.fixer_finding_id = Some(finding_id.to_string());
             worker.checks.clear();
+            worker.fix_rounds += 1;
             worker.review = None;
         })
         .await;
         self.persist().await?;
-        let brief = format!(
-            "Fix review finding {}: {}\n{}\nFile: {}:{}\nCommit the fix, rerun the affected checks, and report evidence for delta review.",
-            finding.id, finding.title, finding.detail, finding.file, finding.line
-        );
+        let brief = route_fix_brief(&worker, &finding);
         if let Err(err) = self
             .message_inner_with_kind(worker_id, brief, MessageSender::Mnemo, Some(InboxKind::Fix))
             .await
@@ -3693,7 +6125,26 @@ impl TeamRuntime {
             .await;
             self.persist().await?;
         }
-        self.worker(worker_id).await
+        let record = self.worker(worker_id).await?;
+        if record.status == WorkerStatus::Merged {
+            // The one terminal end a worker is labelled at (design §4.7):
+            // the merge landed and the record is Merged. The retryable
+            // InReview cleanup path above logs nothing; its successful retry
+            // arrives here. The outcome row follows `logs_label` — a hand
+            // reroute is a learning in every mode — while the nudge row is
+            // Laya-derived and keeps the `logs_routing` gate.
+            if logs_label(&record, self.routing_mode()) {
+                if let Some(row) = outcome_row(&record, "merged") {
+                    self.append_dispatch_routing_row(&row);
+                }
+            }
+            if logs_routing(&record, self.routing_mode()) {
+                if let Some(row) = nudge_ignored_row(&record) {
+                    self.append_dispatch_routing_row(&row);
+                }
+            }
+        }
+        Ok(record)
     }
 
     /// Revert a worker merge on the lead branch before it reaches main.
@@ -4961,13 +7412,57 @@ async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Re
     Ok(())
 }
 
-/// Handle a worker's host-tool call (`message_parent`) and return its result.
+/// The plan coordinate a worker may read: its own plan, or for an audit the
+/// plan of the worker it audits. The step stays 0-based, like the record.
+async fn worker_plan_stamp(
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    worker_id: &str,
+) -> Option<(String, usize)> {
+    let records = records.lock().await;
+    let record = records.iter().find(|worker| worker.id == worker_id)?;
+    let source = if record.kind == "audit" {
+        let target = record.audit_target.as_deref()?;
+        records.iter().find(|worker| worker.id == target)?
+    } else {
+        record
+    };
+    Some((source.plan_id.clone()?, source.plan_step?))
+}
+
+/// Handle a worker's host-tool call (`message_parent`, `plan_read`) and return
+/// its result.
 async fn worker_host_tool_result(
     messages: &Arc<Mutex<Vec<TeamMessage>>>,
     worker_id: &str,
     name: &str,
     args: &Value,
+    board: Option<&Arc<PlanBoard>>,
+    plan_stamp: Option<&(String, usize)>,
 ) -> ToolResult {
+    if name == "plan_read" {
+        let Some(board) = board else {
+            return ToolResult::error("the plan board is not available");
+        };
+        if let Some(capability) = args.get("capability") {
+            let Some(capability) = capability.as_str() else {
+                return ToolResult::error("plan_read expects 'capability' to be a string");
+            };
+            return match board.capability_spec(capability) {
+                Ok(Some(text)) => ToolResult::success(text),
+                Ok(None) => {
+                    ToolResult::success(format!("No current spec for '{capability}' yet."))
+                }
+                Err(error) => ToolResult::error(error),
+            };
+        }
+        let Some((plan_id, step)) = plan_stamp else {
+            return ToolResult::error("you have no plan to read");
+        };
+        return match board.worker_view(plan_id, step + 1) {
+            Ok(text) => ToolResult::success(text),
+            Err(error) => ToolResult::error(error),
+        };
+    }
     if name != "message_parent" {
         return ToolResult::error(format!("unknown worker host tool '{name}'"));
     }
@@ -5058,8 +7553,27 @@ async fn pump_worker(
     save_lock: Arc<Mutex<()>>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     persistence: TeamPersistence,
+    routing_log_path: PathBuf,
+    routing: Arc<std::sync::RwLock<RoutingSettings>>,
+    signals: broadcast::Sender<BoardSignal>,
+    strikes: Arc<Mutex<route_question::Strikes>>,
+    models: Arc<std::sync::RwLock<Vec<LeadModel>>>,
+    tiers: Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
+    live: Arc<Mutex<HashMap<String, LiveWorker>>>,
+    fail_next_close: Arc<AtomicBool>,
+    board: Option<Arc<PlanBoard>>,
 ) {
     let mut turn_active = false;
+    let mut plan_stamp = worker_plan_stamp(&records, &worker_id).await;
+    // The `outcome` row owed when the worker lands in a terminal status this
+    // iteration; appended once the record save below has persisted it.
+    let mut pending_outcome: Option<DispatchRoutingRow> = None;
+    // The tool calls whose results have not landed yet (the nudge strike
+    // counter, design §4.6): the session streams arguments as index-keyed
+    // fragments, matched to results by the provider's call id.
+    let mut call_ids: HashMap<u32, String> = HashMap::new();
+    let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
+    let mut previous_signature: Option<String> = None;
     loop {
         let event = match receiver.recv().await {
             Ok(event) => event,
@@ -5080,8 +7594,70 @@ async fn pump_worker(
             args,
         } = &event.event
         {
-            let result = worker_host_tool_result(&messages, &worker_id, name, args).await;
+            if name == "plan_read" {
+                plan_stamp = worker_plan_stamp(&records, &worker_id).await;
+            }
+            let result = worker_host_tool_result(
+                &messages,
+                &worker_id,
+                name,
+                args,
+                board.as_ref(),
+                plan_stamp.as_ref(),
+            )
+            .await;
             send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
+            // An audit's report is the message_parent call that delivered
+            // it (plan 5779641): mark the record the moment the message is
+            // recorded, so the turn's Finished event below can end the
+            // session and free the slot it holds.
+            if name == "message_parent" {
+                let mut records = records.lock().await;
+                if let Some(worker) = records.iter_mut().find(|worker| {
+                    worker.id == worker_id
+                        && (worker.generation == 0 || worker.generation == generation)
+                        && worker.kind == "audit"
+                }) {
+                    worker.report_delivered = true;
+                }
+            }
+        }
+        // The nudge strike counter (design §4.6): fingerprint every finished
+        // tool call — failures and verbatim repeats of the previous call
+        // both count — and try the one nudge after the record block below
+        // releases its lock. `repeated` keeps which kind of streak fired.
+        let mut strike_fired: Option<bool> = None;
+        match &event.event {
+            SerializableAgentEvent::ToolCallStart { index, id, name } => {
+                // A provider may supersede an unexecuted call at the same
+                // index; drop the old entry so the buffers stay bounded.
+                if let Some(superseded) = call_ids.insert(*index, id.clone()) {
+                    pending_calls.remove(&superseded);
+                }
+                pending_calls.insert(id.clone(), (name.clone(), String::new()));
+            }
+            SerializableAgentEvent::ToolCallArgDelta { index, fragment } => {
+                if let Some(id) = call_ids.get(index) {
+                    if let Some((_, args)) = pending_calls.get_mut(id) {
+                        args.push_str(fragment);
+                    }
+                }
+            }
+            SerializableAgentEvent::ToolResult { tool_call_id, result } => {
+                if let Some((name, args)) = pending_calls.remove(tool_call_id) {
+                    let parsed = serde_json::from_str::<Value>(&args)
+                        .unwrap_or(Value::String(args));
+                    let signature = route_question::call_signature(&name, &parsed);
+                    let repeated =
+                        previous_signature.as_deref() == Some(signature.as_str());
+                    previous_signature = Some(signature.clone());
+                    let failed = !result.success;
+                    if strikes.lock().await.observe(signature, failed) {
+                        strike_fired = Some(repeated);
+                    }
+                }
+            }
+            _ => {}
         }
         let usage_model = if matches!(&event.event, SerializableAgentEvent::Usage { .. }) {
             match engine.session(&session_id).await {
@@ -5098,6 +7674,10 @@ async fn pump_worker(
         let mut terminal = false;
         let mut refresh = false;
         let mut changed = false;
+        // Whether this event ended a reported audit's turn (plan 5779641):
+        // its live session is released below, once the save persists the
+        // report and the `Completed` status.
+        let mut audit_release = false;
         {
             let mut records = records.lock().await;
             if let Some(worker) = records.iter_mut().find(|worker| {
@@ -5231,18 +7811,26 @@ async fn pump_worker(
                     SerializableAgentEvent::Compacted { .. } => {
                         if worker.compacting {
                             worker.compacting = false;
-                            busy.store(false, Ordering::SeqCst);
-                            if !matches!(
-                                worker.status,
-                                WorkerStatus::Paused
-                                    | WorkerStatus::Interrupted
-                                    | WorkerStatus::Stopped
-                            ) {
-                                worker.status = if worker.pending.is_some() {
-                                    WorkerStatus::NeedsYou
-                                } else {
-                                    WorkerStatus::Idle
-                                };
+                            // A compaction INSIDE a live turn (a mid-run
+                            // compact-then-switch, or the new model's own
+                            // trigger right after one) must not idle the
+                            // worker: the turn continues on the new model, so
+                            // only the badge ends. Between turns (turn_active
+                            // false) the worker really is idle again.
+                            if !turn_active {
+                                busy.store(false, Ordering::SeqCst);
+                                if !matches!(
+                                    worker.status,
+                                    WorkerStatus::Paused
+                                        | WorkerStatus::Interrupted
+                                        | WorkerStatus::Stopped
+                                ) {
+                                    worker.status = if worker.pending.is_some() {
+                                        WorkerStatus::NeedsYou
+                                    } else {
+                                        WorkerStatus::Idle
+                                    };
+                                }
                             }
                             worker.error = None;
                             changed = true;
@@ -5286,6 +7874,14 @@ async fn pump_worker(
                             worker.status = WorkerStatus::Completed;
                             worker.turns = worker.turns.saturating_add(1);
                         }
+                        // An audit that reported ends its own job: its
+                        // session is released below so it stops holding a
+                        // worker slot. A turn that ended without a report
+                        // (failure, interrupt) keeps today's behavior —
+                        // the lead can still resume it.
+                        audit_release = worker.kind == "audit"
+                            && worker.report_delivered
+                            && matches!(worker.status, WorkerStatus::Completed);
                         terminal = true;
                     }
                     SerializableAgentEvent::Exited => {
@@ -5328,6 +7924,20 @@ async fn pump_worker(
                         }
                         terminal = true;
                     }
+                    // The deferred compact-then-switch COMPLETED: the worker
+                    // summarized and now runs on the new model. Informational
+                    // — the turn continues, so status stays Working, busy
+                    // stays set, and no error is recorded (bug 2026-11-02:
+                    // this used to arrive as an `Error`, which failed a
+                    // perfectly healthy worker). This path emits
+                    // CompactStarted but no Compacted, so the badge ends here.
+                    SerializableAgentEvent::ModelSwapSummarized { .. } => {
+                        changed |= worker.compacting;
+                        worker.compacting = false;
+                    }
+                    // Mnemo2 routes at dispatch; a Mnemo1-only session notice
+                    // cannot alter worker status, busy, or compaction state.
+                    SerializableAgentEvent::RoutingNotice { .. } => {}
                     SerializableAgentEvent::Error { error, retrying } => {
                         if !retrying {
                             turn_active = false;
@@ -5352,8 +7962,24 @@ async fn pump_worker(
                             changed = true;
                         } else if !retrying {
                             busy.store(false, Ordering::SeqCst);
+                            // Failed-and-stopped is terminal (design §4.7):
+                            // queue the worker's `outcome` row, appended after
+                            // the save below. Only the transition into Failed
+                            // queues it — a repeated terminal error does not.
+                            let first_failure = worker.status != WorkerStatus::Failed;
                             worker.status = WorkerStatus::Failed;
                             worker.error = Some(error.clone());
+                            if first_failure {
+                                let mode = routing
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .mode;
+                                // A failure is resumable, not terminal: the
+                                // outcome row only — nudge_ignored waits for
+                                // stop, merge, or cleanup.
+                                pending_outcome = outcome_row(worker, "failed")
+                                    .filter(|_| logs_label(worker, mode));
+                            }
                             terminal = true;
                         }
                     }
@@ -5368,6 +7994,75 @@ async fn pump_worker(
         });
         if terminal || changed {
             let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+        }
+        if audit_release {
+            // The record with the report and the `Completed` status is
+            // persisted above; end the live session exactly as
+            // `stop_inner` does — but keep the status `Completed`, since
+            // the audit finished its job on its own. Then stop pumping:
+            // the session is gone and this pump only outlives its turn.
+            // The ledger handles move over: the loop breaks right after.
+            let _ = release_finished_audit(
+                &worker_id,
+                generation,
+                &live,
+                PumpLedger {
+                    records: records.clone(),
+                    usage: usage.clone(),
+                    save_lock: save_lock.clone(),
+                    persistence,
+                },
+                &fail_next_close,
+            )
+            .await;
+            break;
+        }
+        if let Some(row) = pending_outcome.take() {
+            mnemo::agent::model_routing::append_row(&routing_log_path, &row);
+        }
+        if let Some(repeated) = strike_fired.take() {
+            let settings = routing
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if settings.nudges {
+                try_strike_nudge(
+                    &worker_id,
+                    StrikeNudges {
+                        records: &records,
+                        models: &models,
+                        tiers: &tiers,
+                        signals: &signals,
+                        routing_log_path: &routing_log_path,
+                        settings: &settings,
+                    },
+                    repeated,
+                )
+                .await;
+            }
+        }
+        let settings = routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if settings.nudges && settings.mode == RoutingMode::Auto {
+            // A strike fires during a busy turn. Trying on every event makes
+            // the first idle event apply the pending nudge without a restart.
+            let _ = auto_escalate_idle(
+                &worker_id,
+                AutoEscalation {
+                    records: &records,
+                    live: &live,
+                    models: &models,
+                    tiers: &tiers,
+                    signals: &signals,
+                    routing_log_path: &routing_log_path,
+                    usage: &usage,
+                    save_lock: &save_lock,
+                    persistence: &persistence,
+                },
+            )
+            .await;
         }
         if terminal || refresh {
             let engine = engine.clone();
@@ -5425,6 +8120,100 @@ async fn pump_worker(
             });
         }
     }
+}
+
+/// Close a worker session for cleanup, honoring the transition tests'
+/// injected close failure. Shared by [`TeamRuntime::stop_inner`] and the
+/// audit release below so both paths behave identically.
+async fn close_worker_session(
+    session: &AgentSession,
+    fail_next_close: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    if fail_next_close.swap(false, Ordering::SeqCst) {
+        return Err("injected close failure for transition tests".to_string());
+    }
+    session
+        .close_and_wait()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The shared ledger handles a worker pump holds: the record store plus
+/// everything [`save_workers`] needs. [`release_finished_audit`] takes
+/// them as one group because the pump hands them over on its way out.
+struct PumpLedger {
+    records: Arc<Mutex<Vec<WorkerRecord>>>,
+    usage: Arc<Mutex<ProjectUsage>>,
+    save_lock: Arc<Mutex<()>>,
+    persistence: TeamPersistence,
+}
+
+/// End a finished audit's live session from inside its own pump (plan
+/// 5779641): the report was recorded and `Completed` is persisted, so the
+/// slot is freed the way [`TeamRuntime::stop_inner`] frees a stopped
+/// one — snapshot folded into the record, session closed, record and
+/// worktree kept — but the status stays `Completed`, because the audit
+/// ended its job on its own rather than being stopped.
+///
+/// On a failed close the [`LiveWorker`] goes back into `live` with
+/// `cleanup_retry_only` set, exactly like a failed stop: a later stop
+/// retries the close. The pump calling this breaks its loop right after,
+/// so no self-abort is needed.
+async fn release_finished_audit(
+    worker_id: &str,
+    generation: u64,
+    live: &Arc<Mutex<HashMap<String, LiveWorker>>>,
+    ledger: PumpLedger,
+    fail_next_close: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let Some(mut live_worker) = live.lock().await.remove(worker_id) else {
+        // Not live: a repeated Finished event, or the lead already
+        // stopped or deleted the audit. Nothing to release.
+        return Ok(());
+    };
+    let snapshot = live_worker.session.snapshot().await.ok();
+    {
+        let mut records = ledger.records.lock().await;
+        if let Some(worker) = records.iter_mut().find(|worker| {
+            worker.id == worker_id
+                && (worker.generation == 0 || worker.generation == generation)
+        }) {
+            if let Some(snapshot) = &snapshot {
+                if !snapshot.transcript.messages.is_empty() {
+                    worker.transcript = snapshot.transcript.clone();
+                    worker.used_tokens = snapshot.used_tokens;
+                    worker.max_tokens = snapshot.max_tokens;
+                    if worker.model_id.is_none() {
+                        worker.model_id = snapshot_model(snapshot);
+                    }
+                } else if worker.transcript.messages.is_empty() && worker.brief_sent {
+                    worker.transcript = Transcript {
+                        messages: vec![mnemo::provider::Message::user_text(
+                            kickoff_message(worker).to_string(),
+                        )],
+                    };
+                }
+            }
+        }
+    }
+    if let Err(error) = close_worker_session(&live_worker.session, fail_next_close).await {
+        let message = format!("could not close worker session: {error}");
+        live_worker.cleanup_retry_only = true;
+        live.lock().await.insert(worker_id.to_string(), live_worker);
+        {
+            let mut records = ledger.records.lock().await;
+            if let Some(worker) = records.iter_mut().find(|worker| {
+                worker.id == worker_id
+                    && (worker.generation == 0 || worker.generation == generation)
+            }) {
+                worker.error = Some(message.clone());
+            }
+        }
+        let _ = save_workers(&ledger.records, &ledger.usage, &ledger.save_lock, &ledger.persistence).await;
+        return Err(message);
+    }
+    let _ = save_workers(&ledger.records, &ledger.usage, &ledger.save_lock, &ledger.persistence).await;
+    Ok(())
 }
 
 /// Write the whole ledger — workers, slots, and the usage accumulator.
@@ -5549,7 +8338,11 @@ pub struct CleanupReport {
 }
 
 /// Clean only inactive, clean worker checkouts; retain every worker branch.
-pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupReport, String> {
+pub async fn cleanup_workspace(
+    root: &Path,
+    state_dir: &Path,
+    routing_log_path: &Path,
+) -> Result<CleanupReport, String> {
     current_branch(root)?;
     let persistence = TeamPersistence::new(state_dir);
     let Some(mut ledger) = persistence.load()? else {
@@ -5663,7 +8456,25 @@ pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupR
         worker.worktree = PathBuf::new();
         worker.error =
             Some("inactive checkout cleaned; the branch is retained for review".to_string());
+        // Abandoned is terminal (design §4.7): the worker's `outcome` row
+        // and, when its one nudge was never acted on, the `nudge_ignored`
+        // row land beside the cleaned checkout — the outcome row for a
+        // worker routing ever applied to or one that was rerouted by hand
+        // (a hand reroute is a learning in every mode), the nudge row only
+        // for a worker routing ever applied to (cleanup has no settings
+        // handle, so the record decides).
+        let outcome = outcome_row(worker, "abandoned")
+            .filter(|_| logs_label(worker, RoutingMode::Off));
+        let nudge_ignored = nudge_ignored_row(worker)
+            .filter(|_| logs_routing(worker, RoutingMode::Off));
+        let rows = [outcome, nudge_ignored]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         persistence.save(&ledger)?;
+        for row in rows {
+            mnemo::agent::model_routing::append_row(routing_log_path, &row);
+        }
     }
     Ok(report)
 }
@@ -5832,6 +8643,9 @@ fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
         "cost_micros": worker.cost_micros,
         "last_activity_ms": worker.last_activity_ms,
     });
+    if let Some(routing) = &worker.routing {
+        view["routing"] = json!(routing);
+    }
     if let Some(review) = &worker.review {
         view["review"] = json!({
             "summary": review.summary,
@@ -5895,19 +8709,129 @@ fn worker_result(result: Result<WorkerRecord, String>, action: &str) -> ToolResu
 
 /// A dispatch answer: the compact worker entry next to the idempotent-reuse
 /// flag. `data` keeps the whole record, as the single-worker answers do.
-fn dispatch_result(result: Result<(WorkerRecord, bool), String>, action: &str) -> ToolResult {
+fn dispatch_result(
+    result: Result<(WorkerRecord, bool), String>,
+    action: &str,
+    mode: RoutingMode,
+    fold_request: Option<String>,
+    explicit_model: bool,
+) -> ToolResult {
     match result {
         Ok((worker, reused)) => {
+            let routing = worker.routing.as_ref();
+            let requested = if explicit_model {
+                None
+            } else {
+                match fold_request.as_deref() {
+                    Some("auto") | None => routing.and_then(|routing| {
+                        if routing.routed_by == "laya" {
+                            routing.laya_tier.as_deref()
+                        } else {
+                            routing.lead_tier.as_deref()
+                        }
+                    }),
+                    Some(tier) => Some(tier),
+                }
+            };
+            let ran_tier = routing
+                .and_then(|routing| routing.ran_tier.as_deref())
+                .or(worker.tier.as_deref());
+            let routing_note = match (requested, ran_tier) {
+                (Some(requested), Some(ran))
+                    if requested != ran && TierLadder::default().get(requested).is_some() =>
+                {
+                    Some(format!("{requested} has no model; ran on {ran}"))
+                }
+                _ => None,
+            };
             let output = serde_json::to_string(&json!({
                 "action": action,
-                "result": {"worker": worker_status_view(&worker, false), "reused": reused},
+                "result": {
+                    "worker": worker_status_view(&worker, false),
+                    "reused": reused,
+                    "routing_note": routing_note,
+                },
             }))
             .unwrap_or_else(|_| action.to_string());
+            let mut lines = Vec::new();
+            if let Some(line) = dispatch_routing_line(mode, routing) {
+                lines.push(line);
+            }
+            if let Some(note) = &routing_note {
+                lines.push(note.clone());
+            }
+            let output = if lines.is_empty() {
+                output
+            } else {
+                format!("{output}\n{}", lines.join("\n"))
+            };
             let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
-            ToolResult::success(output).with_data(json!({"worker": data, "reused": reused}))
+            ToolResult::success(output).with_data(
+                json!({"worker": data, "reused": reused, "routing_note": routing_note}),
+            )
         }
         Err(err) => team_tool_error(err),
     }
+}
+
+fn dispatch_routing_line(mode: RoutingMode, routing: Option<&WorkerRouting>) -> Option<String> {
+    let routing = routing?;
+    if mode == RoutingMode::Off {
+        return None;
+    }
+    // The dispatch-time ran tier (audit finding M1): a later manual reroute
+    // may have moved the worker to another tier, but what the dispatch ran
+    // is what this line reports.
+    let ran_tier = routing.ran_tier.as_deref();
+    let confidence = routing.confidence;
+
+    if routing.routed_by == "lead_override" {
+        let choice = match (ran_tier, routing.lead_tier.as_deref()) {
+            (Some(ran), Some(requested)) if ran != requested => {
+                format!("you ran {ran} (requested {requested})")
+            }
+            _ => format!(
+                "you chose {}",
+                routing
+                    .lead_tier
+                    .as_deref()
+                    .or(ran_tier)
+                    .unwrap_or("a custom model")
+            ),
+        };
+        return Some(format!(
+            "Laya: {} ({:.2}) — {choice}; logged as an override.",
+            routing.laya_tier.as_deref().unwrap_or("unknown"),
+            confidence.unwrap_or(0.0),
+        ));
+    }
+    if routing.routed_by == "laya" {
+        return Some(format!(
+            "Laya: routed to {} ({:.2}).",
+            routing.laya_tier.as_deref().unwrap_or("unknown"),
+            confidence.unwrap_or(0.0)
+        ));
+    }
+    if mode == RoutingMode::Shadow {
+        return Some(match (routing.laya_tier.as_deref(), confidence, routing.cleared) {
+            (Some(tier), Some(confidence), true) => {
+                format!("Laya would pick {tier} ({confidence:.2}).")
+            }
+            (_, Some(confidence), _) => format!("Laya: unsure ({confidence:.2})."),
+            _ => "Laya: offline.".to_string(),
+        });
+    }
+    if !routing.cleared {
+        return Some(match confidence {
+            Some(confidence) => format!("Laya: unsure ({confidence:.2})."),
+            None => "Laya: offline.".to_string(),
+        });
+    }
+    Some(format!(
+        "Laya: {} ({:.2}) — matches your tier.",
+        routing.laya_tier.as_deref().unwrap_or("unknown"),
+        confidence.unwrap_or(0.0)
+    ))
 }
 
 /// Scan a plan document for its `## Acceptance scenarios` section.
@@ -5949,25 +8873,65 @@ fn acceptance_scenarios(doc: &str) -> (bool, usize) {
     (found, bullets)
 }
 
-/// Require the dispatched board plan's document to declare observable
-/// `## Acceptance scenarios` before a high-risk dispatch on it.
-///
-/// Returns an actionable error for a missing section and for a section
-/// without an observable bullet.
+/// Require observable acceptance scenarios before a high-risk dispatch.
+/// Either the lead's `## Acceptance scenarios` bullets or a complete OpenSpec
+/// `Scenario:` block under `## Spec changes` satisfies the requirement.
 fn require_acceptance_scenarios(plan_id: &str, doc: &str) -> Result<(), String> {
-    let guidance = "add observable scenarios with plan_update add_acceptance_scenarios, or dispatch with review_risk='standard'";
+    let guidance = "add observable scenarios with plan_update add_acceptance_scenarios or spec_deltas, or dispatch with review_risk='standard'";
     let (found, bullets) = acceptance_scenarios(doc);
+    if found && bullets > 0 {
+        return Ok(());
+    }
+
+    let mut in_spec_changes = false;
+    let mut in_scenario = false;
+    let mut has_when = false;
+    let mut has_then = false;
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        let level = trimmed.chars().take_while(|c| *c == '#').count();
+        if level > 0 && trimmed[level..].starts_with(' ') {
+            if in_scenario && has_when && has_then {
+                return Ok(());
+            }
+            in_scenario = false;
+            has_when = false;
+            has_then = false;
+            let heading = trimmed[level..].trim();
+            if level <= 2 {
+                in_spec_changes = level == 2 && heading.eq_ignore_ascii_case("spec changes");
+            } else if in_spec_changes && heading.starts_with("Scenario:") {
+                in_scenario = true;
+            }
+            continue;
+        }
+        if !in_spec_changes || !in_scenario {
+            continue;
+        }
+        let Some(text) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            continue;
+        };
+        if let Some(value) = text.trim().strip_prefix("**WHEN**") {
+            has_when = has_when || !value.trim().is_empty();
+        } else if let Some(value) = text.trim().strip_prefix("**THEN**") {
+            has_then = has_then || !value.trim().is_empty();
+        }
+    }
+    if in_scenario && has_when && has_then {
+        return Ok(());
+    }
+
     if !found {
         return Err(format!(
             "review_risk='high' requires acceptance scenarios, but plan '{plan_id}' does not declare any; {guidance}"
         ));
     }
-    if bullets == 0 {
-        return Err(format!(
-            "review_risk='high' requires acceptance scenarios, but plan '{plan_id}' has no observable bullet (a concrete, verifiable outcome of at least eight characters); {guidance}"
-        ));
-    }
-    Ok(())
+    Err(format!(
+        "review_risk='high' requires acceptance scenarios, but plan '{plan_id}' has no observable bullet (a concrete, verifiable outcome of at least eight characters) or complete OpenSpec scenario; {guidance}"
+    ))
 }
 
 /// Enforce every source/evidence precondition while the merge lock is held.
@@ -6373,6 +9337,19 @@ fn executor_gate_rules() -> Vec<GateRule> {
 mod tests {
     use super::*;
 
+    macro_rules! tiers_dto {
+        (difficult: $difficult:expr, average: $average:expr, simple: $simple:expr $(,)?) => {{
+            let mut dto = mnemo::headless::TiersDto::default();
+            dto.tiers[0].models = $simple;
+            dto.tiers[1].models = $average;
+            dto.tiers[3].models = $difficult;
+            dto
+        }};
+        (simple: $simple:expr, average: $average:expr, difficult: $difficult:expr $(,)?) => {{
+            tiers_dto!(difficult: $difficult, average: $average, simple: $simple)
+        }};
+    }
+
     #[tokio::test]
 
     async fn phase_two_ledgers_load_with_phase_three_defaults() {
@@ -6724,9 +9701,13 @@ mod tests {
             })
             .expect("ledger");
 
-        let report = cleanup_workspace(root, state.path())
-            .await
-            .expect("cleanup");
+        let report = cleanup_workspace(
+            root,
+            state.path(),
+            &state.path().join("dispatch_routing.jsonl"),
+        )
+        .await
+        .expect("cleanup");
         assert_eq!(report.removed, vec![clean_branch.clone()]);
         assert!(report
             .skipped
@@ -6799,6 +9780,17 @@ mod tests {
             .await
             .expect("knowledge records are lead bookkeeping too");
         std::fs::remove_file(root.join(".coding/knowledge/note.md")).expect("remove note");
+        std::fs::create_dir_all(root.join(".coding/openspec/specs/importer"))
+            .expect("OpenSpec dir");
+        std::fs::write(
+            root.join(".coding/openspec/specs/importer/spec.md"),
+            "# Importer\n",
+        )
+        .expect("OpenSpec spec");
+        phase3::require_clean_lead(root, "lead")
+            .await
+            .expect("OpenSpec specs and archives are lead bookkeeping too");
+        std::fs::remove_dir_all(root.join(".coding/openspec")).expect("remove OpenSpec dir");
         std::fs::write(root.join("file.txt"), "changed").expect("change source");
         phase3::require_clean_lead(root, "lead")
             .await
@@ -6855,6 +9847,7 @@ mod tests {
             used_tokens: 0,
             max_tokens: 0,
             brief_sent: true,
+            read_back: false,
             compacting: false,
             total_tokens: 0,
             prompt_tokens: 0,
@@ -6871,14 +9864,21 @@ mod tests {
             kind: "implementation".to_string(),
             audit_target: None,
             audit_tip: None,
+            report_delivered: false,
             findings: Vec::new(),
             review: None,
+            review_rounds: 0,
+            fix_rounds: 0,
+            audits: 0,
+            models_used: Vec::new(),
             fixer_finding_id: None,
             merge: None,
             error: None,
             plan_id: None,
             plan_step: None,
             tier: None,
+            routing: None,
+            reroutes: Vec::new(),
         }
     }
 
@@ -6897,18 +9897,27 @@ mod tests {
         workers: Vec<WorkerRecord>,
     ) -> TeamRuntime {
         let config = tempfile::tempdir().expect("config");
+        open_test_team_with_config(root, state, workers, config.path()).await
+    }
+
+    async fn open_test_team_with_config(
+        root: &std::path::Path,
+        state: &std::path::Path,
+        workers: Vec<WorkerRecord>,
+        config: &std::path::Path,
+    ) -> TeamRuntime {
         std::fs::write(
-            config.path().join("config.toml"),
+            config.join("config.toml"),
             "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
         )
         .expect("config.toml");
         std::fs::write(
-            config.path().join("endpoints.toml"),
+            config.join("endpoints.toml"),
             "[[endpoint]]
 name = \"test\"
 kind = \"local\"
 base_url = \"http://127.0.0.1:9/v1/\"
-models = [\"scripted-a\"]
+models = [\"scripted-a\", \"scripted-b\"]
 ",
         )
         .expect("endpoints.toml");
@@ -6921,7 +9930,7 @@ models = [\"scripted-a\"]
             .expect("save the team ledger");
         let engine = mnemo::headless::Engine::start(mnemo::headless::EngineOptions {
             workspace: mnemo::workspace::Workspace::new(root),
-            config_dir: Some(config.path().to_path_buf()),
+            config_dir: Some(config.to_path_buf()),
             permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
             memory: mnemo::headless::MemoryBackend::Disabled,
             index_codegraph: false,
@@ -6934,6 +9943,9 @@ models = [\"scripted-a\"]
             engine: Arc::new(engine),
             workspace_root: root.to_path_buf(),
             state_dir: state.to_path_buf(),
+            config_dir: config.to_path_buf(),
+            classifier: None,
+            routing_log_path: Some(state.join("dispatch_routing.jsonl")),
             slots: Some(2),
             models: Vec::new(),
             pricing: Vec::new(),
@@ -6944,14 +9956,15 @@ models = [\"scripted-a\"]
 
     async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
         let session = team
-            .spawn_worker_session(
-                worker.name.clone(),
-                None,
-                None,
-                worker.worktree.clone(),
-                None,
-                "implementation",
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: worker.worktree.clone(),
+                resume: None,
+                kind: "implementation".to_string(),
+                trace_identity: TeamRuntime::worker_trace_identity(worker),
+                pinned_task: None,
+            })
             .await
             .expect("spawn worker session");
         team.live.lock().await.insert(
@@ -6961,6 +9974,7 @@ models = [\"scripted-a\"]
                 pump: tokio::spawn(std::future::pending::<()>()),
                 cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
+                strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
             },
         );
     }
@@ -7034,14 +10048,15 @@ models = [\"scripted-a\"]
         .await;
         for worker in [&dangling, &fragment] {
             let session = team
-                .spawn_worker_session(
-                    worker.name.clone(),
-                    None,
-                    None,
-                    worker.worktree.clone(),
-                    None,
-                    "implementation",
-                )
+                .spawn_worker_session(WorkerSessionSpec {
+                    model: None,
+                    reasoning_effort: None,
+                    worktree: worker.worktree.clone(),
+                    resume: None,
+                    kind: "implementation".to_string(),
+                    trace_identity: TeamRuntime::worker_trace_identity(worker),
+                    pinned_task: None,
+                })
                 .await
                 .expect("open a worktree-bound session and its code graph");
             assert!(worker.worktree.join(".coding/codegraph.db").is_file());
@@ -7052,6 +10067,7 @@ models = [\"scripted-a\"]
                     pump: tokio::spawn(async {}),
                     cleanup_retry_only: false,
                     busy: Arc::new(AtomicBool::new(false)),
+                    strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
                 },
             );
         }
@@ -7528,14 +10544,15 @@ models = [\"scripted-a\"]
         });
         let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
         let session = team
-            .spawn_worker_session(
-                worker.name.clone(),
-                None,
-                None,
-                worker.worktree.clone(),
-                None,
-                "implementation",
-            )
+            .spawn_worker_session(WorkerSessionSpec {
+                model: None,
+                reasoning_effort: None,
+                worktree: worker.worktree.clone(),
+                resume: None,
+                kind: "implementation".to_string(),
+                trace_identity: TeamRuntime::worker_trace_identity(&worker),
+                pinned_task: None,
+            })
             .await
             .expect("open a worktree-bound session and its code graph");
         assert!(worker.worktree.join(".coding/codegraph.db").is_file());
@@ -7546,6 +10563,7 @@ models = [\"scripted-a\"]
                 pump: tokio::spawn(async {}),
                 cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
+                strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
             },
         );
 
@@ -7642,9 +10660,13 @@ models = [\"scripted-a\"]
             })
             .expect("ledger");
 
-        let report = cleanup_workspace(root, state.path())
-            .await
-            .expect("cleanup");
+        let report = cleanup_workspace(
+            root,
+            state.path(),
+            &state.path().join("dispatch_routing.jsonl"),
+        )
+        .await
+        .expect("cleanup");
         assert_eq!(report.removed, vec![agent_branch.clone()]);
         assert!(!agent_path.exists());
         assert!(runall_path.is_dir(), "the Mnemo1 checkout survives");
@@ -7945,6 +10967,30 @@ models = [\"scripted-a\"]
         .expect("observable bullets validate high-risk dispatch");
     }
 
+    #[test]
+    fn high_risk_dispatch_accepts_complete_openspec_delta_scenarios() {
+        require_acceptance_scenarios(
+            "planid01",
+            "# Plan\n\n## Spec changes\n\n### importer\n\n#### ADDED Requirements\n\n##### Requirement: Rows survive\nThe system SHALL retain rows.\n\n###### Scenario: Contract exercised\n- **WHEN** rows are imported\n- **THEN** every row remains visible\n",
+        )
+        .expect("a complete OpenSpec scenario satisfies high-risk dispatch");
+    }
+
+    #[test]
+    fn high_risk_dispatch_refuses_spec_changes_without_complete_scenarios() {
+        require_acceptance_scenarios(
+            "planid01",
+            "# Plan\n\n## Spec changes\n\n### importer\n\n#### REMOVED Requirements\n\n##### Requirement: Old behavior\nNo longer needed.\n",
+        )
+        .expect_err("a Spec changes section without scenarios must not pass");
+
+        require_acceptance_scenarios(
+            "planid01",
+            "# Plan\n\n## Spec changes\n\n### importer\n\n#### MODIFIED Requirements\n\n##### Requirement: Rows survive\nThe system SHALL retain rows.\n\n###### Scenario: Incomplete\n- **WHEN** rows are imported\n",
+        )
+        .expect_err("a scenario without THEN must not pass");
+    }
+
     /// The parsed answer of one in-app lead `team_status` call.
     async fn team_status_answer(team: &TeamRuntime, args: Value) -> Value {
         let result = team.handle_lead_host_tool("team_status", args).await;
@@ -7960,7 +11006,7 @@ models = [\"scripted-a\"]
         worker.model_id = Some("scripted-a".to_string());
         worker.plan_id = Some("plan0001".to_string());
         worker.plan_step = Some(2);
-        worker.tier = Some("average".to_string());
+        worker.tier = Some("routine".to_string());
         worker.status = WorkerStatus::InReview;
         worker.error = Some("a recorded error".to_string());
         worker.cost_micros = Some(1234);
@@ -8058,7 +11104,7 @@ models = [\"scripted-a\"]
         assert_eq!(entry["id"], "00000001000000000001");
         assert_eq!(entry["status"], "in_review");
         assert_eq!(entry["kind"], "implementation");
-        assert_eq!(entry["tier"], "average");
+        assert_eq!(entry["tier"], "routine");
         assert_eq!(entry["model"], "scripted-a");
         assert_eq!(entry["plan_id"], "plan0001");
         assert_eq!(entry["plan_step"], 2);
@@ -8209,6 +11255,34 @@ models = [\"scripted-a\"]
         team.shutdown().await;
     }
 
+    /// A release forgets every helper that led, so a helper that closes after
+    /// one cannot keep a stale claim alive, and a detached lead remembers no
+    /// new helper until it attaches again.
+    #[tokio::test]
+    async fn a_release_forgets_every_external_bridge() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+        // Two helpers led; one closing must leave the other in charge.
+        assert!(team.attach_external_lead(), "the first attach takes the team");
+        team.note_external_bridge("a");
+        team.note_external_bridge("b");
+        assert_eq!(team.forget_external_bridge("a"), 1, "b still leads");
+
+        // A release forgets every helper, and none is noted while detached.
+        assert!(team.detach_external_lead());
+        team.note_external_bridge("c");
+        assert_eq!(team.forget_external_bridge("b"), 0, "the release forgot b");
+        assert_eq!(team.forget_external_bridge("c"), 0, "a detached lead notes no helper");
+
+        // The next attach starts with no remembered helpers.
+        assert!(team.attach_external_lead(), "it can lead again");
+        assert_eq!(team.forget_external_bridge("a"), 0, "the release had cleared the set");
+        team.shutdown().await;
+    }
+
     /// `team_status` says who leads: the in-app lead, an attached Claude Code
     /// session, or one that was released for silence.
     #[tokio::test]
@@ -8274,6 +11348,7 @@ models = [\"scripted-a\"]
         )
         .expect("stray plan file");
         let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        let team = Arc::new(team);
         team.attach_board(Arc::new(board));
 
         let document = team.plan_document(&plan.id).expect("the plan document");
@@ -8284,6 +11359,4134 @@ models = [\"scripted-a\"]
             .plan_document(stray)
             .expect_err("an id no board row names is refused");
         assert!(refused.contains(stray), "{refused}");
+        team.shutdown().await;
+    }
+
+    /// The lead's `team_dispatch` schema offers a read-back first turn for
+    /// large or subtle specs, as a boolean opt-in.
+    #[tokio::test]
+    async fn team_dispatch_schema_offers_read_back() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+        let dispatch = team
+            .lead_host_tools()
+            .into_iter()
+            .find(|tool| tool.name == "team_dispatch")
+            .expect("team_dispatch");
+        let read_back = &dispatch.parameters["properties"]["read_back"];
+        assert_eq!(read_back["type"], json!("boolean"), "{read_back}");
+        let description = read_back["description"]
+            .as_str()
+            .expect("a read_back description");
+        assert!(description.contains("No questions."), "{description}");
+        assert!(description.contains("waits for the lead's reply"), "{description}");
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn team_dispatch_refuses_unmet_openspec_apply_requirements() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        let openspec = root.path().join(".coding/openspec");
+        let templates = openspec.join("schemas/custom/templates");
+        std::fs::create_dir_all(&templates).expect("schema templates");
+        for id in ["proposal", "research", "tasks"] {
+            std::fs::write(templates.join(format!("{id}.md")), format!("# {id}\n"))
+                .expect("template");
+        }
+        std::fs::write(
+            openspec.join("schemas/custom/schema.yaml"),
+            "name: custom\nversion: 1\nartifacts:\n  - {id: proposal, generates: proposal.md, template: proposal.md}\n  - {id: research, generates: research.md, template: research.md, instruction: Record evidence.}\n  - {id: tasks, generates: tasks.md, template: tasks.md}\napply: {requires: [research], tracks: tasks.md}\n",
+        )
+        .expect("schema.yaml");
+        std::fs::write(
+            openspec.join("config.yaml"),
+            "schema: custom\nrules:\n  research: Cite the source.\n",
+        )
+        .expect("config.yaml");
+        let board = PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        );
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Needs research".to_string(),
+                goal: "Implement safely".to_string(),
+                context: "Symptom: dispatch lacks artifact gates; src-tauri/src/mnemo2/team.rs validates the plan; verify with cargo test.".to_string(),
+                steps: vec!["Implement in src-tauri/src/mnemo2/team.rs and run cargo test".to_string()],
+                ..Default::default()
+            })
+            .expect("creation is allowed before apply requirements are met");
+        let team = Arc::new(team);
+        team.attach_board(Arc::new(board));
+
+        let error = team
+            .dispatch_request(DispatchRequest {
+                brief: "Implement the plan".to_string(),
+                tier: None,
+                dispatch_routing: false,
+                source: DispatchSource::Ipc,
+                model: None,
+                reasoning_effort: None,
+                worker_id: None,
+                plan: Some(PlanRef {
+                    plan_id: plan.id.clone(),
+                    step: 0,
+                }),
+                review_risk: None,
+                read_back: false,
+            })
+            .await
+            .expect_err("apply.requires must refuse dispatch");
+        assert!(error.contains("cannot be dispatched"), "{error}");
+        assert!(error.contains("artifact 'research'"), "{error}");
+        assert!(error.contains("Cite the source."), "{error}");
+        assert!(team.records.lock().await.is_empty());
+        team.shutdown().await;
+    }
+
+    /// Idempotent re-dispatch compares `read_back` like the brief: the same
+    /// worker id with a different value is refused rather than silently
+    /// re-pinned.
+    #[tokio::test]
+    async fn redispatch_with_a_different_read_back_is_refused() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut existing = worker(root.path(), "00000001000000000001");
+        existing.brief = "BRIEF-91x".to_string();
+        let team = open_test_team(root.path(), state.path(), vec![existing.clone()]).await;
+
+        let (reused, fresh) = team
+            .dispatch_request(DispatchRequest {
+                brief: "BRIEF-91x".to_string(),
+                tier: None,
+                dispatch_routing: false,
+            source: DispatchSource::Ipc,
+                model: None,
+                reasoning_effort: None,
+                worker_id: Some(existing.id.clone()),
+                plan: None,
+                review_risk: None,
+                read_back: false,
+            })
+            .await
+            .expect("the identical re-dispatch reuses the worker");
+        assert!(fresh, "the identical re-dispatch is a reuse");
+        assert_eq!(reused.id, existing.id);
+
+        let refused = team
+            .dispatch_request(DispatchRequest {
+                brief: "BRIEF-91x".to_string(),
+                tier: None,
+                dispatch_routing: false,
+            source: DispatchSource::Ipc,
+                model: None,
+                reasoning_effort: None,
+                worker_id: Some(existing.id.clone()),
+                plan: None,
+                review_risk: None,
+                read_back: true,
+            })
+            .await
+            .expect_err("a different read_back is refused");
+        assert!(refused.contains("read_back"), "{refused}");
+        team.shutdown().await;
+    }
+
+    /// An open high finding for the round counters.
+    fn open_finding(id: &str) -> Finding {
+        Finding {
+            id: id.to_string(),
+            severity: "high".to_string(),
+            title: "the unchecked path".to_string(),
+            detail: "the whole finding detail".to_string(),
+            file: "src/a.rs".to_string(),
+            line: 7,
+            status: "open".to_string(),
+            fix_commit: None,
+            evidence: None,
+            justification: None,
+        }
+    }
+
+    struct ReviewFixture {
+        _root: tempfile::TempDir,
+        state: tempfile::TempDir,
+        _config: tempfile::TempDir,
+        team: TeamRuntime,
+        record: WorkerRecord,
+    }
+
+    impl ReviewFixture {
+        fn rows(&self) -> Vec<DispatchRoutingRow> {
+            std::fs::read_to_string(self.state.path().join("dispatch_routing.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect()
+        }
+    }
+
+    async fn review_fixture(
+        mode: crate::mnemo2::dispatch_routing::RoutingMode,
+        id: &str,
+    ) -> ReviewFixture {
+        use crate::mnemo2::dispatch_routing::{save_routing_settings, RoutingSettings};
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        save_routing_settings(
+            config.path(),
+            &RoutingSettings {
+                mode,
+                ..RoutingSettings::default()
+            },
+        )
+        .expect("routing settings");
+        let mut record = worker(root.path(), id);
+        record.model = Some("test/scripted-difficult".into());
+        record.tier = Some("high".into());
+        record.routing = Some(WorkerRouting {
+            laya_tier: Some("high".into()),
+            confidence: Some(0.8),
+            cleared: true,
+            lead_tier: Some("high".into()),
+            routed_by: "lead".into(),
+            ran_tier: Some("high".into()),
+            nudged: None,
+        });
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("worker checkout");
+        let team = open_test_team_with_config(
+            root.path(),
+            state.path(),
+            vec![record.clone()],
+            config.path(),
+        )
+        .await;
+        let mut tiers = tiers_dto! {
+            difficult: vec!["test/scripted-difficult".into()],
+            average: vec!["test/scripted-average".into()],
+            simple: vec!["test/scripted-simple".into()],
+        };
+        tiers.tiers[4].models = vec!["test/scripted-escalate".into()];
+        team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-simple"),
+                lead_model("scripted-escalate"),
+            ],
+            tiers,
+            Vec::new(),
+        );
+        ReviewFixture {
+            _root: root,
+            state,
+            _config: config,
+            team,
+            record,
+        }
+    }
+
+    /// One configured model in the team's catalog, so `change_model` accepts
+    /// the spec the test endpoint also serves.
+    fn lead_model(model: &str) -> LeadModel {
+        LeadModel {
+            endpoint: "test".to_string(),
+            model: model.to_string(),
+            spec: format!("test/{model}"),
+            is_default: model == "scripted-a",
+            reasoning_efforts: Vec::new(),
+            default_effort: None,
+        }
+    }
+
+    /// Every review of a worker is a review round, and a finding routed back
+    /// to it is a fix round (plan 40eef714 step 4).
+    #[tokio::test]
+    async fn review_and_fix_rounds_are_counted() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let record = worker(root.path(), "rounds000001");
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        let team = open_test_team(root.path(), state.path(), vec![record.clone()]).await;
+
+        let first = team
+            .review(
+                &record.id,
+                "first pass".into(),
+                vec![open_finding("finding1")],
+                evidence(),
+            )
+            .await
+            .expect("record the first review");
+        assert_eq!(first.review_rounds, 1, "{first:?}");
+        assert_eq!(first.fix_rounds, 0, "{first:?}");
+
+        let routed = team
+            .route_fix(&record.id, "finding1")
+            .await
+            .expect("route the finding back to the worker");
+        assert_eq!(routed.review_rounds, 1, "{routed:?}");
+        assert_eq!(routed.fix_rounds, 1, "{routed:?}");
+
+        // The test endpoint cannot serve the fixer turn; freeze the session and
+        // review the still-open finding again: that is review round two.
+        team.stop_inner(&record.id).await.expect("stop the worker");
+        let second = team
+            .review(
+                &record.id,
+                "second pass".into(),
+                vec![open_finding("finding1")],
+                evidence(),
+            )
+            .await
+            .expect("record the second review");
+        assert_eq!(second.review_rounds, 2, "{second:?}");
+        assert_eq!(second.fix_rounds, 1, "{second:?}");
+        team.shutdown().await;
+    }
+
+    /// An independent audit is counted on the worker it audits, never on the
+    /// audit worker itself (plan 40eef714 step 4).
+    #[tokio::test]
+    async fn audit_dispatch_counts_on_the_target() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let plans_dir = root.path().join(".coding/plans");
+        std::fs::create_dir_all(&plans_dir).expect("plans dir");
+        let board = PlanBoard::new(&plans_dir, root.path().join(".coding/reviews"));
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Audited plan".into(),
+                goal: "Count the audits".into(),
+                context: "verified: src-tauri/src/mnemo2/team.rs records the audit round.".into(),
+                steps: vec!["**Count** the audits in src-tauri/src/mnemo2/team.rs".into()],
+                acceptance: vec!["The audited worker records the audit".into()],
+                ..Default::default()
+            })
+            .expect("create the plan");
+        let mut record = worker(root.path(), "audited00001");
+        record.plan_id = Some(plan.id.clone());
+        record.plan_step = Some(0);
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        let team = open_test_team(root.path(), state.path(), vec![record.clone()]).await;
+        let team = Arc::new(team);
+        team.attach_board(Arc::new(board));
+
+        let (audit, reused) = team
+            .audit_dispatch(&record.id, "auditworker1", None, None, None)
+            .await
+            .expect("dispatch the audit");
+        assert!(!reused, "a fresh audit is not a reuse");
+        assert_eq!(audit.kind, "audit", "{audit:?}");
+        assert_eq!(audit.audits, 0, "the count lands on the target: {audit:?}");
+        let target = team.worker(&record.id).await.expect("the audited worker");
+        assert_eq!(target.audits, 1, "{target:?}");
+        team.shutdown().await;
+    }
+
+    /// An audit that reported ends its own session (plan 5779641): the
+    /// slot it held is freed the moment its turn ends, without the lead
+    /// stopping it, and its report is already recorded when that happens.
+    #[tokio::test]
+    async fn finished_audit_releases_its_slot() {
+        let (fixture, _notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings::default(),
+            None,
+            std::time::Duration::ZERO,
+            vec![
+                // The audit reports through message_parent, then ends its
+                // turn — exactly what audit_prompt() tells it to do.
+                tool_call_batch(
+                    "audit-report",
+                    "message_parent",
+                    r#"{"text":"Read-only audit: no findings; the change matches its plan."}"#,
+                ),
+                vec![
+                    mnemo::provider::LlmEvent::TextDelta {
+                        text: "reported".to_string(),
+                    },
+                    mnemo::provider::LlmEvent::Finish {
+                        reason: mnemo::provider::FinishReason::Stop,
+                    },
+                ],
+            ],
+        )
+        .await;
+        let team = &fixture.team;
+        // One slot: the audit itself is the only worker that may hold it.
+        team.persistence.slots.store(1, Ordering::SeqCst);
+        // The audited implementation worker: an idle record with a live
+        // checkout, dispatched on the fixture's board plan.
+        let mut target = worker(fixture._root.path(), "target00001");
+        target.plan_id = Some(fixture.plan_id.clone());
+        target.plan_step = Some(0);
+        provision_agent_worktree(
+            fixture._root.path().to_path_buf(),
+            target.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the target checkout");
+        team.records.lock().await.push(target.clone());
+
+        let (audit, reused) = team
+            .audit_dispatch(&target.id, "auditworker1", None, None, None)
+            .await
+            .expect("dispatch the audit into the one slot");
+        assert!(!reused, "a fresh audit is not a reuse");
+        let audit_id = audit.id.clone();
+        let finished = eventually(|| async {
+            let record = team.worker(&audit_id).await.ok()?;
+            (record.status == WorkerStatus::Completed).then_some(record)
+        })
+        .await;
+        // The report was recorded before the session ended.
+        assert!(finished.report_delivered, "{finished:?}");
+        assert!(
+            team.messages()
+                .await
+                .iter()
+                .any(|message| message.worker_id == audit_id),
+            "the audit's report is recorded for the lead"
+        );
+        // The finished audit no longer counts against the slots.
+        assert_eq!(
+            team.live.lock().await.len(),
+            0,
+            "the finished audit released its slot"
+        );
+        // The freed slot dispatches a fresh audit with no manual stop
+        // (a different id prefix: the finished audit's branch stays).
+        team.audit_dispatch(&target.id, "audittwo001", None, None, None)
+            .await
+            .expect("the released slot dispatches a fresh audit");
+        team.shutdown().await;
+    }
+
+    /// A finished audit never comes back (plan 5779641): resume, compact,
+    /// model change and message are all refused with the same words.
+    #[tokio::test]
+    async fn finished_audit_cannot_be_resumed() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut audit = worker(root.path(), "auditworker1");
+        audit.kind = "audit".to_string();
+        audit.status = WorkerStatus::Completed;
+        audit.report_delivered = true;
+        let team = open_test_team(root.path(), state.path(), vec![audit]).await;
+        let refusal = "audit worker 'auditworker1' already delivered its report; dispatch a new audit with team_audit_dispatch";
+        let error = team
+            .resume("auditworker1")
+            .await
+            .expect_err("resume refuses a finished audit");
+        assert_eq!(error, refusal);
+        let error = team
+            .compact("auditworker1")
+            .await
+            .expect_err("compact refuses a finished audit");
+        assert_eq!(error, refusal);
+        let error = team
+            .change_model("auditworker1", None, None, ChangeSource::User)
+            .await
+            .expect_err("change_model refuses a finished audit");
+        assert_eq!(error, refusal);
+        let error = team
+            .message(
+                "auditworker1",
+                "one more look at the diff".to_string(),
+                MessageSender::User,
+            )
+            .await
+            .expect_err("message refuses a finished audit");
+        assert_eq!(error, refusal);
+        team.set_catalog(
+            vec![lead_model("scripted-difficult")],
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: Vec::new(),
+                simple: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let result = team
+            .handle_lead_host_tool(
+                "team_resume",
+                json!({"worker_id": "auditworker1", "tier": "high"}),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains(refusal), "{}", result.output);
+        team.shutdown().await;
+    }
+
+    /// The other side of the coin: an audit that failed before it reported
+    /// keeps today's resume path — the lead can still bring it back.
+    #[tokio::test]
+    async fn audit_that_failed_before_reporting_can_still_be_resumed() {
+        let (fixture, _notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings::default(),
+            None,
+            std::time::Duration::ZERO,
+            vec![vec![
+                mnemo::provider::LlmEvent::TextDelta {
+                    text: "done".to_string(),
+                },
+                mnemo::provider::LlmEvent::Finish {
+                    reason: mnemo::provider::FinishReason::Stop,
+                },
+            ]],
+        )
+        .await;
+        let team = &fixture.team;
+        let mut audit = worker(fixture._root.path(), "auditworker1");
+        audit.kind = "audit".to_string();
+        audit.status = WorkerStatus::Failed;
+        audit.error = Some("the audit's turn failed before any report".to_string());
+        provision_agent_worktree(
+            fixture._root.path().to_path_buf(),
+            audit.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the audit checkout");
+        team.records.lock().await.push(audit.clone());
+        let resumed = team
+            .resume("auditworker1")
+            .await
+            .expect("a failed audit can still be resumed");
+        assert_eq!(resumed.status, WorkerStatus::Idle, "{resumed:?}");
+        team.shutdown().await;
+    }
+
+    /// Ledgers written before `report_delivered` existed decode without it;
+    /// a `Completed` audit from such a ledger still counts as finished.
+    #[tokio::test]
+    async fn legacy_completed_audit_counts_as_finished() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut audit = worker(root.path(), "auditworker1");
+        audit.kind = "audit".to_string();
+        audit.status = WorkerStatus::Completed;
+        // The on-disk ledger predates the field: serialize and strip it.
+        let mut value = serde_json::to_value(&audit).expect("serialize the audit");
+        value
+            .as_object_mut()
+            .expect("the record serializes as an object")
+            .remove("report_delivered");
+        let legacy: WorkerRecord =
+            serde_json::from_value(value).expect("decode the legacy ledger");
+        assert!(!legacy.report_delivered, "{legacy:?}");
+        assert!(audit_finished(&legacy), "{legacy:?}");
+        let team = open_test_team(root.path(), state.path(), vec![legacy]).await;
+        let error = team
+            .resume("auditworker1")
+            .await
+            .expect_err("resume refuses a legacy completed audit");
+        assert_eq!(
+            error,
+            "audit worker 'auditworker1' already delivered its report; dispatch a new audit with team_audit_dispatch"
+        );
+        team.shutdown().await;
+    }
+
+    /// A model switch appends the new spec once: `models_used` is the order the
+    /// worker ran in, without consecutive duplicates (plan 40eef714 step 4).
+    #[tokio::test]
+    async fn model_switch_appends_models_used() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        team.set_catalog(
+            vec![lead_model("scripted-a"), lead_model("scripted-b")],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+
+        let dispatched = team
+            .dispatch_with_id(
+                "implement the counting feature".into(),
+                Some("test/scripted-a".into()),
+                Some("models00001".into()),
+                None,
+            )
+            .await
+            .expect("dispatch the worker on model A");
+        assert_eq!(
+            dispatched.models_used,
+            vec!["test/scripted-a".to_string()],
+            "{dispatched:?}"
+        );
+
+        let switched = team
+            .change_model(
+                "models00001",
+                Some("test/scripted-b".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("switch the worker to model B");
+        assert_eq!(
+            switched.models_used,
+            vec![
+                "test/scripted-a".to_string(),
+                "test/scripted-b".to_string()
+            ],
+            "{switched:?}"
+        );
+
+        let again = team
+            .change_model(
+                "models00001",
+                Some("test/scripted-b".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("switch to model B again");
+        assert_eq!(
+            again.models_used,
+            vec![
+                "test/scripted-a".to_string(),
+                "test/scripted-b".to_string()
+            ],
+            "a repeated model adds nothing: {again:?}"
+        );
+        team.shutdown().await;
+    }
+
+    struct StubDispatchClassifier {
+        answer: Option<mnemo::memory::Answer>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        delay: std::time::Duration,
+    }
+
+    impl StubDispatchClassifier {
+        fn new(answer: Option<mnemo::memory::Answer>) -> Self {
+            Self {
+                answer,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                delay: std::time::Duration::ZERO,
+            }
+        }
+
+        fn slow(answer: Option<mnemo::memory::Answer>, delay: std::time::Duration) -> Self {
+            Self { delay, ..Self::new(answer) }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mnemo::memory::Classifier for StubDispatchClassifier {
+        async fn classify(
+            &self,
+            _state: &str,
+            _question: &mnemo::memory::Question,
+        ) -> Option<mnemo::memory::Answer> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+            self.answer.clone()
+        }
+    }
+
+    struct RoutingFixture {
+        _root: tempfile::TempDir,
+        state: tempfile::TempDir,
+        _config: tempfile::TempDir,
+        team: std::sync::Arc<TeamRuntime>,
+        plan_id: String,
+        classifier: std::sync::Arc<StubDispatchClassifier>,
+    }
+
+    impl RoutingFixture {
+        fn log_path(&self) -> std::path::PathBuf {
+            self.state.path().join("dispatch_routing.jsonl")
+        }
+
+        /// The rows written so far; an absent log (routing off, never
+        /// touched) reads as no rows.
+        fn rows(&self) -> Vec<crate::mnemo2::dispatch_routing::DispatchRoutingRow> {
+            std::fs::read_to_string(self.log_path())
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect()
+        }
+
+        async fn dispatch(&self, tier: Option<&str>, model: Option<&str>) -> ToolResult {
+            let mut args = json!({
+                "worker_id": "routingworker",
+                "plan_id": self.plan_id,
+                "step": 1,
+                "brief": "Implement the step exactly and run its focused regression tests.",
+            });
+            if let Some(tier) = tier {
+                args["tier"] = json!(tier);
+            }
+            if let Some(model) = model {
+                args["model"] = json!(model);
+            }
+            self.team.handle_lead_host_tool("team_dispatch", args).await
+        }
+    }
+
+    fn routing_answer(label: &str, confidence: f64) -> Option<mnemo::memory::Answer> {
+        Some(mnemo::memory::Answer::Choice {
+            label: label.into(),
+            confidence,
+            probabilities: std::collections::BTreeMap::new(),
+        })
+    }
+
+    async fn routing_fixture_with(
+        settings: crate::mnemo2::dispatch_routing::RoutingSettings,
+        answer: Option<mnemo::memory::Answer>,
+        install_classifier: bool,
+        delay: std::time::Duration,
+    ) -> RoutingFixture {
+        use crate::mnemo2::dispatch_routing::save_routing_settings;
+        use mnemo::app::plan_board::{PlanBoard, PlanDraft};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        save_routing_settings(config.path(), &settings).expect("save routing mode");
+        let mut team = open_test_team_with_config(
+            root.path(),
+            state.path(),
+            Vec::new(),
+            config.path(),
+        )
+        .await;
+        let models = vec![
+            lead_model("scripted-difficult"),
+            lead_model("scripted-average"),
+            lead_model("scripted-simple"),
+        ];
+        team.set_catalog(
+            models,
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec!["test/scripted-average".into()],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            Vec::new(),
+        );
+        let classifier = std::sync::Arc::new(StubDispatchClassifier::slow(answer, delay));
+        if install_classifier {
+            let slot: mnemo::memory::classifier::ClassifierSlot =
+                std::sync::Arc::new(std::sync::RwLock::new(Some(classifier.clone())));
+            team.classifier = Some(slot);
+        }
+        let board = Arc::new(
+            PlanBoard::new(
+                root.path().join(".coding/plans"),
+                root.path().join(".coding/reviews"),
+            ),
+        );
+        let plan = board
+            .create(PlanDraft {
+                title: "Dispatch routing test".into(),
+                goal: "Exercise Laya dispatch routing through the real worker lifecycle".into(),
+                context: "A persisted board step supplies the exact implementation text and worker brief.".into(),
+                steps: vec!["Implement the requested routing behavior in src-tauri/src/mnemo2/team.rs and verify it with focused regression tests".into()],
+                ..PlanDraft::default()
+            })
+            .expect("create routing plan");
+        let team = Arc::new(team);
+        team.attach_board(board);
+        RoutingFixture {
+            _root: root,
+            state,
+            _config: config,
+            team,
+            plan_id: plan.id,
+            classifier,
+        }
+    }
+
+    async fn routing_fixture(
+        mode: crate::mnemo2::dispatch_routing::RoutingMode,
+        answer: Option<mnemo::memory::Answer>,
+        install_classifier: bool,
+    ) -> RoutingFixture {
+        routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            answer,
+            install_classifier,
+            std::time::Duration::ZERO,
+        )
+        .await
+    }
+
+    /// Poll `probe` every 25 ms until it resolves to `Some`, or fail after
+    /// 20 s: the worker pumps and the detached drift work run concurrently
+    /// with the test.
+    async fn eventually<T, F, Fut>(probe: F) -> T
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        for _ in 0..800 {
+            if let Some(value) = probe().await {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the polled condition never became true");
+    }
+
+    /// A scripted LLM client (the team module's scripted-mock seam): every
+    /// `complete` serves the next scripted batch, then a plain text stop —
+    /// so a dispatched worker runs real turns, executes real tool calls,
+    /// and the pump observes real tool events.
+    struct ScriptedLlm {
+        responses: std::sync::Mutex<VecDeque<Vec<mnemo::provider::LlmEvent>>>,
+    }
+
+    impl ScriptedLlm {
+        fn new(responses: Vec<Vec<mnemo::provider::LlmEvent>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mnemo::provider::LlmClient for ScriptedLlm {
+        fn capabilities(&self) -> &mnemo::provider::Capabilities {
+            static CAPS: std::sync::OnceLock<mnemo::provider::Capabilities> =
+                std::sync::OnceLock::new();
+            CAPS.get_or_init(mnemo::provider::Capabilities::openai)
+        }
+
+        fn kind(&self) -> mnemo::provider::ProviderKind {
+            mnemo::provider::ProviderKind::OpenAI
+        }
+
+        fn model(&self) -> &str {
+            "scripted"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[mnemo::provider::Message],
+            _tools: &[mnemo::provider::ToolSchema],
+            _tool_choice: Option<mnemo::provider::ToolChoice>,
+        ) -> mnemo::error::Result<
+            futures::stream::BoxStream<'_, mnemo::provider::LlmEvent>,
+        > {
+            let events = self
+                .responses
+                .lock()
+                .map(|mut queue| queue.pop_front())
+                .unwrap_or_default()
+                .unwrap_or_else(|| {
+                    vec![
+                        mnemo::provider::LlmEvent::TextDelta {
+                            text: "done".to_string(),
+                        },
+                        mnemo::provider::LlmEvent::Finish {
+                            reason: mnemo::provider::FinishReason::Stop,
+                        },
+                    ]
+                });
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// One scripted batch: a single tool call the session executes for
+    /// real. An unknown tool name deterministically fails; `read_files` on
+    /// the worktree's seeded README.md deterministically succeeds.
+    fn tool_call_batch(call_id: &str, name: &str, args: &str) -> Vec<mnemo::provider::LlmEvent> {
+        vec![
+            mnemo::provider::LlmEvent::ToolCallStart {
+                index: 0,
+                id: call_id.to_string(),
+                name: name.to_string(),
+            },
+            mnemo::provider::LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: args.to_string(),
+            },
+            mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::ToolCalls,
+            },
+        ]
+    }
+
+    /// The nudge tests' live team (design §4.6): the routing settings come
+    /// from the config dir, all three tiers are in the catalog, and the
+    /// worker sessions run real turns served by the scripted LLM — so the
+    /// pump observes real tool results and the strike counter counts real
+    /// failures. Returns the usual routing fixture plus a board-signal
+    /// subscription taken before any dispatch, to catch nudge notices.
+    async fn nudge_fixture_with(
+        settings: crate::mnemo2::dispatch_routing::RoutingSettings,
+        answer: Option<mnemo::memory::Answer>,
+        delay: std::time::Duration,
+        responses: Vec<Vec<mnemo::provider::LlmEvent>>,
+    ) -> (RoutingFixture, broadcast::Receiver<BoardSignal>) {
+        use crate::mnemo2::dispatch_routing::save_routing_settings;
+        use mnemo::app::plan_board::{PlanBoard, PlanDraft};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        save_routing_settings(config.path(), &settings).expect("save routing settings");
+        std::fs::write(
+            config.path().join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
+        )
+        .expect("config.toml");
+        std::fs::write(
+            config.path().join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"scripted-a\", \"scripted-b\"]\n",
+        )
+        .expect("endpoints.toml");
+        TeamPersistence::new(state.path())
+            .save(&PersistedTeam {
+                workers: Vec::new(),
+                slots: Some(2),
+                usage: ProjectUsage::default(),
+            })
+            .expect("save the team ledger");
+        let engine = mnemo::headless::EngineBuilder::new(mnemo::headless::EngineOptions {
+            workspace: mnemo::workspace::Workspace::new(root.path()),
+            config_dir: Some(config.path().to_path_buf()),
+            permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+            memory: mnemo::headless::MemoryBackend::Disabled,
+            index_codegraph: false,
+            require_git: true,
+            auto_install_embedder: false,
+        })
+        .provider(Arc::new(ScriptedLlm::new(responses)))
+        .start()
+        .await
+        .expect("start the scripted engine");
+        let mut team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: Arc::new(engine),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            config_dir: config.path().to_path_buf(),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+            slots: Some(2),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("open the team");
+        team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-simple"),
+            ],
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec!["test/scripted-average".into()],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            Vec::new(),
+        );
+        let classifier = std::sync::Arc::new(StubDispatchClassifier::slow(answer, delay));
+        let slot: mnemo::memory::classifier::ClassifierSlot =
+            std::sync::Arc::new(std::sync::RwLock::new(Some(classifier.clone())));
+        team.classifier = Some(slot);
+        let board = Arc::new(PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        ));
+        let plan = board
+            .create(PlanDraft {
+                title: "Nudge test".into(),
+                goal: "Exercise the nudge paths through the real worker lifecycle".into(),
+                context: "A persisted board step supplies the exact implementation text and worker brief.".into(),
+                steps: vec!["Implement the requested nudge behavior in src-tauri/src/mnemo2/team.rs and verify it with focused regression tests".into()],
+                ..PlanDraft::default()
+            })
+            .expect("create the nudge plan");
+        let team = Arc::new(team);
+        team.attach_board(board);
+        let notices = team.subscribe_board();
+        (
+            RoutingFixture {
+                _root: root,
+                state,
+                _config: config,
+                team,
+                plan_id: plan.id,
+                classifier,
+            },
+            notices,
+        )
+    }
+
+    /// A shadow-mode nudge fixture with the scripted responses.
+    async fn nudge_fixture(
+        responses: Vec<Vec<mnemo::provider::LlmEvent>>,
+    ) -> (RoutingFixture, broadcast::Receiver<BoardSignal>) {
+        nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            std::time::Duration::ZERO,
+            responses,
+        )
+        .await
+    }
+
+    /// Wait until the live worker's turn settles: the pump processes the
+    /// turn's tool events synchronously, so once the status flips the
+    /// nudge decision has also been made.
+    async fn wait_worker_settled(team: &TeamRuntime, worker_id: &str) -> WorkerRecord {
+        eventually(|| async {
+            let worker = team.worker(worker_id).await.expect("worker");
+            matches!(
+                worker.status,
+                WorkerStatus::Idle
+                    | WorkerStatus::Completed
+                    | WorkerStatus::Stopped
+                    | WorkerStatus::Failed
+            )
+            .then_some(worker)
+        })
+        .await
+    }
+
+    /// Poll the board signals until the worker's nudge notice lands;
+    /// unrelated refreshes drain away.
+    async fn wait_nudge_notice(
+        notices: &mut broadcast::Receiver<BoardSignal>,
+        worker_id: &str,
+    ) -> String {
+        let key = format!("nudge:{worker_id}");
+        for _ in 0..800 {
+            while let Ok(signal) = notices.try_recv() {
+                if let BoardSignal::Notice { key: notice_key, text } = signal {
+                    if notice_key == key {
+                        return text;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the nudge notice never arrived");
+    }
+
+    /// A lead message long enough for drift classification (≥ 20 words).
+    fn drift_message() -> String {
+        "This change turned out to touch the shared routing contract after all, \
+         so please be extra careful with the integration boundary and run the \
+         full regression battery once more before you call the step done."
+            .to_string()
+    }
+
+    /// Three failing tool calls in a row nudge the lead once — and only
+    /// once, even when the streak keeps failing (design §4.6).
+    #[tokio::test]
+    async fn three_failing_tool_calls_nudge_once() {
+        let responses = (1..=3)
+            .map(|attempt| tool_call_batch(&format!("call-{attempt}"), "not_a_real_tool", &format!("{{\"attempt\":{attempt}}}")))
+            .chain([vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ]])
+            .collect::<Vec<_>>();
+        let (fixture, mut notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let row = eventually(|| async {
+            fixture
+                .rows()
+                .into_iter()
+                .find(|row| matches!(row, DispatchRoutingRow::Nudge { .. }))
+        })
+        .await;
+        assert!(
+            matches!(
+                &row,
+                DispatchRoutingRow::Nudge {
+                    reason,
+                    from_tier,
+                    to_tier,
+                    detail,
+                    ..
+                } if reason == "strikes"
+                    && from_tier == "routine"
+                    && to_tier == "high"
+                    && detail == "looks stuck (3 failing tool calls in a row)"
+            ),
+            "the strike nudge row: {row:?}"
+        );
+        let notice = wait_nudge_notice(&mut notices, "routingworker").await;
+        assert_eq!(
+            notice,
+            "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier high."
+        );
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert_eq!(
+            settled.routing.as_ref().expect("routed at dispatch").nudged.as_deref(),
+            Some("high"),
+            "the nudge is marked on the record: {settled:?}"
+        );
+        // Three consecutive real failures also trip the session's own
+        // doom guard, so the worker lands Failed — exactly when the nudge
+        // telling the lead to resume on a stronger tier is useful. The
+        // nudge never stopped or switched anything itself.
+        assert!(
+            matches!(settled.status, WorkerStatus::Failed),
+            "the doom guard, not the nudge, failed the worker: {settled:?}"
+        );
+        assert_ne!(
+            settled.model.as_deref(),
+            Some("test/scripted-difficult"),
+            "the nudge never switched the model: {settled:?}"
+        );
+        assert_eq!(
+            fixture
+                .rows()
+                .into_iter()
+                .filter(|row| matches!(row, DispatchRoutingRow::Nudge { .. }))
+                .count(),
+            1,
+            "exactly one nudge: {:?}",
+            fixture.rows()
+        );
+        // A failure is resumable, not terminal: the doom-guard failure
+        // logs the outcome but never nudge_ignored — a team_resume on a
+        // stronger tier can still take the nudge.
+        assert!(
+            matches!(
+                fixture.rows().as_slice(),
+                [DispatchRoutingRow::Route { .. },
+                 DispatchRoutingRow::Nudge { .. },
+                 DispatchRoutingRow::Outcome { status, .. }]
+                    if status == "failed"
+            ),
+            "the route, the nudge, and the outcome rows: {:?}",
+            fixture.rows()
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// A failure is resumable, not terminal: the doom-guard failure that
+    /// rides the strike nudge logs the outcome but never `nudge_ignored` —
+    /// `team_resume` on a stronger tier can still take the nudge.
+    #[tokio::test]
+    async fn failed_worker_does_not_log_nudge_ignored() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        // The terminal failure row is the deterministic marker that the
+        // pump has fully processed the worker's failure; the nudge row
+        // lands with the third tool result, before the Error event.
+        let outcome = eventually(|| async {
+            fixture.rows().into_iter().find(|row| {
+                matches!(row, DispatchRoutingRow::Outcome { status, .. } if status == "failed")
+            })
+        })
+        .await;
+        assert!(
+            matches!(&outcome, DispatchRoutingRow::Outcome { final_tier, .. } if final_tier == "routine"),
+            "the failure outcome: {outcome:?}"
+        );
+        assert!(
+            fixture
+                .rows()
+                .iter()
+                .any(|row| matches!(row, DispatchRoutingRow::Nudge { .. })),
+            "the strike nudge fired before the failure: {:?}",
+            fixture.rows()
+        );
+        assert!(
+            fixture
+                .rows()
+                .iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::NudgeIgnored { .. })),
+            "a failed worker never logs nudge_ignored: {:?}",
+            fixture.rows()
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// Stopping the failed worker is truly terminal: the ignored nudge logs
+    /// there, once — a repeated stop writes nothing more.
+    #[tokio::test]
+    async fn stopped_after_failure_logs_nudge_ignored_once() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        // The strike nudge fires and the doom guard fails the worker.
+        let failed = eventually(|| async {
+            let worker = fixture
+                .team
+                .worker("routingworker")
+                .await
+                .expect("worker");
+            (worker.status == WorkerStatus::Failed).then_some(worker)
+        })
+        .await;
+        assert!(
+            failed.routing.as_ref().expect("routed at dispatch").nudged.is_some(),
+            "the strike nudge was claimed before the failure: {failed:?}"
+        );
+        assert!(
+            fixture
+                .rows()
+                .iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::NudgeIgnored { .. })),
+            "the failure itself never logs nudge_ignored: {:?}",
+            fixture.rows()
+        );
+        // The lead stops the failed worker: the ignored nudge lands beside
+        // the stopped outcome.
+        let stopped = fixture
+            .team
+            .stop("routingworker")
+            .await
+            .expect("stop the failed worker");
+        assert!(matches!(stopped.status, WorkerStatus::Stopped), "{stopped:?}");
+        assert!(
+            matches!(
+                fixture.rows().as_slice(),
+                [..,
+                 DispatchRoutingRow::Outcome { status, .. },
+                 DispatchRoutingRow::NudgeIgnored { tier, .. }
+                ] if status == "stopped" && tier == "routine"
+            ),
+            "the stopped outcome plus the ignored nudge: {:?}",
+            fixture.rows()
+        );
+        // Stopping again writes nothing more.
+        fixture
+            .team
+            .stop("routingworker")
+            .await
+            .expect("stopping again is a no-op");
+        assert_eq!(
+            fixture
+                .rows()
+                .iter()
+                .filter(|row| matches!(row, DispatchRoutingRow::NudgeIgnored { .. }))
+                .count(),
+            1,
+            "nudge_ignored logs once: {:?}",
+            fixture.rows()
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// Identical tool calls count as strikes even when they succeed: the
+    /// repeat is the strike, and the nudge says "going in circles".
+    #[tokio::test]
+    async fn identical_calls_count_as_strikes() {
+        let batch = tool_call_batch("same-call", "read_files", "{\"files\":[\"README.md\"]}");
+        let responses = vec![
+            batch.clone(),
+            batch.clone(),
+            batch.clone(),
+            batch,
+            vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ],
+        ];
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let row = eventually(|| async {
+            fixture
+                .rows()
+                .into_iter()
+                .find(|row| matches!(row, DispatchRoutingRow::Nudge { .. }))
+        })
+        .await;
+        assert!(
+            matches!(
+                &row,
+                DispatchRoutingRow::Nudge { reason, detail, to_tier, .. }
+                    if reason == "circles"
+                        && detail == "looks stuck (going in circles)"
+                        && to_tier == "high"
+            ),
+            "the circles nudge row: {row:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// A successful, non-repeated call resets the strike counter: two
+    /// failures, a success, two more failures never reach three.
+    #[tokio::test]
+    async fn a_success_resets_the_strikes() {
+        let responses = vec![
+            tool_call_batch("call-1", "not_a_real_tool", "{\"attempt\":1}"),
+            tool_call_batch("call-2", "not_a_real_tool", "{\"attempt\":2}"),
+            tool_call_batch("call-3", "read_files", "{\"files\":[\"README.md\"]}"),
+            tool_call_batch("call-4", "not_a_real_tool", "{\"attempt\":4}"),
+            tool_call_batch("call-5", "not_a_real_tool", "{\"attempt\":5}"),
+            vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ],
+        ];
+        let (fixture, mut notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert!(
+            fixture
+                .rows()
+                .into_iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::Nudge { .. })),
+            "the reset streak never nudged: {:?}",
+            fixture.rows()
+        );
+        assert!(
+            settled.routing.as_ref().expect("routed at dispatch").nudged.is_none(),
+            "the reset streak never claimed a nudge: {settled:?}"
+        );
+        let mut saw_nudge_notice = false;
+        while let Ok(signal) = notices.try_recv() {
+            if let BoardSignal::Notice { key, .. } = signal {
+                if key.starts_with("nudge:") {
+                    saw_nudge_notice = true;
+                }
+            }
+        }
+        assert!(!saw_nudge_notice, "no nudge notice was queued");
+        fixture.team.shutdown().await;
+    }
+
+    /// A worker already on the top enabled tier is never nudged.
+    #[tokio::test]
+    async fn no_nudge_on_the_top_tier() {
+        let responses = (1..=3)
+            .map(|attempt| tool_call_batch(&format!("call-{attempt}"), "not_a_real_tool", &format!("{{\"attempt\":{attempt}}}")))
+            .chain([vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ]])
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("high"), None).await;
+        assert!(result.success, "{}", result.output);
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert_eq!(settled.tier.as_deref(), Some("high"), "{settled:?}");
+        assert!(
+            fixture
+                .rows()
+                .into_iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::Nudge { .. })),
+            "the top tier is never nudged: {:?}",
+            fixture.rows()
+        );
+        assert!(
+            settled.routing.as_ref().expect("routed at dispatch").nudged.is_none(),
+            "no nudge was claimed on the top tier: {settled:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// A lead message Laya reads a tier above the worker's nudges with
+    /// reason `drift` (design §4.6).
+    #[tokio::test]
+    async fn drift_message_nudges_when_laya_reads_it_harder() {
+        let (fixture, mut notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            std::time::Duration::ZERO,
+            vec![vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ]],
+        )
+        .await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        wait_worker_settled(&fixture.team, "routingworker").await;
+        let record = fixture
+            .team
+            .message("routingworker", drift_message(), MessageSender::Lead)
+            .await
+            .expect("deliver the message");
+        assert!(record.routing.is_some(), "the dispatched worker is routed");
+        let row = eventually(|| async {
+            fixture
+                .rows()
+                .into_iter()
+                .find(|row| matches!(row, DispatchRoutingRow::Nudge { .. }))
+        })
+        .await;
+        assert!(
+            matches!(
+                &row,
+                DispatchRoutingRow::Nudge { reason, from_tier, to_tier, .. }
+                    if reason == "drift" && from_tier == "routine" && to_tier == "high"
+            ),
+            "the drift nudge row: {row:?}"
+        );
+        let notice = wait_nudge_notice(&mut notices, "routingworker").await;
+        assert_eq!(
+            notice,
+            "worker_id=routingworker Laya nudge: routingworker this got harder (Laya reads the message as hard, 0.91); consider team_resume with tier high."
+        );
+        assert_eq!(
+            fixture.classifier.calls(),
+            2,
+            "dispatch and drift each asked Laya once"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// Drift classification is detached: a slow Laya never delays the
+    /// message, and the nudge still lands (design §4.6).
+    #[tokio::test]
+    async fn drift_never_blocks_the_message() {
+        let (fixture, _notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            std::time::Duration::from_secs(2),
+            vec![vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ]],
+        )
+        .await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        wait_worker_settled(&fixture.team, "routingworker").await;
+        let started = std::time::Instant::now();
+        fixture
+            .team
+            .message("routingworker", drift_message(), MessageSender::Lead)
+            .await
+            .expect("the message returns without waiting on Laya");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_000),
+            "the message waited {elapsed:?} on drift classification"
+        );
+        assert_eq!(
+            fixture.classifier.calls(),
+            1,
+            "only the dispatch classified before the message"
+        );
+        let row = eventually(|| async {
+            fixture
+                .rows()
+                .into_iter()
+                .find(|row| matches!(row, DispatchRoutingRow::Nudge { .. }))
+        })
+        .await;
+        assert!(
+            matches!(&row, DispatchRoutingRow::Nudge { reason, .. } if reason == "drift"),
+            "the slow drift nudge still landed: {row:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// The deterministic review nudge: a second review round that still
+    /// records a high finding nudges the lead to the next tier up, in
+    /// every mode except off (design §4.6).
+    #[tokio::test]
+    async fn second_high_finding_review_nudges() {
+        use crate::mnemo2::dispatch_routing::{save_routing_settings, RoutingSettings, RoutingMode};
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        save_routing_settings(
+            config.path(),
+            &RoutingSettings {
+                mode: RoutingMode::Shadow,
+                ..RoutingSettings::default()
+            },
+        )
+        .expect("save routing settings");
+        let mut record = worker(root.path(), "nudgereview001");
+        record.tier = Some("routine".into());
+        record.routing = Some(WorkerRouting {
+            laya_tier: Some("routine".into()),
+            confidence: Some(0.62),
+            cleared: true,
+            lead_tier: Some("routine".into()),
+            routed_by: "lead".into(),
+            ran_tier: Some("routine".into()),
+            nudged: None,
+        });
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        let team = open_test_team_with_config(
+            root.path(),
+            state.path(),
+            vec![record.clone()],
+            config.path(),
+        )
+        .await;
+        team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-simple"),
+            ],
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec!["test/scripted-average".into()],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            Vec::new(),
+        );
+
+        let first = team
+            .review(&record.id, "first pass".into(), vec![open_finding("finding1")], evidence())
+            .await
+            .expect("record the first review");
+        assert_eq!(first.review_rounds, 1, "{first:?}");
+        assert!(
+            first.routing.as_ref().expect("routed").nudged.is_none(),
+            "one high finding in round one is not a pattern: {first:?}"
+        );
+        team.route_fix(&record.id, "finding1")
+            .await
+            .expect("route the finding back to the worker");
+        team.stop_inner(&record.id)
+            .await
+            .expect("stop the fixer session");
+        let second = team
+            .review(&record.id, "second pass".into(), vec![open_finding("finding1")], evidence())
+            .await
+            .expect("record the second review");
+        assert_eq!(second.review_rounds, 2, "{second:?}");
+        assert_eq!(
+            second.routing.as_ref().expect("routed").nudged.as_deref(),
+            Some("high"),
+            "the second high review round nudged: {second:?}"
+        );
+        let rows = std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<DispatchRoutingRow>(line).expect("routing row"))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                rows.as_slice(),
+                [DispatchRoutingRow::Nudge { reason, from_tier, to_tier, detail, .. }]
+                    if reason == "review"
+                        && from_tier == "routine"
+                        && to_tier == "high"
+                        && detail == "keeps a high finding after 2 review rounds"
+            ),
+            "the review nudge row: {rows:?}"
+        );
+        team.shutdown().await;
+    }
+
+    /// A nudged worker that finishes on the tier it was nudged from logs
+    /// `nudge_ignored` (design §4.7).
+    #[tokio::test]
+    async fn ignored_nudge_is_logged_at_merge() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000003000000000003");
+        worker.status = WorkerStatus::InReview;
+        worker.plan_id = Some("plan0001".into());
+        worker.plan_step = Some(0);
+        worker.tier = Some("routine".into());
+        worker.model = Some("test/scripted-average".into());
+        worker.routing = Some(WorkerRouting {
+            laya_tier: Some("routine".into()),
+            confidence: Some(0.62),
+            cleared: true,
+            lead_tier: Some("routine".into()),
+            routed_by: "lead".into(),
+            ran_tier: Some("routine".into()),
+            // Laya nudged difficult while the worker sat on average, and
+            // no reroute ever took it.
+            nudged: Some("high".into()),
+        });
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        let merged = team.merge(&worker.id).await.expect("merge the worker");
+        assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+        let rows: Vec<DispatchRoutingRow> =
+            std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
+                .expect("the routing log")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect();
+        assert!(
+            matches!(
+                rows.as_slice(),
+                [DispatchRoutingRow::Outcome { status, final_tier, .. },
+                 DispatchRoutingRow::NudgeIgnored { tier, .. }]
+                    if status == "merged" && final_tier == "routine" && tier == "routine"
+            ),
+            "the merged outcome plus the ignored nudge: {rows:?}"
+        );
+        team.shutdown().await;
+    }
+
+    /// `nudges = false` disables all three kinds: strikes never fire, a
+    /// hard-read message never reaches Laya, and a second high review
+    /// round never nudges (design §4.6).
+    #[tokio::test]
+    async fn nudges_off_disables_all_three() {
+        let settings = crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            nudges: false,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        };
+        // Strikes and drift, on a live scripted worker.
+        let responses = (1..=3)
+            .map(|attempt| tool_call_batch(&format!("call-{attempt}"), "not_a_real_tool", &format!("{{\"attempt\":{attempt}}}")))
+            .chain([vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ]])
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture_with(
+            settings.clone(),
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            std::time::Duration::ZERO,
+            responses,
+        )
+        .await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert!(
+            fixture
+                .rows()
+                .into_iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::Nudge { .. })),
+            "strikes never nudged: {:?}",
+            fixture.rows()
+        );
+        assert!(
+            settled.routing.as_ref().expect("routed at dispatch").nudged.is_none(),
+            "no strike nudge was claimed: {settled:?}"
+        );
+        let calls_after_turn = fixture.classifier.calls();
+        fixture
+            .team
+            .message("routingworker", drift_message(), MessageSender::Lead)
+            .await
+            .expect("deliver the message");
+        wait_worker_settled(&fixture.team, "routingworker").await;
+        assert_eq!(
+            fixture.classifier.calls(),
+            calls_after_turn,
+            "drift never asked Laya with nudges off"
+        );
+        assert!(
+            fixture
+                .rows()
+                .into_iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::Nudge { .. })),
+            "nothing nudged with nudges off: {:?}",
+            fixture.rows()
+        );
+        fixture.team.shutdown().await;
+
+        // The review nudge, on a record-based team with the same settings.
+        use crate::mnemo2::dispatch_routing::save_routing_settings;
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let config = tempfile::tempdir().expect("config");
+        init_git(root.path());
+        save_routing_settings(config.path(), &settings).expect("save routing settings");
+        let mut record = worker(root.path(), "nudgesoff0001");
+        record.tier = Some("routine".into());
+        record.routing = Some(WorkerRouting {
+            laya_tier: Some("routine".into()),
+            confidence: Some(0.62),
+            cleared: true,
+            lead_tier: Some("routine".into()),
+            routed_by: "lead".into(),
+            ran_tier: Some("routine".into()),
+            nudged: None,
+        });
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        let team = open_test_team_with_config(
+            root.path(),
+            state.path(),
+            vec![record.clone()],
+            config.path(),
+        )
+        .await;
+        team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-simple"),
+            ],
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec!["test/scripted-average".into()],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            Vec::new(),
+        );
+        team.review(&record.id, "first pass".into(), vec![open_finding("finding1")], evidence())
+            .await
+            .expect("record the first review");
+        team.route_fix(&record.id, "finding1")
+            .await
+            .expect("route the finding back to the worker");
+        team.stop_inner(&record.id)
+            .await
+            .expect("stop the fixer session");
+        let second = team
+            .review(&record.id, "second pass".into(), vec![open_finding("finding1")], evidence())
+            .await
+            .expect("record the second review");
+        assert_eq!(second.review_rounds, 2, "{second:?}");
+        assert!(
+            second.routing.as_ref().expect("routed").nudged.is_none(),
+            "the review never nudged: {second:?}"
+        );
+        let rows = std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
+            .unwrap_or_default();
+        assert!(
+            rows.lines().all(|line| !line.contains("\"nudge\"")),
+            "nothing was written with nudges off: {rows}"
+        );
+        team.shutdown().await;
+    }
+
+    /// Review R1: a routing-settings save must reach a team that is already
+    /// open. The Laya page's Save and the eval's Apply share
+    /// `apply_routing_settings`, which writes the table and then reloads the
+    /// live team — no restart, no unrelated model-settings save.
+    #[tokio::test]
+    async fn saved_routing_mode_reaches_the_open_team() {
+        use crate::mnemo2::dispatch_routing::{load_routing_settings, RoutingMode, RoutingSettings};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let config = tempfile::tempdir().expect("config");
+        let team =
+            open_test_team_with_config(root.path(), state.path(), Vec::new(), config.path()).await;
+        assert_eq!(
+            team.routing_mode(),
+            RoutingMode::Off,
+            "no [routing] table yet: off"
+        );
+
+        let shadow = RoutingSettings { mode: RoutingMode::Shadow, ..RoutingSettings::default() };
+        crate::mnemo2::laya_settings::apply_routing_settings(config.path(), &shadow, Some(&team))
+            .expect("save through the command's core");
+
+        assert_eq!(
+            team.routing_mode(),
+            RoutingMode::Shadow,
+            "the open team reloads the saved mode without a restart"
+        );
+        assert_eq!(
+            load_routing_settings(config.path()).mode,
+            RoutingMode::Shadow,
+            "and the table is on disk for the next open"
+        );
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_never_asks_laya() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fixture.classifier.calls(), 0);
+        assert!(!fixture.log_path().exists());
+        assert!(fixture
+            .team
+            .worker("routingworker")
+            .await
+            .expect("worker")
+            .routing
+            .is_none());
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shadow_logs_layas_pick_and_runs_the_lead_tier() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Laya would pick routine (0.62)."));
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("routine"));
+        let routing = worker.routing.expect("routing metadata");
+        assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.routed_by, "lead");
+        assert_eq!(routing.confidence, Some(0.62));
+        assert!(routing.cleared);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(matches!(
+            &rows[0],
+            crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                tier: Some(tier),
+                ran_tier: Some(ran),
+                ..
+            } if tier == "routine" && ran == "routine"
+        ));
+        let status = team_status_answer(&fixture.team, json!({})).await;
+        assert_eq!(status["result"][0]["routing"]["laya_tier"], "routine");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shadow_override_is_logged_when_laya_cleared_elsewhere() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        assert_eq!(fixture.classifier.calls(), 1);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(matches!(
+            &rows[1],
+            crate::mnemo2::dispatch_routing::DispatchRoutingRow::LeadOverride {
+                laya_tier: Some(laya),
+                lead_tier,
+                ..
+            } if laya == "high" && lead_tier == "routine"
+        ));
+        assert_eq!(
+            fixture
+                .team
+                .worker("routingworker")
+                .await
+                .expect("worker")
+                .routing
+                .expect("routing")
+                .routed_by,
+            "lead_override"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suggest_auto_uses_a_cleared_laya_tier() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("high"));
+        assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+        assert_eq!(worker.routing.expect("routing").routed_by, "laya");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suggest_auto_refuses_when_unsure() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "Laya is unsure (0.39); pass a tier");
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                ran_tier: None,
+                ..
+            }]
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suggest_auto_refuses_when_laya_is_offline() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            None,
+            false,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "Laya is not running; pass a tier");
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn auto_mode_falls_back_when_unsure() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Laya: unsure (0.39)."));
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("routine"));
+        assert_eq!(worker.routing.expect("routing").routed_by, "lead");
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                ran_tier: Some(ran),
+                ..
+            }] if ran == "routine"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_model_wins_in_auto_mode() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(None, Some("test/scripted-simple")).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model.as_deref(), Some("test/scripted-simple"));
+        assert_eq!(worker.tier.as_deref(), Some("trivial"));
+        assert_eq!(worker.routing.expect("routing").routed_by, "lead_override");
+        assert_eq!(fixture.rows().len(), 2);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_laya_times_out_as_offline() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let result = fixture.dispatch(None, None).await;
+        let elapsed = started.elapsed();
+        assert!(result.success, "{}", result.output);
+        assert!(elapsed >= std::time::Duration::from_secs(3), "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+        assert!(result.output.contains("Laya: offline."));
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn redispatch_does_not_classify_twice() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        let reused = fixture.dispatch(Some("routine"), None).await;
+        assert!(reused.success, "{}", reused.output);
+        assert!(reused.output.contains("\"reused\":true"));
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert_eq!(fixture.rows().len(), 1);
+        assert_eq!(
+            fixture
+                .team
+                .worker("routingworker")
+                .await
+                .expect("worker")
+                .routing
+                .expect("stored routing")
+                .confidence,
+            Some(0.62)
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn user_model_change_logs_a_user_reroute() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        // A pending nudge travels with the reroute row and leaves the record.
+        fixture
+            .team
+            .update_worker("routingworker", |worker| {
+                if let Some(routing) = worker.routing.as_mut() {
+                    routing.nudged = Some("high".into());
+                }
+            })
+            .await;
+        fixture
+            .team
+            .change_model(
+                "routingworker",
+                Some("test/scripted-difficult".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("the user moves the worker onto difficult");
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        match &rows[1] {
+            DispatchRoutingRow::UserReroute {
+                worker_id,
+                from_tier,
+                to_tier,
+                from_model,
+                to_model,
+                nudged,
+                ..
+            } => {
+                assert_eq!(worker_id, "routingworker");
+                assert_eq!(from_tier, "routine");
+                assert_eq!(to_tier, "high");
+                assert_eq!(from_model.as_deref(), Some("test/scripted-average"));
+                assert_eq!(to_model.as_deref(), Some("test/scripted-difficult"));
+                assert!(*nudged, "the pending nudge rides the row");
+            }
+            other => panic!("a user reroute row is logged: {other:?}"),
+        }
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.reroutes.len(), 1);
+        assert!(
+            worker
+                .routing
+                .as_ref()
+                .is_some_and(|routing| routing.nudged.is_none()),
+            "the nudge leaves the record: {worker:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lead_resume_onto_another_tier_logs_a_lead_reroute() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        let resumed = fixture
+            .team
+            .handle_lead_host_tool(
+                "team_resume",
+                json!({"worker_id": "routingworker", "tier": "high"}),
+            )
+            .await;
+        assert!(resumed.success, "{}", resumed.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("high"), "{worker:?}");
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        match &rows[1] {
+            DispatchRoutingRow::LeadReroute {
+                worker_id,
+                from_tier,
+                to_tier,
+                nudged,
+                ..
+            } => {
+                assert_eq!(worker_id, "routingworker");
+                assert_eq!(from_tier, "routine");
+                assert_eq!(to_tier, "high");
+                assert!(!*nudged);
+            }
+            other => panic!("a lead reroute row is logged: {other:?}"),
+        }
+        assert_eq!(worker.reroutes.len(), 1);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn same_tier_switch_logs_without_counting_as_override() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-average2"),
+                lead_model("scripted-simple"),
+            ],
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec![
+                    "test/scripted-average".into(),
+                    "test/scripted-average2".into(),
+                ],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            Vec::new(),
+        );
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        fixture
+            .team
+            .change_model(
+                "routingworker",
+                Some("test/scripted-average2".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("the user picks another model inside the average tier");
+        let rows = fixture.rows();
+        match &rows[1] {
+            DispatchRoutingRow::UserReroute { from_tier, to_tier, .. } => {
+                assert_eq!(from_tier, "routine");
+                assert_eq!(
+                    to_tier, "routine",
+                    "a same-tier switch logs equal tiers"
+                );
+            }
+            other => panic!("a reroute row is still logged: {other:?}"),
+        }
+        // Equal tiers never count as an override: there is no effective
+        // reroute, so with two fix rounds the merged label follows the
+        // no-reroute rule (the tier above, weak) instead of the reroute
+        // rule (average, strong).
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        let (label, weak) = outcome_label(&worker.reroutes, "merged", "routine", 2, 0)
+            .expect("a label still derives");
+        assert_eq!(label, "medium");
+        assert!(weak);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn merge_appends_an_outcome_with_the_derived_label() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000002000000000002");
+        worker.status = WorkerStatus::InReview;
+        worker.plan_id = Some("plan0001".into());
+        worker.plan_step = Some(0);
+        worker.tier = Some("routine".into());
+        worker.model = Some("test/scripted-average".into());
+        worker.routing = Some(WorkerRouting {
+            laya_tier: Some("routine".into()),
+            confidence: Some(0.62),
+            cleared: true,
+            lead_tier: Some("routine".into()),
+            routed_by: "lead".into(),
+            ran_tier: Some("routine".into()),
+            nudged: None,
+        });
+        // The worker was rerouted up to difficult before its review closed.
+        worker.reroutes = vec![DispatchRoutingRow::LeadReroute {
+            ts: 1,
+            worker_id: worker.id.clone(),
+            plan_id: "plan0001".into(),
+            step: 1,
+            from_tier: "routine".into(),
+            to_tier: "high".into(),
+            from_model: Some("test/scripted-average".into()),
+            to_model: Some("test/scripted-difficult".into()),
+            status: "idle".into(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }];
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        let merged = team.merge(&worker.id).await.expect("merge the worker");
+        assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+        let rows: Vec<DispatchRoutingRow> =
+            std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
+                .expect("the routing log")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect();
+        // The reroute up to difficult, merged with no fix rounds and no high
+        // findings, derives the strong difficult label (design §4.8 rule 2).
+        assert!(
+            matches!(
+                rows.as_slice(),
+                [DispatchRoutingRow::Outcome {
+                    worker_id,
+                    plan_id,
+                    status,
+                    final_tier,
+                    label: Some(label),
+                    review_rounds,
+                    fix_rounds,
+                    ..
+                }]
+                    if worker_id == "00000002000000000002"
+                        && plan_id == "plan0001"
+                        && status == "merged"
+                        && final_tier == "high"
+                        && label == "high"
+                        && *review_rounds == 0
+                        && *fix_rounds == 0
+            ),
+            "the merged outcome row: {rows:?}"
+        );
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_worker_outcome_has_no_label() {
+        // Routing on, so the worker carries a decision and its terminal
+        // failure is logged (with routing off nothing is written at all).
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        // A forced spec the engine cannot resolve to an endpoint: the
+        // dispatch records the worker, its session fails to spawn, and the
+        // worker lands Failed (the same path as a real host failure).
+        fixture.team.set_catalog(
+            vec![LeadModel {
+                endpoint: "broken".into(),
+                model: "broken".into(),
+                spec: "broken".into(),
+                is_default: false,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+        let result = fixture.dispatch(Some("routine"), Some("broken")).await;
+        assert!(!result.success, "{result:?}");
+        let worker = fixture
+            .team
+            .worker("routingworker")
+            .await
+            .expect("the failed worker is tracked");
+        assert!(
+            matches!(worker.status, WorkerStatus::Failed),
+            "{worker:?}"
+        );
+        // Failed-and-stopped is terminal (design §4.7): the dispatch's route
+        // row is followed by one outcome row, and no label — the worker never
+        // merged.
+        let rows = fixture.rows();
+        assert!(
+            matches!(
+                rows.last(),
+                Some(DispatchRoutingRow::Outcome {
+                    worker_id,
+                    status,
+                    label: None,
+                    ..
+                })
+                    if worker_id == "routingworker" && status == "failed"
+            ),
+            "one unlabeled outcome row: {rows:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reused_dispatch_line_keeps_the_dispatch_time_tier() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        // Laya clears difficult, the lead passes average: an override that
+        // runs average.
+        let first = fixture.dispatch(Some("routine"), None).await;
+        assert!(first.success, "{}", first.output);
+        assert!(
+            first
+                .output
+                .contains("you chose routine; logged as an override."),
+            "{}",
+            first.output
+        );
+        // The worker's tier changes afterwards, on the same model: the
+        // record's mutable tier now reads 'difficult' while the dispatch ran
+        // average. (A switch that also moved the model is refused by the
+        // reuse guard, correctly — only the tier moved here.)
+        fixture
+            .team
+            .record_tier("routingworker", "high")
+            .await;
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("high"), "{worker:?}");
+        // An idempotent re-dispatch reports the dispatch-time ran tier, not
+        // the tier the worker was rerouted onto (audit finding M1).
+        let reused = fixture.dispatch(Some("routine"), None).await;
+        assert!(reused.success, "{}", reused.output);
+        assert!(
+            reused
+                .output
+                .contains("you chose routine; logged as an override."),
+            "the reused dispatch keeps the dispatch-time tier: {}",
+            reused.output
+        );
+        assert!(
+            !reused.output.contains("you ran difficult (requested average)"),
+            "{}",
+            reused.output
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_model_change_logs_the_user_reroute() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            false,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        // No hand reroute yet: off mode keeps the log absent.
+        assert!(!fixture.log_path().exists());
+        fixture
+            .team
+            .change_model(
+                "routingworker",
+                Some("test/scripted-difficult".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("the user moves the worker");
+        // A hand-moved model is a learning even with routing off (decided
+        // 2026-11-04): exactly one user reroute row lands in the log, and
+        // the record's tier is the destination tier — final_tier and
+        // team_status agree instead of showing null.
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        match &rows[0] {
+            DispatchRoutingRow::UserReroute {
+                worker_id,
+                from_tier,
+                to_tier,
+                from_model,
+                to_model,
+                ..
+            } => {
+                assert_eq!(worker_id, "routingworker");
+                assert_eq!(from_tier, "routine");
+                assert_eq!(to_tier, "high");
+                assert_eq!(from_model.as_deref(), Some("test/scripted-average"));
+                assert_eq!(to_model.as_deref(), Some("test/scripted-difficult"));
+            }
+            other => panic!("a user reroute row is logged: {other:?}"),
+        }
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.reroutes.len(), 1, "{worker:?}");
+        assert_eq!(worker.tier.as_deref(), Some("high"), "{worker:?}");
+        assert_eq!(final_tier(&worker), "high");
+        let status = team_status_answer(&fixture.team, json!({})).await;
+        assert_eq!(status["result"][0]["tier"], "high");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_unrerouted_merge_writes_no_outcome_row() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000002000000000003");
+        worker.status = WorkerStatus::InReview;
+        worker.plan_id = Some("plan0001".into());
+        worker.plan_step = Some(0);
+        worker.tier = Some("routine".into());
+        worker.model = Some("test/scripted-average".into());
+        // No dispatch decision and no hand reroute: this worker ran with
+        // routing off and was never moved by a hand, so it stays off the
+        // calibration log.
+        worker.routing = None;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        let merged = team.merge(&worker.id).await.expect("merge the worker");
+        assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+        assert!(
+            !state.path().join("dispatch_routing.jsonl").exists(),
+            "off mode writes no outcome row for a worker with no reroute"
+        );
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_rerouted_merge_writes_the_outcome_row() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000002000000000004");
+        worker.status = WorkerStatus::InReview;
+        worker.plan_id = Some("plan0001".into());
+        worker.plan_step = Some(0);
+        worker.tier = Some("routine".into());
+        worker.model = Some("test/scripted-average".into());
+        // No dispatch decision: this worker ran with routing off — but the
+        // user moved it to difficult by hand, and a hand reroute is a
+        // learning in every mode (decided 2026-11-04), so its terminal
+        // outcome row is calibration data.
+        worker.routing = None;
+        worker.reroutes = vec![DispatchRoutingRow::UserReroute {
+            ts: 1,
+            worker_id: worker.id.clone(),
+            plan_id: "plan0001".into(),
+            step: 1,
+            from_tier: "routine".into(),
+            to_tier: "high".into(),
+            from_model: Some("test/scripted-average".into()),
+            to_model: Some("test/scripted-difficult".into()),
+            status: "idle".into(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }];
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision the worker checkout");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        let merged = team.merge(&worker.id).await.expect("merge the worker");
+        assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+        let rows: Vec<DispatchRoutingRow> =
+            std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
+                .expect("the routing log")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("routing row"))
+                .collect();
+        // The hand reroute makes the off-mode worker calibration data: its
+        // merged outcome row is written, labelled difficult by the reroute
+        // rule (design §4.8 rule 2).
+        assert!(
+            matches!(
+                rows.as_slice(),
+                [DispatchRoutingRow::Outcome {
+                    worker_id,
+                    status,
+                    final_tier,
+                    label: Some(label),
+                    ..
+                }]
+                    if worker_id == "00000002000000000004"
+                        && status == "merged"
+                        && final_tier == "high"
+                        && label == "high"
+            ),
+            "the rerouted worker's outcome row: {rows:?}"
+        );
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn routed_worker_still_logs_after_routing_is_turned_off() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        // Routing is switched off after the worker was routed: the worker's
+        // own decision still makes it calibration data.
+        *fixture.team.routing.write().unwrap_or_else(|e| e.into_inner()) =
+            crate::mnemo2::dispatch_routing::RoutingSettings::default();
+        fixture
+            .team
+            .change_model(
+                "routingworker",
+                Some("test/scripted-difficult".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("the user moves the routed worker");
+        let rows = fixture.rows();
+        assert!(
+            matches!(
+                rows.as_slice(),
+                [_, DispatchRoutingRow::UserReroute { worker_id, .. }]
+                    if worker_id == "routingworker"
+            ),
+            "a routed worker still logs its reroute: {rows:?}"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_dispatch_is_never_classified() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        fixture
+            .team
+            .stop("routingworker")
+            .await
+            .expect("stop the audit target");
+        // Routing off and the worker was dispatched without a decision: the
+        // stop writes nothing at all.
+        assert!(
+            fixture.rows().is_empty(),
+            "off mode writes no stop outcome row"
+        );
+        *fixture.team.routing.write().unwrap_or_else(|e| e.into_inner()) =
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            };
+        let result = fixture
+            .team
+            .handle_lead_host_tool(
+                "team_audit_dispatch",
+                json!({
+                    "worker_id": "routingworker",
+                    "reviewer_id": "routingaudit",
+                    "plan_id": fixture.plan_id,
+                    "step": 1,
+                    "brief": "Audit the implementation independently against the complete step specification.",
+                }),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fixture.classifier.calls(), 0);
+        // The audit dispatch classifies nothing and logs nothing: not even a
+        // shadow-mode row appears for it.
+        assert!(
+            !fixture.log_path().exists(),
+            "an audit dispatch adds no routing row"
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn schema_offers_auto_only_in_suggest_and_auto() {
+        for (mode, offers_auto) in [
+            (crate::mnemo2::dispatch_routing::RoutingMode::Off, false),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Shadow, false),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Suggest, true),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Auto, true),
+        ] {
+            let root = tempfile::tempdir().expect("workspace");
+            let state = tempfile::tempdir().expect("state");
+            init_git(root.path());
+            let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+            team.set_catalog(
+                vec![lead_model("scripted-model")],
+                tiers_dto! {
+                    simple: vec!["test/scripted-model".into()],
+                    average: vec!["test/scripted-model".into()],
+                    difficult: vec!["test/scripted-model".into()],
+                },
+                Vec::new(),
+            );
+            *team.routing.write().unwrap_or_else(|e| e.into_inner()) =
+                crate::mnemo2::dispatch_routing::RoutingSettings {
+                    mode,
+                    ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+                };
+            let tools = team.lead_host_tools();
+            let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+            let tiers = dispatch.parameters["properties"]["tier"]["enum"]
+                .as_array()
+                .expect("tier enum");
+            assert_eq!(tiers.contains(&json!("auto")), offers_auto, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_is_optional_only_in_auto_mode() {
+        for (mode, required) in [
+            (crate::mnemo2::dispatch_routing::RoutingMode::Off, true),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Shadow, true),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Suggest, true),
+            (crate::mnemo2::dispatch_routing::RoutingMode::Auto, false),
+        ] {
+            let root = tempfile::tempdir().expect("workspace");
+            let state = tempfile::tempdir().expect("state");
+            init_git(root.path());
+            let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+            team.set_catalog(
+                vec![lead_model("scripted-model")],
+                tiers_dto! {
+                    simple: vec!["test/scripted-model".into()],
+                    average: vec!["test/scripted-model".into()],
+                    difficult: vec!["test/scripted-model".into()],
+                },
+                Vec::new(),
+            );
+            *team.routing.write().unwrap_or_else(|e| e.into_inner()) =
+                crate::mnemo2::dispatch_routing::RoutingSettings {
+                    mode,
+                    ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+                };
+            let tools = team.lead_host_tools();
+            let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+            let required_fields = dispatch.parameters["required"]
+                .as_array()
+                .expect("required fields");
+            assert_eq!(required_fields.contains(&json!("tier")), required, "{mode:?}");
+        }
+    }
+
+
+    #[tokio::test]
+    async fn suggest_auto_refuses_when_laya_returns_no_answer() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            None,
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("auto"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "Laya is not running; pass a tier");
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn classification_happens_outside_merge_lock() {
+        let fixture = std::sync::Arc::new(
+            routing_fixture(
+                crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+                true,
+            )
+            .await,
+        );
+        let merge_guard = fixture.team.merge_lock.lock().await;
+        let dispatch_fixture = std::sync::Arc::clone(&fixture);
+        let dispatch = tokio::spawn(async move {
+            dispatch_fixture.dispatch(Some("routine"), None).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while fixture.classifier.calls() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("classification runs while merge_lock is held elsewhere");
+        assert!(!dispatch.is_finished(), "dispatch still waits for merge_lock");
+        drop(merge_guard);
+        let result = dispatch.await.expect("dispatch task");
+        assert!(result.success, "{}", result.output);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permit_wait_counts_toward_laya_timeout() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        let _permit = fixture.team.routing_permit.acquire().await.expect("permit");
+        let request = DispatchRequest {
+            brief: "Use the complete step specification to choose this worker's model tier".into(),
+            tier: None,
+            dispatch_routing: true,
+            source: DispatchSource::Ipc,
+            model: None,
+            reasoning_effort: None,
+            worker_id: Some("permitwait".into()),
+            plan: Some(PlanRef {
+                plan_id: fixture.plan_id.clone(),
+                step: 0,
+            }),
+            review_risk: None,
+            read_back: false,
+        };
+        let routed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture.team.route_implementation_dispatch(
+                &request,
+                "Implement the requested routing behavior in src-tauri/src/mnemo2/team.rs and verify it with focused regression tests",
+                &request.brief,
+            ),
+        )
+        .await
+        .expect("the permit wait is inside Laya's 3 s timeout")
+        .expect("routing decision");
+        assert_eq!(routed.tier.as_deref(), Some("routine"));
+        assert_eq!(fixture.classifier.calls(), 0);
+        assert!(matches!(
+            routed.rows.as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shadow_without_tiers_keeps_the_default_model() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+            true,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        assert_eq!(fixture.classifier.calls(), 0);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn team_status_omits_routing_when_none() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            None,
+            false,
+        )
+        .await;
+        assert!(fixture.dispatch(Some("routine"), None).await.success);
+        let compact = team_status_answer(&fixture.team, json!({})).await;
+        assert!(compact["result"][0].get("routing").is_none());
+        let detailed = team_status_answer(&fixture.team, json!({"detail": true})).await;
+        assert!(detailed["result"][0].get("routing").is_none());
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn auto_fallback_without_that_tier_folds_down() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
+            true,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            tiers_dto! {
+                simple: vec!["test/scripted-model".into()],
+                average: Vec::new(),
+                difficult: vec!["test/scripted-model".into()],
+            },
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("routine has no model; ran on trivial"));
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model.as_deref(), Some("test/scripted-model"));
+        assert_eq!(worker.tier.as_deref(), Some("trivial"));
+        let routing = worker.routing.expect("routing");
+        assert_eq!(routing.routed_by, "lead");
+        assert_eq!(routing.lead_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.ran_tier.as_deref(), Some("trivial"));
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                lead_tier: Some(lead_tier),
+                ran_tier: Some(ran_tier),
+                ..
+            }] if lead_tier == "routine" && ran_tier == "trivial"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn racing_duplicate_dispatch_logs_one_route_row() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let (first, second) = tokio::join!(
+            fixture.dispatch(Some("routine"), None),
+            fixture.dispatch(Some("routine"), None)
+        );
+        assert!(first.success, "{}", first.output);
+        assert!(second.success, "{}", second.output);
+        assert_eq!(fixture.classifier.calls(), 2);
+        assert_eq!(fixture.rows().len(), 1, "exactly one Route row is committed");
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn no_free_slot_writes_no_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        fixture
+            .team
+            .persistence
+            .slots
+            .store(0, Ordering::SeqCst);
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "all 0 worker slots are busy");
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(!fixture.log_path().exists());
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provisioning_failure_writes_no_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let git = fixture._root.path().join(".git");
+        let parked = fixture._root.path().join(".git-parked");
+        std::fs::rename(&git, &parked).expect("park git metadata");
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(!result.success);
+        assert!(result.output.contains("not a usable Git checkout"));
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert!(!fixture.log_path().exists());
+        std::fs::rename(parked, git).expect("restore git metadata");
+        fixture.team.shutdown().await;
+    }
+
+
+    #[test]
+    fn dispatch_routing_line_truth_table() {
+        let routing = WorkerRouting {
+            laya_tier: Some("high".into()),
+            confidence: Some(0.71),
+            cleared: true,
+            lead_tier: Some("routine".into()),
+            routed_by: "lead_override".into(),
+            ran_tier: Some("routine".into()),
+            nudged: None,
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            Some("Laya: high (0.71) — you chose routine; logged as an override.")
+        );
+        // The dispatch-time ran tier decides the override line (audit finding
+        // M1): a reroute after dispatch never rewrites what this reports.
+        let routing = WorkerRouting {
+            ran_tier: Some("high".into()),
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            Some(
+                "Laya: high (0.71) — you ran high (requested routine); logged as an override."
+            )
+        );
+        let routing = WorkerRouting {
+            laya_tier: Some("routine".into()),
+            confidence: Some(0.62),
+            lead_tier: Some("routine".into()),
+            routed_by: "lead".into(),
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            Some("Laya would pick routine (0.62).")
+        );
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Suggest, Some(&routing)).as_deref(),
+            Some("Laya: routine (0.62) — matches your tier.")
+        );
+        assert_eq!(dispatch_routing_line(RoutingMode::Off, Some(&routing)), None);
+        let routing = WorkerRouting {
+            routed_by: "laya".into(),
+            lead_tier: None,
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
+            Some("Laya: routed to routine (0.62).")
+        );
+        let routing = WorkerRouting {
+            confidence: Some(0.39),
+            cleared: false,
+            routed_by: "lead".into(),
+            lead_tier: Some("routine".into()),
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
+            Some("Laya: unsure (0.39).")
+        );
+        let routing = WorkerRouting {
+            laya_tier: None,
+            confidence: None,
+            ..routing
+        };
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            Some("Laya: offline.")
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_non_auto_without_tiers_uses_default_model() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            None,
+            false,
+        )
+        .await;
+        fixture.team.set_catalog(
+            vec![lead_model("scripted-model")],
+            mnemo::headless::TiersDto::default(),
+            Vec::new(),
+        );
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gated_answer_has_no_skip_reason() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
+            true,
+        )
+        .await;
+        assert!(fixture.dispatch(None, None).await.success);
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: None,
+                cleared: false,
+                confidence,
+                ..
+            }] if (*confidence - 0.39).abs() < f64::EPSILON
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn off_mode_schema_uses_the_ladder_without_auto() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        team.set_catalog(
+            vec![lead_model("scripted-model")],
+            tiers_dto! {
+                simple: vec!["test/scripted-model".into()],
+                average: vec!["test/scripted-model".into()],
+                difficult: vec!["test/scripted-model".into()],
+            },
+            Vec::new(),
+        );
+        let tools = team.lead_host_tools();
+        let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+        let tier = &dispatch.parameters["properties"]["tier"];
+        assert_eq!(
+            tier["enum"],
+            json!(["trivial", "routine", "medium", "high", "escalate"])
+        );
+        let description = tier["description"].as_str().expect("tier description");
+        assert!(description.contains("trivial (Trivial)"));
+        assert!(description.contains("routine (Routine)"));
+        assert!(description.contains("medium (Medium)"));
+        assert!(description.contains("no model; folds down to routine"));
+        assert!(description.contains("high (High)"));
+        assert!(description.contains("escalation only, never a first pick"));
+        assert!(!description.contains("\nauto -"));
+        assert_eq!(
+            dispatch.parameters["properties"]["model"]["enum"],
+            json!(["test/scripted-model"])
+        );
+        assert!(dispatch.parameters["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("tier"))));
+    }
+
+
+    #[tokio::test]
+    async fn ipc_dispatch_on_plan_logs_a_shadow_route_row() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the IPC-dispatched step and run its regression tests".into(),
+                Some("test/scripted-average".into()),
+                None,
+                Some("ipcworker".into()),
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("IPC dispatch");
+        assert!(!reused);
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert_eq!(fixture.rows().len(), 1);
+        let routing = worker.routing.expect("IPC worker routing");
+        assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.routed_by, "lead");
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn dispatch_uses_every_ladder_tier_and_refuses_legacy_ids() {
+        for (tier, model, ran_tier, fold_note) in [
+            ("trivial", "test/scripted-simple", "trivial", None),
+            ("routine", "test/scripted-average", "routine", None),
+            (
+                "medium",
+                "test/scripted-average",
+                "routine",
+                Some("medium has no model; ran on routine"),
+            ),
+            ("high", "test/scripted-difficult", "high", None),
+        ] {
+            let fixture = routing_fixture(
+                crate::mnemo2::dispatch_routing::RoutingMode::Off,
+                None,
+                false,
+            )
+            .await;
+            let result = fixture.dispatch(Some(tier), None).await;
+            assert!(result.success, "tier {tier}: {}", result.output);
+            if let Some(note) = fold_note {
+                assert!(result.output.contains(note), "{}", result.output);
+            }
+            let worker = fixture.team.worker("routingworker").await.expect("worker");
+            assert_eq!(worker.model.as_deref(), Some(model), "tier {tier}");
+            assert_eq!(worker.tier.as_deref(), Some(ran_tier), "tier {tier}");
+            fixture.team.shutdown().await;
+        }
+
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            None,
+            false,
+        )
+        .await;
+        for old_id in ["simple", "average", "difficult"] {
+            let result = fixture.dispatch(Some(old_id), None).await;
+            assert!(!result.success, "legacy tier {old_id} was accepted");
+            assert!(result.output.contains(old_id), "{}", result.output);
+            assert!(
+                result
+                    .output
+                    .contains("trivial, routine, medium, high, escalate"),
+                "{}",
+                result.output
+            );
+        }
+        let result = fixture.dispatch(Some("escalate"), None).await;
+        assert!(!result.success, "tier escalate was accepted as a first pick");
+        assert!(
+            result.output.contains("escalation only, never a first pick"),
+            "{}",
+            result.output
+        );
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lead_dispatch_refuses_escalate_in_every_routing_mode() {
+        for mode in [
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+        ] {
+            let fixture = routing_fixture(mode, None, false).await;
+            let result = fixture.dispatch(Some("escalate"), None).await;
+            assert!(
+                !result.success,
+                "routing mode {mode:?}: escalate was accepted as a first pick"
+            );
+            assert!(
+                result.output.contains("escalation only, never a first pick"),
+                "routing mode {mode:?}: {}",
+                result.output
+            );
+            assert!(
+                fixture.team.worker("routingworker").await.is_err(),
+                "routing mode {mode:?}: the refused dispatch provisioned a worker"
+            );
+            fixture.team.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn legacy_team_tier_ids_convert_once_with_a_preserved_backup() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let mut legacy = worker(root.path(), "legacyworker1");
+        legacy.tier = Some("simple".into());
+        legacy.routing = Some(WorkerRouting {
+            laya_tier: Some("average".into()),
+            confidence: Some(0.9),
+            cleared: true,
+            lead_tier: Some("simple".into()),
+            routed_by: "lead_override".into(),
+            ran_tier: Some("difficult".into()),
+            nudged: Some("average".into()),
+        });
+        legacy.reroutes = vec![DispatchRoutingRow::UserReroute {
+            ts: 1,
+            worker_id: legacy.id.clone(),
+            plan_id: "plan0001".into(),
+            step: 1,
+            from_tier: "simple".into(),
+            to_tier: "difficult".into(),
+            from_model: None,
+            to_model: None,
+            status: "idle".into(),
+            review_rounds: 0,
+            fix_rounds: 0,
+            nudged: false,
+        }];
+        let persisted = PersistedTeam {
+            workers: vec![legacy],
+            ..PersistedTeam::default()
+        };
+        let original = serde_json::to_vec_pretty(&persisted).expect("legacy JSON");
+        let path = state.path().join(TEAM_STATE_FILE);
+        std::fs::write(&path, &original).expect("write legacy team");
+        let persistence = TeamPersistence::new(state.path());
+
+        let converted = persistence
+            .load()
+            .expect("load legacy team")
+            .expect("legacy team exists");
+        let converted_worker = &converted.workers[0];
+        assert_eq!(converted_worker.tier.as_deref(), Some("trivial"));
+        let routing = converted_worker.routing.as_ref().expect("routing");
+        assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.lead_tier.as_deref(), Some("trivial"));
+        assert_eq!(routing.ran_tier.as_deref(), Some("high"));
+        assert_eq!(routing.nudged.as_deref(), Some("routine"));
+        assert!(matches!(
+            &converted_worker.reroutes[0],
+            DispatchRoutingRow::UserReroute { from_tier, to_tier, .. }
+                if from_tier == "trivial" && to_tier == "high"
+        ));
+        let backup = state.path().join(TEAM_PRE_TIERS_BACKUP);
+        assert_eq!(std::fs::read(&backup).expect("pre-tier backup"), original);
+
+        // A second legacy load converts the live file but never replaces the
+        // first backup's original bytes.
+        std::fs::write(&path, &original).expect("write legacy team again");
+        persistence.load().expect("second conversion").expect("team");
+        assert_eq!(std::fs::read(&backup).expect("backup remains"), original);
+    }
+
+    #[tokio::test]
+    async fn audit_defaults_to_high_and_unreported_audits_switch_tiers() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            None,
+            false,
+        )
+        .await;
+        let team = &fixture.team;
+        let mut target = worker(fixture._root.path(), "audittarget1");
+        target.plan_id = Some(fixture.plan_id.clone());
+        target.plan_step = Some(1);
+        provision_agent_worktree(
+            fixture._root.path().to_path_buf(),
+            target.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision audit target");
+        team.records.lock().await.push(target.clone());
+
+        let (audit, reused) = team
+            .audit_dispatch(&target.id, "auditdefault1", None, None, None)
+            .await
+            .expect("default-tier audit");
+        assert!(!reused);
+        assert_eq!(audit.tier.as_deref(), Some("high"));
+        assert_eq!(audit.model.as_deref(), Some("test/scripted-difficult"));
+        let immediate = worker_status_view(&audit, false);
+        assert_eq!(immediate["tier"], json!("high"));
+        assert_eq!(immediate["model"], json!("test/scripted-difficult"));
+
+        let switched = team
+            .change_model(
+                &audit.id,
+                Some("test/scripted-average".into()),
+                None,
+                ChangeSource::User,
+            )
+            .await
+            .expect("unreported audit model switch");
+        assert_eq!(switched.tier.as_deref(), Some("routine"));
+        assert_eq!(switched.model.as_deref(), Some("test/scripted-average"));
+
+        let resumed = team
+            .handle_lead_host_tool(
+                "team_resume",
+                json!({"worker_id": audit.id, "tier": "high"}),
+            )
+            .await;
+        assert!(resumed.success, "{}", resumed.output);
+        let switched = team.worker(&audit.id).await.expect("switched audit");
+        assert_eq!(switched.tier.as_deref(), Some("high"));
+        assert_eq!(switched.model.as_deref(), Some("test/scripted-difficult"));
+        assert!(!switched.report_delivered);
+        assert!(switched.reroutes.len() >= 2, "audit switches stay in its ledger");
+        assert!(fixture.rows().is_empty(), "audit switches are not training labels");
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tier_plus_cross_tier_model_logs_the_ran_tier() {
+        for (requested, ran, laya_label, expected_effort) in [
+            ("trivial", "high", mnemo::agent::route_question::LABEL_TRIVIAL, "high"),
+            ("high", "trivial", mnemo::agent::route_question::LABEL_HARD, "low"),
+        ] {
+            let fixture = routing_fixture_with(
+                crate::mnemo2::dispatch_routing::RoutingSettings {
+                    mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                    ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+                },
+                routing_answer(laya_label, 0.91),
+                true,
+                std::time::Duration::ZERO,
+            )
+            .await;
+            let mut tiers = tiers_dto! {
+                difficult: vec!["test/scripted-high".into()],
+                average: vec!["test/scripted-routine".into()],
+                simple: vec!["test/scripted-trivial".into()],
+            };
+            tiers.tiers[0].effort = Some("low".into());
+            tiers.tiers[3].effort = Some("high".into());
+            fixture.team.set_catalog(
+                ["high", "routine", "trivial"]
+                    .into_iter()
+                    .map(|tier| LeadModel {
+                        reasoning_efforts: vec!["low".into(), "high".into()],
+                        ..lead_model(&format!("scripted-{tier}"))
+                    })
+                    .collect(),
+                tiers,
+                Vec::new(),
+            );
+            let model = format!("test/scripted-{ran}");
+            let result = fixture.dispatch(Some(requested), Some(&model)).await;
+            assert!(result.success, "{requested} -> {ran}: {}", result.output);
+            assert!(result.output.contains(&format!(
+                "Laya: {requested} (0.91) — you ran {ran} (requested {requested}); logged as an override."
+            )));
+            let worker = fixture.team.worker("routingworker").await.expect("worker");
+            assert_eq!(worker.tier.as_deref(), Some(ran));
+            assert_eq!(worker.model.as_deref(), Some(model.as_str()));
+            assert_eq!(worker.reasoning_effort.as_deref(), Some(expected_effort));
+            let routing = worker.routing.expect("routing");
+            assert_eq!(routing.lead_tier.as_deref(), Some(requested));
+            assert_eq!(routing.laya_tier.as_deref(), Some(requested));
+            assert_eq!(routing.routed_by, "lead_override");
+            let rows = fixture.rows();
+            assert_eq!(rows.len(), 2);
+            assert!(matches!(
+                &rows[0],
+                crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                    lead_tier: Some(lead),
+                    ran_tier: Some(actual),
+                    ..
+                } if lead == requested && actual == ran
+            ));
+            assert!(matches!(
+                &rows[1],
+                crate::mnemo2::dispatch_routing::DispatchRoutingRow::LeadOverride {
+                    lead_tier,
+                    requested_tier,
+                    ..
+                } if lead_tier == ran && requested_tier.as_deref() == Some(requested)
+            ));
+            fixture.team.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_below_gate_with_a_different_fallback_reports_unsure() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                fallback_tier: "high".into(),
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.39),
+            true,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let result = fixture.dispatch(None, None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Laya: unsure (0.39)."));
+        assert!(!result.output.contains("routed to difficult"));
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        assert_eq!(worker.tier.as_deref(), Some("high"));
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn ipc_auto_id_dispatch_row_carries_the_real_worker_id() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the auto-id IPC step and verify its routing log".into(),
+                Some("test/scripted-average".into()),
+                None,
+                None,
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("auto-id IPC dispatch");
+        assert!(!reused);
+        assert_eq!(fixture.classifier.calls(), 1);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0],
+            crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route { worker_id, .. }
+                if worker_id == &worker.id
+        ));
+        assert!(!worker.id.is_empty());
+
+
+        fixture.team.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn ipc_shadow_dispatch_without_model_classifies_and_uses_the_default() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.71),
+            true,
+        )
+        .await;
+        let (worker, reused) = fixture
+            .team
+            .dispatch_on_plan(
+                "Implement the IPC default-model step and verify its routing metadata".into(),
+                None,
+                None,
+                Some("ipcdefault".into()),
+                None,
+                false,
+                &fixture.plan_id,
+                1,
+            )
+            .await
+            .expect("IPC default-model dispatch");
+        assert!(!reused);
+        assert_eq!(worker.model, None);
+        assert_eq!(worker.tier, None);
+        assert_eq!(fixture.classifier.calls(), 1);
+        assert_eq!(fixture.rows().len(), 1);
+        let routing = worker.routing.expect("routing");
+        assert_eq!(routing.laya_tier.as_deref(), Some("high"));
+        assert_eq!(routing.routed_by, "lead");
+
+        let lead_tool = fixture.dispatch(None, None).await;
+        assert!(!lead_tool.success);
+        assert!(lead_tool.output.contains("choose a `tier` for this worker"));
+        fixture.team.shutdown().await;
+    }
+
+    #[test]
+    fn route_fix_prompt_contains_every_open_finding_detail() {
+        let root = tempfile::tempdir().expect("workspace");
+        let mut record = worker(root.path(), "fixprompt001");
+        let routed = open_finding("finding1");
+        let mut other = open_finding("finding2");
+        other.severity = "medium".into();
+        other.title = "the second unchecked path".into();
+        other.detail = "EVERY OTHER OPEN FINDING DETAIL".into();
+        other.file = "src/other.rs".into();
+        record.findings = vec![routed.clone(), other];
+        let mut closed = open_finding("finding3");
+        closed.status = "fixed".into();
+        closed.detail = "CLOSED DETAIL MUST NOT BE SENT".into();
+        record.findings.push(closed);
+        let brief = route_fix_brief(&record, &routed);
+        assert!(brief.contains(&routed.detail), "{brief}");
+        assert!(brief.contains("EVERY OTHER OPEN FINDING DETAIL"), "{brief}");
+        assert!(brief.contains("src/other.rs"), "{brief}");
+        assert!(!brief.contains("CLOSED DETAIL MUST NOT BE SENT"), "{brief}");
+    }
+
+    #[tokio::test]
+    async fn failed_downshift_restores_prior_tier_and_logs_both_outcomes() {
+        let fixture = review_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            "downshift001",
+        )
+        .await;
+        let routed = open_finding("finding1");
+        fixture
+            .team
+            .review(&fixture.record.id, "first".into(), vec![routed.clone()], evidence())
+            .await
+            .expect("first review");
+        let down = fixture
+            .team
+            .route_fix_with_tier(&fixture.record.id, "finding1", Some("routine"))
+            .await
+            .expect("explicit downshift is allowed even for a high finding");
+        assert_eq!(down.tier.as_deref(), Some("routine"));
+        assert_eq!(down.model.as_deref(), Some("test/scripted-average"));
+        fixture.team.stop_inner(&fixture.record.id).await.expect("stop fixer");
+        let restored = fixture
+            .team
+            .review(&fixture.record.id, "still open".into(), vec![routed.clone()], evidence())
+            .await
+            .expect("failed downshift review");
+        assert_eq!(restored.tier.as_deref(), Some("high"));
+        assert_eq!(restored.model.as_deref(), Some("test/scripted-difficult"));
+        let raw = std::fs::read_to_string(fixture.state.path().join("dispatch_routing.jsonl"))
+            .expect("routing log");
+        assert!(raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                row["source"] == "fix_downshift" && row["finding_closed"] == false
+            })
+        }), "{raw}");
+
+        fixture
+            .team
+            .route_fix_with_tier(&fixture.record.id, "finding1", Some("routine"))
+            .await
+            .expect("second deliberate downshift");
+        fixture.team.stop_inner(&fixture.record.id).await.expect("stop second fixer");
+        let mut closed = routed;
+        closed.status = "fixed".into();
+        closed.evidence = Some("fixed and checked".into());
+        let stayed = fixture
+            .team
+            .review(&fixture.record.id, "closed".into(), vec![closed], evidence())
+            .await
+            .expect("closed downshift review");
+        assert_eq!(stayed.tier.as_deref(), Some("routine"));
+        let raw = std::fs::read_to_string(fixture.state.path().join("dispatch_routing.jsonl"))
+            .expect("routing log");
+        assert!(raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                row["source"] == "fix_downshift" && row["finding_closed"] == true
+            })
+        }), "{raw}");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auto_fix_classification_never_lowers_a_high_severity_finding() {
+        let mut fixture = review_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            "protected001",
+        )
+        .await;
+        let classifier = std::sync::Arc::new(StubDispatchClassifier::slow(
+            routing_answer(mnemo::agent::route_question::LABEL_TRIVIAL, 0.95),
+            std::time::Duration::ZERO,
+        ));
+        fixture.team.classifier = Some(std::sync::Arc::new(std::sync::RwLock::new(Some(
+            classifier.clone(),
+        ))));
+        fixture
+            .team
+            .review(
+                &fixture.record.id,
+                "first".into(),
+                vec![open_finding("finding1")],
+                evidence(),
+            )
+            .await
+            .expect("first review");
+        let unchanged = fixture
+            .team
+            .route_fix_with_tier(&fixture.record.id, "finding1", Some("auto"))
+            .await
+            .expect("classified but protected fix");
+        assert_eq!(unchanged.tier.as_deref(), Some("high"));
+        assert_eq!(unchanged.model.as_deref(), Some("test/scripted-difficult"));
+        assert_eq!(classifier.calls(), 1);
+        assert!(fixture.rows().iter().any(|row| matches!(
+            row,
+            DispatchRoutingRow::Route { skip, .. }
+                if skip.as_deref() == Some("fix_downshift_protected")
+        )));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn high_audit_finding_after_fix_nudges_to_escalate() {
+        let fixture = review_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            "auditnudge001",
+        )
+        .await;
+        fixture
+            .team
+            .review(
+                &fixture.record.id,
+                "first".into(),
+                vec![open_finding("finding1")],
+                evidence(),
+            )
+            .await
+            .expect("first review");
+        fixture
+            .team
+            .route_fix(&fixture.record.id, "finding1")
+            .await
+            .expect("route fix");
+        fixture.team.stop_inner(&fixture.record.id).await.expect("stop fixer");
+        let tip = fixture.team.worker_tip(&fixture.record).await.expect("tip");
+        let audit = audit_worker(WorkerStatus::Completed, &fixture.record.id, &tip);
+        fixture.team.records.lock().await.push(audit);
+        fixture.team.persist().await.expect("save audit");
+        let mut audit_evidence = evidence();
+        audit_evidence.independent_reviewer_id = Some("auditor0001".into());
+        audit_evidence.audit_adjudication = Some("accepted the high finding".into());
+        let reviewed = fixture
+            .team
+            .review(
+                &fixture.record.id,
+                "audit still open".into(),
+                vec![open_finding("finding1")],
+                audit_evidence,
+            )
+            .await
+            .expect("audited review");
+        assert_eq!(
+            reviewed.routing.as_ref().and_then(|routing| routing.nudged.as_deref()),
+            Some("escalate")
+        );
+        assert!(fixture.rows().iter().any(|row| matches!(
+            row,
+            DispatchRoutingRow::Nudge { to_tier, .. } if to_tier == "escalate"
+        )));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auto_mode_switches_an_idle_nudged_worker_and_notifies_the_lead() {
+        let (fixture, mut notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.8),
+            std::time::Duration::ZERO,
+            vec![vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".into() },
+                mnemo::provider::LlmEvent::Finish {
+                    reason: mnemo::provider::FinishReason::Stop,
+                },
+            ]],
+        )
+        .await;
+        let dispatched = fixture.dispatch(Some("routine"), None).await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        wait_worker_settled(&fixture.team, "routingworker").await;
+        fixture
+            .team
+            .update_worker("routingworker", |worker| {
+                if let Some(routing) = worker.routing.as_mut() {
+                    routing.nudged = Some("high".into());
+                }
+            })
+            .await;
+        fixture.team.persist().await.expect("save pending nudge");
+        assert!(
+            fixture
+                .team
+                .auto_escalate_worker("routingworker")
+                .await
+                .expect("auto escalation")
+        );
+        let switched = fixture.team.worker("routingworker").await.expect("switched");
+        assert_eq!(switched.model.as_deref(), Some("test/scripted-difficult"));
+        assert_eq!(switched.tier.as_deref(), Some("high"));
+        assert!(switched.routing.expect("routing").nudged.is_none());
+        let raw = std::fs::read_to_string(fixture.log_path()).expect("routing log");
+        assert!(raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                row["event"] == "lead_reroute" && row["source"] == "escalation"
+            })
+        }), "{raw}");
+        let mut notice = None;
+        for _ in 0..800 {
+            while let Ok(signal) = notices.try_recv() {
+                if let BoardSignal::Notice { key, text } = signal {
+                    if key == "escalation:auto:routingworker" {
+                        notice = Some(text);
+                    }
+                }
+            }
+            if notice.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let notice = notice.expect("auto escalation notice");
+        assert!(notice.contains("session and transcript were kept"), "{notice}");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auto_strike_streak_escalates_when_the_worker_becomes_idle() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("auto-call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .chain([vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".into() },
+                mnemo::provider::LlmEvent::Finish {
+                    reason: mnemo::provider::FinishReason::Stop,
+                },
+            ]])
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.8),
+            std::time::Duration::ZERO,
+            responses,
+        )
+        .await;
+        let dispatched = fixture.dispatch(Some("routine"), None).await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        let switched = eventually(|| async {
+            let worker = fixture.team.worker("routingworker").await.expect("worker");
+            (worker.model.as_deref() == Some("test/scripted-difficult")).then_some(worker)
+        })
+        .await;
+        assert_eq!(switched.tier.as_deref(), Some("high"));
+        assert!(switched.routing.expect("routing").nudged.is_none());
+        let raw = std::fs::read_to_string(fixture.log_path()).expect("routing log");
+        assert!(raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                row["source"] == "escalation" && row["nudged"] == true
+            })
+        }), "{raw}");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn worker_host_tools_offer_plan_read() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        let tools = team.worker_host_tools();
+        let plan_read = tools
+            .iter()
+            .find(|tool| tool.name == "plan_read")
+            .expect("plan_read is offered");
+        assert!(matches!(plan_read.safety, SafetyLevel::AutoRun));
+        assert_eq!(plan_read.timeout_ms, Some(10_000));
+        assert_eq!(
+            plan_read.parameters["properties"]["capability"]["type"],
+            "string"
+        );
+        assert!(plan_read.parameters.get("required").is_none());
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plan_read_returns_the_current_plan() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        let plans_dir = root.path().join(".coding/plans");
+        let board = PlanBoard::new(&plans_dir, root.path().join(".coding/reviews"));
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Plan reading".into(),
+                goal: "Let a worker re-read its plan".into(),
+                context: "A worker re-reads src-tauri/src/mnemo2/team.rs after dispatch and verifies with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team.".into(),
+                steps: vec![
+                    "Implement plan_read in src-tauri/src/mnemo2/team.rs and verify with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team".into(),
+                    "Handle notices in src-tauri/src/mnemo2/team.rs and verify with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team".into(),
+                ],
+                ..Default::default()
+            })
+            .expect("create plan");
+        board
+            .update(
+                &plan.id,
+                mnemo::app::plan_board::PlanEdit {
+                    decision: Some("Use the shared capability reader".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("record the decision");
+        let board = Arc::new(board);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let stamp = Some((plan.id.clone(), 1usize));
+        let result = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({}),
+            Some(&board),
+            stamp.as_ref(),
+        )
+        .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("Use the shared capability reader"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Re-read this plan at any time"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("## Your step (2)"), "{}", result.output);
+
+        let no_plan = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({}),
+            Some(&board),
+            None,
+        )
+        .await;
+        assert!(!no_plan.success);
+        assert!(no_plan.output.contains("no plan"), "{}", no_plan.output);
+    }
+
+    #[tokio::test]
+    async fn plan_read_reads_a_capability_spec() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        let spec_dir = root
+            .path()
+            .join(".coding/openspec/specs/tier-ladder");
+        std::fs::create_dir_all(&spec_dir).expect("spec dir");
+        std::fs::write(spec_dir.join("spec.md"), "# Tier ladder\n").expect("spec file");
+        let board = Arc::new(PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        ));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let current = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({"capability": "tier-ladder"}),
+            Some(&board),
+            None,
+        )
+        .await;
+        assert!(current.success, "{}", current.output);
+        assert_eq!(current.output, "# Tier ladder\n");
+
+        let missing = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({"capability": "not-a-capability"}),
+            Some(&board),
+            None,
+        )
+        .await;
+        assert!(missing.success, "{}", missing.output);
+        assert_eq!(
+            missing.output,
+            "No current spec for 'not-a-capability' yet."
+        );
+
+        let invalid = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({"capability": "../x"}),
+            Some(&board),
+            None,
+        )
+        .await;
+        assert!(!invalid.success);
+        assert!(invalid.output.contains("invalid capability"), "{}", invalid.output);
+    }
+
+    #[tokio::test]
+    async fn plan_edit_notifies_only_working_workers() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let board = PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        );
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Plan change notices".into(),
+                goal: "Tell only the workers still working".into(),
+                context: "One worker is editing src-tauri/src/mnemo2/team.rs while another waits for review; the working one verifies with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team.".into(),
+                steps: vec![
+                    "Send notices in src-tauri/src/mnemo2/team.rs and verify with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team".into(),
+                    "Review the notice in src-tauri/src/mnemo2/team.rs and verify with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team".into(),
+                ],
+                ..Default::default()
+            })
+            .expect("create plan");
+        let working_id = "00000001000000000001";
+        let completed_id = "00000002000000000002";
+        let mut working = worker(root.path(), working_id);
+        working.status = WorkerStatus::Working;
+        working.plan_id = Some(plan.id.clone());
+        working.plan_step = Some(0);
+        let mut completed = worker(root.path(), completed_id);
+        completed.status = WorkerStatus::Completed;
+        completed.plan_id = Some(plan.id.clone());
+        completed.plan_step = Some(1);
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            working.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the working worker");
+        let team = open_test_team(root.path(), state.path(), vec![working.clone(), completed.clone()]).await;
+        team.update_worker(working_id, |record| {
+            record.status = WorkerStatus::Working;
+        })
+        .await;
+        team.update_worker(completed_id, |record| {
+            record.status = WorkerStatus::Completed;
+        })
+        .await;
+        spawn_live_worker(&team, &working).await;
+        let team = Arc::new(team);
+        let board = Arc::new(board);
+        team.attach_board(board.clone());
+        board
+            .update(
+                &plan.id,
+                mnemo::app::plan_board::PlanEdit {
+                    decision: Some("A decision recorded after dispatch".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("record the decision");
+        let expected = format!(
+            "Plan {} changed: new decision. Call plan_read to re-read it before you continue.",
+            plan.id
+        );
+        let mut notice = None;
+        for _ in 0..250 {
+            let worker = team.worker(working_id).await.expect("working worker");
+            if let Some(entry) = worker.inbox.first() {
+                notice = Some(entry.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let notice = match notice {
+            Some(notice) => notice,
+            None => {
+                let worker = team.worker(working_id).await.expect("working worker");
+                panic!(
+                    "the working worker got no notice; status {:?}, inbox {:?}",
+                    worker.status, worker.inbox
+                )
+            }
+        };
+        assert_eq!(notice.text, expected);
+        assert_eq!(
+            team.worker(completed_id)
+                .await
+                .expect("completed worker")
+                .inbox,
+            Vec::new()
+        );
+
+        board
+            .update(
+                &plan.id,
+                mnemo::app::plan_board::PlanEdit {
+                    progress_note: Some("Only a progress note".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("record the progress note");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            team.worker(working_id).await.expect("working worker").inbox.len(),
+            1
+        );
         team.shutdown().await;
     }
 }

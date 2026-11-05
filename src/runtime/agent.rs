@@ -219,7 +219,17 @@ impl AgentTask {
     /// the seeded history is the first request's prefix (§5.9.5
     /// :693-695: the provider prefix-cache byte-for-byte contract).
     pub(crate) fn seed_messages(&mut self, messages: Vec<Message>) {
+        if !messages.is_empty() {
+            // A restored transcript already had its first prompt in the prior
+            // process. Never classify a later message as a fresh first prompt.
+            self.agent_loop.mark_route_once_resumed();
+        }
         self.messages = messages;
+        // A resumed transcript is the conversation BEFORE any request exists —
+        // publish it so a model switch landing before the first request still
+        // measures the real history instead of an empty/zero count (a
+        // too-big history must compact first).
+        self.agent_loop.publish_message_tokens(&self.messages);
     }
 
     /// Build the user-message content for a text + images payload —
@@ -619,7 +629,14 @@ impl AgentTask {
         // "retries exhausted" for a skip.
         let mut skip_triage: Option<FailureClass> = None;
         loop {
-            match self
+            // Publish the real conversation BEFORE the turn (a switch landing
+            // between turns must see the true history, including messages
+            // pushed by suggestions, steers and between-turns compaction) and
+            // again AFTER it (the turn's final message is part of it) — the
+            // compact-before-switch decision never runs off a stale or zero
+            // count.
+            self.agent_loop.publish_message_tokens(&self.messages);
+            let result = self
                 .agent_loop
                 .run_turn(
                     &mut self.messages,
@@ -628,8 +645,9 @@ impl AgentTask {
                     cmd_rx,
                     self.session_id.as_deref(),
                 )
-                .await
-            {
+                .await;
+            self.agent_loop.publish_message_tokens(&self.messages);
+            match result {
                 Ok(outcome) => {
                     if let Some(pending) = pending_triage.take() {
                         failure_triage::resolve_failure(
@@ -1115,6 +1133,10 @@ impl AgentTask {
         // inbox-closed exit and the Cancel break above (there is no separate
         // Cancel-path spawn), so working-tier events are compressed + pruned
         // whenever a session ends.
+        // A nudge left unanswered when this session terminates is calibration
+        // data too. The shared consume-and-log helper dedups Clear-then-end.
+        let outstanding = self.agent_loop.end_route_session();
+        self.agent_loop.log_nudge_ignored(self.id, outstanding);
         self.spawn_consolidation().await;
         let id = self.id;
         // Release the loop (including a worktree's open codegraph SQLite
@@ -1173,6 +1195,14 @@ impl AgentTask {
                         String::new()
                     }
                 };
+                // Plan c3ba2b58 step A: stamp this session's identity + the
+                // consolidation purpose onto the pipeline's LLM calls. Snapshotted
+                // BEFORE the spawn so the closure owns it (identity reads stay
+                // off the spawned task's path).
+                let llm_context = self.agent_loop.llm_request_context(
+                    None,
+                    crate::provider::trace::TracePurpose::MemoryConsolidation,
+                );
                 tokio::spawn(async move {
                     let _guard = guard;
                     // The policy hook still precedes memory session teardown.
@@ -1180,9 +1210,14 @@ impl AgentTask {
                     if let Err(e) = store.end_session(&sid).await {
                         eprintln!("memory: end_session({sid}) failed during consolidation: {e}");
                     }
-                    if let Err(e) =
-                        consolidate_session(store.as_ref(), &sid, Some(provider.as_ref()), &corpus)
-                            .await
+                    if let Err(e) = consolidate_session(
+                        store.as_ref(),
+                        &sid,
+                        Some(provider.as_ref()),
+                        &corpus,
+                        &llm_context,
+                    )
+                    .await
                     {
                         eprintln!("memory: consolidate_session({sid}) failed: {e}");
                     }
@@ -1259,16 +1294,26 @@ impl AgentTask {
         } else {
             None
         };
+        // Plan c3ba2b58 step A: manual compaction carries the loop's
+        // identity + the compaction purpose. No turn id — the command
+        // runs between turns.
+        let compaction_context = self.agent_loop.llm_request_context(
+            None,
+            crate::provider::trace::TracePurpose::Compaction,
+        );
         let (summarized, mut buffered, stop, summarize_usage) = match context_manager
             .summarize_with_interrupt_opts(
                 &self.messages,
-                6,
                 // The TURN provider is what sends the compacted history next, so
                 // the result is bounded by its window, not the summarizer's.
-                crate::agent::context::sendable_budget(turn_provider.capabilities()),
                 provider.as_ref(),
-                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
+                crate::agent::context::SummarizeRequest::new(
+                    6,
+                    crate::agent::context::sendable_budget(turn_provider.capabilities()),
+                    &compaction_context,
+                ),
+                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
             )
             .await
         {
@@ -1451,6 +1496,11 @@ impl AgentTask {
                 }
             }
         }
+        // Publish the FINAL count: after the survival digest and every
+        // re-injected buffered prompt (images included) are appended, so a
+        // switch landing right after /compact decides on the conversation that
+        // really exists — not on the bare summary.
+        self.agent_loop.publish_message_tokens(&self.messages);
         // Emit the new context usage so the UI's ctx bar updates.
         let used = crate::agent::context::ContextManager::count_tokens(&self.messages) as u32;
         let max = context_manager.max_tokens() as u32;
@@ -1535,8 +1585,15 @@ impl AgentTask {
     /// Clear the conversation history entirely — a fresh start. Emits a
     /// `ContextUsage` event with `used: 0` so the UI's ctx bar resets. Backed
     /// by `/new`.
-    async fn clear_context(&mut self, fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>) {
+    pub(crate) async fn clear_context(
+        &mut self,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+    ) {
+        let outstanding = self.agent_loop.clear_route_session();
+        self.agent_loop.log_nudge_ignored(self.id, outstanding);
         self.messages.clear();
+        // /new: the conversation a switch measures is now empty.
+        self.agent_loop.publish_message_tokens(&self.messages);
         // A fresh session must not inherit the previous one's temporary raise
         // (backlog 11513ee5) — the ladder is session state, and /new starts a
         // new session.
@@ -1592,6 +1649,57 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use tempfile::tempdir;
+
+    /// Overall budget for one test's event drain. It is an upper bound, not a
+    /// wait: every drain loop exits the moment its own terminal event arrives.
+    ///
+    /// 30s rather than the old 5s because these tests run inside the full
+    /// parallel `cargo test --lib` suite (3000+ tests): one stretch of work
+    /// between two fan-in events — tokenizing a 60k-token prompt, say — can
+    /// take seconds on a loaded box. The bound stays: a real regression must
+    /// still fail the test rather than hang the suite.
+    const TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Wait for the next `(agent id, event)` on the fan-in channel until the
+    /// turn's overall `deadline`.
+    ///
+    /// `None` means the deadline passed or the channel closed — never a quiet
+    /// gap between two events. The pre-fix drain loops wrapped `recv` in a
+    /// 500ms `timeout` and broke on the timeout, so any >500ms stretch of work
+    /// between two events (tokenizing the ~60k-token prompt of
+    /// `rate_limit_429_high_fill_rate_does_not_regress_window_viability` under
+    /// full-suite load) ended the drain before the turn's terminal event and
+    /// failed the turn's assertions (plan a4837353).
+    async fn next_event(
+        rx: &mut mpsc::Receiver<(u64, AgentEvent)>,
+        deadline: tokio::time::Instant,
+    ) -> Option<AgentEvent> {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some((_agent_id, event))) => Some(event),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// Regression (plan a4837353): an event that arrives 800ms after the
+    /// previous one must still be delivered. The old drain loops broke on the
+    /// first 500ms gap between fan-in events — exactly the flake this helper
+    /// removes — so this test fails against the pre-fix wait.
+    #[tokio::test]
+    async fn next_event_waits_out_a_gap_longer_than_the_old_idle_break() {
+        let (tx, mut rx) = mpsc::channel::<(u64, AgentEvent)>(8);
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            assert!(tx.send((1, AgentEvent::Started)).await.is_ok());
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let event = next_event(&mut rx, deadline).await;
+        assert!(
+            matches!(event, Some(AgentEvent::Started)),
+            "an event arriving 800ms after the previous one must still be received"
+        );
+        sender.await.expect("the sender task must not panic");
+    }
 
     /// A mock provider that returns a simple text response.
     struct MockProvider {
@@ -1679,11 +1787,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         cmd_tx.send(AgentCommand::Cancel).await.unwrap();
 
-        // Collect events.
+        // Collect events until the run ends (Cancel ends it, closing the
+        // channel) — bounded by the overall deadline.
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
         let mut events = Vec::new();
-        while let Ok(Some((_id, event))) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-        {
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
             events.push(event);
             if events.len() > 20 {
                 break;
@@ -1824,13 +1932,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Collect events until the agent goes idle (Finished/Exited/Error).
+        // Collect events until the agent goes idle (Finished/Exited/terminal
+        // Error). The task stays alive afterwards, so the drain ends on that
+        // terminal event — never on a quiet gap between two events.
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
         let mut events = Vec::new();
-        while let Ok(Some((_id, event))) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-        {
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            let terminal = matches!(
+                event,
+                AgentEvent::Finished { .. }
+                    | AgentEvent::Exited
+                    | AgentEvent::Error {
+                        retrying: false,
+                        ..
+                    }
+            );
             events.push(event);
-            if events.len() > 20 {
+            if terminal || events.len() > 20 {
                 break;
             }
         }
@@ -1916,6 +2034,89 @@ mod tests {
                         .into(),
                 ));
             }
+            Ok(Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta {
+                    text: "recovered".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ])))
+        }
+    }
+
+    /// The traced variant of [`FallbackTestProvider`] for the attribution
+    /// test (plan c3ba2b58 step A review: fallbackAttributionTest): every
+    /// `complete_with_context` call ALSO opens a record in the SHARED
+    /// [`LlmRequestLog`](crate::provider::trace::LlmRequestLog) stamped
+    /// with the received context — what a real client does at
+    /// request-preparation time — then stamps the outcome (the 429 error,
+    /// or status/response/finish on success). Overrides
+    /// `complete_with_context` directly: the trait's default implementation
+    /// would drop the context on its way to `complete`.
+    struct TracedFallbackProvider {
+        model: &'static str,
+        provider: &'static str,
+        rate_limited: bool,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+        log: Arc<crate::provider::trace::LlmRequestLog>,
+        caps: Capabilities,
+    }
+
+    #[async_trait]
+    impl LlmClient for TracedFallbackProvider {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            self.model
+        }
+        fn provider_name(&self) -> &str {
+            self.provider
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            panic!("the turn path must call complete_with_context");
+        }
+        async fn complete_with_context(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+            context: &crate::provider::trace::LlmRequestContext,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let rec_id = self.log.start_with_context(
+                self.model,
+                "http://mock/v1/",
+                self.provider,
+                serde_json::json!({"rate_limited": self.rate_limited}),
+                context,
+            );
+            if self.rate_limited {
+                self.log.fail(
+                    rec_id,
+                    429,
+                    "stream request: HTTP 429 from https://primary.example.com/v1/ — \
+                     Too Many Requests",
+                );
+                return Err(crate::error::Error::Provider(
+                    "stream request: HTTP 429 from https://primary.example.com/v1/ — \
+                     Too Many Requests"
+                        .into(),
+                ));
+            }
+            self.log.set_status(rec_id, 200);
+            self.log.append_response(rec_id, "recovered");
+            self.log.finish(rec_id, "stop");
             Ok(Box::pin(futures::stream::iter(vec![
                 LlmEvent::TextDelta {
                     text: "recovered".into(),
@@ -2066,27 +2267,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2117,6 +2314,178 @@ mod tests {
             !saw_terminal_error,
             "no terminal error — the fallback recovered the turn"
         );
+    }
+
+    #[tokio::test]
+    async fn four29_endpoint_fallback_keeps_attribution_on_both_records() {
+        // Review finding fallbackAttributionTest (plan c3ba2b58 step A):
+        // the turn-level endpoint fallback ladder — a 429 on the primary
+        // switches to the alternate endpoint and re-runs the request. BOTH
+        // records (the failed primary attempt AND the successful fallback
+        // call) must carry the calling loop's attribution: the same
+        // identity, the same turn purpose — the fallback call is never
+        // anonymous and never cross-labelled with another agent's
+        // identity. Turn ids stay millisecond-scoped (`new_turn_id` =
+        // `<unix-millis>-<agent_id>`) — the identity, not turn-id
+        // distinctness, is what must survive the switch.
+        use crate::model_resolver::ModelResolver;
+
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let mut registry = ToolRegistry::new();
+        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
+
+        let log = Arc::new(crate::provider::trace::LlmRequestLog::new());
+        let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let primary: Arc<dyn LlmClient> = Arc::new(TracedFallbackProvider {
+            model: "test-model",
+            provider: "primary",
+            rate_limited: true,
+            calls: Arc::clone(&primary_calls),
+            log: Arc::clone(&log),
+            caps: fallback_test_caps(128_000),
+        });
+        let fallback: Arc<dyn LlmClient> = Arc::new(TracedFallbackProvider {
+            model: "test-model",
+            provider: "fallback",
+            rate_limited: false,
+            calls: Arc::clone(&fallback_calls),
+            log: Arc::clone(&log),
+            caps: fallback_test_caps(128_000),
+        });
+        let resolver: Arc<dyn ModelResolver> = Arc::new(FallbackResolver {
+            primary: Arc::clone(&primary),
+            fallback: Arc::clone(&fallback),
+            has_alternate: true,
+        });
+
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                AgentLoopConfig {
+                    provider: fallback.clone(),
+                    tools: Arc::new(registry),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
+                    sandbox,
+                    safety_mode: SafetyMode::Autonomous,
+                    context_manager: ContextManager::new(128_000, 0.5),
+                    memory: None,
+                    vision: None,
+                },
+                crate::project::Constitution::default(),
+            )
+            .with_model_resolver(resolver),
+        );
+        // Plan c3ba2b58 step A: the worker identity the loop's requests
+        // are stamped from.
+        agent_loop.set_trace_identity(crate::provider::trace::TraceIdentity {
+            actor_kind: crate::provider::trace::TraceActorKind::Worker,
+            agent_id: "1".into(),
+            session_id: "1".into(),
+            agent_name: "wt-fallback".into(),
+            worker_id: Some("wt-fallback".into()),
+            plan_id: Some("plan-9".into()),
+            plan_step: Some(2),
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = AgentTask::new(1, "test".into(), agent_loop);
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        cmd_tx
+            .send(AgentCommand::Prompt {
+                text: "hello".into(),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Drain the event fan-in until the turn finishes on the fallback, the
+        // channel closes, or the overall deadline passes. A quiet gap between
+        // two events must NOT break the loop — under a fully loaded parallel
+        // test suite a >500ms gap is possible mid-turn, and bailing early would
+        // drop cmd_tx before the fallback request ever runs (a flake the first
+        // full-suite run caught). `next_event` waits any such gap out, up to
+        // the deadline.
+        let mut saw_finished = false;
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
+            }
+        }
+        drop(cmd_tx);
+        let _ = handle.await;
+
+        assert!(saw_finished, "the turn must finish on the fallback provider");
+        assert_eq!(
+            primary_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the primary 429s exactly once"
+        );
+        assert_eq!(
+            fallback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the fallback provider serves the retried request"
+        );
+
+        // Plan c3ba2b58 step A: BOTH records carry the loop's attribution.
+        let rows = log.list();
+        assert_eq!(
+            rows.len(),
+            2,
+            "one record per attempt: the 429 + the fallback retry"
+        );
+        for row in &rows {
+            let a = row
+                .attribution
+                .as_ref()
+                .expect("attribution survives on both records");
+            assert_eq!(
+                a.actor_kind,
+                crate::provider::trace::TraceActorKind::Worker
+            );
+            assert_eq!(a.agent_id, "1");
+            assert_eq!(a.agent_name, "wt-fallback");
+            assert_eq!(a.worker_id.as_deref(), Some("wt-fallback"));
+            assert_eq!(a.plan_id.as_deref(), Some("plan-9"));
+            assert_eq!(a.plan_step, Some(2));
+            assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
+            assert!(
+                a.turn_id.is_some(),
+                "each request cycle minted a turn id"
+            );
+        }
+        // The failed attempt and the recovered one are distinguishable —
+        // same identity, different providers/outcomes.
+        let (failed, succeeded) = if rows[0].error.is_some() {
+            (&rows[0], &rows[1])
+        } else {
+            (&rows[1], &rows[0])
+        };
+        assert_eq!(failed.provider, "primary");
+        assert_eq!(failed.http_status, Some(429));
+        assert!(failed.error.as_deref().unwrap_or("").contains("429"));
+        assert_eq!(succeeded.provider, "fallback");
+        assert_eq!(succeeded.http_status, Some(200));
+        assert!(succeeded.is_complete);
+        assert_eq!(succeeded.finish_reason.as_deref(), Some("stop"));
+        // The identity is identical across the switch (asserted above) —
+        // that is the fallback invariant. NO distinctness claim on the
+        // turn IDS: `new_turn_id` is `<unix-millis>-<agent_id>`,
+        // millisecond-scoped, so the two request cycles minted within the
+        // same millisecond legitimately share one id (observed under
+        // full-suite load — the second run of this test flaked exactly
+        // here before this claim was dropped).
     }
 
     #[tokio::test]
@@ -2190,22 +2559,18 @@ mod tests {
             .unwrap();
 
         let mut terminal_error_text: Option<String> = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error {
-                        error,
-                        retrying: false,
-                    } => {
-                        terminal_error_text = Some(error);
-                        break;
-                    }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error {
+                    error,
+                    retrying: false,
+                } => {
+                    terminal_error_text = Some(error);
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2312,27 +2677,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2443,24 +2804,20 @@ mod tests {
 
         let mut terminal_error_text: Option<String> = None;
         let mut saw_switching = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            terminal_error_text = Some(error);
-                            break;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } | AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                    if !retrying {
+                        terminal_error_text = Some(error);
+                        break;
+                    }
+                }
+                AgentEvent::Finished { .. } | AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2657,27 +3014,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2779,22 +3132,18 @@ mod tests {
             .unwrap();
 
         let mut terminal_error_text: Option<String> = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error {
-                        error,
-                        retrying: false,
-                    } => {
-                        terminal_error_text = Some(error);
-                        break;
-                    }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error {
+                    error,
+                    retrying: false,
+                } => {
+                    terminal_error_text = Some(error);
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -2943,27 +3292,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         drop(cmd_tx);
@@ -3003,27 +3348,23 @@ mod tests {
         let mut saw_switching = false;
         let mut saw_finished = false;
         let mut saw_terminal_error = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), fanin_rx.recv()).await
-            {
-                Ok(Some((_id, event))) => match event {
-                    AgentEvent::Error { error, retrying } => {
-                        if retrying && error.contains("429") && error.contains("switching") {
-                            saw_switching = true;
-                        }
-                        if !retrying {
-                            saw_terminal_error = true;
-                        }
+        let deadline = tokio::time::Instant::now() + TURN_DEADLINE;
+        while let Some(event) = next_event(&mut *fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Error { error, retrying } => {
+                    if retrying && error.contains("429") && error.contains("switching") {
+                        saw_switching = true;
                     }
-                    AgentEvent::Finished { .. } => {
-                        saw_finished = true;
-                        break;
+                    if !retrying {
+                        saw_terminal_error = true;
                     }
-                    AgentEvent::Exited => break,
-                    _ => {}
-                },
-                _ => break,
+                }
+                AgentEvent::Finished { .. } => {
+                    saw_finished = true;
+                    break;
+                }
+                AgentEvent::Exited => break,
+                _ => {}
             }
         }
         (saw_finished, saw_terminal_error, saw_switching)
@@ -7544,6 +7885,147 @@ mod tests {
         // Drain the fanin channel so nothing blocks.
         while let Ok((_id, _event)) = fanin_rx.try_recv() {}
         drop(cmd_tx);
+    }
+
+    // Audit follow-up: the switch decision must measure the conversation a
+    // compaction LEFT BEHIND — the survival digest and every re-injected
+    // buffered prompt (images included) — not the bare summary. The publish used
+    // to run right after `self.messages = summarized`, before those appends.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_switch_after_a_compaction_measures_the_final_conversation() {
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let stream_entered = Arc::new(tokio::sync::Notify::new());
+        let (stream_gate_tx, stream_gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                AgentLoopConfig {
+                    provider: Arc::new(GatedMockProvider {
+                        caps: Capabilities::openai(),
+                        stream_entered: Arc::clone(&stream_entered),
+                        stream_gate: std::sync::Mutex::new(Some(stream_gate_rx)),
+                    }),
+                    tools: Arc::new(ToolRegistry::new()),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
+                    sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
+                    safety_mode: SafetyMode::Autonomous,
+                    context_manager: ContextManager::new(128_000, 0.5),
+                    memory: None,
+                    vision: None,
+                },
+                crate::project::Constitution::default(),
+            )
+            .with_agent_id(1),
+        );
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let mut task = AgentTask::new(1, "test".into(), agent_loop);
+        for i in 0..10 {
+            task.messages
+                .push(Message::user_text(format!("old message {i}")));
+        }
+        let handle = tokio::spawn(async move {
+            let outcome = task.compact_context(&fanin_tx, &mut cmd_rx).await;
+            (task, outcome)
+        });
+        stream_entered.notified().await;
+        // A big prompt lands while the summary stream is gated: it is buffered
+        // and appended AFTER the rewrite.
+        cmd_tx
+            .send(AgentCommand::Prompt {
+                text: format!("follow-up context {}", "detail ".repeat(8_000)),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let _ = stream_gate_tx.send(());
+        let (task, outcome) = handle.await.unwrap();
+        assert!(
+            matches!(outcome, CompactOutcome::Completed),
+            "the mock summarization must complete"
+        );
+        assert!(
+            task.messages
+                .iter()
+                .any(|m| m.content.as_text().contains("follow-up context")),
+            "the buffered prompt must be part of the final conversation"
+        );
+        // Target: an 8K window → a 4K trigger. The bare post-summary
+        // conversation is far below it; the final one (summary + the ~14K-token
+        // prompt) is far above — so only a publish at the FINAL count defers.
+        let small: Arc<dyn LlmClient> = Arc::new(MockProvider {
+            caps: Capabilities {
+                max_context: 8_000,
+                ..Capabilities::openai()
+            },
+        });
+        task.agent_loop
+            .set_explicit_provider(small, ContextManager::new(8_000, 0.5));
+        assert!(
+            task.agent_loop.has_pending_swap(),
+            "the final conversation is over the new window's trigger — it must compact first"
+        );
+        while let Ok((_id, _event)) = fanin_rx.try_recv() {}
+        drop(cmd_tx);
+    }
+
+    // Audit follow-up: the PRODUCTION resume path (`AgentTask::seed_messages`)
+    // must publish the transcript itself, so a switch landing before the first
+    // request sees a too-big history instead of a count of 0.
+    #[tokio::test]
+    async fn a_seeded_transcript_compacts_before_the_switch() {
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                AgentLoopConfig {
+                    provider: Arc::new(MockProvider {
+                        caps: Capabilities::openai(),
+                    }),
+                    tools: Arc::new(ToolRegistry::new()),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
+                    sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
+                    safety_mode: SafetyMode::Autonomous,
+                    context_manager: ContextManager::new(200_000, 0.5),
+                    memory: None,
+                    vision: None,
+                },
+                crate::project::Constitution::default(),
+            )
+            .with_agent_id(1),
+        );
+        let mut task = AgentTask::new(1, "test".into(), agent_loop);
+        let history: Vec<Message> = (0..20)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                Message::text(role, "z".repeat(800))
+            })
+            .collect();
+        // The ONLY publish is the one `seed_messages` performs.
+        task.seed_messages(history);
+        // Target: a 4K window → a 2K trigger; the 16K-char transcript is far
+        // over it, and no request has ever run.
+        let small: Arc<dyn LlmClient> = Arc::new(MockProvider {
+            caps: Capabilities {
+                max_context: 4_000,
+                ..Capabilities::openai()
+            },
+        });
+        task.agent_loop
+            .set_explicit_provider(small, ContextManager::new(4_000, 0.5));
+        assert!(
+            task.agent_loop.has_pending_swap(),
+            "a transcript seeded through the production resume path must compact before the switch"
+        );
     }
 
     #[tokio::test]

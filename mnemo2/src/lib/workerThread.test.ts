@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TeamEvent, TeamWorkerRecord } from "./teamState";
 import type { WorkerThreadEntry } from "./types";
 import {
+  applyModelSwitch,
   applyWorkerLiveEvent,
   CONTEXT_FOOTER,
   emptyWorkerLive,
@@ -42,12 +43,16 @@ function record(messages: TeamWorkerRecord["transcript"]["messages"]): TeamWorke
   } as TeamWorkerRecord;
 }
 
-/** A compact view of a thread: who said what, or which tool ran. */
+/** A compact view of a thread: who said what, which tool ran, or what failed. */
 function shape(entries: WorkerThreadEntry[]): string[] {
   return entries.map((entry) =>
     entry.kind === "tool"
       ? `tool:${entry.toolName}:${entry.result === null ? "running" : entry.result.success ? "ok" : "failed"}`
-      : `${entry.from}:${entry.body}`,
+      : entry.kind === "error"
+        ? `error${entry.retrying ? "-retrying" : ""}:${entry.body}`
+        : entry.kind === "model_switch"
+          ? `model-switch${entry.applied ? "-applied" : "-pending"}:${entry.body}`
+          : `${entry.from}:${entry.body}`,
   );
 }
 
@@ -178,5 +183,143 @@ describe("worker thread", () => {
     const first = live.entries.find((entry) => entry.kind === "tool" && entry.toolCallId === "c1");
     expect(first?.kind === "tool" && first.startedAtMs).toBe(2_000);
     expect(first?.kind === "tool" && first.endedAtMs).toBe(4_000);
+  });
+
+  it("holds one retrying-error note: newer errors replace it and resumed text clears it", () => {
+    let live = emptyWorkerLive(1, 0);
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "Halfway " }));
+    live = applyWorkerLiveEvent(live, event("error", { error: "429: usage limit", retrying: true }));
+
+    // The half-written message stays open: a successful retry continues it.
+    expect(live.streamingId).not.toBeNull();
+    expect(shape(live.entries)).toEqual(["worker:Halfway ", "error-retrying:429: usage limit"]);
+
+    // A newer provider error replaces the note — never two notes at once.
+    live = applyWorkerLiveEvent(live, event("error", { message: "still over the session limit", retrying: true }));
+    expect(shape(live.entries)).toEqual(["worker:Halfway ", "error-retrying:still over the session limit"]);
+
+    // Streaming resumes: the note is gone and the message continues.
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "through." }));
+    expect(shape(live.entries)).toEqual(["worker:Halfway through."]);
+  });
+
+  it("turns a final error into a lasting thread entry that closes the stream", () => {
+    let live = emptyWorkerLive(1, 0);
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "Halfway" }));
+    live = applyWorkerLiveEvent(live, event("error", { error: "429: you have reached your session usage limit", retrying: true }));
+    live = applyWorkerLiveEvent(live, event("error", { error: "429: retries exhausted", retrying: false }));
+
+    expect(shape(live.entries)).toEqual(["worker:Halfway", "error:429: retries exhausted"]);
+    expect(live.streamingId).toBeNull();
+
+    // The final entry is not transient: a later lifecycle event keeps it.
+    live = applyWorkerLiveEvent(live, event("finished"));
+    expect(shape(live.entries)).toEqual(["worker:Halfway", "error:429: retries exhausted"]);
+  });
+
+  it("falls back to the generic stop error when the event carries no text", () => {
+    const live = applyWorkerLiveEvent(emptyWorkerLive(1, 0), event("error", { retrying: false }));
+    expect(shape(live.entries)).toEqual(["error:The worker stopped with an error."]);
+  });
+});
+
+describe("live model switch", () => {
+  it("notes the switch with the badge's short model name, keeping the stream open", () => {
+    let live = emptyWorkerLive(1, 0);
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "Halfway" }));
+
+    live = applyModelSwitch(live, "test/deep");
+
+    // The request in flight still serves on the old model: the muted note
+    // lands at the thread's end while the open message keeps streaming.
+    expect(live.streamingId).not.toBeNull();
+    expect(shape(live.entries)).toEqual([
+      "worker:Halfway",
+      "model-switch-pending:Model changed to deep by you; it takes effect on the next call",
+    ]);
+
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: " there." }));
+    expect(shape(live.entries)).toEqual([
+      "worker:Halfway there.",
+      "model-switch-pending:Model changed to deep by you; it takes effect on the next call",
+    ]);
+  });
+
+  it("confirms the note once the switched model serves, ignoring other models", () => {
+    let live = applyModelSwitch(emptyWorkerLive(1, 0), "test/deep");
+
+    // A different model serving does not confirm the pending note.
+    live = applyWorkerLiveEvent(live, event("model_changed", { model: "fast", provider: "test" }));
+    expect(shape(live.entries)).toEqual([
+      "model-switch-pending:Model changed to deep by you; it takes effect on the next call",
+    ]);
+
+    // The kernel's ModelChanged names the model it serves, not the spec.
+    live = applyWorkerLiveEvent(
+      live,
+      event("model_changed", { model: "deep", provider: "test", reasoning_effort: null }),
+    );
+    expect(shape(live.entries)).toEqual(["model-switch-applied:Now running on deep"]);
+
+    // Repeated ModelChanged events for the same model change nothing.
+    live = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
+    expect(shape(live.entries)).toEqual(["model-switch-applied:Now running on deep"]);
+  });
+
+  it("replaces a pending note with a newer switch, keeping confirmed history", () => {
+    let live = applyModelSwitch(emptyWorkerLive(1, 0), "test/deep");
+    live = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
+    live = applyModelSwitch(live, "test/fast");
+
+    expect(shape(live.entries)).toEqual([
+      "model-switch-applied:Now running on deep",
+      "model-switch-pending:Model changed to fast by you; it takes effect on the next call",
+    ]);
+
+    // The newer switch replaces the pending note; confirmed history stays,
+    // and the note names the model the badge shows even for a vendor-prefixed spec.
+    live = applyModelSwitch(live, "openrouter/anthropic/claude-opus-5-5");
+    expect(shape(live.entries)).toEqual([
+      "model-switch-applied:Now running on deep",
+      "model-switch-pending:Model changed to claude-opus-5-5 by you; it takes effect on the next call",
+    ]);
+  });
+
+  it("leaves the thread alone when a model change arrives with no pending note", () => {
+    let live = emptyWorkerLive(1, 0);
+    live = applyWorkerLiveEvent(live, event("text_delta", { text: "Working" }));
+    const next = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
+    expect(next).toBe(live);
+  });
+
+  it("notes a summarized deferred switch as a muted note, never an error", () => {
+    // The deferred compact-then-switch completed: the OLD model summarized the
+    // conversation to fit the new, smaller window. Informational (bug
+    // 2026-11-02, plan 1238e0de) — a muted note beside the switch note, never
+    // an `error` entry, and the pending switch keeps waiting for its serve.
+    let live = applyModelSwitch(emptyWorkerLive(1, 0), "test/deep");
+    live = applyWorkerLiveEvent(live, event("model_swap_summarized", { model: "deep" }));
+
+    expect(shape(live.entries)).toEqual([
+      "model-switch-pending:Model changed to deep by you; it takes effect on the next call",
+      "model-switch-applied:Summarized the conversation to fit deep",
+    ]);
+    expect(live.entries.some((entry) => entry.kind === "error")).toBe(false);
+
+    live = applyWorkerLiveEvent(live, event("model_changed", { model: "deep" }));
+    expect(shape(live.entries)).toEqual([
+      "model-switch-applied:Now running on deep",
+      "model-switch-applied:Summarized the conversation to fit deep",
+    ]);
+  });
+
+  it("names the summarization note by the badge's short model", () => {
+    const live = applyWorkerLiveEvent(
+      emptyWorkerLive(1, 0),
+      event("model_swap_summarized", { model: "openrouter/anthropic/claude-opus-5-5" }),
+    );
+    expect(shape(live.entries)).toEqual([
+      "model-switch-applied:Summarized the conversation to fit claude-opus-5-5",
+    ]);
   });
 });

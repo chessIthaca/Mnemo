@@ -152,6 +152,25 @@ pub struct SpawnOptions {
     /// with `external_policy`; exclusive with `policy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardrails: Option<crate::agent::policy::Guardrails>,
+
+    /// Trace attribution (plan c3ba2b58 step A): the identity stamped on
+    /// this session's model-call records — who the session is in the
+    /// trace (lead/worker/subagent/system) plus its worker/plan labels.
+    /// `None` (every pre-c3ba2b58 caller) keeps the records
+    /// unattributed. The engine passes it to the host spawn path, which
+    /// fills the allocated agent/session ids and stamps it on the loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_identity: Option<crate::provider::trace::TraceIdentity>,
+    /// The session's task, kept verbatim in the system message for the
+    /// whole session (never summarized by compaction or a model switch).
+    /// `None` for an ordinary session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_task: Option<String>,
+    /// When true, this session's turns are never classified by the
+    /// pre-prompt routing gate, and no routing.jsonl rows are written for
+    /// them. Mnemo2 routes at dispatch instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_turn_routing: bool,
 }
 
 /// A command to a live session (§5.3 :327-338) — the public mirror of the

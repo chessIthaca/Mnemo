@@ -213,8 +213,10 @@
           failed === 1
             ? "Could not attach the pasted image."
             : `Could not attach ${failed} pasted images.`,
+          "error",
         );
       }
+
     } finally {
       attaching = false;
     }

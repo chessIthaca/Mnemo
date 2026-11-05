@@ -2,7 +2,7 @@
   "name": "mnemo",
   "private": true,
   "license": "MIT",
-  "version": "1.3.0",
+  "version": "2.0.0",
   "workspaces": [
     "frontend",
     "mnemo2"
@@ -15,11 +15,15 @@
     "build:mnemo2": "npm run build --workspace mnemo2",
     "dev:mnemo2:native": "cargo run --manifest-path src-tauri/Cargo.toml --features mnemo2 --bin mnemo2",
     "build:mnemo2:native": "npm run build:mnemo2 && cargo build --manifest-path src-tauri/Cargo.toml --features mnemo2,custom-protocol --bin mnemo2 --bin mnemo2-mcp --release && node scripts/install-mnemo2-mcp.mjs",
+    "rebuild:mnemo2": "node scripts/rebuild-mnemo2.mjs",
     "test:mnemo2": "npm test --workspace mnemo2",
     "test:mnemo2:native": "cargo test --manifest-path src-tauri/Cargo.toml -p mnemo-app --features mnemo2 --lib",
     "check:mnemo2": "npm run check --workspace mnemo2"
   },
   "allowScripts": {
     "esbuild": true
+  },
+  "overrides": {
+    "postcss-selector-parser": "^6.1.5"
   }
 }

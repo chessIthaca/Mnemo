@@ -31,24 +31,28 @@ Never infer worker lifecycle from Git, files, timestamps or team.json. `team_sta
 
 ## Tiers
 
-Dispatch by `tier`, not by model name:
+Dispatch by `tier`, not by model name. Five tiers, cheapest first:
 
-- `difficult`: design, debugging, bug_fixing plans, cross-cutting work, steps touching shared contracts.
-- `average`: typical implementation steps.
-- `simple`: single-file mechanical edits, checks, lookups, scaffolding.
+- `trivial`: rename, typo, version bump, config value, copy change, a log line, dead code, doc comment, a single-file mechanical edit, a lookup or a check.
+- `routine`: implement a specified function, tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.
+- `medium`: a normal multi-file change with a clear spec — a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.
+- `high`: subtle bugs, races, flaky tests, data loss, performance regressions, security, persistence formats, shared contracts, concurrency, design the spec leaves open, bug_fixing plans.
+- `escalate`: only work a lower tier visibly failed at — repeated review failures, a stuck worker, an audit that keeps finding real problems. Never a first pick: only an escalation path and a deliberate choice use it.
 
 Rules:
 
 - Choose the cheapest tier that fits the step. The tier's first available model runs the worker.
-- The `tier` parameter of `team_dispatch` lists each tier's models and prices. Read it before choosing.
+- An empty tier runs on the nearest tier below it that has a model, and the dispatch result says so ("medium has no model; ran on routine"). Fix rounds and audits fold the same way.
+- The `tier` parameter of `team_dispatch` lists each tier's name, definition, models and prices. Read it before choosing.
 - Pass `model` only when the tier's first model does not fit. It must be a model some tier names; anything else is refused with the allowed list.
-- `reasoning_effort` is optional and must be one the chosen model supports.
+- `reasoning_effort` is optional and must be one the chosen model supports; without it the tier's default effort applies.
 - Tiers are enforced server-side. With tiers configured, a dispatch with neither `tier` nor `model` is refused.
+- Those five ids are the only tier names. `simple`, `average` and `difficult` are refused, and the error lists the five ids.
 - With no tiers configured (Mnemo2 Settings > Tiers), omit `tier`. The default model runs, or pass a `model` from the tool's enum.
 
 ## Briefs
 
-The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. Your `brief` carries only what is specific to this task:
+The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. The design belongs in the step text, written as a spec as the `mnemo-plan` skill describes, because the brief is not saved in the plan: a later worker on the same step never sees it. If you notice while writing a brief that the step lacks signatures, rules or test names, add them to the plan first, with `plan_update` `add_steps` or `decision`. Your `brief` then carries only what is specific to this dispatch:
 
 - the goal of this task in one or two sentences;
 - the files it owns, and the files it must not touch because another step owns them;
@@ -56,6 +60,8 @@ The worker automatically receives the plan (title, goal, context, decisions, int
 - the exact verification commands to run (build, tests, lint);
 - constraints and traps you know about;
 - "commit on your branch, report the commit and the checks you ran, and message the lead if you are blocked".
+
+Pass `read_back: true` to `team_dispatch` for a large or subtle spec. The worker then first sends you its questions, or "No questions.", and waits. Answer by amending the plan (`plan_update` `decision` or `add_steps`) and then `team_message` the worker, so the answer is durable.
 
 Give whole, self-contained implementation tasks. Never send read-only, content-only or "send me the file text" briefs.
 
@@ -80,7 +86,9 @@ A worker's turn ends with a "finished its turn" notice. Then:
    - Each review replaces the finding list: send every finding every time, and reuse finding ids when re-reviewing.
 5. Every open finding (`title`, `detail`, `file`, `line`, `severity` high or low) blocks the merge, whatever its severity. Close them:
    - Tiny exact fix: `review_fix`. One `old_string` that occurs exactly once in the finding's file, at most 100 lines in total, not in test files or `.coding`. It commits on the worker branch, marks the finding fixed, and clears checks and review, so re-check and re-review.
-   - Larger fix: `team_route_fix` hands the finding to the same worker and clears checks and review. A new "finished its turn" notice arrives when it is done. Do a delta review: re-run checks, `team_review` again.
+   - Larger fix: `team_route_fix` hands the finding to the same worker and clears checks and review. The fix prompt carries every open finding in full (id, severity, title, detail, file, line), so one round fixes them together. A new "finished its turn" notice arrives when it is done. Do a delta review: re-run checks, `team_review` again.
+     - It takes an optional `tier`: a ladder id runs the round on that tier's model in the same session (transcript, worktree and branch kept) — a cheaper tier is enough for a small exact fix; `auto` lets the routing question classify the findings' text. With `auto`, a `high`-severity finding, or one in a file the plan lists as an interface, never steps down; name the tier yourself if it must.
+     - If the review after that round leaves the finding open, the worker is moved back to its previous tier at once, and the escalation notice below fires.
    - Fixed or not a problem: `team_resolve_finding` with `status` fixed plus `evidence`, or wontfix plus a written `justification`. It does not move the tip, so the review stays valid.
 6. `team_merge` merges the worker with `--no-ff` into the lead branch. It never targets `main` and never pushes. It needs:
    - the worker in review, with a review of the exact current tip and complete evidence;
@@ -95,11 +103,28 @@ A worker's turn ends with a "finished its turn" notice. Then:
 
 After the last step merges, the plan closes when the team review passes, and a review report is written under `.coding/reviews/`. Tell the user the outcome and the report path.
 
+### Escalation notices
+
+Mnemo2 sends an escalation notice when a worker's work keeps failing. Four things trigger it:
+
+- the second review round leaves the same finding open;
+- a `team_route_fix` round ends with its finding still open;
+- a fix round after a high-severity audit finding leaves that finding open;
+- three failing or verbatim-repeated tool calls in a row.
+
+The notice names the tier to try next: the nearest rung above the worker's that has a model of its own, `escalate` once the worker is on `high`. When no rung above has a model, no notice fires.
+
+- Outside "Auto" mode it is advice: `team_resume` with the `worker_id` and that `tier`, then `team_message` the worker to continue. Its session, transcript and worktree are kept. With routing off you get no notice.
+- In "Auto" mode Mnemo2 switches the worker itself as soon as it is idle and keeps its session, and the notice says which tier and model it moved to. Do not switch it again; just `team_message` it. A busy worker is switched at its next idle moment, never mid-turn.
+- One nudge per worker. The routing log says whether it was followed (the worker ended on a higher tier) or ignored (it ended where it was).
+
 ### High-risk work
 
 Dispatch with `review_risk` "high" for shared contracts, persistence, concurrency, security and large cross-cutting work. Such a worker cannot merge without a fresh independent audit.
 
 1. When the worker is idle at its final tip, call `team_audit_dispatch` with a new `reviewer_id` (8 to 64 letters and digits) and an intent `brief`. The audit worker is read-only. It gets the plan, your brief and the diff, never the implementer's summary.
+   - It takes an optional `tier`, default `high`. An empty tier folds down like a dispatch, and `escalate` is allowed when the work keeps failing. The audit's tier and model show in `team_status` and mission control from the moment it is dispatched.
+   - Until it reports, `team_resume` with its `worker_id` and a `tier` or `model` switches it. Once it has reported it is locked; dispatch a new audit instead. Audits are never routed by Laya, and their switches are not training data.
 2. Its notice says "finished its read-only audit". Read its reports, then `team_review` the implementation worker with `evidence.independent_reviewer_id` and a written `evidence.audit_adjudication` that answers each audit finding.
 3. Any fix commit moves the tip and makes the audit stale. Dispatch a fresh audit with a new `reviewer_id`. Never merge the audit worker itself.
 
@@ -113,8 +138,10 @@ Mnemo2 sends lead notices that start with "[TeamManager notice — not the human
 - "reports: ...": a worker's message to the lead (a status or a question). Answer with `team_message`.
 - "is blocked waiting for an approval" or "an answer": the user decides in mission control. Tell them which worker waits, and open it with `open_mission_control`.
 - "failed: ...": see Failures below.
+- "Laya nudge: ..." or "Auto escalation switched worker ...": escalation advice, see Escalation notices above.
 - "finished its read-only audit": adjudicate it, see High-risk work.
-- "Plan X step N is done", "Plan X is closed", "cannot close yet", "could not be ticked": board events. Read them, then `plan_show`.
+- "Plan this backlog item <id>": the user handed you a backlog idea. Write the plan with `plan_create` and pass that item's `backlog_id`; the item is marked done with the new plan's id.
+- "Plan X step N is done", "Plan X is closed", "cannot close yet", "could not be ticked": board events. Read them, then `plan_show`. A "cannot close yet" can name a spec change that no longer applies to the current spec: fix it with `plan_update`, then tick the last step again.
 
 They reach you three ways:
 
@@ -157,7 +184,7 @@ Knowledge files live on the lead branch; a merge allows uncommitted changes ther
 - Decisions and history: `memory_search`, which finds the `SPEC:`, `DECISION:`, `BUG:` and `HOW:` records a text search cannot.
 - `Grep` and `Glob` stay for exact text in files you know, and for regexes.
 
-The Mnemo tools are deferred `mcp__plugin_mnemo_mnemo__<name>` tools: load one with `ToolSearch` (`select:mcp__plugin_mnemo_mnemo__search`) before the first call. A PreToolUse hook adds a one-line hint when a Grep or Glob looks like a symbol or a knowledge lookup; it never blocks the call.
+The Mnemo tools are deferred `mcp__plugin_mnemo_mnemo__<name>` tools: load one with `ToolSearch` (`select:mcp__plugin_mnemo_mnemo__search`) before the first call. A PreToolUse hook adds a one-line hint when a Grep or Glob, or a shell `grep`/`rg`/`git grep`/`findstr`/`Select-String` that searches files, looks like a symbol or a knowledge lookup; a shell command that only filters another command's output gets none. It never blocks the call.
 
 ## Failures and course changes
 

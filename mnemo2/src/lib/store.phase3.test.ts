@@ -598,4 +598,84 @@ describe("native Phase 3 store integration", () => {
       },
     });
   });
+
+  it("switches a working worker live, noting the switch until the new model serves", async () => {
+    const initial = nativeWorker({ status: "working", model: "test/scripted-a" });
+    const transport = makeTransport(initial);
+    const handlers: ((event: TeamEvent) => void)[] = [];
+    let record = initial;
+    transport.setModel = vi.fn(async (_workerId: string, model: string) => {
+      // The live-switch contract: the record keeps running and its model_id
+      // is cleared; the next request serves on the new model.
+      record = { ...record, model, model_id: null };
+      return record;
+    });
+    transport.snapshot = vi.fn(async () => ({
+      workers: [record],
+      slots: 3,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    }));
+    transport.onEvent = vi.fn(async (handler: (event: TeamEvent) => void) => {
+      handlers.push(handler);
+      return () => {};
+    });
+    await openNativeTeam(transport);
+
+    await actions.setWorkerModel("ana", "test/deep", null);
+
+    expect(transport.setModel).toHaveBeenCalledWith("ana", "test/deep", null);
+    const state = get(app);
+    // No stop or resume: the worker kept working, now on the new model.
+    expect(state.workers[0].status).toBe("working");
+    expect(state.workers[0].model).toBe("test/deep");
+    expect(state.toast?.message).toBe("Ana keeps working; it runs on test/deep from its next call.");
+    expect(state.workers[0].messages.at(-1)).toMatchObject({
+      kind: "model_switch",
+      model: "test/deep",
+      applied: false,
+      body: "Model changed to deep by you; it takes effect on the next call",
+    });
+
+    // The kernel's ModelChanged arrives once the new model serves: the note
+    // flips to its confirmed text, without a second copy.
+    const modelChanged: TeamEvent = {
+      worker_id: "ana",
+      generation: 1,
+      event: { agent: 7, event: { kind: "model_changed", model: "deep", provider: "test", reasoning_effort: null } },
+    };
+    for (const handler of handlers) handler(modelChanged);
+    await vi.waitFor(() => {
+      expect(get(app).workers[0].messages.at(-1)).toMatchObject({
+        kind: "model_switch",
+        applied: true,
+        body: "Now running on deep",
+      });
+    });
+    expect(
+      get(app).workers[0].messages.filter((entry) => entry.kind === "model_switch"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps the non-running path unchanged: idle toast, no thread note", async () => {
+    const transport = makeTransport(nativeWorker());
+    let record = nativeWorker();
+    transport.setModel = vi.fn(async (_workerId: string, model: string) => {
+      record = { ...record, model, model_id: null };
+      return record;
+    });
+    transport.snapshot = vi.fn(async () => ({
+      workers: [record],
+      slots: 3,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    }));
+    await openNativeTeam(transport);
+
+    await actions.setWorkerModel("ana", "test/deep", null);
+
+    const state = get(app);
+    expect(state.toast?.message).toBe("Ana now runs on test/deep. Message it to continue.");
+    expect(state.workers[0].messages.some((entry) => entry.kind === "model_switch")).toBe(false);
+  });
 });

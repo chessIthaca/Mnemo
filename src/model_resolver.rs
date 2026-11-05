@@ -406,20 +406,20 @@ impl ModelResolver for ConfigModelResolver {
             .config
             .read()
             .expect("ConfigModelResolver config lock poisoned");
-        let routing = &config.general.general.routing;
-        let target_ref = match target {
-            RouteTarget::Cheap => routing.cheap.as_ref(),
-            RouteTarget::Capable => routing.capable.as_ref(),
-            // The escalation-lane rungs (backlog ad56c7bd): each has its own
-            // USER-CHOSEN target, and an unset or dangling one falls through
-            // below to None -- the caller keeps the current model.
-            RouteTarget::Medium => routing.lane_medium.as_ref(),
-            RouteTarget::High => routing.lane_high.as_ref(),
-            RouteTarget::Escalate => routing.escalate.as_ref(),
+        // The target IS the ladder tier id (plan 87932c46): the ladder
+        // supplies fold-down (an empty tier resolves to the nearest lower
+        // tier with a model), and a dangling endpoint still falls back.
+        let (ran_tier, spec) = config.tiers.resolve(target.label())?;
+        let (endpoint, model) = spec.split_once('/')?;
+        let target_ref = ModelRef {
+            endpoint: endpoint.to_string(),
+            model: model.to_string(),
+            reasoning_effort: config
+                .tiers
+                .get(&ran_tier)
+                .and_then(|tier| tier.effort.clone()),
         };
-        // Validated as its own link: unset or dangling (endpoint deleted)
-        // falls through to None, and the caller keeps the resolve() model.
-        config.resolve_model_ref(target_ref)
+        config.resolve_model_ref(Some(&target_ref))
     }
 
     fn routing_policy(&self) -> Option<RoutingPolicy> {
@@ -433,9 +433,19 @@ impl ModelResolver for ConfigModelResolver {
             return None;
         }
         let routing = &config.general.general.routing;
+        let offered = crate::agent::route_question::OfferedLabels {
+            trivial: config.tiers.first_model("trivial").is_some(),
+            routine: true,
+            involved: config.tiers.first_model("medium").is_some(),
+            hard: config.tiers.first_model("high").is_some(),
+        };
         Some(RoutingPolicy {
             threshold: routing.threshold,
             enforce: routing.enforce,
+            offered,
+            first_prompt_min_confidence: routing
+                .first_prompt_min_confidence
+                .unwrap_or_else(|| crate::agent::route_question::default_min_confidence(offered.count())),
         })
     }
 
@@ -576,7 +586,7 @@ mod tests {
     // 2b.3: the production imports retired with the kernel decoupling; the
     // tests keep the typed workflow enums (cfg(test) — scan-excluded).
     use crate::app::workflow::{PlanKind, WorkflowState};
-    use crate::config::{Endpoint, GeneralConfig, ModelsConfig, RoutingConfig};
+    use crate::config::{Endpoint, GeneralConfig, ModelsConfig};
     use std::collections::HashMap;
 
     /// Build a Config with two endpoints ("openai" + "deepseek") so overrides
@@ -602,6 +612,7 @@ mod tests {
                 },
             ],
             pricing: vec![],
+            tiers: Default::default(),
             keys: Default::default(),
             mcp: Vec::new(),
             projects: Default::default(),
@@ -615,12 +626,50 @@ mod tests {
         )
     }
 
-    /// A config whose only difference from a plain default is
-    /// `[general.routing]` -- the routing tests key off this.
+    /// Test-only legacy fixture: each case is converted to the unified ladder
+    /// before reaching the production resolver.
+    #[derive(Default)]
+    struct RoutingConfig {
+        cheap: Option<ModelRef>,
+        routine: Option<ModelRef>,
+        capable: Option<ModelRef>,
+        lane_medium: Option<ModelRef>,
+        lane_high: Option<ModelRef>,
+        escalate: Option<ModelRef>,
+        threshold: f64,
+        first_prompt_min_confidence: Option<f64>,
+        enforce: bool,
+    }
+
     fn config_with_routing(routing: RoutingConfig) -> Config {
         let mut config = config_with_endpoints(ModelsConfig::default());
-        config.general.general.routing = routing;
-        config
+        config.general.general.routing = crate::config::RoutingConfig {
+            threshold: routing.threshold,
+            first_prompt_min_confidence: routing.first_prompt_min_confidence,
+            enforce: routing.enforce,
+        };
+        let dir = tempfile::tempdir().expect("routing fixture");
+        config.save_all(dir.path()).expect("fixture endpoints");
+        let mut text = toml::to_string(&config.general).expect("fixture general");
+        for (lane, model) in [
+            ("cheap", routing.cheap),
+            ("routine", routing.routine),
+            ("capable", routing.capable),
+            ("lane_medium", routing.lane_medium),
+            ("lane_high", routing.lane_high),
+            ("escalate", routing.escalate),
+        ] {
+            let Some(model) = model else { continue };
+            text.push_str(&format!(
+                "\n[general.routing.{lane}]\nendpoint = {:?}\nmodel = {:?}\n",
+                model.endpoint, model.model
+            ));
+            if let Some(effort) = model.reasoning_effort {
+                text.push_str(&format!("reasoning_effort = {:?}\n", effort));
+            }
+        }
+        std::fs::write(dir.path().join("config.toml"), text).expect("legacy lanes");
+        Config::load(dir.path()).expect("migrate routing fixture")
     }
 
     fn cheap_ref() -> ModelRef {
@@ -643,19 +692,28 @@ mod tests {
     fn routed_targets_resolve_when_configured() {
         let r = resolver(config_with_routing(RoutingConfig {
             cheap: Some(cheap_ref()),
+            routine: Some(ModelRef {
+                endpoint: "openai".into(),
+                model: "routine-model".into(),
+                reasoning_effort: None,
+            }),
             capable: Some(capable_ref()),
             ..RoutingConfig::default()
         }));
         let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
         let cheap = r
-            .resolve_routed(RouteTarget::Cheap, ctx.clone())
-            .expect("cheap target");
+            .resolve_routed(RouteTarget::Trivial, ctx.clone())
+            .expect("trivial target");
         assert_eq!(cheap.endpoint, "deepseek");
         assert_eq!(cheap.model, "deepseek-v4-flash");
         assert_eq!(cheap.reasoning_effort.as_deref(), Some("minimal"));
+        let routine = r
+            .resolve_routed(RouteTarget::Routine, ctx.clone())
+            .expect("routine target");
+        assert_eq!(routine.model, "routine-model");
         let capable = r
-            .resolve_routed(RouteTarget::Capable, ctx.clone())
-            .expect("capable target");
+            .resolve_routed(RouteTarget::High, ctx.clone())
+            .expect("high target");
         assert_eq!(capable.endpoint, "openai");
         assert_eq!(capable.model, "o3");
         assert_eq!(capable.reasoning_effort.as_deref(), Some("max"));
@@ -666,8 +724,8 @@ mod tests {
         let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
         // Unset: no routing config at all (the default config shape).
         let plain = resolver(config_with_endpoints(ModelsConfig::default()));
-        assert!(plain.resolve_routed(RouteTarget::Cheap, ctx.clone()).is_none());
-        assert!(plain.resolve_routed(RouteTarget::Capable, ctx.clone()).is_none());
+        assert!(plain.resolve_routed(RouteTarget::Trivial, ctx.clone()).is_none());
+        assert!(plain.resolve_routed(RouteTarget::High, ctx.clone()).is_none());
 
         // Dangling: the endpoint no longer exists -> today's model.
         let dangling = resolver(config_with_routing(RoutingConfig {
@@ -679,8 +737,8 @@ mod tests {
             capable: Some(capable_ref()),
             ..RoutingConfig::default()
         }));
-        assert!(dangling.resolve_routed(RouteTarget::Cheap, ctx.clone()).is_none());
-        assert!(dangling.resolve_routed(RouteTarget::Capable, ctx.clone()).is_some());
+        assert!(dangling.resolve_routed(RouteTarget::Trivial, ctx.clone()).is_none());
+        assert!(dangling.resolve_routed(RouteTarget::High, ctx.clone()).is_some());
     }
 
     #[test]
@@ -701,12 +759,16 @@ mod tests {
         }));
         let medium = r
             .resolve_routed(RouteTarget::Medium, ctx.clone())
-            .expect("lane_medium target");
+            .expect("medium tier target");
         assert_eq!(medium.endpoint, "deepseek");
         assert_eq!(medium.model, "medium-model");
-        // An unset rung falls through without error: the caller keeps the
-        // turn's configured model.
-        assert!(r.resolve_routed(RouteTarget::High, ctx.clone()).is_none());
+        // An empty rung folds down to the nearest lower rung with a model.
+        assert_eq!(
+            r.resolve_routed(RouteTarget::High, ctx.clone())
+                .expect("high folds down to medium")
+                .model,
+            "medium-model"
+        );
         let escalate = r
             .resolve_routed(RouteTarget::Escalate, ctx.clone())
             .expect("escalate target");
@@ -734,6 +796,28 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_medium_tier_folds_down_to_routine() {
+        // Design §3.2: every tier resolves — an empty tier folds down to the
+        // nearest lower tier with a model. Here `medium` is empty, so the
+        // step-lane `medium` rung runs on `routine`'s first model.
+        let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
+        let r = resolver(config_with_routing(RoutingConfig {
+            routine: Some(ModelRef {
+                endpoint: "openai".into(),
+                model: "routine-model".into(),
+                reasoning_effort: None,
+            }),
+            ..RoutingConfig::default()
+        }));
+        assert_eq!(
+            r.resolve_routed(RouteTarget::Medium, ctx)
+                .expect("medium folds down to routine")
+                .model,
+            "routine-model"
+        );
+    }
+
+    #[test]
     fn explicit_pins_beat_routing() {
         let r = resolver(config_with_routing(RoutingConfig {
             cheap: Some(cheap_ref()),
@@ -742,10 +826,10 @@ mod tests {
         }));
         // A skill is a deliberate context switch.
         let skill = ModelContext::new(WorkflowState::Skill, Some("merge_to_main"), false, None);
-        assert!(r.resolve_routed(RouteTarget::Cheap, skill).is_none());
+        assert!(r.resolve_routed(RouteTarget::Trivial, skill).is_none());
         // Subagents have their own role slot.
         let sub = ModelContext::new(WorkflowState::Subagent, None, true, None);
-        assert!(r.resolve_routed(RouteTarget::Capable, sub).is_none());
+        assert!(r.resolve_routed(RouteTarget::High, sub).is_none());
         // The bug-fixing plan-kind slot wins in its active lifecycle.
         let bug = ModelContext::new(
             WorkflowState::Executing,
@@ -753,7 +837,7 @@ mod tests {
             false,
             Some(PlanKind::BugFixing),
         );
-        assert!(r.resolve_routed(RouteTarget::Capable, bug).is_none());
+        assert!(r.resolve_routed(RouteTarget::High, bug).is_none());
         // ... but not in Complete (the plan is finished, no slot engaged).
         let done = ModelContext::new(
             WorkflowState::Complete,
@@ -761,7 +845,7 @@ mod tests {
             false,
             Some(PlanKind::BugFixing),
         );
-        assert!(r.resolve_routed(RouteTarget::Capable, done).is_some());
+        assert!(r.resolve_routed(RouteTarget::High, done).is_some());
     }
 
     #[test]
@@ -784,6 +868,14 @@ mod tests {
             Some(RoutingPolicy {
                 threshold: 0.9,
                 enforce: true,
+                offered: crate::agent::route_question::OfferedLabels {
+                    trivial: false,
+                    routine: true,
+                    involved: false,
+                    hard: false,
+                },
+                first_prompt_min_confidence:
+                    crate::agent::route_question::default_min_confidence(1),
             })
         );
     }
@@ -867,15 +959,15 @@ mod tests {
         };
         let baseline = resolver(config_with_endpoints(models()));
         let mut routed_config = config_with_endpoints(models());
-        routed_config.general.general.routing = RoutingConfig {
+        let routed_lanes = config_with_routing(RoutingConfig {
             cheap: Some(cheap_ref()),
             capable: Some(capable_ref()),
-            lane_medium: None,
-            lane_high: None,
-            escalate: None,
             threshold: 0.9,
             enforce: true,
-        };
+            ..RoutingConfig::default()
+        });
+        routed_config.general.general.routing = routed_lanes.general.general.routing.clone();
+        routed_config.tiers = routed_lanes.tiers;
         let routed = resolver(routed_config);
         for ctx in [
             ModelContext::new(WorkflowState::Planning, None, false, None),
@@ -1606,6 +1698,7 @@ mod tests {
                 },
             ],
             pricing: vec![],
+            tiers: Default::default(),
             keys: Default::default(),
             mcp: Vec::new(),
             projects: Default::default(),

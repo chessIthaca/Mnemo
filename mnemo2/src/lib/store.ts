@@ -1,7 +1,9 @@
 import { derived, get, writable } from "svelte/store";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
 import { createProjectTransport, type ProjectPreferences, type ProjectRecord, type ProjectTransport } from "./projectEngine";
+import type { RepoPathRef } from "./repoPaths";
 import { probeMnemo2Host } from "./runtime";
+import { createStreamCoalescer } from "./streamCoalescer";
 import {
   createTeamTransport,
   type TeamTransport,
@@ -22,6 +24,7 @@ import { createWorkbenchTransport, type WorkbenchTransport } from "./workbenchEn
 import { createBrowserTransport, type BrowserTransport } from "./browserEngine";
 import { workerScreenshotPaths } from "./workbenchState";
 import {
+  applyModelSwitch,
   applyWorkerLiveEvent,
   emptyWorkerLive,
   STREAM_ONLY_EVENTS,
@@ -31,6 +34,8 @@ import {
 import { applyWorkerEvent, applyWorkerStatus } from "./workerActivity";
 import { leadEventSound, loadSoundToggles, notifySound, workerTransitionSound } from "./sounds";
 import { applyStoredTheme } from "./theme";
+import type { TraceEntry } from "./trace";
+import { logUi } from "./uiLog";
 import {
   createOpenWorkerTransport,
   openWorkerNotice,
@@ -75,6 +80,7 @@ import type {
   Project,
   ReviewEvidence,
   TeamFilter,
+  ToastLevel,
   Worker,
   WorkerActivity,
   WorkerStatus,
@@ -171,6 +177,7 @@ async function refreshNativeLead(token: number): Promise<void> {
   try {
     const snapshot = await transport.snapshot();
     if (token === leadSessionToken) {
+      leadStream.flush();
       app.update((state) => applyLeadSnapshot(state, snapshot));
     }
   } catch (error) {
@@ -183,23 +190,44 @@ async function refreshNativeLead(token: number): Promise<void> {
   }
 }
 
+/**
+ * Lead events pass through a coalescer: while the window paints they apply one
+ * by one, but a backlog from a hidden or throttled window lands in one update
+ * (see streamCoalescer.ts). Flush it before any other write to lead state so
+ * queued events never apply on top of a newer snapshot.
+ */
+const leadStream = createStreamCoalescer<{ token: number; event: LeadEvent }>(applyNativeLeadEvents);
+
 function handleNativeLeadEvent(token: number, event: LeadEvent): void {
   if (token !== leadSessionToken) return;
-  app.update((state) => applyLeadEvent(state, event));
+  leadStream.push({ token, event });
+}
+
+function applyNativeLeadEvents(items: { token: number; event: LeadEvent }[]): void {
+  const token = leadSessionToken;
+  const events = items.filter((item) => item.token === token).map((item) => item.event);
+  if (events.length === 0) return;
+  app.update((state) => events.reduce(applyLeadEvent, state));
   // The lead's own turn-finished / needs-you / stopped-with-errors events ring
   // the matching notification sound (gated by the [ui] toggles, per-sound
   // debounce, more urgent sounds always through).
   const runtime = get(app).leadRuntime;
-  if (runtime.mode === "native" && runtime.generation === event.generation) {
-    const sound = leadEventSound(event.event?.event);
-    if (sound) notifySound(sound);
+  let affectsUsage = false;
+  let needsSnapshot = false;
+  for (const event of events) {
+    if (runtime.mode === "native" && runtime.generation === event.generation) {
+      const sound = leadEventSound(event.event?.event);
+      if (sound) notifySound(sound);
+    }
+    affectsUsage ||= leadEventAffectsUsage(event);
+    needsSnapshot ||= leadEventNeedsSnapshot(event);
   }
-  if (leadEventAffectsUsage(event)) {
+  if (affectsUsage) {
     // The durable per-project accumulator changed; re-read the team snapshot
     // (debounced and project-guarded) so the header cost follows the lead too.
     scheduleTeamSync();
   }
-  if (leadEventNeedsSnapshot(event)) {
+  if (needsSnapshot) {
     setTimeout(() => {
       if (token === leadSessionToken) void refreshNativeLead(token);
     }, 25);
@@ -237,6 +265,7 @@ async function connectNativeLead(project: Project, allowConflict = false): Promi
       ...(allowConflict ? { allowInstanceConflict: true } : {}),
     });
     if (token !== leadSessionToken) return;
+    leadStream.flush();
     app.update((state) => applyLeadSnapshot(state, snapshot));
   } catch (error) {
     if (token !== leadSessionToken) return;
@@ -250,6 +279,13 @@ async function connectNativeLead(project: Project, allowConflict = false): Promi
     }));
   }
 }
+
+/**
+ * When this app instance booted, as the anchor for the Trace route's
+ * "This session" time filter — the engine starts with the app, so its ring
+ * holds nothing older.
+ */
+export const SESSION_START_MS = Date.now();
 
 export function createInitialState(): AppState {
   return {
@@ -271,6 +307,12 @@ export function createInitialState(): AppState {
     workbenchWidth: 480,
     /** No saved mission-control split until the user drags or the project restores one. */
     boardWidth: null,
+    /** No Trace-route filter hand-over until an entry point plants one. */
+    traceEntry: null,
+    /** No plan hand-over until the Memory tab plants one. */
+    planDocumentId: null,
+    /** No file hand-over until the Memory tab plants one. */
+    workbenchFile: null,
     workerPanelId: null,
     browserUrl: "about:blank",
     browserTitle: "",
@@ -352,8 +394,9 @@ export const needsYouCount = derived(
   ($app) => $app.workers.filter((worker) => worker.needsYou).length,
 );
 
-function withToast(state: AppState, message: string): AppState {
-  return { ...state, toast: { id: ++sequence, message } };
+function withToast(state: AppState, message: string, level: ToastLevel = "info"): AppState {
+  logUi(level, message, { source: "toast", route: state.route });
+  return { ...state, toast: { id: ++sequence, message, level } };
 }
 
 function updateWorker(
@@ -381,7 +424,7 @@ async function flushWorkbenchPreferences(): Promise<void> {
     await pending.transport.savePreferences(pending.workspaceRoot, pending.preferences);
   } catch (error) {
     app.update((state) => state.projectId === pending.projectId
-      ? withToast(state, `Could not save workbench preferences: ${leadError(error)}`)
+      ? withToast(state, `Could not save workbench preferences: ${leadError(error)}`, "error")
       : state);
   }
 }
@@ -398,10 +441,10 @@ function schedulePreferenceSave(): void {
     preferences: {
       workbench_open: state.workbenchOpen,
       workbench_tab: state.workbenchTab,
-      workbench_width: state.workbenchWidth,
+      workbench_width: Math.round(state.workbenchWidth),
       browser_url: state.browserUrl,
       diff_worker_id: state.diffWorkerId,
-      board_width: state.boardWidth,
+      board_width: state.boardWidth === null ? null : Math.round(state.boardWidth),
     },
   };
   if (preferenceTimer) clearTimeout(preferenceTimer);
@@ -434,7 +477,7 @@ async function restoreWorkbench(project: Project): Promise<void> {
     }
   } catch (error) {
     app.update((state) => state.projectId === project.id
-      ? withToast(state, `Could not restore workbench preferences: ${leadError(error)}`)
+      ? withToast(state, `Could not restore workbench preferences: ${leadError(error)}`, "error")
       : state);
   }
 }
@@ -460,19 +503,19 @@ function projectFromRecord(record: ProjectRecord): Project {
 async function openProject(projectId: string, allowConflict = false): Promise<void> {
   const project = get(app).projects.find((item) => item.id === projectId);
   if (!project) {
-    app.update((state) => withToast(state, "That project is not registered."));
+    app.update((state) => withToast(state, "That project is not registered.", "error"));
     return;
   }
   if (preferenceSave) await flushWorkbenchPreferences();
   if (project.available === false) {
-    app.update((state) => withToast(state, project.description || "The project folder is unavailable."));
+    app.update((state) => withToast(state, project.description || "The project folder is unavailable.", "error"));
     return;
   }
   const transport = createProjectTransport();
   if (transport) {
     try {
       if (!(await probeMnemo2Host())) {
-        app.update((state) => withToast(state, "The native project host is unavailable."));
+        app.update((state) => withToast(state, "The native project host is unavailable.", "error"));
         return;
       }
       const attachment = await transport.attach(project.path, allowConflict);
@@ -488,7 +531,7 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
         return;
       }
     } catch (error) {
-      app.update((state) => withToast(state, leadError(error)));
+      app.update((state) => withToast(state, leadError(error), "error"));
       return;
     }
   }
@@ -563,7 +606,7 @@ async function loadProjects(): Promise<void> {
       projects: records.map(projectFromRecord),
     }));
   } catch (error) {
-    app.update((state) => withToast(state, `Could not load projects: ${leadError(error)}`));
+    app.update((state) => withToast(state, `Could not load projects: ${leadError(error)}`, "error"));
   }
 }
 
@@ -637,7 +680,11 @@ async function openExternalRoot(root: string): Promise<void> {
   }
   if (!project) {
     app.update((state) =>
-      withToast(state, `Claude Code asked to open ${root}, which is not a Mnemo2 project. Add it first.`),
+      withToast(
+        state,
+        `Claude Code asked to open ${root}, which is not a Mnemo2 project. Add it first.`,
+        "error",
+      ),
     );
     reportExternalOpenFailure(root, "it is not a registered Mnemo2 project");
     return;
@@ -650,7 +697,11 @@ async function openExternalRoot(root: string): Promise<void> {
     // Switching would stop the open project's lead; the user decides that.
     const name = project.name;
     app.update((state) =>
-      withToast(state, `Claude Code asked to open ${name}, but another project is open. Close it first.`),
+      withToast(
+        state,
+        `Claude Code asked to open ${name}, but another project is open. Close it first.`,
+        "error",
+      ),
     );
     reportExternalOpenFailure(root, "another project is open in this Mnemo2 window");
     return;
@@ -754,20 +805,20 @@ function handleOpenWorkerRequest(request: OpenWorkerRequest): void {
     selectWorker(outcome.workerId);
     return;
   }
-  app.update((current) => withToast(current, openWorkerNotice(outcome)));
+  app.update((current) => withToast(current, openWorkerNotice(outcome), "error"));
 }
 
 async function openFolder(): Promise<void> {
   const transport = createProjectTransport();
   if (!transport) {
-    app.update((state) => withToast(state, "Opening a folder needs the native shell."));
+    app.update((state) => withToast(state, "Opening a folder needs the native shell.", "error"));
     return;
   }
   // A Tauri WebView is not necessarily the Mnemo2 host: Mnemo1's Browser tab
   // has one too, and its IPC never registered this command (Tauri answers
   // "not allowed by ACL"). Confirm the handshake before invoking anything.
   if (!(await probeMnemo2Host())) {
-    app.update((state) => withToast(state, "Opening a folder needs the native shell."));
+    app.update((state) => withToast(state, "Opening a folder needs the native shell.", "error"));
     return;
   }
   try {
@@ -777,7 +828,7 @@ async function openFolder(): Promise<void> {
     await loadProjects();
     await openProject(record.path);
   } catch (error) {
-    app.update((state) => withToast(state, `Could not open the folder: ${leadError(error)}`));
+    app.update((state) => withToast(state, `Could not open the folder: ${leadError(error)}`, "error"));
   }
 }
 
@@ -839,7 +890,7 @@ async function confirmCloseProject(): Promise<void> {
     await closeProjectNow();
   } catch (error) {
     app.update((state) => ({
-      ...withToast(state, `Could not stop the team: ${leadError(error)}`),
+      ...withToast(state, `Could not stop the team: ${leadError(error)}`, "error"),
       closeProjectPending: false,
     }));
   }
@@ -890,7 +941,7 @@ async function confirmCleanup(): Promise<void> {
     await loadProjects();
   } catch (error) {
     app.update((state) => ({
-      ...withToast(state, `Cleanup failed: ${leadError(error)}`),
+      ...withToast(state, `Cleanup failed: ${leadError(error)}`, "error"),
       cleanupBusy: false,
     }));
   }
@@ -899,18 +950,18 @@ async function confirmCleanup(): Promise<void> {
 async function openNewProject(): Promise<void> {
   const transport = createProjectTransport();
   if (!transport) {
-    app.update((state) => withToast(state, "Project creation needs the native shell."));
+    app.update((state) => withToast(state, "Project creation needs the native shell.", "error"));
     return;
   }
   try {
     if (!(await probeMnemo2Host())) {
-      app.update((state) => withToast(state, "Project creation needs the native shell."));
+      app.update((state) => withToast(state, "Project creation needs the native shell.", "error"));
       return;
     }
     const parent = await transport.pickFolder();
     if (parent) app.update((state) => ({ ...state, newProjectParent: parent }));
   } catch (error) {
-    app.update((state) => withToast(state, leadError(error)));
+    app.update((state) => withToast(state, leadError(error), "error"));
   }
 }
 
@@ -926,7 +977,7 @@ async function createProject(name: string): Promise<void> {
     app.update((state) => ({ ...state, newProjectParent: null }));
     await openProject(record.path);
   } catch (error) {
-    app.update((state) => withToast(state, `Could not create the project: ${leadError(error)}`));
+    app.update((state) => withToast(state, `Could not create the project: ${leadError(error)}`, "error"));
   } finally {
     app.update((state) => ({ ...state, creatingProject: false }));
   }
@@ -991,6 +1042,76 @@ function openMemory() {
     teamPeekOpen: false,
     workbenchOpen: false,
   }));
+}
+
+/**
+ * Open the Trace route — every model call, in detail. Optional filters carry
+ * an entry point's hand-over (a worker from mission control, a lead turn
+ * from the chat); the view consumes them once and they never enter a URL.
+ */
+function openTrace(filters?: TraceEntry) {
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "trace" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: false,
+    traceEntry: filters ?? null,
+  }));
+}
+
+/** Clear a consumed Trace hand-over so returning to the route starts unfiltered. */
+function clearTraceEntry() {
+  app.update((state) => (state.traceEntry === null ? state : { ...state, traceEntry: null }));
+}
+
+/**
+ * Open a plan document: the Memory tab's link to `.coding/plans/<id>.md`. The
+ * Plans route expands the plan, reads its document and scrolls it into view;
+ * an id the board does not hold shows a short not-found note.
+ */
+function openPlanDocument(planId: string) {
+  const id = planId.trim();
+  if (id === "") return;
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "plans" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: false,
+    planDocumentId: id,
+  }));
+}
+
+/** Clear a consumed plan hand-over so returning to the route starts collapsed. */
+function clearPlanDocument() {
+  app.update((state) => (state.planDocumentId === null ? state : { ...state, planDocumentId: null }));
+}
+
+/**
+ * Open a project file in the Workbench: the Memory tab's link to a path a
+ * record names. The Files tab reads it through its own `openPath` and reveals
+ * `line` when the reference carries one.
+ */
+function openFileInWorkbench(path: string, line: number | null = null) {
+  const target = path.trim();
+  if (target === "") return;
+  const at = line !== null && Number.isInteger(line) && line > 0 ? line : null;
+  openWorkbench("files");
+  app.update((state) => ({ ...state, workbenchFile: { path: target, line: at } }));
+}
+
+/** Clear a consumed file hand-over so returning to the tab opens the tree. */
+function clearWorkbenchFile() {
+  app.update((state) => (state.workbenchFile === null ? state : { ...state, workbenchFile: null }));
+}
+
+/**
+ * Open a repository path a Markdown view names: a plan document goes to the
+ * Plans route, anything else to the Workbench's Files tab at its line. This is
+ * the one action every Markdown surface passes as `onOpenPath`.
+ */
+function openRepoPath(ref: RepoPathRef) {
+  if (ref.kind === "plan" && ref.planId !== null) openPlanDocument(ref.planId);
+  else openFileInWorkbench(ref.path, ref.line);
 }
 
 function toggleTeamPeek() {
@@ -1178,9 +1299,13 @@ export function maxWorkbenchWidth(windowWidth: number): number {
   return Math.max(MIN_WORKBENCH_WIDTH, windowWidth - MIN_LEAD_WIDTH);
 }
 
-/** Keep a side-panel width between its floor and the window-relative ceiling. */
+/**
+ * Keep a side-panel width between its floor and the window-relative ceiling.
+ * Always a whole pixel: a scaled display hands the drag handlers fractional
+ * coordinates, and the saved preference field is a `u32`.
+ */
 export function clampWorkbenchWidth(workbenchWidth: number, windowWidth: number): number {
-  return Math.min(maxWorkbenchWidth(windowWidth), Math.max(MIN_WORKBENCH_WIDTH, workbenchWidth));
+  return Math.round(Math.min(maxWorkbenchWidth(windowWidth), Math.max(MIN_WORKBENCH_WIDTH, workbenchWidth)));
 }
 
 function setWorkbenchWidth(workbenchWidth: number) {
@@ -1223,9 +1348,12 @@ export function maxBoardWidth(windowWidth: number): number {
   return Math.max(MIN_BOARD_WIDTH, windowWidth - MIN_BOARD_OUTPUT_WIDTH - BOARD_DIVIDER_WIDTH);
 }
 
-/** Keep a worker-list width between its floor and the window-relative ceiling. */
+/**
+ * Keep a worker-list width between its floor and the window-relative ceiling,
+ * in whole pixels so the saved `u32` preference can never see a float.
+ */
 export function clampBoardWidth(boardWidth: number, windowWidth: number): number {
-  return Math.min(maxBoardWidth(windowWidth), Math.max(MIN_BOARD_WIDTH, boardWidth));
+  return Math.round(Math.min(maxBoardWidth(windowWidth), Math.max(MIN_BOARD_WIDTH, boardWidth)));
 }
 
 /** The width a window this wide opens mission control with when nothing is saved. */
@@ -1445,6 +1573,8 @@ async function sendNativeLeadMessage(message: string, images: string[]): Promise
   const transport = leadTransport;
   if (!transport) return false;
   const token = leadSessionToken;
+  // The optimistic entry goes after every event the host already sent.
+  leadStream.flush();
   const before = get(app).leadRuntime;
   // A submission on a busy turn steers the running turn instead of starting
   // a new one: the elapsed clock and the streaming entry must survive.
@@ -1499,7 +1629,7 @@ async function sendNativeLeadMessage(message: string, images: string[]): Promise
               turnStartedAtMs: before.turnStartedAtMs,
               streamingEntryId: before.streamingEntryId,
             };
-        return withToast({ ...state, leadEntries: entries, leadRuntime: runtime }, failure);
+        return withToast({ ...state, leadEntries: entries, leadRuntime: runtime }, failure, "error");
       });
     }
     return false;
@@ -1523,7 +1653,7 @@ async function sendLeadMessage(body: string, images: string[] = []): Promise<boo
   const state = get(app);
   if (state.leadRuntime.mode === "native") {
     if (!leadTransport) {
-      app.update((current) => withToast(current, "The native lead is not connected."));
+      app.update((current) => withToast(current, "The native lead is not connected.", "error"));
       return false;
     }
     if (state.leadRuntime.status !== "ready") {
@@ -1547,6 +1677,7 @@ async function sendLeadMessage(body: string, images: string[] = []): Promise<boo
     ...withToast(
       current,
       "This build has no native shell; open Mnemo2's desktop app to run the lead.",
+      "error",
     ),
     leadEntries: [
       ...current.leadEntries,
@@ -1608,15 +1739,15 @@ function clearLeadDraft(): void {
 }
 
 /** Surface a transient status or failure message to the user. */
-function showToast(message: string): void {
-  app.update((state) => withToast(state, message));
+function showToast(message: string, level: ToastLevel = "info"): void {
+  app.update((state) => withToast(state, message, level));
 }
 
 async function interruptLead(): Promise<void> {
   const transport = leadTransport;
   if (!transport) {
     const error = new Error("The native lead is not connected, so it cannot be interrupted.");
-    app.update((state) => withToast(state, error.message));
+    app.update((state) => withToast(state, error.message, "error"));
     throw error;
   }
   const token = leadSessionToken;
@@ -1624,7 +1755,7 @@ async function interruptLead(): Promise<void> {
     await transport.interrupt();
   } catch (error) {
     if (token === leadSessionToken) {
-      app.update((state) => withToast(state, leadError(error)));
+      app.update((state) => withToast(state, leadError(error), "error"));
     }
     throw error;
   }
@@ -1635,7 +1766,11 @@ async function compactLead(): Promise<void> {
   const transport = leadTransport;
   if (!transport) {
     app.update((state) =>
-      withToast(state, "The native lead is not connected, so its context cannot be compacted."),
+      withToast(
+        state,
+        "The native lead is not connected, so its context cannot be compacted.",
+        "error",
+      ),
     );
     return;
   }
@@ -1644,7 +1779,7 @@ async function compactLead(): Promise<void> {
     await transport.compact();
   } catch (error) {
     if (token === leadSessionToken) {
-      app.update((state) => withToast(state, leadError(error)));
+      app.update((state) => withToast(state, leadError(error), "error"));
     }
   }
 }
@@ -1658,7 +1793,7 @@ function approveLead(requestId: string, decision: LeadApprovalDecision) {
     .then(() => refreshNativeLead(token))
     .catch((error) => {
       if (token === leadSessionToken) {
-        app.update((state) => withToast(state, leadError(error)));
+        app.update((state) => withToast(state, leadError(error), "error"));
       }
     });
 }
@@ -1681,7 +1816,7 @@ async function answerLead(
     await transport.answer(questionId, answer);
   } catch (error) {
     if (token === leadSessionToken) {
-      app.update((state) => withToast(state, leadError(error)));
+      app.update((state) => withToast(state, leadError(error), "error"));
     }
     return false;
   }
@@ -1705,12 +1840,13 @@ function setLeadModel(spec: string, reasoningEffort: string | null = null) {
     .setModel(spec, reasoningEffort)
     .then((snapshot) => {
       if (token === leadSessionToken) {
+        leadStream.flush();
         app.update((current) => applyLeadSnapshot(current, snapshot));
       }
     })
     .catch((error) => {
       if (token === leadSessionToken) {
-        app.update((current) => withToast(current, leadError(error)));
+        app.update((current) => withToast(current, leadError(error), "error"));
       }
     });
 }
@@ -1726,14 +1862,14 @@ function retryLead() {
 
 function requireTeam(): TeamTransport | null {
   if (!teamTransport) {
-    app.update((state) => withToast(state, "The native team runtime is not connected."));
+    app.update((state) => withToast(state, "The native team runtime is not connected.", "error"));
     return null;
   }
   return teamTransport;
 }
 
 function noteTeamError(error: unknown): void {
-  app.update((state) => withToast(state, leadError(error)));
+  app.update((state) => withToast(state, leadError(error), "error"));
 }
 
 function replyWorker(workerId: string, body: string) {
@@ -1752,28 +1888,6 @@ function steerWorker(workerId: string) {
     workerId,
     "Steer: keep the current scope, avoid unrelated edits, and surface any conflict before continuing.",
   );
-}
-
-/** Dispatch on a board plan step (1-based); false when the host refused it. */
-async function dispatchWorker(
-  brief: string,
-  planId: string,
-  step: number,
-  model?: string | null,
-  reasoningEffort?: string | null,
-): Promise<boolean> {
-  const transport = requireTeam();
-  if (!transport) return false;
-  const task = brief.trim();
-  if (!task || !planId) return false;
-  try {
-    await transport.dispatch(task, planId, step, model ?? null, null, reasoningEffort ?? null);
-  } catch (error) {
-    noteTeamError(error);
-    return false;
-  }
-  await syncTeam();
-  return true;
 }
 
 function stopWorker(workerId: string) {
@@ -1977,6 +2091,7 @@ async function confirmDeleteWorkers(): Promise<void> {
           ? { ...state, workerDeletion: { ...state.workerDeletion, phase: "ready" } }
           : state,
         `Delete failed: ${leadError(error)}`,
+        "error",
       ),
     );
   }
@@ -2002,20 +2117,56 @@ function resumeWorker(workerId: string) {
     .catch(noteTeamError);
 }
 
-/** Move a worker to another model; it comes back idle with its transcript. */
+/**
+ * Move a worker to another model. A worker mid-run (working, dispatching,
+ * fixing) keeps its session running: the switch applies to its next request
+ * and its thread notes the change; every other worker comes back idle
+ * with its transcript, as before.
+ */
 async function setWorkerModel(workerId: string, model: string, reasoningEffort: string | null): Promise<void> {
   const transport = requireTeam();
   if (!transport) return;
+  let switched = false;
   try {
     const record = await transport.setModel(workerId, model, reasoningEffort);
+    // A still-running record means the switch was applied live — the request
+    // in flight keeps serving on the old model.
+    switched = ["working", "dispatching", "fixing"].includes(record.status);
     app.update((state) => withToast(
       state,
-      `${workerDisplayName(record.id, record.name)} now runs on ${model}. Message it to continue.`,
+      switched
+        ? `${workerDisplayName(record.id, record.name)} keeps working; it runs on ${model} from its next call.`
+        : `${workerDisplayName(record.id, record.name)} now runs on ${model}. Message it to continue.`,
     ));
   } catch (error) {
     noteTeamError(error);
   }
   await syncTeam();
+  if (switched) noteWorkerModelSwitch(workerId, model);
+}
+
+/**
+ * Note a live model switch in the worker's open thread tail. The note rides
+ * the live entries (the saved transcript never holds it), stays in step with
+ * the current saved generation, and flips to "Now running on …" once the
+ * kernel's model_changed event reports the new model serving.
+ */
+function noteWorkerModelSwitch(workerId: string, model: string): void {
+  const saved = workerSaved.get(workerId);
+  if (!saved) return;
+  let live = workerLive.get(workerId);
+  if (!live || live.generation !== saved.generation || live.baseLength !== saved.length) {
+    live = emptyWorkerLive(saved.generation, saved.length);
+  }
+  workerLive.set(workerId, applyModelSwitch(live, model));
+  const thread = composeThread(workerId);
+  if (!thread) return;
+  app.update((state) => ({
+    ...state,
+    workers: state.workers.map((worker) =>
+      worker.id === workerId ? { ...worker, messages: thread } : worker,
+    ),
+  }));
 }
 
 async function compactWorker(workerId: string): Promise<void> {
@@ -2085,7 +2236,7 @@ async function fixFinding(
     .find((worker) => worker.id === workerId)
     ?.findings.find((item) => item.id === findingId);
   if (!finding) {
-    app.update((state) => withToast(state, `Unknown finding '${findingId}'.`));
+    app.update((state) => withToast(state, `Unknown finding '${findingId}'.`, "error"));
     return;
   }
   await performTeam((transport) =>
@@ -2261,6 +2412,7 @@ function workerFromRecord(
     hue: (index * 47 + 12) % 360,
     task: record.brief,
     summary: record.error ?? "",
+    error: record.error ?? null,
     status,
     model: record.model_id ?? record.model ?? "",
     modelSpec: record.model,
@@ -2285,6 +2437,8 @@ function workerFromRecord(
     reviewRisk: reviewRiskFrom(record.review_risk),
     auditTarget: record.audit_target ?? undefined,
     auditTip: record.audit_tip ?? undefined,
+    reportDelivered: record.report_delivered === true,
+    routing: record.routing ?? null,
     planId: record.plan_id ?? null,
     planStep: record.plan_step ?? null,
     checks: record.checks.map((check) => ({
@@ -2426,11 +2580,47 @@ function streamWorkerActivity(event: TeamEvent): void {
   if (next === current) return;
   if (next) workerActivity.set(workerId, next);
   else workerActivity.delete(workerId);
+  workerStream.push({ token: teamToken, workerId, thread: false });
+}
+
+/**
+ * A worker whose activity or open thread changed in the maps above. The store
+ * write is coalesced (see streamCoalescer.ts): a batch re-reads the maps, so
+ * it carries the newest state and can never undo a later team sync.
+ */
+interface WorkerStreamMark {
+  token: number;
+  workerId: string;
+  thread: boolean;
+}
+
+const workerStream = createStreamCoalescer<WorkerStreamMark>(applyWorkerStreamMarks);
+
+function applyWorkerStreamMarks(marks: WorkerStreamMark[]): void {
+  const threads = new Set<string>();
+  const activities = new Set<string>();
+  for (const mark of marks) {
+    if (mark.token !== teamToken) continue;
+    (mark.thread ? threads : activities).add(mark.workerId);
+  }
+  const composed = new Map<string, Worker["messages"]>();
+  for (const workerId of threads) {
+    const thread = composeThread(workerId);
+    if (thread) composed.set(workerId, thread);
+  }
+  if (activities.size === 0 && composed.size === 0) return;
   app.update((state) => ({
     ...state,
-    workers: state.workers.map((worker) =>
-      worker.id === workerId ? { ...worker, activity: next } : worker,
-    ),
+    workers: state.workers.map((worker) => {
+      const activity = activities.has(worker.id);
+      const thread = composed.get(worker.id);
+      if (!activity && !thread) return worker;
+      return {
+        ...worker,
+        ...(activity ? { activity: workerActivity.get(worker.id) ?? null } : {}),
+        ...(thread ? { messages: thread } : {}),
+      };
+    }),
   }));
 }
 
@@ -2447,14 +2637,7 @@ function streamWorkerEvent(event: TeamEvent): void {
   if (next === live && workerLive.get(event.worker_id) === live) return;
   workerLive.set(event.worker_id, next);
   if (event.generation !== saved.generation) return;
-  const thread = composeThread(event.worker_id);
-  if (!thread) return;
-  app.update((state) => ({
-    ...state,
-    workers: state.workers.map((worker) =>
-      worker.id === event.worker_id ? { ...worker, messages: thread } : worker,
-    ),
-  }));
+  workerStream.push({ token: teamToken, workerId: event.worker_id, thread: true });
 }
 
 /** Refetch the plan board; failures keep the last board (it is only a view). */
@@ -2689,7 +2872,7 @@ async function connectTeam(): Promise<void> {
 
 function setWorkerSlots(workerSlots: number): void {
   if (!Number.isInteger(workerSlots) || workerSlots < 1 || workerSlots > 32) {
-    app.update((state) => withToast(state, "Worker slots must be a whole number from 1 to 32."));
+    app.update((state) => withToast(state, "Worker slots must be a whole number from 1 to 32.", "error"));
     return;
   }
   const transport = requireTeam();
@@ -2756,6 +2939,13 @@ export const actions = {
   openGraph,
   openPlans,
   openMemory,
+  openTrace,
+  clearTraceEntry,
+  openPlanDocument,
+  clearPlanDocument,
+  openFileInWorkbench,
+  clearWorkbenchFile,
+  openRepoPath,
   toggleTeamPeek,
   selectWorker,
   setTeamFilter,
@@ -2794,7 +2984,6 @@ export const actions = {
   answerLead,
   setLeadModel,
   retryLead,
-  dispatchWorker,
   replyWorker,
   steerWorker,
   stopWorker,

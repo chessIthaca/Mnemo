@@ -5,6 +5,7 @@
   import { app } from "../lib/store";
   import { workerPhaseLabel } from "../lib/workerActivity";
   import { workerStatusText, type Worker } from "../lib/types";
+  import { nudgeChipText, routingChipText } from "../lib/workerRouting";
   import ActivityStatus from "./ActivityStatus.svelte";
   import ModelBadge from "./ModelBadge.svelte";
 
@@ -23,6 +24,10 @@
   const planLabel = $derived(workerPlanLabel($app.board, worker));
   /** One plain paragraph of the brief; the row clamps it to three lines. */
   const taskSummary = $derived(briefSummary(worker.task));
+  /** The dispatch decision chip, when the dispatch recorded one. */
+  const routingChip = $derived(routingChipText(worker.routing));
+  /** The live nudge chip: it clears on a tier change or when the run ends. */
+  const nudgeChip = $derived(nudgeChipText(worker.routing, worker.tier, worker.status));
 </script>
 
 <button
@@ -37,6 +42,9 @@
   <span class="avatar" style="--hue: {worker.hue}">{worker.initials}</span>
   <span class="worker-copy">
     <span class="worker-name"><strong>{worker.name}</strong>{#if worker.needsYou}<AlertCircle size={11} />{/if}{#if worker.kind === "audit"}<span class="row-badge" data-kind="audit">Audit</span>{/if}{#if worker.reviewRisk === "high"}<span class="row-badge" data-risk="high">High risk</span>{/if}<ModelBadge model={worker.model} /></span>
+    {#if routingChip || nudgeChip}
+      <span class="worker-route">{#if routingChip}<span class="route-chip" data-kind="routing">{routingChip}</span>{/if}{#if nudgeChip}<span class="route-chip" data-kind="nudge">{nudgeChip}</span>{/if}</span>
+    {/if}
     {#if planLabel}<span class="worker-plan">{planLabel}</span>{/if}
     <span class="worker-task" title={taskSummary}>{taskSummary}</span>
     {#if !compact}<span class="worker-progress"><span style={`width: ${worker.progress}%`}></span></span>{/if}
@@ -73,7 +81,7 @@
   .worker-name { display: flex; align-items: center; gap: 5px; }
   .worker-name strong { font-size: var(--text-title); font-weight: 650; }
   .worker-name :global(svg) { color: var(--warning); }
-  .worker-name :global(.model-badge) { max-width: 130px; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
+  .worker-name :global(.model-badge) { flex: 0 1 auto; max-width: 130px; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
   .row-badge { flex: 0 0 auto; padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; }
   .row-badge[data-kind="audit"] { background: var(--accent-soft); color: var(--accent-strong); }
   .row-badge[data-risk="high"] { background: var(--risk-bg); color: var(--danger); }
@@ -89,6 +97,11 @@
   .status-label[data-status="merged"] { background: var(--accent-soft); color: var(--accent-strong); }
   .status-label[data-status="working"], .status-label[data-status="fixing"] { background: var(--running-bg); color: var(--running-ink); }
   .worker-row :global(.row-chevron) { flex: 0 0 auto; color: var(--line-strong); }
+  .route-chip { flex: 0 0 auto; padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; white-space: nowrap; }
+  .route-chip[data-kind="nudge"] { background: var(--warning-soft); color: var(--warning); }
+  /* The routing and nudge chips keep a small line of their own under the name, so
+     the model badge on the name line never has to shrink away behind them. */
+  .worker-route { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
   .worker-row.compact .worker-meta small, .worker-row.compact .worker-live { display: none; }
   @media (max-width: 1100px) { .worker-meta small, .worker-live { display: none; } }
 </style>

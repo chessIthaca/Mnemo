@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createGraphTransport } from "../lib/graph";
 import { canMoveMain, createGitTransport } from "../lib/git";
-import type { AppState, LeadEntry, Worker, WorkerThreadEntry } from "../lib/types";
+import type { AppState, LeadEntry, Worker, WorkerErrorEntry, WorkerModelSwitchEntry, WorkerThreadEntry } from "../lib/types";
 import { costPreviewInsights } from "../lib/cost";
 import { createMemoryTransport } from "../lib/memoryView";
 import {
@@ -16,8 +16,10 @@ type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
 
 const isToolRow = (entry: WorkerThreadEntry): entry is ToolEntry => entry.kind === "tool";
 
-const isMessage = (entry: WorkerThreadEntry): entry is Exclude<WorkerThreadEntry, ToolEntry> =>
-  entry.kind !== "tool";
+const isMessage = (
+  entry: WorkerThreadEntry,
+): entry is Exclude<WorkerThreadEntry, ToolEntry | WorkerErrorEntry | WorkerModelSwitchEntry> =>
+  entry.kind !== "tool" && entry.kind !== "error" && entry.kind !== "model_switch";
 
 function build(name: string): AppState {
   const scene = previewScene(name);
@@ -52,7 +54,9 @@ describe("preview scenes", () => {
     expect(state.projectId).not.toBeNull();
     const transport = createGraphTransport();
     expect(transport).not.toBeNull();
-    expect(await transport?.status()).toMatchObject({ available: true, indexing: false });
+    // The scene opens mid-rebuild, so the Graph tab's rebuild notice is visible.
+    expect(state.indexing?.code).toMatchObject({ state: "running", done: 1200, total: 2400 });
+    expect(await transport?.status()).toMatchObject({ available: true, indexing: true });
     expect((await transport?.top(3))?.length).toBe(3);
     // The scene opens on a whole-graph module map, not an empty canvas.
     const overview = await transport?.overview(2, 60);
@@ -71,15 +75,15 @@ describe("preview scenes", () => {
       "mission-control",
       "graph",
       "files",
-      "trace",
       "git",
       "worker-thread",
       "lead-chat",
       "settings-models",
-      "settings-laya",
+      "settings-tiers",
       "settings-safety",
       "settings-mcp",
       "settings-appearance",
+      "settings-project",
       "mission-control-dark",
       "lead-chat-dark",
       "graph-dark",
@@ -88,6 +92,11 @@ describe("preview scenes", () => {
       "cost",
       "plans",
       "memory",
+      "trace",
+      "trace-empty",
+      "trace-tab",
+      "trace-tab-empty",
+      "lead-tool-rows",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
     expect(previewScene("")?.name).toBe(defaultPreviewScene);

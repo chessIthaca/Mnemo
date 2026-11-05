@@ -87,16 +87,25 @@ export interface SoundToggles {
   sound_stopped_errors: boolean;
 }
 
-/** The Appearance page's snapshot: the toggles plus the stored theme word. */
+/** The `[window] close` words `mnemo2.toml` stores: today's automatic rule,
+ * always hide, or quit through the tray path. */
+export type CloseBehavior = "auto" | "tray" | "quit";
+
+/** The Appearance page's snapshot: the toggles plus the theme and close words. */
 export interface AppearanceSettings extends SoundToggles {
   /** The stored `[ui] theme` (`"dark"`, `"light"` or `"system"`). */
   theme: string;
+  /** The stored `[window] close` behaviour (`"auto"`, `"tray"` or `"quit"`). */
+  close_behavior: CloseBehavior;
 }
 
-/** A partial save — omitted flags (and the theme) keep their stored value. */
+/** A partial save — omitted flags (and the theme and close behaviour) keep
+ * their stored value. */
 export type AppearancePatch = Partial<SoundToggles> & {
   /** New `[ui] theme` word: `light`, `dark` or `system`. */
   theme?: string;
+  /** New `[window] close` behaviour: `auto`, `tray` or `quit`. */
+  close_behavior?: CloseBehavior;
 };
 
 /** Every sound is on until the user says otherwise (matches `UiConfig`). */
@@ -373,9 +382,9 @@ export interface AppearanceTransportBindings {
 
 /** The IPC surface the Appearance page needs. */
 export interface AppearanceTransport {
-  /** The stored toggles plus the stored theme word. */
+  /** The stored toggles plus the stored theme and close words. */
   get(): Promise<AppearanceSettings>;
-  /** Save the supplied toggles (omitted ones keep their value). */
+  /** Save the supplied fields (omitted ones keep their value). */
   save(patch: AppearancePatch): Promise<AppearanceSettings>;
 }
 
@@ -391,6 +400,10 @@ export function normalizeAppearance(
     sound_input_needed: value?.sound_input_needed !== false,
     sound_stopped_errors: value?.sound_stopped_errors !== false,
     theme: typeof value?.theme === "string" && value.theme !== "" ? value.theme : "dark",
+    close_behavior:
+      value?.close_behavior === "tray" || value?.close_behavior === "quit"
+        ? value.close_behavior
+        : "auto",
   };
 }
 

@@ -265,12 +265,8 @@ fn dto_fixtures_match_serde() {
             auto_compact_on_plan_complete: false,
             optimizer: OptimizerConfig::default(),
             routing: RoutingWire {
-                cheap: None,
-                capable: None,
-                lane_medium: None,
-                lane_high: None,
-                escalate: None,
                 threshold: 0.80,
+                first_prompt_min_confidence: None,
                 enforce: false,
             },
             budget: BudgetWire {

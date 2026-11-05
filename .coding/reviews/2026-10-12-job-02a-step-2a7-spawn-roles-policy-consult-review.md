@@ -9,7 +9,7 @@ Reviewed-state: b9f76c64992ea1bf823ff9a5573cc958610892b8
 - Post-change code in full: src/host/runtime.rs :330-459 (`compute_subagent_allowlist` + the role match) — HEAD == b9f76c6, so the committed state is the live file.
 - The seam: src/agent/policy.rs:1-272 (`AgentPolicy`, `ToolSurface::constant()` → gate `None`, `NoPolicy::tool_surface`), src/app/workflow_policy.rs:76-86 (`tool_surface` = one lock, `advertise: Some(wf.schema_filter())`, `gate: Some(wf.allowed_tools())`), src/agent/loop_impl.rs:2397-2417 (`workflow_handle()` / `policy()`), src/agent/factory.rs:1043 (`WorkflowPolicy::new(agent.workflow_handle())` — the policy wraps the SAME Arc the raw read takes).
 - The filter under review: src/workflow/mod.rs:425-491 (`Workflow::allowed_tools` — allow-list override branch, Skill arm, **the Subagent-state `panic!`**, Executing-research arm, `from_state` fallback).
-- The spec §2a.7 (.coding/specs/headless-free-agent/job-02a-agent-policy-seam.md:749-758) and the sub-plan frame dc98b5fa.md (goal/anchors/steps match what shipped).
+- The spec §2a.7 (.coding/design/headless-free-agent/job-02a-agent-policy-seam.md:749-758) and the sub-plan frame dc98b5fa.md (goal/anchors/steps match what shipped).
 - The tests: all seven job-1 host::runtime spawn tests located (:754/:903/:1011/:1059/:1122/:1158/:1171) and the `parent_in_state` harness (:793-899) read in full; `subagent_stamp_replaces_derived_state_keeps_mirror` located (factory.rs:3552).
 
 ## Check results

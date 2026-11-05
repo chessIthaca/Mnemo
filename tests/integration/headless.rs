@@ -14,6 +14,7 @@ use mnemo::headless::{
     RecvError, SessionCommand, SessionEvent, SessionId, SessionLimits, SpawnOptions,
     TimeoutAction, Transcript,
 };
+use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent, UserAnswer};
 use mnemo::workspace::Workspace;
 
@@ -109,6 +110,27 @@ fn public_types_serde_roundtrip() {
             question_policy: QuestionPolicy::AnswerConstant("decide yourself".into()),
             ..Guardrails::default()
         }),
+        // Plan c3ba2b58 step A: a representative trace identity — the
+        // worker actor + its worker/plan labels with the runtime-filled
+        // ids. The field's None form round-trips via the default above.
+        trace_identity: Some(TraceIdentity {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: "13".into(),
+            session_id: "13".into(),
+            agent_name: "wt-roundtrip".into(),
+            worker_id: Some("wt-roundtrip".into()),
+            plan_id: Some("plan-9".into()),
+            plan_step: Some(2),
+        }),
+        // Plan 40eef714 step 1: a representative pinned task — the
+        // session's assignment riding the system head. The field's None
+        // form round-trips via the default above.
+        pinned_task: Some("do the thing, verbatim".into()),
+        // Plan 2ba2168a step 1: a representative per-turn-routing skip —
+        // the session opts out of the pre-prompt gate (Mnemo2 routes at
+        // dispatch instead). The field's false form round-trips via the
+        // default above (skip_serializing_if keeps it off the wire).
+        skip_turn_routing: true,
     });
 
     // 3c/G6 tier 3 (D5): the answer wire — the Gate/Deny form, the

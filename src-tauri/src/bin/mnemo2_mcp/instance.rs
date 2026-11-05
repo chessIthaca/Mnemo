@@ -227,6 +227,79 @@ fn read_run_files(run_dir: &Path) -> Vec<(PathBuf, RunFile)> {
         .collect()
 }
 
+/// A run file, as `quit` needs it: enough to reach the instance behind it.
+pub struct RunEntry {
+    pub pid: u32,
+    pub port: u16,
+    pub token: String,
+    pub project: Option<String>,
+}
+
+/// Every run file in `run_dir` that parses, whatever project it belongs to and
+/// whether or not its pid is still alive (the caller decides that; `quit` asks
+/// every live one, since any of them locks the executable the build writes).
+pub fn run_files(run_dir: &Path) -> Vec<RunEntry> {
+    read_run_files(run_dir)
+        .into_iter()
+        .map(|(_, run)| RunEntry {
+            pid: run.pid,
+            port: run.port,
+            token: run.token,
+            project: run.project,
+        })
+        .collect()
+}
+
+// ---- the rebuild marker ----------------------------------------------------
+
+/// The marker `scripts/rebuild-mnemo2.mjs` writes into `<config>/run` before
+/// it builds: while it is there, no helper may start Mnemo2.
+const REBUILD_MARKER: &str = "rebuilding";
+
+/// How long a rebuild marker is honoured. A script that dies without removing
+/// its marker must not stop the helper from starting Mnemo2 forever.
+const REBUILD_MARKER_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// What a helper reports instead of starting Mnemo2 during a rebuild.
+pub const REBUILDING: &str =
+    "Mnemo2 is being rebuilt (npm run rebuild:mnemo2); try again when the build finishes";
+
+/// True while a rebuild is building and has asked Mnemo2 not to be started.
+///
+/// The marker is JSON `{"pid": <script pid>, "started_ms": <ms>}`; a marker that
+/// does not parse falls back to its own modification time, and one whose age
+/// cannot be read at all counts as in progress, so a start never races a build.
+/// A marker older than [`REBUILD_MARKER_TTL`] belongs to a script that died: it
+/// is ignored and removed.
+pub fn rebuild_in_progress(run_dir: &Path, now: SystemTime) -> bool {
+    let path = run_dir.join(REBUILD_MARKER);
+    let Ok(meta) = fs::metadata(&path) else {
+        return false;
+    };
+    let started_ms = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|marker| marker.get("started_ms").and_then(Value::as_u64))
+        .or_else(|| meta.modified().ok().and_then(unix_ms));
+    let age_ms = match (started_ms, unix_ms(now)) {
+        // A marker from slightly in the future (two clocks) is simply young.
+        (Some(started_ms), Some(now_ms)) => now_ms.saturating_sub(started_ms),
+        _ => return true,
+    };
+    if age_ms < u64::try_from(REBUILD_MARKER_TTL.as_millis()).unwrap_or(u64::MAX) {
+        return true;
+    }
+    let _ = fs::remove_file(&path);
+    false
+}
+
+/// `time` as milliseconds since the Unix epoch.
+fn unix_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX))
+}
+
 enum Probe {
     /// Answered `/health`; carries the project it reports, when it reports one.
     Alive(Option<Option<String>>),
@@ -434,6 +507,11 @@ pub fn resolve(env: &Env, cwd: &Path) -> Resolution {
 }
 
 fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance, String> {
+    // Only reached when no live instance serves `root`: a running Mnemo2 is
+    // still found (and used) while the rebuild marker is up.
+    if rebuild_in_progress(&env.run_dir, SystemTime::now()) {
+        return Err(REBUILDING.to_string());
+    }
     let mut busy = already_busy;
     // Only a failure reported after this moment belongs to the wait below.
     let began = Instant::now();

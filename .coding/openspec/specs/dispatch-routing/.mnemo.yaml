@@ -1,0 +1,5 @@
+paths:
+  - src-tauri/src/mnemo2/dispatch_routing.rs
+  - src/agent/route_question.rs
+  - src/agent/route_knn.rs
+  - src-tauri/src/mnemo2/route_eval.rs

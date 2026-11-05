@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { Check, Copy, LoaderCircle, Minus, Network, Plus, RefreshCw, RotateCcw, Search } from "@lucide/svelte";
   import {
     compactNodeRadius,
@@ -29,6 +30,7 @@
     type GraphTransport,
     type LabelCandidate,
   } from "../lib/graph";
+  import { app } from "../lib/store";
 
   const CANVAS_W = 540;
   const CANVAS_H = 420;
@@ -41,6 +43,12 @@
   const OVERVIEW_SYMBOL_LIMIT = 40;
   /** Directory depth the overview aggregates at (see `graph_overview.rs`). */
   const OVERVIEW_LEVEL = 2;
+  /** The notice while a pass replaces index files: what is drawn can be stale. */
+  const REBUILD_NOTICE = "Rebuilding the code index — results may be incomplete";
+  /** A symbol the running pass has not parsed yet: a retry note, not an error. */
+  const NOT_INDEXED_NOTE = "Not indexed yet — retrying when the index is ready.";
+  /** A symbol the finished pass no longer has: keep the panel, explain the gap. */
+  const GONE_NOTE = "This symbol moved or was removed when the index rebuilt — search again to find it.";
 
   const transport = createGraphTransport();
 
@@ -63,6 +71,8 @@
   let context = $state<GraphContext | null>(null);
   let impact = $state<GraphImpactSymbol[]>([]);
   let viewError = $state("");
+  /** A soft note in place of the hard error: the index has not caught up yet. */
+  let viewNote = $state("");
   let loadingView = $state(false);
 
   /** The whole-graph overview: modules by default, the top symbols on demand. */
@@ -86,6 +96,8 @@
   let canvasSvg = $state<SVGSVGElement | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
   let statusSeq = 0;
+  /** Set once a pass was seen running, so its end reloads what it left stale. */
+  let wasRebuilding = false;
   let searchSeq = 0;
   let viewSeq = 0;
   let overviewSeq = 0;
@@ -340,6 +352,20 @@
       : "",
   );
 
+  /** The startup code pass the host reports, when it reports one. */
+  const codePass = $derived($app.indexing?.code ?? null);
+
+  /** True while a pass may be replacing index files: what is drawn can be incomplete. */
+  const rebuilding = $derived((status?.indexing ?? false) || codePass?.state === "running");
+
+  /** How far the rebuild has got: file counts when known, else the symbol count. */
+  const rebuildProgress = $derived.by(() => {
+    if (codePass?.state === "running" && codePass.total > 0) {
+      return `${formatCount(codePass.done)}/${formatCount(codePass.total)} files`;
+    }
+    return status ? `${formatCount(status.symbols)} symbols so far` : "";
+  });
+
   /** Load the status line and the entry-point list; `seq` drops stale answers. */
   function loadStatus(active: GraphTransport) {
     const seq = ++statusSeq;
@@ -401,6 +427,7 @@
     context = null;
     impact = [];
     viewError = "";
+    viewNote = "";
     copied = false;
   }
 
@@ -412,6 +439,7 @@
     context = null;
     impact = [];
     viewError = "";
+    viewNote = "";
     copied = false;
     if (!overview && transport) loadOverview(transport);
   }
@@ -453,6 +481,78 @@
     return () => clearInterval(timer);
   });
 
+  /**
+   * A pass that ends leaves everything drawn during it stale or missing: reload
+   * the map, the current search and the selected symbol once, in place.
+   */
+  $effect(() => {
+    const active = transport;
+    const rebuildingNow = rebuilding;
+    const ended = wasRebuilding && !rebuildingNow;
+    wasRebuilding = rebuildingNow;
+    if (!active || !ended) return;
+    untrack(() => reloadAfterPass(active));
+  });
+
+  /** Reload what the finished pass may have left stale: map, search, selection. */
+  function reloadAfterPass(active: GraphTransport) {
+    loadStatus(active); // the counts and the entry points moved on too
+    if (overview) loadOverview(active); // the map, or the module drilled into
+    if (query.trim() !== "") runSearch(active, query, kindFilter);
+    if (selected) void reloadSelection(active, selected);
+  }
+
+  /** Re-fetch the selected symbol after a pass; one the rebuild dropped keeps
+   *  its panel with a note instead of the hard unknown-symbol error. */
+  async function reloadSelection(active: GraphTransport, symbol: GraphSymbol) {
+    const seq = ++viewSeq;
+    try {
+      const [hoodLoaded, contextLoaded, impactLoaded] = await Promise.all([
+        active.neighbourhood(symbol.id, depth),
+        active.context(symbol.id),
+        active.impact(symbol.id),
+      ]);
+      if (seq !== viewSeq) return;
+      hood = hoodLoaded;
+      context = contextLoaded;
+      impact = impactLoaded;
+      viewError = "";
+      viewNote = "";
+    } catch {
+      if (seq !== viewSeq) return;
+      dropView();
+      viewError = "";
+      viewNote = GONE_NOTE;
+    }
+  }
+
+  /** Run the current query now; `seq` drops answers that arrive late. */
+  function runSearch(active: GraphTransport, text: string, kind: string | null) {
+    const seq = ++searchSeq;
+    const trimmed = text.trim();
+    if (trimmed === "") {
+      results = null;
+      searching = false;
+      searchError = "";
+      return;
+    }
+    searching = true;
+    searchError = "";
+    void active
+      .search(trimmed, kind)
+      .then((found) => {
+        if (seq !== searchSeq) return;
+        results = found;
+        searching = false;
+      })
+      .catch((error) => {
+        if (seq !== searchSeq) return;
+        results = [];
+        searchError = errorText(error);
+        searching = false;
+      });
+  }
+
   /** Debounced search: empty query shows the most-connected entry points. */
   $effect(() => {
     const text = query;
@@ -460,32 +560,9 @@
     const active = transport;
     if (!active || !status?.available) return;
     const seq = ++searchSeq;
-    const trimmed = text.trim();
     const timer = setTimeout(() => {
       if (seq !== searchSeq) return;
-      if (trimmed === "") {
-        results = null;
-        searching = false;
-        searchError = "";
-        return;
-      }
-      searching = true;
-      searchError = "";
-      void active
-        .search(trimmed, kind)
-        .then((found) => {
-          if (seq === searchSeq) {
-            results = found;
-            searching = false;
-          }
-        })
-        .catch((error) => {
-          if (seq === searchSeq) {
-            results = [];
-            searchError = errorText(error);
-            searching = false;
-          }
-        });
+      runSearch(active, text, kind);
     }, SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   });
@@ -495,12 +572,33 @@
     return () => clearTimeout(copyTimer);
   });
 
+  /** Forget the drawn ring: the details behind it could not be fetched. */
+  function dropView() {
+    hood = null;
+    context = null;
+    impact = [];
+    positions = {};
+    radii = {};
+  }
+
+  /** Record a failed details fetch: a note while a pass runs, the error otherwise. */
+  function viewFailure(error: unknown) {
+    if (rebuilding) {
+      viewError = "";
+      viewNote = NOT_INDEXED_NOTE;
+    } else {
+      viewError = errorText(error);
+      viewNote = "";
+    }
+  }
+
   /** Focus a symbol: draw its neighbourhood and load its details. */
   function focus(symbol: GraphSymbol) {
     if (!transport) return;
     if (selected && symbol.id === selected.id && hood) return;
     selected = symbol;
     viewError = "";
+    viewNote = "";
     loadingView = true;
     hood = null;
     context = null;
@@ -524,12 +622,8 @@
         impact = impactLoaded;
       } catch (error) {
         if (seq !== viewSeq) return;
-        hood = null;
-        context = null;
-        impact = [];
-        positions = {};
-        radii = {};
-        viewError = errorText(error);
+        dropView();
+        viewFailure(error);
       } finally {
         if (seq === viewSeq) loadingView = false;
       }
@@ -549,7 +643,7 @@
         hood = hoodLoaded;
       })
       .catch((error) => {
-        if (seq === viewSeq) viewError = errorText(error);
+        if (seq === viewSeq) viewFailure(error);
       });
   }
 
@@ -705,7 +799,7 @@
       {#if transport && status}
         <p class="status-line">
           {statusLine}
-          {#if status.indexing}<span class="index-pulse"><i class="pulse-dot"></i>Indexing…</span>{/if}
+          {#if rebuilding}<span class="index-pulse"><i class="pulse-dot"></i>Indexing…</span>{/if}
         </p>
       {:else if transport && loadingStatus}
         <p class="status-line">Loading graph…</p>
@@ -739,6 +833,13 @@
       <p>Code indexing is off for this project — there are no symbols to explore yet.</p>
     </div>
   {:else if status}
+    {#if rebuilding}
+      <div class="rebuild-notice" role="status">
+        <span class="spin"><LoaderCircle size={13} /></span>
+        <p>{REBUILD_NOTICE}</p>
+        {#if rebuildProgress}<span class="rebuild-progress">{rebuildProgress}</span>{/if}
+      </div>
+    {/if}
     <div class="graph-body">
       <aside class="graph-side" aria-label="Symbol search">
         <div class="search-box">
@@ -927,6 +1028,9 @@
               </button>
             </div>
           </div>
+          {#if viewNote}
+            <p class="detail-note" role="status">{viewNote}</p>
+          {/if}
           {#if context}
             <section class="detail-section" aria-label="Callers">
               <h3>Callers <span class="detail-count">{formatCount(context.caller_total)}</span></h3>
@@ -971,7 +1075,7 @@
           {/if}
           <section class="detail-section" aria-label="If you change this">
             <h3>If you change this</h3>
-            {#if impact.length === 0 && !loadingView && !viewError}
+            {#if impact.length === 0 && !loadingView && !viewError && !viewNote}
               <p class="detail-none">Nothing depends on this symbol.</p>
             {:else}
               {#each impactGroups as group (group.label)}
@@ -1002,6 +1106,9 @@
   .status-line { margin: 6px 0 0; color: var(--muted); font-size: var(--text-meta); }
   .index-pulse { display: inline-flex; align-items: center; gap: 5px; margin-left: 10px; color: var(--accent-strong); font-weight: 600; }
   .pulse-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-strong); animation: pulse 1.2s ease-in-out infinite; }
+  .rebuild-notice { display: flex; align-items: center; gap: 8px; margin: 0 24px 12px; padding: 8px 12px; border: 1px solid var(--warning-line); border-radius: 9px; background: var(--warning-soft); color: var(--warning); font-size: var(--text-meta); }
+  .rebuild-notice p { margin: 0; font-weight: 600; }
+  .rebuild-progress { margin-left: auto; font-variant-numeric: tabular-nums; }
   .spin { animation: spin 0.9s linear infinite; }
   .graph-note { display: grid; flex: 1; place-items: center; align-content: center; gap: 10px; padding: 40px 24px; color: var(--muted); text-align: center; }
   .graph-note p { margin: 0; font-size: var(--text-body); max-width: 360px; line-height: 1.5; }
@@ -1071,6 +1178,7 @@
   .detail-meta { overflow: hidden; color: var(--muted); font-size: var(--text-meta); font-family: var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
   .detail-more { margin: 4px 0 0; color: var(--muted); font-size: var(--text-meta); }
   .detail-none { margin: 4px 0 0; color: var(--muted); font-size: var(--text-body); }
+  .detail-note { margin: 0; color: var(--warning); font-size: var(--text-body); line-height: 1.5; }
 
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes pulse { 50% { opacity: 0.25; } }

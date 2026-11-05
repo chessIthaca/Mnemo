@@ -1,0 +1,78 @@
+# Plan: OpenSpec support: current-state specs, spec changes on plans, schemas and a Specs page
+
+## Goal
+Mnemo keeps OpenSpec-format current-state specs in .coding/openspec/, plans carry ADDED/MODIFIED/REMOVED/RENAMED spec changes that are merged into those specs and archived when the plan closes, OpenSpec schemas shape what a plan must contain, a Settings > Specs page manages schemas, and a backlog item can be handed to the lead with "Plan this".
+
+## Kind
+implementation
+
+## Context
+\## Source of truth
+`.coding/design/openspec-support.md` (read it first; the decisions in its §12 override older text). Summary of decisions (user, 2026-11-04):
+1. Adopt OpenSpec's **file formats**, not its tool: no `/opsx` commands, no required Node CLI. The plan board stays the only home of in-flight work.
+2. Folder: `.coding/openspec/` (`config.yaml`, `specs/<capability>/spec.md`, `schemas/<name>/schema.yaml` + `templates/`, `changes/archive/<YYYY-MM-DD>-<plan-slug>/`). OpenSpec's CLI is optional and is run with `.coding/` as its working directory.
+3. Spec changes on plans are **encouraged, not required**: plan_create reminds when a plan touches a specced capability's files without spec changes, never refuses for that.
+4. Schemas: built-in `spec-driven` plus custom schemas the user adds or forks; no bundled community schema.
+
+\## Formats (OpenSpec)
+- spec.md: `# <Capability>`, `## Purpose`, `## Requirements`, then `### Requirement: <name>` with SHALL/MUST text and one or more `#### Scenario: <name>` blocks with `- **WHEN** …` / `- **THEN** …` (`- **AND** …`) bullets.
+- Deltas: `## ADDED Requirements`, `## MODIFIED Requirements`, `## REMOVED Requirements` (with a reason), `## RENAMED Requirements` (`FROM:`/`TO:`). Archive semantics: apply RENAMED, then REMOVED, MODIFIED, ADDED.
+- schema.yaml: `name`, `version`, `description`, `artifacts[]` (`id`, `generates`, `template`, `instruction`, `requires`), `apply` (`requires`, `tracks`). config.yaml: `schema`, `context`, `rules` (per artifact id). Resolution: a plan's recorded schema → config.yaml `schema` → `spec-driven`.
+
+\## Mnemo-specific
+- Which files belong to a capability: `.coding/openspec/specs/<capability>/.mnemo.yaml` with `paths: [globs]` (Mnemo-only; OpenSpec ignores dotfiles). Used for the "touches a specced capability" reminder.
+- The existing `.coding/specs/` (free-form notes) moves to `.coding/design/` so there is one specs folder.
+
+\## Current code (verified)
+- Plan tools: `src/app/tool/workflow/board.rs` (PlanCreateTool ~150, PlanUpdateTool ~295, acceptance_scenarios plumbing), board logic `src/app/plan_board.rs` (PlanDraft ~96, PlanEdit ~115, close gates ~610-680 incl. the memory_write gate, review report ~955), plan file rendering `src/app/workflow/plan_file.rs` (sections incl. `## Acceptance scenarios` ~86). Workers receive the rendered plan file, so rendering spec changes there puts them in every brief.
+- Memory indexing of knowledge files: `src/memory/indexer/knowledge.rs` (pattern to follow for indexing spec files).
+- Backlog: kernel `src/app/backlog.rs`, Mnemo2 commands `src-tauri/src/mnemo2/backlog.rs` (comment ~27 reserves "Plan this"), UI in `mnemo2/src/` (Plans tab backlog section).
+- Settings dialog: `mnemo2/src/components/SettingsDialog.svelte`.
+- No YAML crate yet: add the maintained `serde_norway` (serde_yaml fork) to the root Cargo.toml.
+
+\## Verification commands
+- Root: `cargo clippy --all-targets -- -D warnings`, `cargo test --lib`
+- App: `cargo clippy --manifest-path src-tauri/Cargo.toml --features mnemo2 --lib --tests --bins -- -D warnings`, `cargo test --manifest-path src-tauri/Cargo.toml --features mnemo2 --lib --bins`
+- UI (in mnemo2/): `npm run check`, `npx vitest run src/lib src/components`
+No release builds; the lead rebuilds with `npm run rebuild:mnemo2`.
+
+## Acceptance scenarios
+- A plan created with a spec change MODIFYing a requirement that does not exist is refused with the requirement's name.
+- A plan touching files under a specced capability's paths without spec changes is created, and the result reminds the lead which spec applies.
+- Closing a plan with valid spec changes updates .coding/openspec/specs/<capability>/spec.md and writes .coding/openspec/changes/archive/<date>-<slug>/ with proposal.md, design.md, tasks.md and the delta specs.
+- With a custom schema whose 'research' artifact is required before apply, team_dispatch is refused until the plan has a research section.
+- On Settings > Specs, adding a schema folder with a template file missing shows a validation error and copies nothing.
+- Clicking Plan this on a backlog item sends the lead a notice, and plan_create with that backlog_id marks the item done with the plan id.
+
+## Steps
+- [x] 1. **Spec files, deltas and indexing (kernel)** — new `src/app/openspec/mod.rs`, `src/app/openspec/spec.rs` (parse and render spec.md: purpose, requirements, scenarios; round-trip byte-stable for well-formed files), `src/app/openspec/delta.rs` (delta model, validation against a spec, apply with OpenSpec archive order, clear conflict errors), `.mnemo.yaml` capability paths; register in `src/app/mod.rs`; add `serde_norway` to Cargo.toml; a spec-file indexer in `src/memory/indexer/` (new `openspec.rs`, wired like `knowledge.rs`) so memory_search finds requirements; move `.coding/specs/*` to `.coding/design/` (git mv) and fix any references. Tests: parse/render round trip, each delta kind, conflict cases, capability path matching, indexer finds a requirement.
+- [x] 2. **Plans carry spec changes** — `src/app/tool/workflow/board.rs` (`spec_deltas` on plan_create and plan_update, schema in the tool description), `src/app/plan_board.rs` (store and validate deltas against the current specs at create/update; reminder text when step files match a specced capability's paths and the plan has no deltas; delta scenarios count as acceptance scenarios for high-risk dispatch), `src/app/workflow/plan_file.rs` (render a `## Spec changes` section in OpenSpec delta format). Tests: validation refusals (unknown MODIFIED requirement, duplicate ADDED, missing WHEN/THEN), reminder shown and never refusing, rendering, high-risk gate satisfied by delta scenarios.
+- [x] 3. **Schemas shape plans** — new `src/app/openspec/schema.rs` (load and validate schema.yaml + templates + config.yaml, built-in spec-driven, resolution order, requires-cycle check), `src/app/tool/workflow/board.rs` + `src/app/plan_board.rs` (optional `sections` on plan_create/update keyed by artifact id; the plan records `schema@version`; missing or still-template required sections and unmet `requires` give refusals that include the template and instruction + config rules; spec-driven maps proposal/design/tasks/specs onto goal+context/decisions+interfaces/steps/spec_deltas; `apply.requires` gates team_dispatch), `src/app/workflow/plan_file.rs` (render extra sections), worker context gets config.yaml `context` and the artifact instructions. Tests: spec-driven plans unchanged in behaviour, a custom schema's required section refused until filled, apply.requires blocks dispatch, cycle rejected.
+- [x] 4. **Archive on close** — `src/app/plan_board.rs` close path (before closing: apply the plan's deltas to `.coding/openspec/specs/` and write `.coding/openspec/changes/archive/<date>-<slug>/` with the files the plan's schema generates plus `.openspec.yaml`; refuse to close with a clear reason when a delta no longer applies), the merge/close commit allowance for `.coding/openspec/`. Tests: close merges deltas and writes the archive folder; a conflicting delta blocks the close with the requirement named; plans without deltas close as today.
+- [x] 5. **Settings > Specs page** — new `src-tauri/src/mnemo2/specs_settings.rs` (commands: list/resolve schemas, add from a folder or git URL with validation, fork, read/save artifact templates and instructions, read/save config.yaml context and rules, plan preview, specs status, optional `openspec validate` run with cwd `.coding/` when the CLI is on PATH), registered in `src-tauri/src/mnemo2/mod.rs`; new `mnemo2/src/components/SpecsPage.svelte` + `mnemo2/src/lib/specsSettings.ts`, a Specs entry in `mnemo2/src/components/SettingsDialog.svelte`. Tests: Rust command tests on a temp project; vitest for schema pick, add-validation errors, fork, template edit, status.
+- [x] 6. **Backlog "Plan this"** — `src-tauri/src/mnemo2/backlog.rs` (a plan_this command that queues a lead notice "Plan this backlog item: <id> <text>" for the external lead or prompts the in-app lead), `src/app/tool/workflow/board.rs` + `src/app/backlog.rs` (optional `backlog_id` on plan_create marks the item done with the plan id), the backlog UI button in `mnemo2/src/`. Tests: the notice is queued, plan_create with backlog_id resolves the item.
+- [x] 7. **Plugin text** — `mnemo2/plugin/skills/mnemo-plan/SKILL.md` and `mnemo2/plugin/skills/mnemo-lead/SKILL.md`: spec changes (encouraged, the reminder), schemas and sections, archive on close, "Plan this" notices. Simple.
+- [ ] 8. **First specs and live check (lead)** — no-code research: draft `.coding/openspec/specs/dispatch-routing/spec.md` and `tier-ladder/spec.md` (+ `.mnemo.yaml`) from their SPEC records, run a small plan with spec changes end to end (create, dispatch, merge, close, archive folder, specs updated), try a custom schema on the Specs page, run openspec validate if available.
+- [x] 9. **Integration check** — run the combined result (build, tests, or launching the entry point) and verify the parallel steps fit together; fix any seam breakage.
+
+## Decisions
+- 2026-11-05: added step 9 (Integration check) because steps 5 and 6 ran in parallel
+
+## Interfaces
+- 2026-11-04: Order: 1 → 2 → 3 → 4 → (5 ∥ 6 ∥ 7) → 8. Steps 2, 3 and 4 all edit board.rs/plan_board.rs/plan_file.rs, so they run one after another.
+- 2026-11-04: `src/app/openspec` (step 1) is the only code that parses or writes OpenSpec files: `Spec::parse/render`, `Delta` + `apply(spec, delta) -> Result<Spec, DeltaConflict>`, `Capability { name, paths }` with `matches(path)`, later `Schema::load/resolve` (step 3).
+- 2026-11-04: Plan storage (step 2): spec changes live in the plan file's `## Spec changes` section in OpenSpec delta format and in board.json as structured `spec_deltas`; step 4 reads them from board.json.
+- 2026-11-04: Layering (decided during step 1): the OpenSpec format layer (Spec parse/render, Delta + apply, Capability paths) lives in the kernel at `src/openspec/` so the kernel memory indexer can use it; `src/app/openspec/mod.rs` re-exports it and holds app-only parts (step 3's schema.rs may live there or in src/openspec if the kernel needs it). All OpenSpec parsing goes through `src/openspec`.
+- 2026-11-05: Steps 5 and 6 run in parallel and both register Tauri commands in src-tauri/src/mnemo2/mod.rs generate_handler!: step 5 adds its specs_settings::* entries directly after the last laya_settings:: entry; step 6 adds backlog::plan_this directly after the existing backlog:: entries. Neither reorders other lines. In mnemo2/src, step 5 owns SpecsPage.svelte, specsSettings.ts and the Specs entry in SettingsDialog.svelte; step 6 owns the backlog components and lib/backlog.ts; shared files such as store.ts are edited only by appending.
+
+## Progress
+- 2026-11-04: Lead follow-up after step 1 merges: five .coding/knowledge/spec/* records still mention .coding/specs (7 occurrences); fix them with memory_update on the lead checkout (memory tools edit the main project, not worker worktrees).
+- 2026-11-04 step 1 done: step 1 merged: openspecCore195 (openspecCore195) on kimi-k3.1-pro, merge commit ff6fbd63; review: Step 1 matches the plan with the agreed layering: the kernel module src/openspec (Spec parse/render with byte-stable round trips, Delta validation and apply in OpenSpec order RENAMED-REMOVED-MODIFIED-ADDED with named conflicts and a capability-mismatch guard, Capability paths from .mnemo.yaml) is re-exported from src/app/openspec; requirements are indexed for memory_search through src/memory/indexer/openspec.rs; serde_norway added; .coding/specs notes moved to .coding/design with references updated.
+- 2026-11-04: Step 1 merged (ff6fbd63). The five historical .coding/knowledge/spec records that cite .coding/specs/ paths are left unchanged as history (the notes now live under .coding/design/ with the same names); not worth rewriting finished-work records.
+- 2026-11-05 step 2 done: step 2 merged: specDeltas196 (specDeltas196) on kimi-k3.1-pro, merge commit aaf30d56; review: Step 2 is complete: spec_deltas on plan_create/plan_update validated against current specs and earlier deltas, persisted in board.json, a never-refusing spec reminder, `## Spec changes` rendering in plan files and briefs; Acceptance scenarios hold only lead-written text, and the high-risk gate accepts a complete Scenario (WHEN and THEN) under `## Spec changes`.
+- 2026-11-05 step 3 done: step 3 merged: specSchemas197 (specSchemas197) on kimi-k3.1-pro, merge commit 4ea2c640; review: Step 3 matches the plan: src/app/openspec/schema.rs loads and validates schema.yaml, templates and config.yaml with a built-in spec-driven schema and the plan → config → spec-driven resolution; plans record schema@version (missing = spec-driven@1, so existing plans are unchanged), take optional sections, and get refusals with template, instruction and rules for missing, template-identical or out-of-order artifacts of custom schemas; apply.requires gates team_dispatch through PlanBoard::dispatch_blockers; config.yaml context reaches worker plan text.
+- 2026-11-05 step 4 done: step 4 merged: specArchive198 (specArchive198) on Kimi/kimi-k3.1-pro, merge commit 8363e9b5; review: Step 4 is complete: a delta-bearing close stages every spec apply, blocks stale deltas with a named requirement, writes the specs and a schema-shaped archive with the .openspec.yaml marker written last, and a retry after a partial failure skips the already-done archive (already_archived) and only writes the report and board; plans without deltas close as before; .coding/openspec is allowed dirty on the lead checkout.
+- 2026-11-05 step 7 done: step 7 merged: specsSkill201 (specsSkill201) on deepseek-v4.1-flash:1017, merge commit e01463ec; review: Step 7 matches the plan: mnemo-plan gains "Spec changes and schemas" (current specs and memory_search, spec_deltas shape and the never-refusing reminder, delta scenarios for high-risk, schemas and sections, merge and archive on close with the blocked-close fix); mnemo-lead documents the "Plan this backlog item" notice and spec-related cannot-close notices.
+- 2026-11-05 step 6 done: step 6 merged: planThis200 (planThis200) on glm-5.3, merge commit 3b7be9f5; review: Step 6 is complete: plan_this marks the item in_flight and hands it to the lead, the external lead getting a marked notice that says the user clicked Plan this with the idea quoted, the in-app lead a plain user message; plan_create backlog_id marks the item done with the plan id and title, an unknown id only warns; the Plan this button shows a confirmation.
+- 2026-11-05 step 5 done: step 5 merged: specsPage199 (specsPage199) on glm-5.3, merge commit a19d1caa; review: Step 5 is complete: the Settings > Specs page with schema list/activate/add (validated before any copy; git URLs cloned with a `--` separator)/fork, artifact and config editing with reload validation, plan preview, specs status and an optional openspec validate run from .coding/.
+- 2026-11-05 step 9 done: Combined lead branch at a19d1caa (steps 1-7): root clippy clean + 3371 tests; kernel-only build clean; src-tauri clippy clean + 553/319/166; mnemo2 svelte-check 0/0 + vitest 997. No seam breakage between the parallel steps 5, 6 and 7.

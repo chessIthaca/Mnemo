@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import MemoryView from "./MemoryView.svelte";
+import { actions } from "../lib/store";
 import type {
   MemoryDetail,
   MemoryHit,
@@ -10,6 +11,7 @@ import type {
   MemoryRow,
   MemoryTransport,
 } from "../lib/memoryView";
+import { ENGINE_STARTING } from "../lib/memoryView";
 
 const mocks = vi.hoisted(() => ({
   transport: null as MemoryTransport | null,
@@ -259,5 +261,153 @@ describe("MemoryView", () => {
 
     expect(await screen.findByText("The Memory tab is available in the desktop app.")).toBeTruthy();
     expect(screen.queryByRole("complementary", { name: "Records" })).toBeNull();
+  });
+
+  it("opens a plan record's path in the Plans tab", async () => {
+    const transport = plantedTransport();
+    transport.read = async (id) => ({ ...DETAILS[id], path: ".coding/plans/fc536488.md" });
+    mocks.transport = transport;
+    const openPath = vi.spyOn(actions, "openRepoPath").mockImplementation(() => {});
+    try {
+      render(MemoryView);
+      await waitFor(() => expect(reader()).toBeTruthy());
+
+      const path = await within(reader()).findByText(".coding/plans/fc536488.md");
+      const button = path.closest("button") as HTMLButtonElement;
+      expect(button.title).toBe("Open plan fc536488 in the Plans tab");
+      await fireEvent.click(button);
+
+      expect(openPath).toHaveBeenCalledWith({
+        path: ".coding/plans/fc536488.md",
+        line: null,
+        kind: "plan",
+        planId: "fc536488",
+      });
+    } finally {
+      openPath.mockRestore();
+    }
+  });
+
+  it("opens a record's own path in the Files tab", async () => {
+    const openPath = vi.spyOn(actions, "openRepoPath").mockImplementation(() => {});
+    try {
+      render(MemoryView);
+      await waitFor(() => expect(reader()).toBeTruthy());
+
+      const path = await within(reader()).findByText(SPEC.path as string);
+      const button = path.closest("button") as HTMLButtonElement;
+      expect(button.title).toBe(`Open ${SPEC.path} in the Files tab`);
+      await fireEvent.click(button);
+
+      expect(openPath).toHaveBeenCalledWith({
+        path: SPEC.path,
+        line: null,
+        kind: "file",
+        planId: null,
+      });
+    } finally {
+      openPath.mockRestore();
+    }
+  });
+
+  it("opens a path named in the record's text at its line", async () => {
+    const transport = plantedTransport();
+    transport.read = async (id) => ({ ...DETAILS[id], markdown: "It edits `src/agent/turn.rs:4352` first." });
+    mocks.transport = transport;
+    const openPath = vi.spyOn(actions, "openRepoPath").mockImplementation(() => {});
+    try {
+      render(MemoryView);
+      await waitFor(() => expect(within(reader()).getByText(/It edits/)).toBeTruthy());
+
+      const inline = await waitFor(() => {
+        const button = reader().querySelector<HTMLButtonElement>("button.md-path");
+        expect(button).toBeTruthy();
+        return button as HTMLButtonElement;
+      });
+      expect(inline.title).toBe("Open src/agent/turn.rs at line 4352 in the Files tab");
+      await fireEvent.click(inline);
+
+      expect(openPath).toHaveBeenCalledWith({
+        path: "src/agent/turn.rs",
+        line: 4352,
+        kind: "file",
+        planId: null,
+      });
+    } finally {
+      openPath.mockRestore();
+    }
+  });
+
+  it("leaves a link that is not a path as plain text", async () => {
+    render(MemoryView);
+    await waitFor(() => expect(reader()).toBeTruthy());
+
+    const links = within(reader()).getByRole("region", { name: "Links" });
+    const entry = within(links).getByText("spec/2027-02-09-knowledge-as-files");
+
+    expect(entry.closest("button")).toBeNull();
+  });
+
+  // Plan d49ea4a6: the tab used to be blank while its first page was on the way.
+  it("shows a spinner with what it waits for instead of a blank list", async () => {
+    const transport = plantedTransport();
+    let release: (page: MemoryListPage) => void = () => {};
+    transport.list = () =>
+      new Promise<MemoryListPage>((resolve) => {
+        release = resolve;
+      });
+    mocks.transport = transport;
+    render(MemoryView);
+
+    // The pane keeps its "0 records" status line; the wait is the spinner block.
+    const spinner = await waitFor(() => {
+      const block = listPane().querySelector(".memory-loading");
+      expect(block).toBeTruthy();
+      return block as HTMLElement;
+    });
+    expect(within(spinner).getByText("Loading the project's memory…")).toBeTruthy();
+    expect(listPane().querySelector(".spin")).toBeTruthy();
+    expect(within(listPane()).queryByText("No record matches this filter.")).toBeNull();
+
+    release({ rows: ROWS, offset: 0, has_more: false });
+    await waitFor(() => expect(listPane().querySelectorAll("button.record-row")).toHaveLength(3));
+    expect(listPane().querySelector(".memory-loading")).toBeNull();
+  });
+
+  it("says it is waiting for the project engine to start, then loads once it does", async () => {
+    const transport = plantedTransport();
+    const answers = transport.list.bind(transport);
+    let attempts = 0;
+    transport.list = async (query) => {
+      attempts += 1;
+      if (attempts <= 2) throw ENGINE_STARTING;
+      return answers(query);
+    };
+    mocks.transport = transport;
+    render(MemoryView);
+
+    expect(await within(listPane()).findByText("Waiting for the project engine to start…")).toBeTruthy();
+    expect(within(listPane()).queryByText("No record matches this filter.")).toBeNull();
+
+    await waitFor(() => expect(listPane().querySelectorAll("button.record-row")).toHaveLength(3));
+    expect(attempts).toBeGreaterThanOrEqual(3);
+    expect(within(listPane()).queryByText("Waiting for the project engine to start…")).toBeNull();
+  });
+
+  it("shows the elapsed counter only after a wait passes a second", async () => {
+    const transport = plantedTransport();
+    transport.list = () => new Promise<MemoryListPage>(() => {});
+    mocks.transport = transport;
+    render(MemoryView);
+
+    const spinner = await waitFor(() => {
+      const block = listPane().querySelector(".memory-loading");
+      expect(block).toBeTruthy();
+      return block as HTMLElement;
+    });
+    expect(spinner.querySelector(".elapsed-time")).toBeNull();
+    await waitFor(() => expect(spinner.querySelector(".elapsed-time")).toBeTruthy(), {
+      timeout: 2500,
+    });
   });
 });

@@ -35,8 +35,27 @@ function fakeTransport(initial: BacklogItem[]) {
     items = items.map((item) => (item.id === id ? { ...item, deferred } : item));
     return items;
   });
+  const setDone = vi.fn(async (id: string, done: boolean) => {
+    items = items.map((item) => {
+      if (item.id !== id) return item;
+      if (done && item.status === "pending") return { ...item, status: "done" as const };
+      if (!done && item.status !== "pending" && item.status !== "in_flight") {
+        return { ...item, status: "pending" as const };
+      }
+      return item;
+    });
+    return items;
+  });
   const clearFinished = vi.fn(async () => {
     items = items.filter((item) => item.status === "pending");
+    return items;
+  });
+  const planThis = vi.fn(async (id: string) => {
+    items = items.map((item) =>
+      item.id === id
+        ? { ...item, status: "in_flight" as const, note: "handed to the lead" }
+        : item,
+    );
     return items;
   });
   const onChanged = vi.fn(async (_handler: () => void) => () => {});
@@ -47,39 +66,60 @@ function fakeTransport(initial: BacklogItem[]) {
     remove,
     reorder,
     setDeferred,
+    setDone,
     clearFinished,
+    planThis,
     onChanged,
   };
   return {
     transport,
-    calls: { add, edit, remove, reorder, setDeferred, clearFinished, onChanged },
+    calls: { add, edit, remove, reorder, setDeferred, setDone, clearFinished, planThis, onChanged },
     append: (item: BacklogItem) => {
       items = [...items, item];
     },
   };
 }
 
-/** The rendered rows' idea texts, top to bottom. */
+/** The idea title each rendered row shows, top to bottom. */
 function shownIdeas(): string[] {
-  return screen.queryAllByRole("listitem").map((item) => item.querySelector(".text")?.textContent ?? "");
+  return screen
+    .queryAllByRole("listitem")
+    .map((item) => item.querySelector(".row-title")?.textContent?.trim() ?? "");
+}
+
+/** Expand one row to its full text and actions (the chevron's name). */
+async function expand(title: string): Promise<void> {
+  await fireEvent.click(screen.getByRole("button", { name: `Expand ${title}` }));
+}
+
+/** Open the collapsed Done group of finished ideas. */
+async function openDone(): Promise<void> {
+  await fireEvent.click(screen.getByRole("button", { name: /^Done/ }));
 }
 
 describe("BacklogSection", () => {
   afterEach(() => seedBacklogPreview(null));
 
-  it("lists the pending ideas in order and hides finished ones behind a count", async () => {
+  it("lists the pending ideas in order and keeps the finished ones in the Done group", async () => {
     const { transport } = fakeTransport([
       row("a"),
       row("b", { deferred: true }),
       row("done", { status: "done" }),
       row("failed", { status: "failed" }),
+      row("stuck", { status: "cant_resolve" }),
     ]);
     render(BacklogSection, { props: { transport } });
 
     await waitFor(() => expect(shownIdeas()).toEqual(["Idea a", "Idea b"]));
-    expect(screen.getByText("2 finished")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^Backlog/ })).toBeTruthy();
     expect(screen.getByText("Deferred")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /Backlog/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Done/ }).textContent).toContain("3");
+    expect(shownIdeas()).not.toContain("Idea done");
+
+    await openDone();
+    expect(shownIdeas()).toEqual(["Idea a", "Idea b", "Idea done", "Idea failed", "Idea stuck"]);
+    expect(screen.getByText("failed")).toBeTruthy();
+    expect(screen.getByText("Can't resolve")).toBeTruthy();
   });
 
   it("adds an idea from the box and clears the box", async () => {
@@ -101,6 +141,7 @@ describe("BacklogSection", () => {
     render(BacklogSection, { props: { transport } });
     await waitFor(() => expect(shownIdeas()).toEqual(["Idea a", "Idea b"]));
 
+    await expand("Idea a");
     await fireEvent.click(screen.getByRole("button", { name: "Edit Idea a" }));
     const box = screen.getByLabelText("Edit text of Idea a") as HTMLTextAreaElement;
     await fireEvent.input(box, { target: { value: "Idea a, edited" } });
@@ -115,6 +156,7 @@ describe("BacklogSection", () => {
     render(BacklogSection, { props: { transport } });
     await waitFor(() => expect(shownIdeas()).toEqual(["Idea a", "Idea b"]));
 
+    await expand("Idea a");
     await fireEvent.click(screen.getByRole("button", { name: "Remove Idea a" }));
     expect(calls.remove).not.toHaveBeenCalled();
 
@@ -128,6 +170,7 @@ describe("BacklogSection", () => {
     render(BacklogSection, { props: { transport } });
     await waitFor(() => expect(shownIdeas()).toEqual(["Idea a"]));
 
+    await expand("Idea a");
     await fireEvent.click(screen.getByRole("button", { name: "Defer Idea a" }));
     expect(calls.setDeferred).toHaveBeenCalledWith("a", true);
     await waitFor(() => expect(screen.getByRole("button", { name: "Undefer Idea a" })).toBeTruthy());
@@ -141,22 +184,41 @@ describe("BacklogSection", () => {
     render(BacklogSection, { props: { transport } });
     await waitFor(() => expect(shownIdeas()).toEqual(["Idea a", "Idea b", "Idea c"]));
 
+    await expand("Idea a");
     await fireEvent.click(screen.getByRole("button", { name: "Move Idea a down" }));
     expect(calls.reorder).toHaveBeenCalledWith(["b", "a", "c"]);
     await waitFor(() => expect(shownIdeas()).toEqual(["Idea b", "Idea a", "Idea c"]));
 
+    await expand("Idea c");
     await fireEvent.click(screen.getByRole("button", { name: "Move Idea c up" }));
     expect(calls.reorder).toHaveBeenLastCalledWith(["b", "c", "a"]);
   });
 
-  it("clears the finished ideas behind the count", async () => {
+  it("clears the finished ideas inside the Done group", async () => {
     const { transport, calls } = fakeTransport([row("a"), row("done", { status: "done" })]);
     render(BacklogSection, { props: { transport } });
-    await waitFor(() => expect(screen.getByText("1 finished")).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Done/ })).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Clear finished" })).toBeNull();
 
+    await openDone();
     await fireEvent.click(screen.getByRole("button", { name: "Clear finished" }));
     expect(calls.clearFinished).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(screen.queryByText("1 finished")).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("button", { name: /^Done/ })).toBeNull());
+  });
+
+  it("hands an idea to the lead and confirms it was sent", async () => {
+    const { transport, calls } = fakeTransport([row("a")]);
+    render(BacklogSection, { props: { transport } });
+    await waitFor(() => expect(shownIdeas()).toEqual(["Idea a"]));
+
+    await expand("Idea a");
+    await fireEvent.click(screen.getByRole("button", { name: "Plan this Idea a" }));
+    expect(calls.planThis).toHaveBeenCalledWith("a");
+
+    await waitFor(() => expect(screen.getByText("Sent to the lead — Idea a")).toBeTruthy());
+    expect(screen.getByText("No ideas yet. Add the first one above.")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^With the lead/ })).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: "Mark done Idea a" })).toBeTruthy();
   });
 
   it("shows a failed write's message", async () => {
@@ -197,5 +259,64 @@ describe("BacklogSection", () => {
     await waitFor(() =>
       expect(screen.getByText(/open the Mnemo2 desktop app/)).toBeTruthy(),
     );
+  });
+
+  it("shows one line per idea until the row is expanded", async () => {
+    const { transport } = fakeTransport([
+      row("a", { text: "First line\nsecond line\nthird line" }),
+    ]);
+    render(BacklogSection, { props: { transport } });
+
+    await waitFor(() => expect(shownIdeas()).toEqual(["First line"]));
+    expect(screen.queryByText(/second line/)).toBeNull();
+
+    await expand("First line");
+    expect(screen.getByText(/second line/)).toBeTruthy();
+  });
+
+  it("checks an idea done and shows it in the Done group", async () => {
+    const { transport, calls } = fakeTransport([row("a"), row("b")]);
+    render(BacklogSection, { props: { transport } });
+    await waitFor(() => expect(shownIdeas()).toEqual(["Idea a", "Idea b"]));
+
+    await fireEvent.click(screen.getByRole("checkbox", { name: "Mark done Idea a" }));
+
+    expect(calls.setDone).toHaveBeenCalledWith("a", true);
+    await waitFor(() => expect(shownIdeas()).toEqual(["Idea b"]));
+
+    await openDone();
+    expect(shownIdeas()).toEqual(["Idea b", "Idea a"]);
+    const checked = screen.getByRole("checkbox", {
+      name: "Mark not done Idea a",
+    }) as HTMLInputElement;
+    expect(checked.checked).toBe(true);
+  });
+
+  it("unchecks a done idea back into the queue", async () => {
+    const { transport, calls } = fakeTransport([row("a"), row("done", { status: "done" })]);
+    render(BacklogSection, { props: { transport } });
+    await waitFor(() => expect(shownIdeas()).toEqual(["Idea a"]));
+
+    await openDone();
+    await fireEvent.click(screen.getByRole("checkbox", { name: "Mark not done Idea done" }));
+
+    expect(calls.setDone).toHaveBeenCalledWith("done", false);
+    await waitFor(() => expect(shownIdeas()).toEqual(["Idea a", "Idea done"]));
+    expect(screen.queryByRole("button", { name: /^Done/ })).toBeNull();
+  });
+
+  it("lists the lead's in-flight ideas with a disabled checkbox", async () => {
+    const { transport } = fakeTransport([row("a"), row("live", { status: "in_flight" })]);
+    render(BacklogSection, { props: { transport } });
+    await waitFor(() => expect(shownIdeas()).toEqual(["Idea a", "Idea live"]));
+
+    expect(screen.getByRole("heading", { name: /^With the lead/ })).toBeTruthy();
+    const check = screen.getByRole("checkbox", { name: "Mark done Idea live" }) as HTMLInputElement;
+    expect(check.disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "Plan this Idea live" })).toBeNull();
+
+    await expand("Idea live");
+    expect(screen.queryByRole("button", { name: "Edit Idea live" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Remove Idea live" })).toBeNull();
   });
 });

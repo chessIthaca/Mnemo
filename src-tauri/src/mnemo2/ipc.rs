@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri_plugin_notification::NotificationExt;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -43,8 +44,8 @@ use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
 use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
-    BoardSignal, BoardSnapshot, DeletionPhase, DeletionProgress, MessageSender, TeamMessage,
-    TeamRuntime, TeamSnapshot, TeamDeleteOutcome, WorkerDeletion, WorkerRecord,
+    BoardSignal, BoardSnapshot, ChangeSource, DeletionPhase, DeletionProgress, MessageSender,
+    TeamMessage, TeamRuntime, TeamSnapshot, TeamDeleteOutcome, WorkerDeletion, WorkerRecord,
     DELETION_EVENT_CHANNEL, TEAM_EVENT_CHANNEL,
 };
 use crate::mnemo2::workbench::{self, DiffSnapshot};
@@ -74,6 +75,12 @@ pub struct Mnemo2State {
     /// canonical root, the reason and when it was reported, until the next
     /// request or open.
     open_failure: std::sync::Mutex<Option<(PathBuf, String, Instant)>>,
+    /// True while a project open is in flight — `lead_open` has begun and the
+    /// runtime (with its engine) is not installed yet. The Memory tab reads it
+    /// to say "waiting for the project engine to start" instead of showing an
+    /// empty list: every memory command goes through the runtime, so before
+    /// the install there is nothing to read from yet.
+    opening: AtomicBool,
 }
 
 impl Mnemo2State {
@@ -108,6 +115,30 @@ impl Mnemo2State {
     /// Forget a reported open failure (a new request, or a project opened).
     pub(crate) fn clear_open_failure(&self) {
         *self.open_failure.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Mark a project open as in flight. The returned guard clears the flag on
+    /// EVERY exit path — success, an early `return Err`, or a `?`.
+    pub(crate) fn begin_opening(&self) -> OpeningGuard<'_> {
+        self.opening.store(true, Ordering::SeqCst);
+        OpeningGuard { state: self }
+    }
+
+    /// True while a project open is in flight (its engine is still starting).
+    pub(crate) fn is_opening(&self) -> bool {
+        self.opening.load(Ordering::SeqCst)
+    }
+}
+
+/// Clears [`Mnemo2State`]'s `opening` flag when a project open finishes —
+/// however it exits, so a failed open never leaves the tab waiting forever.
+pub(crate) struct OpeningGuard<'a> {
+    state: &'a Mnemo2State,
+}
+
+impl Drop for OpeningGuard<'_> {
+    fn drop(&mut self) {
+        self.state.opening.store(false, Ordering::SeqCst);
     }
 }
 
@@ -477,7 +508,12 @@ pub async fn project_cleanup(
             return Err(error);
         }
     };
-    let result = crate::mnemo2::team::cleanup_workspace(&root, &state_dir).await;
+    let result = crate::mnemo2::team::cleanup_workspace(
+        &root,
+        &state_dir,
+        &crate::mnemo2::dispatch_routing::dispatch_routing_log_path(),
+    )
+    .await;
     project::detach(&root);
     *state.marker_root.lock().await = None;
     result
@@ -501,6 +537,10 @@ pub async fn lead_open(
             "project is already in use by process {pid}; confirm opening another instance"
         ));
     }
+    // From here the engine is starting: until the runtime is installed, memory
+    // readers report "the project engine is still starting" (the tab keeps its
+    // spinner and retries) instead of "no open project".
+    let _opening = state.begin_opening();
     if let Some(forwarder) = state.forwarder.lock().await.take() {
         forwarder.abort();
     }
@@ -818,6 +858,9 @@ pub async fn team_dispatch(
             reasoning_effort,
             worker_id,
             review_risk,
+            // The Control Room form has no read-back switch; the lead's
+            // `team_dispatch` tool is the read-back surface.
+            false,
             &plan_id,
             step,
         )
@@ -831,13 +874,21 @@ pub async fn team_audit_dispatch(
     state: State<'_, Mnemo2State>,
     worker_id: String,
     reviewer_id: String,
+    tier: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
     brief: Option<String>,
 ) -> Result<WorkerRecord, String> {
     current_team(&state)
         .await?
-        .audit_dispatch(&worker_id, &reviewer_id, model, reasoning_effort, brief)
+        .audit_dispatch_with_tier(
+            &worker_id,
+            &reviewer_id,
+            tier.as_deref(),
+            model,
+            reasoning_effort,
+            brief,
+        )
         .await
         .map(|(worker, _reused)| worker)
 }
@@ -892,7 +943,8 @@ pub async fn team_resume(
 }
 
 /// Move a worker to another model and reasoning effort, keeping its
-/// transcript; an idle or stopped worker comes back idle on the new model.
+/// transcript; a working worker switches at its next call, an idle or
+/// stopped one comes back idle on the new model.
 #[tauri::command]
 pub async fn team_set_model(
     state: State<'_, Mnemo2State>,
@@ -902,7 +954,7 @@ pub async fn team_set_model(
 ) -> Result<WorkerRecord, String> {
     current_team(&state)
         .await?
-        .change_model(&worker_id, model, reasoning_effort)
+        .change_model(&worker_id, model, reasoning_effort, ChangeSource::User)
         .await
 }
 

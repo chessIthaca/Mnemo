@@ -192,4 +192,62 @@ describe("WorkerRow", () => {
     expect(getComputedStyle(label).textOverflow).not.toBe("ellipsis");
     expect(getComputedStyle(label).minWidth).not.toBe("0px");
   });
+  it("shows the dispatch routing chip and the live nudge chip", () => {
+    const routed: Worker = {
+      ...worker(),
+      tier: "routine",
+      routing: {
+        laya_tier: "routine",
+        confidence: 0.62,
+        cleared: true,
+        lead_tier: null,
+        routed_by: "laya",
+        ran_tier: "routine",
+        nudged: "high",
+      },
+    };
+    const { container } = render(WorkerRow, { worker: routed, onSelect: vi.fn() });
+    expect(screen.getByText("Laya: routine 0.62")).toBeTruthy();
+    expect(screen.getByText("Laya suggests high — stuck")).toBeTruthy();
+    expect(container.querySelectorAll(".route-chip")).toHaveLength(2);
+    // The chips sit on their own line under the name; the name line keeps the model.
+    expect(container.querySelector(".worker-name .route-chip")).toBeNull();
+    expect(container.querySelector(".worker-route .route-chip")).not.toBeNull();
+    expect(container.querySelector(".worker-name .model-badge")?.textContent).toContain("kimi-k3.1-pro");
+  });
+
+  it("clears the nudge chip once the worker finished, keeping the routing chip", () => {
+    const routed: Worker = {
+      ...worker(),
+      status: "merged",
+      tier: "routine",
+      routing: {
+        laya_tier: "routine",
+        confidence: 0.62,
+        cleared: true,
+        lead_tier: null,
+        routed_by: "laya",
+        ran_tier: "routine",
+        nudged: "high",
+      },
+    };
+    const { container } = render(WorkerRow, { worker: routed, onSelect: vi.fn() });
+    expect(screen.queryByText(/Laya suggests/)).toBeNull();
+    expect(screen.getByText("Laya: routine 0.62")).toBeTruthy();
+    expect(container.querySelectorAll(".route-chip")).toHaveLength(1);
+    // The routing chip moved off the name line; the model stayed on it.
+    expect(container.querySelector(".worker-name .route-chip")).toBeNull();
+    expect(container.querySelector(".worker-route .route-chip")).not.toBeNull();
+    expect(container.querySelector(".worker-name .model-badge")?.textContent).toContain("kimi-k3.1-pro");
+  });
+
+  it("renders no route line when the dispatch recorded no routing", () => {
+    const unrouted: Worker = { ...worker(), routing: null };
+    const { container } = render(WorkerRow, { worker: unrouted, onSelect: vi.fn() });
+
+    // No decision and no nudge: there is no route line at all…
+    expect(container.querySelector(".worker-route")).toBeNull();
+    // …and the model still sits on the name line.
+    expect(container.querySelector(".worker-name .model-badge")?.textContent).toContain("kimi-k3.1-pro");
+  });
 });

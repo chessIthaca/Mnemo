@@ -306,6 +306,7 @@ pub fn apply_endpoints(
         general,
         endpoints: built,
         pricing: current.pricing.clone(),
+        tiers: current.tiers.clone(),
         keys,
         mcp: current.mcp.clone(),
         projects: current.projects.clone(),

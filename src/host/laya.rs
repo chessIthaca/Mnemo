@@ -720,7 +720,11 @@ fn extract_uv_asset(archive: &Path, dest: &Path, binary: &str) -> Result<()> {
         let mut zip = zip::ZipArchive::new(file)?;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i)?;
-            if entry.is_dir() || entry.name().rsplit('/').next() != Some(binary) {
+            // zip 9 decodes an entry name fallibly; an undecodable name can
+            // never be the (ASCII) `binary`, so skip that entry and keep
+            // scanning — same as the pre-9 lossy-name compare did.
+            let Ok(name) = entry.name() else { continue };
+            if entry.is_dir() || name.rsplit('/').next() != Some(binary) {
                 continue;
             }
             let mut out = std::fs::File::create(dest)?;

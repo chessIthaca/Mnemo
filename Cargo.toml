@@ -105,7 +105,7 @@ base64 = "0.23"
 # Managed-Laya setup pipeline (job 4 D5, §5.1 :168 — the Tauri-free core in
 # src/host/laya.rs): the uv release asset extraction (zip on Windows,
 # tar/flate2 elsewhere). Small pure-Rust crates.
-zip = "8"
+zip = "9"
 tar = "0.4"
 flate2 = "1"
 

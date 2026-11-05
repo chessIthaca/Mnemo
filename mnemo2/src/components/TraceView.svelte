@@ -81,7 +81,8 @@
   let previousRow = $state<TraceRow | null>(null);
   let previousPending = $state(false);
 
-  let insightsOpen = $state(false);
+  // Open by default: the Lead's per-call evolution is the tab's headline.
+  let insightsOpen = $state(true);
   let listWidth = $state(420);
   let narrow = $state(false);
   let dragging = $state(false);
@@ -223,7 +224,8 @@
 
   function clearChip(key: string): void {
     const reset: Partial<TraceFilters> = {};
-    if (key === "agent") reset.agent = "all";
+    // Removing the agent chip returns to the Lead default — the neutral scope.
+    if (key === "agent") reset.agent = "lead";
     else if (key === "model") reset.model = "all";
     else if (key === "status") reset.status = "all";
     else if (key === "purpose") reset.purpose = "all";
@@ -680,7 +682,7 @@
     if (prefs !== null) {
       const restored: TraceFilters = { ...DEFAULT_TRACE_FILTERS, ...prefs };
       filters = restored;
-      insightsOpen = prefs.insightsOpen ?? false;
+      insightsOpen = prefs.insightsOpen ?? true;
       if (typeof prefs.listWidth === "number") {
         listWidth = Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, prefs.listWidth));
       }
@@ -935,6 +937,17 @@
       <p class="data-note error" role="alert">{exportError}</p>
     {/if}
 
+    <section class="insights">
+      <button type="button" class="insights-toggle" aria-expanded={insightsOpen} onclick={toggleInsights}>
+        {insightsOpen ? "Hide charts" : "Insights"}
+      </button>
+      {#if insightsOpen}
+        <div class="insights-body">
+          <TraceCharts rows={rows} scopeLabel={insightsScopeLabel} onbucket={applyBucket} />
+        </div>
+      {/if}
+    </section>
+
     {#snippet listColumn()}
       <div class="list-column">
         {#if chips.length > 0}
@@ -1052,17 +1065,6 @@
         {@render detailColumn()}
       </div>
     {/if}
-
-    <section class="insights">
-      <button type="button" class="insights-toggle" aria-expanded={insightsOpen} onclick={toggleInsights}>
-        {insightsOpen ? "Hide charts" : "Insights"}
-      </button>
-      {#if insightsOpen}
-        <div class="insights-body">
-          <TraceCharts rows={rows} scopeLabel={insightsScopeLabel} onbucket={applyBucket} />
-        </div>
-      {/if}
-    </section>
   {/if}
 </section><style>
   .trace-view { display: flex; min-height: 0; flex: 1; flex-direction: column; }

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
+// A release build is a GUI app: no console window (mnemo2-mcp stays a
+// console binary, it speaks MCP over stdio).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![deny(warnings)]
 
 //! Mnemo2's desktop entry point.

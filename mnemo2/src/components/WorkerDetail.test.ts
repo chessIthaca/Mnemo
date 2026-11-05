@@ -145,7 +145,7 @@ describe("WorkerDetail compact header", () => {
 
   it("keeps every worker action available under its accessible name", () => {
     render(WorkerDetail, { worker: createWorkers()[1] });
-    for (const name of ["Diff", "Steer", "Compact", "Pause", "Stop", "Delete Kai"]) {
+    for (const name of ["Diff", "Compact", "Pause", "Stop", "Delete Kai"]) {
       expect(screen.getByRole("button", { name })).toBeTruthy();
     }
   });

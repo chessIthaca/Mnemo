@@ -8,6 +8,7 @@
 //! derived from the file, never the other way around — so a crash or restart
 //! loses nothing.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
@@ -320,17 +321,33 @@ impl PlanFile {
         id: &str,
         spec_deltas: &[Delta],
     ) -> Result<PathBuf> {
+        self.write_to_dir_with_sections(plans_dir, id, spec_deltas, &BTreeMap::new())
+    }
+
+    /// Write OpenSpec changes and additional schema artifacts. Additional
+    /// artifacts render in artifact-id order under `## <artifact id>` headings.
+    pub fn write_to_dir_with_sections(
+        &self,
+        plans_dir: &Path,
+        id: &str,
+        spec_deltas: &[Delta],
+        sections: &BTreeMap<String, String>,
+    ) -> Result<PathBuf> {
         let path = plans_dir.join(format!("{id}.md"));
         let serialized = self.serialize();
-        let spec_changes = render_spec_changes(spec_deltas);
-        let text = if spec_changes.is_empty() {
+        let board_sections = format!(
+            "{}{}",
+            render_spec_changes(spec_deltas),
+            render_schema_sections(sections)
+        );
+        let text = if board_sections.is_empty() {
             serialized
         } else if let Some(index) = serialized.find("\n## Steps\n") {
             let mut text = serialized;
-            text.insert_str(index, &spec_changes);
+            text.insert_str(index, &board_sections);
             text
         } else {
-            format!("{serialized}{spec_changes}")
+            format!("{serialized}{board_sections}")
         };
         std::fs::write(&path, text)?;
         Ok(path)
@@ -424,6 +441,17 @@ pub fn render_spec_changes(deltas: &[Delta]) -> String {
             for renamed in &delta.renamed {
                 out.push_str(&format!("\nFROM: {}\nTO: {}\n", renamed.from, renamed.to));
             }
+        }
+    }
+    out
+}
+
+fn render_schema_sections(sections: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (id, text) in sections {
+        let text = text.trim();
+        if !text.is_empty() {
+            out.push_str(&format!("\n## {id}\n\n{text}\n"));
         }
     }
     out
@@ -523,6 +551,27 @@ mod tests {
         assert_eq!(parsed.steps.len(), 1);
         assert_eq!(parsed.title, "T");
         assert!(render_spec_changes(&[]).is_empty());
+    }
+
+    #[test]
+    fn additional_schema_sections_render_before_steps_without_changing_plan_parsing() {
+        let dir = tempdir().unwrap();
+        let plan = PlanFile::new("T", "G", "C", vec!["step one".into()]);
+        let sections = BTreeMap::from([
+            ("research".to_string(), "Evidence and findings.\n".to_string()),
+            ("decision-log".to_string(), "Use the existing store.".to_string()),
+        ]);
+        let path = plan
+            .write_to_dir_with_sections(dir.path(), "plan", &[], &sections)
+            .unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.find("## decision-log").unwrap() < text.find("## research").unwrap());
+        assert!(text.find("## research").unwrap() < text.find("## Steps").unwrap());
+        assert!(text.contains("## research\n\nEvidence and findings.\n"));
+        let parsed = PlanFile::parse(&text).unwrap();
+        assert_eq!(parsed.title, "T");
+        assert_eq!(parsed.steps.len(), 1);
+        assert_eq!(parsed.steps[0].text, "step one");
     }
 
     #[test]

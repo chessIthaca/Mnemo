@@ -2254,7 +2254,7 @@ export const previewScenes: PreviewScene[] = [
     name: "settings-models",
     title: "Settings: Models and Savings",
     description:
-      "The settings dialog's Models page (per-task, vision, code indexing, budget) and Savings page (levers, pricing) against seeded data.",
+      "The settings dialog's Models page (per-task, vision, code indexing, budget) and Savings page (levers) against seeded data.",
     // The dialog opens from component-local state, so the scene mounts it
     // directly with the preview fakes seeded; `build` keeps the app shell
     // valid for the scenes test.

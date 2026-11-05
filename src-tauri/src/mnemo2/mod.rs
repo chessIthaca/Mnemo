@@ -126,7 +126,7 @@ pub mod model_label;
 
 /// Model-role settings for the Models and Savings pages: per-task
 /// models, vision, the code-indexing (embedding) model with install
-/// progress, optimizer levers, per-model pricing and budget caps.
+/// progress, optimizer levers and budget caps.
 pub mod model_settings;
 
 /// The Memory tab's read-only command surface: the project's knowledge

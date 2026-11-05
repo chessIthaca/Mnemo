@@ -1626,6 +1626,44 @@ mod tests {
         );
     }
 
+    // A directory junction is the link kind any Windows user can create
+    // without a privilege (`mklink /J`), so it must be refused exactly
+    // like a symlink — and unlike the two tests above it also runs on
+    // a Windows box without developer mode, where true symlinks cannot
+    // be created. `is_symlink()` reports junctions too, so the same
+    // refusal fires.
+    #[test]
+    #[cfg(windows)]
+    fn add_schema_refuses_a_junctioned_schema_folder() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        let real = project.path().join("real-schema");
+        write_schema(&real);
+        let source = project.path().join("repo");
+        fs::create_dir_all(source.join("schemas")).expect("schemas dir");
+        let linked = source.join("schemas").join("custom");
+        let mklink = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&linked)
+            .arg(&real)
+            .output()
+            .expect("mklink");
+        assert!(
+            mklink.status.success(),
+            "mklink: {}",
+            String::from_utf8_lossy(&mklink.stderr)
+        );
+        // The junction lives inside the temp project, so dropping it
+        // at the end of the test cleans the link up too.
+        let error = add_schema_from(&dir, source.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("symbolic links"), "{error}");
+        assert!(error.contains("custom"), "{error}");
+        assert!(
+            !dir.join("schemas").exists(),
+            "a refused source must copy nothing"
+        );
+    }
+
     #[test]
     fn classifies_git_sources() {
         assert!(is_git_source("https://example.com/schema.git"));

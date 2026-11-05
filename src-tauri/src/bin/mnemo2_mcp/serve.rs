@@ -78,6 +78,10 @@ struct Bridge {
     /// This process forwarded a `tools/call`, which is what attaches the
     /// external lead on the server. Only then may it detach it again.
     attached: AtomicBool,
+    /// Identifies this helper process to the server: the `X-Mnemo-Bridge`
+    /// header on every forwarded request and `bridge` in the detach body, so
+    /// closing one helper cannot release a lead another helper still holds.
+    id: String,
     /// The one-time "run Mnemo without prompts" note for the first tool result.
     offer: Offer,
     /// The cwd is in a registered project: answer `initialize` locally.
@@ -194,6 +198,7 @@ impl Bridge {
             out: Mutex::new(out),
             in_flight: AtomicUsize::new(0),
             attached: AtomicBool::new(false),
+            id: uuid::Uuid::new_v4().simple().to_string(),
             offer,
             local_initialize,
             stale_list: AtomicBool::new(false),
@@ -461,6 +466,7 @@ impl Bridge {
         let headers = [
             ("X-Mnemo-Root", instance.root.as_str()),
             ("X-Mnemo-Helper", helper.as_str()),
+            ("X-Mnemo-Bridge", self.id.as_str()),
         ];
         // No read timeout: tool calls and the server's own waits can be long.
         match http::post(&instance.endpoint, "/mcp", &headers, line, None) {
@@ -475,7 +481,10 @@ impl Bridge {
 
     /// stdin closed: let quick requests finish, then release the external lead
     /// if this session is the one that led (it forwarded a tool call). A
-    /// session that only listed tools must not drop another session's lead.
+    /// session that only listed tools must not drop another session's lead, and
+    /// the server releases the lead only when no other leading helper remains:
+    /// the detach names this helper's id, so a short-lived second helper cannot
+    /// detach the lead the main session still holds.
     fn finish(&self) {
         let deadline = Instant::now() + EOF_GRACE;
         while self.in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
@@ -486,11 +495,13 @@ impl Bridge {
         }
         let target = self.lock_slot().target.clone();
         if let Some(Target::Live(instance)) = target {
+            let mut body = root_body(&instance);
+            body["bridge"] = json!(self.id);
             let _ = http::post(
                 &instance.endpoint,
                 "/lead/detach",
                 &[],
-                &root_body(&instance).to_string(),
+                &body.to_string(),
                 Some(Duration::from_secs(3)),
             );
         }

@@ -204,6 +204,13 @@ impl Spec {
     }
 
     /// Render the specification as OpenSpec Markdown.
+    ///
+    /// A specification that was not changed by a delta renders byte-identical
+    /// to its input. Reassembly from parts normalizes the spacing around each
+    /// block instead: a requirement's retained Markdown carries the blank line
+    /// that separated it from the next heading, so the trailing whitespace is
+    /// trimmed and exactly one newline re-added — otherwise every merge would
+    /// add another blank line before each preserved requirement.
     pub fn render(&self) -> String {
         if let Some(original) = &self.original {
             return original.clone();
@@ -216,13 +223,15 @@ impl Spec {
         out.push_str("\n## Requirements\n");
         for requirement in &self.requirements {
             out.push('\n');
-            out.push_str(&requirement.render());
+            out.push_str(requirement.render().trim_end());
+            out.push('\n');
         }
         for section in &self.extra_sections {
             if !out.ends_with("\n\n") {
                 out.push('\n');
             }
-            out.push_str(section);
+            out.push_str(section.trim_end());
+            out.push('\n');
         }
         out
     }
@@ -388,16 +397,22 @@ impl Scenario {
     }
 
     /// Render one scenario in canonical OpenSpec form.
+    ///
+    /// WHEN values are all written as `WHEN`. The first THEN value is written
+    /// as `THEN` and every further outcome — as well as each explicit `and`
+    /// value — as `AND`, the form OpenSpec uses for extra outcomes. Parsing
+    /// such a bullet stores it in `and`, so the round trip is stable.
     pub fn render(&self) -> String {
         let mut out = format!("#### Scenario: {}\n", self.name);
-        for (label, values) in [
-            ("WHEN", &self.when),
-            ("THEN", &self.then),
-            ("AND", &self.and),
-        ] {
-            for value in values {
-                out.push_str(&format!("- **{label}** {}\n", value.trim()));
-            }
+        for value in &self.when {
+            out.push_str(&format!("- **WHEN** {}\n", value.trim()));
+        }
+        for (index, value) in self.then.iter().enumerate() {
+            let label = if index == 0 { "THEN" } else { "AND" };
+            out.push_str(&format!("- **{label}** {}\n", value.trim()));
+        }
+        for value in &self.and {
+            out.push_str(&format!("- **AND** {}\n", value.trim()));
         }
         out
     }
@@ -559,5 +574,19 @@ mod tests {
             "# dispatch-routing\n\n## Purpose\nCurrent routing behavior.\n\n## Requirements\n\n### Requirement: Labels\nThe system MUST record labels.\n\n#### Scenario: Change\n- **WHEN** a model changes\n- **THEN** a label is stored\n"
         );
         assert_eq!(Spec::parse(&spec.render()).unwrap().render(), spec.render());
+    }
+
+    #[test]
+    fn scenario_renders_second_outcome_as_and() {
+        let scenario = Scenario::new(
+            "S",
+            vec!["w".to_string()],
+            vec!["t1".to_string(), "t2".to_string()],
+            vec!["a".to_string()],
+        );
+        assert_eq!(
+            scenario.render(),
+            "#### Scenario: S\n- **WHEN** w\n- **THEN** t1\n- **AND** t2\n- **AND** a\n"
+        );
     }
 }

@@ -523,4 +523,55 @@ mod tests {
             })
         );
     }
+
+    /// Three requirements, each with a scenario, separated by one blank line —
+    /// the shape a live `spec.md` has between requirements.
+    const THREE_REQUIREMENTS: &str = "# Dispatch routing\n\n## Purpose\nRouting behavior.\n\n## Requirements\n\n### Requirement: Alpha\nThe system SHALL keep alpha.\n\n#### Scenario: Alpha used\n- **WHEN** alpha is used\n- **THEN** alpha is kept\n\n### Requirement: Beta\nThe system SHALL keep beta.\n\n#### Scenario: Beta used\n- **WHEN** beta is used\n- **THEN** beta is kept\n\n### Requirement: Gamma\nThe system SHALL keep gamma.\n\n#### Scenario: Gamma used\n- **WHEN** gamma is used\n- **THEN** gamma is kept\n";
+
+    const BETA_BLOCK: &str = "### Requirement: Beta\nThe system SHALL keep beta.\n\n#### Scenario: Beta used\n- **WHEN** beta is used\n- **THEN** beta is kept\n";
+
+    const GAMMA_BLOCK: &str = "### Requirement: Gamma\nThe system SHALL keep gamma.\n\n#### Scenario: Gamma used\n- **WHEN** gamma is used\n- **THEN** gamma is kept\n";
+
+    fn modify_alpha(text: &str) -> Delta {
+        let mut change = delta();
+        change.modified.push(Requirement::new(
+            "Alpha",
+            text,
+            requirement("ignored").scenarios,
+        ));
+        change
+    }
+
+    #[test]
+    fn modified_delta_keeps_one_blank_line_between_requirements() {
+        let original = Spec::parse(THREE_REQUIREMENTS).unwrap();
+        let first = apply(
+            Some(&original),
+            &modify_alpha("The system MUST keep alpha, revision two."),
+        )
+        .unwrap()
+        .render();
+        assert!(
+            !first.contains("\n\n\n"),
+            "the first merge doubled a blank line:\n{first}"
+        );
+
+        let reparsed = Spec::parse(&first).unwrap();
+        let second = apply(
+            Some(&reparsed),
+            &modify_alpha("The system MUST keep alpha, revision three."),
+        )
+        .unwrap()
+        .render();
+        assert!(
+            !second.contains("\n\n\n"),
+            "the second merge doubled a blank line:\n{second}"
+        );
+        assert!(
+            second.contains("The system MUST keep alpha, revision three."),
+            "{second}"
+        );
+        assert_eq!(second.matches(BETA_BLOCK).count(), 1, "{second}");
+        assert_eq!(second.matches(GAMMA_BLOCK).count(), 1, "{second}");
+    }
 }

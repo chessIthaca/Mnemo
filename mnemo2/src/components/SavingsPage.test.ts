@@ -1,12 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { describe, expect, it, vi } from "vitest";
 import type { ModelSettings, ModelSettingsSection, ModelSettingsTransport } from "../lib/modelSettings";
-import { emptyModel, type EndpointDetailDto } from "../lib/settingsEngine";
 import SavingsPage from "./SavingsPage.svelte";
 
 /**
- * SavingsPage — the optimizer levers with their knobs and the per-model
- * pricing table, each section saving on its own button.
+ * SavingsPage — the optimizer levers with their knobs, saved as the
+ * "optimizer" section on its own button. Model prices are set with each
+ * model on the Endpoints page, so this page only points there.
  */
 
 function sampleSettings(): ModelSettings {
@@ -28,33 +28,8 @@ function sampleSettings(): ModelSettings {
       nudge_cooldown_requests: 4,
       compress_extra_commands: ["cargo test", "npm run build"],
     },
-    pricing: [
-      { model: "glm-4.6-flash", input_per_1m: 0.12, output_per_1m: 0.39, cached_per_1m: 0.012 },
-      { model: "gpt-5.2", input_per_1m: 1.25, output_per_1m: 10, cached_per_1m: 0.125 },
-      { model: "qwen3-30b-a3b", input_per_1m: 0.05, output_per_1m: 0.2, cached_per_1m: 0 },
-    ],
     budget: { enabled: false, max_tokens_per_plan: 0, max_escalations_per_plan: 0, max_retries_per_lane: 0 },
   };
-}
-
-function sampleEndpoints(): EndpointDetailDto[] {
-  return [
-    {
-      name: "openrouter",
-      kind: "openrouter",
-      base_url: "https://openrouter.ai/api/v1/",
-      has_api_key: true,
-      max_context: null,
-      max_output_tokens: null,
-      multimodal: false,
-      supports_reasoning_effort: true,
-      reasoning_effort: null,
-      supports_strict_schema: null,
-      workspace_id: null,
-      temperature: null,
-      models: [emptyModel("glm-4.6-flash"), emptyModel("gpt-5.2")],
-    },
-  ];
 }
 
 function makeTransport(overrides: Partial<ModelSettingsTransport> = {}) {
@@ -70,12 +45,12 @@ function makeTransport(overrides: Partial<ModelSettingsTransport> = {}) {
 
 function page(overrides: Partial<ModelSettingsTransport> = {}) {
   const made = makeTransport(overrides);
-  render(SavingsPage, { props: { transport: made.transport, endpoints: sampleEndpoints() } });
+  render(SavingsPage, { props: { transport: made.transport } });
   return made;
 }
 
 describe("SavingsPage", () => {
-  it("renders every lever with its switch state and explanation, the knobs and the pricing table", async () => {
+  it("renders every lever with its switch state and explanation, and the knobs", async () => {
     page();
     expect((await screen.findByRole("checkbox", { name: /Delta reads/ }) as HTMLInputElement).checked).toBe(true);
     expect((screen.getByRole("checkbox", { name: /Recall deltas/ }) as HTMLInputElement).checked).toBe(false);
@@ -83,8 +58,6 @@ describe("SavingsPage", () => {
     expect((screen.getByLabelText("Archive after") as HTMLInputElement).value).toBe("2400");
     expect((screen.getByLabelText("Nudge at fill %") as HTMLInputElement).value).toBe("80");
     expect((screen.getByLabelText("Extra commands") as HTMLInputElement).value).toBe("cargo test, npm run build");
-    expect((screen.getByLabelText("Model for row 1") as HTMLInputElement).value).toBe("glm-4.6-flash");
-    expect((screen.getByLabelText("Input price for row 1") as HTMLInputElement).value).toBe("0.12");
   });
 
   it("toggles a lever and saves the optimizer section", async () => {
@@ -130,54 +103,13 @@ describe("SavingsPage", () => {
     expect(made.transport.save).not.toHaveBeenCalled();
   });
 
-  it("edits prices and saves the pricing section", async () => {
-    const made = page();
-    await screen.findByLabelText("Input price for row 1");
-    await fireEvent.input(screen.getByLabelText("Input price for row 1"), { target: { value: "0.15" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Save prices" }));
-    await waitFor(() =>
-      expect(made.transport.save).toHaveBeenCalledWith("pricing", [
-        { model: "glm-4.6-flash", input_per_1m: 0.15, output_per_1m: 0.39, cached_per_1m: 0.012 },
-        { model: "gpt-5.2", input_per_1m: 1.25, output_per_1m: 10, cached_per_1m: 0.125 },
-        { model: "qwen3-30b-a3b", input_per_1m: 0.05, output_per_1m: 0.2, cached_per_1m: 0 },
-      ]),
-    );
-    expect(await screen.findByText("Applies after reopening the project.")).toBeTruthy();
-  });
-
-  it("adds and removes pricing rows", async () => {
-    const made = page();
-    await screen.findByLabelText("Model for row 1");
-    await fireEvent.click(screen.getByRole("button", { name: "Add model" }));
-    await fireEvent.input(screen.getByLabelText("Model for row 4"), { target: { value: "fresh-model" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Remove row 2" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Save prices" }));
-    await waitFor(() =>
-      expect(made.transport.save).toHaveBeenCalledWith("pricing", [
-        { model: "glm-4.6-flash", input_per_1m: 0.12, output_per_1m: 0.39, cached_per_1m: 0.012 },
-        { model: "qwen3-30b-a3b", input_per_1m: 0.05, output_per_1m: 0.2, cached_per_1m: 0 },
-        { model: "fresh-model", input_per_1m: 0, output_per_1m: 0, cached_per_1m: 0 },
-      ]),
-    );
-  });
-
-  it("skips blank-model rows on save", async () => {
-    const made = page();
-    await screen.findByLabelText("Model for row 1");
-    await fireEvent.input(screen.getByLabelText("Model for row 2"), { target: { value: "" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Save prices" }));
-    await waitFor(() => expect(made.transport.save).toHaveBeenCalled());
-    const rows = made.transport.save.mock.calls[0][1] as { model: string }[];
-    expect(rows.map((row) => row.model)).toEqual(["glm-4.6-flash", "qwen3-30b-a3b"]);
-  });
-
-  it("rejects a non-numeric price inline", async () => {
-    const made = page();
-    await screen.findByLabelText("Output price for row 1");
-    await fireEvent.input(screen.getByLabelText("Output price for row 1"), { target: { value: "cheap" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Save prices" }));
-    expect(screen.getByText("Output price for glm-4.6-flash must be a number")).toBeTruthy();
-    expect(made.transport.save).not.toHaveBeenCalled();
+  it("has no pricing table and points to the Endpoints page", async () => {
+    page();
+    await screen.findByRole("checkbox", { name: /Delta reads/ });
+    expect(screen.queryByRole("region", { name: "Per-model pricing" })).toBeNull();
+    expect(screen.queryByLabelText("Model for row 1")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save prices" })).toBeNull();
+    expect(screen.getByText("Model prices are set with each model on the Endpoints page.")).toBeTruthy();
   });
 
   it("shows the load error when the snapshot fails", async () => {

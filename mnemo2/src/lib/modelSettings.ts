@@ -66,14 +66,6 @@ export interface OptimizerSettings {
   compress_extra_commands: string[];
 }
 
-/** One per-model pricing row, US dollars per 1M tokens. */
-export interface PricingRow {
-  model: string;
-  input_per_1m: number;
-  output_per_1m: number;
-  cached_per_1m: number;
-}
-
 /** The deterministic budget caps. */
 export interface BudgetCaps {
   enabled: boolean;
@@ -88,12 +80,11 @@ export interface ModelSettings {
   vision_model: string | null;
   embedding: EmbeddingSection;
   optimizer: OptimizerSettings;
-  pricing: PricingRow[];
   budget: BudgetCaps;
 }
 
 /** One page-owned section a save writes in isolation. */
-export type ModelSettingsSection = "models" | "vision" | "embedding" | "optimizer" | "pricing" | "budget";
+export type ModelSettingsSection = "models" | "vision" | "embedding" | "optimizer" | "budget";
 
 /** A `SetupEvent` payload from `embedding_install`: progress, then done/failed. */
 export interface EmbedderEvent {
@@ -183,24 +174,6 @@ export function optimizerDraft(settings: OptimizerSettings): OptimizerDraft {
   };
 }
 
-/** One editable pricing row: the numbers as input text. */
-export interface PricingDraftRow {
-  model: string;
-  input: string;
-  output: string;
-  cached: string;
-}
-
-/** Seed pricing draft rows from the wire table. */
-export function pricingDraft(rows: PricingRow[]): PricingDraftRow[] {
-  return rows.map((row) => ({
-    model: row.model,
-    input: String(row.input_per_1m),
-    output: String(row.output_per_1m),
-    cached: String(row.cached_per_1m),
-  }));
-}
-
 /** An editable budget draft: the caps as input text. */
 export interface BudgetDraft {
   enabled: boolean;
@@ -238,14 +211,6 @@ export function parseWholeNumber(text: string): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-/** Parse a non-negative dollar amount; null when it is not one. Blank is 0. */
-export function parsePrice(text: string): number | null {
-  const trimmed = text.trim();
-  if (trimmed === "") return 0;
-  if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
-  return Number(trimmed);
-}
-
 /** Parse an optimizer draft into the save payload, or the first error. */
 export function optimizerWire(draft: OptimizerDraft): { value?: Partial<OptimizerSettings>; error?: string } {
   const value: Partial<OptimizerSettings> = {
@@ -278,28 +243,6 @@ export function optimizerWire(draft: OptimizerDraft): { value?: Partial<Optimize
     .map((command) => command.trim())
     .filter((command) => command.length > 0);
   return { value: { ...value, ...knobs } };
-}
-
-/** Parse pricing draft rows into the save table, or the first error. */
-export function pricingWire(draft: PricingDraftRow[]): { value?: PricingRow[]; error?: string } {
-  const value: PricingRow[] = [];
-  for (const row of draft) {
-    const model = row.model.trim();
-    if (model === "") continue;
-    const prices: [keyof Omit<PricingRow, "model">, string, string][] = [
-      ["input_per_1m", row.input, "Input price"],
-      ["output_per_1m", row.output, "Output price"],
-      ["cached_per_1m", row.cached, "Cached price"],
-    ];
-    const next: PricingRow = { model, input_per_1m: 0, output_per_1m: 0, cached_per_1m: 0 };
-    for (const [key, text, label] of prices) {
-      const parsed = parsePrice(text);
-      if (parsed === null) return { error: `${label} for ${model} must be a number` };
-      next[key] = parsed;
-    }
-    value.push(next);
-  }
-  return { value };
 }
 
 /** Parse a budget draft into the save caps, or the first error. */
@@ -335,17 +278,6 @@ export function modelRefOptions(endpoints: EndpointDetailDto[]): string[] {
   for (const endpoint of endpoints) {
     for (const model of endpoint.models) {
       seen.add(`${endpoint.name}/${model.id}`);
-    }
-  }
-  return [...seen];
-}
-
-/** Model ids (no endpoint prefix) for the pricing table's model column. */
-export function modelIdOptions(endpoints: EndpointDetailDto[]): string[] {
-  const seen = new Set<string>();
-  for (const endpoint of endpoints) {
-    for (const model of endpoint.models) {
-      seen.add(model.id);
     }
   }
   return [...seen];

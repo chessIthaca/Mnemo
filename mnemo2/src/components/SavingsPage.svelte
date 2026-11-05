@@ -1,43 +1,29 @@
 <script lang="ts">
-  import { Plus, X } from "@lucide/svelte";
   import {
     OPTIMIZER_KNOBS,
     OPTIMIZER_LEVERS,
-    modelIdOptions,
     optimizerDraft,
     optimizerWire,
-    pricingDraft,
-    pricingWire,
     type ModelSettings,
     type ModelSettingsTransport,
     type OptimizerDraft,
-    type PricingDraftRow,
   } from "../lib/modelSettings";
-  import type { EndpointDetailDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import { trackUnsaved } from "../lib/unsavedEdits";
 
   /**
    * The Savings settings page: one switch per optimizer lever with a
-   * one-line explanation, the knobs as small inputs, and the per-model
-   * pricing table the Cost tab figures are computed from. The levers save
-   * as the "optimizer" section and the prices as the "pricing" section;
-   * the engine reads both when it starts, so a change applies after
-   * reopening the project.
+   * one-line explanation, plus the knobs as small inputs. The levers save
+   * as the "optimizer" section, which the engine reads when it starts, so
+   * a change applies after reopening the project. Model prices are not set
+   * here — each model carries its own prices on the Endpoints page.
    */
-  let {
-    transport,
-    endpoints,
-  }: {
-    transport: ModelSettingsTransport;
-    endpoints: EndpointDetailDto[];
-  } = $props();
+  let { transport }: { transport: ModelSettingsTransport } = $props();
 
   let loaded = $state(false);
   let loadError = $state("");
 
   let optimizer = $state({ draft: emptyOptimizer(), original: emptyOptimizer(), saving: false, error: "", saved: false });
-  let pricing = $state({ draft: [] as PricingDraftRow[], original: [] as PricingDraftRow[], saving: false, error: "", saved: false });
 
   function emptyOptimizer(): OptimizerDraft {
     return {
@@ -56,10 +42,8 @@
     };
   }
 
-  const options = $derived(modelIdOptions(endpoints));
   const optimizerDirty = $derived(different(optimizer.draft, optimizer.original));
-  const pricingDirty = $derived(different(pricing.draft, pricing.original));
-  trackUnsaved(() => optimizerDirty || pricingDirty);
+  trackUnsaved(() => optimizerDirty);
 
   function different(a: unknown, b: unknown): boolean {
     return JSON.stringify(a) !== JSON.stringify(b);
@@ -74,8 +58,6 @@
         if (cancelled) return;
         optimizer.draft = optimizerDraft(settings.optimizer);
         optimizer.original = optimizerDraft(settings.optimizer);
-        pricing.draft = pricingDraft(settings.pricing);
-        pricing.original = pricingDraft(settings.pricing);
         loaded = true;
       })
       .catch((failure) => {
@@ -105,51 +87,12 @@
     }
   }
 
-  async function savePrices(): Promise<void> {
-    const parsed = pricingWire(pricing.draft);
-    if (parsed.error) {
-      pricing.error = parsed.error;
-      return;
-    }
-    pricing.saving = true;
-    pricing.error = "";
-    try {
-      await transport.save("pricing", parsed.value);
-      pricing.original = pricing.draft.map((row) => ({ ...row }));
-      pricing.saved = true;
-    } catch (failure) {
-      pricing.error = errorText(failure);
-    } finally {
-      pricing.saving = false;
-    }
-  }
-
   function discardLevers(): void {
     optimizer.draft = { ...optimizer.original };
     optimizer.error = "";
     optimizer.saved = false;
   }
-
-  function discardPrices(): void {
-    pricing.draft = pricing.original.map((row) => ({ ...row }));
-    pricing.error = "";
-    pricing.saved = false;
-  }
-
-  function addRow(): void {
-    pricing.draft.push({ model: "", input: "0", output: "0", cached: "0" });
-  }
-
-  function removeRow(index: number): void {
-    pricing.draft.splice(index, 1);
-  }
 </script>
-
-<datalist id="savings-page-models">
-  {#each options as option (option)}
-    <option value={option}></option>
-  {/each}
-</datalist>
 
 <div class="savings-page">
   <div class="savings-scroll">
@@ -190,6 +133,7 @@
             </div>
           {/each}
         </div>
+        <p class="micro">Model prices are set with each model on the Endpoints page.</p>
         <div class="section-actions">
           {#if optimizer.error}<p class="section-error" role="alert">{optimizer.error}</p>{/if}
           {#if optimizer.saved && !optimizerDirty}<p class="section-note">Applies after reopening the project.</p>{/if}
@@ -197,48 +141,6 @@
             <button class="button button-quiet" disabled={optimizer.saving || !optimizerDirty} onclick={discardLevers}>Discard</button>
             <button class="button button-primary" disabled={optimizer.saving || !optimizerDirty} onclick={saveLevers}>
               {optimizer.saving ? "Saving…" : "Save levers"}
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <section class="group" aria-label="Per-model pricing">
-        <header>
-          <h3>Per-model pricing</h3>
-          <p class="micro">US dollars per 1M tokens. The Cost tab computes its figures from these prices.</p>
-        </header>
-        <table class="pricing-table">
-          <thead>
-            <tr><th>Model</th><th>Input $/1M</th><th>Output $/1M</th><th>Cached $/1M</th><th></th></tr>
-          </thead>
-          <tbody>
-            {#each pricing.draft as row, index}
-              <tr>
-                <td>
-                  <input list="savings-page-models" aria-label={`Model for row ${index + 1}`} bind:value={row.model} placeholder="model id" spellcheck="false" />
-                </td>
-                <td><input inputmode="decimal" aria-label={`Input price for row ${index + 1}`} bind:value={row.input} /></td>
-                <td><input inputmode="decimal" aria-label={`Output price for row ${index + 1}`} bind:value={row.output} /></td>
-                <td><input inputmode="decimal" aria-label={`Cached price for row ${index + 1}`} bind:value={row.cached} /></td>
-                <td>
-                  <button class="icon-button" aria-label={`Remove row ${index + 1}`} onclick={() => removeRow(index)}>
-                    <X size={12} />
-                  </button>
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-        <div>
-          <button class="button button-quiet" onclick={addRow}><Plus size={13} /> Add model</button>
-        </div>
-        <div class="section-actions">
-          {#if pricing.error}<p class="section-error" role="alert">{pricing.error}</p>{/if}
-          {#if pricing.saved && !pricingDirty}<p class="section-note">Applies after reopening the project.</p>{/if}
-          <div class="section-buttons">
-            <button class="button button-quiet" disabled={pricing.saving || !pricingDirty} onclick={discardPrices}>Discard</button>
-            <button class="button button-primary" disabled={pricing.saving || !pricingDirty} onclick={savePrices}>
-              {pricing.saving ? "Saving…" : "Save prices"}
             </button>
           </div>
         </div>
@@ -284,25 +186,6 @@
   .knob-row { display: grid; gap: 3px; }
   .knob-row label { font-size: var(--text-body); font-weight: 620; }
   .knob-row input {
-    padding: 7px 10px;
-    border: 1px solid var(--line);
-    border-radius: 9px;
-    background: var(--surface);
-    font-size: var(--text-body);
-  }
-
-  .pricing-table { border-collapse: collapse; font-size: var(--text-body); }
-  .pricing-table th {
-    padding: 4px 8px;
-    color: var(--muted);
-    font-size: var(--text-meta);
-    font-weight: 650;
-    text-align: left;
-    white-space: nowrap;
-  }
-  .pricing-table td { padding: 3px 4px 3px 0; }
-  .pricing-table input {
-    width: 100%;
     padding: 7px 10px;
     border: 1px solid var(--line);
     border-radius: 9px;

@@ -249,7 +249,7 @@
           {/if}
         {:else if page === "savings"}
           {#if modelTransport}
-            <SavingsPage transport={modelTransport} {endpoints} />
+            <SavingsPage transport={modelTransport} />
           {:else}
             <p class="settings-empty">Savings settings are available in the desktop app.</p>
           {/if}

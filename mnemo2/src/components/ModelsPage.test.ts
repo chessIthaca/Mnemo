@@ -40,10 +40,6 @@ function sampleSettings(): ModelSettings {
       nudge_cooldown_requests: 4,
       compress_extra_commands: ["cargo test"],
     },
-    pricing: [
-      { model: "glm-4.6-flash", input_per_1m: 0.12, output_per_1m: 0.39, cached_per_1m: 0.012 },
-      { model: "gpt-5.2", input_per_1m: 1.25, output_per_1m: 10, cached_per_1m: 0.125 },
-    ],
     budget: { enabled: true, max_tokens_per_plan: 2_000_000, max_escalations_per_plan: 3, max_retries_per_lane: 2 },
   };
 }

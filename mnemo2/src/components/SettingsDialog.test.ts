@@ -446,7 +446,6 @@ describe("SettingsDialog", () => {
           nudge_cooldown_requests: 4,
           compress_extra_commands: [],
         },
-        pricing: [{ model: "m1", input_per_1m: 3, output_per_1m: 15, cached_per_1m: 0 }],
         budget: { enabled: false, max_tokens_per_plan: 0, max_escalations_per_plan: 0, max_retries_per_lane: 0 },
       })),
       save: vi.fn(async () => undefined),
@@ -462,7 +461,7 @@ describe("SettingsDialog", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Savings" }));
     const levers = await screen.findByRole("region", { name: "Savings levers" });
     expect(within(levers).getByText("Delta reads")).toBeTruthy();
-    expect((screen.getByLabelText("Model for row 1") as HTMLInputElement).value).toBe("m1");
+    expect(screen.getByText("Model prices are set with each model on the Endpoints page.")).toBeTruthy();
   });
 
   it("shows the Tiers page's Laya section with status, switches and the kNN count", async () => {
@@ -598,8 +597,6 @@ describe("unsaved edits", () => {
           nudge_cooldown_requests: 4,
           compress_extra_commands: [],
         },
-
-        pricing: [{ model: "m1", input_per_1m: 3, output_per_1m: 15, cached_per_1m: 0 }],
         budget: { enabled: false, max_tokens_per_plan: 0, max_escalations_per_plan: 0, max_retries_per_lane: 0 },
       })),
       save: vi.fn(async () => undefined),

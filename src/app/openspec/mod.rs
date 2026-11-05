@@ -4,6 +4,7 @@
 
 //! App-side access to Mnemo's single kernel-owned OpenSpec format layer.
 
+pub(crate) mod archive;
 pub mod schema;
 
 pub use crate::openspec::*;

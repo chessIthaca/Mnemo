@@ -9628,6 +9628,17 @@ mod tests {
             .await
             .expect("knowledge records are lead bookkeeping too");
         std::fs::remove_file(root.join(".coding/knowledge/note.md")).expect("remove note");
+        std::fs::create_dir_all(root.join(".coding/openspec/specs/importer"))
+            .expect("OpenSpec dir");
+        std::fs::write(
+            root.join(".coding/openspec/specs/importer/spec.md"),
+            "# Importer\n",
+        )
+        .expect("OpenSpec spec");
+        phase3::require_clean_lead(root, "lead")
+            .await
+            .expect("OpenSpec specs and archives are lead bookkeeping too");
+        std::fs::remove_dir_all(root.join(".coding/openspec")).expect("remove OpenSpec dir");
         std::fs::write(root.join("file.txt"), "changed").expect("change source");
         phase3::require_clean_lead(root, "lead")
             .await

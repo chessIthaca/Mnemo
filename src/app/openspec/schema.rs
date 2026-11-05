@@ -43,6 +43,14 @@ pub struct OpenSpecConfig {
     /// Additional rules keyed by artifact id.
     #[serde(default, deserialize_with = "deserialize_rules")]
     pub rules: BTreeMap<String, Vec<String>>,
+    /// Capability name → the repo-relative source files whose changes
+    /// affect that capability's specified behavior (exact paths,
+    /// `/`-separated). `plan_create` refuses a plan whose steps touch a
+    /// governed file without a spec delta for that capability or an
+    /// explicit no-spec-impact declaration. An empty or absent list means
+    /// no gating for that capability.
+    #[serde(default)]
+    pub governed_files: BTreeMap<String, Vec<String>>,
     /// Unrecognised config keys, retained for forwards compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -536,6 +544,28 @@ mod tests {
         assert_eq!(resolved.config.rules["tasks"].len(), 2);
         assert_eq!(resolved.config.extra["future_config"], "retained");
         assert_eq!(resolved.warnings().len(), 4);
+    }
+
+    #[test]
+    fn loads_governed_files_and_treats_absent_or_empty_as_ungated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "governed_files:\n  dispatch-routing:\n    - src-tauri/src/mnemo2/team.rs\n  tier-ladder: []\n",
+        )
+        .unwrap();
+        let config = OpenSpecConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            config.governed_files["dispatch-routing"],
+            vec!["src-tauri/src/mnemo2/team.rs"]
+        );
+        assert!(config.governed_files["tier-ladder"].is_empty());
+
+        let absent = tempfile::tempdir().unwrap();
+        assert!(OpenSpecConfig::load(absent.path())
+            .unwrap()
+            .governed_files
+            .is_empty());
     }
 
     #[test]

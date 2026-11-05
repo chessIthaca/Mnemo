@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -299,4 +299,33 @@ pub fn closed_port() -> u16 {
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
     port
+}
+
+/// True when a probe connect to `port` fails, so no listener can accept the
+/// bridge's next request there. The failure kind is platform-specific — macOS
+/// resets a connection the closed listener's backlog completed, Windows drops
+/// the SYN — and the bridge turns any failed connect into a `HttpError::Connect`
+/// error, the resendable path a test waits for.
+pub fn connect_fails(port: u16) -> bool {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_err()
+}
+
+/// Wait until nothing listens on `port` any more.
+///
+/// Dropping a [`FakeServer`] closes its listener on the accept thread, but
+/// macOS can still complete a handshake from that socket's backlog and reset
+/// it afterwards. The bridge deliberately never resends a request whose
+/// connection broke after it opened, so a test that wants the "Mnemo2 is gone"
+/// path — a connect that provably reached no one — waits here first instead of
+/// racing the kernel.
+pub fn wait_until_connect_fails(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !connect_fails(port) {
+        assert!(
+            Instant::now() < deadline,
+            "port {port} still accepted a connection after five seconds"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

@@ -140,7 +140,8 @@ Mnemo2 sends lead notices that start with "[TeamManager notice — not the human
 - "failed: ...": see Failures below.
 - "Laya nudge: ..." or "Auto escalation switched worker ...": escalation advice, see Escalation notices above.
 - "finished its read-only audit": adjudicate it, see High-risk work.
-- "Plan X step N is done", "Plan X is closed", "cannot close yet", "could not be ticked": board events. Read them, then `plan_show`.
+- "Plan this backlog item <id>": the user handed you a backlog idea. Write the plan with `plan_create` and pass that item's `backlog_id`; the item is marked done with the new plan's id.
+- "Plan X step N is done", "Plan X is closed", "cannot close yet", "could not be ticked": board events. Read them, then `plan_show`. A "cannot close yet" can name a spec change that no longer applies to the current spec: fix it with `plan_update`, then tick the last step again.
 
 They reach you three ways:
 

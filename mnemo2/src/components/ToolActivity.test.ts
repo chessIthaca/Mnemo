@@ -1,5 +1,5 @@
 import { fireEvent, render, waitFor } from "@testing-library/svelte";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LeadEntry } from "../lib/types";
 import ToolActivity from "./ToolActivity.svelte";
 
@@ -240,5 +240,71 @@ describe("ToolActivity expanded bodies", () => {
     await waitFor(() => expect(container.textContent).toContain("Error"));
     expect(container.textContent).toContain("permission denied");
     expect(container.querySelector(".tool-diff")).toBeNull();
+  });
+});
+describe("ToolActivity turn time", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** A finished read call, overridable per test. */
+  function card(overrides: Partial<ToolEntry> = {}): ToolEntry {
+    return {
+      id: "tool-1",
+      kind: "tool",
+      time: "now",
+      toolCallId: "call-1",
+      toolName: "read_files",
+      arguments: '{"files":["README.md"]}',
+      liveOutput: "",
+      result: { success: true, output: "read 42 lines" },
+      ...overrides,
+    } as ToolEntry;
+  }
+
+  function statusText(container: HTMLElement): string {
+    return container.querySelector<HTMLElement>(".tool-status")?.textContent?.trim() ?? "";
+  }
+
+  function timeTitle(container: HTMLElement): string | null {
+    return container.querySelector<HTMLElement>(".elapsed-time")?.getAttribute("title") ?? null;
+  }
+
+  it("a completed card shows only the turn time", () => {
+    const { container } = render(ToolActivity, {
+      entry: card({ startedAtMs: 61_000, endedAtMs: 61_400 }),
+      turnStartedAtMs: 0,
+    });
+    // 61.4 s into the turn — not the call's own 0.4 s.
+    expect(statusText(container)).toBe("1:01");
+    expect(statusText(container)).not.toContain("Completed");
+    // The status word stays reachable for screen readers on the card's label.
+    expect(container.querySelector("article")?.getAttribute("aria-label")).toContain("Completed");
+  });
+
+  it("a failed card keeps the word", () => {
+    const { container } = render(ToolActivity, {
+      entry: card({ startedAtMs: 61_000, endedAtMs: 61_400, result: { success: false, output: "boom" } }),
+      turnStartedAtMs: 0,
+    });
+    expect(statusText(container)).toBe("Failed · 1:01");
+  });
+
+  it("the tooltip names turn and call time", () => {
+    const { container } = render(ToolActivity, {
+      entry: card({ startedAtMs: 61_000, endedAtMs: 61_400 }),
+      turnStartedAtMs: 0,
+    });
+    expect(timeTitle(container)).toBe("Turn time 1:01 · this call 0:00");
+  });
+
+  it("a running card counts from the turn start and says so in its tooltip", () => {
+    vi.spyOn(Date, "now").mockReturnValue(63_000);
+    const { container } = render(ToolActivity, {
+      entry: card({ startedAtMs: 61_000, result: null }),
+      turnStartedAtMs: 60_000,
+    });
+    expect(statusText(container)).toBe("0:03");
+    expect(timeTitle(container)).toBe("Turn time 0:03 · running 0:02");
   });
 });

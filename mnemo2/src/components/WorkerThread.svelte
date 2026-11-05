@@ -2,6 +2,7 @@
   import { Send } from "@lucide/svelte";
   import { onMount } from "svelte";
   import { actions } from "../lib/store";
+  import { turnStartTimes } from "../lib/elapsed";
   import { workerPhaseLabel } from "../lib/workerActivity";
   import type { Worker } from "../lib/types";
   import ActivityStatus from "./ActivityStatus.svelte";
@@ -16,6 +17,9 @@
    * reader stays near the bottom; scrolling up to read pauses the follow.
    */
   let { worker, compact = false }: { worker: Worker; compact?: boolean } = $props();
+
+  /** Each tool call's turn start: its card shows how long the turn has run. */
+  const turnStarts = $derived(turnStartTimes(worker.messages));
 
   /** The reader counts as "at the bottom" within this many pixels (same rule as LeadChat). */
   const STICK_TO_BOTTOM_PX = 48;
@@ -94,7 +98,7 @@
 {#snippet threadMessages()}
   {#each worker.messages as entry (entry.id)}
     {#if entry.kind === "tool"}
-      <div class="thread-tool"><ToolActivity {entry} /></div>
+      <div class="thread-tool"><ToolActivity {entry} turnStartedAtMs={turnStarts[entry.id]} /></div>
     {:else if entry.kind === "error"}
       {#if entry.retrying}
         <div class="thread-error-note" role="status">Provider error, retrying: {entry.body}</div>

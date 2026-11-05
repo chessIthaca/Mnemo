@@ -11,6 +11,7 @@
     webFetchUrl,
   } from "../../../frontend/src/lib/toolCardPaths";
   import { parseAnsi, stripAnsi, terminalTail } from "../lib/ansi";
+  import { formatElapsed } from "../lib/elapsed";
   import { app } from "../lib/store";
   import { prettyArguments } from "../lib/toolArguments";
   import { editDiffSections, writeDiffSections } from "../lib/toolDiff";
@@ -23,7 +24,12 @@
 
   type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
 
-  let { entry }: { entry: ToolEntry } = $props();
+  /**
+   * One tool call's card. `turnStartedAtMs` is when the turn's first call
+   * started: the card shows how long the turn has run, and keeps the call's own
+   * duration in its tooltip. A card rendered on its own falls back to the call.
+   */
+  let { entry, turnStartedAtMs }: { entry: ToolEntry; turnStartedAtMs?: number } = $props();
   let expanded = $state(false);
   const status = $derived(
     entry.result === null ? "running" : entry.result.success ? "completed" : "failed",
@@ -36,6 +42,15 @@
       $app.workers.find((worker) => worker.id === workerId)?.name ?? workerId,
     ),
   );
+  /** The time's tooltip: the turn's clock, then this call's own slice of it. */
+  const timeTitle = $derived.by(() => {
+    const callStartMs = entry.startedAtMs;
+    if (callStartMs === undefined) return "Elapsed time";
+    const endMs = entry.endedAtMs ?? Date.now();
+    const turn = formatElapsed(turnStartedAtMs ?? callStartMs, endMs);
+    const call = formatElapsed(callStartMs, endMs);
+    return `Turn time ${turn} · ${entry.endedAtMs === undefined ? "running" : "this call"} ${call}`;
+  });
   const errorSummary = $derived(
     entry.result && !entry.result.success ? toolErrorSummary(stripAnsi(entry.result.output)) : "",
   );
@@ -128,7 +143,14 @@
       </span>
       <span class="tool-copy"><strong title={headline.title}>{headline.text}</strong></span>
       <span class="tool-status" data-status={status}>
-        {statusLabel}{#if entry.startedAtMs !== undefined}<ElapsedTime startedAtMs={entry.startedAtMs} endedAtMs={entry.endedAtMs} />{/if}
+        {#if entry.startedAtMs !== undefined}
+          {#if status === "failed"}Failed{/if}<ElapsedTime
+            startedAtMs={turnStartedAtMs ?? entry.startedAtMs}
+            endedAtMs={entry.endedAtMs}
+            prefix={status === "failed" ? " · " : ""}
+            title={timeTitle}
+          />
+        {:else if status === "failed"}Failed{/if}
       </span>
       <ChevronRight class="tool-chevron" size={12} aria-hidden="true" />
     </summary>
@@ -261,7 +283,8 @@
   .tool-status { flex: 0 0 auto; color: var(--muted); font-size: var(--text-meta); }
   .tool-status[data-status="running"] { color: var(--accent-strong); }
   .tool-status[data-status="failed"] { color: var(--danger); }
-  .tool-status :global(.elapsed-time) { color: var(--muted); }
+  /* The time is the cell's only text now: it takes the status colour (live, danger, muted). */
+  .tool-status :global(.elapsed-time) { color: inherit; }
   .tool-heading :global(.tool-chevron) { flex: 0 0 auto; margin-left: auto; color: var(--muted); transition: transform 120ms ease; }
   .tool-disclosure[open] .tool-heading :global(.tool-chevron) { transform: rotate(90deg); }
   .tool-details { margin: 6px 0 2px 26px; padding-top: 6px; border-top: 1px solid var(--line); }

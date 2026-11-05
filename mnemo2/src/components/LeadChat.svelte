@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { ArrowUpRight, ClipboardCheck, MessageSquareText } from "@lucide/svelte";
   import { actions, app } from "../lib/store";
+  import { turnStartTimes } from "../lib/elapsed";
   import { workerStatusText } from "../lib/types";
   import { selectNeedsYouWorkers, selectRunningWorkers } from "../lib/workerSelection";
   import Composer from "./Composer.svelte";
@@ -33,6 +34,8 @@
   const entries = $derived(
     $app.leadEntries.filter((entry) => !(entry.kind === "message" && entry.author === "lead" && !entry.body.trim())),
   );
+  /** Each tool call's turn start: its card shows how long the turn has run. */
+  const turnStarts = $derived(turnStartTimes(entries));
 
   // The lead ends its turn while workers run; TeamManager wakes it when one
   // finishes. Say so, so an idle lead does not read as a stalled one.
@@ -153,7 +156,7 @@
               class:tool-connected={entries[index + 1]?.kind === "tool"}
               class:before-message={entries[index + 1]?.kind === "message"}
             >
-              <ToolActivity {entry} />
+              <ToolActivity {entry} turnStartedAtMs={turnStarts[entry.id]} />
             </div>
           {:else if entry.kind === "team-message"}
             {@const name = $app.workers.find((item) => item.id === entry.workerId)?.name ?? entry.workerName ?? entry.workerId}

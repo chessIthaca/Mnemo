@@ -1,10 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { emptyModel, type EndpointDetailDto, type SettingsTransport, type TiersDto } from "../lib/settingsEngine";
+import { emptyModel, emptyTiers, type EndpointDetailDto, type SettingsTransport, type TiersDto } from "../lib/settingsEngine";
 import { setPreviewAppearanceTransport, type AppearanceSettings } from "../lib/sounds";
 import { app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import SettingsDialog from "./SettingsDialog.svelte";
+import EndpointsPage from "./EndpointsPage.svelte";
 import TopBar from "./TopBar.svelte";
 
 
@@ -98,6 +99,41 @@ function makeTransport(overrides: Partial<SettingsTransport> = {}) {
   const transport = { ...base, ...overrides } as typeof base;
   mocks.transport = transport;
   return transport;
+}
+
+function safetySnapshot() {
+  return { mode: "approve-each-action", rules: [], project_open: true, live_lead: false };
+}
+
+function makeSafetyTransport() {
+  mocks.safetyTransport = {
+    get: vi.fn(async () => safetySnapshot()),
+    saveMode: vi.fn(async () => safetySnapshot()),
+    saveRules: vi.fn(async () => safetySnapshot()),
+  };
+}
+
+function mcpServer() {
+  return {
+    name: "fs",
+    enabled: true,
+    command: "npx",
+    args: ["-y", "server-fs"],
+    env: [],
+    headers_env: {},
+    scopes: [],
+    trusted: false,
+    source: "global",
+  };
+}
+
+function makeMcpTransport() {
+  const snapshot = { servers: [mcpServer()], project_open: true, live_lead: false, statuses: [] };
+  mocks.mcpTransport = {
+    get: vi.fn(async () => snapshot),
+    save: vi.fn(async () => snapshot),
+    test: vi.fn(async () => ({ ok: true, tools: [], error: null })),
+  };
 }
 
 async function openDialog() {
@@ -228,6 +264,91 @@ describe("SettingsDialog", () => {
     expect((screen.getByLabelText("Base URL") as HTMLInputElement).value).toBe("https://changed/");
     await fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
     expect((screen.getByLabelText("Base URL") as HTMLInputElement).value).toBe("https://beta.example/v1/");
+  });
+
+  it("Discard changes reverts the edit instead of adopting it", async () => {
+    makeTransport();
+    await openDialog();
+    await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: "https://edited.example/v1/" } });
+    // Leaving alpha for beta raises the in-page banner; discarding must put
+    // alpha's saved values back, not crown the edited draft as the baseline.
+    await fireEvent.click(screen.getByRole("button", { name: "Edit beta" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect((screen.getByLabelText("Base URL") as HTMLInputElement).value).toBe("https://beta.example/v1/");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Edit alpha" }));
+    expect((screen.getByLabelText("Base URL") as HTMLInputElement).value).toBe("https://alpha.example/v1/");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+  });
+
+  it("Discard changes reverts the draft even when the queued navigation no longer resolves", async () => {
+    // The page on its own: the endpoint the banner was queued for can vanish
+    // before the user answers, leaving the queued navigation a no-op. A discard
+    // that only marks the edited draft clean would then show it as saved, with
+    // no dirty footer — the old handler's "adopt the draft" defect.
+    const transport = makeTransport();
+    const alpha = endpoint("alpha");
+    const beta = endpoint("beta");
+    const page = render(EndpointsPage, { transport, endpoints: [alpha, beta], tiers: emptyTiers(), onendpoints: vi.fn() });
+    await fireEvent.input(await screen.findByLabelText("Base URL"), { target: { value: "https://edited.example/v1/" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Edit beta" }));
+    expect(screen.getByText("Discard unsaved changes?")).toBeTruthy();
+
+    await page.rerender({ transport, endpoints: [alpha], tiers: emptyTiers(), onendpoints: vi.fn() });
+    await fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+
+    expect((screen.getByLabelText("Base URL") as HTMLInputElement).value).toBe("https://alpha.example/v1/");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+  });
+
+  it("a failed endpoints read leaves Safety, MCP and Appearance usable and shows the error on Endpoints", async () => {
+    makeTransport({ endpoints: vi.fn(async () => Promise.reject(new Error("settings host unavailable"))) });
+    makeSafetyTransport();
+    makeMcpTransport();
+    const appearance: AppearanceSettings = {
+      sound_complete: true,
+      sound_input_needed: true,
+      sound_stopped_errors: true,
+      theme: "light",
+      close_behavior: "auto",
+    };
+    setPreviewAppearanceTransport({
+      get: vi.fn(async () => appearance),
+      save: vi.fn(async () => appearance),
+    });
+    render(SettingsDialog, { open: true, onclose: vi.fn(), initialPage: "endpoints" });
+
+    // Endpoints needs the read, so it reports the failure in place of the editor.
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("settings host unavailable");
+    expect(screen.queryByLabelText("Base URL")).toBeNull();
+
+    // The pages that read neither endpoints nor tiers keep working.
+    await fireEvent.click(screen.getByRole("button", { name: "Safety" }));
+    expect(await screen.findByRole("region", { name: "Approval mode" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "MCP" }));
+    expect(await screen.findByRole("region", { name: "MCP servers" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Appearance" }));
+    expect(await screen.findByRole("region", { name: "Sounds" })).toBeTruthy();
+    setPreviewAppearanceTransport(null);
+  });
+
+  it("a failed tiers re-read after an endpoint save shows an alert, and a later save clears it", async () => {
+    const transport = makeTransport();
+    await openDialog();
+    // The dialog's own read succeeded; the re-read after the save is what fails.
+    transport.tiers.mockRejectedValueOnce(new Error("tier store locked"));
+
+    await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: "https://edited.example/v1/" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    const alert = await screen.findByText(/Could not re-read tiers after the endpoint change: tier store locked/);
+    expect(alert.getAttribute("role")).toBe("alert");
+
+    // A later re-read that works takes the warning down again.
+    await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: "https://edited-again.example/v1/" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByText(/Could not re-read tiers/)).toBeNull());
   });
 
   it("tests the connection with the unsaved draft and shows the result", async () => {
@@ -484,41 +605,6 @@ describe("unsaved edits", () => {
       save: vi.fn(async () => undefined),
       install: vi.fn(async () => undefined),
       onEmbedderEvent: vi.fn(async () => () => {}),
-    };
-  }
-
-  function safetySnapshot() {
-    return { mode: "approve-each-action", rules: [], project_open: true, live_lead: false };
-  }
-
-  function makeSafetyTransport() {
-    mocks.safetyTransport = {
-      get: vi.fn(async () => safetySnapshot()),
-      saveMode: vi.fn(async () => safetySnapshot()),
-      saveRules: vi.fn(async () => safetySnapshot()),
-    };
-  }
-
-  function mcpServer() {
-    return {
-      name: "fs",
-      enabled: true,
-      command: "npx",
-      args: ["-y", "server-fs"],
-      env: [],
-      headers_env: {},
-      scopes: [],
-      trusted: false,
-      source: "global",
-    };
-  }
-
-  function makeMcpTransport() {
-    const snapshot = { servers: [mcpServer()], project_open: true, live_lead: false, statuses: [] };
-    mocks.mcpTransport = {
-      get: vi.fn(async () => snapshot),
-      save: vi.fn(async () => snapshot),
-      test: vi.fn(async () => ({ ok: true, tools: [], error: null })),
     };
   }
 

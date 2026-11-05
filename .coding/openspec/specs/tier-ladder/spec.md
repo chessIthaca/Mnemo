@@ -15,7 +15,7 @@ The system SHALL keep exactly five tiers in fixed order: trivial, routine, mediu
 #### Scenario: Lead picks escalate for fresh work
 - **WHEN** the lead calls team_dispatch with tier escalate
 - **THEN** the dispatch is refused as escalation only, never a first pick
-- **THEN** no worker is provisioned
+- **AND** no worker is provisioned
 
 #### Scenario: Escalating an existing worker
 - **WHEN** the lead calls team_resume on an idle worker with tier escalate
@@ -32,7 +32,6 @@ The system SHALL resolve a tier without models to the nearest lower tier that ha
 - **WHEN** an endpoint rename or removal would leave trivial without a model
 - **THEN** the change is refused
 
-
 ### Requirement: Retired tier ids
 The system SHALL refuse the retired ids simple, average and difficult in tool calls and SHALL convert them (to trivial, routine and high) only in stored data, writing a converted file back once.
 
@@ -40,14 +39,12 @@ The system SHALL refuse the retired ids simple, average and difficult in tool ca
 - **WHEN** the lead dispatches with tier `average`
 - **THEN** the dispatch is refused as an unknown tier, listing the current tier ids
 
-
 ### Requirement: Serialized configuration writes
 The system SHALL hold an exclusive OS file lock on `<config>/config.write.lock` for every write of config.toml, endpoints.toml, keys.toml and mcp.toml, for the legacy migration and for crash recovery, retrying every 50 ms for up to 5 seconds. A cached Config save SHALL never write the ladder.
 
 #### Scenario: Two writers at once
 - **WHEN** two processes save endpoints.toml at the same time
 - **THEN** one waits for the other's lock and both edits are kept
-
 
 ### Requirement: One Tiers page
 The system SHALL configure the ladder, the Laya routing choice (shown on top) and the Laya settings (at the bottom) on one Settings > Tiers page in Mnemo2.

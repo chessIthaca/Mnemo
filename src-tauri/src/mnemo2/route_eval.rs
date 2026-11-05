@@ -8,8 +8,9 @@
 //! `min_confidence_2`, and the `route_eval.json` record the Laya page reads
 //! back.
 //!
-//! Two surfaces share it: the `mnemo2_route_eval` CLI
-//! (`src-tauri/src/bin/mnemo2_route_eval.rs`, `--laya-url` required) and the
+//! Two surfaces share it: the `mnemo2-app` package's
+//! `mnemo2_route_eval` example (`src-tauri/mnemo2-app/examples/mnemo2_route_eval.rs`,
+//! `--laya-url` required) and the
 //! Laya page's Run-eval button (the `run_routing_eval` command in
 //! [`super::laya_settings`], which asks the lead engine's attached
 //! classifier). Everything except [`classify_corpus`] is pure — corpus

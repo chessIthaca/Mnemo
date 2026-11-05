@@ -560,6 +560,7 @@ pub fn run() {
             laya_settings::tiers_top_control_status,
             laya_settings::save_tiers_top_control,
             specs_settings::specs_status,
+            specs_settings::read_capability_spec,
             specs_settings::list_schemas,
             specs_settings::set_active_schema,
             specs_settings::add_schema,

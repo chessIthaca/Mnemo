@@ -29,6 +29,8 @@ const mocks = vi.hoisted(() => ({
   detailKeys: [] as string[],
   /** Body-logging switches the page set. */
   bodies: [] as boolean[],
+  /** When set, list() filters rows by query.agent the way the backend does. */
+  agentFilters: false,
   cleared: 0,
   deletes: 0,
 }));
@@ -135,6 +137,23 @@ function detailKey(row: TraceRow): string {
   return `${row.run_id}:${row.id}`;
 }
 
+/**
+ * The backend's agent_matches contract (trace_view.rs): "lead" selects the
+ * lead's rows by actor kind, "unattributed" the legacy rows without
+ * attribution, any other value that worker/agent/session id — and a null
+ * attribution never matches "lead".
+ */
+function rowsMatchingAgent(rows: TraceRow[], agent: string | undefined): TraceRow[] {
+  if (agent === undefined || !mocks.agentFilters) return rows;
+  return rows.filter((row) => {
+    const attribution = row.attribution;
+    if (attribution === null) return agent === "unattributed";
+    if (agent === "lead") return attribution.actor_kind === "lead";
+    if (agent === "unattributed") return false;
+    return attribution.worker_id === agent || attribution.agent_id === agent || attribution.session_id === agent;
+  });
+}
+
 /** Plant the mock IPC surface the page talks to. */
 function installTransport(): void {
   mocks.transport = {
@@ -144,9 +163,10 @@ function installTransport(): void {
         mocks.failList -= 1;
         throw new Error("engine offline");
       }
+      const rows = rowsMatchingAgent(mocks.rows, query.agent);
       return {
-        rows: mocks.rows,
-        total: mocks.rows.length,
+        rows,
+        total: rows.length,
         unpriced: 0,
         has_more: false,
         next_cursor: null,
@@ -204,6 +224,7 @@ describe("TraceView", () => {
     mocks.detailKeys = [];
     mocks.revealed = [];
     mocks.bodies = [];
+    mocks.agentFilters = false;
     mocks.cleared = 0;
     mocks.deletes = 0;
     app.set({ ...fixtureState(), route: "trace", traceEntry: null });
@@ -256,7 +277,9 @@ describe("TraceView", () => {
       expect(mocks.queries.some((query) => query.agent === "design-trace")).toBe(true);
     });
     expect(screen.getByRole("button", { name: "Remove filter Agent: design-trace" })).toBeTruthy();
-  });  it("shows removable chips and a no-match state when a filter empties the list", async () => {
+  });
+
+  it("shows removable chips and a no-match state when a filter empties the list", async () => {
     installTransport();
     render(TraceView);
     await vi.waitFor(() => expect(screen.getByText(/0 calls ·/)).toBeTruthy());
@@ -271,9 +294,61 @@ describe("TraceView", () => {
     expect(screen.getByRole("button", { name: "Remove filter Agent: unattributed" })).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     await vi.waitFor(() => {
-      expect(mocks.queries[mocks.queries.length - 1].agent).toBeUndefined();
+      // The reset restores the Lead default, not the unscoped "all".
+      expect(mocks.queries[mocks.queries.length - 1].agent).toBe("lead");
     });
     expect(screen.queryByText("No calls match these filters.")).toBeNull();
+  });
+
+  it("opens on the Lead with the charts at the top scoped to the lead's calls", async () => {
+    installTransport();
+    // The mock filters by query.agent exactly as the backend's agent_matches
+    // does, so the walk exercises the real scoping contract end to end.
+    mocks.agentFilters = true;
+    const leadCall = callRow({
+      id: 1,
+      model: "lead-model",
+      attribution: attribution({ actor_kind: "lead", agent_id: "lead", worker_id: null, plan_id: null, plan_step: null, turn_id: null }),
+    });
+    const workerCall = callRow({ id: 2, ts_ms: Date.now() - 60_000, attribution: attribution({ turn_id: "t-9" }) });
+    const legacy = callRow({ id: 3, ts_ms: Date.now() - 90_000, model: "legacy-model", attribution: null });
+    mocks.rows = [leadCall, workerCall, legacy];
+    render(TraceView);
+
+    // The tab opens with Lead selected and asks the backend for the lead's calls.
+    const agentSelect = screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement;
+    await vi.waitFor(() => expect(agentSelect.value).toBe("lead"));
+    await vi.waitFor(() => expect(mocks.queries.some((query) => query.agent === "lead")).toBe(true));
+
+    // The Insights charts sit open at the top, over only the lead's calls —
+    // the worker's and the unattributed legacy row never match "lead".
+    expect(screen.getByRole("region", { name: "Insights" })).toBeTruthy();
+    await vi.waitFor(() => expect(screen.getByText(/Charts for 1 filtered call · lead · this session/)).toBeTruthy());
+    expect(screen.getByRole("button", { name: /lead-model/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /kimi-k3\.1-pro/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /legacy-model/ })).toBeNull();
+
+    // A worker is selectable from the same dropdown and scopes list and charts.
+    await fireEvent.change(agentSelect, { target: { value: "design-trace" } });
+    // Wait on the worker's row: the scope label flips before the reload lands.
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /kimi-k3\.1-pro/ })).toBeTruthy());
+    expect(screen.getByText(/Charts for 1 filtered call · design-trace · this session/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /lead-model/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Remove filter Agent: design-trace" })).toBeTruthy();
+
+    // Removing the agent chip returns to the Lead default.
+    await fireEvent.click(screen.getByRole("button", { name: "Remove filter Agent: design-trace" }));
+    await vi.waitFor(() => expect(agentSelect.value).toBe("lead"));
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /lead-model/ })).toBeTruthy());
+    expect(screen.getByText(/Charts for 1 filtered call · lead · this session/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove filter Agent: design-trace" })).toBeNull();
+
+    // All remains available and shows every actor.
+    await fireEvent.change(agentSelect, { target: { value: "all" } });
+    await vi.waitFor(() => expect(screen.getByText(/Charts for 3 filtered calls · this session/)).toBeTruthy());
+    expect(screen.getByRole("button", { name: /lead-model/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /kimi-k3\.1-pro/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /legacy-model/ })).toBeTruthy();
   });
 
   it("debounces the search box and carries its scope", async () => {
@@ -495,17 +570,27 @@ describe("TraceView", () => {
     await vi.waitFor(() => expect(mocks.queries.some((query) => query.cursor === "cursor-2")).toBe(true));
   });
 
-  it("mounts the Insights charts over the loaded rows with the filter scope", async () => {
+  it("mounts the Insights charts open over the loaded rows with the filter scope", async () => {
     installTransport();
     mocks.rows = [callRow({ id: 1 })];
     render(TraceView);
     await vi.waitFor(() => expect(screen.getByRole("button", { name: /kimi-k3.1-pro/ })).toBeTruthy());
 
-    await fireEvent.click(screen.getByRole("button", { name: "Insights" }));
+    // The charts open with the tab, scoped to the Lead's calls.
     await vi.waitFor(() => expect(screen.getByRole("region", { name: "Insights" })).toBeTruthy());
-    expect(screen.getByText(/Charts for 1 filtered call · this session/)).toBeTruthy();
+    expect(screen.getByText(/Charts for 1 filtered call · lead · this session/)).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Hide charts" }));
     await vi.waitFor(() => expect(screen.queryByRole("region", { name: "Insights" })).toBeNull());
+  });
+
+  it("keeps the Insights charts closed when the saved preference says so", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    window.localStorage.setItem("mnemo2.trace.mnemo", JSON.stringify({ insightsOpen: false }));
+    render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /kimi-k3.1-pro/ })).toBeTruthy());
+    expect(screen.queryByRole("region", { name: "Insights" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Insights" })).toBeTruthy();
   });
 
   it("exports the open call, shows the bundle path and reveals it on demand", async () => {

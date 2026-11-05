@@ -217,7 +217,9 @@ fn job_block(text: &str, job: &str) -> String {
         + header.len();
     text[start..]
         .lines()
-        .take_while(|line| !(line.starts_with("  ") && !line.starts_with("   ")))
+        // Stop at the next 2-space job key: two leading spaces, but not the
+        // three or more of a body line.
+        .take_while(|line| !line.starts_with("  ") || line.starts_with("   "))
         .collect::<Vec<_>>()
         .join("\n")
 }

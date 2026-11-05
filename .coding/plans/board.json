@@ -1233,6 +1233,43 @@
       ],
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "9adee90a",
+      "status": "closed",
+      "created_at_ms": 1793918863295,
+      "closed_at_ms": 1793919749948,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-9adee90a-20261105-230229.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Model prices have one editor",
+              "text": "Mnemo2's settings dialog SHALL edit model prices only with each model on the Endpoints page, and the Savings page SHALL NOT offer a pricing table.",
+              "scenarios": [
+                {
+                  "name": "Savings page points to Endpoints",
+                  "when": [
+                    "the user opens the Savings page"
+                  ],
+                  "then": [
+                    "no pricing table is shown",
+                    "a line says prices are set with each model on the Endpoints page"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

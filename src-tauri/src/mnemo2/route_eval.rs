@@ -32,7 +32,7 @@ use mnemo::memory::classifier::{Answer, Classifier};
 use super::dispatch_routing::{DispatchRoutingRow, RoutingSettings};
 
 /// The hand-set corpus shipped with the repo (`tests/fixtures/route_eval.jsonl`),
-/// embedded so the app's Run-eval button needs no fixture path at runtime.
+/// embedded so the automatic Laya check needs no fixture path at runtime.
 pub const HAND_SET_JSONL: &str = include_str!("../../tests/fixtures/route_eval.jsonl");
 
 /// The four labels, easiest first — the eval's expected labels (`involved`
@@ -694,7 +694,7 @@ pub async fn run_check(
         let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
         on_progress(finished, total);
     };
-    // The offered sets `laya_settings::routing_eval_reports` has always used:
+    // The offered sets the eval has always used:
     // the four-label question dispatch actually asks, the interim three-label
     // shape, and the extremes with both middles folded into `hard`.
     let four_offered = OfferedLabels { trivial: true, routine: true, involved: true, hard: true };

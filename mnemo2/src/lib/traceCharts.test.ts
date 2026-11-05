@@ -53,11 +53,14 @@ function row(overrides: Partial<TraceRow> = {}): TraceRow {
     generation_ms: 4000,
     reasoning_ms: 600,
     connect_ms: 500,
+    upload_ms: null,
+    server_ms: null,
     tools_ms: 800,
     prep_ms: 1000,
     compact_ms: 300,
     backoff_ms: 200,
     stall_ms: 400,
+    chunks: null,
     error: null,
     cancelled: false,
     response_truncated: false,
@@ -78,19 +81,37 @@ describe("timingChart", () => {
     // Setup is prep_ms and CONTAINS compaction; compaction is a hatch, not a slice.
     expect(column.setupMs).toBe(1000);
     expect(column.compactionMs).toBe(300);
-    // First token follows the headers: ttft_ms − connect_ms.
-    expect(column.connectMs).toBe(500);
+    // A legacy row (no upload/server stamps): the whole pre-headers window
+    // reads as Server wait, and First token follows the headers.
+    expect(column.uploadMs).toBe(0);
+    expect(column.serverMs).toBe(500);
     expect(column.firstTokenMs).toBe(400);
     // Generation is generation_ms and CONTAINS stalls.
     expect(column.generationMs).toBe(4000);
     expect(column.stallMs).toBe(400);
 
-    // The stack is the six disjoint phases only.
-    expect(column.stackMs).toBe(200 + 1000 + 500 + 400 + 4000 + 800);
+    // The stack is the seven disjoint phases only.
+    expect(column.stackMs).toBe(200 + 1000 + 0 + 500 + 400 + 4000 + 800);
     const values = timingValues(column);
-    expect(Object.keys(values)).toHaveLength(6);
+    expect(Object.keys(values)).toHaveLength(7);
     expect(Object.values(values).reduce((sum, value) => sum + value, 0)).toBe(column.stackMs);
     expect(column.stackMs).not.toBe(column.stackMs + column.compactionMs + column.stallMs);
+  });
+
+  it("splits the connect window into upload and server wait on new rows", () => {
+    const [column] = timingChart([
+      row({ upload_ms: 45, server_ms: 6_716, connect_ms: 6_761, ttft_ms: 6_762 }),
+    ]).columns;
+
+    expect(column.uploadMs).toBe(45);
+    expect(column.serverMs).toBe(6_716);
+    // First token is what remains of ttft_ms after upload + server wait.
+    expect(column.firstTokenMs).toBe(1);
+    // connect_ms is ignored once the split exists — no double count — and the
+    // stack total is unchanged from the legacy decomposition of the same
+    // window: upload + server + first token still sums to ttft.
+    expect(column.uploadMs + column.serverMs + column.firstTokenMs).toBe(6_762);
+    expect(column.stackMs).toBe(200 + 1000 + 45 + 6_716 + 1 + 4000 + 800);
   });
 
   it("saturates first-token and containment maths on inconsistent reports", () => {
@@ -101,7 +122,7 @@ describe("timingChart", () => {
     expect(column.firstTokenMs).toBe(0);
     expect(column.compactionMs).toBe(1000);
     expect(column.stallMs).toBe(500);
-    expect(column.stackMs).toBe(200 + 1000 + 500 + 0 + 500 + 800);
+    expect(column.stackMs).toBe(200 + 1000 + 0 + 500 + 0 + 500 + 800);
   });
 
   it("reads missing timings as zero and reports hasData honestly", () => {
@@ -110,6 +131,8 @@ describe("timingChart", () => {
         ttft_ms: null,
         generation_ms: null,
         connect_ms: null,
+        upload_ms: null,
+        server_ms: null,
         tools_ms: null,
         prep_ms: null,
         compact_ms: null,

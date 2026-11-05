@@ -15,7 +15,7 @@
 //! the OpenAI-compatible path. The SSE stream is parsed from raw bytes (via
 //! reqwest) into [`LlmEvent`]s, mirroring `openai.rs`.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -32,6 +32,7 @@ use crate::provider::stream::{
     REPETITION_WINDOW,
 };
 use crate::provider::trace::{LlmRequestLog, LlmUsage};
+use crate::provider::upload_stamp::{stamping_body, UploadStamps};
 use crate::provider::{
     Capabilities, ContentPart, FinishReason, LlmClient, LlmEvent, Message, MessageContent,
     ProviderKind, Role, StallTracker, ToolChoice, ToolSchema,
@@ -1391,6 +1392,25 @@ impl LlmClient for AnthropicClient {
         // the first token is ready, so headers arrive with the first chunk
         // and a headers-arrived anchor measures ~0.
         let post_sent = std::time::Instant::now();
+        // The request body ships through the stamping wrapper (plan
+        // 7bc0b473): pre-serialized once here, handed to reqwest in pieces
+        // whose final piece stamps the upload-done instant (`upload_ms`)
+        // live onto the trace record, so the Trace tab can distinguish
+        // "uploading" from "waiting for first token" in flight.
+        // Content-Length is set explicitly — a wrapped stream carries no
+        // known length for reqwest, and without the header the request
+        // would switch to chunked transfer-encoding (a wire-format change
+        // for the gateway).
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| Error::Provider(format!("request body serialization failed: {e}")))?;
+        // Per-request upload/server phase accounting, shared with the
+        // stream task below (which re-stamps the closed windows at every
+        // connect stamp site).
+        let stamps = Arc::new(Mutex::new(UploadStamps::default()));
+        let body_trace = match (&trace, rec_id) {
+            (Some(log), Some(id)) => Some((log.clone(), id)),
+            _ => None,
+        };
         let response = match self
             .http_client
             .post(&url)
@@ -1401,16 +1421,47 @@ impl LlmClient for AnthropicClient {
             // Omitted entirely when unset — never sent empty.
             .headers(self.workspace_headers())
             .header("Content-Type", "application/json")
-            .json(&body)
+            .header("Content-Length", body_bytes.len())
+            .body(stamping_body(
+                body_bytes,
+                post_sent,
+                stamps.clone(),
+                body_trace,
+            ))
             .send()
             .await
         {
-            Ok(response) => response,
+            Ok(response) => {
+                // Response headers just arrived: close the server-wait
+                // window (upload done → headers) and stamp it live.
+                if let (Some(log), Some(id)) = (&trace, rec_id) {
+                    let now = std::time::Instant::now();
+                    if let Some(server_ms) = stamps
+                        .lock()
+                        .expect("AnthropicClient upload stamps lock poisoned")
+                        .note_headers(now)
+                    {
+                        log.set_server_ms(id, server_ms);
+                    }
+                }
+                response
+            }
             Err(e) => {
                 if let (Some(log), Some(id)) = (&trace, rec_id) {
                     // Stamp the connect bucket: the request died before any
                     // response headers arrived — the same window success
-                    // attributes to connect_ms, so failures must too.
+                    // attributes to connect_ms, so failures must too. When
+                    // the body had already been fully written, the
+                    // server-wait window closes at the failure moment (the
+                    // wait that died).
+                    let now = std::time::Instant::now();
+                    let mut s = stamps
+                        .lock()
+                        .expect("AnthropicClient upload stamps lock poisoned");
+                    if let Some(server_ms) = s.note_headers(now) {
+                        log.set_server_ms(id, server_ms);
+                    }
+                    s.stamp(log, id);
                     log.set_connect_ms(id, record_created.elapsed().as_millis() as u32);
                     // Status 0 = no HTTP response at all (transport failure).
                     log.fail(id, 0, &format!("failed to start stream: {e}"));
@@ -1436,6 +1487,15 @@ impl LlmClient for AnthropicClient {
                 // (connect + the server's reject processing), matching the
                 // success path's connect attribution.
                 log.set_connect_ms(id, record_created.elapsed().as_millis() as u32);
+                // Re-stamp the finer upload/server windows at this connect
+                // stamp site (plan 7bc0b473): both were stamped live
+                // (upload at body completion, server at headers arrival) —
+                // this keeps the invariant that wherever connect_ms is
+                // stamped, the finer phases are too.
+                stamps
+                    .lock()
+                    .expect("AnthropicClient upload stamps lock poisoned")
+                    .stamp(log, id);
                 log.fail(id, status.as_u16(), &trace_msg);
             }
             return Err(provider_error(status, &body_text, &url, "stream request"));
@@ -1473,6 +1533,11 @@ impl LlmClient for AnthropicClient {
             let mut state = StreamState::default();
             // First-chunk timestamp (set when the first bytes arrive).
             let mut first_chunk: Option<std::time::Instant> = None;
+            // SSE byte-chunk counter (plan 7bc0b473): one increment per
+            // transport-level read in the Ok(bytes) arm, stamped live
+            // onto the record so an in-flight row shows streaming
+            // progress.
+            let mut chunk_count: u32 = 0;
             // Reasoning-window tracking for `reasoning_ms`: whether any
             // thinking/ReasoningDelta streamed, and the first chunk that
             // carried an answer/tool delta (the reasoning→answer boundary).
@@ -1551,6 +1616,14 @@ impl LlmClient for AnthropicClient {
                                         .as_millis() as u32,
                                 );
                                 log.set_ttft_ms(*id, post_sent.elapsed().as_millis() as u32);
+                                // Re-stamp the finer upload/server windows at
+                                // this connect stamp site (plan 7bc0b473) —
+                                // both were already stamped live; this keeps
+                                // abnormal-end rows carrying them too.
+                                stamps
+                                    .lock()
+                                    .expect("UploadStamps lock poisoned")
+                                    .stamp(log, *id);
                             } else {
                                 // The trailing silence (last chunk →
                                 // timeout) is a stall too — finalize the
@@ -1576,8 +1649,10 @@ impl LlmClient for AnthropicClient {
                         }
                         stall_tracker.on_chunk(now);
                         let chunk_text = String::from_utf8_lossy(&bytes);
+                        chunk_count += 1;
                         if let Some((log, id)) = &trace_ctx {
                             log.append_response(*id, &chunk_text);
+                            log.set_chunks(*id, chunk_count);
                             // Live usage overlay (backlog b5503915): push the
                             // chars/4 estimate at most every 500ms — during a
                             // long thinking phase this is the only thing that
@@ -1660,6 +1735,10 @@ impl LlmClient for AnthropicClient {
                                                         *id,
                                                         post_sent.elapsed().as_millis() as u32,
                                                     );
+                                                    stamps
+                                                        .lock()
+                                                        .expect("UploadStamps lock poisoned")
+                                                        .stamp(log, *id);
                                                 }
                                                 log.fail(*id, status.as_u16(), msg);
                                             }
@@ -1740,6 +1819,15 @@ impl LlmClient for AnthropicClient {
                                                 // graph shows actual
                                                 // streaming vs. waiting.
                                                 log.set_stall_ms(*id, stall_tracker.ms());
+                                                // Re-stamp the finer upload/server
+                                                // windows at this connect stamp
+                                                // site (plan 7bc0b473) — both were
+                                                // already stamped live; this keeps
+                                                // abnormal-end rows carrying them.
+                                                stamps
+                                                    .lock()
+                                                    .expect("UploadStamps lock poisoned")
+                                                    .stamp(log, *id);
                                             }
                                             LlmEvent::Usage {
                                                 prompt_tokens,
@@ -1792,6 +1880,10 @@ impl LlmClient for AnthropicClient {
                                                                 post_sent.elapsed().as_millis()
                                                                     as u32,
                                                             );
+                                                            stamps
+                                                                .lock()
+                                                                .expect("UploadStamps lock poisoned")
+                                                                .stamp(log, *id);
                                                         }
                                                         log.fail(*id, status.as_u16(), error);
                                                     }
@@ -1830,6 +1922,10 @@ impl LlmClient for AnthropicClient {
                                                     *id,
                                                     post_sent.elapsed().as_millis() as u32,
                                                 );
+                                                stamps
+                                                    .lock()
+                                                    .expect("UploadStamps lock poisoned")
+                                                    .stamp(log, *id);
                                             }
                                             log.cancelled(*id, status.as_u16());
                                         }
@@ -1856,6 +1952,10 @@ impl LlmClient for AnthropicClient {
                                                 *id,
                                                 post_sent.elapsed().as_millis() as u32,
                                             );
+                                            stamps
+                                                .lock()
+                                                .expect("UploadStamps lock poisoned")
+                                                .stamp(log, *id);
                                         }
                                         log.fail(*id, status.as_u16(), &error);
                                     }
@@ -1894,6 +1994,10 @@ impl LlmClient for AnthropicClient {
                                         .as_millis() as u32,
                                 );
                                 log.set_ttft_ms(*id, post_sent.elapsed().as_millis() as u32);
+                                stamps
+                                    .lock()
+                                    .expect("UploadStamps lock poisoned")
+                                    .stamp(log, *id);
                             }
                             log.fail(*id, status.as_u16(), &error);
                         }
@@ -3617,5 +3721,63 @@ mod tests {
             connect >= 200,
             "connect keeps its record→headers window (got {connect}ms)"
         );
+    }
+
+    #[tokio::test]
+    async fn anthropic_delayed_headers_split_connect_into_upload_and_server_ms() {
+        // Plan 7bc0b473 (anthropic path): the coarse Connect bucket is
+        // split into upload (POST sent → body fully written) and server
+        // wait (upload done → headers). With a server that reads the
+        // request immediately but holds headers+first event ~300ms, the
+        // delay must land in server_ms while upload_ms stays small.
+        use futures::StreamExt;
+
+        let log = Arc::new(LlmRequestLog::new());
+        let server = DelayedAnthropicSseServer::start().await;
+        let client = AnthropicClient::new_with_trace(
+            AnthropicClientConfig {
+                base_url: format!("http://{}/v1", server.addr),
+                api_key: "sk-test".into(),
+                model: "claude-sonnet-4-5".into(),
+                provider: "anthropic".into(),
+                max_context: None,
+                max_output_tokens: None,
+                multimodal: false,
+                workspace_id: None,
+                reasoning_effort: None,
+            },
+            Some(log.clone()),
+        );
+
+        let mut stream = client
+            .complete(&[Message::user_text("hi")], &[], None)
+            .await
+            .expect("complete must succeed");
+        while let Some(ev) = stream.next().await {
+            if let LlmEvent::Error { error } = ev {
+                panic!("unexpected error: {error}");
+            }
+        }
+
+        let summaries = log.list();
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        let upload = s.upload_ms.expect("upload_ms set (body fully written)");
+        assert!(
+            upload < 200,
+            "the tiny body must upload quickly — the 300ms delay belongs to the server wait (got upload={upload}ms)"
+        );
+        let server_ms = s.server_ms.expect("server_ms set (headers arrived)");
+        assert!(
+            server_ms >= 200,
+            "the delayed headers must land in server_ms (got {server_ms}ms)"
+        );
+        let connect = s.connect_ms.expect("connect_ms set");
+        assert!(
+            connect >= 200,
+            "connect keeps its record→headers window (got {connect}ms)"
+        );
+        let chunks = s.chunks.expect("chunks counted");
+        assert!(chunks >= 1, "at least one SSE byte-chunk was read");
     }
 }

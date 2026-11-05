@@ -24,6 +24,7 @@ pub mod sse_util;
 pub mod strict;
 pub mod stream;
 pub mod trace;
+pub mod upload_stamp;
 pub mod vision;
 
 pub use stream::{DeltaAccumulator, ToolCallAccumulator};

@@ -4742,3 +4742,308 @@ async fn reasoning_effort_fallback_keeps_attribution() {
     assert_eq!(a.purpose, crate::provider::trace::TracePurpose::Turn);
     assert_eq!(rows[0].http_status, Some(200), "the retried outcome stands");
 }
+
+/// A server that reads the request head, then waits ~300ms WITHOUT
+/// reading the body, then drains it and responds immediately — so the
+/// client's body write blocks on the socket buffer and the wait lands in
+/// `upload_ms` (plan 7bc0b473), not in the server bucket.
+struct SlowBodyDrainServer {
+    addr: std::net::SocketAddr,
+}
+
+impl SlowBodyDrainServer {
+    async fn start() -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow drain server");
+        let addr = listener.local_addr().expect("slow drain server addr");
+        tokio::spawn(async move {
+            let (mut socket, _peer) = listener.accept().await.expect("accept");
+            // Read the request head (up to the \r\n\r\n terminator).
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.expect("read head");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let head_end = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| p + 4)
+                .expect("request head terminator");
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|l| {
+                    let lower = l.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .expect("content-length header present");
+            // The stall: don't read the body for 300ms — the client's
+            // socket send buffer fills and the final body piece cannot be
+            // handed to the transport until we drain.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Drain the full body (the head read may have pulled body
+            // bytes in too).
+            let mut received = buf.len() - head_end;
+            while received < content_length {
+                let n = socket.read(&mut chunk).await.expect("drain body");
+                if n == 0 {
+                    break;
+                }
+                received += n;
+            }
+            // Respond immediately: headers arrive right after the drain,
+            // so the server-wait window stays small.
+            let head =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.expect("write head");
+            socket
+                .write_all(
+                    b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+                )
+                .await
+                .expect("write chunk");
+            socket
+                .write_all(
+                    b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"model\":\"test\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n",
+                )
+                .await
+                .expect("write usage chunk");
+            socket
+                .write_all(b"data: [DONE]\n\n")
+                .await
+                .expect("write done");
+        });
+        Self { addr }
+    }
+}
+
+/// A server for the reasoning_effort fallback retry (plan 7bc0b473):
+/// serves a 400 `reasoning_effort` rejection then a 200 SSE stream,
+/// holding EACH response ~150ms after fully reading the request — so
+/// both attempts' server-wait windows accumulate in `server_ms` (a
+/// last-attempt-only stamp would show only ~150ms).
+struct DelayedRetryServer {
+    addr: std::net::SocketAddr,
+}
+
+impl DelayedRetryServer {
+    async fn start() -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed retry server");
+        let addr = listener.local_addr().expect("delayed retry server addr");
+        tokio::spawn(async move {
+            for (status, reason, content_type, body) in [
+                (400u16, "Bad Request", "application/json", EFFORT_REJECTION),
+                (200u16, "OK", "text/event-stream", SSE_OK),
+            ] {
+                let (mut socket, _peer) = listener.accept().await.expect("accept");
+                // Read the full request (head + content-length body).
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).await.expect("read head");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let head_end = buf
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .expect("request head terminator");
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < head_end + content_length {
+                    let n = socket.read(&mut chunk).await.expect("read body");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                // The server wait for THIS attempt: the response is held
+                // ~150ms after the request was fully read.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let head = format!(
+                    "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    status,
+                    reason,
+                    content_type,
+                    body.len(),
+                );
+                socket.write_all(head.as_bytes()).await.expect("write head");
+                socket.write_all(body.as_bytes()).await.expect("write body");
+                socket.shutdown().await.expect("shutdown");
+            }
+        });
+        Self { addr }
+    }
+}
+
+#[tokio::test]
+async fn delayed_headers_split_connect_into_upload_and_server_ms() {
+    // Plan 7bc0b473: the coarse Connect bucket is split into upload
+    // (POST sent → body fully written) and server wait (upload done →
+    // headers). With a server that reads the request immediately but
+    // holds headers+first chunk ~300ms, the delay must land in server_ms
+    // while upload_ms stays small — the old single connect bucket
+    // silently absorbed the server's prefill/queue wait.
+    use futures::StreamExt;
+
+    let log = Arc::new(LlmRequestLog::new());
+    let server = DelayedFirstChunkSseServer::start().await;
+    let client = OpenAiClient::new_with_trace(
+        OpenAiClientConfig {
+            base_url: format!("http://{}/v1", server.addr),
+            ..OpenAiClientConfig::test_default()
+        },
+        Some(log.clone()),
+    );
+
+    let mut stream = client
+        .complete(&[Message::user_text("hi")], &[], None)
+        .await
+        .expect("complete must succeed");
+    while let Some(ev) = stream.next().await {
+        if let LlmEvent::Error { error } = ev {
+            panic!("unexpected error: {error}");
+        }
+    }
+
+    let summaries = log.list();
+    assert_eq!(summaries.len(), 1);
+    let s = &summaries[0];
+    let upload = s.upload_ms.expect("upload_ms set (body fully written)");
+    assert!(
+        upload < 200,
+        "the tiny body must upload quickly — the 300ms delay belongs to the server wait (got upload={upload}ms)"
+    );
+    let server_ms = s.server_ms.expect("server_ms set (headers arrived)");
+    assert!(
+        server_ms >= 200,
+        "the delayed headers must land in server_ms (got {server_ms}ms)"
+    );
+    let connect = s.connect_ms.expect("connect_ms set");
+    assert!(
+        connect >= 200,
+        "connect keeps its record→headers window (got {connect}ms)"
+    );
+    let chunks = s.chunks.expect("chunks counted");
+    assert!(chunks >= 1, "at least one SSE byte-chunk was read");
+}
+
+#[tokio::test]
+async fn slow_body_write_lands_in_upload_ms() {
+    // Plan 7bc0b473: a server that drains the request body slowly must
+    // delay the upload-done stamp — the wait lands in upload_ms, and the
+    // server-wait window (upload done → headers) stays small because the
+    // response follows the drain immediately. The body must exceed the
+    // kernel socket buffers so the final piece genuinely blocks.
+    use futures::StreamExt;
+
+    let log = Arc::new(LlmRequestLog::new());
+    let server = SlowBodyDrainServer::start().await;
+    let client = OpenAiClient::new_with_trace(
+        OpenAiClientConfig {
+            base_url: format!("http://{}/v1", server.addr),
+            ..OpenAiClientConfig::test_default()
+        },
+        Some(log.clone()),
+    );
+
+    // ~8 MB of user text: far beyond the kernel socket send buffer plus
+    // the peer's receive window, so the transport cannot accept the final
+    // body piece until the server drains.
+    let big = "x".repeat(8 * 1024 * 1024);
+    let mut stream = client
+        .complete(&[Message::user_text(&big)], &[], None)
+        .await
+        .expect("complete must succeed");
+    while let Some(ev) = stream.next().await {
+        if let LlmEvent::Error { error } = ev {
+            panic!("unexpected error: {error}");
+        }
+    }
+
+    let summaries = log.list();
+    assert_eq!(summaries.len(), 1);
+    let s = &summaries[0];
+    let upload = s.upload_ms.expect("upload_ms set");
+    assert!(
+        upload >= 250,
+        "the slow body drain must land in upload_ms (got {upload}ms)"
+    );
+    let server_ms = s.server_ms.expect("server_ms set");
+    assert!(
+        server_ms < 150,
+        "headers follow the drain immediately — the server wait must stay small (got {server_ms}ms)"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_effort_retry_accumulates_both_attempts_server_ms() {
+    // Plan 7bc0b473: the reasoning_effort fallback retry sends TWO
+    // requests. Both attempts' server-wait windows must be attributed —
+    // server_ms accumulates both ~150ms holds (~300ms total); a
+    // last-attempt-only stamp would show only ~150ms. upload_ms must be
+    // set (both bodies were fully written) and stay small.
+    use futures::StreamExt;
+
+    let log = Arc::new(LlmRequestLog::new());
+    let server = DelayedRetryServer::start().await;
+    let client = OpenAiClient::new_with_trace(
+        OpenAiClientConfig {
+            base_url: format!("http://{}/v1", server.addr),
+            reasoning_effort: Some("max".to_string()),
+            ..OpenAiClientConfig::test_default()
+        },
+        Some(log.clone()),
+    );
+
+    let mut stream = client
+        .complete(&[Message::user_text("hi")], &[], None)
+        .await
+        .expect("complete must succeed via the fallback retry");
+    while let Some(ev) = stream.next().await {
+        if let LlmEvent::Error { error } = ev {
+            panic!("unexpected error: {error}");
+        }
+    }
+
+    let summaries = log.list();
+    assert_eq!(summaries.len(), 1);
+    let s = &summaries[0];
+    let server_ms = s.server_ms.expect("server_ms set (both attempts)");
+    assert!(
+        server_ms >= 250,
+        "both attempts' server waits must accumulate into server_ms (got {server_ms}ms; a last-attempt-only stamp would show ~150ms)"
+    );
+    let upload = s.upload_ms.expect("upload_ms set (both bodies written)");
+    assert!(
+        upload < 200,
+        "both tiny bodies upload quickly (got upload={upload}ms)"
+    );
+    let connect = s.connect_ms.expect("connect_ms set");
+    assert!(
+        connect >= 250,
+        "connect covers both attempts (got {connect}ms)"
+    );
+}

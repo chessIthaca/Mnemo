@@ -24,6 +24,7 @@ use crate::provider::stream::{
     REPETITION_WINDOW,
 };
 use crate::provider::trace::{LlmRequestLog, LlmUsage};
+use crate::provider::upload_stamp::UploadStamps;
 use crate::provider::{LlmEvent, StallTracker};
 
 use super::OpenAiClient;
@@ -53,6 +54,11 @@ pub(super) struct StreamTask {
     /// arrive with the first chunk for SSE providers, so ttft is measured
     /// from the send, not the headers).
     pub(super) post_sent: std::time::Instant,
+    /// The per-request upload/server phase accumulator shared with the
+    /// stamping body wrapper (plan 7bc0b473) — re-stamps
+    /// `upload_ms`/`server_ms` at every connect stamp site so a row that
+    /// ends abnormally still carries the windows that completed.
+    pub(super) stamps: Arc<std::sync::Mutex<UploadStamps>>,
     /// Whether inline think-tag extraction is enabled (Local providers).
     pub(super) think_tags_enabled: bool,
     /// Whether to parse the Responses API event format.
@@ -81,6 +87,7 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
         request_start,
         record_created,
         post_sent,
+        stamps,
         think_tags_enabled,
         use_responses_api,
         stop_boundaries: stream_stop_boundaries,
@@ -92,6 +99,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
     // TTFT (post_sent→first_chunk — perf review L1) and generation time
     // (first_chunk→usage event, i.e. the final chunk).
     let mut first_chunk: Option<std::time::Instant> = None;
+    // SSE byte-chunk counter (plan 7bc0b473): one increment per
+    // transport-level read in the Ok(bytes) arm, stamped live onto the
+    // record so an in-flight row shows streaming progress.
+    let mut chunk_count: u32 = 0;
     // Reasoning-window tracking for `reasoning_ms`: whether any
     // ReasoningDelta streamed, and the first chunk that carried an
     // answer/tool delta (the reasoning→answer boundary).
@@ -170,6 +181,14 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                 .as_millis() as u32,
                         );
                         log.set_ttft_ms(*id, post_sent.elapsed().as_millis() as u32);
+                        // Re-stamp the finer upload/server windows at
+                        // this connect stamp site (plan 7bc0b473) — both
+                        // were already stamped live; this keeps
+                        // abnormal-end rows carrying them too.
+                        stamps
+                            .lock()
+                            .expect("UploadStamps lock poisoned")
+                            .stamp(log, *id);
                     } else {
                         // The trailing silence (last chunk →
                         // timeout) is a stall too — finalize the
@@ -195,8 +214,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                 }
                 stall_tracker.on_chunk(now);
                 let chunk_text = String::from_utf8_lossy(&bytes);
+                chunk_count += 1;
                 if let Some((log, id)) = &trace_ctx {
                     log.append_response(*id, &chunk_text);
+                    log.set_chunks(*id, chunk_count);
                     // Live usage overlay (backlog b5503915): push the
                     // chars/4 estimate at most every 500ms — during a
                     // long reasoning phase this is the only thing that
@@ -348,6 +369,15 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                             // graph shows actual
                                             // streaming vs. waiting.
                                             log.set_stall_ms(*id, stall_tracker.ms());
+                                            // Re-stamp the finer upload/server
+                                            // windows at this connect stamp
+                                            // site (plan 7bc0b473) — both were
+                                            // already stamped live; this keeps
+                                            // abnormal-end rows carrying them.
+                                            stamps
+                                                .lock()
+                                                .expect("UploadStamps lock poisoned")
+                                                .stamp(log, *id);
                                         }
                                         LlmEvent::Usage {
                                             prompt_tokens,
@@ -401,6 +431,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                                                 .as_millis()
                                                                 as u32,
                                                         );
+                                                        stamps
+                                                            .lock()
+                                                            .expect("UploadStamps lock poisoned")
+                                                            .stamp(log, *id);
                                                     }
                                                     log.fail(*id, status.as_u16(), error);
                                                 }
@@ -449,6 +483,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                                 *id,
                                                 post_sent.elapsed().as_millis() as u32,
                                             );
+                                            stamps
+                                                .lock()
+                                                .expect("UploadStamps lock poisoned")
+                                                .stamp(log, *id);
                                         }
                                         log.cancelled(*id, status.as_u16());
                                     }
@@ -490,6 +528,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                                 *id,
                                                 post_sent.elapsed().as_millis() as u32,
                                             );
+                                            stamps
+                                                .lock()
+                                                .expect("UploadStamps lock poisoned")
+                                                .stamp(log, *id);
                                         }
                                         log.fail(*id, status.as_u16(), msg);
                                     }
@@ -549,6 +591,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                             *id,
                                             post_sent.elapsed().as_millis() as u32,
                                         );
+                                        stamps
+                                            .lock()
+                                            .expect("UploadStamps lock poisoned")
+                                            .stamp(log, *id);
                                     }
                                     if let Some(details) = &guard_cut {
                                         log.set_guard_cut(*id, details.clone());
@@ -583,6 +629,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                         *id,
                                         post_sent.elapsed().as_millis() as u32,
                                     );
+                                    stamps
+                                        .lock()
+                                        .expect("UploadStamps lock poisoned")
+                                        .stamp(log, *id);
                                 }
                                 log.fail(*id, status.as_u16(), &error);
                             }
@@ -623,6 +673,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                 .as_millis() as u32,
                         );
                         log.set_ttft_ms(*id, post_sent.elapsed().as_millis() as u32);
+                        stamps
+                            .lock()
+                            .expect("UploadStamps lock poisoned")
+                            .stamp(log, *id);
                     }
                     log.fail(*id, status.as_u16(), &error);
                 }

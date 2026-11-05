@@ -2276,9 +2276,58 @@ impl TeamRuntime {
             .clone()
     }
 
-    /// Share the lead's one plan board with the team.
-    pub(crate) fn attach_board(&self, board: Arc<PlanBoard>) {
+    /// Share the lead's one plan board with the team and register the observer
+    /// that tells working workers when the lead records something new.
+    pub(crate) fn attach_board(self: &Arc<Self>, board: Arc<PlanBoard>) {
         board.set_external_lead_attached(self.external_lead_attached());
+        let team = Arc::downgrade(self);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        board.set_edit_observer(Box::new(move |plan_id, kinds| {
+            let Some(team) = team.upgrade() else {
+                return;
+            };
+            let plan_id = plan_id.to_string();
+            let text = format!(
+                "Plan {plan_id} changed: new {}. Call plan_read to re-read it before you continue.",
+                kinds.join(", ")
+            );
+            // The board calls this synchronously after releasing its own
+            // guard, so the observer only hands the work to the runtime.
+            let Some(runtime) = runtime.clone() else {
+                eprintln!(
+                    "team: no runtime is available to tell workers that plan {plan_id} changed"
+                );
+                return;
+            };
+            runtime.spawn(async move {
+                let workers = {
+                    let records = team.records.lock().await;
+                    records
+                        .iter()
+                        .filter(|worker| worker.plan_id.as_deref() == Some(plan_id.as_str()))
+                        .filter(|worker| {
+                            matches!(
+                                worker.status,
+                                WorkerStatus::Working
+                                    | WorkerStatus::Dispatching
+                                    | WorkerStatus::Fixing
+                            )
+                        })
+                        .map(|worker| worker.id.clone())
+                        .collect::<Vec<_>>()
+                };
+                for worker_id in workers {
+                    if let Err(error) = team
+                        .message(&worker_id, text.clone(), MessageSender::Lead)
+                        .await
+                    {
+                        eprintln!(
+                            "team: could not tell worker '{worker_id}' that plan {plan_id} changed: {error}"
+                        );
+                    }
+                }
+            });
+        }));
         *self.board.lock().unwrap_or_else(|e| e.into_inner()) = Some(board);
     }
 
@@ -3097,15 +3146,24 @@ impl TeamRuntime {
         ]
     }
 
-    /// The worker's host tool for reporting back to the lead.
+    /// The worker's host tools: report back to the lead, and re-read the plan.
     pub fn worker_host_tools(&self) -> Vec<HostToolSpec> {
-        vec![HostToolSpec {
-            name: "message_parent".to_string(),
-            description: "Send a short status or question to the lead.".to_string(),
-            parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
-            safety: SafetyLevel::AutoRun,
-            timeout_ms: Some(10_000),
-        }]
+        vec![
+            HostToolSpec {
+                name: "message_parent".to_string(),
+                description: "Send a short status or question to the lead.".to_string(),
+                parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "plan_read".to_string(),
+                description: "Re-read your plan as it stands now (decisions and interfaces the lead added after you started), or with capability, that capability's current OpenSpec spec.".to_string(),
+                parameters: json!({"type":"object","properties":{"capability":{"type":"string","description":"Optional kebab-case capability name, e.g. tier-ladder"}}}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+        ]
     }
 
     /// Execute a built-in lead host-tool call.
@@ -4313,6 +4371,7 @@ impl TeamRuntime {
             self.tiers.clone(),
             self.live.clone(),
             self.fail_next_close.clone(),
+            self.board(),
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {
@@ -4882,6 +4941,7 @@ impl TeamRuntime {
             self.tiers.clone(),
             self.live.clone(),
             self.fail_next_close.clone(),
+            self.board(),
         ));
         self.live.lock().await.insert(
             worker_id.to_string(),
@@ -7352,13 +7412,57 @@ async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Re
     Ok(())
 }
 
-/// Handle a worker's host-tool call (`message_parent`) and return its result.
+/// The plan coordinate a worker may read: its own plan, or for an audit the
+/// plan of the worker it audits. The step stays 0-based, like the record.
+async fn worker_plan_stamp(
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    worker_id: &str,
+) -> Option<(String, usize)> {
+    let records = records.lock().await;
+    let record = records.iter().find(|worker| worker.id == worker_id)?;
+    let source = if record.kind == "audit" {
+        let target = record.audit_target.as_deref()?;
+        records.iter().find(|worker| worker.id == target)?
+    } else {
+        record
+    };
+    Some((source.plan_id.clone()?, source.plan_step?))
+}
+
+/// Handle a worker's host-tool call (`message_parent`, `plan_read`) and return
+/// its result.
 async fn worker_host_tool_result(
     messages: &Arc<Mutex<Vec<TeamMessage>>>,
     worker_id: &str,
     name: &str,
     args: &Value,
+    board: Option<&Arc<PlanBoard>>,
+    plan_stamp: Option<&(String, usize)>,
 ) -> ToolResult {
+    if name == "plan_read" {
+        let Some(board) = board else {
+            return ToolResult::error("the plan board is not available");
+        };
+        if let Some(capability) = args.get("capability") {
+            let Some(capability) = capability.as_str() else {
+                return ToolResult::error("plan_read expects 'capability' to be a string");
+            };
+            return match board.capability_spec(capability) {
+                Ok(Some(text)) => ToolResult::success(text),
+                Ok(None) => {
+                    ToolResult::success(format!("No current spec for '{capability}' yet."))
+                }
+                Err(error) => ToolResult::error(error),
+            };
+        }
+        let Some((plan_id, step)) = plan_stamp else {
+            return ToolResult::error("you have no plan to read");
+        };
+        return match board.worker_view(plan_id, step + 1) {
+            Ok(text) => ToolResult::success(text),
+            Err(error) => ToolResult::error(error),
+        };
+    }
     if name != "message_parent" {
         return ToolResult::error(format!("unknown worker host tool '{name}'"));
     }
@@ -7457,8 +7561,10 @@ async fn pump_worker(
     tiers: Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
     live: Arc<Mutex<HashMap<String, LiveWorker>>>,
     fail_next_close: Arc<AtomicBool>,
+    board: Option<Arc<PlanBoard>>,
 ) {
     let mut turn_active = false;
+    let mut plan_stamp = worker_plan_stamp(&records, &worker_id).await;
     // The `outcome` row owed when the worker lands in a terminal status this
     // iteration; appended once the record save below has persisted it.
     let mut pending_outcome: Option<DispatchRoutingRow> = None;
@@ -7488,7 +7594,18 @@ async fn pump_worker(
             args,
         } = &event.event
         {
-            let result = worker_host_tool_result(&messages, &worker_id, name, args).await;
+            if name == "plan_read" {
+                plan_stamp = worker_plan_stamp(&records, &worker_id).await;
+            }
+            let result = worker_host_tool_result(
+                &messages,
+                &worker_id,
+                name,
+                args,
+                board.as_ref(),
+                plan_stamp.as_ref(),
+            )
+            .await;
             send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
             // An audit's report is the message_parent call that delivered
             // it (plan 5779641): mark the record the moment the message is
@@ -11231,6 +11348,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .expect("stray plan file");
         let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        let team = Arc::new(team);
         team.attach_board(Arc::new(board));
 
         let document = team.plan_document(&plan.id).expect("the plan document");
@@ -11304,6 +11422,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 ..Default::default()
             })
             .expect("creation is allowed before apply requirements are met");
+        let team = Arc::new(team);
         team.attach_board(Arc::new(board));
 
         let error = team
@@ -11579,6 +11698,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         .await
         .expect("provision the worker checkout");
         let team = open_test_team(root.path(), state.path(), vec![record.clone()]).await;
+        let team = Arc::new(team);
         team.attach_board(Arc::new(board));
 
         let (audit, reused) = team
@@ -11908,7 +12028,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         _root: tempfile::TempDir,
         state: tempfile::TempDir,
         _config: tempfile::TempDir,
-        team: TeamRuntime,
+        team: std::sync::Arc<TeamRuntime>,
         plan_id: String,
         classifier: std::sync::Arc<StubDispatchClassifier>,
     }
@@ -12009,6 +12129,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 ..PlanDraft::default()
             })
             .expect("create routing plan");
+        let team = Arc::new(team);
         team.attach_board(board);
         RoutingFixture {
             _root: root,
@@ -12226,6 +12347,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 ..PlanDraft::default()
             })
             .expect("create the nudge plan");
+        let team = Arc::new(team);
         team.attach_board(board);
         let notices = team.subscribe_board();
         (
@@ -15119,4 +15241,252 @@ models = [\"scripted-a\", \"scripted-b\"]
         fixture.team.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn worker_host_tools_offer_plan_read() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        let tools = team.worker_host_tools();
+        let plan_read = tools
+            .iter()
+            .find(|tool| tool.name == "plan_read")
+            .expect("plan_read is offered");
+        assert!(matches!(plan_read.safety, SafetyLevel::AutoRun));
+        assert_eq!(plan_read.timeout_ms, Some(10_000));
+        assert_eq!(
+            plan_read.parameters["properties"]["capability"]["type"],
+            "string"
+        );
+        assert!(plan_read.parameters.get("required").is_none());
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plan_read_returns_the_current_plan() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        let plans_dir = root.path().join(".coding/plans");
+        let board = PlanBoard::new(&plans_dir, root.path().join(".coding/reviews"));
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Plan reading".into(),
+                goal: "Let a worker re-read its plan".into(),
+                context: "A worker re-reads src-tauri/src/mnemo2/team.rs after dispatch and verifies with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team.".into(),
+                steps: vec![
+                    "Implement plan_read in src-tauri/src/mnemo2/team.rs and verify with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team".into(),
+                    "Handle notices in src-tauri/src/mnemo2/team.rs and verify with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team".into(),
+                ],
+                ..Default::default()
+            })
+            .expect("create plan");
+        board
+            .update(
+                &plan.id,
+                mnemo::app::plan_board::PlanEdit {
+                    decision: Some("Use the shared capability reader".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("record the decision");
+        let board = Arc::new(board);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let stamp = Some((plan.id.clone(), 1usize));
+        let result = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({}),
+            Some(&board),
+            stamp.as_ref(),
+        )
+        .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("Use the shared capability reader"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Re-read this plan at any time"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("## Your step (2)"), "{}", result.output);
+
+        let no_plan = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({}),
+            Some(&board),
+            None,
+        )
+        .await;
+        assert!(!no_plan.success);
+        assert!(no_plan.output.contains("no plan"), "{}", no_plan.output);
+    }
+
+    #[tokio::test]
+    async fn plan_read_reads_a_capability_spec() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        let spec_dir = root
+            .path()
+            .join(".coding/openspec/specs/tier-ladder");
+        std::fs::create_dir_all(&spec_dir).expect("spec dir");
+        std::fs::write(spec_dir.join("spec.md"), "# Tier ladder\n").expect("spec file");
+        let board = Arc::new(PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        ));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let current = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({"capability": "tier-ladder"}),
+            Some(&board),
+            None,
+        )
+        .await;
+        assert!(current.success, "{}", current.output);
+        assert_eq!(current.output, "# Tier ladder\n");
+
+        let missing = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({"capability": "not-a-capability"}),
+            Some(&board),
+            None,
+        )
+        .await;
+        assert!(missing.success, "{}", missing.output);
+        assert_eq!(
+            missing.output,
+            "No current spec for 'not-a-capability' yet."
+        );
+
+        let invalid = worker_host_tool_result(
+            &messages,
+            "planreader",
+            "plan_read",
+            &json!({"capability": "../x"}),
+            Some(&board),
+            None,
+        )
+        .await;
+        assert!(!invalid.success);
+        assert!(invalid.output.contains("invalid capability"), "{}", invalid.output);
+    }
+
+    #[tokio::test]
+    async fn plan_edit_notifies_only_working_workers() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let board = PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        );
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Plan change notices".into(),
+                goal: "Tell only the workers still working".into(),
+                context: "One worker is editing src-tauri/src/mnemo2/team.rs while another waits for review; the working one verifies with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team.".into(),
+                steps: vec![
+                    "Send notices in src-tauri/src/mnemo2/team.rs and verify with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team".into(),
+                    "Review the notice in src-tauri/src/mnemo2/team.rs and verify with cargo test -p mnemo-app --features mnemo2 --lib mnemo2::team".into(),
+                ],
+                ..Default::default()
+            })
+            .expect("create plan");
+        let working_id = "00000001000000000001";
+        let completed_id = "00000002000000000002";
+        let mut working = worker(root.path(), working_id);
+        working.status = WorkerStatus::Working;
+        working.plan_id = Some(plan.id.clone());
+        working.plan_step = Some(0);
+        let mut completed = worker(root.path(), completed_id);
+        completed.status = WorkerStatus::Completed;
+        completed.plan_id = Some(plan.id.clone());
+        completed.plan_step = Some(1);
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            working.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the working worker");
+        let team = open_test_team(root.path(), state.path(), vec![working.clone(), completed.clone()]).await;
+        team.update_worker(working_id, |record| {
+            record.status = WorkerStatus::Working;
+        })
+        .await;
+        team.update_worker(completed_id, |record| {
+            record.status = WorkerStatus::Completed;
+        })
+        .await;
+        spawn_live_worker(&team, &working).await;
+        let team = Arc::new(team);
+        let board = Arc::new(board);
+        team.attach_board(board.clone());
+        board
+            .update(
+                &plan.id,
+                mnemo::app::plan_board::PlanEdit {
+                    decision: Some("A decision recorded after dispatch".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("record the decision");
+        let expected = format!(
+            "Plan {} changed: new decision. Call plan_read to re-read it before you continue.",
+            plan.id
+        );
+        let mut notice = None;
+        for _ in 0..250 {
+            let worker = team.worker(working_id).await.expect("working worker");
+            if let Some(entry) = worker.inbox.first() {
+                notice = Some(entry.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let notice = match notice {
+            Some(notice) => notice,
+            None => {
+                let worker = team.worker(working_id).await.expect("working worker");
+                panic!(
+                    "the working worker got no notice; status {:?}, inbox {:?}",
+                    worker.status, worker.inbox
+                )
+            }
+        };
+        assert_eq!(notice.text, expected);
+        assert_eq!(
+            team.worker(completed_id)
+                .await
+                .expect("completed worker")
+                .inbox,
+            Vec::new()
+        );
+
+        board
+            .update(
+                &plan.id,
+                mnemo::app::plan_board::PlanEdit {
+                    progress_note: Some("Only a progress note".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("record the progress note");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            team.worker(working_id).await.expect("working worker").inbox.len(),
+            1
+        );
+        team.shutdown().await;
+    }
 }

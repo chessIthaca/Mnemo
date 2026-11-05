@@ -380,44 +380,12 @@ pub fn status(root: &Path) -> SpecsStatus {
 
 // ── Current spec ─────────────────────────────────────────────────────────────
 
-/// A capability name in the canonical kebab-case shape
-/// `^[a-z0-9]+(-[a-z0-9]+)*$`: ASCII lowercase letters, digits and `-` —
-/// never empty, never a leading or trailing `-`, never a double `--`.
-/// Nothing that could traverse a path (`/`, `\`, `.`) survives it.
-fn valid_capability_name(capability: &str) -> bool {
-    !capability.is_empty()
-        && !capability.starts_with('-')
-        && !capability.ends_with('-')
-        && !capability.contains("--")
-        && capability.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-        })
-}
-
 /// The current spec of one capability, or None when it has none yet.
 /// The read refuses links — a linked capability folder or `spec.md`
 /// whose target sits outside the project would serve bytes the project
 /// never held.
 fn capability_spec(root: &Path, capability: &str) -> Result<Option<String>, String> {
-    if !valid_capability_name(capability) {
-        return Err(format!("invalid capability name '{capability}'"));
-    }
-    let folder = openspec_dir(root).join("specs").join(capability);
-    let path = folder.join("spec.md");
-    let is_link = |candidate: &Path| {
-        std::fs::symlink_metadata(candidate)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    };
-    if is_link(&folder) || is_link(&path) {
-        return Err(format!(
-            "capability spec '{capability}' is a link; Mnemo does not follow links"
-        ));
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("could not read {}: {e}", path.display())),
-    }
+    mnemo::app::openspec::read_capability_spec(&openspec_dir(root), capability)
 }
 
 // ── Schema list and activation ───────────────────────────────────────────────

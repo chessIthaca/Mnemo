@@ -392,11 +392,12 @@ impl LeadRuntime {
             pricing: runtime.pricing()?,
         })
         .await?;
+        let team = Arc::new(team);
         team.set_tiers(runtime.tiers());
         if let Some(board) = runtime.board_handle() {
             team.attach_board(board);
         }
-        *runtime.team.lock().await = Some(Arc::new(team));
+        *runtime.team.lock().await = Some(team);
         let live = runtime
             .spawn_live(1, selected, spawn_model, spawn_effort, persisted.transcript)
             .await?;
@@ -2357,7 +2358,7 @@ mod tests {
         config: &TempDir,
         state: &TempDir,
         llm: Arc<dyn LlmClient>,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         open_git_team_with_pricing(root, config, state, llm, Vec::new()).await
     }
 
@@ -2367,7 +2368,7 @@ mod tests {
         state: &TempDir,
         llm: Arc<dyn LlmClient>,
         pricing: Vec<mnemo::config::PricingEntry>,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         open_git_team_slots(root, config, state, llm, pricing, 1).await
     }
 
@@ -2378,7 +2379,7 @@ mod tests {
         llm: Arc<dyn LlmClient>,
         pricing: Vec<mnemo::config::PricingEntry>,
         slots: usize,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_config(config.path(), &["scripted-a"]);
@@ -2399,6 +2400,7 @@ mod tests {
             })
             .await
             .expect("team opens");
+        let team = Arc::new(team);
         team.attach_board(lead.board_handle().expect("the lead's plan board"));
         (lead, team)
     }
@@ -2411,7 +2413,7 @@ mod tests {
         state: &TempDir,
         llm: Arc<dyn LlmClient>,
         slots: usize,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_config(config.path(), &["scripted-a"]);
@@ -2432,6 +2434,7 @@ mod tests {
             })
             .await
             .expect("team opens");
+        let team = Arc::new(team);
         team.attach_board(lead.board_handle().expect("the lead's plan board"));
         (lead, team)
     }
@@ -2650,6 +2653,7 @@ mod tests {
                 ..mnemo::app::plan_board::PlanDraft::default()
             })
             .expect("create plan");
+        let team = Arc::new(team);
         team.attach_board(board);
 
         let dispatched = team
@@ -3529,7 +3533,6 @@ mod tests {
         // Install the test's TeamRuntime as the lead handle. The production
         // pump keeps its original handle; this test isolates send_prompt's
         // gate arms instead of reproducing that cross-handle interleave.
-        let team = Arc::new(team);
         *runtime.team.lock().await = Some(team.clone());
         assert!(
             !team.lead_is_busy(),
@@ -3586,7 +3589,6 @@ mod tests {
         let (runtime, team) = open_git_team_spawns(&root, &config, &state, llm, 1).await;
         // The production pump keeps its original TeamRuntime handle; this
         // replacement isolates send_prompt's arms and the test's gate writes.
-        let team = Arc::new(team);
         *runtime.team.lock().await = Some(team.clone());
         runtime
             .send_prompt("first".to_string(), Vec::new())
@@ -9353,7 +9355,7 @@ mod tests {
         state: &TempDir,
         addr: std::net::SocketAddr,
         slots: usize,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_stub_config(config.path(), addr);
@@ -9374,6 +9376,7 @@ mod tests {
             })
             .await
             .expect("team opens");
+        let team = Arc::new(team);
         team.attach_board(lead.board_handle().expect("the lead's plan board"));
         (lead, team)
     }
@@ -9388,7 +9391,7 @@ mod tests {
         slots: usize,
         model_a_max_context: usize,
         model_b_max_context: usize,
-    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_stub_config_windows(
@@ -9414,6 +9417,7 @@ mod tests {
             })
             .await
             .expect("team opens");
+        let team = Arc::new(team);
         team.attach_board(lead.board_handle().expect("the lead's plan board"));
         (lead, team)
     }

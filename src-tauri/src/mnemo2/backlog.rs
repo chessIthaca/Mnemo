@@ -26,8 +26,10 @@
 //! and hands one idea to the lead with [`plan_this`] ("Plan this"): the
 //! item becomes `in_flight` (note: "handed to the lead") and the lead
 //! receives a notice asking for a plan created with `backlog_id=<id>`,
-//! which marks the item done with the plan. Nothing else dispatches: the
-//! plan board stays the one home of in-flight work.
+//! which marks the item done with the plan — marked
+//! [`TEAM_NOTICE_PREFIX`] with the idea quoted for an attached external
+//! lead, a plain user message for the in-app one. Nothing else dispatches:
+//! the plan board stays the one home of in-flight work.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,6 +38,7 @@ use mnemo::app::backlog::{BacklogItem, BacklogStatus, BacklogStore};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::mnemo2::ipc::Mnemo2State;
+use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
 use crate::mnemo2::team::TeamRuntime;
 
 /// The payload-less event emitted after every successful backlog write, so
@@ -238,14 +241,27 @@ pub async fn backlog_clear_finished(
     Ok(items)
 }
 
+/// The "Plan this" handoff: the refreshed live list (the item is now
+/// `in_flight`) plus the notice in each delivery shape. `external` is
+/// what an attached external lead's queue receives — the
+/// [`TEAM_NOTICE_PREFIX`] marker, the handoff line, the idea quoted line by
+/// line — because notice text is data, never a direct instruction.
+/// `in_app` is the plain user message the in-app lead receives: the user
+/// clicked the button there, so the request is theirs, unmarked and
+/// unquoted.
+#[derive(Debug)]
+struct PlanThisHandoff {
+    items: Vec<BacklogItem>,
+    external: String,
+    in_app: String,
+}
+
 /// Hand one pending backlog idea to the lead ("Plan this"): the item moves
 /// to `in_flight` with a "handed to the lead" note — the transition table's
 /// dispatch entry, so a second click on a stale view refuses instead of
-/// double-queueing — and the notice for the lead names the idea.
-///
-/// Returns the refreshed live list and the notice text; the command decides
-/// where the notice goes ([`deliver_plan_this_notice`]).
-fn plan_this_item(path: &Path, id: &str) -> Result<(Vec<BacklogItem>, String), String> {
+/// double-queueing — and the handoff carries the notice in both delivery
+/// shapes ([`PlanThisHandoff`]).
+fn plan_this_item(path: &Path, id: &str) -> Result<PlanThisHandoff, String> {
     let mut store = BacklogStore::open(path.to_path_buf());
     let Some(item) = store.items().into_iter().find(|item| item.id == id) else {
         return Err(unknown_item(id));
@@ -256,43 +272,62 @@ fn plan_this_item(path: &Path, id: &str) -> Result<(Vec<BacklogItem>, String), S
         ));
     }
     let headline = item.text.lines().next().unwrap_or_default().trim();
-    let notice = format!(
+    let quoted = item
+        .text
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let in_app = format!(
         "Plan this backlog item {id}: {headline}\n\n{}\n\nWrite a plan with plan_create and pass backlog_id={id}.",
         item.text
     );
-    Ok((store.items(), notice))
+    let external = format!(
+        "{TEAM_NOTICE_PREFIX}\n\
+         Plan this backlog item {id} (the user clicked Plan this in mission control): {headline}\n\n\
+         {quoted}\n\n\
+         Write a plan with plan_create and pass backlog_id={id}."
+    );
+    Ok(PlanThisHandoff {
+        items: store.items(),
+        external,
+        in_app,
+    })
 }
 
-/// Deliver the "Plan this" notice to whichever lead is active: the external
-/// lead's queue when one is attached ([`TeamRuntime::push_external_notice`],
-/// the same queue every lead notice rides), else the in-app lead as a user
-/// message — the composer's
+/// Deliver the "Plan this" handoff to whichever lead is active: the
+/// external lead's queue when one is attached
+/// ([`TeamRuntime::push_external_notice`], the same queue every lead notice
+/// rides) receives the marked `external_notice`, else the in-app lead
+/// receives `in_app_message` as a user message — the composer's
 /// [`send_prompt`](crate::mnemo2::runtime::LeadRuntime::send_prompt) path,
 /// handed in as `prompt_lead` so the tests can intercept it. Returns `true`
 /// when the notice was queued for an external lead.
 async fn deliver_plan_this_notice<F, Fut>(
     team: &TeamRuntime,
-    notice: String,
+    external_notice: String,
+    in_app_message: String,
     prompt_lead: F,
 ) -> Result<bool, String>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    if team.push_external_notice(notice.clone()) {
+    if team.push_external_notice(external_notice) {
         return Ok(true);
     }
-    prompt_lead(notice).await?;
+    prompt_lead(in_app_message).await?;
     Ok(false)
 }
 
 /// Hand one backlog idea to the lead to plan ("Plan this"): the item becomes
-/// `in_flight` (note: "handed to the lead") and the lead receives a notice —
-/// "Plan this backlog item <id>: <headline>", the full text, then "Write a
-/// plan with plan_create and pass backlog_id=<id>." — queued for the
-/// external lead when one is attached, else sent to the in-app lead as a
-/// user message. The plan_create that carries `backlog_id` then marks the
-/// item done with the plan. Returns the new list.
+/// `in_flight` (note: "handed to the lead") and the lead receives the
+/// notice — "Plan this backlog item <id>", the idea, then "Write a plan
+/// with plan_create and pass backlog_id=<id>." — queued for the external
+/// lead when one is attached (marked as a TeamManager notice, the idea
+/// quoted), else sent to the in-app lead as a plain user message. The
+/// plan_create that carries `backlog_id` then marks the item done with the
+/// plan. Returns the new list.
 #[tauri::command]
 pub async fn plan_this(
     state: State<'_, Mnemo2State>,
@@ -304,14 +339,14 @@ pub async fn plan_this(
         .await
         .ok_or_else(|| "Mnemo2 has no open lead; call lead_open first".to_string())?;
     let team = lead.team_handle().await?;
-    let (items, notice) = plan_this_item(&backlog_file(lead.workspace_root()), &id)?;
+    let handoff = plan_this_item(&backlog_file(lead.workspace_root()), &id)?;
     let prompt = {
         let lead = Arc::clone(&lead);
         move |text: String| async move { lead.send_prompt(text, Vec::new()).await }
     };
-    deliver_plan_this_notice(&team, notice, prompt).await?;
+    deliver_plan_this_notice(&team, handoff.external, handoff.in_app, prompt).await?;
     let _ = app.emit(BACKLOG_CHANGED_CHANNEL, ());
-    Ok(items)
+    Ok(handoff.items)
 }
 
 #[cfg(test)]
@@ -576,26 +611,43 @@ mod tests {
     }
 
     #[test]
-    fn plan_this_marks_the_item_in_flight_and_builds_the_notice() {
+    fn plan_this_marks_the_item_in_flight_and_builds_both_notice_shapes() {
         let project = project();
         let path = file(&project);
         add_item(&path, "Fix the importer\nKeep the CLI flags").expect("add");
 
         let id = id_of(&path, "Fix the importer\nKeep the CLI flags");
-        let (items, notice) = plan_this_item(&path, &id).expect("hand the idea to the lead");
-        let item = items
+        let handoff = plan_this_item(&path, &id).expect("hand the idea to the lead");
+        let item = handoff
+            .items
             .iter()
             .find(|item| item.id == id)
             .expect("the handed item");
         assert_eq!(item.status, BacklogStatus::InFlight);
         assert_eq!(item.note.as_deref(), Some("handed to the lead"));
-        assert!(
-            notice.starts_with(&format!(
+
+        // The in-app lead receives the user's request unmarked: the user
+        // clicked the button there, so the plan ask is theirs.
+        assert_eq!(
+            handoff.in_app,
+            format!(
                 "Plan this backlog item {id}: Fix the importer\n\n\
                  Fix the importer\nKeep the CLI flags\n\n\
                  Write a plan with plan_create and pass backlog_id={id}."
-            )),
-            "{notice}"
+            )
+        );
+
+        // The external lead's queue entry carries the notice marker, says
+        // who asked, and quotes the idea line by line — notice text is data,
+        // never a direct instruction.
+        assert_eq!(
+            handoff.external,
+            format!(
+                "{TEAM_NOTICE_PREFIX}\n\
+                 Plan this backlog item {id} (the user clicked Plan this in mission control): Fix the importer\n\n\
+                 > Fix the importer\n> Keep the CLI flags\n\n\
+                 Write a plan with plan_create and pass backlog_id={id}."
+            )
         );
     }
 
@@ -724,19 +776,37 @@ mod tests {
         let path = backlog_file(live.root.path());
         add_item(&path, "Fix the importer").expect("add the idea");
         let id = id_of(&path, "Fix the importer");
-        let (_, notice) = plan_this_item(&path, &id).expect("hand the idea to the lead");
+        let handoff = plan_this_item(&path, &id).expect("hand the idea to the lead");
 
         assert!(live.team.attach_external_lead());
-        let queued = deliver_plan_this_notice(&live.team, notice.clone(), |text| async move {
-            Err::<(), String>(format!(
-                "the in-app lead must not be prompted while an external lead is attached: {text}"
-            ))
-        })
+        let queued = deliver_plan_this_notice(
+            &live.team,
+            handoff.external.clone(),
+            handoff.in_app.clone(),
+            |text| async move {
+                Err::<(), String>(format!(
+                    "the in-app lead must not be prompted while an external lead is attached: {text}"
+                ))
+            },
+        )
         .await
         .expect("the notice is delivered");
 
         assert!(queued, "the notice belongs to the external lead");
-        assert_eq!(live.team.drain_external_notices(), vec![notice]);
+        let drained = live.team.drain_external_notices();
+        assert_eq!(drained.len(), 1, "exactly one queued notice: {drained:?}");
+        let text = drained[0].as_str();
+        assert_eq!(
+            text,
+            handoff.external.as_str(),
+            "the queue holds the marked handoff notice"
+        );
+        assert!(text.starts_with(TEAM_NOTICE_PREFIX), "the marker: {text}");
+        assert!(
+            text.contains("the user clicked Plan this in mission control"),
+            "the ask names the user: {text}"
+        );
+        assert!(text.contains("\n> Fix the importer"), "the idea is quoted: {text}");
     }
 
     #[tokio::test]
@@ -745,22 +815,36 @@ mod tests {
         let path = backlog_file(live.root.path());
         add_item(&path, "Fix the importer").expect("add the idea");
         let id = id_of(&path, "Fix the importer");
-        let (_, notice) = plan_this_item(&path, &id).expect("hand the idea to the lead");
+        let handoff = plan_this_item(&path, &id).expect("hand the idea to the lead");
 
         let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = Arc::clone(&sent);
-        let queued = deliver_plan_this_notice(&live.team, notice.clone(), move |text| {
-            let sink = Arc::clone(&sink);
-            async move {
-                sink.lock().expect("sink").push(text);
-                Ok(())
-            }
-        })
+        let queued = deliver_plan_this_notice(
+            &live.team,
+            handoff.external.clone(),
+            handoff.in_app.clone(),
+            move |text| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().expect("sink").push(text);
+                    Ok(())
+                }
+            },
+        )
         .await
         .expect("the notice is delivered");
 
         assert!(!queued, "the notice belongs to the in-app lead");
         assert!(live.team.drain_external_notices().is_empty());
-        assert_eq!(*sent.lock().expect("sent"), vec![notice]);
+        let sent = sent.lock().expect("sent").clone();
+        assert_eq!(sent.len(), 1, "exactly one prompted message: {sent:?}");
+        let text = sent[0].as_str();
+        assert_eq!(
+            text,
+            handoff.in_app.as_str(),
+            "the in-app lead gets the user's unmarked request"
+        );
+        assert!(!text.starts_with(TEAM_NOTICE_PREFIX), "a user message, not a notice: {text}");
+        assert!(!text.contains("\n> "), "the idea is not quoted in a user message: {text}");
     }
 }

@@ -895,6 +895,9 @@ struct ExternalLead {
     /// (no session to receive them). They wait here, oldest first, for the
     /// in-app lead's next notice or the next external lead.
     undelivered: VecDeque<String>,
+    /// Helper process ids that made a tool call while the lead was attached.
+    /// A named close releases the lead only after the last id has left.
+    bridges: std::collections::BTreeSet<String>,
     /// Its last call (MCP, notices or wait), in Unix epoch milliseconds.
     last_activity_ms: u64,
     /// Successful memory searches in the current plan-creation window.
@@ -2431,6 +2434,23 @@ impl TeamRuntime {
         self.attach_external_lead_as(Some(session))
     }
 
+    /// Remember a helper process that made a tool call while this external
+    /// lead was attached. Does nothing while no external lead is attached.
+    pub fn note_external_bridge(&self, bridge: &str) {
+        let mut state = self.external_state();
+        if state.since_ms.is_some() {
+            state.bridges.insert(bridge.to_string());
+        }
+    }
+
+    /// Forget a closing helper process and return how many leading helpers
+    /// remain. The caller releases the lead only when this returns zero.
+    pub fn forget_external_bridge(&self, bridge: &str) -> usize {
+        let mut state = self.external_state();
+        state.bridges.remove(bridge);
+        state.bridges.len()
+    }
+
     /// Hand the team back to the in-app lead and wake blocked waiters.
     /// Returns `true` when an external lead was attached.
     ///
@@ -2448,6 +2468,7 @@ impl TeamRuntime {
             let mut state = self.external_state();
             let was_attached = state.since_ms.take().is_some();
             state.idle_since_ms = None;
+            state.bridges.clear();
             // They are newer than anything already held back.
             let unread = std::mem::take(&mut state.queue);
             state.undelivered.extend(unread);
@@ -11114,6 +11135,34 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(data["brief"], "the whole brief");
         assert_eq!(data["opening_prompt"], "the whole opening prompt");
 
+        team.shutdown().await;
+    }
+
+    /// A release forgets every helper that led, so a helper that closes after
+    /// one cannot keep a stale claim alive, and a detached lead remembers no
+    /// new helper until it attaches again.
+    #[tokio::test]
+    async fn a_release_forgets_every_external_bridge() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+        // Two helpers led; one closing must leave the other in charge.
+        assert!(team.attach_external_lead(), "the first attach takes the team");
+        team.note_external_bridge("a");
+        team.note_external_bridge("b");
+        assert_eq!(team.forget_external_bridge("a"), 1, "b still leads");
+
+        // A release forgets every helper, and none is noted while detached.
+        assert!(team.detach_external_lead());
+        team.note_external_bridge("c");
+        assert_eq!(team.forget_external_bridge("b"), 0, "the release forgot b");
+        assert_eq!(team.forget_external_bridge("c"), 0, "a detached lead notes no helper");
+
+        // The next attach starts with no remembered helpers.
+        assert!(team.attach_external_lead(), "it can lead again");
+        assert_eq!(team.forget_external_bridge("a"), 0, "the release had cleared the set");
         team.shutdown().await;
     }
 

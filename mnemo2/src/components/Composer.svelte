@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { ArrowUp, Square, X } from "@lucide/svelte";
+  import { X } from "@lucide/svelte";
   import { get } from "svelte/store";
   import { parseNumericAnswer } from "../../../frontend/src/lib/answerSelect";
   import { fileToAttachedDataUrl } from "../../../frontend/src/lib/attachImages";
   import { actions, app } from "../lib/store";
   import type { LeadAnswerInput } from "../lib/types";
+  import ComposerBox from "./ComposerBox.svelte";
   import IndexingStatus from "./IndexingStatus.svelte";
   import LeadModelPicker from "./LeadModelPicker.svelte";
   import Sheet from "./Sheet.svelte";
@@ -63,6 +64,29 @@
   /** The open `ask_user` question this box answers, if any. */
   const questionId = $derived(
     $app.leadRuntime.pending?.kind === "question" ? $app.leadRuntime.pending.question_id ?? null : null,
+  );
+
+  /** The one button beside the box: answer, steer, send, or a disabled send. */
+  const sendButton = $derived(
+    canAnswerQuestion || canSend
+      ? {
+          ariaLabel: canAnswerQuestion ? "Answer question" : busy ? "Steer the lead" : "Send message",
+          enabled: canSubmit && !submitting && !answering,
+        }
+      : canInterrupt
+        ? null
+        : { ariaLabel: "Send message", enabled: false },
+  );
+  /** Stop while the lead runs; a stopped lead offers send again once it settles. */
+  const stopButton = $derived(
+    canInterrupt || stopping
+      ? {
+          ariaLabel: stopping ? "Stopping the lead" : "Stop the lead",
+          text: stopping ? "Stopping…" : "Stop",
+          busy: stopping,
+          onclick: () => void stop(),
+        }
+      : null,
   );
 
   $effect(() => {
@@ -170,10 +194,6 @@
     }
   }
 
-  function handleInput(event: Event) {
-    actions.setLeadDraftText((event.currentTarget as HTMLTextAreaElement).value);
-  }
-
   function imageFiles(data: DataTransfer | null): File[] {
     const fromItems = Array.from(data?.items ?? [])
       .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
@@ -226,18 +246,6 @@
     event.preventDefault();
     send();
   }
-
-  function handleKeydown(event: KeyboardEvent) {
-    if (event.key === "Escape" && freeformMode) {
-      event.preventDefault();
-      freeformQuestionId = null;
-      return;
-    }
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      send();
-    }
-  }
 </script>
 
 <form class="composer" onsubmit={handleSubmit}>
@@ -259,61 +267,20 @@
       {/each}
     </ul>
   {/if}
-  <div class="composer-input">
-    <textarea
-      value={draft.text}
-      oninput={handleInput}
-      onpaste={handlePaste}
-      onkeydown={handleKeydown}
-      rows="2"
-      aria-label="Message the lead"
-      placeholder={freeformMode
-        ? "Type your freeform answer…"
-        : "Ask, plan, or redirect the team…"}
-    ></textarea>
-    {#if canInterrupt || stopping}
-      <button
-        class="send-button stop-button"
-        type="button"
-        aria-label={stopping ? "Stopping the lead" : "Stop the lead"}
-        title={stopping ? "Stopping the lead" : "Stop the lead"}
-        disabled={stopping}
-        onclick={stop}
-      >
-        <Square size={12} fill="currentColor" strokeWidth={1.5} />
-        <span>{stopping ? "Stopping…" : "Stop"}</span>
-      </button>
-    {/if}
-    {#if canAnswerQuestion || canSend}
-      <button
-        class="send-button"
-        type="submit"
-        aria-label={canAnswerQuestion
-          ? "Answer question"
-          : busy
-            ? "Steer the lead"
-            : "Send message"}
-        title={canAnswerQuestion
-          ? "Answer question"
-          : busy
-            ? "Steer the lead"
-            : "Send message"}
-        disabled={!canSubmit || submitting || answering}
-      >
-        <ArrowUp size={17} strokeWidth={2} />
-      </button>
-    {:else if !canInterrupt}
-      <button
-        class="send-button"
-        type="submit"
-        aria-label="Send message"
-        title="Send message"
-        disabled
-      >
-        <ArrowUp size={17} strokeWidth={2} />
-      </button>
-    {/if}
-  </div>
+  <ComposerBox
+    value={draft.text}
+    label="Message the lead"
+    placeholder={freeformMode
+      ? "Type your freeform answer…"
+      : "Ask, plan, or redirect the team…"}
+    send={sendButton}
+    stop={stopButton}
+    oninput={actions.setLeadDraftText}
+    onsubmit={() => void send()}
+    onpaste={handlePaste}
+    onescape={freeformMode ? () => { freeformQuestionId = null; } : undefined}
+  />
+
   <div class="composer-meta">
     <LeadModelPicker compact />
     <div class="composer-status" aria-live="polite">
@@ -375,49 +342,9 @@
     cursor: pointer;
   }
   .remove-image:hover { background: var(--line); }
-  .composer-input {
-    display: flex;
-    align-items: flex-end;
-    gap: 12px;
-    padding: 12px 12px 10px 16px;
-    border: 1px solid var(--line-strong);
-    border-radius: 16px;
-    background: var(--surface);
-    box-shadow: var(--shadow-composer);
-    transition: border-color 160ms ease, box-shadow 160ms ease;
-  }
-  .composer-input:focus-within { border-color: var(--focus-line); box-shadow: var(--shadow-composer-focus), 0 0 0 3px var(--accent-soft); }
-  textarea {
-    flex: 1;
-    min-height: 44px;
-    max-height: 150px;
-    resize: none;
-    border: 0;
-    outline: 0;
-    background: transparent;
-    color: var(--ink);
-    font-size: var(--text-body);
-    line-height: 1.55;
-  }
-  textarea::placeholder { color: var(--placeholder); }
-  .send-button {
-    display: grid;
-    flex: 0 0 auto;
-    width: 34px;
-    height: 34px;
-    place-items: center;
-    border: 0;
-    border-radius: 10px;
-    background: var(--primary-bg);
-    color: var(--primary-ink);
-    cursor: pointer;
-  }
-  .send-button:disabled { background: var(--surface-soft); color: var(--disabled-ink); cursor: default; }
-  .stop-button { display: inline-flex; width: auto; min-width: 64px; gap: 6px; padding: 0 10px; border: 1px solid var(--line); background: var(--surface-soft); color: var(--ink); font-size: var(--text-body); font-weight: 600; }
-  .stop-button:hover { border-color: var(--line-strong); background: var(--line); }
-  .stop-button:disabled { cursor: wait; }
   .composer-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 14px; padding: 8px 4px 0; }
   .composer-status { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: var(--text-meta); font-weight: 600; letter-spacing: 0.04em; }
+
   .confirm-copy { margin: 0 0 16px; color: var(--muted); font-size: var(--text-body); line-height: 1.55; }
   .confirm-actions { display: flex; justify-content: space-between; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
   @media (max-width: 560px) { .composer { width: 100%; } }

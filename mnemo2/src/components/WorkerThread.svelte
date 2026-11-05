@@ -1,18 +1,27 @@
+<script module lang="ts">
+  /**
+   * Half-typed replies, kept per worker id: switching tabs or workers unmounts
+   * the thread, and the draft must survive that instead of dying with it.
+   */
+  const drafts = new Map<string, string>();
+</script>
+
 <script lang="ts">
-  import { Send } from "@lucide/svelte";
   import { onMount } from "svelte";
   import { actions } from "../lib/store";
   import { turnStartTimes } from "../lib/elapsed";
+  import { workerBox } from "../lib/workerComposer";
   import { workerPhaseLabel } from "../lib/workerActivity";
   import type { Worker } from "../lib/types";
   import ActivityStatus from "./ActivityStatus.svelte";
   import Collapsible from "./Collapsible.svelte";
+  import ComposerBox from "./ComposerBox.svelte";
   import Markdown from "./Markdown.svelte";
   import ToolActivity from "./ToolActivity.svelte";
 
   /**
    * A worker's live conversation — streamed messages and tool calls, screenshot
-   * links, and the private reply box. In `compact` mode (the lead-side worker
+   * links, and the shared message box. In `compact` mode (the lead-side worker
    * panel) the messages scroll on their own and follow the stream while the
    * reader stays near the bottom; scrolling up to read pauses the follow.
    */
@@ -24,7 +33,11 @@
   /** The reader counts as "at the bottom" within this many pixels (same rule as LeadChat). */
   const STICK_TO_BOTTOM_PX = 48;
 
+  /** What this worker's box offers now: steer it, message it, or why it can't. */
+  const box = $derived(workerBox(worker));
+
   let reply = $state("");
+  let sending = $state(false);
   let lastWorkerId = "";
   let scroller = $state<HTMLDivElement | null>(null);
   let stream = $state<HTMLDivElement | null>(null);
@@ -36,7 +49,7 @@
     const id = worker.id;
     if (id === lastWorkerId) return;
     lastWorkerId = id;
-    reply = "";
+    reply = drafts.get(id) ?? "";
     nearBottom = true;
   });
 
@@ -81,16 +94,24 @@
     });
   }
 
-  function sendReply() {
-    if (!reply.trim()) return;
-    actions.replyWorker(worker.id, reply);
-    reply = "";
+  function setReply(text: string) {
+    reply = text;
+    if (text) drafts.set(worker.id, text);
+    else drafts.delete(worker.id);
   }
 
-  function replyKeydown(event: KeyboardEvent) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      sendReply();
+  async function sendReply() {
+    const text = reply;
+    const id = worker.id;
+    if (!box.canSend || sending || !text.trim()) return;
+    sending = true;
+    try {
+      // A refused message keeps its text: the box clears only once accepted.
+      if (!(await actions.replyWorker(id, text))) return;
+      if (drafts.get(id) === text) drafts.delete(id);
+      if (id === worker.id && reply === text) reply = "";
+    } finally {
+      sending = false;
     }
   }
 </script>
@@ -155,10 +176,31 @@
       </div>
     </div>
   {/if}
-  <div class="thread-composer">
-    <textarea bind:value={reply} onkeydown={replyKeydown} rows="2" aria-label={`Reply to ${worker.name}`} placeholder={`Message ${worker.name}`} disabled={worker.status === "cancelled"}></textarea>
-    <button class="icon-button" aria-label={`Send reply to ${worker.name}`} disabled={!reply.trim() || worker.status === "cancelled"} onclick={sendReply}><Send size={14} /></button>
-  </div>
+  <form
+    class="thread-composer"
+    onsubmit={(event) => {
+      event.preventDefault();
+      void sendReply();
+    }}
+  >
+    <ComposerBox
+      value={box.mode === "done" ? "" : reply}
+      label={`Reply to ${worker.name}`}
+      placeholder={box.placeholder}
+      disabled={!box.canSend}
+      send={{ ariaLabel: box.sendLabel, enabled: box.canSend && !sending && reply.trim() !== "" }}
+      stop={box.canPause
+        ? {
+            ariaLabel: `Pause ${worker.name}`,
+            text: "Pause",
+            busy: false,
+            onclick: () => actions.pauseWorker(worker.id),
+          }
+        : null}
+      oninput={setReply}
+      onsubmit={() => void sendReply()}
+    />
+  </form>
 </section>
 
 <style>
@@ -184,8 +226,7 @@
   .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
   .screenshot-links > span { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .screenshot-links > div { display: flex; flex-wrap: wrap; gap: 6px; }
-  .thread-composer { display: flex; align-items: flex-end; gap: 8px; margin-top: 16px; padding: 9px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); }
-  .thread-composer textarea { flex: 1; resize: none; border: 0; outline: 0; color: var(--ink); font-size: var(--text-body); }
+  .thread-composer { margin-top: 16px; }
 
   /* Compact: the panel body scrolls the messages alone so the reply box stays put. */
   .compact { display: flex; flex-direction: column; height: 100%; min-height: 0; }

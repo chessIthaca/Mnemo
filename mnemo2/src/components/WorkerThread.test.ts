@@ -1,6 +1,6 @@
-import { render } from "@testing-library/svelte";
-import { beforeEach, describe, expect, it } from "vitest";
-import { app } from "../lib/store";
+import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { actions, app } from "../lib/store";
 import type { Worker, WorkerThreadEntry } from "../lib/types";
 import { createWorkers, fixtureState } from "../test/fixtures";
 import WorkerThread from "./WorkerThread.svelte";
@@ -18,6 +18,7 @@ describe("WorkerThread", () => {
 
   it("shows the failure block with the full error text when the worker failed", () => {
     const { container } = render(WorkerThread, { worker: worker() });
+
 
     const block = container.querySelector<HTMLElement>(".thread-failure");
     if (!block) throw new Error("failure block missing");
@@ -100,5 +101,128 @@ describe("WorkerThread", () => {
       node.textContent?.trim(),
     );
     expect(statuses).toEqual(["0:00", "0:10"]);
+  });
+
+  it("uses the same box as the lead", () => {
+    const { container } = render(WorkerThread, { worker: worker({ id: "same-box" }) });
+
+    // One component, one look: the lead's composer shell renders here too.
+    expect(container.querySelector(".composer-input")).toBeTruthy();
+  });
+
+  it("steers a working agent and clears after acceptance", async () => {
+    const reply = vi.spyOn(actions, "replyWorker").mockResolvedValue(true);
+    render(WorkerThread, { worker: worker({ id: "steer-1", name: "Kai", status: "working" }) });
+    const box = screen.getByRole("textbox", { name: "Reply to Kai" }) as HTMLTextAreaElement;
+
+    expect(box.placeholder).toBe("Steer Kai…");
+    expect(screen.getByRole("button", { name: "Steer Kai" })).toBeTruthy();
+
+    await fireEvent.input(box, { target: { value: "Skip the flaky test." } });
+    await fireEvent.keyDown(box, { key: "Enter" });
+
+    expect(reply).toHaveBeenCalledWith("steer-1", "Skip the flaky test.");
+    // Cleared only once the backend accepted it.
+    await waitFor(() => expect(box.value).toBe(""));
+  });
+
+  it("keeps the text when the message is refused", async () => {
+    const reply = vi.spyOn(actions, "replyWorker").mockResolvedValue(false);
+    render(WorkerThread, { worker: worker({ id: "refused-1", name: "Kai", status: "working" }) });
+    const box = screen.getByRole("textbox", { name: "Reply to Kai" }) as HTMLTextAreaElement;
+
+    await fireEvent.input(box, { target: { value: "Still here?" } });
+    await fireEvent.keyDown(box, { key: "Enter" });
+
+    await waitFor(() => expect(reply).toHaveBeenCalled());
+    expect(box.value).toBe("Still here?");
+  });
+
+  it("is disabled and says so once the agent is done", async () => {
+    const reply = vi.spyOn(actions, "replyWorker").mockResolvedValue(true);
+    const merged = render(WorkerThread, { worker: worker({ id: "done-1", status: "merged" }) });
+    const mergedBox = screen.getByRole("textbox", { name: "Reply to Ana" }) as HTMLTextAreaElement;
+
+    expect(mergedBox.disabled).toBe(true);
+    expect(mergedBox.placeholder).toBe("Ana is done");
+    expect(
+      (screen.getByRole("button", { name: "Send message to Ana" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    await fireEvent.keyDown(mergedBox, { key: "Enter" });
+    expect(reply).not.toHaveBeenCalled();
+    merged.unmount();
+
+    render(WorkerThread, {
+      worker: worker({ id: "done-2", kind: "audit", status: "completed" }),
+    });
+    const auditBox = screen.getByRole("textbox", { name: "Reply to Ana" }) as HTMLTextAreaElement;
+    expect(auditBox.disabled).toBe(true);
+    expect(auditBox.placeholder).toBe("Ana finished its audit");
+  });
+
+  it("points at Resume for a stopped agent", () => {
+    render(WorkerThread, { worker: worker({ id: "stopped-1", status: "stopped" }) });
+
+    const box = screen.getByRole("textbox", { name: "Reply to Ana" }) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(true);
+    expect(box.placeholder).toBe("Resume Ana to message it");
+  });
+
+  it("is disabled and says so for a completed agent", async () => {
+    const reply = vi.spyOn(actions, "replyWorker").mockResolvedValue(true);
+    render(WorkerThread, { worker: worker({ id: "open-1", status: "completed" }) });
+
+    const box = screen.getByRole("textbox", { name: "Reply to Ana" }) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(true);
+    expect(box.placeholder).toBe("Ana is done");
+    expect(
+      (screen.getByRole("button", { name: "Send message to Ana" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    await fireEvent.keyDown(box, { key: "Enter" });
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it("is disabled for an in-review agent", () => {
+    render(WorkerThread, { worker: worker({ id: "open-2", status: "in_review" }) });
+
+    const box = screen.getByRole("textbox", { name: "Reply to Ana" }) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(true);
+    expect(box.placeholder).toBe("Ana is done");
+  });
+
+  it("stays open for a failed agent", () => {
+    render(WorkerThread, { worker: worker({ id: "open-3", status: "failed" }) });
+
+    const box = screen.getByRole("textbox", { name: "Reply to Ana" }) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(false);
+    expect(box.placeholder).toBe("Message Ana");
+  });
+
+
+  it("keeps a draft across unmount", async () => {
+    const props = { worker: worker({ id: "draft-1", status: "working" }) };
+    const first = render(WorkerThread, props);
+    await fireEvent.input(screen.getByRole("textbox", { name: "Reply to Ana" }), {
+      target: { value: "Half-typed thought" },
+    });
+    first.unmount();
+
+    render(WorkerThread, props);
+    const box = screen.getByRole("textbox", { name: "Reply to Ana" }) as HTMLTextAreaElement;
+    await waitFor(() => expect(box.value).toBe("Half-typed thought"));
+  });
+
+  it("offers Pause while working and not while idle", async () => {
+    const pause = vi.spyOn(actions, "pauseWorker").mockReturnValue(undefined);
+    const working = render(WorkerThread, {
+      worker: worker({ id: "pause-1", name: "Kai", status: "working" }),
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Pause Kai" }));
+    expect(pause).toHaveBeenCalledWith("pause-1");
+    working.unmount();
+
+    render(WorkerThread, { worker: worker({ id: "pause-2", name: "Kai", status: "idle" }) });
+    expect(screen.queryByRole("button", { name: "Pause Kai" })).toBeNull();
   });
 });

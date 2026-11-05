@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/svelte";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TeamTransport } from "../lib/teamEngine";
@@ -335,7 +335,8 @@ describe("WorkerPanel", () => {
     await fireEvent.keyDown(box, { key: "Enter" });
 
     expect(transport.message).toHaveBeenCalledWith("kai", "Prioritize the scroll follow rule.");
-    expect(box.value).toBe("");
+    // The box clears only once the backend accepted the message.
+    await waitFor(() => expect(box.value).toBe(""));
   });
 
   it("shares the right side with the Workbench: each one closes the other", async () => {

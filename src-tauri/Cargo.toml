@@ -17,6 +17,14 @@ tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# OpenSpec schema/config YAML editing (mnemo2/specs_settings.rs) — same
+# version the mnemo lib pins for the OpenSpec format layer, so the crate
+# unifies.
+serde_norway = "0.9"
+# Git-clone staging for schema adds (mnemo2/specs_settings.rs): the shallow
+# clone lands in a TempDir removed when dropped. Same version as the
+# dev-dependency below, so the crate unifies.
+tempfile = "3"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.23"

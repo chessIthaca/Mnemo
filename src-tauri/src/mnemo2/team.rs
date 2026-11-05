@@ -1834,8 +1834,22 @@ impl TeamRuntime {
             .clone();
         let requested_tier = request.tier.as_deref();
         if requested_tier == Some("auto") && matches!(settings.mode, RoutingMode::Off | RoutingMode::Shadow) {
-            return Err("tier auto needs routing mode suggest or auto (Settings > Decisions)".into());
+            return Err("tier auto needs routing mode suggest or auto (Settings > Tiers)".into());
         }
+        // The escalation rung is never a first pick: fresh work dispatches on
+        // high, and team_resume or team_route_fix moves an existing worker up.
+        if request.source == DispatchSource::LeadTool {
+            let ladder = self.tier_ladder();
+            if let (Some(tier), Some(rung)) = (requested_tier, ladder.escalation()) {
+                if tier == rung.id {
+                    return Err(
+                        "tier escalate is escalation only, never a first pick; dispatch on high, or move an existing worker up with team_resume or team_route_fix and tier escalate"
+                            .into(),
+                    );
+                }
+            }
+        }
+
         if requested_tier.is_none()
             && request.model.is_none()
             && settings.mode != RoutingMode::Auto
@@ -14407,12 +14421,6 @@ models = [\"scripted-a\", \"scripted-b\"]
                 Some("medium has no model; ran on routine"),
             ),
             ("high", "test/scripted-difficult", "high", None),
-            (
-                "escalate",
-                "test/scripted-difficult",
-                "high",
-                Some("escalate has no model; ran on high"),
-            ),
         ] {
             let fixture = routing_fixture(
                 crate::mnemo2::dispatch_routing::RoutingMode::Off,
@@ -14449,7 +14457,41 @@ models = [\"scripted-a\", \"scripted-b\"]
                 result.output
             );
         }
+        let result = fixture.dispatch(Some("escalate"), None).await;
+        assert!(!result.success, "tier escalate was accepted as a first pick");
+        assert!(
+            result.output.contains("escalation only, never a first pick"),
+            "{}",
+            result.output
+        );
         fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lead_dispatch_refuses_escalate_in_every_routing_mode() {
+        for mode in [
+            crate::mnemo2::dispatch_routing::RoutingMode::Off,
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            crate::mnemo2::dispatch_routing::RoutingMode::Suggest,
+            crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+        ] {
+            let fixture = routing_fixture(mode, None, false).await;
+            let result = fixture.dispatch(Some("escalate"), None).await;
+            assert!(
+                !result.success,
+                "routing mode {mode:?}: escalate was accepted as a first pick"
+            );
+            assert!(
+                result.output.contains("escalation only, never a first pick"),
+                "routing mode {mode:?}: {}",
+                result.output
+            );
+            assert!(
+                fixture.team.worker("routingworker").await.is_err(),
+                "routing mode {mode:?}: the refused dispatch provisioned a worker"
+            );
+            fixture.team.shutdown().await;
+        }
     }
 
     #[test]

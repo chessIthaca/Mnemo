@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
+use crate::openspec::{Delta, Requirement};
 
 pub use crate::memory::plan_format::{PlanFile, PlanKind, ReviewRoundStamp, Step};
 use crate::memory::plan_format::{extract_bold_header, parse_checkbox};
@@ -307,8 +308,31 @@ impl PlanFile {
     /// Write the plan to a file in the given plans directory.
     /// Returns the path it was written to.
     pub fn write_to_dir(&self, plans_dir: &Path, id: &str) -> Result<PathBuf> {
+        self.write_to_dir_with_spec_deltas(plans_dir, id, &[])
+    }
+
+    /// Write the plan with its structured OpenSpec changes rendered between
+    /// acceptance scenarios and steps. The deltas remain board-owned state;
+    /// ordinary plan parsing continues to use the established plan format.
+    pub fn write_to_dir_with_spec_deltas(
+        &self,
+        plans_dir: &Path,
+        id: &str,
+        spec_deltas: &[Delta],
+    ) -> Result<PathBuf> {
         let path = plans_dir.join(format!("{id}.md"));
-        std::fs::write(&path, self.serialize())?;
+        let serialized = self.serialize();
+        let spec_changes = render_spec_changes(spec_deltas);
+        let text = if spec_changes.is_empty() {
+            serialized
+        } else if let Some(index) = serialized.find("\n## Steps\n") {
+            let mut text = serialized;
+            text.insert_str(index, &spec_changes);
+            text
+        } else {
+            format!("{serialized}{spec_changes}")
+        };
+        std::fs::write(&path, text)?;
         Ok(path)
     }
 
@@ -374,6 +398,54 @@ impl PlanFile {
     }
 }
 
+/// Render board-owned OpenSpec deltas as the plan's `## Spec changes` section.
+/// Requirement and scenario bodies come from the shared OpenSpec renderer;
+/// their headings are nested beneath the capability and operation headings.
+pub fn render_spec_changes(deltas: &[Delta]) -> String {
+    if deltas.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n## Spec changes\n");
+    for delta in deltas {
+        out.push_str(&format!("\n### {}\n", delta.capability));
+        push_delta_requirements(&mut out, "ADDED", &delta.added);
+        push_delta_requirements(&mut out, "MODIFIED", &delta.modified);
+        if !delta.removed.is_empty() {
+            out.push_str("\n#### REMOVED Requirements\n");
+            for removed in &delta.removed {
+                out.push_str(&format!(
+                    "\n##### Requirement: {}\n{}\n",
+                    removed.requirement, removed.reason
+                ));
+            }
+        }
+        if !delta.renamed.is_empty() {
+            out.push_str("\n#### RENAMED Requirements\n");
+            for renamed in &delta.renamed {
+                out.push_str(&format!("\nFROM: {}\nTO: {}\n", renamed.from, renamed.to));
+            }
+        }
+    }
+    out
+}
+
+fn push_delta_requirements(out: &mut String, operation: &str, requirements: &[Requirement]) {
+    if requirements.is_empty() {
+        return;
+    }
+    out.push_str(&format!("\n#### {operation} Requirements\n"));
+    for requirement in requirements {
+        out.push('\n');
+        for line in requirement.render().lines() {
+            if line.starts_with("### Requirement:") || line.starts_with("#### Scenario:") {
+                out.push_str("##");
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
 /// Public wrapper so other modules (e.g. `Workflow::update_plan`) can extract
 /// a bold header from step text. See [`extract_bold_header`].
 pub(crate) fn extract_bold_header_pub(text: &str) -> Option<String> {
@@ -385,7 +457,73 @@ pub(crate) fn extract_bold_header_pub(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::memory::plan_format::parse_step_header;
+    use crate::openspec::{RemovedRequirement, RenamedRequirement, Scenario};
     use tempfile::tempdir;
+
+    #[test]
+    fn spec_changes_render_in_openspec_delta_format_before_steps() {
+        let dir = tempdir().unwrap();
+        let mut plan = PlanFile::new("T", "G", "C", vec!["step one".into()]);
+        plan.acceptance = Some("- An existing observable outcome.".to_string());
+        let scenarios = vec![Scenario::new(
+            "Observed",
+            vec!["a request arrives".to_string()],
+            vec!["the response is stored".to_string()],
+            vec!["the status is visible".to_string()],
+        )];
+        let mut delta = Delta {
+            capability: "dispatch-routing".to_string(),
+            ..Delta::default()
+        };
+        delta.added.push(Requirement::new(
+            "Added requirement",
+            "The system SHALL route the request.",
+            scenarios.clone(),
+        ));
+        delta.modified.push(Requirement::new(
+            "Modified requirement",
+            "The system MUST retain the route.",
+            scenarios,
+        ));
+        delta.removed.push(RemovedRequirement {
+            requirement: "Removed requirement".to_string(),
+            reason: "The behavior was retired.".to_string(),
+        });
+        delta.renamed.push(RenamedRequirement {
+            from: "Old requirement".to_string(),
+            to: "New requirement".to_string(),
+        });
+        let path = plan
+            .write_to_dir_with_spec_deltas(dir.path(), "plan", &[delta])
+            .unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        for expected in [
+            "## Spec changes",
+            "### dispatch-routing",
+            "#### ADDED Requirements",
+            "#### MODIFIED Requirements",
+            "#### REMOVED Requirements",
+            "#### RENAMED Requirements",
+            "##### Requirement: Added requirement",
+            "###### Scenario: Observed",
+            "- **WHEN** a request arrives",
+            "- **THEN** the response is stored",
+            "- **AND** the status is visible",
+            "FROM: Old requirement",
+            "TO: New requirement",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+        }
+        assert!(
+            text.find("## Acceptance scenarios").unwrap()
+                < text.find("## Spec changes").unwrap()
+        );
+        assert!(text.find("## Spec changes").unwrap() < text.find("## Steps").unwrap());
+        let parsed = PlanFile::parse(&text).unwrap();
+        assert_eq!(parsed.steps.len(), 1);
+        assert_eq!(parsed.title, "T");
+        assert!(render_spec_changes(&[]).is_empty());
+    }
 
     #[test]
     fn serialize_and_parse_roundtrip() {

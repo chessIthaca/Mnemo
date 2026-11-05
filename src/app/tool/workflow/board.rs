@@ -21,6 +21,7 @@ use crate::app::plan_board::{
 use crate::app::team_ledger::TeamLedger;
 use crate::app::tool::workflow::plan::StepNumber;
 use crate::app::workflow::PlanKind;
+use crate::openspec::Delta;
 use crate::provider::ToolSchema;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
@@ -65,6 +66,64 @@ fn step_lines(plan: &BoardPlan) -> String {
 
 fn plan_data(plan: &BoardPlan) -> serde_json::Value {
     serde_json::to_value(plan).unwrap_or(serde_json::Value::Null)
+}
+
+/// JSON schema for the OpenSpec delta arrays shared by create and update.
+fn spec_deltas_schema() -> serde_json::Value {
+    let scenario = json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "when": {"type": "array", "items": {"type": "string"}},
+            "then": {"type": "array", "items": {"type": "string"}},
+            "and": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["name", "when", "then"]
+    });
+    let requirement = json!({
+        "type": "object",
+        "properties": {
+            "requirement": {"type": "string"},
+            "text": {"type": "string", "description": "Normative text containing SHALL or MUST."},
+            "scenarios": {"type": "array", "items": scenario}
+        },
+        "required": ["requirement", "text", "scenarios"]
+    });
+    json!({
+        "type": "array",
+        "description": "OpenSpec changes for capabilities under .coding/openspec/specs/. Encouraged when a plan changes specified behavior, never required. Deltas are validated against the current spec and earlier deltas on the same plan; their scenarios also serve as acceptance scenarios.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "capability": {"type": "string", "description": "Capability folder name, usually kebab-case."},
+                "added": {"type": "array", "items": requirement.clone()},
+                "modified": {"type": "array", "items": requirement},
+                "removed": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "requirement": {"type": "string"},
+                            "reason": {"type": "string"}
+                        },
+                        "required": ["requirement", "reason"]
+                    }
+                },
+                "renamed": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "from": {"type": "string"},
+                            "to": {"type": "string"}
+                        },
+                        "required": ["from", "to"]
+                    }
+                }
+            },
+            "required": ["capability"]
+        }
+    })
 }
 
 // ── advisory spec notes ───────────────────────────────────────────────────
@@ -144,6 +203,8 @@ struct CreateArgs {
     interfaces: Vec<String>,
     #[serde(default)]
     acceptance_scenarios: Vec<String>,
+    #[serde(default)]
+    spec_deltas: Vec<Delta>,
 }
 
 /// `plan_create` — open a new plan on the board.
@@ -181,8 +242,10 @@ impl Tool for PlanCreateTool {
              name the files each step touches. List the observable outcomes in \
              `acceptance_scenarios` (or add them later with plan_update \
              `add_acceptance_scenarios`): workers receive them, and a review_risk='high' \
-             dispatch on this plan requires at least one. Delegate each step with \
-             team_dispatch(plan_id, step, ...). The plan stays on disk after it closes.",
+             dispatch on this plan requires at least one. OpenSpec `spec_deltas` are encouraged \
+             when specified behavior changes, never required, and are checked against \
+             .coding/openspec/specs/; delta scenarios also count as acceptance scenarios. \
+             Delegate each step with team_dispatch(plan_id, step, ...). The plan stays on disk after it closes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -193,7 +256,8 @@ impl Tool for PlanCreateTool {
                     "kind": {"type": "string", "enum": ["implementation", "research", "bug_fixing"], "description": "Default implementation. bug_fixing needs `bug` and, to close, a recorded regression test."},
                     "bug": {"type": "string", "description": "The symptom (bug_fixing only)."},
                     "interfaces": {"type": "array", "items": {"type": "string"}, "description": "Contracts between steps, one per entry: exports, signatures, data shapes, file ownership, e.g. \"`src/game.js` — exports `Game` as a named export; UI owns rendering and must not modify it\". Record one whenever two steps touch the same file or module boundary, before dispatching them."},
-                    "acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes the finished work must show, one per entry: a command and its result, a persisted state, a concurrency or security property, a UI behavior. Kept in the plan's '## Acceptance scenarios' section and given to every worker; a review_risk='high' dispatch requires at least one."}
+                    "acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes the finished work must show, one per entry: a command and its result, a persisted state, a concurrency or security property, a UI behavior. Kept in the plan's '## Acceptance scenarios' section and given to every worker; a review_risk='high' dispatch requires at least one."},
+                    "spec_deltas": spec_deltas_schema()
                 },
                 "required": ["title", "goal", "context", "steps"]
             }),
@@ -226,6 +290,7 @@ impl Tool for PlanCreateTool {
             steps: args.steps,
             interfaces: args.interfaces,
             acceptance: args.acceptance_scenarios,
+            spec_deltas: args.spec_deltas,
         };
         let plan = match self.board.create(draft) {
             Ok(plan) => plan,
@@ -240,6 +305,9 @@ impl Tool for PlanCreateTool {
             step_lines(&plan),
             plan.id
         );
+        for reminder in self.board.spec_reminders(&plan) {
+            output.push_str(&format!("\n\n{reminder}"));
+        }
         // Advisory spec notes: a thin step is noted, never refused — the plan
         // already exists, and the lead decides whether the step is enough.
         let step_specs: Vec<(usize, &str)> = plan
@@ -286,6 +354,8 @@ struct UpdateArgs {
     #[serde(default)]
     add_acceptance_scenarios: Vec<String>,
     #[serde(default)]
+    spec_deltas: Vec<Delta>,
+    #[serde(default)]
     regression_test: Option<String>,
     #[serde(default)]
     landed_design: bool,
@@ -323,8 +393,10 @@ impl Tool for PlanUpdateTool {
              `progress` (commits, review status, what is next), append to the context (stable \
              why, constraints, intent only — never status, because every worker brief copies \
              it), add steps, add observable acceptance scenarios (required before a \
-             review_risk='high' dispatch), record a bug_fixing plan's regression test, or flag a feature-scale fix with \
-             landed_design (closing then needs a \"Landed design\" context paragraph).",
+             review_risk='high' dispatch), append OpenSpec `spec_deltas` (encouraged, never required, \
+             checked against .coding/openspec/specs/ and this plan's earlier deltas), record a \
+             bug_fixing plan's regression test, or flag a feature-scale fix with landed_design \
+             (closing then needs a \"Landed design\" context paragraph).",
             json!({
                 "type": "object",
                 "properties": {
@@ -336,7 +408,8 @@ impl Tool for PlanUpdateTool {
                     "add_steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered steps, each a bold **header** followed by an implementation spec a cheaper model can follow without design decisions: the files and the functions/types to add or change with signatures (mark new code as new), the data shapes, the behaviour rules and edge cases, the order of edits, every test by name with its setup and assertions, a done checklist, and the files not to touch. Longer is better than vague."},
                     "add_acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes appended to the plan's '## Acceptance scenarios', one per entry; workers receive them, and a review_risk='high' dispatch requires at least one. A scenario already recorded is not repeated."},
                     "regression_test": {"type": "string", "description": "The regression test name (bug_fixing)."},
-                    "landed_design": {"type": "boolean"}
+                    "landed_design": {"type": "boolean"},
+                    "spec_deltas": spec_deltas_schema()
                 },
                 "required": ["plan_id"]
             }),
@@ -366,6 +439,7 @@ impl Tool for PlanUpdateTool {
             progress_note: args.progress,
             add_steps: args.add_steps,
             add_acceptance: args.add_acceptance_scenarios,
+            spec_deltas: args.spec_deltas,
             regression_test: args.regression_test,
             landed_design: args.landed_design,
         };
@@ -377,6 +451,9 @@ impl Tool for PlanUpdateTool {
                     plan.title,
                     plan.steps.len()
                 );
+                for reminder in self.board.spec_reminders(&plan) {
+                    output.push_str(&format!("\n{reminder}"));
+                }
                 if added > 0 {
                     let start = plan.steps.len().saturating_sub(added);
                     let step_specs: Vec<(usize, &str)> = plan.steps[start..]
@@ -929,6 +1006,66 @@ mod tests {
             "{}",
             shown.output
         );
+    }
+
+    #[tokio::test]
+    async fn specced_capability_reminder_is_advisory_and_suppressed_by_a_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_dir = dir.path().join("openspec").join("specs").join("config");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(
+            spec_dir.join("spec.md"),
+            crate::openspec::Spec::new("config").render(),
+        )
+        .unwrap();
+        std::fs::write(spec_dir.join(".mnemo.yaml"), "paths: ['src/**/*.rs']\n").unwrap();
+        let board = board(dir.path());
+        let tool = PlanCreateTool::new(board.clone());
+        let res = tool
+            .execute(json!({
+                "title": "Config loader",
+                "goal": "Keep configuration loading reliable",
+                "context": "Why: malformed configuration must not silently discard defaults. Verify: cargo test --lib config.",
+                "steps": [full_spec_step()]
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        let reminder = "Spec reminder: this plan touches config (.coding/openspec/specs/config/spec.md) but changes none of its requirements.";
+        assert!(res.output.contains(reminder), "{}", res.output);
+        let id = res.data.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+        assert!(board.get(&id).is_ok());
+
+        let updated = PlanUpdateTool::new(board.clone())
+            .execute(json!({"plan_id": id, "decision": "keep defaults explicit"}))
+            .await;
+        assert!(updated.success, "{}", updated.output);
+        assert!(updated.output.contains(reminder), "{}", updated.output);
+
+        let with_delta = tool
+            .execute(json!({
+                "title": "Config spec change",
+                "goal": "Specify configuration loading",
+                "context": "Why: configuration behavior needs an explicit durable contract. Verify: cargo test --lib config.",
+                "steps": [full_spec_step()],
+                "spec_deltas": [{
+                    "capability": "config",
+                    "added": [{
+                        "requirement": "Defaults survive",
+                        "text": "The system SHALL preserve every default.",
+                        "scenarios": [{
+                            "name": "Empty overrides",
+                            "when": ["the override file is empty"],
+                            "then": ["every default remains visible"],
+                            "and": []
+                        }]
+                    }]
+                }]
+            }))
+            .await;
+        assert!(with_delta.success, "{}", with_delta.output);
+        assert!(!with_delta.output.contains("Spec reminder"), "{}", with_delta.output);
+        let data = with_delta.data.unwrap();
+        assert_eq!(data["spec_deltas"][0]["capability"], "config");
     }
 
     #[tokio::test]

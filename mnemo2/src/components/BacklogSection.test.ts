@@ -55,6 +55,7 @@ function fakeTransport(initial: BacklogItem[]) {
     remove,
     reorder,
     setDeferred,
+    setDone: vi.fn(async () => items),
     clearFinished,
     planThis,
     onChanged,

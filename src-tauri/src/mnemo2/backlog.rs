@@ -154,6 +154,33 @@ fn set_deferred(path: &Path, id: &str, deferred: bool) -> Result<Vec<BacklogItem
     Ok(store.items())
 }
 
+/// Mark one idea done (checked) or put a finished one back in the queue
+/// (unchecked) and return the new list.
+///
+/// The store decides what is legal: checked goes through the guarded
+/// `transition` to `Done`, unchecked through the stricter `requeue`, which only
+/// accepts a done / failed / cant-resolve item. A refused change comes back as
+/// an error naming the item — but the view disables the box for an in-flight
+/// idea, so a running one is never toggled from there.
+fn set_done(path: &Path, id: &str, done: bool) -> Result<Vec<BacklogItem>, String> {
+    let mut store = BacklogStore::open(path.to_path_buf());
+    let moved = if done {
+        store.transition(id, BacklogStatus::Done, None)
+    } else {
+        store.requeue(id)
+    };
+    if !moved {
+        if !store.items().iter().any(|item| item.id == id) {
+            return Err(unknown_item(id));
+        }
+        return Err(format!(
+            "backlog item {id} cannot be marked {}",
+            if done { "done" } else { "not done" }
+        ));
+    }
+    Ok(store.items())
+}
+
 /// Soft-delete every finished (done / failed / cant-resolve) idea and return
 /// the new list.
 fn clear_finished(path: &Path) -> Vec<BacklogItem> {
@@ -230,7 +257,21 @@ pub async fn backlog_set_deferred(
     Ok(items)
 }
 
+/// Mark one idea done (checked) or put it back in the queue (unchecked); returns the new list.
+#[tauri::command]
+pub async fn backlog_set_done(
+    state: State<'_, Mnemo2State>,
+    app: AppHandle,
+    id: String,
+    done: bool,
+) -> Result<Vec<BacklogItem>, String> {
+    let items = set_done(&backlog_path(&state).await?, &id, done)?;
+    let _ = app.emit(BACKLOG_CHANGED_CHANNEL, ());
+    Ok(items)
+}
+
 /// Soft-delete every finished idea; returns the new list.
+
 #[tauri::command]
 pub async fn backlog_clear_finished(
     state: State<'_, Mnemo2State>,
@@ -592,6 +633,56 @@ mod tests {
 
         let error = set_deferred(&path, "missing", true).expect_err("unknown id");
         assert!(error.contains("no backlog item"), "{error}");
+    }
+
+    #[test]
+    fn set_done_checks_and_unchecks_an_idea() {
+        let project = project();
+        let path = file(&project);
+        add_item(&path, "Finished by hand").expect("add");
+        let id = id_of(&path, "Finished by hand");
+
+        let items = set_done(&path, &id, true).expect("check");
+        assert_eq!(items[0].status, BacklogStatus::Done);
+        assert_eq!(
+            read_items(&path)[0].status,
+            BacklogStatus::Done,
+            "the check is persisted, not just returned"
+        );
+
+        let items = set_done(&path, &id, false).expect("uncheck");
+        assert_eq!(items[0].status, BacklogStatus::Pending);
+        assert_eq!(read_items(&path)[0].status, BacklogStatus::Pending);
+    }
+
+    #[test]
+    fn set_done_refuses_an_in_flight_idea() {
+        let project = project();
+        let path = file(&project);
+        add_item(&path, "Being planned").expect("add");
+        let id = id_of(&path, "Being planned");
+        let mut store = BacklogStore::open(path.clone());
+        assert!(store.transition(&id, BacklogStatus::InFlight, None));
+
+        let error = set_done(&path, &id, false).expect_err("an in-flight idea is not finished");
+        assert!(error.contains("cannot be marked"), "{error}");
+
+        assert_eq!(
+            read_items(&path)[0].status,
+            BacklogStatus::InFlight,
+            "a refused checkbox leaves the item alone"
+        );
+    }
+
+    #[test]
+    fn set_done_names_an_unknown_id() {
+        let project = project();
+        let path = file(&project);
+
+        let error = set_done(&path, "nope", true).expect_err("unknown id");
+        assert_eq!(error, unknown_item("nope"));
+        let error = set_done(&path, "nope", false).expect_err("unknown id");
+        assert_eq!(error, unknown_item("nope"));
     }
 
     #[test]

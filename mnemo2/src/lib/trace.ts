@@ -56,11 +56,17 @@ export interface TraceRow {
   generation_ms: number | null;
   reasoning_ms: number | null;
   connect_ms: number | null;
+  /** Time spent writing the request body to the server; `null` on rows from before the upload/server split. */
+  upload_ms: number | null;
+  /** Wait from the body fully written until the response headers arrive; `null` on rows from before the upload/server split. */
+  server_ms: number | null;
   tools_ms: number | null;
   prep_ms: number | null;
   compact_ms: number | null;
   backoff_ms: number | null;
   stall_ms: number | null;
+  /** SSE byte-chunks read during the stream; `null` on rows from before this field existed. */
+  chunks: number | null;
   error: string | null;
   cancelled: boolean;
   response_truncated: boolean;
@@ -467,20 +473,34 @@ export interface CallStatus {
 }
 
 /**
- * The status a call is in: Waiting and Streaming are the two faces of
- * in-progress (headers not yet arrived vs. chunks flowing), and a client
- * guard cut is its own terminal class, distinct from failure.
+ * The status a call is in, derived from the fields the kernel has stamped so
+ * far — no separate state enum travels the wire. An in-flight call walks the
+ * ladder Preparing → Uploading → Waiting for first token → Streaming, and
+ * shows Stalled once the stream has hit a silence longer than the kernel's
+ * stall threshold (the label stays until the call ends: a recovered stall is
+ * indistinguishable from a streaming one at row granularity). Every in-flight
+ * state keeps the `in_progress` query key so filters and chips agree, and a
+ * client guard cut is its own terminal class, distinct from failure.
  */
 export function callStatus(row: TraceRow): CallStatus {
   if (row.error !== null) return { key: "failed", label: "Failed", tone: "error" };
   if (row.cancelled) return { key: "cancelled", label: "Cancelled", tone: "stopped" };
   if (row.guard_cut !== null) return { key: "guard_cut", label: "Guard cut", tone: "guard" };
   if (!row.is_complete) {
-    return {
-      key: "in_progress",
-      label: row.ttft_ms === null ? "Waiting" : "Streaming",
-      tone: "live",
-    };
+    if (row.ttft_ms !== null) {
+      // stall_ms > 0: the stream has hit a >2s silence at some point.
+      if ((row.stall_ms ?? 0) > 0) return { key: "in_progress", label: "Stalled", tone: "live" };
+      return { key: "in_progress", label: "Streaming", tone: "live" };
+    }
+    // The body is written (or, on rows from before the upload/server split,
+    // the headers have arrived): what is left before the first chunk is the
+    // server's queue and prefill.
+    if (row.upload_ms !== null || row.connect_ms !== null) {
+      return { key: "in_progress", label: "Waiting for first token", tone: "live" };
+    }
+    // The POST is out but the body is still being written.
+    if (row.prep_ms !== null) return { key: "in_progress", label: "Uploading", tone: "live" };
+    return { key: "in_progress", label: "Preparing", tone: "live" };
   }
   return { key: "complete", label: "Complete", tone: "ok" };
 }
@@ -638,24 +658,40 @@ export interface TracePhase {
   key: MetricTerm;
   label: string;
   ms: number | null;
-  /** Phases measured inside `ms` — Compaction in Setup, Stalls in Generation. */
+  /** Phases measured inside `ms` — Compaction in Setup, Reasoning and Stalls in Generation. */
   inside?: TracePhase[];
 }
 
 /**
- * The request's timing phases, in the order the wire runs them. Total time
- * is their sum; `Tools` runs after the response and never counts towards it.
+ * The request's timing phases as non-overlapping segments, in the order the
+ * wire runs them: Setup → Upload → Server wait → Generation, with Retry wait
+ * before a retried attempt. Total time is their sum; `Tools` runs after the
+ * response and never counts towards it. Connect and First token are metrics,
+ * not segments: Connect is the record→headers window that Upload + Server
+ * wait decompose (rows from before the split have both `null`, so those
+ * segments simply collapse), and First token spans the same upload + server
+ * wait, so drawing it would double-count the same wall time.
  */
 export function tracePhases(row: TraceRow): TracePhase[] {
   const phases: TracePhase[] = [];
   const setupInside: TracePhase[] | undefined =
     row.compact_ms === null ? undefined : [{ key: "compaction", label: "Compaction", ms: row.compact_ms }];
   phases.push({ key: "setup", label: "Setup", ms: row.prep_ms, inside: setupInside });
-  phases.push({ key: "connect", label: "Connect", ms: row.connect_ms });
-  phases.push({ key: "first_token", label: "First token", ms: row.ttft_ms });
-  const generationInside: TracePhase[] | undefined =
-    row.stall_ms === null ? undefined : [{ key: "stalls", label: "Stalls", ms: row.stall_ms }];
-  phases.push({ key: "generation", label: "Generation", ms: row.generation_ms, inside: generationInside });
+  phases.push({ key: "upload", label: "Upload", ms: row.upload_ms });
+  phases.push({ key: "server", label: "Server wait", ms: row.server_ms });
+  const generationInside: TracePhase[] = [];
+  if (row.reasoning_ms !== null) {
+    generationInside.push({ key: "reasoning_time", label: "Reasoning", ms: row.reasoning_ms });
+  }
+  if (row.stall_ms !== null) {
+    generationInside.push({ key: "stalls", label: "Stalls", ms: row.stall_ms });
+  }
+  phases.push({
+    key: "generation",
+    label: "Generation",
+    ms: row.generation_ms,
+    inside: generationInside.length > 0 ? generationInside : undefined,
+  });
   phases.push({ key: "retry_wait", label: "Retry wait", ms: row.backoff_ms });
   return phases;
 }
@@ -1227,9 +1263,12 @@ export type MetricTerm =
   | "cache_reuse"
   | "output"
   | "reasoning"
+  | "reasoning_time"
   | "cost"
   | "setup"
   | "compaction"
+  | "upload"
+  | "server"
   | "connect"
   | "first_token"
   | "generation"
@@ -1275,6 +1314,10 @@ export const TRACE_GLOSSARY: Record<MetricTerm, MetricGloss> = {
     term: "Reasoning",
     body: "The portion of output used for model reasoning; it is not added to Output twice.",
   },
+  reasoning_time: {
+    term: "Reasoning time",
+    body: "The portion of Generation spent streaming reasoning; the rest of Generation is the answer content. Included in Generation, not extra time.",
+  },
   cost: {
     term: "Estimated cost",
     body: "Estimate from current model pricing and final token counts. It can differ from the provider bill and is unavailable without a price.",
@@ -1287,21 +1330,29 @@ export const TRACE_GLOSSARY: Record<MetricTerm, MetricGloss> = {
     term: "Compaction",
     body: "Time spent shortening earlier context. Included in Setup, not extra time.",
   },
+  upload: {
+    term: "Upload",
+    body: "Time spent writing the request body to the server — the prompt upload. Large prompts take proportionally longer.",
+  },
+  server: {
+    term: "Server wait",
+    body: "Wait from the upload finishing until the response headers arrive: the server's queue and prefill. For SSE providers the headers arrive with the first chunk, so this is where time-to-first-token is actually spent.",
+  },
   connect: {
     term: "Connect",
-    body: "Time from sending the request until response headers arrive: connection, upload, and server acknowledgement.",
+    body: "Time from creating the request record until the response headers arrive. For SSE providers the headers arrive with the first chunk, so this window also contains the server's queue and prefill — on the internal gateway serving GLM-5.3 it measured equal to time-to-first-token on every timed call (2026-11-05 investigation). New calls decompose it into Upload and Server wait.",
   },
   first_token: {
     term: "First token",
-    body: "Wait after response headers until the first streamed chunk.",
+    body: "Wait from sending the request until the first streamed chunk: upload, server queue and prefill — the latency a user feels before output starts. A metric, not a bar segment; the bar decomposes the same window into Upload and Server wait.",
   },
   generation: {
     term: "Generation",
-    body: "Time from the first chunk until the final response/usage chunk.",
+    body: "Time from the first chunk until the final response/usage chunk. Contains the model's reasoning and any stalls.",
   },
   stalls: {
     term: "Stalls",
-    body: "Silences of more than one second inside Generation. Included in Generation, not extra time.",
+    body: "Silences of more than two seconds inside Generation. Included in Generation, not extra time.",
   },
   tools: {
     term: "Tools",

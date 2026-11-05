@@ -158,6 +158,16 @@
           <span class="phase-segment {segment.key}" style:width="{(segment.ms / totalMs) * 100}%"></span>
         {/each}
       </div>
+      {#if row.connect_ms !== null || row.ttft_ms !== null}
+        <div class="metric-chips">
+          {#if row.connect_ms !== null}
+            <span class="metric-chip">Connect <MetricTip term="connect" label="Connect" /> <strong>{formatDuration(row.connect_ms)}</strong></span>
+          {/if}
+          {#if row.ttft_ms !== null}
+            <span class="metric-chip">First token <MetricTip term="first_token" label="First token" /> <strong>{formatDuration(row.ttft_ms)}</strong></span>
+          {/if}
+        </div>
+      {/if}
       <dl class="overview-list phases">
         {#each phases as phase (phase.key)}
           {#if phase.ms !== null}
@@ -165,13 +175,13 @@
               <dt>{phase.label} <MetricTip term={phase.key} /></dt>
               <dd>{formatDuration(phase.ms)}</dd>
             </div>
-            {#each phase.inside ?? [] as inner (inner.key)}
-              <div class="inside">
-                <dt>↳ {inner.label} <MetricTip term={inner.key} /></dt>
-                <dd>{formatDuration(inner.ms)}</dd>
-              </div>
-            {/each}
           {/if}
+          {#each phase.inside ?? [] as inner (inner.key)}
+            <div class="inside">
+              <dt>↳ {inner.label} <MetricTip term={inner.key} /></dt>
+              <dd>{formatDuration(inner.ms)}</dd>
+            </div>
+          {/each}
         {/each}
         {#if totalMs !== null}
           <div class="total">
@@ -197,9 +207,6 @@
       {/if}
       {#if row.http_status !== null}
         <div><dt>HTTP <MetricTip term="http" /></dt><dd>{row.http_status}</dd></div>
-      {/if}
-      {#if row.reasoning_ms !== null}
-        <div><dt>Reasoning time</dt><dd>{formatDuration(row.reasoning_ms)}</dd></div>
       {/if}
       {#if attribution !== null}
         <div><dt>Session</dt><dd title={attribution.session_id}>{shortTurnId(attribution.session_id)}</dd></div>
@@ -239,10 +246,13 @@
   .notice strong { font-weight: 650; }
   .notice code { font-family: var(--font-mono); font-size: var(--text-meta); }
   .phase-bar { display: flex; height: 10px; overflow: hidden; border-radius: 5px; background: var(--line); }
+  .metric-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .metric-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; background: var(--surface-soft); color: var(--muted); font-size: var(--text-meta); }
+  .metric-chip strong { color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; }
   .phase-segment { height: 100%; min-width: 2px; }
   .phase-segment.setup { background: var(--ink-soft); }
-  .phase-segment.connect { background: var(--running-ink); }
-  .phase-segment.first_token { background: var(--warning); }
+  .phase-segment.upload { background: var(--warning); }
+  .phase-segment.server { background: var(--running-ink); }
   .phase-segment.generation { background: var(--stat-add); }
   .phase-segment.retry_wait { background: var(--muted); }
   .overview-list .inside dt { padding-left: 14px; color: var(--muted); font-size: var(--text-meta); }

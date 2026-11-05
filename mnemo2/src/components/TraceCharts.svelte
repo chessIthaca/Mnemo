@@ -56,7 +56,8 @@
   const TIMING_COLORS: Record<string, string> = {
     retry: "var(--warning)",
     setup: "var(--ink-soft)",
-    connect: "var(--running-ink)",
+    upload: "var(--code-number)",
+    server: "var(--running-ink)",
     firstToken: "var(--code-keyword)",
     generation: "var(--accent)",
     tools: "var(--event-review-ink)",
@@ -342,7 +343,8 @@
                     <th scope="col">Call</th>
                     <th scope="col">Setup</th>
                     <th scope="col">Compaction (in Setup)</th>
-                    <th scope="col">Connect</th>
+                    <th scope="col">Upload</th>
+                    <th scope="col">Server wait</th>
                     <th scope="col">First token</th>
                     <th scope="col">Generation</th>
                     <th scope="col">Stalls (in Generation)</th>
@@ -357,7 +359,8 @@
                       <th scope="row">{column.clock}</th>
                       <td>{durationCell(column.setupMs)}</td>
                       <td>{durationCell(column.compactionMs)}</td>
-                      <td>{durationCell(column.connectMs)}</td>
+                      <td>{durationCell(column.uploadMs)}</td>
+                      <td>{durationCell(column.serverMs)}</td>
                       <td>{durationCell(column.firstTokenMs)}</td>
                       <td>{durationCell(column.generationMs)}</td>
                       <td>{durationCell(column.stallMs)}</td>

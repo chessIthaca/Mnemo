@@ -1,0 +1,24 @@
+# OpenSpec project configuration — loaded by src/app/openspec/schema.rs
+# (a missing file is the empty configuration; malformed YAML is an error).
+#
+# governed_files maps a capability to the source files whose changes affect
+# its specified behavior. plan_create refuses a plan whose steps touch a
+# governed file without a spec delta for that capability, unless the plan
+# carries an explicit spec_impact "none" declaration with a reason — the
+# same refusal-with-guidance pattern as the memory-search gate.
+governed_files:
+  dispatch-routing:
+    - src-tauri/src/mnemo2/team.rs
+    - src-tauri/src/mnemo2/dispatch_routing.rs
+    - src-tauri/src/mnemo2/route_eval.rs
+    - src-tauri/src/mnemo2/laya_settings.rs
+    - src-tauri/src/ipc/finetune.rs
+    - src-tauri/src/bin/mnemo2_route_eval.rs
+    - src/agent/route_question.rs
+    - src/agent/route_knn.rs
+    - src/agent/model_routing.rs
+    - src/agent/failure_triage.rs
+    - src/agent/failure_triage_knn.rs
+  external-lead: []
+  tier-ladder: []
+  worker-brief: []

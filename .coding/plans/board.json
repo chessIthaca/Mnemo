@@ -1171,6 +1171,68 @@
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "5aac2023",
+      "status": "closed",
+      "created_at_ms": 1793910315740,
+      "closed_at_ms": 1793914233366,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5aac2023-20261105-213033.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Leaving with unsaved edits asks first",
+              "text": "The settings dialog SHALL ask for confirmation before closing or switching pages while any page holds unsaved edits, and SHALL close or switch without asking when none does.",
+              "scenarios": [
+                {
+                  "name": "Close with unsaved edits",
+                  "when": [
+                    "a settings page has an unsaved edit",
+                    "the user presses the close button, Escape or the backdrop"
+                  ],
+                  "then": [
+                    "the dialog stays open and asks to discard unsaved changes"
+                  ],
+                  "and": [
+                    "Keep editing keeps the edit",
+                    "Discard changes closes the dialog"
+                  ]
+                },
+                {
+                  "name": "Switch page with unsaved edits",
+                  "when": [
+                    "a settings page has an unsaved edit",
+                    "the user picks another page in the rail"
+                  ],
+                  "then": [
+                    "the page does not change until the user chooses Discard changes"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "No unsaved edits",
+                  "when": [
+                    "no settings page has an unsaved edit",
+                    "the user closes the dialog"
+                  ],
+                  "then": [
+                    "the dialog closes at once"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

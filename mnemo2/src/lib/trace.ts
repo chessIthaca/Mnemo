@@ -1091,9 +1091,9 @@ export interface TraceFilters {
   selected: string | null;
 }
 
-/** How the route opens: everything, this session, newest first. */
+/** How the route opens: the Lead's calls, this session, newest first. */
 export const DEFAULT_TRACE_FILTERS: TraceFilters = {
-  agent: "all",
+  agent: "lead",
   model: "all",
   status: "all",
   purpose: "all",
@@ -1171,10 +1171,16 @@ export const TRACE_STATUS_OPTIONS: { value: TraceListStatus; label: string }[] =
   { value: "guard_cut", label: "Guard cut" },
 ];
 
-/** The filters that differ from the defaults, as removable chips. */
+/**
+ * The filters that differ from the defaults, as removable chips. The agent
+ * filter treats its default ("lead") like "all" — the neutral scope — so
+ * neither value chips; every other agent selection does.
+ */
 export function activeTraceChips(filters: TraceFilters): { key: keyof TraceFilters; label: string }[] {
   const chips: { key: keyof TraceFilters; label: string }[] = [];
-  if (filters.agent !== "all") chips.push({ key: "agent", label: `Agent: ${filters.agent}` });
+  if (filters.agent !== "all" && filters.agent !== DEFAULT_TRACE_FILTERS.agent) {
+    chips.push({ key: "agent", label: `Agent: ${filters.agent}` });
+  }
   if (filters.model !== "all") chips.push({ key: "model", label: `Model: ${filters.model}` });
   if (filters.status !== "all") {
     const label = TRACE_STATUS_OPTIONS.find((option) => option.value === filters.status)?.label ?? filters.status;
@@ -1201,17 +1207,27 @@ export interface TraceAgentOption {
   label: string;
 }
 
+/** A stand-in lead attribution so the Lead option's label follows actorLabel. */
+const LEAD_OPTION_ATTRIBUTION: TraceAttribution = {
+  actor_kind: "lead",
+  agent_id: "",
+  session_id: "",
+  agent_name: "",
+  worker_id: null,
+  plan_id: null,
+  plan_step: null,
+  turn_id: null,
+  purpose: "turn",
+};
+
 /**
- * The Agent filter's options: All, the Lead, every live worker, then every
+ * The Agent filter's options: the Lead first, every live worker, then every
  * other actor observed in the log (deleted workers keep the name captured on
- * their calls), and Unattributed last.
+ * their calls), All, and Unattributed last.
  */
 export function traceAgentOptions(rows: TraceRow[], workers: { id: string; name: string }[] = []): TraceAgentOption[] {
-  const options: TraceAgentOption[] = [
-    { value: "all", label: "All agents" },
-    { value: "lead", label: "Lead" },
-  ];
-  const seen = new Set(["all", "lead"]);
+  const options: TraceAgentOption[] = [{ value: "lead", label: actorLabel(LEAD_OPTION_ATTRIBUTION) }];
+  const seen = new Set(["lead", "all", "unattributed"]);
   for (const worker of workers) {
     if (worker.id === "" || seen.has(worker.id)) continue;
     seen.add(worker.id);
@@ -1225,6 +1241,7 @@ export function traceAgentOptions(rows: TraceRow[], workers: { id: string; name:
     seen.add(value);
     options.push({ value, label: actorLabel(attribution) });
   }
+  options.push({ value: "all", label: "All agents" });
   options.push({ value: "unattributed", label: "Unattributed" });
   return options;
 }

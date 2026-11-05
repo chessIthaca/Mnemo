@@ -591,6 +591,14 @@ describe("trace page contract helpers", () => {
       });
     });
 
+    it("opens scoped to the Lead: the default agent filter is the lead", () => {
+      expect(DEFAULT_TRACE_FILTERS.agent).toBe("lead");
+      // The default flows into the wire query; the backend matches "lead" by
+      // attribution.actor_kind (agent_matches, trace_view.rs) and never a
+      // null attribution, so the tab opens on the Lead's calls alone.
+      expect(traceListQuery(DEFAULT_TRACE_FILTERS, { sessionStartMs: 0, nowMs: 100, limit: 50 }).agent).toBe("lead");
+    });
+
     it("maps the time presets and the custom range", () => {
       const base = { sessionStartMs: 500, nowMs: 10_000 };
       expect(traceTimeRange({ ...DEFAULT_TRACE_FILTERS, time: "session" }, 500, 10_000)).toEqual({ from_ms: 500 });
@@ -610,7 +618,7 @@ describe("trace page contract helpers", () => {
   });
 
   describe("agent and model options", () => {
-    it("keeps live workers, observed actors and deleted workers' names", () => {
+    it("lists the Lead first, then live workers, observed actors, All and Unattributed", () => {
       const options = traceAgentOptions(
         [
           row({ attribution: attr() }),
@@ -618,7 +626,8 @@ describe("trace page contract helpers", () => {
         ],
         [{ id: "design-trace", name: "design-trace" }],
       );
-      expect(options.map((option) => option.value)).toEqual(["all", "lead", "design-trace", "agent-gone", "unattributed"]);
+      expect(options.map((option) => option.value)).toEqual(["lead", "design-trace", "agent-gone", "all", "unattributed"]);
+      expect(options[0]).toEqual({ value: "lead", label: "Lead" });
     });
 
     it("disambiguates models by provider when a name serves two", () => {

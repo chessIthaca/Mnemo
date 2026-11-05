@@ -59,6 +59,14 @@ Only for really complicated work, where you cannot write the spec without substa
 - For each step, say what an observer can check afterwards: a test that passes, a command output, a screen state.
 - For shared contracts, persistence, concurrency or security work you will dispatch with `review_risk` "high". That needs observable acceptance scenarios on the plan: `acceptance_scenarios` in `plan_create`, or `plan_update` `add_acceptance_scenarios` later. See the High-risk work section of the `mnemo-lead` skill.
 
+### Spec changes and schemas
+
+The project's current-state specs are OpenSpec files in `.coding/openspec/specs/<capability>/spec.md`: a purpose, then requirements with SHALL/MUST text and WHEN/THEN scenarios. `memory_search` finds their requirements, so search before planning a change to behaviour a spec already covers.
+
+- `spec_deltas` on `plan_create` and `plan_update`: the requirements this plan changes, per `capability` — `added`, `modified`, `removed` (with a `reason`) and `renamed` (`from`/`to`). Added and modified requirements carry their SHALL/MUST `text` and one or more `scenarios` with `name`, `when`, `then` and optional `and`. Spec changes are encouraged, not required: a plan touching a specced capability without changing its requirements is still created, and the result adds a "Spec reminder" naming the spec. The delta scenarios count as the plan's acceptance scenarios, so they also satisfy the high-risk requirement above.
+- Schemas: the built-in `spec-driven` needs nothing beyond the fields above. A project on a custom schema can require extra artifacts; put each one's markdown in `sections`, keyed by its artifact id. A refusal prints that artifact's template and rules. `team_dispatch` is refused until the schema's `apply` requirements are present.
+- Closing: at close the plan's spec changes are merged into `.coding/openspec/specs/<capability>/spec.md` and archived under `.coding/openspec/changes/archive/<date>-<slug>/` beside the plan's proposal, design and tasks. A change that no longer applies to the current spec blocks the close; correct it with `plan_update`, then tick the last step again.
+
 ## 3. Confirm
 
 Summarize the plan to the user in a few lines: the steps, the tier each will use, and which run in parallel. For small, clear work, go straight on. For large, ambiguous or costly work, wait for a go-ahead.

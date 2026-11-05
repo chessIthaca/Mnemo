@@ -15,6 +15,7 @@
   } from "../lib/modelSettings";
   import type { EndpointDetailDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
+  import { trackUnsaved } from "../lib/unsavedEdits";
 
   /**
    * The Savings settings page: one switch per optimizer lever with a
@@ -58,6 +59,7 @@
   const options = $derived(modelIdOptions(endpoints));
   const optimizerDirty = $derived(different(optimizer.draft, optimizer.original));
   const pricingDirty = $derived(different(pricing.draft, pricing.original));
+  trackUnsaved(() => optimizerDirty || pricingDirty);
 
   function different(a: unknown, b: unknown): boolean {
     return JSON.stringify(a) !== JSON.stringify(b);

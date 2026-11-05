@@ -3,6 +3,7 @@
   import { EMBEDDING_KEYWORD_ID, EMBEDDING_STATUS_META, budgetDraft, budgetWire, isValidModelRef, modelRefOptions, type BudgetDraft, type EmbeddingSection, type ModelSettingsTransport, type TaskModels } from "../lib/modelSettings";
   import type { EndpointDetailDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
+  import { trackUnsaved } from "../lib/unsavedEdits";
 
   /**
    * The Models settings page: the model each kind of work uses beyond the
@@ -46,6 +47,7 @@
   const visionDirty = $derived(vision.draft !== vision.original);
   const indexDirty = $derived(index.draft !== index.original);
   const budgetDirty = $derived(different(budget.draft, budget.original));
+  trackUnsaved(() => compactionDirty || visionDirty || indexDirty || budgetDirty);
 
   function different(a: unknown, b: unknown): boolean {
     return JSON.stringify(a) !== JSON.stringify(b);

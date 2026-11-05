@@ -9,8 +9,10 @@
   import { createSettingsTransport, emptyTiers, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import { createSpecsTransport } from "../lib/specsSettings";
+  import { provideUnsavedRegistry } from "../lib/unsavedEdits";
   import AppearancePage from "./AppearancePage.svelte";
   import EndpointsPage from "./EndpointsPage.svelte";
+  import InlineConfirm from "./InlineConfirm.svelte";
   import McpPage from "./McpPage.svelte";
   import ModelsPage from "./ModelsPage.svelte";
   import ProjectPage from "./ProjectPage.svelte";
@@ -73,10 +75,54 @@
   // Read once for the first paint; the effect below re-resolves it on every open.
   let page = $state<Page>(untrack(() => startPage(initialPage)));
 
+  /** The pages' shared answer to "would leaving now drop an edit?". */
+  const registry = provideUnsavedRegistry();
+  /** The action the visible banner would run, parked until the user chooses. */
+  let pendingLeave = $state<(() => void) | null>(null);
+
   // Re-resolved on every open, not just at mount, so the gear always lands on
   // the Project page while a later caller can ask for another one.
   $effect(() => {
-    if (open) page = startPage(initialPage);
+    if (open) {
+      page = startPage(initialPage);
+    } else {
+      // A closed dialog drops any question it was still asking.
+      pendingLeave = null;
+    }
+  });
+
+  /**
+   * Ask before leaving while a page holds unsaved edits, then run `action`.
+   * A question already on screen keeps its own action: Escape, the close
+   * button and the backdrop never retarget it.
+   */
+  function requestLeave(action: () => void): void {
+    if (pendingLeave !== null) return;
+    if (!registry.hasUnsaved()) {
+      action();
+      return;
+    }
+    pendingLeave = action;
+  }
+
+  /** A rail click: the page already showing does nothing, and a new pick replaces the question. */
+  function requestPage(next: Page): void {
+    if (next === page) return;
+    // A different page is a different question — retarget the banner, or ask it.
+    pendingLeave = null;
+    requestLeave(() => (page = next));
+  }
+
+  // The browser's own "changes may not be saved" prompt, only while edits are live.
+  $effect(() => {
+    if (!open) return;
+    const guard = (event: BeforeUnloadEvent): void => {
+      if (!registry.hasUnsaved()) return;
+      event.preventDefault();
+      event.returnValue = true;
+    };
+    window.addEventListener("beforeunload", guard);
+    return () => window.removeEventListener("beforeunload", guard);
   });
 
   let endpoints = $state<EndpointDetailDto[]>([]);
@@ -121,7 +167,7 @@
   }
 </script>
 
-<Sheet {open} title="Settings" eyebrow="MNEMO" wide {onclose}>
+<Sheet {open} title="Settings" eyebrow="MNEMO" wide onclose={() => requestLeave(onclose)}>
   {#if !transport}
     <p class="settings-empty">Settings are available in the desktop app.</p>
   {:else}
@@ -131,12 +177,20 @@
           <div class="rail-group">
             <p class="rail-heading">{group.label}</p>
             {#each group.pages as entry (entry.id)}
-              <button class:active={page === entry.id} aria-current={page === entry.id ? "page" : undefined} onclick={() => (page = entry.id)}>{entry.id === "project" ? projectLabel : entry.label}</button>
+              <button class:active={page === entry.id} aria-current={page === entry.id ? "page" : undefined} onclick={() => requestPage(entry.id)}>{entry.id === "project" ? projectLabel : entry.label}</button>
             {/each}
           </div>
         {/each}
       </nav>
       <section class="settings-page">
+        {#if pendingLeave}
+          <InlineConfirm
+            message="Discard unsaved changes?"
+            onkeep={() => (pendingLeave = null)}
+            ondiscard={() => { const run = pendingLeave; pendingLeave = null; run?.(); }}
+          />
+        {/if}
+
         {#if page === "project"}
           <ProjectPage />
         {:else if page === "specs"}

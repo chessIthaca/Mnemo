@@ -461,21 +461,3 @@ export function shareText(share: number | null): string {
 export function evalDateText(record: EvalRecord | null): string {
   return record === null ? "provisional defaults, no eval yet" : `eval ${record.date}`;
 }
-
-// ── Leaving with unsaved edits ────────────────────────────────────────────────
-
-/**
- * Whether a captured DOM event is the user leaving the Tiers page: an
- * Escape keypress (the settings dialog closes on it) or a click on a button
- * outside the page's own subtree — the settings rail or the dialog's close
- * button and backdrop. The page asks for a confirm before either one drops
- * unsaved dispatch edits; every click inside the page keeps its own meaning.
- */
-export function leavesPage(event: Event, root: HTMLElement | null): boolean {
-  if (event instanceof KeyboardEvent) return event.key === "Escape";
-  if (event.type !== "click") return false;
-  const target = event.target;
-  if (!(target instanceof Element)) return false;
-  if (root !== null && root.contains(target)) return false;
-  return target.closest("button") !== null;
-}

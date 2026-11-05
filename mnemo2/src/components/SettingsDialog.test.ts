@@ -1,12 +1,21 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyModel, type EndpointDetailDto, type SettingsTransport, type TiersDto } from "../lib/settingsEngine";
+import { setPreviewAppearanceTransport, type AppearanceSettings } from "../lib/sounds";
 import { app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import SettingsDialog from "./SettingsDialog.svelte";
 import TopBar from "./TopBar.svelte";
 
-const mocks = vi.hoisted(() => ({ transport: null as unknown, modelTransport: null as unknown, layaTransport: null as unknown }));
+
+const mocks = vi.hoisted(() => ({
+  transport: null as unknown,
+  modelTransport: null as unknown,
+  layaTransport: null as unknown,
+  safetyTransport: null as unknown,
+  mcpTransport: null as unknown,
+  specsTransport: null as unknown,
+}));
 
 vi.mock("../lib/settingsEngine", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/settingsEngine")>();
@@ -21,6 +30,21 @@ vi.mock("../lib/modelSettings", async (importOriginal) => {
 vi.mock("../lib/layaSettings", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/layaSettings")>();
   return { ...original, createLayaTransport: () => mocks.layaTransport };
+});
+
+vi.mock("../lib/safetySettings", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/safetySettings")>();
+  return { ...original, createSafetyTransport: () => mocks.safetyTransport };
+});
+
+vi.mock("../lib/mcpSettings", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/mcpSettings")>();
+  return { ...original, createMcpTransport: () => mocks.mcpTransport };
+});
+
+vi.mock("../lib/specsSettings", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/specsSettings")>();
+  return { ...original, createSpecsTransport: () => mocks.specsTransport };
 });
 
 function endpoint(name: string, overrides: Partial<EndpointDetailDto> = {}): EndpointDetailDto {
@@ -86,8 +110,12 @@ describe("SettingsDialog", () => {
     mocks.transport = null;
     mocks.modelTransport = null;
     mocks.layaTransport = null;
+    mocks.safetyTransport = null;
+    mocks.mcpTransport = null;
+    mocks.specsTransport = null;
     app.set(fixtureState());
   });
+
 
   it("opens from the gear straight onto the Project page, with no per-project sheet left", async () => {
     makeTransport();
@@ -406,5 +434,397 @@ describe("SettingsDialog", () => {
     await openDialog();
     await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
     expect(await screen.findByText("Laya settings are available in the desktop app.")).toBeTruthy();
+  });
+});
+
+/**
+ * The dialog-level unsaved guard: every draft page reports through one
+ * registry, and closing or switching pages asks first.
+ */
+describe("unsaved edits", () => {
+  beforeEach(() => {
+    mocks.transport = null;
+    mocks.modelTransport = null;
+    mocks.layaTransport = null;
+    mocks.safetyTransport = null;
+    mocks.mcpTransport = null;
+    mocks.specsTransport = null;
+    app.set(fixtureState());
+  });
+
+  /** The Models and Savings pages share the model-settings transport. */
+  function makeModelTransport() {
+    mocks.modelTransport = {
+      get: vi.fn(async () => ({
+        task_models: { summarize: null },
+        vision_model: null,
+        embedding: {
+          selected: "hash",
+          status: "keyword_only",
+          options: [{ id: "hash", label: "Keyword only", size_mb: 0, installed: true }],
+        },
+        optimizer: {
+          delta_reads: true,
+          compress_output: true,
+          archive: true,
+          compaction_survival: true,
+          quality_score: true,
+          lean_output_nudge: true,
+          recall_delta: false,
+          archive_min_chars: 2400,
+          compress_min_chars: 3000,
+          lean_output_fill_pct: 80,
+          nudge_cooldown_requests: 4,
+          compress_extra_commands: [],
+        },
+
+        pricing: [{ model: "m1", input_per_1m: 3, output_per_1m: 15, cached_per_1m: 0 }],
+        budget: { enabled: false, max_tokens_per_plan: 0, max_escalations_per_plan: 0, max_retries_per_lane: 0 },
+      })),
+      save: vi.fn(async () => undefined),
+      install: vi.fn(async () => undefined),
+      onEmbedderEvent: vi.fn(async () => () => {}),
+    };
+  }
+
+  function safetySnapshot() {
+    return { mode: "approve-each-action", rules: [], project_open: true, live_lead: false };
+  }
+
+  function makeSafetyTransport() {
+    mocks.safetyTransport = {
+      get: vi.fn(async () => safetySnapshot()),
+      saveMode: vi.fn(async () => safetySnapshot()),
+      saveRules: vi.fn(async () => safetySnapshot()),
+    };
+  }
+
+  function mcpServer() {
+    return {
+      name: "fs",
+      enabled: true,
+      command: "npx",
+      args: ["-y", "server-fs"],
+      env: [],
+      headers_env: {},
+      scopes: [],
+      trusted: false,
+      source: "global",
+    };
+  }
+
+  function makeMcpTransport() {
+    const snapshot = { servers: [mcpServer()], project_open: true, live_lead: false, statuses: [] };
+    mocks.mcpTransport = {
+      get: vi.fn(async () => snapshot),
+      save: vi.fn(async () => snapshot),
+      test: vi.fn(async () => ({ ok: true, tools: [], error: null })),
+    };
+  }
+
+  function makeSpecsTransport() {
+    const schemas = {
+      schemas: [
+        {
+          name: "default",
+          reference: "default",
+          description: "",
+          origin: "project",
+          path: ".coding/openspec/schemas/default",
+          artifacts: ["context"],
+          warnings: [],
+          error: null,
+        },
+      ],
+      active: "default",
+      active_error: null,
+    };
+    const artifacts = { name: "default", reference: "default", origin: "project", description: "", artifacts: [] };
+    const config = { schema: "default", context: "Original context", rules: {}, warnings: [] };
+    mocks.specsTransport = {
+      status: vi.fn(async () => ({ capabilities: [], pending_plans: [], openspec_cli: true })),
+      listSchemas: vi.fn(async () => schemas),
+      setActiveSchema: vi.fn(async () => schemas),
+      addSchema: vi.fn(async () => schemas),
+      forkSchema: vi.fn(async () => schemas),
+      readArtifacts: vi.fn(async () => artifacts),
+      saveArtifact: vi.fn(async () => artifacts),
+      readConfig: vi.fn(async () => config),
+      saveConfig: vi.fn(async () => config),
+      planPreview: vi.fn(async () => ({ name: "", reference: "", description: "", sections: [], required: [], worker_context: "" })),
+      runValidate: vi.fn(async () => ({ exit_code: 0, stdout: "", stderr: "" })),
+    };
+  }
+
+  /** Open the dialog on a fresh instance and hand back the close spy. */
+  function openSettings(initialPage?: "project" | "specs" | "endpoints" | "tiers" | "models" | "savings" | "safety" | "mcp" | "appearance") {
+    makeTransport();
+    const onclose = vi.fn();
+    render(SettingsDialog, { open: true, onclose, ...(initialPage ? { initialPage } : {}) });
+    return onclose;
+  }
+
+  /** One draft page: how to reach it, one unsaved edit, and proof it survived. */
+  type PageCase = {
+    name: string;
+    prepare: () => void;
+    open: () => Promise<void>;
+    edit: () => Promise<void>;
+    kept: () => boolean;
+  };
+
+  const editedUrl = "https://edited.example/v1/";
+  const editedDefinition = "Edited: cheap chatter only";
+
+  const pages: PageCase[] = [
+    {
+      name: "Endpoints",
+      prepare: () => {},
+      open: async () => {
+        await screen.findByRole("button", { name: "Edit alpha" });
+      },
+      edit: async () => {
+        await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: editedUrl } });
+      },
+      kept: () => (screen.getByLabelText("Base URL") as HTMLInputElement).value === editedUrl,
+    },
+    {
+      name: "Tiers",
+      prepare: () => {},
+      open: async () => {
+        await screen.findByRole("button", { name: "Edit alpha" });
+        await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
+        await screen.findByRole("region", { name: "Routine tier" });
+      },
+      edit: async () => {
+        const routine = screen.getByRole("region", { name: "Routine tier" });
+        await fireEvent.input(within(routine).getByLabelText(/^Definition/), { target: { value: editedDefinition } });
+      },
+      kept: () =>
+        (within(screen.getByRole("region", { name: "Routine tier" })).getByLabelText(/^Definition/) as HTMLTextAreaElement)
+          .value === editedDefinition,
+    },
+    {
+      name: "Models",
+      prepare: makeModelTransport,
+      open: async () => {
+        await screen.findByRole("button", { name: "Edit alpha" });
+        await fireEvent.click(screen.getByRole("button", { name: "Models" }));
+        await screen.findByLabelText("Compaction model");
+      },
+      edit: async () => {
+        await fireEvent.input(screen.getByLabelText("Compaction model"), { target: { value: "alpha/m1" } });
+      },
+      kept: () => (screen.getByLabelText("Compaction model") as HTMLInputElement).value === "alpha/m1",
+    },
+    {
+      name: "Savings",
+      prepare: makeModelTransport,
+      open: async () => {
+        await screen.findByRole("button", { name: "Edit alpha" });
+        await fireEvent.click(screen.getByRole("button", { name: "Savings" }));
+        await screen.findByRole("region", { name: "Savings levers" });
+      },
+      edit: async () => {
+        await fireEvent.click(screen.getByRole("checkbox", { name: /Delta reads/ }));
+      },
+      kept: () => !(screen.getByRole("checkbox", { name: /Delta reads/ }) as HTMLInputElement).checked,
+    },
+    {
+      name: "Safety",
+      prepare: makeSafetyTransport,
+      open: async () => {
+        await screen.findByRole("button", { name: "Edit alpha" });
+        await fireEvent.click(screen.getByRole("button", { name: "Safety" }));
+        await screen.findByRole("region", { name: "Approval mode" });
+      },
+      edit: async () => {
+        await fireEvent.click(screen.getByRole("radio", { name: /Run without asking/ }));
+      },
+      kept: () => (screen.getByRole("radio", { name: /Run without asking/ }) as HTMLInputElement).checked,
+    },
+    {
+      name: "MCP",
+      prepare: makeMcpTransport,
+      open: async () => {
+        await screen.findByRole("button", { name: "Edit alpha" });
+        await fireEvent.click(screen.getByRole("button", { name: "MCP" }));
+        await screen.findByRole("region", { name: "MCP servers" });
+      },
+      edit: async () => {
+        await fireEvent.click(screen.getByRole("checkbox", { name: "Enabled" }));
+      },
+      kept: () => !(screen.getByRole("checkbox", { name: "Enabled" }) as HTMLInputElement).checked,
+    },
+    {
+      name: "Specs",
+      prepare: makeSpecsTransport,
+      open: async () => {
+        await screen.findByRole("button", { name: "Edit alpha" });
+        await fireEvent.click(screen.getByRole("button", { name: "Specs" }));
+        const context = await screen.findByLabelText("Project context");
+        await waitFor(() => expect((context as HTMLTextAreaElement).disabled).toBe(false));
+      },
+      edit: async () => {
+        await fireEvent.input(screen.getByLabelText("Project context"), { target: { value: "Edited context" } });
+      },
+      kept: () => (screen.getByLabelText("Project context") as HTMLTextAreaElement).value === "Edited context",
+    },
+  ];
+
+  for (const entry of pages) {
+    it(`${entry.name}: X with an unsaved edit asks, Keep editing keeps it, Discard changes closes`, async () => {
+      entry.prepare();
+      const onclose = openSettings();
+      await entry.open();
+      await entry.edit();
+
+      await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      const banner = await screen.findByRole("alert");
+      expect(within(banner).getByText("Discard unsaved changes?")).toBeTruthy();
+      expect(onclose).not.toHaveBeenCalled();
+
+      await fireEvent.click(within(banner).getByRole("button", { name: "Keep editing" }));
+      expect(screen.queryByText("Discard unsaved changes?")).toBeNull();
+      expect(onclose).not.toHaveBeenCalled();
+      expect(entry.kept()).toBe(true);
+
+      await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      const again = await screen.findByRole("alert");
+      await fireEvent.click(within(again).getByRole("button", { name: "Discard changes" }));
+      expect(onclose).toHaveBeenCalledTimes(1);
+    });
+  }
+
+
+  it("Escape asks instead of closing", async () => {
+    const onclose = openSettings();
+    await screen.findByRole("button", { name: "Edit alpha" });
+    await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: editedUrl } });
+
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(await screen.findByText("Discard unsaved changes?")).toBeTruthy();
+    expect(onclose).not.toHaveBeenCalled();
+  });
+
+  it("the backdrop asks instead of closing", async () => {
+    const onclose = openSettings();
+    await screen.findByRole("button", { name: "Edit alpha" });
+    await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: editedUrl } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Close sheet" }));
+    expect(await screen.findByText("Discard unsaved changes?")).toBeTruthy();
+    expect(onclose).not.toHaveBeenCalled();
+  });
+
+  it("a rail click asks and switches only after Discard changes", async () => {
+    const onclose = openSettings();
+    await screen.findByRole("button", { name: "Edit alpha" });
+    await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: editedUrl } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
+    expect(await screen.findByText("Discard unsaved changes?")).toBeTruthy();
+    // Still on Endpoints: the rail did not move and the draft is intact.
+    expect(screen.getByRole("button", { name: "Endpoints" }).getAttribute("aria-current")).toBe("page");
+    expect((screen.getByLabelText("Base URL") as HTMLInputElement).value).toBe(editedUrl);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Tiers" }).getAttribute("aria-current")).toBe("page"));
+    expect(onclose).not.toHaveBeenCalled();
+  });
+
+  it("Escape while asking keeps the question up", async () => {
+    const onclose = openSettings();
+    await screen.findByRole("button", { name: "Edit alpha" });
+    await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: editedUrl } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(await screen.findByText("Discard unsaved changes?")).toBeTruthy();
+
+    // Escape and a second X both leave the one question standing.
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.getByText("Discard unsaved changes?")).toBeTruthy();
+    expect(onclose).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.queryByText("Discard unsaved changes?")).toBeNull();
+    expect((screen.getByLabelText("Base URL") as HTMLInputElement).value).toBe(editedUrl);
+  });
+
+  it("focus lands on Keep editing", async () => {
+    openSettings();
+    await screen.findByRole("button", { name: "Edit alpha" });
+    await fireEvent.input(screen.getByLabelText("Base URL"), { target: { value: editedUrl } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    const keep = await screen.findByRole("button", { name: "Keep editing" });
+    await waitFor(() => expect(document.activeElement).toBe(keep));
+  });
+
+  it("a clean page closes at once with no question", async () => {
+    const onclose = openSettings();
+    await screen.findByRole("button", { name: "Edit alpha" });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onclose).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Discard unsaved changes?")).toBeNull();
+  });
+
+  it("a clean page switches at once", async () => {
+    const onclose = openSettings();
+    await screen.findByRole("button", { name: "Edit alpha" });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Tiers" }).getAttribute("aria-current")).toBe("page"));
+    expect(screen.queryByText("Discard unsaved changes?")).toBeNull();
+    expect(onclose).not.toHaveBeenCalled();
+  });
+
+  it("Project and Appearance never ask", async () => {
+    // Project applies on change, so there is nothing to protect.
+    const onclose = openSettings("project");
+    const slots = await screen.findByLabelText("Project worker slots");
+    await fireEvent.change(slots, { target: { value: "5" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onclose).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    // Appearance saves each toggle as it is clicked.
+    const appearance: AppearanceSettings = {
+      sound_complete: true,
+      sound_input_needed: true,
+      sound_stopped_errors: true,
+      theme: "light",
+      close_behavior: "auto",
+    };
+    setPreviewAppearanceTransport({
+      get: vi.fn(async () => appearance),
+      save: vi.fn(async () => ({ ...appearance, sound_complete: false })),
+    });
+
+    const again = openSettings("appearance");
+    const sounds = await screen.findByRole("region", { name: "Sounds" });
+    expect(within(sounds).getAllByRole("checkbox").length).toBeGreaterThan(0);
+    await fireEvent.click(within(sounds).getAllByRole("checkbox")[0]);
+    await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(again).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Discard unsaved changes?")).toBeNull();
+    setPreviewAppearanceTransport(null);
+  });
+
+  it("an open MCP form counts as unsaved", async () => {
+    makeMcpTransport();
+    const onclose = openSettings("mcp");
+    await screen.findByRole("region", { name: "MCP servers" });
+
+    // Typing into the add form leaves the saved list untouched but holds values.
+    await fireEvent.click(screen.getByRole("button", { name: "Add server" }));
+    const editor = await screen.findByRole("region", { name: "Server editor" });
+    await fireEvent.input(within(editor).getByLabelText("Name"), { target: { value: "half-typed" } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(await screen.findByText("Discard unsaved changes?")).toBeTruthy();
+    expect(onclose).not.toHaveBeenCalled();
   });
 });

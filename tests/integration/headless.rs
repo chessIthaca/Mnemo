@@ -1415,6 +1415,22 @@ impl LlmClient for PendingLlm {
 }
 
 #[tokio::test]
+// Windows/Linux cover the Full path; the macOS runner takes the other side
+// of a real race. `Session::send` -> `agent_command` awaits the manager
+// mutex before `AgentManager::send`'s `try_send`, and that await point (plus
+// the tokio coop budget) lets the agent task run mid-loop — where the turn's
+// `select!` polls `cmd_rx.recv()` beside the pending provider future
+// (src/agent/turn.rs:4805-4828 and the mid-stream loop at :5196), draining
+// each queued `Compact` before the next insert. The 64-slot command channel
+// (src/host/runtime.rs:405) is then never full, so the test sees no Err.
+// No provider behaviour can wedge that select (a hanging `complete()` is
+// itself inside it), so the queue cannot be filled deterministically on
+// macOS without a production test hook; the `Full` handling under test is
+// covered on the platforms where the sender wins the race.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the agent task drains queued commands mid-turn on the macOS runner, so the queue never fills; covered on Windows/Linux"
+)]
 async fn close_and_wait_rejects_a_full_command_queue() {
     let root = tempfile::tempdir().expect("workspace");
     let cfg = tempfile::tempdir().expect("config");

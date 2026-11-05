@@ -1091,6 +1091,16 @@
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "e76ff094",
+      "status": "closed",
+      "created_at_ms": 1793909772982,
+      "closed_at_ms": 1793910121650,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-e76ff094-20261105-202201.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

@@ -490,9 +490,17 @@ where
 }
 
 /// Answer a connection over the cap with `503` and close it.
+///
+/// The client's request is still unread when the refusal is written. Closing
+/// with unread data queued turns the FIN into an RST on BSD sockets (macOS),
+/// so the client's read fails with `ConnectionReset` before it ever sees the
+/// 503; shutting the write side and then draining the read side until EOF (at
+/// most 500 ms) lets the close be an orderly FIN everywhere.
 async fn reject_busy(mut stream: TcpStream) {
     let busy = Response::error(503, "too many open connections");
     let _ = tokio::time::timeout(Duration::from_secs(2), write_response(&mut stream, &busy)).await;
+    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_millis(500), peer_closed(&mut stream)).await;
 }
 
 /// Resolves when the peer closes its end (a hung-up long-poll).

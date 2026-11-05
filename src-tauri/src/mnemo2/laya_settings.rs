@@ -60,8 +60,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use mnemo::agent::route_knn::RouteKnn;
-use mnemo::agent::route_question::OfferedLabels;
+use mnemo::OfferedLabels;
+use mnemo::RouteKnn;
 use mnemo::config::general::LayaConfig;
 use mnemo::config::settings_dto::{RoutingConfigDto, SettingsSaveDto};
 use mnemo::config::Config;

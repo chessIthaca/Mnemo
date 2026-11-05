@@ -28,7 +28,8 @@ pub mod team;
 pub mod dispatch_routing;
 
 /// The routing eval's core (corpora, threshold table, `route_eval.json`) —
-/// shared by the `mnemo2_route_eval` CLI and the Laya page's Run-eval button.
+/// shared by the `mnemo2-app` package's `mnemo2_route_eval` example CLI and
+/// the Laya page's Run-eval button.
 pub mod route_eval;
 
 /// Best-effort naming of the processes holding a worker checkout's files.

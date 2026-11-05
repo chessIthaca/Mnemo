@@ -31,7 +31,7 @@ const app = join(targetDir, `mnemo2${exe}`);
 const configDir = process.env.MNEMO_HOME || join(homedir(), ".mnemo");
 
 if (!existsSync(helper)) {
-  console.error(`install-mnemo2-mcp: ${helper} is missing; build it with --bin mnemo2-mcp first.`);
+  console.error(`install-mnemo2-mcp: ${helper} is missing; build it with cargo build -p mnemo2-app --bin mnemo2-mcp first.`);
   process.exit(1);
 }
 

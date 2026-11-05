@@ -392,13 +392,15 @@ fn read_regular_file(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: u32 = 0x20000;
+        // The unix extension's `custom_flags` takes `i32` — only the Windows
+        // extension above takes `u32`.
+        const O_NOFOLLOW: i32 = 0x20000;
         options.custom_flags(O_NOFOLLOW);
     }
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: u32 = 0x100;
+        const O_NOFOLLOW: i32 = 0x100;
         options.custom_flags(O_NOFOLLOW);
     }
     let file = options

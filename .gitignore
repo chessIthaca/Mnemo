@@ -29,6 +29,7 @@ pnpm-debug.log*
 
 # ===== Tauri =====
 src-tauri/gen/
+src-tauri/mnemo2-app/gen/
 src-tauri/WixTools/
 
 # ===== Environment / secrets =====

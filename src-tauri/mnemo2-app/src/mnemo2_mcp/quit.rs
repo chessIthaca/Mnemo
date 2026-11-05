@@ -293,9 +293,11 @@ mod tests {
             {
                 let alive = Arc::clone(&alive);
                 move |_: u32| {
-                    alive
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
-                        .is_ok()
+                    let left = alive.load(Ordering::SeqCst);
+                    left > 0
+                        && alive
+                            .compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
                 }
             },
             Arc::clone(&waits),

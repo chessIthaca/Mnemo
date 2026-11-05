@@ -12,7 +12,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use mnemo::config::{global_config_dir, Config, SafetyMode};
+use mnemo::config::{Config, SafetyMode};
 use mnemo::app::project::Project;
 use mnemo::provider::trace::LlmRequestLog;
 use mnemo::AgentManager;
@@ -40,7 +40,7 @@ use mnemo::notifier::{HostEvent, HostNotifier};
 /// clearly present). Debug builds ignore this and always expose CDP.
 #[cfg(windows)]
 fn browser_inspection_enabled() -> bool {
-    let path = global_config_dir().join("config.toml");
+    let path = mnemo::config::global_config_dir().join("config.toml");
     mnemo::config::GeneralConfig::load_or_default(&path)
         .map(|c| c.general.enable_browser_inspection)
         .unwrap_or(false)

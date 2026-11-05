@@ -35,6 +35,7 @@
 //! status is `FineTuning { label }` — restored to `Ready` on any skip (only
 //! a still-own `FineTuning` is ever overwritten).
 
+#[cfg(feature = "mnemo2")]
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,7 @@ use std::sync::{Arc, RwLock};
 use tauri::{AppHandle, Emitter};
 
 use mnemo::{read_rows, training_log_path, FailureLogRow};
+#[cfg(feature = "mnemo2")]
 use mnemo::agent::failure_triage::training_log_dir;
 use mnemo::config::Config;
 use mnemo::config::general::LayaConfig;

@@ -454,6 +454,24 @@ pub struct LlmRequestRecord {
     /// in flight. Pure network waiting (not local work); includes the full
     /// round trip and the reasoning_effort fallback retry when one fires.
     pub connect_ms: Option<u32>,
+    /// Request-body upload time in ms (POST sent → the request body fully
+    /// written to the socket, stamped live by the wrapping body stream —
+    /// plan 7bc0b473). `None` on legacy rows and when the body never
+    /// finished writing (the window then stays inside `connect_ms`).
+    /// Accumulates across the reasoning_effort fallback retry's two send
+    /// attempts.
+    pub upload_ms: Option<u32>,
+    /// Server wait in ms (request body fully written → the POST response
+    /// headers arrived) — the prefill/queue wait the coarse Connect
+    /// bucket used to absorb silently. `None` on legacy rows and when no
+    /// upload-completed instant anchors the window. Accumulates across
+    /// the reasoning_effort fallback retry's two send attempts.
+    pub server_ms: Option<u32>,
+    /// SSE byte-chunks read during the stream (transport-level reads the
+    /// pump loop made — not events: one chunk can carry several SSE
+    /// events and one event can span chunks). `None` on legacy rows and
+    /// when no chunk was ever read.
+    pub chunks: Option<u32>,
     /// Tools time in ms (stream end → the tool batch this response triggered
     /// finished executing). Attributed by the turn loop via
     /// [`LlmRequestLog::set_tools_ms`] — the record for the request whose
@@ -610,6 +628,13 @@ pub struct LlmRequestSummary {
     /// in flight. Pure network waiting (not local work); includes the full
     /// round trip and the reasoning_effort fallback retry when one fires.
     pub connect_ms: Option<u32>,
+    /// Request-body upload time in ms (see [`LlmRequestRecord::upload_ms`]).
+    pub upload_ms: Option<u32>,
+    /// Server wait in ms (see [`LlmRequestRecord::server_ms`]).
+    pub server_ms: Option<u32>,
+    /// SSE byte-chunks read during the stream (see
+    /// [`LlmRequestRecord::chunks`]).
+    pub chunks: Option<u32>,
     /// Tools time in ms (stream end → the tool batch this response triggered
     /// finished executing).
     pub tools_ms: Option<u32>,
@@ -662,6 +687,9 @@ impl From<&LlmRequestRecord> for LlmRequestSummary {
             generation_ms: r.generation_ms,
             reasoning_ms: r.reasoning_ms,
             connect_ms: r.connect_ms,
+            upload_ms: r.upload_ms,
+            server_ms: r.server_ms,
+            chunks: r.chunks,
             tools_ms: r.tools_ms,
             prep_ms: r.prep_ms,
             compact_ms: r.compact_ms,
@@ -913,6 +941,9 @@ impl LlmRequestLog {
             generation_ms: None,
             reasoning_ms: None,
             connect_ms: None,
+            upload_ms: None,
+            server_ms: None,
+            chunks: None,
             tools_ms: None,
             prep_ms: None,
             compact_ms: None,
@@ -1043,6 +1074,34 @@ impl LlmRequestLog {
     /// ids.
     pub fn set_connect_ms(&self, id: u64, ms: u32) {
         self.with_record(id, |r| r.connect_ms = Some(ms));
+    }
+
+    /// Stamp the upload bucket — POST sent → the request body fully
+    /// written (stamped live by the wrapping body stream the moment the
+    /// final piece is handed to the transport, so the Trace tab can
+    /// distinguish "uploading" from "waiting for first token" while the
+    /// call is in flight). Routed through `with_record` so the
+    /// file-writer mirror sees the mutation. A no-op for unknown/evicted
+    /// ids.
+    pub fn set_upload_ms(&self, id: u64, ms: u32) {
+        self.with_record(id, |r| r.upload_ms = Some(ms));
+    }
+
+    /// Stamp the server-wait bucket — request body fully written → the
+    /// POST response headers arrived (the prefill/queue wait the coarse
+    /// connect bucket used to absorb). Stamped live when the headers
+    /// arrive and re-stamped at every connect stamp site so a row that
+    /// ends abnormally still carries the window. A no-op for
+    /// unknown/evicted ids.
+    pub fn set_server_ms(&self, id: u64, ms: u32) {
+        self.with_record(id, |r| r.server_ms = Some(ms));
+    }
+
+    /// Stamp the SSE byte-chunk count read during the stream — updated
+    /// live on every transport read so an in-flight row shows streaming
+    /// progress. A no-op for unknown/evicted ids.
+    pub fn set_chunks(&self, id: u64, chunks: u32) {
+        self.with_record(id, |r| r.chunks = Some(chunks));
     }
 
     /// Stamp the generation bucket on an error record — the elapsed time
@@ -3123,6 +3182,9 @@ mod tests {
             generation_ms: None,
             reasoning_ms: None,
             connect_ms: None,
+            upload_ms: None,
+            server_ms: None,
+            chunks: None,
             tools_ms: None,
             prep_ms: None,
             compact_ms: None,

@@ -1307,7 +1307,10 @@ impl PlanBoard {
             }
             BoardStatus::Abandoned => return Err(format!("plan {id} was abandoned")),
         }
-        if !entry.spec_deltas.is_empty() {
+        // Idempotent OpenSpec close: the archive marker is written last, so its
+        // presence means an earlier attempt already applied every delta and
+        // wrote the archive — only the report and board save remain to retry.
+        if !entry.spec_deltas.is_empty() && !archive::already_archived(&self.openspec_dir(), id) {
             let plan = self.load_plan(id)?;
             let resolved = Schema::resolve(&self.openspec_dir(), Some(&entry.schema))?;
             let prepared = archive::prepare_close(
@@ -2861,10 +2864,60 @@ mod tests {
         assert_eq!(metadata.get("schema").map(String::as_str), Some("custom"));
         assert_eq!(metadata.get("mnemo_plan"), Some(&plan.id));
         assert!(!archive.join("specs").exists());
+        assert!(dir.path().join("openspec/specs/importer/spec.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_close_retries_after_the_archive_succeeded_but_the_report_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                spec_deltas: vec![added_delta("importer", "Preserve source rows")],
+                ..draft("Archive retry")
+            })
+            .unwrap();
+        complete_steps(&board, &plan.id);
+
+        // A plain file where the reviews directory should be makes the report
+        // write fail while the OpenSpec writes before it already succeeded.
+        std::fs::write(dir.path().join("reviews"), "not a directory").unwrap();
+        let CloseOutcome::Blocked { reasons } =
+            board.try_close(&plan.id, &FakeLedger::passing()).await
+        else {
+            panic!("a failed report write must block the close");
+        };
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("could not write the review report")),
+            "{reasons:?}"
+        );
         assert!(dir
             .path()
             .join("openspec/specs/importer/spec.md")
             .is_file());
+        assert_eq!(board.get(&plan.id).unwrap().status, BoardStatus::Open);
+
+        // Repair the reviews directory and retry: the close must not re-apply
+        // the already-merged and already-archived spec changes.
+        std::fs::remove_file(dir.path().join("reviews")).unwrap();
+        std::fs::create_dir(dir.path().join("reviews")).unwrap();
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+        let spec =
+            std::fs::read_to_string(dir.path().join("openspec/specs/importer/spec.md")).unwrap();
+        assert_eq!(
+            spec.matches("### Requirement: Preserve source rows")
+                .count(),
+            1,
+            "{spec}"
+        );
+        let archive = dir.path().join("openspec/changes/archive");
+        assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 1);
+        assert_eq!(board.get(&plan.id).unwrap().status, BoardStatus::Closed);
     }
 
     #[test]

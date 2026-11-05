@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
+use serde_norway::Value;
 
 use super::schema::ResolvedSchema;
 use crate::app::workflow::PlanFile;
@@ -25,29 +26,41 @@ struct PreparedWrite {
 /// any capability leaves all current-state specs and the archive untouched.
 pub(crate) struct PreparedOpenSpecClose {
     writes: Vec<PreparedWrite>,
+    /// The archive marker, written last: its presence on disk means every
+    /// spec and archive file of this close was already written.
+    marker: Option<PreparedWrite>,
 }
 
 impl PreparedOpenSpecClose {
-    /// Write the staged current-state specs and archive files.
+    /// Write the staged current-state specs and archive files, then the marker
+    /// last — a retried close sees the marker and skips re-applying the deltas.
     pub(crate) fn write(self) -> Result<(), String> {
         for file in self.writes {
-            if let Some(parent) = file.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    format!(
-                        "could not create OpenSpec folder '{}': {error}",
-                        parent.display()
-                    )
-                })?;
-            }
-            std::fs::write(&file.path, file.contents).map_err(|error| {
-                format!(
-                    "could not write OpenSpec file '{}': {error}",
-                    file.path.display()
-                )
-            })?;
+            write_one(file)?;
+        }
+        if let Some(marker) = self.marker {
+            write_one(marker)?;
         }
         Ok(())
     }
+}
+
+/// Write one staged file, creating its folder first.
+fn write_one(file: PreparedWrite) -> Result<(), String> {
+    if let Some(parent) = file.path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "could not create OpenSpec folder '{}': {error}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(&file.path, file.contents).map_err(|error| {
+        format!(
+            "could not write OpenSpec file '{}': {error}",
+            file.path.display()
+        )
+    })
 }
 
 #[derive(Serialize)]
@@ -67,7 +80,10 @@ pub(crate) fn prepare_close(
     date: &str,
 ) -> Result<PreparedOpenSpecClose, String> {
     if deltas.is_empty() {
-        return Ok(PreparedOpenSpecClose { writes: Vec::new() });
+        return Ok(PreparedOpenSpecClose {
+            writes: Vec::new(),
+            marker: None,
+        });
     }
 
     let specs_dir = openspec_dir.join("specs");
@@ -121,15 +137,11 @@ pub(crate) fn prepare_close(
             contents,
         });
     }
-    let metadata = serde_norway::to_string(&ArchiveMetadata {
+    let marker = serde_norway::to_string(&ArchiveMetadata {
         schema: &resolved.schema.name,
         mnemo_plan: plan_id,
     })
     .map_err(|error| format!("could not render OpenSpec archive metadata: {error}"))?;
-    archive_files.push(PreparedWrite {
-        path: archive_dir.join(".openspec.yaml"),
-        contents: metadata,
-    });
 
     let mut writes = Vec::new();
     for (capability, spec) in specs {
@@ -139,7 +151,37 @@ pub(crate) fn prepare_close(
         });
     }
     writes.extend(archive_files);
-    Ok(PreparedOpenSpecClose { writes })
+    Ok(PreparedOpenSpecClose {
+        writes,
+        marker: Some(PreparedWrite {
+            path: archive_dir.join(".openspec.yaml"),
+            contents: marker,
+        }),
+    })
+}
+
+/// Whether this plan's OpenSpec close already completed. The archive marker is
+/// written last, after every spec and archive file, so a marker naming this
+/// plan means a retried close must not apply the deltas again — only the
+/// review report and the board save remain. A missing or unreadable marker
+/// simply counts as absent: the normal close path re-runs and either succeeds
+/// or reports the actual conflict.
+pub(crate) fn already_archived(openspec_dir: &Path, plan_id: &str) -> bool {
+    let Ok(folders) = std::fs::read_dir(openspec_dir.join("changes").join("archive")) else {
+        return false;
+    };
+    for folder in folders.flatten() {
+        let Ok(text) = std::fs::read_to_string(folder.path().join(".openspec.yaml")) else {
+            continue;
+        };
+        let Ok(metadata) = serde_norway::from_str::<Value>(&text) else {
+            continue;
+        };
+        if metadata.get("mnemo_plan").and_then(Value::as_str) == Some(plan_id) {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_capability(capability: &str) -> Result<(), String> {

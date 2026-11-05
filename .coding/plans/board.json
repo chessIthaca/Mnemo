@@ -1309,10 +1309,10 @@
     },
     {
       "id": "a707e9fa",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793919163037,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793920968987,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-a707e9fa-20261105-232248.md",
       "abandon_reason": null,
       "spec_deltas": [
         {

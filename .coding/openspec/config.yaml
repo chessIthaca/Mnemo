@@ -52,7 +52,12 @@ governed_files:
     - src/app/plan_board.rs
     - src-tauri/src/mnemo2/team.rs
   # plan-board — born with plan a707e9fa's spec delta (the spec-impact gate
-  # requirement): the plan board and its plan_create/plan_update tools.
+  # requirement): the plan board and its plan_create/plan_update tools,
+  # plus the openspec machinery the gate itself reads (audit follow-up:
+  # schema.rs and capability_spec.rs are governed so gate changes need a
+  # plan-board delta).
   plan-board:
     - src/app/plan_board.rs
     - src/app/tool/workflow/board.rs
+    - src/app/openspec/schema.rs
+    - src/app/openspec/capability_spec.rs

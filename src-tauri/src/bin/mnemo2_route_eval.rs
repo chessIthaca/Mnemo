@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use mnemo::agent::route_question::OfferedLabels;
+use mnemo::route_question::OfferedLabels;
 use mnemo::memory::classifier::{ClassifierStatus, LayaClassifier};
 
 use mnemo_app::mnemo2::dispatch_routing::{self, DispatchRoutingRow};

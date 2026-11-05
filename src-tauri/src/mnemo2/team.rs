@@ -8713,25 +8713,65 @@ fn acceptance_scenarios(doc: &str) -> (bool, usize) {
     (found, bullets)
 }
 
-/// Require the dispatched board plan's document to declare observable
-/// `## Acceptance scenarios` before a high-risk dispatch on it.
-///
-/// Returns an actionable error for a missing section and for a section
-/// without an observable bullet.
+/// Require observable acceptance scenarios before a high-risk dispatch.
+/// Either the lead's `## Acceptance scenarios` bullets or a complete OpenSpec
+/// `Scenario:` block under `## Spec changes` satisfies the requirement.
 fn require_acceptance_scenarios(plan_id: &str, doc: &str) -> Result<(), String> {
-    let guidance = "add observable scenarios with plan_update add_acceptance_scenarios, or dispatch with review_risk='standard'";
+    let guidance = "add observable scenarios with plan_update add_acceptance_scenarios or spec_deltas, or dispatch with review_risk='standard'";
     let (found, bullets) = acceptance_scenarios(doc);
+    if found && bullets > 0 {
+        return Ok(());
+    }
+
+    let mut in_spec_changes = false;
+    let mut in_scenario = false;
+    let mut has_when = false;
+    let mut has_then = false;
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        let level = trimmed.chars().take_while(|c| *c == '#').count();
+        if level > 0 && trimmed[level..].starts_with(' ') {
+            if in_scenario && has_when && has_then {
+                return Ok(());
+            }
+            in_scenario = false;
+            has_when = false;
+            has_then = false;
+            let heading = trimmed[level..].trim();
+            if level <= 2 {
+                in_spec_changes = level == 2 && heading.eq_ignore_ascii_case("spec changes");
+            } else if in_spec_changes && heading.starts_with("Scenario:") {
+                in_scenario = true;
+            }
+            continue;
+        }
+        if !in_spec_changes || !in_scenario {
+            continue;
+        }
+        let Some(text) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            continue;
+        };
+        if let Some(value) = text.trim().strip_prefix("**WHEN**") {
+            has_when = has_when || !value.trim().is_empty();
+        } else if let Some(value) = text.trim().strip_prefix("**THEN**") {
+            has_then = has_then || !value.trim().is_empty();
+        }
+    }
+    if in_scenario && has_when && has_then {
+        return Ok(());
+    }
+
     if !found {
         return Err(format!(
             "review_risk='high' requires acceptance scenarios, but plan '{plan_id}' does not declare any; {guidance}"
         ));
     }
-    if bullets == 0 {
-        return Err(format!(
-            "review_risk='high' requires acceptance scenarios, but plan '{plan_id}' has no observable bullet (a concrete, verifiable outcome of at least eight characters); {guidance}"
-        ));
-    }
-    Ok(())
+    Err(format!(
+        "review_risk='high' requires acceptance scenarios, but plan '{plan_id}' has no observable bullet (a concrete, verifiable outcome of at least eight characters) or complete OpenSpec scenario; {guidance}"
+    ))
 }
 
 /// Enforce every source/evidence precondition while the merge lock is held.
@@ -10754,6 +10794,30 @@ models = [\"scripted-a\", \"scripted-b\"]
             "# Plan\n\n## Acceptance scenarios\n\n- A standard worker cannot merge with only a summary and passing checks.\n\n## Steps\n- done\n",
         )
         .expect("observable bullets validate high-risk dispatch");
+    }
+
+    #[test]
+    fn high_risk_dispatch_accepts_complete_openspec_delta_scenarios() {
+        require_acceptance_scenarios(
+            "planid01",
+            "# Plan\n\n## Spec changes\n\n### importer\n\n#### ADDED Requirements\n\n##### Requirement: Rows survive\nThe system SHALL retain rows.\n\n###### Scenario: Contract exercised\n- **WHEN** rows are imported\n- **THEN** every row remains visible\n",
+        )
+        .expect("a complete OpenSpec scenario satisfies high-risk dispatch");
+    }
+
+    #[test]
+    fn high_risk_dispatch_refuses_spec_changes_without_complete_scenarios() {
+        require_acceptance_scenarios(
+            "planid01",
+            "# Plan\n\n## Spec changes\n\n### importer\n\n#### REMOVED Requirements\n\n##### Requirement: Old behavior\nNo longer needed.\n",
+        )
+        .expect_err("a Spec changes section without scenarios must not pass");
+
+        require_acceptance_scenarios(
+            "planid01",
+            "# Plan\n\n## Spec changes\n\n### importer\n\n#### MODIFIED Requirements\n\n##### Requirement: Rows survive\nThe system SHALL retain rows.\n\n###### Scenario: Incomplete\n- **WHEN** rows are imported\n",
+        )
+        .expect_err("a scenario without THEN must not pass");
     }
 
     /// The parsed answer of one in-app lead `team_status` call.

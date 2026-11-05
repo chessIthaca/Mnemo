@@ -349,7 +349,6 @@ impl PlanBoard {
             ));
         }
         self.validate_spec_deltas(&draft.spec_deltas)?;
-        let delta_acceptance = delta_acceptance_scenarios(&draft.spec_deltas);
         let _guard = self.guard();
         let mut board = self.load_board()?;
         let id = self.fresh_id(&board);
@@ -366,14 +365,7 @@ impl PlanBoard {
                 push_line(&mut plan.interfaces, format!("- {}: {interface}", today()));
             }
         }
-        add_scenarios(
-            &mut plan,
-            draft
-                .acceptance
-                .iter()
-                .chain(&lifted)
-                .chain(&delta_acceptance),
-        );
+        add_scenarios(&mut plan, draft.acceptance.iter().chain(&lifted));
         plan.bug_symptom = bug.filter(|_| draft.kind == PlanKind::BugFixing);
         std::fs::create_dir_all(&self.plans_dir).map_err(|e| e.to_string())?;
         self.save_plan(&id, &plan, &draft.spec_deltas)?;
@@ -405,18 +397,11 @@ impl PlanBoard {
             combined.extend(edit.spec_deltas.iter().cloned());
             self.validate_spec_deltas(&combined)?;
         }
-        let delta_acceptance = delta_acceptance_scenarios(&edit.spec_deltas);
         let (extra, lifted) = lift_acceptance(edit.context_append.as_deref().unwrap_or(""));
         if !extra.is_empty() {
             plan.context = format!("{}\n\n{}", plan.context, escape_section_markers(&extra));
         }
-        add_scenarios(
-            &mut plan,
-            edit.add_acceptance
-                .iter()
-                .chain(&lifted)
-                .chain(&delta_acceptance),
-        );
+        add_scenarios(&mut plan, edit.add_acceptance.iter().chain(&lifted));
         if let Some(decision) = edit.decision.as_deref().map(collapse_whitespace) {
             if !decision.is_empty() {
                 push_line(&mut plan.decisions, format!("- {}: {decision}", today()));
@@ -1116,30 +1101,6 @@ fn load_current_spec(specs_dir: &Path, capability: &str) -> Result<Option<Spec>,
     Spec::parse(&text)
         .map(Some)
         .map_err(|error| format!("invalid spec for capability '{capability}': {error}"))
-}
-
-/// Project OpenSpec scenarios into the plan's observable acceptance bullets.
-fn delta_acceptance_scenarios(deltas: &[Delta]) -> Vec<String> {
-    let mut scenarios = Vec::new();
-    for delta in deltas {
-        for requirement in delta.added.iter().chain(&delta.modified) {
-            for scenario in &requirement.scenarios {
-                let mut text = format!(
-                    "OpenSpec {}/{} — {}: WHEN {} THEN {}",
-                    delta.capability,
-                    requirement.name,
-                    scenario.name,
-                    scenario.when.join(" AND "),
-                    scenario.then.join(" AND ")
-                );
-                if !scenario.and.is_empty() {
-                    text.push_str(&format!(" AND {}", scenario.and.join(" AND ")));
-                }
-                scenarios.push(text);
-            }
-        }
-    }
-    scenarios
 }
 
 fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
@@ -2244,10 +2205,12 @@ mod tests {
         let board = board(dir.path());
         let plan = board
             .create(PlanDraft {
+                acceptance: vec!["The lead's observable outcome remains unchanged.".to_string()],
                 spec_deltas: vec![added_delta("importer", "Rows survive")],
                 ..draft("Sequential deltas")
             })
             .unwrap();
+        let before_update = board.read_markdown(&plan.id).unwrap();
         let mut modified = Delta {
             capability: "importer".to_string(),
             ..Delta::default()
@@ -2265,6 +2228,15 @@ mod tests {
             .unwrap();
         assert_eq!(updated.spec_deltas.len(), 2);
         let markdown = board.read_markdown(&plan.id).unwrap();
+        let acceptance = |doc: &str| {
+            doc.split("## Acceptance scenarios\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n## ").next())
+                .expect("lead-authored acceptance section")
+                .to_string()
+        };
+        assert_eq!(acceptance(&markdown), acceptance(&before_update));
+        assert!(!acceptance(&markdown).contains("OpenSpec"), "{markdown}");
         assert!(markdown.contains("#### ADDED Requirements"), "{markdown}");
         assert!(markdown.contains("#### MODIFIED Requirements"), "{markdown}");
         assert!(markdown.contains("MUST retain every imported row"), "{markdown}");
@@ -2282,20 +2254,17 @@ mod tests {
             })
             .unwrap();
         let markdown = board.read_markdown(&plan.id).unwrap();
-        let acceptance = markdown
-            .split("## Acceptance scenarios\n")
+        assert!(!markdown.contains("## Acceptance scenarios"), "{markdown}");
+        let spec_changes = markdown
+            .split("## Spec changes\n")
             .nth(1)
             .and_then(|rest| rest.split("\n## ").next())
-            .expect("acceptance section");
-        assert!(
-            acceptance.lines().any(|line| {
-                let bullet = line.trim().strip_prefix("- ").unwrap_or("");
-                bullet.len() > 8 && bullet.contains("Contract exercised")
-            }),
-            "{markdown}"
-        );
+            .expect("spec changes section");
+        assert!(spec_changes.contains("Scenario: Contract exercised"), "{markdown}");
+        assert!(spec_changes.contains("- **WHEN**"), "{markdown}");
+        assert!(spec_changes.contains("- **THEN**"), "{markdown}");
         let brief = board.brief_for(&plan.id, 1).unwrap();
-        assert!(brief.contains("## Acceptance scenarios"), "{brief}");
+        assert!(!brief.contains("## Acceptance scenarios"), "{brief}");
         assert!(brief.contains("Contract exercised"), "{brief}");
         assert!(brief.contains("## Spec changes"), "{brief}");
     }

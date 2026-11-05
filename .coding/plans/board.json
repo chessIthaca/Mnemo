@@ -1306,6 +1306,76 @@
       ],
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "a707e9fa",
+      "status": "open",
+      "created_at_ms": 1793919163037,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "plan-board",
+          "added": [
+            {
+              "requirement": "Spec-impact gate on plan creation",
+              "text": "plan_create SHALL refuse a plan whose steps touch files governed by a capability's file map unless the plan carries a spec delta for that capability or an explicit no-spec-impact declaration with a reason; the refusal SHALL name the capability and both remedies. A spec delta that creates a new capability SHALL declare its governed files. plan_update add_steps SHALL apply the same gate to steps added after creation.",
+              "scenarios": [
+                {
+                  "name": "A governed-file plan without a delta is refused",
+                  "when": [
+                    "a plan's steps touch a capability's governed files",
+                    "no spec delta for that capability is attached",
+                    "no explicit no-impact declaration is carried"
+                  ],
+                  "then": [
+                    "plan_create refuses",
+                    "the refusal names the capability and both remedies"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "A delta or an explicit declaration passes",
+                  "when": [
+                    "the same plan carries a spec delta for the capability",
+                    "or an explicit no-spec-impact declaration with a reason"
+                  ],
+                  "then": [
+                    "plan_create accepts the plan"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "New capabilities declare their governed files",
+                  "when": [
+                    "a spec delta adds a new capability without a governed-files entry"
+                  ],
+                  "then": [
+                    "the plan is refused until the files are declared"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Steps added later are gated too",
+                  "when": [
+                    "plan_update add_steps names a governed file without a delta or declaration"
+                  ],
+                  "then": [
+                    "the same refusal fires"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

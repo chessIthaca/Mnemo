@@ -65,6 +65,12 @@ fn initialize(id: i64) -> String {
 
 const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 
+/// True for a helper id: 32 lowercase hex characters, as
+/// `Uuid::new_v4().simple()` renders them.
+fn is_bridge_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// A fake Mnemo2 `/mcp`: pretty-printed replies for requests, 202 for notifications.
 fn mcp_server(project: &str) -> FakeServer {
     mcp_server_as(project, 77)
@@ -131,6 +137,7 @@ fn requests_are_bridged_with_auth_root_and_helper_and_notifications_are_not_answ
         assert_eq!(req.headers["authorization"], "Bearer tok");
         assert_eq!(req.headers["x-mnemo-root"], sandbox.project_str());
         assert_eq!(req.headers["x-mnemo-helper"], env.helper.to_string_lossy());
+        assert!(is_bridge_id(&req.headers["x-mnemo-bridge"]), "{:?}", req.headers);
     }
     assert!(mcp.iter().any(|req| req.json()["method"] == "notifications/initialized"));
 }
@@ -154,7 +161,45 @@ fn stdin_eof_detaches_the_external_lead_it_attached() {
     run_lines(&sandbox.env(), &[&initialize(1), &request(2, "tools/call")]);
     let detach = server.requests_to("/lead/detach");
     assert_eq!(detach.len(), 1);
-    assert_eq!(detach[0].json(), json!({ "root": sandbox.project_str() }));
+    let body = detach[0].json();
+    assert_eq!(body["root"], json!(sandbox.project_str()));
+    assert!(is_bridge_id(body["bridge"].as_str().unwrap_or("")), "{body}");
+}
+
+#[test]
+fn forwarded_calls_carry_a_stable_bridge_id() {
+    let sandbox = Sandbox::new();
+    let server = mcp_server(&sandbox.project_str());
+    attach(&sandbox, &server);
+
+    run_lines(&sandbox.env(), &[&request(1, "tools/call"), &request(2, "tools/call")]);
+
+    let calls = server.requests_to("/mcp");
+    assert_eq!(calls.len(), 2);
+    let ids: Vec<&str> = calls
+        .iter()
+        .filter_map(|req| req.headers.get("x-mnemo-bridge").map(String::as_str))
+        .collect();
+    assert_eq!(ids.len(), 2, "every forwarded call carries the header");
+    assert!(is_bridge_id(ids[0]), "{}", ids[0]);
+    assert_eq!(ids[0], ids[1], "one process keeps one id for all its calls");
+}
+
+#[test]
+fn detach_on_close_names_the_bridge() {
+    let sandbox = Sandbox::new();
+    let server = mcp_server(&sandbox.project_str());
+    attach(&sandbox, &server);
+
+    run_lines(&sandbox.env(), &[&request(1, "tools/call")]);
+
+    let call = &server.requests_to("/mcp")[0];
+    let bridge = call.headers.get("x-mnemo-bridge").expect("the call names its helper").clone();
+    let detach = server.requests_to("/lead/detach");
+    assert_eq!(detach.len(), 1);
+    let body = detach[0].json();
+    assert_eq!(body["root"], json!(sandbox.project_str()));
+    assert_eq!(body["bridge"], json!(bridge), "the detach names the helper that led");
 }
 
 #[test]

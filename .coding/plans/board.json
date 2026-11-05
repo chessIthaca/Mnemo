@@ -1101,6 +1101,77 @@
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "7bc0b473",
+      "status": "open",
+      "created_at_ms": 1793910691905,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "c74b1987",
+      "status": "open",
+      "created_at_ms": 1793911692949,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Non-gating classification never blocks dispatch",
+              "text": "When a dispatch carries an explicit lead or user tier or model choice, the system SHALL start the worker without waiting for the routing classification, SHALL run the classification in the background under the same permit and timeout, and SHALL attach its label to the worker's routing record when it completes, logging it as calibration and training data.",
+              "scenarios": [
+                {
+                  "name": "Explicit-tier dispatch starts without the classification",
+                  "when": [
+                    "a lead dispatches with an explicit tier",
+                    "the routing classifier is still pending"
+                  ],
+                  "then": [
+                    "the worker starts immediately",
+                    "the routing block shows routed_by lead with a null Laya label"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "The background label lands on the record",
+                  "when": [
+                    "the background classification completes"
+                  ],
+                  "then": [
+                    "the worker's routing record carries the Laya tier, confidence and cleared flag",
+                    "the training data records the override label"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Non-explicit dispatches still gate on the classification",
+                  "when": [
+                    "a dispatch carries no explicit tier or model choice"
+                  ],
+                  "then": [
+                    "an unsure classifier refuses a Suggest+auto dispatch",
+                    "a cleared decision runs Laya's tier in Auto mode",
+                    "offline or too-short text produces the same skip reasons as before"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

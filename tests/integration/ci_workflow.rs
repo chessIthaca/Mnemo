@@ -204,6 +204,130 @@ fn build_workflow_uploads_installers_to_a_draft_release_first() {
     );
 }
 
+/// Both platform jobs must build the separate Mnemo2 installer with
+/// `npx tauri build` run from `src-tauri/mnemo2-app`.
+///
+/// Mnemo2 is its own Cargo package (`mnemo2-app`) with its own
+/// `tauri.conf.json` (productName Mnemo2, identifier com.mnemo.mnemo2). The
+/// Mnemo bundle (`npx tauri build` at the repo root) packages every `[[bin]]`
+/// of `mnemo-app` — the v2.0.0 tag build died on that ("cannot find
+/// target/release/mnemo2_mcp.exe") — so each app is bundled from its own
+/// package, both landing in the shared `<repo>/target/...` bundle directories
+/// under distinct `Mnemo_*` / `Mnemo2_*` names. Without the Mnemo2 step the
+/// release would ship only the Mnemo installer.
+///
+/// The macOS zip step must zip each bundle separately: the pre-split `*.app`
+/// glob matches two bundles now and `ditto` refuses several sources, so both
+/// apps get their own zip and both zips are uploaded.
+#[test]
+fn build_workflow_bundles_both_apps() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
+
+    for job in ["windows", "macos"] {
+        let header = format!("\n  {job}:\n");
+        let start = text
+            .find(&header)
+            .unwrap_or_else(|| panic!("build.yml declares a `{job}:` job"))
+            + header.len();
+        // A job block runs to the next 2-space job key (job bodies indent 4
+        // spaces and steps 6), or to EOF for the last job.
+        let block = text[start..]
+            .lines()
+            .take_while(|line| !(line.starts_with("  ") && !line.starts_with("   ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The Mnemo2 bundle: `npx tauri build` with the nested package as its
+        // working directory.
+        let step_dir = block
+            .find("working-directory: src-tauri/mnemo2-app")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the {job} job must build the separate Mnemo2 installer: \
+                     `npx tauri build` with `working-directory: \
+                     src-tauri/mnemo2-app` is missing"
+                )
+            });
+        let step_start = block[..step_dir]
+            .rfind("\n      - name:")
+            .unwrap_or_else(|| {
+                panic!("the {job} job's Mnemo2 working-directory line is not inside a step")
+            });
+        let step_tail = &block[step_start + 1..];
+        let step_end = step_tail.find("\n      - name:").unwrap_or(step_tail.len());
+        let step = &step_tail[..step_end];
+        assert!(
+            step.contains("npx tauri build"),
+            "the {job} job's step with `working-directory: \
+             src-tauri/mnemo2-app` does not run `npx tauri build`: {step}"
+        );
+        assert_eq!(
+            step.contains("--target aarch64-apple-darwin"),
+            job == "macos",
+            "the Mnemo2 bundle step must target aarch64-apple-darwin on macOS \
+             only, mirroring the Mnemo bundle step"
+        );
+        // The frontend dist (target/mnemo2-dist, the nested config's
+        // frontendDist) must be built before the custom-protocol bundle that
+        // embeds it.
+        assert!(
+            block[..step_start].contains("npm run build:mnemo2"),
+            "the {job} job must build the Mnemo2 frontend (`npm run \
+             build:mnemo2`) before bundling it"
+        );
+        // The Mnemo installer must still be built first on the same runner —
+        // only text BEFORE the Mnemo2 step counts (the Mnemo2 step's own run
+        // line must not satisfy the Mnemo check).
+        assert!(
+            block[..step_start].contains("npx tauri build"),
+            "the {job} job runs no Mnemo `npx tauri build` before the Mnemo2 \
+             one — the Mnemo installer is missing"
+        );
+
+        if job == "windows" {
+            // The upload globs must still match both apps' installers: they
+            // share the bundle dirs, distinguished only by the file names.
+            for glob in [
+                "target/release/bundle/msi/*.msi",
+                "target/release/bundle/nsis/*.exe",
+            ] {
+                assert!(
+                    block.contains(glob),
+                    "the windows upload must keep the `{glob}` glob — it \
+                     matches the Mnemo2 installers too (`Mnemo2_*` next to \
+                     `Mnemo_*`)"
+                );
+            }
+        } else {
+            // One zip per .app; both are uploaded.
+            for app in ["Mnemo.app mnemo.app.zip", "Mnemo2.app mnemo2.app.zip"] {
+                assert!(
+                    block.contains(&format!(
+                        "--keepParent target/aarch64-apple-darwin/release/bundle/macos/{app}"
+                    )),
+                    "the macos job must zip `{app}` separately (ditto with the \
+                     pre-split `*.app` glob now matches two bundles and refuses \
+                     several sources)"
+                );
+            }
+            let upload = block
+                .find("name: macos-bundles-aarch64")
+                .map(|idx| &block[idx..])
+                .expect("the macos bundle upload step");
+            for zip in ["mnemo.app.zip", "mnemo2.app.zip"] {
+                assert!(
+                    upload.lines().any(|line| line.trim() == zip),
+                    "the macos upload's path list must include {zip}"
+                );
+            }
+        }
+    }
+}
+
 /// Every `uses:` in this repo's workflows must be pinned to a full 40-hex
 /// commit SHA, with the human version in a trailing `# vN` comment so
 /// Dependabot can keep it current.

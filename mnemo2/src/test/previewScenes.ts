@@ -1594,6 +1594,14 @@ function previewBacklog(initial: BacklogItem[]): BacklogTransport {
       items = items.filter((item) => item.status === "pending");
       return copy();
     },
+    planThis: async (id) => {
+      items = items.map((item) =>
+        item.id === id
+          ? { ...item, status: "in_flight", note: "handed to the lead" }
+          : item,
+      );
+      return copy();
+    },
     onChanged: async () => () => {},
   };
 }

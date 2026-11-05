@@ -580,6 +580,7 @@ pub fn run() {
             backlog::backlog_reorder,
             backlog::backlog_set_deferred,
             backlog::backlog_clear_finished,
+            backlog::plan_this,
             ipc::settings_endpoints,
             ipc::settings_upsert_endpoint,
             ipc::settings_remove_endpoint,

@@ -52,6 +52,7 @@ export interface BacklogTransport {
   reorder(ids: string[]): Promise<BacklogItem[]>;
   setDeferred(id: string, deferred: boolean): Promise<BacklogItem[]>;
   clearFinished(): Promise<BacklogItem[]>;
+  planThis(id: string): Promise<BacklogItem[]>;
   onChanged(handler: () => void): Promise<UnlistenFn>;
 }
 
@@ -79,6 +80,7 @@ export function createTauriBacklogTransport(bindings: BacklogBindings): BacklogT
     setDeferred: (id, deferred) =>
       bindings.invoke<BacklogItem[]>("backlog_set_deferred", { id, deferred }),
     clearFinished: () => bindings.invoke<BacklogItem[]>("backlog_clear_finished"),
+    planThis: (id) => bindings.invoke<BacklogItem[]>("plan_this", { id }),
     onChanged: (handler) => bindings.listen(BACKLOG_EVENT_CHANNEL, () => handler()),
   };
 }

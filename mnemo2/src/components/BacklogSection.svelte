@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ChevronDown, ChevronUp, Clock, Pencil, Plus, Trash2 } from "@lucide/svelte";
+  import { ChevronDown, ChevronUp, Clock, ListTodo, Pencil, Plus, Trash2 } from "@lucide/svelte";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import {
     createBacklogTransport,
@@ -30,6 +30,9 @@
   let editingId = $state<string | null>(null);
   let editingText = $state("");
   let confirmingId = $state<string | null>(null);
+  /** The idea title of the most recent Plan-this handoff — the section's
+   * confirmation that it reached the lead. */
+  let sent = $state<string | null>(null);
 
   /** The pending ideas, in the store's order. */
   const queue = $derived(pendingItems(items));
@@ -148,6 +151,21 @@
     if (!transport) return;
     void mutate(() => transport.clearFinished());
   }
+
+  /** Hand one idea to the lead to plan ("Plan this"): the store marks it
+   * in_flight with a "handed to the lead" note and the lead receives the
+   * notice — queued for an external lead, else a user message to the
+   * in-app lead. The section confirms which idea was sent. */
+  function planThis(item: BacklogItem): void {
+    if (!transport) return;
+    const id = item.id;
+    const title = ideaTitle(item);
+    void mutate(async () => {
+      const next = await transport.planThis(id);
+      sent = title;
+      return next;
+    });
+  }
 </script>
 
 <section class="backlog" aria-label="Backlog">
@@ -188,6 +206,7 @@
     </div>
 
     {#if error}<p class="error" role="alert">{error}</p>{/if}
+    {#if sent !== null}<p class="note">Sent to the lead — {sent}</p>{/if}
 
     {#if loading}
       <p class="note">Loading backlog…</p>
@@ -219,6 +238,13 @@
               <p class="text">{item.text}</p>
               <div class="actions">
                 {#if isDeferred(item)}<span class="badge">Deferred</span>{/if}
+                <button
+                  class="action"
+                  type="button"
+                  aria-label={`Plan this ${ideaTitle(item)}`}
+                  disabled={busy || undefined}
+                  onclick={() => planThis(item)}><ListTodo size={11} /> Plan this</button
+                >
                 <button
                   class="action"
                   type="button"

@@ -11,6 +11,8 @@
     type TiersDto,
   } from "../lib/settingsEngine";
   import { ENDPOINT_KINDS, ENDPOINT_PRESETS, errorText, tiersListing, type EndpointPreset } from "../lib/settingsState";
+  import { trackUnsaved } from "../lib/unsavedEdits";
+  import InlineConfirm from "./InlineConfirm.svelte";
 
   let {
     transport,
@@ -46,6 +48,7 @@
 
   const dirty = $derived(draft !== null && (JSON.stringify(draft) !== snapshot || apiKey !== ""));
   const isNew = $derived(originalName === null);
+  trackUnsaved(() => dirty);
 
   function clone<T>(value: T): T {
     return JSON.parse(JSON.stringify(value)) as T;
@@ -311,11 +314,11 @@
 
     <div class="editor">
       {#if pendingAction}
-        <div class="inline-confirm" role="alert">
-          <span>Discard unsaved changes?</span>
-          <button class="button button-quiet" onclick={() => (pendingAction = null)}>Keep editing</button>
-          <button class="button button-primary" onclick={() => { const run = pendingAction; pendingAction = null; if (draft) { snapshot = JSON.stringify(draft); apiKey = ""; } run?.(); }}>Discard changes</button>
-        </div>
+        <InlineConfirm
+          message="Discard unsaved changes?"
+          onkeep={() => (pendingAction = null)}
+          ondiscard={() => { const run = pendingAction; pendingAction = null; if (draft) { snapshot = JSON.stringify(draft); apiKey = ""; } run?.(); }}
+        />
       {/if}
 
       {#if picking}
@@ -574,8 +577,6 @@
   .delete-confirm ul { margin: 0; padding-left: 16px; color: var(--ink-soft); }
   .row { display: flex; justify-content: flex-end; gap: 8px; }
   .button-danger { background: var(--danger); color: var(--on-danger); }
-  .inline-confirm { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 8px 22px; border-bottom: 1px solid var(--line); background: var(--warning-soft); color: var(--warning); font-size: var(--text-body); }
-  .inline-confirm span { margin-right: auto; font-weight: 600; }
   .settings-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 22px; border-top: 1px solid var(--line); background: var(--surface); }
   .settings-footer div { display: flex; gap: 8px; }
   .footer-note { color: var(--muted); font-size: var(--text-body); }

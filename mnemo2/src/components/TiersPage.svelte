@@ -10,7 +10,6 @@
     LAYA_STATUS_META,
     evalDateText,
     layaStatusHint,
-    leavesPage,
     modeAvailable,
     modeUnlockText,
     routingDraft,
@@ -27,6 +26,7 @@
     type TierChoice,
     type TiersTopControl,
   } from "../lib/layaSettings";
+  import { trackUnsaved } from "../lib/unsavedEdits";
 
   /**
    * The Settings > Tiers page (plan 87932c46, design §7): the top control —
@@ -609,39 +609,7 @@
     );
   }
 
-  let pageEl = $state<HTMLDivElement | null>(null);
-
-  /**
-   * While edits are unsaved, ask before leaving the page. Window unload
-   * rides the browser's own prompt; in-app navigation (the settings rail,
-   * the dialog's close button or backdrop, Escape) rides capture-phase
-   * listeners on the window, so a declined confirm cancels the event
-   * before the dialog's own handlers ever run.
-   */
-  $effect(() => {
-    const root = pageEl;
-    if (!hasUnsaved()) return;
-    const guard = (event: Event): void => {
-      if (event.type === "beforeunload") {
-        // The browser's own "changes you made may not be saved" prompt.
-        event.preventDefault();
-        (event as BeforeUnloadEvent).returnValue = true;
-        return;
-      }
-      if (!leavesPage(event, root)) return;
-      if (confirm("Discard unsaved Tiers edits?")) return;
-      event.preventDefault();
-      event.stopPropagation();
-    };
-    window.addEventListener("beforeunload", guard);
-    window.addEventListener("click", guard, true);
-    window.addEventListener("keydown", guard, true);
-    return () => {
-      window.removeEventListener("beforeunload", guard);
-      window.removeEventListener("click", guard, true);
-      window.removeEventListener("keydown", guard, true);
-    };
-  });
+  trackUnsaved(hasUnsaved);
 </script>
 
 <datalist id="effort-options">
@@ -650,7 +618,7 @@
   <option value="high"></option>
 </datalist>
 
-<div class="tiers-page" bind:this={pageEl}>
+<div class="tiers-page">
   <div class="tiers-scroll">
     {#if loadError}
       <p class="load-error" role="alert">{loadError}</p>

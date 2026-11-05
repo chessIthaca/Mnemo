@@ -54,20 +54,32 @@
       error = "Plan details need the desktop app.";
       return;
     }
-    loading = true;
-    error = "";
-    markdown = "";
+    // A refresh of the plan already on screen keeps it (scroll position and
+    // open spec folds survive) until the new text arrives; only a different
+    // plan blanks the panel and shows the loading note.
+    const refresh = id === shownId && markdown !== "";
+    if (!refresh) {
+      loading = true;
+      error = "";
+      markdown = "";
+    }
     try {
       const text = await active.document(id);
       if (id !== planId) return;
       markdown = text;
+      shownId = id;
+      error = "";
       loading = false;
     } catch (failure) {
       if (id !== planId) return;
-      error = errorText(failure, "Could not read the plan");
       loading = false;
+      // A failed refresh leaves the shown plan in place.
+      if (!refresh) error = errorText(failure, "Could not read the plan");
     }
   }
+
+  /** The plan id whose document is on screen, so a refresh can keep it. */
+  let shownId = "";
 
   // Mount and every planId change read the plan's document fresh.
   $effect(() => {

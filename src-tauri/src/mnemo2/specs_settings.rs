@@ -663,6 +663,7 @@ fn clone_repo(url: &str, target: &Path) -> Result<(), String> {
         .arg("clone")
         .arg("--depth")
         .arg("1")
+        .arg("--")
         .arg(url)
         .arg(target)
         .output()

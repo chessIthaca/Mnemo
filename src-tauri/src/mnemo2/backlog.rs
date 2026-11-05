@@ -271,7 +271,6 @@ pub async fn backlog_set_done(
 }
 
 /// Soft-delete every finished idea; returns the new list.
-
 #[tauri::command]
 pub async fn backlog_clear_finished(
     state: State<'_, Mnemo2State>,

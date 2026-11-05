@@ -14,7 +14,8 @@
 //! - `/mcp`: one JSON-RPC message (`initialize`, `tools/list`, `tools/call`,
 //!   `ping`, notifications). The `X-Mnemo-Root` header names the project the
 //!   Claude session works in; `X-Mnemo-Helper` the helper executable, which
-//!   the lead instructions use as the waiter command.
+//!   the lead instructions use as the waiter command; `X-Mnemo-Bridge` one
+//!   helper process's random id, fixed for that process's lifetime.
 //! - `/lead/notices`, `/lead/wait`, `/lead/gate-agent`, `/lead/detach`: what
 //!   the plugin's hooks and the background waiter need.
 //!
@@ -23,8 +24,14 @@
 //! then on worker notices queue for it and ride the next tool result under
 //! "Since your last call:". Merely opening Claude Code in a project
 //! (`initialize`, `tools/list`, `ping`) or reading `/lead/notices` never
-//! attaches, so it cannot take worker notices from the in-app lead. An
-//! external lead that makes no call for 10 minutes is detached; whatever it
+//! attaches, so it cannot take worker notices from the in-app lead.
+//!
+//! A `tools/call` with a valid `X-Mnemo-Bridge` id remembers that helper while
+//! the lead is attached. `/lead/detach` with a `bridge` forgets only that
+//! helper and releases the lead when no remembered helper remains; a detach
+//! without a valid id keeps the older helpers' behaviour and releases at once.
+//! Every release forgets all helper ids. An external lead that makes no call
+//! for 10 minutes is detached regardless of remembered helpers; whatever it
 //! never read goes to the in-app lead (see
 //! [`LeadRuntime::release_external_lead`]).
 //!
@@ -766,7 +773,7 @@ impl Shared {
             "/lead/gate-agent" => Response::json(200, &self.gate_agent(target, body).await),
             "/lead/summary" => self.summary(target).await,
             "/lead/show-worker" => self.show_worker(target, body).await,
-            _ => Response::json(200, &self.detach(target).await),
+            _ => Response::json(200, &self.detach(target, body).await),
         }
     }
 
@@ -973,15 +980,37 @@ impl Shared {
     }
 
     /// Hand the project back to the in-app lead (with the notices the
-    /// external lead never read) and wake any waiter.
-    async fn detach(&self, target: Option<Target>) -> Value {
-        if let Some(target) = target {
-            let was_idle = target.team.clear_external_lead_idle();
-            if target.lead.release_external_lead().await || was_idle {
-                self.host.lead_changed(false, Some(&target.root));
+    /// external lead never read) and wake any waiter. A named helper closes
+    /// without releasing while another helper that made a tool call remains.
+    async fn detach(&self, target: Option<Target>, body: Value) -> Value {
+        let Some(target) = target else {
+            return json!({ "released": false });
+        };
+        if let Some(bridge) = body
+            .get("bridge")
+            .and_then(Value::as_str)
+            .and_then(Self::valid_bridge_id)
+        {
+            if target.team.forget_external_bridge(bridge) > 0 {
+                return json!({ "released": false });
             }
         }
-        json!({})
+        let was_idle = target.team.clear_external_lead_idle();
+        let released = target.lead.release_external_lead().await;
+        if released || was_idle {
+            self.host.lead_changed(false, Some(&target.root));
+        }
+        json!({ "released": released })
+    }
+
+    /// The helper id wire format: lowercase hexadecimal, bounded so an
+    /// arbitrary request cannot grow a team's bridge set without limit.
+    fn valid_bridge_id(value: &str) -> Option<&str> {
+        let id = value.trim();
+        (!id.is_empty()
+            && id.len() <= 64
+            && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+        .then_some(id)
     }
 
     /// Attach the external lead to `target` and report a new attachment.
@@ -1040,6 +1069,12 @@ impl Shared {
                         // Code does not tell its MCP servers the session id.
                         if method == "tools/call" {
                             self.attach(&target, None);
+                            if let Some(bridge) = request
+                                .header("x-mnemo-bridge")
+                                .and_then(Self::valid_bridge_id)
+                            {
+                                target.team.note_external_bridge(bridge);
+                            }
                         }
                         target.team.touch_external_lead();
                         self.dispatch(method, params, request, &target).await
@@ -1754,6 +1789,30 @@ mod tests {
         async fn attach(&self) {
             let reply = self.call("team_status", json!({})).await;
             assert_eq!(reply["result"]["isError"], false, "{reply}");
+        }
+
+        /// A `team_status` call from the helper process `bridge`, the way the
+        /// helper identifies itself once per process (header `X-Mnemo-Bridge`).
+        async fn call_as(&self, id: u64, bridge: &str) -> Value {
+            let root = self.root.to_string_lossy().into_owned();
+            let (status, body) = self
+                .post(
+                    "/mcp",
+                    Some("tok-123"),
+                    &[
+                        ("X-Mnemo-Root", &root),
+                        ("X-Mnemo-Helper", HELPER),
+                        ("X-Mnemo-Bridge", bridge),
+                    ],
+                    &json!({
+                        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                        "params": { "name": "team_status", "arguments": {} }
+                    })
+                    .to_string(),
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str(&body).expect("json reply")
         }
 
         /// The request a `tools/call` for `name` would arrive as, for driving
@@ -3268,6 +3327,79 @@ mod tests {
             .lead_post("/lead/gate-agent", json!({ "root": "/elsewhere", "subagent_type": "x" }))
             .await;
         assert_eq!(reply["decision"], "allow");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_closing_helper_keeps_the_lead_while_another_helper_led() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        for (id, bridge) in [(70, "a"), (71, "b")] {
+            let reply = fixture.call_as(id, bridge).await;
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+        }
+        assert!(team.external_lead_attached());
+
+        let closing = fixture
+            .lead_post("/lead/detach", json!({ "root": root, "bridge": "b" }))
+            .await;
+        assert!(
+            team.external_lead_attached(),
+            "helper a still leads after helper b closes"
+        );
+        assert_eq!(closing, json!({ "released": false }));
+
+        let closing = fixture
+            .lead_post("/lead/detach", json!({ "root": root, "bridge": "a" }))
+            .await;
+        assert!(!team.external_lead_attached());
+        assert_eq!(closing, json!({ "released": true }));
+        assert_eq!(fixture.host.changes(), vec![true, false]);
+        fixture.shutdown().await;
+    }
+
+    /// A helper that names no bridge is anonymous (the pre-bridge contract):
+    /// its detach releases the lead at once, even when another helper led too.
+    #[tokio::test]
+    async fn detach_without_a_bridge_still_releases() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        let reply = fixture.call_as(70, "a").await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert!(team.external_lead_attached());
+
+        let closing = fixture.lead_post("/lead/detach", json!({ "root": root })).await;
+        assert_eq!(closing, json!({ "released": true }));
+        assert!(!team.external_lead_attached());
+        assert_eq!(fixture.host.changes(), vec![true, false]);
+        fixture.shutdown().await;
+    }
+
+    /// The idle sweep releases the lead even though a remembered helper
+    /// never closed (it crashed), and the release forgets it: its own later
+    /// detach finds nothing left to release.
+    #[tokio::test]
+    async fn idle_sweep_releases_even_with_bridges_left() {
+        let options = ServerOptions {
+            idle_detach_ms: 10 * 60 * 1000,
+            ..ServerOptions::default()
+        };
+        let fixture = Fixture::new(true, true, options).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        let reply = fixture.call_as(70, "a").await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert!(team.external_lead_attached());
+        let now = run_file::now_ms();
+        assert!(!fixture.server.sweep_idle(now + 9 * 60 * 1000).await, "still within the window");
+        assert!(fixture.server.sweep_idle(now + 11 * 60 * 1000).await);
+        assert!(!team.external_lead_attached(), "the crashed helper idled out");
+        let closing = fixture
+            .lead_post("/lead/detach", json!({ "root": root, "bridge": "a" }))
+            .await;
+        assert_eq!(closing, json!({ "released": false }), "the sweep already forgot it");
         fixture.shutdown().await;
     }
 

@@ -1550,6 +1550,13 @@ const PREVIEW_BACKLOG: BacklogItem[] = [
     created_at: 0,
   },
   {
+    id: "idea-preview-embedded",
+    text: "Let each worker's panel scroll its own log without moving the thread.",
+    images: [],
+    status: "in_flight",
+    created_at: 0,
+  },
+  {
     id: "idea-preview-burndown",
     text: "Show the plan board's steps as a burn-down per worker.",
     images: [],
@@ -1588,6 +1595,17 @@ function previewBacklog(initial: BacklogItem[]): BacklogTransport {
     },
     setDeferred: async (id, deferred) => {
       items = items.map((item) => (item.id === id ? { ...item, deferred } : item));
+      return copy();
+    },
+    setDone: async (id, done) => {
+      items = items.map((item) => {
+        if (item.id !== id) return item;
+        if (done && item.status === "pending") return { ...item, status: "done" };
+        if (!done && item.status !== "pending" && item.status !== "in_flight") {
+          return { ...item, status: "pending" };
+        }
+        return item;
+      });
       return copy();
     },
     clearFinished: async () => {

@@ -1104,20 +1104,20 @@
     },
     {
       "id": "7bc0b473",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793910691905,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793914720312,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-7bc0b473-20261105-213840.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
     },
     {
       "id": "c74b1987",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793911692949,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793914720702,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-c74b1987-20261105-213840.md",
       "abandon_reason": null,
       "spec_deltas": [
         {

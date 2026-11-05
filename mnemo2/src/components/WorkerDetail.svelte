@@ -23,6 +23,7 @@
   import ReviewEvidence from "./ReviewEvidence.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
   import WorkerInbox from "./WorkerInbox.svelte";
+  import WorkerPlanTab from "./WorkerPlanTab.svelte";
   import WorkerThread from "./WorkerThread.svelte";
 
   const BRIEF_MAX_HEIGHT = 42;
@@ -36,7 +37,7 @@
     measureBriefOverflow?: (element: HTMLElement) => boolean;
   } = $props();
 
-  let tab = $state<"review" | "thread" | "timeline">("thread");
+  let tab = $state<"review" | "thread" | "timeline" | "plan">("thread");
   let lastWorkerId = "";
   let briefContent = $state<HTMLDivElement>();
   let briefExpanded = $state(false);
@@ -77,6 +78,13 @@
     lastWorkerId = id;
     tab = "thread";
     briefExpanded = false;
+  });
+
+  // The Plan tab needs a plan: when the selected worker's plan stamp
+  // disappears in place (its record updated without switching workers),
+  // fall back to the thread instead of showing an empty plan panel.
+  $effect(() => {
+    if (tab === "plan" && !worker.planId) tab = "thread";
   });
 
   $effect(() => {
@@ -222,6 +230,9 @@
       <button class:active={tab === "thread"} type="button" aria-pressed={tab === "thread"} onclick={() => { tab = "thread"; }}>Thread <span>{threadMessages}</span></button>
       <button class:active={tab === "review"} type="button" aria-pressed={tab === "review"} onclick={() => { tab = "review"; }}>Review {#if openFindings > 0}<span>{openFindings}</span>{/if}</button>
       <button class:active={tab === "timeline"} type="button" aria-pressed={tab === "timeline"} onclick={() => { tab = "timeline"; }}>Timeline</button>
+      {#if worker.planId}
+        <button class:active={tab === "plan"} type="button" aria-pressed={tab === "plan"} onclick={() => { tab = "plan"; }}>Plan</button>
+      {/if}
     </nav>
   </header>
 
@@ -284,6 +295,8 @@
     {:else if tab === "thread"}
       <WorkerInbox {worker} />
       <WorkerThread {worker} />
+    {:else if tab === "plan" && worker.planId}
+      <WorkerPlanTab planId={worker.planId} planStep={worker.planStep ?? null} />
     {:else}
       <section class="timeline-panel" aria-label={`${worker.name} timeline`}>
         {#each worker.timeline as step (step.id)}

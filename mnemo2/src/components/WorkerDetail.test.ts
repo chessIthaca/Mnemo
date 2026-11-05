@@ -259,3 +259,24 @@ describe("WorkerDetail finished audit", () => {
     expect(screen.queryByText("Audit finished; its report is with the lead.")).toBeNull();
   });
 });
+
+describe("WorkerDetail plan tab", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  it("shows the Plan tab for a worker on a plan and renders the plan header", async () => {
+    const worker: Worker = { ...createWorkers()[0], planId: "bfa3a622", planStep: 1 };
+    render(WorkerDetail, { worker });
+
+    const tabs = screen.getByRole("navigation", { name: "Worker detail sections" });
+    await fireEvent.click(within(tabs).getByRole("button", { name: "Plan" }));
+
+    expect(await screen.findByText("Plan bfa3a622 · step 2")).toBeTruthy();
+  });
+
+  it("shows no Plan tab for a worker without a plan", () => {
+    render(WorkerDetail, { worker: createWorkers()[0] });
+
+    const tabs = screen.getByRole("navigation", { name: "Worker detail sections" });
+    expect(within(tabs).queryByRole("button", { name: "Plan" })).toBeNull();
+  });
+});

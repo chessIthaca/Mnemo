@@ -56,3 +56,26 @@ export function planDetailMarkdown(markdown: string, keepSteps: boolean): string
     .filter((text) => text !== "")
     .join("\n\n");
 }
+
+/**
+ * The kebab-case capabilities a plan's `## Spec changes` section names, in
+ * order, without duplicates — one `### <name>` heading per capability, as
+ * the plan file renders its OpenSpec deltas. Requirement and scenario
+ * headings, and headings inside fenced code blocks, never make the list.
+ */
+export function specCapabilities(markdown: string): string[] {
+  const sections = splitSections(markdown.replace(/\r\n?/g, "\n"));
+  const section = sections.find((candidate) => candidate.heading?.toLowerCase() === "spec changes");
+  if (!section) return [];
+  const names: string[] = [];
+  let fenced = false;
+  for (const line of section.lines) {
+    if (/^\s*```/.test(line)) fenced = !fenced;
+    if (fenced) continue;
+    const heading = /^###\s+(.+?)\s*$/.exec(line);
+    if (!heading) continue;
+    const name = heading[1].trim();
+    if (/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name) && !names.includes(name)) names.push(name);
+  }
+  return names;
+}

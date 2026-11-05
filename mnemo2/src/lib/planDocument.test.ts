@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { planDetailMarkdown } from "./planDocument";
+import { planDetailMarkdown, specCapabilities } from "./planDocument";
 
 /** A plan file in the shape `PlanFile::serialize` writes it. */
 const PLAN = [
@@ -73,5 +73,54 @@ describe("planDetailMarkdown", () => {
 
   it("returns empty text for a document the card already shows in full", () => {
     expect(planDetailMarkdown("# Plan: Only a title\n\n## Goal\nJust the goal.\n", false)).toBe("");
+  });
+});
+
+/** A plan's `## Spec changes` slice as the board renders it. */
+const SPEC_CHANGES = [
+  "# Plan: Tier ladder",
+  "",
+  "## Goal",
+  "Show the ladder.",
+  "",
+  "## Spec changes",
+  "### tier-ladder",
+  "#### ADDED Requirements",
+  "##### Requirement: Ladder renders",
+  "###### Scenario: Ladder visible",
+  "- **WHEN** the page opens **THEN** the ladder shows.",
+  "",
+  "### dispatch-routing",
+  "#### MODIFIED Requirements",
+  "",
+  "## Steps",
+  "- [ ] 1. Build it.",
+].join("\n");
+
+describe("specCapabilities", () => {
+  it("lists the capabilities a plan's spec changes touch, in order", () => {
+    expect(specCapabilities(SPEC_CHANGES)).toEqual(["tier-ladder", "dispatch-routing"]);
+  });
+
+  it("drops duplicate capabilities", () => {
+    expect(specCapabilities("## Spec changes\n### tier-ladder\n### tier-ladder\n")).toEqual(["tier-ladder"]);
+  });
+
+  it("matches the section heading case-insensitively", () => {
+    expect(specCapabilities("## SPEC CHANGES\n### tier-ladder\n")).toEqual(["tier-ladder"]);
+  });
+
+  it("returns nothing without a Spec changes section", () => {
+    expect(specCapabilities(PLAN)).toEqual([]);
+  });
+
+  it("ignores headings inside fenced blocks", () => {
+    const fenced = ["## Spec changes", "### real-cap", "```", "### fenced-fake", "```"].join("\n");
+    expect(specCapabilities(fenced)).toEqual(["real-cap"]);
+  });
+
+  it("ignores non-kebab headings like Requirement:", () => {
+    const requirements = ["## Spec changes", "### Requirement: Foo bar", "#### ADDED Requirements", "### real-cap"].join("\n");
+    expect(specCapabilities(requirements)).toEqual(["real-cap"]);
   });
 });

@@ -149,7 +149,9 @@
   }
 
   async function saveIndex(): Promise<void> {
-    await persist(index, "embedding", index.draft, () => (index.original = index.draft));
+    await persist(index, "embedding", index.draft, () => {
+      index.original = index.draft;
+    });
   }
 
   async function saveBudget(): Promise<void> {
@@ -158,7 +160,9 @@
       budget.error = parsed.error;
       return;
     }
-    await persist(budget, "budget", parsed.value, () => (budget.original = { ...budget.draft }));
+    await persist(budget, "budget", parsed.value, () => {
+      budget.original = { ...budget.draft };
+    });
   }
 
   /** One section save: error and success states are the section's own. */

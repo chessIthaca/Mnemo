@@ -129,6 +129,8 @@
   let tiers = $state<TiersDto>(emptyTiers());
   let loading = $state(false);
   let loadError = $state("");
+  /** A failed tiers re-read after an endpoint change; the Tiers page would be stale. */
+  let tiersStale = $state("");
   const transport = $derived(open ? createSettingsTransport() : null);
   const modelTransport = $derived(open ? createModelSettingsTransport() : null);
   const layaTransport = $derived(open ? createLayaTransport() : null);
@@ -143,6 +145,7 @@
     let cancelled = false;
     loading = true;
     loadError = "";
+    tiersStale = "";
     Promise.all([active.endpoints(), active.tiers()])
       .then(([loadedEndpoints, loadedTiers]) => {
         if (cancelled) return;
@@ -160,10 +163,22 @@
     };
   });
 
-  /** Renames and removals rewrite tier specs on the backend, so re-read them. */
+  /**
+   * Renames and removals rewrite tier specs on the backend, so re-read them.
+   * A failed re-read leaves the Tiers page showing specs that no longer exist,
+   * so say so until a later read succeeds or the dialog reopens.
+   */
   function refreshAfterEndpointChange(next: EndpointDetailDto[]) {
     endpoints = next;
-    void transport?.tiers().then((loaded) => (tiers = loaded)).catch(() => {});
+    void transport
+      ?.tiers()
+      .then((loaded) => {
+        tiers = loaded;
+        tiersStale = "";
+      })
+      .catch((error) => {
+        tiersStale = errorText(error);
+      });
   }
 </script>
 
@@ -190,6 +205,9 @@
             ondiscard={() => { const run = pendingLeave; pendingLeave = null; run?.(); }}
           />
         {/if}
+        {#if tiersStale}
+          <p class="settings-error" role="alert">Could not re-read tiers after the endpoint change: {tiersStale}. Reopen Settings before editing Tiers.</p>
+        {/if}
 
         {#if page === "project"}
           <ProjectPage />
@@ -198,24 +216,6 @@
             <SpecsPage transport={specsTransport} />
           {:else}
             <p class="settings-empty">Specs settings are available in the desktop app.</p>
-          {/if}
-        {:else if loadError}
-          <p class="settings-error" role="alert">{loadError}</p>
-        {:else if loading}
-          <p class="settings-empty">Loading…</p>
-        {:else if page === "endpoints"}
-          <EndpointsPage {transport} {endpoints} {tiers} onendpoints={refreshAfterEndpointChange} />
-        {:else if page === "models"}
-          {#if modelTransport}
-            <ModelsPage transport={modelTransport} {endpoints} />
-          {:else}
-            <p class="settings-empty">Model settings are available in the desktop app.</p>
-          {/if}
-        {:else if page === "savings"}
-          {#if modelTransport}
-            <SavingsPage transport={modelTransport} {endpoints} />
-          {:else}
-            <p class="settings-empty">Savings settings are available in the desktop app.</p>
           {/if}
         {:else if page === "safety"}
           {#if safetyTransport}
@@ -234,6 +234,24 @@
             <AppearancePage transport={appearanceTransport} />
           {:else}
             <p class="settings-empty">Sound and theme settings are available in the desktop app.</p>
+          {/if}
+        {:else if loadError}
+          <p class="settings-error" role="alert">{loadError}</p>
+        {:else if loading}
+          <p class="settings-empty">Loading…</p>
+        {:else if page === "endpoints"}
+          <EndpointsPage {transport} {endpoints} {tiers} onendpoints={refreshAfterEndpointChange} />
+        {:else if page === "models"}
+          {#if modelTransport}
+            <ModelsPage transport={modelTransport} {endpoints} />
+          {:else}
+            <p class="settings-empty">Model settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "savings"}
+          {#if modelTransport}
+            <SavingsPage transport={modelTransport} {endpoints} />
+          {:else}
+            <p class="settings-empty">Savings settings are available in the desktop app.</p>
           {/if}
         {:else}
           <TiersPage {transport} {layaTransport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />

@@ -317,7 +317,7 @@
         <InlineConfirm
           message="Discard unsaved changes?"
           onkeep={() => (pendingAction = null)}
-          ondiscard={() => { const run = pendingAction; pendingAction = null; if (draft) { snapshot = JSON.stringify(draft); apiKey = ""; } run?.(); }}
+          ondiscard={() => { const run = pendingAction; pendingAction = null; discard(); run?.(); }}
         />
       {/if}
 

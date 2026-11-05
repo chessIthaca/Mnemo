@@ -1185,10 +1185,10 @@
     },
     {
       "id": "fdc334b4",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793918981896,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793920625944,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-fdc334b4-20261105-231705.md",
       "abandon_reason": null,
       "spec_deltas": [
         {

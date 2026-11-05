@@ -30,6 +30,13 @@
 //!   rides this patch: the kernel rejects the DTO field whole, and the
 //!   page routes it through `laya_setup`/`laya_disable`, which own the
 //!   install and the sidecar lifecycle.
+//! - [`save_tiers_top_control`] — the Settings > Tiers top control: the
+//!   one choice (off/shadow/suggest/auto) writes `[routing]` through
+//!   [`update_routing_settings`] (the single-writer load-modify-save the
+//!   automatic Laya check's gate application shares), then Mnemo1's two
+//!   halves through the same patch pipeline; a choice other than `off`
+//!   starts the check ([`crate::mnemo2::laya_check`]) — the eval's old
+//!   Run/Apply buttons are retired with it.
 //!
 //! ## The one-managed-runtime discipline
 //!
@@ -60,14 +67,12 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use mnemo::OfferedLabels;
-use mnemo::RouteKnn;
 use mnemo::config::general::LayaConfig;
 use mnemo::config::settings_dto::{RoutingConfigDto, SettingsSaveDto};
 use mnemo::config::Config;
 use mnemo::headless::{EventReceiver, RecvError, Setup, SetupEvent};
 use mnemo::laya::{LayaManager, english_checkpoint};
-use mnemo::memory::classifier::{Classifier, ClassifierStatus};
+use mnemo::memory::classifier::ClassifierStatus;
 
 use crate::mnemo2::dispatch_routing;
 use crate::mnemo2::ipc::{settings_refresh, settings_setup, Mnemo2State};
@@ -405,6 +410,15 @@ async fn settle_held_manager(app: &AppHandle, manager: Arc<LayaManager>) {
         Err(_) => None,
     };
     settle_held_manager_core(&HELD_SETUP_MANAGER, runtime.as_deref(), manager);
+    // An install that just landed a live sidecar is one of the check's
+    // triggers (plan 8106337a): the check runs unless routing is off,
+    // Laya is down or the fingerprint still matches — every skip is
+    // silent, and an error here never fails the settle.
+    if let Some(runtime) = runtime.as_ref() {
+        if let Err(error) = runtime.start_laya_check(false).await {
+            eprintln!("mnemo2: the Laya check could not start: {error}");
+        }
+    }
 }
 
 /// Settle the settings-side hold at the pipeline task's end (review
@@ -642,7 +656,9 @@ pub async fn tiers_top_control_status(
 /// Save the top control's choice in one call (design §7.1): the mnemo2.toml
 /// `[routing]` mode, Mnemo1's `enforce` gate and the `[general.laya]`
 /// routing master flag, through the sanctioned write paths, then reload the
-/// open team and the engine's config. Returns the fresh wire.
+/// open team and the engine's config. A choice other than `off` also starts
+/// the Laya check (plan 8106337a) — an error there never fails the save.
+/// Returns the fresh wire.
 #[tauri::command]
 pub async fn save_tiers_top_control(
     state: State<'_, Mnemo2State>,
@@ -655,6 +671,16 @@ pub async fn save_tiers_top_control(
     };
     save_tiers_top_control_core(&setup, &choice, team.as_deref()).await?;
     settings_refresh(runtime.clone()).await?;
+    // A choice other than `off` is one of the check's triggers (plan
+    // 8106337a): the check runs unless Laya is down or the fingerprint
+    // still matches — and it must never fail the save.
+    if choice != "off" {
+        if let Some(runtime) = runtime.as_ref() {
+            if let Err(error) = runtime.start_laya_check(false).await {
+                eprintln!("mnemo2: the Laya check could not start: {error}");
+            }
+        }
+    }
     tiers_top_control_read(&setup, runtime).await
 }
 
@@ -669,9 +695,7 @@ pub(crate) async fn save_tiers_top_control_core(
     team: Option<&TeamRuntime>,
 ) -> Result<(), String> {
     let (mode, enforce, laya_routing) = tiers_top_control_writes(choice)?;
-    let mut settings = dispatch_routing::load_routing_settings(setup.config_dir());
-    settings.mode = mode;
-    apply_routing_settings(setup.config_dir(), &settings, team)?;
+    update_routing_settings(setup.config_dir(), team, |settings| settings.mode = mode)?;
     save_laya_settings_core(
         setup,
         Some(LayaFlagsPatch {
@@ -710,26 +734,10 @@ pub async fn routing_settings_status(
     Ok(routing_settings_wire(setup.config_dir()))
 }
 
-/// Persist the `[routing]` table to `mnemo2.toml` (every other table
-/// preserved) and push it into an open team, so the next dispatch sees the
-/// new mode without a restart. Returns the fresh snapshot.
-#[tauri::command]
-pub async fn save_routing_settings(
-    state: State<'_, Mnemo2State>,
-    settings: dispatch_routing::RoutingSettings,
-) -> Result<RoutingSettingsWire, String> {
-    let (setup, runtime) = settings_setup(&state).await?;
-    let team = match runtime {
-        Some(runtime) => runtime.team_handle().await.ok(),
-        None => None,
-    };
-    apply_routing_settings(setup.config_dir(), &settings, team.as_deref())?;
-    Ok(routing_settings_wire(setup.config_dir()))
-}
-
-/// The command's core: write the `[routing]` table, then reload a live team's
-/// copy so the next dispatch acts on it (review R1). The Laya page's Save and
-/// the eval's Apply both land here; with no team open there is nothing to
+/// The write core: write the `[routing]` table, then reload a live team's
+/// copy so the next dispatch acts on it (review R1). The top control's mode
+/// write and the Laya check's gate application land here through
+/// [`update_routing_settings`]; with no team open there is nothing to
 /// reload and the next `TeamRuntime::open` reads the file itself.
 pub fn apply_routing_settings(
     config_dir: &Path,
@@ -741,6 +749,30 @@ pub fn apply_routing_settings(
         team.reload_routing_settings();
     }
     Ok(())
+}
+
+/// One writer at a time for `[routing]`: the top control's mode write and
+/// the Laya check's gate application share this lock, so their
+/// load-modify-save cycles never interleave — a mode change can never
+/// land between a check's load and its save, and vice versa.
+static ROUTING_WRITE: Mutex<()> = Mutex::new(());
+
+/// Load `[routing]`, apply one change, and land it through
+/// [`apply_routing_settings`] — under the [`ROUTING_WRITE`] lock, so the
+/// two writers (the top control, the automatic Laya check) serialize.
+/// The lock is never held across an await: this is a sync function, and
+/// its callers keep their async work outside it.
+pub fn update_routing_settings(
+    config_dir: &Path,
+    team: Option<&TeamRuntime>,
+    change: impl FnOnce(&mut dispatch_routing::RoutingSettings),
+) -> Result<(), String> {
+    let _guard = ROUTING_WRITE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut settings = dispatch_routing::load_routing_settings(config_dir);
+    change(&mut settings);
+    apply_routing_settings(config_dir, &settings, team)
 }
 
 /// The dispatch routing log summarised for the page.
@@ -914,146 +946,7 @@ pub fn summarize_rows(rows: &[dispatch_routing::DispatchRoutingRow]) -> RoutingL
     summary
 }
 
-/// The Laya page's eval result: every label-count run (four labels — the
-/// question dispatch asks — then three and two) and the record written to
-/// `route_eval.json`.
-#[derive(Debug, Clone, Serialize)]
-pub struct RoutingEvalWire {
-    /// The four-label run — the question dispatch actually asks (design
-    /// §5.1).
-    pub four: route_eval::EvalReport,
-    /// The three-label run.
-    pub three: route_eval::EvalReport,
-    /// The two-label run.
-    pub two: route_eval::EvalReport,
-    /// The record written to `route_eval.json`.
-    pub record: route_eval::EvalRecord,
-}
 
-/// Run the routing eval against the open lead's attached Laya: the hand set
-/// under four labels — the question dispatch actually asks — and again under
-/// three and two, one prompt at a time; writes `route_eval.json` and returns
-/// all three reports. It never applies a threshold — the page's Apply button
-/// saves the suggestion through [`save_routing_settings`].
-#[tauri::command]
-pub async fn run_routing_eval(
-    state: State<'_, Mnemo2State>,
-) -> Result<RoutingEvalWire, String> {
-    let (setup, runtime) = settings_setup(&state).await?;
-    let Some(runtime) = runtime else {
-        return Err("open a lead first: the eval asks the lead's attached Laya".to_string());
-    };
-    let classifier = attached_classifier(&setup)?;
-    let route_knn = runtime
-        .team_handle()
-        .await
-        .ok()
-        .and_then(|team| team.route_knn());
-    let routing = dispatch_routing::load_routing_settings(setup.config_dir());
-    let (four, three, two) = routing_eval_reports(
-        classifier.as_ref(),
-        route_knn.as_deref(),
-        routing.knn_min_rows,
-        routing.knn_min_share,
-    )
-    .await?;
-    let record = route_eval::eval_record(&four, &three, &two);
-    route_eval::save_eval_record(&record)?;
-    Ok(RoutingEvalWire { four, three, two, record })
-}
-
-/// The lead engine's live classifier, or a clear error naming what is
-/// missing.
-fn attached_classifier(setup: &Setup) -> Result<Arc<dyn Classifier>, String> {
-    let missing = || "Laya is not attached: enable it on this page first".to_string();
-    let slot = setup.classifier_slot().ok_or_else(missing)?;
-    let classifier = slot
-        .read()
-        .expect("classifier slot lock poisoned")
-        .clone();
-    classifier.ok_or_else(missing)
-}
-
-/// The three corpus passes, sequentially, with no file writes — the command
-/// adds the record; the tests drive this with a stub classifier and never
-/// touch the network.
-pub async fn routing_eval_reports(
-    classifier: &dyn Classifier,
-    knn: Option<&RouteKnn>,
-    knn_min_rows: usize,
-    knn_min_share: f64,
-) -> Result<
-    (
-        route_eval::EvalReport,
-        route_eval::EvalReport,
-        route_eval::EvalReport,
-    ),
-    String,
-> {
-    let cases = route_eval::parse_hand_set(route_eval::HAND_SET_JSONL)?;
-    // The four-label run is the question dispatch actually asks (design §5.1:
-    // every pickable tier is offered); the three- and two-label runs cover the
-    // reduced offered sets — the interim legacy-tier shape, and the extremes
-    // with both middles folded into `hard`.
-    let four_offered = OfferedLabels {
-        trivial: true,
-        routine: true,
-        involved: true,
-        hard: true,
-    };
-    let three_offered = OfferedLabels { trivial: true, routine: true, involved: false, hard: true };
-    let two_offered = OfferedLabels { trivial: true, routine: false, involved: false, hard: true };
-    let four_scores = route_eval::classify_corpus(classifier, four_offered, &cases).await;
-    let three_scores = route_eval::classify_corpus(classifier, three_offered, &cases).await;
-    let two_scores = route_eval::classify_corpus(classifier, two_offered, &cases).await;
-    let four_knn = match knn {
-        Some(knn) => Some(
-            route_eval::evaluate_knn(
-                &cases,
-                &four_scores,
-                four_offered,
-                knn,
-                knn_min_rows,
-                knn_min_share,
-            )
-            .await,
-        ),
-        None => None,
-    };
-    let three_knn = match knn {
-        Some(knn) => Some(
-            route_eval::evaluate_knn(
-                &cases,
-                &three_scores,
-                three_offered,
-                knn,
-                knn_min_rows,
-                knn_min_share,
-            )
-            .await,
-        ),
-        None => None,
-    };
-    let two_knn = match knn {
-        Some(knn) => Some(
-            route_eval::evaluate_knn(
-                &cases,
-                &two_scores,
-                two_offered,
-                knn,
-                knn_min_rows,
-                knn_min_share,
-            )
-            .await,
-        ),
-        None => None,
-    };
-    Ok((
-        route_eval::report_with_knn(&four_scores, four_offered, four_knn),
-        route_eval::report_with_knn(&three_scores, three_offered, three_knn),
-        route_eval::report_with_knn(&two_scores, two_offered, two_knn),
-    ))
-}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 //
@@ -1737,79 +1630,5 @@ simple = ["ep1/exec-model"]
         assert_eq!(summary.nudges, 2);
         assert_eq!(summary.nudges_acted_on, 1);
         assert_eq!(summary.eval_date, None);
-    }
-
-    /// A classifier that answers each hand-set text with the label the
-    /// fixture records for it (`routine` for the vague ones), at confidence
-    /// 0.9 — enough to drive both eval passes with no network.
-    struct StubClassifier {
-        expected: BTreeMap<String, Option<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl Classifier for StubClassifier {
-        async fn classify(
-            &self,
-            state: &str,
-            _question: &mnemo::memory::classifier::Question,
-        ) -> Option<mnemo::memory::classifier::Answer> {
-            let label = self
-                .expected
-                .get(state)
-                .cloned()
-                .flatten()
-                .unwrap_or_else(|| "routine".to_string());
-            Some(mnemo::memory::classifier::Answer::Choice {
-                label,
-                confidence: 0.9,
-                probabilities: BTreeMap::new(),
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn routing_eval_reports_with_a_stub_classifier() {
-        let cases = route_eval::parse_hand_set(route_eval::HAND_SET_JSONL).expect("hand set");
-        let expected: BTreeMap<String, Option<String>> = cases
-            .iter()
-            .map(|case| (case.text.clone(), case.expected.clone()))
-            .collect();
-        let stub = StubClassifier { expected };
-
-        let (four, three, two) = routing_eval_reports(&stub, None, 30, 0.80)
-            .await
-            .expect("reports");
-        assert_eq!(four.labels, 4);
-        assert_eq!(three.labels, 3);
-        assert_eq!(two.labels, 2);
-        assert_eq!(four.table.len(), 23);
-        assert_eq!(three.table.len(), 23);
-        assert_eq!(two.table.len(), 23);
-        // Every case clears the gate at 0.9: the four-label run — the question
-        // dispatch asks — gets all 56 labelled cases right, and the three
-        // vague ones are false routes and so are the misses.
-        assert_eq!(four.table[0].routed, 59);
-        assert!((four.table[0].accuracy - 56.0 / 59.0).abs() < 1e-12);
-        assert_eq!(four.misses.len(), 3);
-        assert!((four.suggested.expect("a suggested gate") - 0.25).abs() < 1e-9);
-        // The stub answers the recorded label, and an un-offered label folds
-        // the same way on the answer and the expectation side — so the
-        // reduced offered sets are also right on all 56 labelled cases. The
-        // runs differ in their labels count and their own default gate.
-        assert!((three.table[0].accuracy - 56.0 / 59.0).abs() < 1e-12);
-        assert_eq!(three.misses.len(), 3);
-        assert!((two.table[0].accuracy - 56.0 / 59.0).abs() < 1e-12);
-        assert!(
-            (four.default_gate - mnemo::agent::route_question::DEFAULT_MIN_CONFIDENCE_4).abs() < 1e-9
-        );
-        assert!(
-            (three.default_gate - mnemo::agent::route_question::DEFAULT_MIN_CONFIDENCE_3).abs()
-                < 1e-9
-        );
-        assert!(
-            (two.default_gate - mnemo::agent::route_question::DEFAULT_MIN_CONFIDENCE_2).abs() < 1e-9
-        );
-        assert!(three.suggested.is_some());
-        assert!(two.suggested.is_some());
     }
 }

@@ -1113,6 +1113,33 @@ impl LeadRuntime {
         }
     }
 
+    /// Run the automatic Laya check (plan 8106337a) on this lead's engine:
+    /// hand [`crate::mnemo2::laya_check::spawn_laya_check`] this runtime's
+    /// indexing tracker (the pass shows on the project's status line),
+    /// the open team (so the gates it applies take effect without a
+    /// restart) and the real record path. Unforced, the check itself
+    /// skips silently when routing is off, Laya is down or the record's
+    /// fingerprint still matches. Never called from `start_engine` or
+    /// `open` — the project-open path in `ipc` owns that trigger, after
+    /// its indexing forwarder exists.
+    pub async fn start_laya_check(&self, force: bool) -> Result<(), String> {
+        let engine = self.engine_handle().await?;
+        let team = self.team_handle().await.ok();
+        let setup = mnemo::headless::Setup::open(Some(self.config_dir.clone()))
+            .map_err(|error| error.to_string())?
+            .for_engine(&engine);
+        crate::mnemo2::laya_check::spawn_laya_check(
+            crate::mnemo2::laya_check::LayaCheck {
+                setup,
+                config_dir: self.config_dir.clone(),
+                team,
+                tracker: self.indexing.clone(),
+                record_path: crate::mnemo2::route_eval::route_eval_path(),
+            },
+            force,
+        )
+    }
+
     async fn spawn_live(
         &self,
         generation: u64,

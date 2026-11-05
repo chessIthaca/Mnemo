@@ -92,6 +92,9 @@ pub mod run_file;
 /// e02de747).
 pub mod laya_settings;
 
+/// The automatic Laya check (plan 8106337a): the routing eval the app runs by itself, plus its Check-again command.
+pub mod laya_check;
+
 /// The Safety settings commands (approval mode + the project's safety
 /// rules) — the backend of the Settings dialog's Safety page (plan
 /// f1bd54e5).
@@ -552,9 +555,8 @@ pub fn run() {
             ipc::lead_open,
             laya_settings::laya_status,
             laya_settings::routing_settings_status,
-            laya_settings::save_routing_settings,
             laya_settings::routing_log_summary,
-            laya_settings::run_routing_eval,
+            laya_check::laya_check_start,
             laya_settings::laya_setup,
             laya_settings::laya_disable,
             laya_settings::save_laya_settings,

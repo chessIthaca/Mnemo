@@ -208,6 +208,8 @@ struct CreateArgs {
     spec_deltas: Vec<Delta>,
     #[serde(default)]
     sections: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    backlog_id: Option<String>,
 }
 
 /// `plan_create` — open a new plan on the board.
@@ -248,6 +250,8 @@ impl Tool for PlanCreateTool {
              dispatch on this plan requires at least one. OpenSpec `spec_deltas` are encouraged \
              when specified behavior changes, never required, and are checked against \
              .coding/openspec/specs/; delta scenarios also count as acceptance scenarios. \
+             When the plan fulfils a backlog idea handed over with Plan this, pass its \
+             `backlog_id` to mark the item done with this plan (an unknown id only warns). \
              Delegate each step with team_dispatch(plan_id, step, ...). The plan stays on disk after it closes.",
             json!({
                 "type": "object",
@@ -261,7 +265,8 @@ impl Tool for PlanCreateTool {
                     "interfaces": {"type": "array", "items": {"type": "string"}, "description": "Contracts between steps, one per entry: exports, signatures, data shapes, file ownership, e.g. \"`src/game.js` — exports `Game` as a named export; UI owns rendering and must not modify it\". Record one whenever two steps touch the same file or module boundary, before dispatching them."},
                     "acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes the finished work must show, one per entry: a command and its result, a persisted state, a concurrency or security property, a UI behavior. Kept in the plan's '## Acceptance scenarios' section and given to every worker; a review_risk='high' dispatch requires at least one."},
                     "spec_deltas": spec_deltas_schema(),
-                    "sections": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Additional OpenSpec artifact markdown keyed by artifact id. The schema's refusal names any required section and supplies its template and rules."}
+                    "sections": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Additional OpenSpec artifact markdown keyed by artifact id. The schema's refusal names any required section and supplies its template and rules."},
+                    "backlog_id": {"type": "string", "description": "The id of the backlog item this plan fulfils (the id a Plan this notice named). The item is marked done with this plan's id and title; an unknown id is only a warning."}
                 },
                 "required": ["title", "goal", "context", "steps"]
             }),
@@ -323,6 +328,23 @@ impl Tool for PlanCreateTool {
             .map(|s| (s.number, s.text.as_str()))
             .collect();
         output.push_str(&spec_notes(&step_specs));
+        // The Plan-this link: the backlog item the lead was handed becomes
+        // done, its idea now living as this plan. Pure bookkeeping — an
+        // unknown id warns, never refuses the created plan.
+        if let Some(backlog_id) = args.backlog_id.as_deref() {
+            if self.board.link_backlog_item(backlog_id, &plan) {
+                output.push_str(&format!(
+                    "\n\nBacklog item {backlog_id} is done — it became plan {} \"{}\".",
+                    plan.id, plan.title
+                ));
+            } else {
+                output.push_str(&format!(
+                    "\n\nWarning: backlog item {backlog_id} was not marked done — \
+                     there is no live pending or in-flight idea with that id. \
+                     The plan is unaffected."
+                ));
+            }
+        }
         // Passive recall rides the result, like create_plan: prior knowledge
         // arrives with the plan. Best-effort; never blocks creation.
         if let Some(rider) = crate::tool::steering::recalled_context_block(
@@ -826,6 +848,7 @@ impl Tool for PlanAbandonTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::backlog::{BacklogStatus, BacklogStore};
     use crate::app::team_ledger::fake::FakeLedger;
     use crate::app::team_ledger::OpenTask;
 
@@ -935,6 +958,63 @@ mod tests {
             .await;
         assert!(res.success, "{}", res.output);
         assert!(!res.output.contains("Spec notes"), "{}", res.output);
+    }
+
+    #[tokio::test]
+    async fn create_with_backlog_id_marks_the_item_done_with_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let mut store = BacklogStore::open(dir.path().join("backlog.jsonl"));
+        let added = store.add("Fix the importer".to_string(), Vec::new());
+
+        let res = PlanCreateTool::new(board)
+            .execute(json!({
+                "title": "Importer",
+                "goal": "Fix the importer",
+                "context": "Rows vanish on empty cells; keep the CLI flags.",
+                "steps": ["Fix src/import.rs"],
+                "backlog_id": added.id
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output.contains(&format!("Backlog item {} is done", added.id)),
+            "{}",
+            res.output
+        );
+
+        let item = BacklogStore::open(dir.path().join("backlog.jsonl"))
+            .items()
+            .into_iter()
+            .find(|item| item.id == added.id)
+            .unwrap();
+        assert_eq!(item.status, BacklogStatus::Done);
+        let plan_id = res.data.unwrap()["id"].as_str().unwrap().to_string();
+        assert_eq!(item.plan_id.as_deref(), Some(plan_id.as_str()));
+        assert_eq!(item.plan_title.as_deref(), Some("Importer"));
+        assert_eq!(item.note.as_deref(), Some("planned as Importer"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_backlog_id_warns_without_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let res = PlanCreateTool::new(board)
+            .execute(json!({
+                "title": "Importer",
+                "goal": "Fix the importer",
+                "context": "Rows vanish on empty cells; keep the CLI flags.",
+                "steps": ["Fix src/import.rs"],
+                "backlog_id": "no-such-item"
+            }))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output
+                .contains("Warning: backlog item no-such-item was not marked done"),
+            "{}",
+            res.output
+        );
     }
 
     #[tokio::test]

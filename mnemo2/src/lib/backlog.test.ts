@@ -46,6 +46,7 @@ describe("backlog transport", () => {
       reorder: vi.fn(async () => [item("a")]),
       setDeferred: vi.fn(async () => [item("a")]),
       clearFinished: vi.fn(async () => [item("a")]),
+      planThis: vi.fn(async () => [item("a")]),
       onChanged: vi.fn(async () => () => {}),
     };
     seedBacklogPreview(planted);
@@ -81,6 +82,7 @@ describe("backlog transport", () => {
     await transport.reorder(["b", "a"]);
     await transport.setDeferred("a", true);
     await transport.clearFinished();
+    await transport.planThis("a");
     const changed = vi.fn();
     await transport.onChanged(changed);
 
@@ -92,6 +94,7 @@ describe("backlog transport", () => {
       { command: "backlog_reorder", args: { ids: ["b", "a"] } },
       { command: "backlog_set_deferred", args: { id: "a", deferred: true } },
       { command: "backlog_clear_finished", args: undefined },
+      { command: "plan_this", args: { id: "a" } },
     ]);
     expect(listen.mock.calls[0][0]).toBe(BACKLOG_EVENT_CHANNEL);
     expect(changed).toHaveBeenCalledTimes(1);

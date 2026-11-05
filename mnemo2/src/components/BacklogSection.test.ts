@@ -39,6 +39,14 @@ function fakeTransport(initial: BacklogItem[]) {
     items = items.filter((item) => item.status === "pending");
     return items;
   });
+  const planThis = vi.fn(async (id: string) => {
+    items = items.map((item) =>
+      item.id === id
+        ? { ...item, status: "in_flight" as const, note: "handed to the lead" }
+        : item,
+    );
+    return items;
+  });
   const onChanged = vi.fn(async (_handler: () => void) => () => {});
   const transport: BacklogTransport = {
     items: async () => items,
@@ -48,11 +56,12 @@ function fakeTransport(initial: BacklogItem[]) {
     reorder,
     setDeferred,
     clearFinished,
+    planThis,
     onChanged,
   };
   return {
     transport,
-    calls: { add, edit, remove, reorder, setDeferred, clearFinished, onChanged },
+    calls: { add, edit, remove, reorder, setDeferred, clearFinished, planThis, onChanged },
     append: (item: BacklogItem) => {
       items = [...items, item];
     },
@@ -157,6 +166,18 @@ describe("BacklogSection", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Clear finished" }));
     expect(calls.clearFinished).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(screen.queryByText("1 finished")).toBeNull());
+  });
+
+  it("hands an idea to the lead and confirms it was sent", async () => {
+    const { transport, calls } = fakeTransport([row("a")]);
+    render(BacklogSection, { props: { transport } });
+    await waitFor(() => expect(shownIdeas()).toEqual(["Idea a"]));
+
+    await fireEvent.click(screen.getByRole("button", { name: "Plan this Idea a" }));
+    expect(calls.planThis).toHaveBeenCalledWith("a");
+
+    await waitFor(() => expect(screen.getByText("Sent to the lead — Idea a")).toBeTruthy());
+    await waitFor(() => expect(shownIdeas()).toEqual([]));
   });
 
   it("shows a failed write's message", async () => {

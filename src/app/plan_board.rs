@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::backlog::{BacklogStatus, BacklogStore};
 use crate::app::openspec::archive;
 use crate::app::openspec::schema::{ResolvedSchema, Schema};
 use crate::app::team_ledger::{PlanReview, TeamLedger};
@@ -406,12 +407,47 @@ impl PlanBoard {
             sections,
         };
         self.validate_artifacts(&resolved, &plan, &entry.spec_deltas, &entry.sections)?;
+        self.validate_artifacts(&resolved, &plan, &entry.spec_deltas, &entry.sections)?;
         std::fs::create_dir_all(&self.plans_dir).map_err(|e| e.to_string())?;
         self.save_plan(&id, &plan, &entry)?;
         let view = board_plan(&entry, &plan);
         board.plans.push(entry);
         self.save_board(&board)?;
         Ok(view)
+    }
+
+    /// The project's backlog file (`.coding/backlog.jsonl`), derived from the
+    /// plans dir like every other `.coding` path. The board owns no backlog
+    /// state of its own — the kernel store over this file is the one source
+    /// of truth, re-read before every mutation.
+    fn backlog_file(&self) -> PathBuf {
+        self.plans_dir
+            .parent()
+            .unwrap_or(&self.plans_dir)
+            .join("backlog.jsonl")
+    }
+
+    /// Finish the "Plan this" handoff after a plan was created: the backlog
+    /// item the lead was handed becomes `Done` — its idea now lives as the
+    /// plan — and its `plan_id`/`plan_title` record which one. Both writes go
+    /// through the guarded table ([`BacklogStore::transition`], then
+    /// [`BacklogStore::set_plan_id`], each re-reading the file first, so a
+    /// concurrent backlog editor never loses its write): a live `Pending` or
+    /// `InFlight` item (the plan_this handoff marks it `InFlight`) links and
+    /// finishes; anything else — an unknown id, an already finished item —
+    /// changes nothing and returns `false`, so the caller warns instead of
+    /// failing the plan. Returns `true` when the item was linked and marked
+    /// done.
+    pub fn link_backlog_item(&self, backlog_id: &str, plan: &BoardPlan) -> bool {
+        let mut store = BacklogStore::open(self.backlog_file());
+        if !store.transition(
+            backlog_id,
+            BacklogStatus::Done,
+            Some(format!("planned as {}", plan.title)),
+        ) {
+            return false;
+        }
+        store.set_plan_id(backlog_id, Some(&plan.id), Some(&plan.title))
     }
 
     /// Edit an open plan: append context, record a decision, add steps,

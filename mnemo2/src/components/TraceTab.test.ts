@@ -61,11 +61,14 @@ function row(overrides: Partial<TraceRow> = {}): TraceRow {
     generation_ms: 900,
     reasoning_ms: null,
     connect_ms: null,
+    upload_ms: null,
+    server_ms: null,
     tools_ms: null,
     prep_ms: null,
     compact_ms: null,
     backoff_ms: null,
     stall_ms: null,
+    chunks: null,
     error: null,
     cancelled: false,
     response_truncated: false,
@@ -170,6 +173,22 @@ describe("TraceTab", () => {
     // The tab asks for the newest 20 and names the scope in plain words.
     expect(mocks.queries[0]).toEqual({ agent: undefined, limit: 20 });
     expect(screen.getByText(/The latest 20 model calls from the lead and every worker/)).toBeTruthy();
+  });
+
+  it("shows the finer live statuses on in-flight calls, not one opaque connect", async () => {
+    installTransport();
+    mocks.rows = [
+      // The POST is out, the body is still being written.
+      row({ id: 11, ts_ms: NOW - 1_000, is_complete: false, finish_reason: null, http_status: null, usage: null, version: 1, ttft_ms: null, connect_ms: null, prep_ms: 40, upload_ms: null, server_ms: null }),
+      // The body is written; the server is queueing and prefilling.
+      row({ id: 10, ts_ms: NOW - 5_000, is_complete: false, finish_reason: null, http_status: null, usage: null, version: 3, ttft_ms: null, connect_ms: null, prep_ms: 40, upload_ms: 120, server_ms: null }),
+    ];
+    render(TraceTab);
+
+    const uploading = await screen.findByRole("button", { name: /Open call 11:/ });
+    expect(uploading.textContent).toContain("Uploading");
+    const waiting = screen.getByRole("button", { name: /Open call 10:/ });
+    expect(waiting.textContent).toContain("Waiting for first token");
   });
 
   it("filters by the lead and by the open worker", async () => {

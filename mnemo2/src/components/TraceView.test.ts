@@ -86,11 +86,14 @@ function callRow(overrides: Partial<TraceRow> = {}): TraceRow {
     generation_ms: 4_000,
     reasoning_ms: 1_200,
     connect_ms: 300,
+    upload_ms: null,
+    server_ms: null,
     tools_ms: 8_000,
     prep_ms: 500,
     compact_ms: null,
     backoff_ms: null,
     stall_ms: null,
+    chunks: null,
     error: null,
     cancelled: false,
     response_truncated: false,
@@ -343,12 +346,20 @@ describe("TraceView", () => {
 
   it("updates an in-flight row in place from the poll, never duplicating it", async () => {
     installTransport();
-    const live = callRow({ id: 1, model: "live-model", is_complete: false, ttft_ms: null, finish_reason: null, http_status: null, usage: null, version: 1 });
+    const live = callRow({ id: 1, model: "live-model", is_complete: false, ttft_ms: null, connect_ms: null, finish_reason: null, http_status: null, usage: null, version: 1 });
     mocks.rows = [live];
     render(TraceView);
-    await vi.waitFor(() => expect(screen.getByRole("button", { name: /Waiting/ })).toBeTruthy());
+    // The POST is out, the body is still being written: the finer live
+    // status shows Uploading where the old model said only Waiting.
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /Uploading/ })).toBeTruthy());
 
-    const finished = callRow({ id: 1, model: "live-model", is_complete: true, version: 2 });
+    // The upload finishes: the same row now waits on the server.
+    const waiting = callRow({ id: 1, model: "live-model", is_complete: false, ttft_ms: null, connect_ms: null, upload_ms: 120, version: 2 });
+    mocks.rows = [waiting];
+    await flush(1_500);
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: /Waiting for first token/ })).toBeTruthy());
+
+    const finished = callRow({ id: 1, model: "live-model", is_complete: true, version: 3 });
     mocks.rows = [finished];
     await flush(1_500);
     await vi.waitFor(() => expect(screen.getByRole("button", { name: /live-model/ })).toBeTruthy());

@@ -62,11 +62,14 @@ const row = (overrides: Partial<TraceRow> = {}): TraceRow => ({
   generation_ms: null,
   reasoning_ms: null,
   connect_ms: null,
+  upload_ms: null,
+  server_ms: null,
   tools_ms: null,
   prep_ms: null,
   compact_ms: null,
   backoff_ms: null,
   stall_ms: null,
+  chunks: null,
   error: null,
   cancelled: false,
   response_truncated: false,
@@ -267,9 +270,25 @@ describe("trace page contract helpers", () => {
         label: "Guard cut",
         tone: "guard",
       });
-      expect(callStatus(row({}))).toEqual({ key: "in_progress", label: "Waiting", tone: "live" });
-      expect(callStatus(row({ ttft_ms: 300 }))).toEqual({ key: "in_progress", label: "Streaming", tone: "live" });
       expect(callStatus(row({ is_complete: true }))).toEqual({ key: "complete", label: "Complete", tone: "ok" });
+    });
+
+    it("walks the finer live ladder as the kernel stamps each field", () => {
+      // Nothing stamped yet: the request body is still being built.
+      expect(callStatus(row({}))).toEqual({ key: "in_progress", label: "Preparing", tone: "live" });
+      // The POST is out, the body is still being written.
+      expect(callStatus(row({ prep_ms: 10 }))).toEqual({ key: "in_progress", label: "Uploading", tone: "live" });
+      // The body is written; the server is queueing and prefilling.
+      expect(callStatus(row({ prep_ms: 10, upload_ms: 45 }))).toEqual({ key: "in_progress", label: "Waiting for first token", tone: "live" });
+      // Rows from before the upload/server split reach the same state once
+      // the headers arrive.
+      expect(callStatus(row({ prep_ms: 10, connect_ms: 6_761 }))).toEqual({ key: "in_progress", label: "Waiting for first token", tone: "live" });
+      // The first chunk landed.
+      expect(callStatus(row({ prep_ms: 10, upload_ms: 45, server_ms: 6_716, ttft_ms: 6_762 }))).toEqual({ key: "in_progress", label: "Streaming", tone: "live" });
+      // The stream hit a silence longer than the kernel's stall threshold.
+      expect(callStatus(row({ ttft_ms: 300, stall_ms: 50 }))).toEqual({ key: "in_progress", label: "Stalled", tone: "live" });
+      // A zero-stall stream keeps streaming.
+      expect(callStatus(row({ ttft_ms: 300, stall_ms: 0 }))).toEqual({ key: "in_progress", label: "Streaming", tone: "live" });
     });
   });
 
@@ -310,13 +329,86 @@ describe("trace page contract helpers", () => {
       expect(traceCostLabel(80_000)).not.toBe("$0.00");
     });
 
-    it("nests compaction inside setup and stalls inside generation", () => {
-      const phases = tracePhases(row({ prep_ms: 500, compact_ms: 200, connect_ms: 300, ttft_ms: 900, generation_ms: 4000, stall_ms: 1200, backoff_ms: 100 }));
-      expect(phases.map((phase) => phase.key)).toEqual(["setup", "connect", "first_token", "generation", "retry_wait"]);
+    it("nests compaction inside setup and reasoning and stalls inside generation", () => {
+      const phases = tracePhases(row({ prep_ms: 500, compact_ms: 200, upload_ms: 300, server_ms: 600, ttft_ms: 900, generation_ms: 4000, reasoning_ms: 2100, stall_ms: 1200, backoff_ms: 100 }));
+      expect(phases.map((phase) => phase.key)).toEqual(["setup", "upload", "server", "generation", "retry_wait"]);
       expect(phases[0].inside?.[0]).toEqual({ key: "compaction", label: "Compaction", ms: 200 });
-      expect(phases[3].inside?.[0]).toEqual({ key: "stalls", label: "Stalls", ms: 1200 });
-      expect(phaseTotalMs(row({ prep_ms: 500, compact_ms: 200, connect_ms: 300, ttft_ms: 900, generation_ms: 4000, backoff_ms: 100 }))).toBe(5800);
+      expect(phases[3].inside).toEqual([
+        { key: "reasoning_time", label: "Reasoning", ms: 2100 },
+        { key: "stalls", label: "Stalls", ms: 1200 },
+      ]);
+      // ttft_ms is a metric, not a segment: it never adds to the total.
+      expect(phaseTotalMs(row({ prep_ms: 500, compact_ms: 200, upload_ms: 300, server_ms: 600, ttft_ms: 900, generation_ms: 4000, backoff_ms: 100 }))).toBe(5500);
       expect(phaseTotalMs(row())).toBeNull();
+    });
+  });
+
+  describe("phase model", () => {
+    // Row 25 of run r1793901734063-57164-1 (the 2026-11-05 investigation),
+    // plus the upload/server split the new kernel stamps: prep 213,
+    // connect 6761, ttft 6762 — connect and ttft measured the same window.
+    const glmRow = row({
+      id: 25,
+      is_complete: true,
+      http_status: 200,
+      finish_reason: "tool_calls",
+      usage: { prompt: 149_352, completion: 7_459, reasoning: 6_776, cached: 48_000 },
+      prep_ms: 213,
+      upload_ms: 45,
+      server_ms: 6_716,
+      connect_ms: 6_761,
+      ttft_ms: 6_762,
+      generation_ms: 23_114,
+      reasoning_ms: 21_453,
+      stall_ms: 0,
+      chunks: 412,
+    });
+
+    it("decomposes the connect window without gaps or overlap, and keeps ttft a metric", () => {
+      const phases = tracePhases(glmRow);
+      // The bar draws exactly the lifecycle segments plus retry wait.
+      expect(phases.map((phase) => phase.key)).toEqual(["setup", "upload", "server", "generation", "retry_wait"]);
+      // Upload + Server wait decompose Connect (record→headers) exactly.
+      expect((phases.find((phase) => phase.key === "upload")?.ms ?? 0) + (phases.find((phase) => phase.key === "server")?.ms ?? 0)).toBe(6_761);
+      // First token is not a segment — drawing it would double-count.
+      expect(phases.some((phase) => phase.key === "first_token")).toBe(false);
+      // The total is the sum of the non-overlapping segments, ttft excluded.
+      expect(phaseTotalMs(glmRow)).toBe(213 + 45 + 6_716 + 23_114);
+    });
+
+    it("collapses absent segments on legacy rows instead of inventing or NaN-ing them", () => {
+      // A row from before the split: upload_ms/server_ms are null, so those
+      // segments collapse; Connect stays a metric, never a segment.
+      const legacy = row({ is_complete: true, prep_ms: 213, connect_ms: 6_761, ttft_ms: 6_762, generation_ms: 23_114, reasoning_ms: 21_453, stall_ms: 0 });
+      const phases = tracePhases(legacy);
+      expect(phases.map((phase) => phase.key)).toEqual(["setup", "upload", "server", "generation", "retry_wait"]);
+      expect(phases.find((phase) => phase.key === "upload")?.ms).toBeNull();
+      expect(phases.find((phase) => phase.key === "server")?.ms).toBeNull();
+      // No NaN: the total is the sum of the captured segments only.
+      expect(phaseTotalMs(legacy)).toBe(213 + 23_114);
+      // The bar draws only the captured segments.
+      expect(phases.filter((phase) => phase.ms !== null).map((phase) => phase.key)).toEqual(["setup", "generation"]);
+    });
+
+    it("renders the null-timing rows of run r1793901734063-57164-1 as complete calls", () => {
+      // Ids 2/12/20: prompt 0, every stream timing null, is_complete true.
+      const silent = row({
+        id: 2,
+        is_complete: true,
+        http_status: 200,
+        finish_reason: "tool_calls",
+        usage: { prompt: 0, completion: 87, reasoning: 1_881, cached: 0 },
+        prep_ms: 38,
+      });
+      expect(callStatus(silent).key).toBe("complete");
+      const phases = tracePhases(silent);
+      expect(phases.map((phase) => phase.key)).toEqual(["setup", "upload", "server", "generation", "retry_wait"]);
+      expect(phaseTotalMs(silent)).toBe(38);
+      // Every segment is a finite number or null — never NaN.
+      for (const phase of phases) {
+        if (phase.ms !== null) expect(Number.isFinite(phase.ms)).toBe(true);
+      }
+      expect(Number.isFinite(phaseTotalMs(silent) ?? Number.NaN)).toBe(true);
     });
   });
 

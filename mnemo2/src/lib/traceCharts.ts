@@ -60,7 +60,8 @@ function rowTokens(row: TraceRow): number {
 export type TimingSegmentKey =
   | "retry"
   | "setup"
-  | "connect"
+  | "upload"
+  | "server"
   | "firstToken"
   | "generation"
   | "tools";
@@ -85,9 +86,14 @@ export const TIMING_SEGMENTS: readonly TimingSegment[] = [
     hint: "Local work before the request: routing, token accounting, recall and prompt building. Includes compaction.",
   },
   {
-    key: "connect",
-    label: "Connect",
-    hint: "From creating the request to the response headers: upload, network and server acknowledgement.",
+    key: "upload",
+    label: "Upload",
+    hint: "Time spent writing the request body to the server — the prompt upload.",
+  },
+  {
+    key: "server",
+    label: "Server wait",
+    hint: "From the upload finishing until the response headers: the server's queue and prefill. Rows from before the upload/server split show their whole pre-headers window here.",
   },
   {
     key: "firstToken",
@@ -119,8 +125,11 @@ export interface TimingColumn {
   /** Compaction inside setup; a subset, shown as a hatch. */
   compactionMs: number;
   retryMs: number;
-  connectMs: number;
-  /** `ttft_ms` after the headers part was removed; never negative. */
+  /** Prompt upload (`upload_ms`); 0 on rows from before the upload/server split. */
+  uploadMs: number;
+  /** Headers wait (`server_ms`); the whole pre-headers window on rows from before the split. */
+  serverMs: number;
+  /** `ttft_ms` after the upload + server wait was removed; never negative. */
   firstTokenMs: number;
   /** Generation total (`generation_ms`), stalls included. */
   generationMs: number;
@@ -128,7 +137,7 @@ export interface TimingColumn {
   stallMs: number;
   toolsMs: number;
   status: TraceStatus;
-  /** The sum of all six stacked phases (overlays excluded). */
+  /** The sum of all seven stacked phases (overlays excluded). */
   stackMs: number;
   /** The sum of the visible stacked phases after legend hides. */
   visibleMs: number;
@@ -145,12 +154,13 @@ export interface TimingChart {
   hasData: boolean;
 }
 
-/** The six stacked phase values of one column, keyed by segment key. */
+/** The seven stacked phase values of one column, keyed by segment key. */
 export function timingValues(column: TimingColumn): Record<TimingSegmentKey, number> {
   return {
     retry: column.retryMs,
     setup: column.setupMs,
-    connect: column.connectMs,
+    upload: column.uploadMs,
+    server: column.serverMs,
     firstToken: column.firstTokenMs,
     generation: column.generationMs,
     tools: column.toolsMs,
@@ -163,8 +173,12 @@ export function timingValues(column: TimingColumn): Record<TimingSegmentKey, num
  * The phase-attribution spec is applied exactly and nothing is double-counted:
  * - Setup is `prep_ms`, which CONTAINS compaction; compaction is a hatch inside
  *   it and is never added to the stack.
- * - Connect is the headers wait; First token is `ttft_ms − connect_ms`, so the
- *   first-token wait follows the headers instead of repeating the connect.
+ * - Upload is `upload_ms` and Server wait is `server_ms` — the two halves of
+ *   the old Connect window. Rows from before the split carry only
+ *   `connect_ms`; their whole pre-headers window reads as Server wait (for SSE
+ *   providers it is the server's queue and prefill), so stack totals stay
+ *   exactly what they were. First token is what remains of `ttft_ms` after
+ *   Upload + Server wait, so it never repeats them.
  * - Generation is `generation_ms`, which CONTAINS stalls; stalls are a hatch
  *   inside it and never extra width.
  * - Retry wait precedes the attempt; Tools run after the response. The column
@@ -181,15 +195,21 @@ export function timingChart(
     const setupMs = ms(row.prep_ms);
     const compactionMs = Math.min(setupMs, ms(row.compact_ms));
     const retryMs = ms(row.backoff_ms);
-    const connectMs = ms(row.connect_ms);
-    const firstTokenMs = Math.max(0, ms(row.ttft_ms) - connectMs);
+    // The connect window decomposes into Upload + Server wait on rows from
+    // after the split; rows from before it carry only `connect_ms`, which
+    // reads as Server wait so the stack total is unchanged.
+    const split = row.upload_ms !== null || row.server_ms !== null;
+    const uploadMs = ms(row.upload_ms);
+    const serverMs = split ? ms(row.server_ms) : ms(row.connect_ms);
+    const firstTokenMs = Math.max(0, ms(row.ttft_ms) - uploadMs - serverMs);
     const generationMs = ms(row.generation_ms);
     const stallMs = Math.min(generationMs, ms(row.stall_ms));
     const toolsMs = ms(row.tools_ms);
     const values = {
       retry: retryMs,
       setup: setupMs,
-      connect: connectMs,
+      upload: uploadMs,
+      server: serverMs,
       firstToken: firstTokenMs,
       generation: generationMs,
       tools: toolsMs,
@@ -207,7 +227,8 @@ export function timingChart(
       setupMs,
       compactionMs,
       retryMs,
-      connectMs,
+      uploadMs,
+      serverMs,
       firstTokenMs,
       generationMs,
       stallMs,

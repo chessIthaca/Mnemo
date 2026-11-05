@@ -41,11 +41,14 @@ function row(overrides: Partial<TraceRow> = {}): TraceRow {
     generation_ms: 4000,
     reasoning_ms: 600,
     connect_ms: 500,
+    upload_ms: null,
+    server_ms: null,
     tools_ms: 800,
     prep_ms: 1000,
     compact_ms: 300,
     backoff_ms: 200,
     stall_ms: 400,
+    chunks: null,
     error: null,
     cancelled: false,
     response_truncated: false,
@@ -108,6 +111,8 @@ describe("TraceCharts", () => {
     expect(details?.textContent).toContain("Values table");
     const table = details?.querySelector("table");
     expect(table?.textContent).toContain("Compaction (in Setup)");
+    expect(table?.textContent).toContain("Upload");
+    expect(table?.textContent).toContain("Server wait");
     expect(table?.textContent).toContain("First token");
     expect(table?.textContent).toContain("400 ms");
     expect(table?.querySelectorAll("tbody tr")).toHaveLength(1);

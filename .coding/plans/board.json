@@ -6,7 +6,9 @@
       "created_at_ms": 1793315412638,
       "closed_at_ms": 1793321060622,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-b952eab4-20261030-004420.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "b2052a9c",
@@ -14,7 +16,9 @@
       "created_at_ms": 1793343003990,
       "closed_at_ms": 1793344400819,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-b2052a9c-20261030-071320.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "3420ba1d",
@@ -22,7 +26,9 @@
       "created_at_ms": 1793372406761,
       "closed_at_ms": 1793373141216,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3420ba1d-20261030-151221.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "292139df",
@@ -30,7 +36,9 @@
       "created_at_ms": 1793377597149,
       "closed_at_ms": 1793387190181,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-292139df-20261030-190630.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "e51c04cd",
@@ -38,7 +46,9 @@
       "created_at_ms": 1793433861479,
       "closed_at_ms": 1793438936762,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e51c04cd-20261031-092856.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "2c26d533",
@@ -46,7 +56,9 @@
       "created_at_ms": 1793439885856,
       "closed_at_ms": 1793443745418,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-2c26d533-20261031-104905.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "1b8e3713",
@@ -54,7 +66,9 @@
       "created_at_ms": 1793440298837,
       "closed_at_ms": 1793441496927,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1b8e3713-20261031-101136.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "6bb1c506",
@@ -62,7 +76,9 @@
       "created_at_ms": 1793441200913,
       "closed_at_ms": 1793442861982,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-6bb1c506-20261031-103421.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "2fea406b",
@@ -70,7 +86,9 @@
       "created_at_ms": 1793449050885,
       "closed_at_ms": 1793452725930,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-2fea406b-20261031-131845.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "edbb0411",
@@ -78,7 +96,9 @@
       "created_at_ms": 1793449051176,
       "closed_at_ms": 1793452560832,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-edbb0411-20261031-131600.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "0f378abe",
@@ -86,7 +106,9 @@
       "created_at_ms": 1793449591831,
       "closed_at_ms": 1793457381988,
       "report_path": ".coding/reviews/claude-lead-0f378abe-round1.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "df0dd2d0",
@@ -94,7 +116,9 @@
       "created_at_ms": 1793481515446,
       "closed_at_ms": 1793492100215,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-df0dd2d0-20261101-001500.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "e061970d",
@@ -102,7 +126,9 @@
       "created_at_ms": 1793481845500,
       "closed_at_ms": 1793482597353,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e061970d-20261031-213637.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "435c399e",
@@ -110,7 +136,9 @@
       "created_at_ms": 1793482674809,
       "closed_at_ms": 1793483644896,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-435c399e-20261031-215404.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "5ce39273",
@@ -118,7 +146,9 @@
       "created_at_ms": 1793483015207,
       "closed_at_ms": 1793505340199,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5ce39273-20261101-035540.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "53e56d1d",
@@ -126,7 +156,9 @@
       "created_at_ms": 1793519477729,
       "closed_at_ms": 1793521084864,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-53e56d1d-20261101-081804.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "763a911f",
@@ -134,7 +166,9 @@
       "created_at_ms": 1793519856043,
       "closed_at_ms": 1793535069684,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-763a911f-20261101-121109.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "fceee53e",
@@ -142,7 +176,9 @@
       "created_at_ms": 1793520681429,
       "closed_at_ms": 1793525950493,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-fceee53e-20261101-093910.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "ce6655f6",
@@ -150,7 +186,9 @@
       "created_at_ms": 1793522076316,
       "closed_at_ms": 1793535088922,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-ce6655f6-20261101-121128.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "01762f92",
@@ -158,7 +196,9 @@
       "created_at_ms": 1793537097159,
       "closed_at_ms": 1793542041769,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-01762f92-20261101-140721.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "e6c49e39",
@@ -166,7 +206,9 @@
       "created_at_ms": 1793537729274,
       "closed_at_ms": 1793540758260,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e6c49e39-20261101-134558.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "f7ae722b",
@@ -174,7 +216,9 @@
       "created_at_ms": 1793538180243,
       "closed_at_ms": 1793541428300,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f7ae722b-20261101-135708.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "955f6b4c",
@@ -182,7 +226,9 @@
       "created_at_ms": 1793542183464,
       "closed_at_ms": 1793543612664,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-955f6b4c-20261101-143332.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "111244fb",
@@ -190,7 +236,9 @@
       "created_at_ms": 1793569429348,
       "closed_at_ms": 1793573725067,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-111244fb-20261101-225525.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "07ee02fd",
@@ -198,7 +246,9 @@
       "created_at_ms": 1793569448957,
       "closed_at_ms": 1793570582770,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-07ee02fd-20261101-220302.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "5115cef1",
@@ -206,7 +256,9 @@
       "created_at_ms": 1793569467297,
       "closed_at_ms": 1793570994036,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5115cef1-20261101-220954.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "ecf59f53",
@@ -214,7 +266,9 @@
       "created_at_ms": 1793570747694,
       "closed_at_ms": 1793571321246,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-ecf59f53-20261101-221521.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "988fe146",
@@ -222,7 +276,9 @@
       "created_at_ms": 1793571027262,
       "closed_at_ms": 1793573038005,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-988fe146-20261101-224358.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "d23736c6",
@@ -230,7 +286,9 @@
       "created_at_ms": 1793573978792,
       "closed_at_ms": 1793574943622,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d23736c6-20261101-231543.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "2fde76bd",
@@ -238,7 +296,9 @@
       "created_at_ms": 1793576391719,
       "closed_at_ms": 1793588165663,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-2fde76bd-20261102-025605.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "d6a64d60",
@@ -246,7 +306,9 @@
       "created_at_ms": 1793576448978,
       "closed_at_ms": 1793581354648,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d6a64d60-20261102-010234.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "e02de747",
@@ -254,7 +316,9 @@
       "created_at_ms": 1793576481963,
       "closed_at_ms": 1793609791768,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e02de747-20261102-085631.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "971ffa5e",
@@ -262,7 +326,9 @@
       "created_at_ms": 1793578095507,
       "closed_at_ms": 1793609340164,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-971ffa5e-20261102-084900.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "3cf38c00",
@@ -270,7 +336,9 @@
       "created_at_ms": 1793579033791,
       "closed_at_ms": 1793585191226,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3cf38c00-20261102-020631.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "9d4016a8",
@@ -278,7 +346,9 @@
       "created_at_ms": 1793579198114,
       "closed_at_ms": 1793580101283,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-9d4016a8-20261102-004141.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "1e7fe37c",
@@ -286,7 +356,9 @@
       "created_at_ms": 1793580481051,
       "closed_at_ms": 1793580916908,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1e7fe37c-20261102-005516.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "bfe2b09f",
@@ -294,7 +366,9 @@
       "created_at_ms": 1793609728980,
       "closed_at_ms": 1793611763724,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-bfe2b09f-20261102-092923.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "b583528b",
@@ -302,7 +376,9 @@
       "created_at_ms": 1793609752000,
       "closed_at_ms": 1793611764267,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-b583528b-20261102-092924.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "102372f7",
@@ -310,7 +386,9 @@
       "created_at_ms": 1793610098010,
       "closed_at_ms": 1793611608767,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-102372f7-20261102-092648.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "c9b29308",
@@ -318,7 +396,9 @@
       "created_at_ms": 1793615429756,
       "closed_at_ms": 1793616898632,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-c9b29308-20261102-105458.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "0d53d659",
@@ -326,7 +406,9 @@
       "created_at_ms": 1793615535736,
       "closed_at_ms": 1793620654496,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-0d53d659-20261102-115734.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "75653550",
@@ -334,7 +416,9 @@
       "created_at_ms": 1793615565104,
       "closed_at_ms": 1793620238847,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-75653550-20261102-115038.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "8af9199d",
@@ -342,7 +426,9 @@
       "created_at_ms": 1793615591482,
       "closed_at_ms": 1793619933446,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-8af9199d-20261102-114533.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "6bec2755",
@@ -350,7 +436,9 @@
       "created_at_ms": 1793615613382,
       "closed_at_ms": 1793617935478,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-6bec2755-20261102-111215.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "b5dc77ab",
@@ -358,7 +446,9 @@
       "created_at_ms": 1793615649853,
       "closed_at_ms": 1793627436375,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-b5dc77ab-20261102-135036.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "f1bd54e5",
@@ -366,7 +456,9 @@
       "created_at_ms": 1793615681601,
       "closed_at_ms": 1793623910245,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f1bd54e5-20261102-125150.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "9cd9d1fc",
@@ -374,7 +466,9 @@
       "created_at_ms": 1793616557321,
       "closed_at_ms": 1793622294003,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-9cd9d1fc-20261102-122454.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "67a396ed",
@@ -382,7 +476,9 @@
       "created_at_ms": 1793626386983,
       "closed_at_ms": 1793627786978,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-67a396ed-20261102-135626.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "2575a63a",
@@ -390,7 +486,9 @@
       "created_at_ms": 1793629500614,
       "closed_at_ms": 1793631662809,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-2575a63a-20261102-150102.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "8545b610",
@@ -398,7 +496,9 @@
       "created_at_ms": 1793629519600,
       "closed_at_ms": 1793630182109,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-8545b610-20261102-143622.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "fbe9be3a",
@@ -406,7 +506,9 @@
       "created_at_ms": 1793629622835,
       "closed_at_ms": 1793632514379,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-fbe9be3a-20261102-151514.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "7f0b3848",
@@ -414,7 +516,9 @@
       "created_at_ms": 1793629983402,
       "closed_at_ms": 1793633719536,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-7f0b3848-20261102-153519.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "96f2bf7c",
@@ -422,7 +526,9 @@
       "created_at_ms": 1793630339398,
       "closed_at_ms": 1793631171783,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-96f2bf7c-20261102-145251.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "f10ac89c",
@@ -430,7 +536,9 @@
       "created_at_ms": 1793631143742,
       "closed_at_ms": 1793633371405,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f10ac89c-20261102-152931.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "c3ba2b58",
@@ -438,7 +546,9 @@
       "created_at_ms": 1793637864974,
       "closed_at_ms": 1793724409568,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-c3ba2b58-20261103-164649.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "4feae876",
@@ -446,7 +556,9 @@
       "created_at_ms": 1793638661799,
       "closed_at_ms": 1793638927348,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-4feae876-20261102-170207.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "fc536488",
@@ -454,7 +566,9 @@
       "created_at_ms": 1793638828210,
       "closed_at_ms": 1793639500306,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-fc536488-20261102-171140.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "966429b4",
@@ -462,7 +576,9 @@
       "created_at_ms": 1793645041789,
       "closed_at_ms": 1793647612723,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-966429b4-20261102-192652.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "27072eb8",
@@ -470,7 +586,9 @@
       "created_at_ms": 1793646072514,
       "closed_at_ms": 1793647337073,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-27072eb8-20261102-192217.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "1586c6c7",
@@ -478,7 +596,9 @@
       "created_at_ms": 1793647693656,
       "closed_at_ms": 1793724406709,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1586c6c7-20261103-164646.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "7da65f3c",
@@ -486,7 +606,9 @@
       "created_at_ms": 1793659063823,
       "closed_at_ms": 1793659656166,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-7da65f3c-20261102-224736.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "1238e0de",
@@ -494,7 +616,9 @@
       "created_at_ms": 1793659175444,
       "closed_at_ms": 1793667583258,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1238e0de-20261103-005943.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "f302cc0e",
@@ -502,7 +626,9 @@
       "created_at_ms": 1793661252669,
       "closed_at_ms": 1793667585838,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f302cc0e-20261103-005945.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "d49ea4a6",
@@ -510,7 +636,9 @@
       "created_at_ms": 1793661614340,
       "closed_at_ms": 1793664254323,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d49ea4a6-20261103-000414.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "badc77c4",
@@ -518,7 +646,9 @@
       "created_at_ms": 1793664649951,
       "closed_at_ms": 1793665821589,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-badc77c4-20261103-003021.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "40eef714",
@@ -526,7 +656,9 @@
       "created_at_ms": 1793665506374,
       "closed_at_ms": 1793700471998,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-40eef714-20261103-100751.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "2ba2168a",
@@ -534,7 +666,9 @@
       "created_at_ms": 1793701715574,
       "closed_at_ms": null,
       "report_path": null,
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "c5b76b54",
@@ -542,7 +676,9 @@
       "created_at_ms": 1793729703041,
       "closed_at_ms": 1793792433922,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-c5b76b54-20261104-114033.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "d21bb4c0",
@@ -550,7 +686,9 @@
       "created_at_ms": 1793730427887,
       "closed_at_ms": 1793792433369,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d21bb4c0-20261104-114033.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "5779641d",
@@ -558,7 +696,9 @@
       "created_at_ms": 1793730848627,
       "closed_at_ms": null,
       "report_path": null,
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "3286b9db",
@@ -566,7 +706,9 @@
       "created_at_ms": 1793779106758,
       "closed_at_ms": 1793781787055,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3286b9db-20261104-084307.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "50eadde4",
@@ -574,7 +716,9 @@
       "created_at_ms": 1793782668935,
       "closed_at_ms": 1793802800364,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-50eadde4-20261104-143320.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "a4837353",
@@ -582,15 +726,19 @@
       "created_at_ms": 1793791548740,
       "closed_at_ms": 1793792258797,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-a4837353-20261104-113738.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "87932c46",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793795736866,
-      "closed_at_ms": null,
-      "report_path": null,
-      "abandon_reason": null
+      "closed_at_ms": 1793833329264,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-87932c46-20261104-230209.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "28db8646",
@@ -598,15 +746,351 @@
       "created_at_ms": 1793795950950,
       "closed_at_ms": 1793796609758,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-28db8646-20261104-125009.md",
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     },
     {
       "id": "5310e9bc",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793831495504,
+      "closed_at_ms": 1793832416542,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5310e9bc-20261104-224656.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "3ec1abde",
+      "status": "open",
+      "created_at_ms": 1793833547893,
       "closed_at_ms": null,
       "report_path": null,
-      "abandon_reason": null
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "351600a2",
+      "status": "closed",
+      "created_at_ms": 1793848088812,
+      "closed_at_ms": 1793848933646,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-351600a2-20261105-032213.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "b5d961b5",
+      "status": "closed",
+      "created_at_ms": 1793856801384,
+      "closed_at_ms": 1793857897460,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-b5d961b5-20261105-055137.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "tier-ladder",
+          "added": [],
+          "modified": [
+            {
+              "requirement": "Five fixed tiers",
+              "text": "The system SHALL keep exactly five tiers in fixed order: trivial, routine, medium, high and escalate, each with an id, a name, a definition, an ordered model list and an optional reasoning effort. Escalate SHALL never be offered to Laya or the kNN overlay as a routing answer, and the lead's team_dispatch SHALL refuse it for fresh work; team_resume and team_route_fix MAY move an existing worker to it.",
+              "scenarios": [
+                {
+                  "name": "Routing never picks escalate",
+                  "when": [
+                    "routing mode is auto and Laya classifies a dispatch"
+                  ],
+                  "then": [
+                    "the chosen tier is one of trivial, routine, medium or high"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Lead picks escalate for fresh work",
+                  "when": [
+                    "the lead calls team_dispatch with tier escalate"
+                  ],
+                  "then": [
+                    "the dispatch is refused as escalation only, never a first pick",
+                    "no worker is provisioned"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Escalating an existing worker",
+                  "when": [
+                    "the lead calls team_resume on an idle worker with tier escalate"
+                  ],
+                  "then": [
+                    "the worker restarts on the escalate tier, folding down when it has no model"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "6859aff6",
+      "status": "closed",
+      "created_at_ms": 1793856990504,
+      "closed_at_ms": 1793857397921,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-6859aff6-20261105-054317.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "bfa3a622",
+      "status": "closed",
+      "created_at_ms": 1793857242916,
+      "closed_at_ms": 1793872095202,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-bfa3a622-20261105-094815.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "d590bfad",
+      "status": "closed",
+      "created_at_ms": 1793857998768,
+      "closed_at_ms": 1793858689631,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d590bfad-20261105-060449.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "fb3abbfb",
+      "status": "closed",
+      "created_at_ms": 1793859654396,
+      "closed_at_ms": 1793860884916,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-fb3abbfb-20261105-064124.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "external-lead",
+          "added": [
+            {
+              "requirement": "Tool calls attach the external lead",
+              "text": "The system SHALL attach the external lead to a project's team on the first MCP tools/call for that project, and SHALL NOT attach it for initialize, tools/list, ping or a notices read.",
+              "scenarios": [
+                {
+                  "name": "Opening Claude Code",
+                  "when": [
+                    "Claude Code starts in a registered project and lists the Mnemo tools"
+                  ],
+                  "then": [
+                    "the in-app lead keeps receiving worker notices"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "First tool call",
+                  "when": [
+                    "a helper forwards a tools/call for the project"
+                  ],
+                  "then": [
+                    "the external lead is attached and worker notices queue for it"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "A closing helper keeps the lead while another helper led",
+              "text": "The system SHALL remember every helper id that made a tools/call while the external lead is attached, and a helper's detach on close SHALL release the lead only when no other remembered helper remains. A detach that names no helper SHALL release the lead.",
+              "scenarios": [
+                {
+                  "name": "Second helper closes",
+                  "when": [
+                    "helpers a and b both made tool calls",
+                    "helper b closes"
+                  ],
+                  "then": [
+                    "the external lead stays attached and its waiter keeps waiting"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Last helper closes",
+                  "when": [
+                    "helper a is the only remembered helper",
+                    "helper a closes"
+                  ],
+                  "then": [
+                    "the external lead is released",
+                    "unread notices go to the in-app lead"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Anonymous detach",
+                  "when": [
+                    "a detach arrives without a helper id"
+                  ],
+                  "then": [
+                    "the external lead is released"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "Idle external leads are released",
+              "text": "The system SHALL release an external lead that made no Mnemo call for 10 minutes while no waiter runs, regardless of remembered helpers, and SHALL forget every remembered helper on any release.",
+              "scenarios": [
+                {
+                  "name": "Crashed helper",
+                  "when": [
+                    "the only leading helper crashed without detaching",
+                    "10 minutes pass with no call and no waiter"
+                  ],
+                  "then": [
+                    "the external lead is released"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "3d329719",
+      "status": "closed",
+      "created_at_ms": 1793860095275,
+      "closed_at_ms": 1793863513081,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3d329719-20261105-072513.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "worker-brief",
+          "added": [
+            {
+              "requirement": "Workers get the whole plan at dispatch",
+              "text": "The system SHALL give every implementation worker, at dispatch, its plan's title, goal, kind, context, decisions, interfaces, acceptance scenarios, spec changes, schema sections, the step list and the full text of its own step, followed by the lead's brief, and SHALL NOT include the plan's progress notes.",
+              "scenarios": [
+                {
+                  "name": "Dispatch header",
+                  "when": [
+                    "the lead dispatches a worker on step 2 of a plan with a decision and a spec change"
+                  ],
+                  "then": [
+                    "the worker's instructions contain the decision, the spec change and step 2's full text before the brief"
+                  ],
+                  "and": [
+                    "they contain no progress note"
+                  ]
+                }
+              ]
+            },
+            {
+              "requirement": "Workers can re-read their plan",
+              "text": "The system SHALL offer workers a read-only plan_read tool that returns their own plan as it stands now, or with a capability name that capability's current OpenSpec spec, and every dispatch header SHALL say so. plan_read SHALL never return another plan.",
+              "scenarios": [
+                {
+                  "name": "Decision after dispatch",
+                  "when": [
+                    "the lead records a decision after a worker started",
+                    "the worker calls plan_read"
+                  ],
+                  "then": [
+                    "the result contains the new decision"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Current spec",
+                  "when": [
+                    "a worker calls plan_read with capability tier-ladder"
+                  ],
+                  "then": [
+                    "the result is the current tier-ladder spec"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "Working workers hear about plan changes",
+              "text": "The system SHALL send each worker that is working on a plan a short notice naming what changed when the plan's context, decisions, interfaces, steps, acceptance scenarios, spec changes or sections change, and SHALL NOT notify idle, completed, in-review or merged workers or notify on progress notes.",
+              "scenarios": [
+                {
+                  "name": "Decision recorded",
+                  "when": [
+                    "a worker is working on a plan",
+                    "the lead records a decision on it"
+                  ],
+                  "then": [
+                    "the worker receives 'Plan <id> changed: new decision. Call plan_read to re-read it before you continue.'"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Worker awaiting review",
+                  "when": [
+                    "a worker finished its turn and awaits review",
+                    "the lead records a decision"
+                  ],
+                  "then": [
+                    "the worker receives nothing"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "b10620bb",
+      "status": "closed",
+      "created_at_ms": 1793872533702,
+      "closed_at_ms": 1793874335805,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-b10620bb-20261105-102535.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "6ff87423",
+      "status": "closed",
+      "created_at_ms": 1793873004412,
+      "closed_at_ms": 1793873956413,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-6ff87423-20261105-101916.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "1653be84",
+      "status": "closed",
+      "created_at_ms": 1793875533805,
+      "closed_at_ms": 1793879387919,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1653be84-20261105-114947.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

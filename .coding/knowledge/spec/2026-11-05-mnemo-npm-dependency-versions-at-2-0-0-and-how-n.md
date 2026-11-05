@@ -1,0 +1,6 @@
++++
+title = "Mnemo npm dependency versions at 2.0.0 and how npm install rewrites ranges"
+created = "2026-11-05"
++++
+
+The npm dependency set shipped at app version 2.0.0 (npm workspace group bump, commit `5fe5532b` "deps: npm minor-patch group", files frontend/package.json, mnemo2/package.json, package-lock.json) resolves to: @radix-ui/react-dialog 1.3.1, @radix-ui/react-tabs 1.2.1, @tauri-apps/plugin-shell 2.6.0, @tauri-apps/api 2.12.4, lucide-react 1.69.0, react/react-dom 19.3.1, zustand 5.0.16, @tauri-apps/cli 2.12.4, @vitejs/plugin-react 6.2.1, postcss 8.5.32, vite 8.3.6, vitest 5.1.0 with @vitest/mocker 5.1.0, @lucide/svelte 1.69.0, svelte 5.57.3. Two conventions worth remembering: `npm install <pkg>@^<ver> -w <workspace>` rewrites the manifest to the caret of the RESOLVED version (so ^8.3.5 became ^8.3.6, ^5.0.5 became ^5.1.0 — still >= the requested floor), and the root package.json `overrides.postcss-selector-parser ^6.1.5` plus source-map-js 1.2.2 are what keep those two security fixes pinned for transitive dependents (@tailwindcss/typography -> postcss-selector-parser 6.1.5; postcss -> source-map-js 1.2.2). Verification for this set: frontend 95 test files / 1381 tests, mnemo2 105 files / 1052 tests, mnemo2 svelte-check 4793 files 0 errors 0 warnings, and both vite builds green.

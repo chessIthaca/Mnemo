@@ -1,0 +1,6 @@
++++
+title = "Mnemo2 workers re-read their plan with plan_read and hear about plan edits"
+created = "2026-11-05"
++++
+
+Workers cannot read plan files (uncommitted on the lead branch, outside their sandboxed worktree), so: every dispatch header (PlanBoard::brief_for, src/app/plan_board.rs) says 'Re-read this plan at any time with the plan_read tool'. The worker host tool plan_read (src-tauri/src/mnemo2/team.rs worker_host_tools / worker_host_tool_result) returns PlanBoard::worker_view(plan, step) — the same header text built from the plan as it stands now, also after the step is done or the plan closed — or, with `capability`, that capability's current .coding/openspec/specs/<cap>/spec.md via the shared src/app/openspec read_capability_spec (also used by the Plan tab command). An audit worker reads its target's plan; a worker never reads another plan. PlanBoard::set_edit_observer fires after a successful edit of context, decision, interface, steps, a new acceptance scenario, spec changes or sections (never progress notes), outside the board guard; TeamRuntime::attach_board registers it with a Weak team handle and spawns 'Plan <id> changed: new <kinds>. Call plan_read to re-read it before you continue.' to the plan's Working/Dispatching/Fixing workers only (sent as a steer when busy).

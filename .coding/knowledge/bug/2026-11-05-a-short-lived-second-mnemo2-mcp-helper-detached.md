@@ -1,0 +1,6 @@
++++
+title = "a short-lived second mnemo2-mcp helper detached the Claude Code lead on exit"
+created = "2026-11-05"
++++
+
+Symptom: running a one-off `mnemo2-mcp serve` (or any second helper) that made a tool call detached the external lead when it exited, although the main Claude Code session's helper was still leading; the waiter returned 'The Mnemo lead was detached', notices could fall to the in-app lead, and per-attachment gates (memory_search before plan_create) reset. Root cause: helper `Bridge::finish` (src-tauri/src/bin/mnemo2_mcp/serve.rs) posts /lead/detach after any forwarded tools/call, and the server's `detach` (src-tauri/src/mnemo2/mcp_server.rs) released unconditionally because anonymous tool calls could not be told apart. Fix: each helper sends a per-process id (uuid simple) as `X-Mnemo-Bridge` on /mcp and as `bridge` in the detach body; the team's ExternalLead keeps a set of ids that made tool calls while attached; a named detach forgets its id and releases only when none remain; an anonymous detach and the 10-minute idle sweep release as before; every release clears the set. Regression test: a_closing_helper_keeps_the_lead_while_another_helper_led (mcp_server.rs tests).

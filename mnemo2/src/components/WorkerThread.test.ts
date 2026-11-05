@@ -76,4 +76,29 @@ describe("WorkerThread", () => {
     expect(danger.textContent).toContain("429 retries exhausted");
     expect(getComputedStyle(danger.querySelector<HTMLElement>("p")!).color).toBe("var(--danger)");
   });
+
+  it("shows one running clock across a turn's tool cards", () => {
+    const call = (id: string, startedAtMs: number) => ({
+      id,
+      kind: "tool" as const,
+      time: "now",
+      toolCallId: `call-${id}`,
+      toolName: "read_files",
+      arguments: "{}",
+      liveOutput: "",
+      result: { success: true, output: "read 1 line" },
+      startedAtMs,
+      endedAtMs: startedAtMs + 200,
+    });
+    const entries: WorkerThreadEntry[] = [call("tool-a", 1000), call("tool-b", 11_000)];
+    const { container } = render(WorkerThread, {
+      worker: worker({ status: "working", error: null, messages: entries }),
+    });
+
+    // Ten seconds apart, each under a second: the cards read the turn's clock, not their own.
+    const statuses = [...container.querySelectorAll<HTMLElement>(".tool-status")].map((node) =>
+      node.textContent?.trim(),
+    );
+    expect(statuses).toEqual(["0:00", "0:10"]);
+  });
 });

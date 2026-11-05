@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAgo } from "./elapsed";
+import { formatAgo, turnStartTimes } from "./elapsed";
 
 const NOW = 1_787_400_000_000;
 
@@ -17,5 +17,49 @@ describe("formatAgo", () => {
 
   it("never reports a future clock as older than now", () => {
     expect(formatAgo(NOW + 5_000, NOW)).toBe("just now");
+  });
+});
+
+describe("turnStartTimes", () => {
+  it("measures from the first tool of each turn", () => {
+    expect(
+      turnStartTimes([
+        { id: "user-1", kind: "message", author: "user" },
+        { id: "tool-a", kind: "tool", startedAtMs: 1000 },
+        { id: "tool-b", kind: "tool", startedAtMs: 5000 },
+        { id: "user-2", kind: "message", author: "user" },
+        { id: "tool-c", kind: "tool", startedAtMs: 9000 },
+      ]),
+    ).toEqual({ "tool-a": 1000, "tool-b": 1000, "tool-c": 9000 });
+  });
+
+  it("starts a new worker turn at a lead message", () => {
+    expect(
+      turnStartTimes([
+        { id: "tool-a", kind: "tool", startedAtMs: 100 },
+        { id: "lead-1", kind: "message", from: "lead" },
+        { id: "tool-b", kind: "tool", startedAtMs: 700 },
+      ]),
+    ).toEqual({ "tool-a": 100, "tool-b": 700 });
+  });
+
+  it("keeps the turn running across worker messages", () => {
+    expect(
+      turnStartTimes([
+        { id: "tool-a", kind: "tool", startedAtMs: 100 },
+        { id: "worker-1", kind: "message", from: "worker" },
+        { id: "note", from: "harness" },
+        { id: "tool-b", kind: "tool", startedAtMs: 700 },
+      ]),
+    ).toEqual({ "tool-a": 100, "tool-b": 100 });
+  });
+
+  it("skips tools without a start time", () => {
+    expect(
+      turnStartTimes([
+        { id: "tool-a", kind: "tool" },
+        { id: "tool-b", kind: "tool", startedAtMs: 400 },
+      ]),
+    ).toEqual({ "tool-b": 400 });
   });
 });

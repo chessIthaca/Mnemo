@@ -199,6 +199,8 @@ struct BoardFile {
     plans: Vec<BoardEntry>,
 }
 
+type EditObserver = dyn Fn(&str, &[&'static str]) + Send + Sync;
+
 /// The plans of one project. Every call takes the interior lock, so
 /// concurrent tool calls and host commands serialize on the files.
 pub struct PlanBoard {
@@ -210,6 +212,7 @@ pub struct PlanBoard {
     /// The external-lead close gate is opt-in so the built-in lead keeps its
     /// prompt-driven memory workflow.
     external_lead_attached: AtomicBool,
+    edit_observer: Mutex<Option<Arc<EditObserver>>>,
     lock: Mutex<()>,
 }
 
@@ -224,6 +227,7 @@ impl PlanBoard {
             knowledge: None,
             codegraph: None,
             external_lead_attached: AtomicBool::new(false),
+            edit_observer: Mutex::new(None),
             lock: Mutex::new(()),
         }
     }
@@ -250,6 +254,16 @@ impl PlanBoard {
     /// lead attachment. Every close path observes the same atomic setting.
     pub fn set_external_lead_attached(&self, attached: bool) {
         self.external_lead_attached.store(attached, Ordering::Release);
+    }
+
+    /// Replace the observer called after a successful worker-visible plan edit.
+    /// The observer runs after the board guard has been released.
+    pub fn set_edit_observer(&self, observer: Box<EditObserver>) {
+        let mut slot = self
+            .edit_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(Arc::from(observer));
     }
 
     /// The memory store, for the `plan_create` recall rider.
@@ -466,10 +480,15 @@ impl PlanBoard {
         mut edit: PlanEdit,
         sections: Option<BTreeMap<String, String>>,
     ) -> Result<BoardPlan, String> {
-        let _guard = self.guard();
+        let guard = self.guard();
         let (mut entry, mut plan) = self.load(id)?;
         require_open(&entry)?;
         let resolved = Schema::resolve(&self.openspec_dir(), Some(&entry.schema))?;
+        let notify_context = edit.context_append.is_some();
+        let notify_decision = edit.decision.is_some();
+        let notify_interface = edit.interface.is_some();
+        let notify_steps = !edit.add_steps.is_empty();
+        let notify_sections = sections.as_ref().is_some_and(|updates| !updates.is_empty());
         let sections_changed = sections.is_some();
         if let Some(updates) = sections {
             for (artifact, text) in updates {
@@ -489,7 +508,8 @@ impl PlanBoard {
         if !extra.is_empty() {
             plan.context = format!("{}\n\n{}", plan.context, escape_section_markers(&extra));
         }
-        add_scenarios(&mut plan, edit.add_acceptance.iter().chain(&lifted));
+        let acceptance_changed =
+            add_scenarios(&mut plan, edit.add_acceptance.iter().chain(&lifted));
         if let Some(decision) = edit.decision.as_deref().map(collapse_whitespace) {
             if !decision.is_empty() {
                 push_line(&mut plan.decisions, format!("- {}: {decision}", today()));
@@ -537,7 +557,41 @@ impl PlanBoard {
             stored.sections = entry.sections.clone();
             self.save_board(&board)?;
         }
-        Ok(board_plan(&entry, &plan))
+        let view = board_plan(&entry, &plan);
+        let mut changed = Vec::new();
+        if notify_context {
+            changed.push("context");
+        }
+        if notify_decision {
+            changed.push("decision");
+        }
+        if notify_interface {
+            changed.push("interface");
+        }
+        if notify_steps {
+            changed.push("steps");
+        }
+        if acceptance_changed {
+            changed.push("acceptance");
+        }
+        if deltas_changed {
+            changed.push("spec changes");
+        }
+        if notify_sections {
+            changed.push("sections");
+        }
+        drop(guard);
+        if !changed.is_empty() {
+            let observer = self
+                .edit_observer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(observer) = observer {
+                observer(id, &changed);
+            }
+        }
+        Ok(view)
     }
 
     /// The worker brief header for `step` (1-based): the plan's title, goal,
@@ -558,6 +612,37 @@ impl PlanBoard {
         if assigned.done {
             return Err(format!("step {step} of plan {id} is already done"));
         }
+        self.header_text(id, &entry, &plan, step)
+    }
+
+    /// The worker view of `step` (1-based) as the plan stands now. Unlike
+    /// [`brief_for`](Self::brief_for), this remains available for done steps
+    /// and closed or abandoned plans.
+    pub fn worker_view(&self, id: &str, step: usize) -> Result<String, String> {
+        let _guard = self.guard();
+        let (entry, plan) = self.load(id)?;
+        self.header_text(id, &entry, &plan, step)
+    }
+
+    /// Read a capability's current OpenSpec specification from this board's
+    /// OpenSpec directory. A missing capability or spec returns `Ok(None)`.
+    pub fn capability_spec(&self, capability: &str) -> Result<Option<String>, String> {
+        crate::app::openspec::read_capability_spec(&self.openspec_dir(), capability)
+    }
+
+    fn header_text(
+        &self,
+        id: &str,
+        entry: &BoardEntry,
+        plan: &PlanFile,
+        step: usize,
+    ) -> Result<String, String> {
+        let Some(assigned) = step.checked_sub(1).and_then(|i| plan.steps.get(i)) else {
+            return Err(format!(
+                "plan {id} has no step {step} (it has {} steps, numbered from 1)",
+                plan.steps.len()
+            ));
+        };
         let mut out = format!(
             "# Plan: {} ({id})\nGoal: {}\nKind: {}\n",
             plan.title, plan.goal, plan.kind
@@ -565,6 +650,9 @@ impl PlanBoard {
         if let Some(bug) = &plan.bug_symptom {
             out.push_str(&format!("Bug symptom: {bug}\n"));
         }
+        out.push_str(
+            "Re-read this plan at any time with the plan_read tool: the lead may record decisions or interfaces after you start.\n",
+        );
         out.push_str(&format!("\n## Context\n{}\n", plan.context));
         if let Some(decisions) = &plan.decisions {
             out.push_str(&format!("\n## Decisions\n{decisions}\n"));
@@ -582,7 +670,7 @@ impl PlanBoard {
                 "\nThe lead verifies these observable outcomes on the integrated result.\n",
             );
         }
-        out.push_str(&self.worker_context(&entry)?);
+        out.push_str(&self.worker_context(entry)?);
         out.push_str(&render_spec_changes(&entry.spec_deltas));
         for (artifact, text) in &entry.sections {
             out.push_str(&format!("\n## {artifact}\n\n{}\n", text.trim()));
@@ -1571,7 +1659,12 @@ fn lift_acceptance(text: &str) -> (String, Vec<String>) {
 /// Record acceptance scenarios as `- ` bullets in `## Acceptance
 /// scenarios`: each collapsed to one line (so it cannot inject a section),
 /// a leading list marker dropped, blanks and already recorded ones skipped.
-fn add_scenarios<'a>(plan: &mut PlanFile, scenarios: impl IntoIterator<Item = &'a String>) {
+/// Returns whether at least one new scenario was recorded.
+fn add_scenarios<'a>(
+    plan: &mut PlanFile,
+    scenarios: impl IntoIterator<Item = &'a String>,
+) -> bool {
+    let mut added = false;
     for scenario in scenarios {
         let text = collapse_whitespace(scenario);
         let text = text
@@ -1589,8 +1682,10 @@ fn add_scenarios<'a>(plan: &mut PlanFile, scenarios: impl IntoIterator<Item = &'
             .is_some_and(|body| body.lines().any(|l| l.trim() == line));
         if !recorded {
             push_line(&mut plan.acceptance, line);
+            added = true;
         }
     }
+    added
 }
 
 /// Append one line to an optional section body.
@@ -2118,6 +2213,123 @@ mod tests {
             .brief_for(&plan.id, 2)
             .unwrap_err()
             .contains("abandoned"));
+    }
+
+    #[test]
+    fn brief_for_tells_the_worker_about_plan_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = create(&board, "Importer");
+        let brief = board.brief_for(&plan.id, 1).unwrap();
+        let reference = "Re-read this plan at any time with the plan_read tool: the lead may record decisions or interfaces after you start.";
+        assert!(brief.contains(reference), "{brief}");
+        assert!(brief.find(reference).unwrap() < brief.find("## Context").unwrap());
+    }
+
+    #[test]
+    fn worker_view_reads_the_plan_as_it_is_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = create(&board, "Importer");
+        let dispatched = board.brief_for(&plan.id, 1).unwrap();
+        assert!(!dispatched.contains("use the current serde API"));
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    decision: Some("use the current serde API".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let current = board.worker_view(&plan.id, 1).unwrap();
+        assert!(current.contains("use the current serde API"), "{current}");
+        assert!(current.contains("## Your step (1)"), "{current}");
+    }
+
+    #[test]
+    fn worker_view_works_after_the_step_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = create(&board, "Importer");
+        board.tick(&plan.id, 0, "done").unwrap();
+        assert!(board.brief_for(&plan.id, 1).unwrap_err().contains("already done"));
+        let current = board.worker_view(&plan.id, 1).unwrap();
+        assert!(current.contains("- [x] 1. Fix parser  <- your step"), "{current}");
+        board.abandon(&plan.id, "obsolete").unwrap();
+        assert!(board.brief_for(&plan.id, 1).unwrap_err().contains("abandoned"));
+        assert!(board.worker_view(&plan.id, 1).unwrap().contains("## Your step (1)"));
+    }
+
+    #[test]
+    fn edit_observer_reports_worker_visible_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = board
+            .create(PlanDraft {
+                acceptance: vec!["Existing scenario".to_string()],
+                ..draft("Importer")
+            })
+            .unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        board.set_edit_observer(Box::new(move |id, kinds| {
+            recorded
+                .lock()
+                .unwrap()
+                .push((id.to_string(), kinds.to_vec()));
+        }));
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    decision: Some("use serde".to_string()),
+                    interface: Some("src/import.rs exports parse".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(plan.id.clone(), vec!["decision", "interface"])]
+        );
+
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    progress_note: Some("committed abc123".to_string()),
+                    add_acceptance: vec!["Existing scenario".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    add_acceptance: vec!["A new observable scenario".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, plan.id);
+        assert_eq!(calls[1].1, vec!["acceptance"]);
+    }
+
+    #[test]
+    fn capability_spec_uses_the_boards_openspec_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        write_spec(dir.path(), "tier-ladder", &["Workers climb"]);
+        let spec = board.capability_spec("tier-ladder").unwrap().unwrap();
+        assert!(spec.contains("Workers climb"), "{spec}");
+        assert!(board.capability_spec("missing-capability").unwrap().is_none());
+        assert!(board.capability_spec("../x").is_err());
     }
 
     #[test]

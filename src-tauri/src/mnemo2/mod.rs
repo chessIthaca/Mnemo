@@ -106,6 +106,12 @@ pub mod mcp_settings;
 /// Appearance page (plan f1bd54e5).
 pub mod appearance_settings;
 
+/// The Specs settings commands (OpenSpec schema list/resolve/add/fork,
+/// artifact templates and instructions, the project `config.yaml`, the
+/// plan preview, the specs status and the optional `openspec validate`)
+/// — the backend of the Settings dialog's Specs page (plan 3ec1abde).
+pub mod specs_settings;
+
 /// The `[window] close` behaviour: what closing the main window does
 /// (hide to the tray, quit, or today's automatic rule), its `mnemo2.toml`
 /// table and the once-per-run tray notification (plan c5b76b54).
@@ -553,6 +559,17 @@ pub fn run() {
             laya_settings::save_laya_settings,
             laya_settings::tiers_top_control_status,
             laya_settings::save_tiers_top_control,
+            specs_settings::specs_status,
+            specs_settings::list_schemas,
+            specs_settings::set_active_schema,
+            specs_settings::add_schema,
+            specs_settings::fork_schema,
+            specs_settings::read_artifacts,
+            specs_settings::save_artifact,
+            specs_settings::read_config,
+            specs_settings::save_config,
+            specs_settings::plan_preview,
+            specs_settings::run_openspec_validate,
             safety_settings::safety_settings_get,
             safety_settings::save_safety_mode,
             safety_settings::save_safety_rules,

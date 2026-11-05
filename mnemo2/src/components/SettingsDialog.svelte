@@ -8,6 +8,7 @@
   import { currentProject } from "../lib/store";
   import { createSettingsTransport, emptyTiers, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
+  import { createSpecsTransport } from "../lib/specsSettings";
   import AppearancePage from "./AppearancePage.svelte";
   import EndpointsPage from "./EndpointsPage.svelte";
   import McpPage from "./McpPage.svelte";
@@ -16,10 +17,12 @@
   import SafetyPage from "./SafetyPage.svelte";
   import SavingsPage from "./SavingsPage.svelte";
   import Sheet from "./Sheet.svelte";
+  import SpecsPage from "./SpecsPage.svelte";
   import TiersPage from "./TiersPage.svelte";
 
   type Page =
     | "project"
+    | "specs"
     | "endpoints"
     | "tiers"
     | "models"
@@ -34,7 +37,7 @@
    * sections inside the install-wide pages.
    */
   const railGroups: { label: string; pages: { id: Page; label: string }[] }[] = [
-    { label: "This project", pages: [{ id: "project", label: "Project" }] },
+    { label: "This project", pages: [{ id: "project", label: "Project" }, { id: "specs", label: "Specs" }] },
     {
       label: "All projects",
       pages: [
@@ -86,6 +89,7 @@
   const safetyTransport = $derived(open ? createSafetyTransport() : null);
   const mcpTransport = $derived(open ? createMcpTransport() : null);
   const appearanceTransport = $derived(open ? createAppearanceTransport() : null);
+  const specsTransport = $derived(open ? createSpecsTransport() : null);
 
   $effect(() => {
     const active = transport;
@@ -135,6 +139,12 @@
       <section class="settings-page">
         {#if page === "project"}
           <ProjectPage />
+        {:else if page === "specs"}
+          {#if specsTransport}
+            <SpecsPage transport={specsTransport} />
+          {:else}
+            <p class="settings-empty">Specs settings are available in the desktop app.</p>
+          {/if}
         {:else if loadError}
           <p class="settings-error" role="alert">{loadError}</p>
         {:else if loading}

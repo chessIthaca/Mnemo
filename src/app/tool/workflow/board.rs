@@ -9,6 +9,7 @@
 //! `abandon_plan` in TeamLead mode and are `AutoRun` — they only rewrite the
 //! project's own `.coding/plans/` and `.coding/reviews/` bookkeeping.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -205,6 +206,8 @@ struct CreateArgs {
     acceptance_scenarios: Vec<String>,
     #[serde(default)]
     spec_deltas: Vec<Delta>,
+    #[serde(default)]
+    sections: Option<BTreeMap<String, String>>,
 }
 
 /// `plan_create` — open a new plan on the board.
@@ -257,7 +260,8 @@ impl Tool for PlanCreateTool {
                     "bug": {"type": "string", "description": "The symptom (bug_fixing only)."},
                     "interfaces": {"type": "array", "items": {"type": "string"}, "description": "Contracts between steps, one per entry: exports, signatures, data shapes, file ownership, e.g. \"`src/game.js` — exports `Game` as a named export; UI owns rendering and must not modify it\". Record one whenever two steps touch the same file or module boundary, before dispatching them."},
                     "acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes the finished work must show, one per entry: a command and its result, a persisted state, a concurrency or security property, a UI behavior. Kept in the plan's '## Acceptance scenarios' section and given to every worker; a review_risk='high' dispatch requires at least one."},
-                    "spec_deltas": spec_deltas_schema()
+                    "spec_deltas": spec_deltas_schema(),
+                    "sections": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Additional OpenSpec artifact markdown keyed by artifact id. The schema's refusal names any required section and supplies its template and rules."}
                 },
                 "required": ["title", "goal", "context", "steps"]
             }),
@@ -292,7 +296,10 @@ impl Tool for PlanCreateTool {
             acceptance: args.acceptance_scenarios,
             spec_deltas: args.spec_deltas,
         };
-        let plan = match self.board.create(draft) {
+        let plan = match self
+            .board
+            .create_with_sections(draft, args.sections.unwrap_or_default())
+        {
             Ok(plan) => plan,
             Err(e) => return ToolResult::error(format!("plan_create failed: {e}")),
         };
@@ -359,6 +366,8 @@ struct UpdateArgs {
     regression_test: Option<String>,
     #[serde(default)]
     landed_design: bool,
+    #[serde(default)]
+    sections: Option<BTreeMap<String, String>>,
 }
 
 /// `plan_update` — record decisions and extend an open plan.
@@ -409,7 +418,8 @@ impl Tool for PlanUpdateTool {
                     "add_acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes appended to the plan's '## Acceptance scenarios', one per entry; workers receive them, and a review_risk='high' dispatch requires at least one. A scenario already recorded is not repeated."},
                     "regression_test": {"type": "string", "description": "The regression test name (bug_fixing)."},
                     "landed_design": {"type": "boolean"},
-                    "spec_deltas": spec_deltas_schema()
+                    "spec_deltas": spec_deltas_schema(),
+                    "sections": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Additional OpenSpec artifact markdown keyed by artifact id; an empty string removes an optional section."}
                 },
                 "required": ["plan_id"]
             }),
@@ -443,7 +453,10 @@ impl Tool for PlanUpdateTool {
             regression_test: args.regression_test,
             landed_design: args.landed_design,
         };
-        match self.board.update(&args.plan_id, edit) {
+        match self
+            .board
+            .update_with_sections(&args.plan_id, edit, args.sections)
+        {
             Ok(plan) => {
                 let mut output = format!(
                     "Updated plan {} \"{}\" ({} steps)",
@@ -1005,6 +1018,68 @@ mod tests {
             ),
             "{}",
             shown.output
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_update_tools_accept_custom_schema_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let openspec = dir.path().join("openspec");
+        let templates = openspec.join("schemas/custom/templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        for id in ["proposal", "research", "tasks"] {
+            std::fs::write(templates.join(format!("{id}.md")), format!("# {id} template\n"))
+                .unwrap();
+        }
+        std::fs::write(
+            openspec.join("schemas/custom/schema.yaml"),
+            "name: custom\nversion: 4\nartifacts:\n  - {id: proposal, generates: proposal.md, template: proposal.md, requires: [research]}\n  - {id: research, generates: research.md, template: research.md, instruction: Record evidence.}\n  - {id: tasks, generates: tasks.md, template: tasks.md, requires: [proposal]}\napply: {requires: [tasks], tracks: tasks.md}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            openspec.join("config.yaml"),
+            "schema: custom\nrules:\n  research: Cite the source.\n",
+        )
+        .unwrap();
+        let board = board(dir.path());
+        let missing = PlanCreateTool::new(board.clone())
+            .execute(json!({
+                "title": "Custom schema",
+                "goal": "Carry research on the plan",
+                "context": "Rows vanish on empty cells; src/import.rs drops them; verify with cargo test.",
+                "steps": ["Fix src/import.rs and run cargo test"]
+            }))
+            .await;
+        assert!(!missing.success);
+        assert!(missing.output.contains("# research template"), "{}", missing.output);
+        assert!(missing.output.contains("Cite the source."), "{}", missing.output);
+
+        let created = PlanCreateTool::new(board.clone())
+            .execute(json!({
+                "title": "Custom schema",
+                "goal": "Carry research on the plan",
+                "context": "Rows vanish on empty cells; src/import.rs drops them; verify with cargo test.",
+                "steps": ["Fix src/import.rs and run cargo test"],
+                "sections": {"research": "Inspected src/import.rs."}
+            }))
+            .await;
+        assert!(created.success, "{}", created.output);
+        let data = created.data.unwrap();
+        assert_eq!(data["schema"], "custom@4");
+        assert_eq!(data["sections"]["research"], "Inspected src/import.rs.");
+        let id = data["id"].as_str().unwrap().to_string();
+
+        let updated = PlanUpdateTool::new(board.clone())
+            .execute(json!({
+                "plan_id": id,
+                "sections": {"research": "Updated evidence from src/import.rs."},
+                "progress": "research refined"
+            }))
+            .await;
+        assert!(updated.success, "{}", updated.output);
+        assert_eq!(
+            updated.data.unwrap()["sections"]["research"],
+            "Updated evidence from src/import.rs."
         );
     }
 

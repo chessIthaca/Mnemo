@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::openspec::schema::{ResolvedSchema, Schema};
 use crate::app::team_ledger::{PlanReview, TeamLedger};
 use crate::app::tool::workflow::plan::{
     bug_fixing_gate, collapse_whitespace, context_issue, escape_section_markers,
@@ -94,6 +95,10 @@ pub struct BoardPlan {
     /// Structured OpenSpec changes, also rendered into the plan markdown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spec_deltas: Vec<Delta>,
+    /// OpenSpec schema reference captured when the plan was created.
+    pub schema: String,
+    /// Additional schema artifacts keyed by artifact id.
+    pub sections: BTreeMap<String, String>,
     pub steps: Vec<BoardStep>,
 }
 
@@ -161,6 +166,10 @@ pub enum CloseOutcome {
     Blocked { reasons: Vec<String> },
 }
 
+fn default_schema_reference() -> String {
+    "spec-driven@1".to_string()
+}
+
 /// One `board.json` row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BoardEntry {
@@ -175,6 +184,12 @@ struct BoardEntry {
     abandon_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     spec_deltas: Vec<Delta>,
+    /// The schema selected at creation; later config changes do not replace it.
+    #[serde(default = "default_schema_reference")]
+    schema: String,
+    /// Additional schema artifacts keyed by artifact id.
+    #[serde(default)]
+    sections: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -317,6 +332,16 @@ impl PlanBoard {
     /// scenarios` section written into the context joins the plan's
     /// acceptance scenarios instead of being escaped into the context.
     pub fn create(&self, draft: PlanDraft) -> Result<BoardPlan, String> {
+        self.create_with_sections(draft, BTreeMap::new())
+    }
+
+    /// Create a plan with additional artifacts for its resolved OpenSpec schema.
+    /// Existing callers use [`create`](Self::create), which supplies no sections.
+    pub fn create_with_sections(
+        &self,
+        draft: PlanDraft,
+        sections: BTreeMap<String, String>,
+    ) -> Result<BoardPlan, String> {
         let title = collapse_whitespace(&draft.title);
         let goal = draft.goal.trim();
         let steps = clean_steps(&draft.steps);
@@ -349,6 +374,7 @@ impl PlanBoard {
             ));
         }
         self.validate_spec_deltas(&draft.spec_deltas)?;
+        let resolved = Schema::resolve(&self.openspec_dir(), None)?;
         let _guard = self.guard();
         let mut board = self.load_board()?;
         let id = self.fresh_id(&board);
@@ -367,17 +393,20 @@ impl PlanBoard {
         }
         add_scenarios(&mut plan, draft.acceptance.iter().chain(&lifted));
         plan.bug_symptom = bug.filter(|_| draft.kind == PlanKind::BugFixing);
-        std::fs::create_dir_all(&self.plans_dir).map_err(|e| e.to_string())?;
-        self.save_plan(&id, &plan, &draft.spec_deltas)?;
         let entry = BoardEntry {
-            id,
+            id: id.clone(),
             status: BoardStatus::Open,
             created_at_ms: now_ms(),
             closed_at_ms: None,
             report_path: None,
             abandon_reason: None,
             spec_deltas: draft.spec_deltas,
+            schema: resolved.schema.reference(),
+            sections,
         };
+        self.validate_artifacts(&resolved, &plan, &entry.spec_deltas, &entry.sections)?;
+        std::fs::create_dir_all(&self.plans_dir).map_err(|e| e.to_string())?;
+        self.save_plan(&id, &plan, &entry)?;
         let view = board_plan(&entry, &plan);
         board.plans.push(entry);
         self.save_board(&board)?;
@@ -388,10 +417,32 @@ impl PlanBoard {
     /// acceptance scenarios, or OpenSpec deltas, set the regression test or the landed-design
     /// flag. As in [`create`](Self::create), an `## Acceptance scenarios`
     /// section in the appended context joins the acceptance scenarios.
-    pub fn update(&self, id: &str, mut edit: PlanEdit) -> Result<BoardPlan, String> {
+    pub fn update(&self, id: &str, edit: PlanEdit) -> Result<BoardPlan, String> {
+        self.update_with_sections(id, edit, None)
+    }
+
+    /// Edit a plan and merge additional schema artifacts. An empty section
+    /// removes an optional artifact; required artifacts still fail validation.
+    pub fn update_with_sections(
+        &self,
+        id: &str,
+        mut edit: PlanEdit,
+        sections: Option<BTreeMap<String, String>>,
+    ) -> Result<BoardPlan, String> {
         let _guard = self.guard();
         let (mut entry, mut plan) = self.load(id)?;
         require_open(&entry)?;
+        let resolved = Schema::resolve(&self.openspec_dir(), Some(&entry.schema))?;
+        let sections_changed = sections.is_some();
+        if let Some(updates) = sections {
+            for (artifact, text) in updates {
+                if text.trim().is_empty() {
+                    entry.sections.remove(&artifact);
+                } else {
+                    entry.sections.insert(artifact, text);
+                }
+            }
+        }
         if !edit.spec_deltas.is_empty() {
             let mut combined = entry.spec_deltas.clone();
             combined.extend(edit.spec_deltas.iter().cloned());
@@ -436,8 +487,9 @@ impl PlanBoard {
         }
         let deltas_changed = !edit.spec_deltas.is_empty();
         entry.spec_deltas.append(&mut edit.spec_deltas);
-        self.save_plan(id, &plan, &entry.spec_deltas)?;
-        if deltas_changed {
+        self.validate_artifacts(&resolved, &plan, &entry.spec_deltas, &entry.sections)?;
+        self.save_plan(id, &plan, &entry)?;
+        if deltas_changed || sections_changed {
             let mut board = self.load_board()?;
             let stored = board
                 .plans
@@ -445,6 +497,7 @@ impl PlanBoard {
                 .find(|candidate| candidate.id == id)
                 .ok_or_else(|| unknown(id))?;
             stored.spec_deltas = entry.spec_deltas.clone();
+            stored.sections = entry.sections.clone();
             self.save_board(&board)?;
         }
         Ok(board_plan(&entry, &plan))
@@ -492,7 +545,11 @@ impl PlanBoard {
                 "\nThe lead verifies these observable outcomes on the integrated result.\n",
             );
         }
+        out.push_str(&self.worker_context(&entry)?);
         out.push_str(&render_spec_changes(&entry.spec_deltas));
+        for (artifact, text) in &entry.sections {
+            out.push_str(&format!("\n## {artifact}\n\n{}\n", text.trim()));
+        }
         out.push_str("\n## Steps\n");
         for s in &plan.steps {
             let mark = if s.done { 'x' } else { ' ' };
@@ -514,6 +571,22 @@ impl PlanBoard {
             plan.title
         ));
         Ok(out)
+    }
+
+    /// Return the schema artifacts that still block implementation dispatch.
+    /// An empty vector means the recorded schema's `apply.requires` is met.
+    pub fn dispatch_blockers(&self, id: &str) -> Result<Vec<String>, String> {
+        let _guard = self.guard();
+        let (entry, plan) = self.load(id)?;
+        require_open(&entry)?;
+        let resolved = Schema::resolve(&self.openspec_dir(), Some(&entry.schema))?;
+        Ok(self.artifact_blockers(
+            &resolved,
+            &plan,
+            &entry.spec_deltas,
+            &entry.sections,
+            &resolved.schema.apply.requires,
+        ))
     }
 
     /// The contract gate for dispatching `step0` (0-based): every OTHER step
@@ -611,7 +684,7 @@ impl PlanBoard {
                 numbers.join(" and ")
             ),
         );
-        self.save_plan(id, &plan, &entry.spec_deltas)?;
+        self.save_plan(id, &plan, &entry)?;
         Ok(true)
     }
 
@@ -634,7 +707,7 @@ impl PlanBoard {
             &mut plan.progress,
             format!("- {} step {number} done: {outcome}", today()),
         );
-        self.save_plan(id, &plan, &entry.spec_deltas)?;
+        self.save_plan(id, &plan, &entry)?;
         Ok(true)
     }
 
@@ -663,7 +736,7 @@ impl PlanBoard {
             &mut plan.progress,
             format!("- {} step {number} reopened: {note}", today()),
         );
-        self.save_plan(id, &plan, &entry.spec_deltas)?;
+        self.save_plan(id, &plan, entry)?;
         if entry.status == BoardStatus::Closed {
             entry.status = BoardStatus::Open;
             entry.closed_at_ms = None;
@@ -827,7 +900,7 @@ impl PlanBoard {
             &mut plan.progress,
             format!("- {} abandoned: {}", today(), collapse_whitespace(reason)),
         );
-        self.save_plan(id, &plan, &entry.spec_deltas)?;
+        self.save_plan(id, &plan, entry)?;
         let view = board_plan(entry, &plan);
         self.save_board(&board)?;
         Ok(view)
@@ -964,18 +1037,212 @@ impl PlanBoard {
             .map_err(|e| format!("could not read plan {id}: {e}"))
     }
 
-    fn save_plan(&self, id: &str, plan: &PlanFile, spec_deltas: &[Delta]) -> Result<(), String> {
-        plan.write_to_dir_with_spec_deltas(&self.plans_dir, id, spec_deltas)
-            .map(|_| ())
-            .map_err(|e| format!("could not write plan {id}: {e}"))
+    fn save_plan(&self, id: &str, plan: &PlanFile, entry: &BoardEntry) -> Result<(), String> {
+        plan.write_to_dir_with_sections(
+            &self.plans_dir,
+            id,
+            &entry.spec_deltas,
+            &entry.sections,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("could not write plan {id}: {e}"))
     }
 
-    fn specs_dir(&self) -> PathBuf {
+    fn openspec_dir(&self) -> PathBuf {
         self.plans_dir
             .parent()
             .unwrap_or(&self.plans_dir)
             .join("openspec")
-            .join("specs")
+    }
+
+    fn specs_dir(&self) -> PathBuf {
+        self.openspec_dir().join("specs")
+    }
+
+    fn worker_context(&self, entry: &BoardEntry) -> Result<String, String> {
+        let resolved = Schema::resolve(&self.openspec_dir(), Some(&entry.schema))?;
+        let mut out = String::new();
+        let context = resolved.config.context.trim();
+        if !context.is_empty() {
+            out.push_str(&format!("\n{context}\n"));
+        }
+        for artifact in &resolved.schema.artifacts {
+            let instruction = artifact.instruction.trim();
+            if !instruction.is_empty() {
+                out.push_str(&format!(
+                    "\n### Artifact: {}\n{instruction}\n",
+                    artifact.id
+                ));
+            }
+        }
+        if out.is_empty() {
+            Ok(out)
+        } else {
+            Ok(format!("\n## Project context\n{out}"))
+        }
+    }
+
+    fn validate_artifacts(
+        &self,
+        resolved: &ResolvedSchema,
+        plan: &PlanFile,
+        deltas: &[Delta],
+        sections: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        for (id, text) in sections {
+            let Some(artifact) = resolved.schema.artifact(id) else {
+                return Err(format!(
+                    "OpenSpec schema '{}' has no artifact '{id}'; valid artifact ids: {}",
+                    resolved.schema.name,
+                    resolved
+                        .schema
+                        .artifacts
+                        .iter()
+                        .map(|artifact| artifact.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            };
+            if let Some(source) = mapped_artifact_source(id) {
+                return Err(format!(
+                    "artifact '{id}' is supplied by {source}, not the sections object"
+                ));
+            }
+            if text.trim() == artifact.template_text.trim() {
+                return Err(self.artifact_guidance(
+                    resolved,
+                    id,
+                    "is still identical to its template; replace the template with the plan's findings",
+                ));
+            }
+        }
+        // The built-in schema is a description of the existing board fields,
+        // not a new gate: spec deltas and a design remain encouraged, optional.
+        if resolved.schema.name == "spec-driven" {
+            return Ok(());
+        }
+        let roots = resolved
+            .schema
+            .artifacts
+            .iter()
+            .filter(|artifact| self.artifact_present(&resolved.schema, artifact.id.as_str(), plan, deltas, sections))
+            .map(|artifact| artifact.id.clone())
+            .collect::<Vec<_>>();
+        let blockers = self.artifact_blockers(resolved, plan, deltas, sections, &roots);
+        if blockers.is_empty() {
+            Ok(())
+        } else {
+            Err(blockers.join("\n\n"))
+        }
+    }
+
+    fn artifact_blockers(
+        &self,
+        resolved: &ResolvedSchema,
+        plan: &PlanFile,
+        deltas: &[Delta],
+        sections: &BTreeMap<String, String>,
+        roots: &[String],
+    ) -> Vec<String> {
+        let mut blockers = Vec::new();
+        for id in roots {
+            self.collect_artifact_blockers(
+                resolved,
+                plan,
+                deltas,
+                sections,
+                id,
+                &mut blockers,
+            );
+        }
+        blockers.sort();
+        blockers.dedup();
+        blockers
+    }
+
+    fn collect_artifact_blockers(
+        &self,
+        resolved: &ResolvedSchema,
+        plan: &PlanFile,
+        deltas: &[Delta],
+        sections: &BTreeMap<String, String>,
+        id: &str,
+        blockers: &mut Vec<String>,
+    ) {
+        if !self.artifact_present(&resolved.schema, id, plan, deltas, sections) {
+            blockers.push(self.artifact_guidance(
+                resolved,
+                id,
+                "is required but missing (or still template text)",
+            ));
+            return;
+        }
+        // Schema loading has already rejected cycles. The built-in schema's
+        // optional design/specs chain intentionally does not gate dispatch.
+        if resolved.schema.name == "spec-driven" {
+            return;
+        }
+        if let Some(artifact) = resolved.schema.artifact(id) {
+            for required in &artifact.requires {
+                self.collect_artifact_blockers(
+                    resolved, plan, deltas, sections, required, blockers,
+                );
+            }
+        }
+    }
+
+    fn artifact_present(
+        &self,
+        schema: &Schema,
+        id: &str,
+        plan: &PlanFile,
+        deltas: &[Delta],
+        sections: &BTreeMap<String, String>,
+    ) -> bool {
+        match id {
+            "proposal" => !plan.goal.trim().is_empty(),
+            "design" => {
+                plan.decisions.as_deref().is_some_and(|text| !text.trim().is_empty())
+                    || plan
+                        .interfaces
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty())
+            }
+            "tasks" => !plan.steps.is_empty(),
+            "specs" => !deltas.is_empty(),
+            _ => sections.get(id).is_some_and(|text| {
+                !text.trim().is_empty()
+                    && schema.artifact(id).is_some_and(|artifact| {
+                        text.trim() != artifact.template_text.trim()
+                    })
+            }),
+        }
+    }
+
+    fn artifact_guidance(&self, resolved: &ResolvedSchema, id: &str, problem: &str) -> String {
+        let Some(artifact) = resolved.schema.artifact(id) else {
+            return format!(
+                "OpenSpec schema '{}' requires unknown artifact '{id}'",
+                resolved.schema.name
+            );
+        };
+        let source = mapped_artifact_source(id)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("plan_create/plan_update sections.{id}"));
+        let mut out = format!(
+            "OpenSpec schema '{}': artifact '{id}' {problem}. Supply {source}.\nTemplate (templates/{}):\n{}\nInstruction:\n{}",
+            resolved.schema.name,
+            artifact.template,
+            artifact.template_text.trim(),
+            artifact.instruction.trim()
+        );
+        if let Some(rules) = resolved.config.rules.get(id) {
+            out.push_str("\nConfig rules:");
+            for rule in rules {
+                out.push_str(&format!("\n- {rule}"));
+            }
+        }
+        out
     }
 
     fn validate_spec_deltas(&self, deltas: &[Delta]) -> Result<(), String> {
@@ -1103,6 +1370,16 @@ fn load_current_spec(specs_dir: &Path, capability: &str) -> Result<Option<Spec>,
         .map_err(|error| format!("invalid spec for capability '{capability}': {error}"))
 }
 
+fn mapped_artifact_source(id: &str) -> Option<&'static str> {
+    match id {
+        "proposal" => Some("the plan's goal and context"),
+        "design" => Some("the plan's decisions and interfaces"),
+        "tasks" => Some("the plan's steps"),
+        "specs" => Some("the plan's spec_deltas"),
+        _ => None,
+    }
+}
+
 fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
     BoardPlan {
         id: entry.id.clone(),
@@ -1113,6 +1390,8 @@ fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
         closed_at_ms: entry.closed_at_ms,
         report_path: entry.report_path.clone(),
         spec_deltas: entry.spec_deltas.clone(),
+        schema: entry.schema.clone(),
+        sections: entry.sections.clone(),
         steps: plan
             .steps
             .iter()
@@ -1332,6 +1611,40 @@ mod tests {
 
     fn create(board: &PlanBoard, title: &str) -> BoardPlan {
         board.create(draft(title)).expect("create")
+    }
+
+    fn research_schema(dir: &Path, proposal_requires_research: bool) {
+        let openspec = dir.join("openspec");
+        let templates = openspec.join("schemas/custom/templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        for (name, text) in [
+            ("proposal.md", "# Proposal\n"),
+            ("research.md", "# Research\n\nReplace with findings.\n"),
+            ("tasks.md", "# Tasks\n"),
+        ] {
+            std::fs::write(templates.join(name), text).unwrap();
+        }
+        let proposal_requires = if proposal_requires_research {
+            "[research]"
+        } else {
+            "[]"
+        };
+        std::fs::write(
+            openspec.join("schemas/custom/schema.yaml"),
+            format!(
+                "name: custom\nversion: 7\ndescription: Custom research workflow\nartifacts:\n  - id: proposal\n    generates: proposal.md\n    template: proposal.md\n    instruction: Explain the proposal.\n    requires: {proposal_requires}\n  - id: research\n    generates: research.md\n    template: research.md\n    instruction: Investigate and record evidence.\n  - id: tasks\n    generates: tasks.md\n    template: tasks.md\n    instruction: Name verification in every step.\n    requires: [proposal]\napply:\n  requires: [research]\n  tracks: tasks.md\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            openspec.join("config.yaml"),
+            "schema: custom\ncontext: Project schema context.\nrules:\n  research:\n    - Cite the inspected files.\n    - Name the evidence.\n",
+        )
+        .unwrap();
+    }
+
+    fn research_section(text: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([("research".to_string(), text.to_string())])
     }
 
     fn requirement(name: &str) -> Requirement {
@@ -2303,6 +2616,107 @@ mod tests {
             reopened.spec_deltas[0].added[0].scenarios[0].when,
             vec!["the contract is exercised".to_string()]
         );
+    }
+
+    #[test]
+    fn built_in_schema_preserves_existing_plan_and_dispatch_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+        let plan = create(&board, "Existing style");
+        assert_eq!(plan.schema, "spec-driven@1");
+        assert!(plan.sections.is_empty());
+        assert!(board.dispatch_blockers(&plan.id).unwrap().is_empty());
+        let markdown = board.read_markdown(&plan.id).unwrap();
+        assert!(!markdown.contains("## Project context"));
+        assert!(markdown.contains("## Steps"));
+    }
+
+    #[test]
+    fn custom_required_section_shows_guidance_and_recorded_schema_survives_config_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        research_schema(dir.path(), true);
+        let board = board(dir.path());
+
+        let missing = board.create(draft("Missing research")).unwrap_err();
+        for expected in [
+            "artifact 'research'",
+            "# Research",
+            "Replace with findings.",
+            "Investigate and record evidence.",
+            "Cite the inspected files.",
+            "sections.research",
+        ] {
+            assert!(missing.contains(expected), "missing {expected:?}: {missing}");
+        }
+        let unchanged = board
+            .create_with_sections(
+                draft("Template research"),
+                research_section("# Research\n\nReplace with findings.\n"),
+            )
+            .unwrap_err();
+        assert!(unchanged.contains("still identical to its template"), "{unchanged}");
+        assert!(unchanged.contains("Cite the inspected files."), "{unchanged}");
+
+        let plan = board
+            .create_with_sections(
+                draft("Researched"),
+                research_section("Inspected src/import.rs; the parser drops rows."),
+            )
+            .unwrap();
+        assert_eq!(plan.schema, "custom@7");
+        assert!(board.dispatch_blockers(&plan.id).unwrap().is_empty());
+        let markdown = board.read_markdown(&plan.id).unwrap();
+        assert!(markdown.contains("## research\n\nInspected src/import.rs"), "{markdown}");
+        let brief = board.brief_for(&plan.id, 1).unwrap();
+        assert!(brief.contains("## Project context\n\nProject schema context."), "{brief}");
+        assert!(brief.contains("### Artifact: research\nInvestigate and record evidence."));
+        assert!(brief.contains("## research\n\nInspected src/import.rs"));
+
+        std::fs::write(
+            dir.path().join("openspec/config.yaml"),
+            "schema: spec-driven\ncontext: Changed project context.\nrules:\n  research: New rule\n",
+        )
+        .unwrap();
+        let updated = board
+            .update(
+                &plan.id,
+                PlanEdit {
+                    progress_note: Some("schema remains pinned".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.schema, "custom@7");
+        assert_eq!(updated.sections, plan.sections);
+        assert!(board.brief_for(&plan.id, 1).unwrap().contains("Changed project context."));
+    }
+
+    #[test]
+    fn apply_requires_blocks_dispatch_until_the_section_is_supplied() {
+        let dir = tempfile::tempdir().unwrap();
+        research_schema(dir.path(), false);
+        let board = board(dir.path());
+        let plan = board.create(draft("Research before apply")).unwrap();
+
+        let blockers = board.dispatch_blockers(&plan.id).unwrap();
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("artifact 'research'"));
+        assert!(blockers[0].contains("# Research"));
+        assert!(blockers[0].contains("Cite the inspected files."));
+
+        let updated = board
+            .update_with_sections(
+                &plan.id,
+                PlanEdit::default(),
+                Some(research_section("Evidence: src/import.rs retains every row.")),
+            )
+            .unwrap();
+        assert_eq!(updated.sections["research"], "Evidence: src/import.rs retains every row.");
+        assert!(board.dispatch_blockers(&plan.id).unwrap().is_empty());
+        assert!(board
+            .read_markdown(&plan.id)
+            .unwrap()
+            .contains("## research\n\nEvidence: src/import.rs retains every row."));
     }
 
     #[tokio::test]

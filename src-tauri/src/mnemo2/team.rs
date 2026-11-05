@@ -3622,6 +3622,14 @@ impl TeamRuntime {
                 // parallel work, which needs contracts for shared files.
                 let in_flight = self.in_flight_steps(&plan.plan_id, plan.step).await;
                 board.contract_gate(&plan.plan_id, plan.step, &in_flight)?;
+                let blockers = board.dispatch_blockers(&plan.plan_id)?;
+                if !blockers.is_empty() {
+                    return Err(format!(
+                        "plan {} cannot be dispatched until its OpenSpec artifacts are complete:\n\n{}",
+                        plan.plan_id,
+                        blockers.join("\n\n")
+                    ));
+                }
                 Some(format!("{}\n---\n\n{brief}", header.trim_end()))
             }
             None => None,
@@ -11183,6 +11191,69 @@ models = [\"scripted-a\", \"scripted-b\"]
             .expect("a read_back description");
         assert!(description.contains("No questions."), "{description}");
         assert!(description.contains("waits for the lead's reply"), "{description}");
+        team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn team_dispatch_refuses_unmet_openspec_apply_requirements() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+        let openspec = root.path().join(".coding/openspec");
+        let templates = openspec.join("schemas/custom/templates");
+        std::fs::create_dir_all(&templates).expect("schema templates");
+        for id in ["proposal", "research", "tasks"] {
+            std::fs::write(templates.join(format!("{id}.md")), format!("# {id}\n"))
+                .expect("template");
+        }
+        std::fs::write(
+            openspec.join("schemas/custom/schema.yaml"),
+            "name: custom\nversion: 1\nartifacts:\n  - {id: proposal, generates: proposal.md, template: proposal.md}\n  - {id: research, generates: research.md, template: research.md, instruction: Record evidence.}\n  - {id: tasks, generates: tasks.md, template: tasks.md}\napply: {requires: [research], tracks: tasks.md}\n",
+        )
+        .expect("schema.yaml");
+        std::fs::write(
+            openspec.join("config.yaml"),
+            "schema: custom\nrules:\n  research: Cite the source.\n",
+        )
+        .expect("config.yaml");
+        let board = PlanBoard::new(
+            root.path().join(".coding/plans"),
+            root.path().join(".coding/reviews"),
+        );
+        let plan = board
+            .create(mnemo::app::plan_board::PlanDraft {
+                title: "Needs research".to_string(),
+                goal: "Implement safely".to_string(),
+                context: "Symptom: dispatch lacks artifact gates; src-tauri/src/mnemo2/team.rs validates the plan; verify with cargo test.".to_string(),
+                steps: vec!["Implement in src-tauri/src/mnemo2/team.rs and run cargo test".to_string()],
+                ..Default::default()
+            })
+            .expect("creation is allowed before apply requirements are met");
+        team.attach_board(Arc::new(board));
+
+        let error = team
+            .dispatch_request(DispatchRequest {
+                brief: "Implement the plan".to_string(),
+                tier: None,
+                dispatch_routing: false,
+                source: DispatchSource::Ipc,
+                model: None,
+                reasoning_effort: None,
+                worker_id: None,
+                plan: Some(PlanRef {
+                    plan_id: plan.id.clone(),
+                    step: 0,
+                }),
+                review_risk: None,
+                read_back: false,
+            })
+            .await
+            .expect_err("apply.requires must refuse dispatch");
+        assert!(error.contains("cannot be dispatched"), "{error}");
+        assert!(error.contains("artifact 'research'"), "{error}");
+        assert!(error.contains("Cite the source."), "{error}");
+        assert!(team.records.lock().await.is_empty());
         team.shutdown().await;
     }
 

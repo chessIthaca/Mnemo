@@ -8093,6 +8093,10 @@ async fn pump_worker(
                 let Some(worktree) = worktree else {
                     return;
                 };
+                // The tip probe runs outside the ledger lock, so a review recorded
+                // while it ran (the lead reviewing the commit it just made) is newer
+                // than this observation and cannot be stale against it.
+                let tip_read_ms = phase3::now_ms();
                 let current_tip = phase3::tip(&worktree).await.ok();
                 {
                     let mut records = records.lock().await;
@@ -8107,21 +8111,48 @@ async fn pump_worker(
                         worker.used_tokens = snapshot.used_tokens;
                         worker.max_tokens = snapshot.max_tokens;
                         worker.pending = snapshot.pending;
-                        if current_tip.as_ref().is_some_and(|tip| {
-                            worker
-                                .review
-                                .as_ref()
-                                .is_some_and(|review| review.tip != *tip)
-                                || worker.checks.iter().any(|check| check.tip != *tip)
-                        }) {
-                            worker.review = None;
-                            worker.checks.clear();
-                        }
+                        clear_review_for_a_newer_tip(worker, current_tip.as_deref(), tip_read_ms);
                     }
                 }
                 let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
             });
         }
+    }
+}
+
+/// Drop a review and its checks when this transcript snapshot saw a worker
+/// commit that the review does not cover.
+///
+/// `tip_read_ms` is the moment before the snapshot's `git rev-parse` ran. A
+/// review recorded at or after it describes whatever `HEAD` is now, so a tip
+/// this probe read earlier cannot make it stale: the review merely landed
+/// while the probe was in flight. Before that guard a slow runner let the lead
+/// commit and review inside that window, the refresh dropped both, and the
+/// merge failed with "the current worker tip has not been reviewed" (macOS CI
+/// run 42071163294). Keeping such a review is safe — [`validate_merge`]
+/// re-reads the live tip and every check tip before it merges.
+fn clear_review_for_a_newer_tip(
+    worker: &mut WorkerRecord,
+    current_tip: Option<&str>,
+    tip_read_ms: u128,
+) {
+    let review_is_newer = worker
+        .review
+        .as_ref()
+        .is_some_and(|review| review.reviewed_at_ms >= tip_read_ms);
+    if review_is_newer {
+        return;
+    }
+    let tip_moved = current_tip.is_some_and(|tip| {
+        worker
+            .review
+            .as_ref()
+            .is_some_and(|review| review.tip != tip)
+            || worker.checks.iter().any(|check| check.tip != tip)
+    });
+    if tip_moved {
+        worker.review = None;
+        worker.checks.clear();
     }
 }
 
@@ -15535,5 +15566,41 @@ models = [\"scripted-a\", \"scripted-b\"]
             1
         );
         team.shutdown().await;
+    }
+
+    /// A refresh reads the worker tip outside the ledger lock, so the lead can
+    /// commit and review inside that window: the review then postdates the
+    /// probe and covers the current tip. Clearing it made the merge fail with
+    /// "the current worker tip has not been reviewed" (plan 0d8a1112, macOS CI
+    /// run 42071163294).
+    #[test]
+    fn a_refresh_that_read_the_tip_before_the_review_keeps_that_review() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        let mut worker = reviewed_worker(root.path(), "00000001000000000001");
+        {
+            let review = worker.review.as_mut().expect("review");
+            review.tip = "reviewed-tip".to_string();
+            review.reviewed_at_ms = 200;
+        }
+        worker.checks[0].tip = "reviewed-tip".to_string();
+
+        // The probe ran at 100 ms, the lead's commit and review landed at 200.
+        clear_review_for_a_newer_tip(&mut worker, Some("older-tip"), 100);
+        assert!(
+            worker.review.is_some(),
+            "a review recorded after the tip probe is not stale"
+        );
+        assert_eq!(worker.checks.len(), 1, "its check survives with it");
+
+        // A probe that ran after the review, but on the reviewed commit.
+        clear_review_for_a_newer_tip(&mut worker, Some("reviewed-tip"), 300);
+        assert!(worker.review.is_some(), "the reviewed tip is never stale");
+
+        // A probe that ran after the review and saw a newer commit is a real
+        // verdict: the review no longer covers the worker's tip.
+        clear_review_for_a_newer_tip(&mut worker, Some("newer-tip"), 300);
+        assert!(worker.review.is_none(), "an older review is cleared");
+        assert!(worker.checks.is_empty(), "and so are its checks");
     }
 }

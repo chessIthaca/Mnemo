@@ -229,6 +229,19 @@ jobs:
       # here on purpose — see the gated steps.
       - name: Tauri build (.app + .dmg, aarch64)
         run: npx tauri build --target aarch64-apple-darwin
+      # Stage Mnemo's outputs out of target/ immediately: the Mnemo2 build
+      # below runs `npx tauri build` again, which clears
+      # target/aarch64-apple-darwin/release/bundle/dmg before writing its own
+      # dmg — a dmg left in place would be gone by upload time (run
+      # 42071163294 shipped only Mnemo2_2.0.0_aarch64.dmg next to both zips).
+      #
+      # upload-artifact@v4 does not preserve file permissions (the Mach-O
+      # exec bit) or symlinks, so a raw .app would not launch after download
+      # (review F2). ditto preserves both — zip the .app and upload the zip
+      # alongside the real distributable (the .dmg).
+      - name: Stage the Mnemo bundles
+        run: |
+          mkdir -p dist-macos && cp target/aarch64-apple-darwin/release/bundle/dmg/*.dmg dist-macos/ && ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/Mnemo.app dist-macos/mnemo.app.zip
       # The separate Mnemo2 installer, built from its own package +
       # tauri.conf.json. It runs after the signing/notarization env exports
       # (GITHUB_ENV), so tauri signs + notarizes Mnemo2 exactly like Mnemo;
@@ -239,23 +252,20 @@ jobs:
       - name: Tauri build Mnemo2 (.app + .dmg, aarch64)
         run: npx tauri build --target aarch64-apple-darwin
         working-directory: src-tauri/mnemo2-app
-      # upload-artifact@v4 does not preserve file permissions (the Mach-O
-      # exec bit) or symlinks, so a raw .app would not launch after download
-      # (review F2). ditto preserves both — zip the .app and upload the zip
-      # alongside the real distributable (the .dmg).
-      - name: Zip the .app bundles
+      # Mnemo2's dmg and .app.zip join Mnemo's in the staging dir (ditto for
+      # the same reason as above — the exec bit and symlinks survive the
+      # round trip).
+      - name: Stage the Mnemo2 bundles
         run: |
-          ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/Mnemo.app mnemo.app.zip
-          ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app mnemo2.app.zip
-      # Same root-target layout note as the Windows job (review F1).
+          cp target/aarch64-apple-darwin/release/bundle/dmg/Mnemo2_*.dmg dist-macos/ && ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app dist-macos/mnemo2.app.zip
+      # Same root-target layout note as the Windows job (review F1). The
+      # upload ships the staging dir: each app's dmg + .app.zip was copied
+      # there right after its own build, so no later build can clear it.
       - name: Upload macOS bundles
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: macos-bundles-aarch64
-          path: |
-            mnemo.app.zip
-            mnemo2.app.zip
-            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          path: dist-macos/*
           if-no-files-found: error
 
   # The second-consumer example's end-to-end run (master-spec §5.9.10 :924 —

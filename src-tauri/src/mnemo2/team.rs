@@ -11365,6 +11365,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
     }
 
+    /// An audit worker is never mergeable — in particular, a still-running
+    /// (busy) audit must be refused with the audit reason, not the generic
+    /// "worker must be idle" gate, which would hide what it actually is.
     #[tokio::test]
     async fn audit_merge_is_refused_even_while_the_audit_is_busy() {
         let root = tempfile::tempdir().expect("workspace");

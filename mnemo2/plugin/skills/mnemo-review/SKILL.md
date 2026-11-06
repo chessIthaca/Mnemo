@@ -65,7 +65,7 @@ When the review is current, no finding is open and all checks passed on the curr
 - After a merge that other open work depends on, run the project's tests on the lead branch before dispatching dependents.
 - After parallel steps, do the plan's "Integration check" step yourself (run the combined result), then `plan_step_done`.
 - If the merge makes things worse and has not reached `main`, `team_revert_merge`.
-- Leave the worker's branch and checkout alone: `team_merge` deletes the branch after a clean merge. If `team_status` shows an `error` starting with "merged, but", tell the user.
+- Leave the worker's branch and checkout alone: `team_merge` deletes the branch after a clean merge. If `team_status` shows an `error` starting with "merged, but", tell the user; Mnemo2 retries it at the next merge and at its next start.
 - A conflict is not auto-resolved. See the Review and merge cycle in the `mnemo-lead` skill.
 
 Finish with a short report to the user: what merged, what the checks showed, what you decided about findings, and what is still running. If more workers are active, make sure one background waiter is running.

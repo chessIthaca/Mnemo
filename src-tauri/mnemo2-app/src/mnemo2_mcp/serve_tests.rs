@@ -6,7 +6,9 @@
 
 use super::*;
 use crate::instance::{resolve_app, AppSearch};
-use crate::testutil::{health, write_run_file, FakeServer, Reply, Sandbox};
+use crate::testutil::{
+    connect_fails, health, wait_until_connect_fails, write_run_file, FakeServer, Reply, Sandbox,
+};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -355,7 +357,13 @@ fn a_dead_connection_triggers_one_lookup_and_the_request_is_resent() {
     assert_eq!(out.messages().len(), 1);
     assert_eq!(first.requests_to("/mcp").len(), 1);
 
+    let first_port = first.port;
     drop(first); // Mnemo2 quits; its port closes.
+    // macOS can still complete a handshake from the closed listener's backlog
+    // and reset it, and the bridge rightly treats a break after connecting as
+    // a mid-request failure it never resends. Wait until a connect to the old
+    // port fails, where nothing reached the dead instance.
+    wait_until_connect_fails(first_port);
     process(&bridge, &request(2, "tools/list"));
 
     let messages = out.messages();
@@ -365,6 +373,18 @@ fn a_dead_connection_triggers_one_lookup_and_the_request_is_resent() {
     assert_eq!(started.load(Ordering::SeqCst), 1);
     let second = second.lock().unwrap();
     assert_eq!(second.as_ref().unwrap().requests_to("/mcp").len(), 1);
+}
+
+/// The premise of the wait above: a live fake instance accepts a probe, a
+/// dropped one does not — any failed connect is the resendable path.
+#[test]
+fn a_dropped_fake_server_stops_accepting_probe_connections() {
+    let server = FakeServer::start("tok", |_| health(78, None));
+    let port = server.port;
+    assert!(!connect_fails(port));
+    drop(server);
+    wait_until_connect_fails(port);
+    assert!(connect_fails(port));
 }
 
 #[test]
@@ -378,7 +398,9 @@ fn when_mnemo2_cannot_be_reached_pending_requests_get_a_json_rpc_error() {
     let (bridge, out) = test_bridge(env);
 
     process(&bridge, &request(1, "tools/list"));
+    let first_port = first.port;
     drop(first);
+    wait_until_connect_fails(first_port);
     process(&bridge, &request(2, "tools/list"));
     process(&bridge, INITIALIZED);
 

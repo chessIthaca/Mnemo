@@ -1,0 +1,8 @@
++++
+title = "a transcript-refresh snapshot must not clear a review recorded after its tip probe"
+created = "2026-11-05"
++++
+
+Invariant in Mnemo2's team ledger: a transcript-refresh snapshot is an OBSERVATION, not a lock. `pump_worker` reads the worker tip with `phase3::tip` (a `git rev-parse`) outside the records lock, so any record written between that read and the records lock may be newer than the observation. Clearing `worker.review` / `worker.checks` on "snapshot tip != recorded tip" therefore needs a timestamp guard: capture `phase3::now_ms()` immediately BEFORE the probe and skip the clear when `review.reviewed_at_ms >= tip_read_ms`. Keeping such a review is safe — `validate_merge` re-reads the live tip and every check tip before merging, so a genuinely stale review is still rejected with "the review is stale; review the current worker tip", and a stale check with "check ... has not passed on the merge-time tip". Without the guard, a review recorded while the probe ran is silently discarded and the merge fails with "the current worker tip has not been reviewed". The decision lives in `clear_review_for_a_newer_tip` in src-tauri/src/mnemo2/team.rs, tested by `mnemo2::team::tests::a_refresh_that_read_the_tip_before_the_review_keeps_that_review`.
+
+Related portability note for tests that wait for a dead HTTP instance: "wait until the port refuses" is not portable — Windows drops the SYN from a closed loopback port (connect returns TimedOut, not ConnectionRefused), while macOS may complete a handshake from a just-closed listener's backlog and reset it. The portable predicate for "nothing listens" is "a probe connect FAILS" (`testutil::connect_fails`), which is also exactly what the bridge classifies as a resendable `HttpError::Connect`.

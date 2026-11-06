@@ -37,9 +37,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use mnemo::route_question;
 use mnemo::training_log_dir;
 use mnemo::RouteKnn;
-use mnemo::route_question;
 use mnemo::config::endpoints::TierLadder;
 use mnemo::memory::classifier::{Answer, Classifier, Question};
 
@@ -316,6 +316,9 @@ pub struct RoutingSettings {
     pub nudges: bool,
     /// Fewest words a dispatch must have to be classified.
     pub min_words: usize,
+    /// Tell the lead when one worker's estimated cost passes this many
+    /// dollars, then at each doubling; 0 turns it off (default 2.0).
+    pub cost_notice_usd: f64,
 }
 
 impl Default for RoutingSettings {
@@ -330,6 +333,7 @@ impl Default for RoutingSettings {
             fallback_tier: "routine".to_string(),
             nudges: true,
             min_words: MIN_WORDS,
+            cost_notice_usd: 2.0,
         }
     }
 }
@@ -1013,6 +1017,40 @@ high = "high"
                 mode: RoutingMode::Shadow,
                 ..RoutingSettings::default()
             }
+        );
+    }
+
+    /// The cost alert (plan 06f1a204) defaults to $2.00, so a `mnemo2.toml`
+    /// written before the key existed loads it, and an explicit 0 (off)
+    /// survives a save and reload.
+    #[test]
+    fn cost_notice_defaults_to_two_dollars_and_old_files_load() {
+        let config = tempfile::tempdir().expect("config dir");
+        std::fs::write(
+            routing_settings_path(config.path()),
+            "[routing]\nmode = \"shadow\"\nmin_words = 20\n",
+        )
+        .expect("an old settings file");
+        let loaded = load_routing_settings(config.path());
+        assert_eq!(
+            loaded.cost_notice_usd, 2.0,
+            "an old file without the key gets the default"
+        );
+        assert_eq!(loaded.mode, RoutingMode::Shadow);
+        assert_eq!(loaded.min_words, 20);
+
+        save_routing_settings(
+            config.path(),
+            &RoutingSettings {
+                cost_notice_usd: 0.0,
+                ..loaded
+            },
+        )
+        .expect("save routing settings");
+        assert_eq!(
+            load_routing_settings(config.path()).cost_notice_usd,
+            0.0,
+            "0 turns the alert off and round-trips"
         );
     }
 

@@ -8,30 +8,31 @@
 //! `min_confidence_2`, and the `route_eval.json` record the Laya page reads
 //! back.
 //!
-//! Two surfaces share it: the `mnemo2_route_eval` CLI
-//! (`src-tauri/src/bin/mnemo2_route_eval.rs`, `--laya-url` required) and the
-//! Laya page's Run-eval button (the `run_routing_eval` command in
-//! [`super::laya_settings`], which asks the lead engine's attached
-//! classifier). Everything except [`classify_corpus`] is pure — corpus
-//! parsing, the table math and the suggestion — so no test touches the
+//! Two surfaces share it: the `mnemo2-app` package's
+//! `mnemo2_route_eval` example (`src-tauri/mnemo2-app/examples/mnemo2_route_eval.rs`,
+//! `--laya-url` required) and the automatic Laya check (`super::laya_check`,
+//! which runs [`run_check`] against the lead engine's attached classifier).
+//! Corpus parsing and the table math are pure; the classification runs take a
+//! [`Classifier`], and the tests drive them with stubs, so no test touches the
 //! network.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use mnemo::training_log_dir;
 use mnemo::RouteKnn;
-use mnemo::route_question::{self, OfferedLabels};
+use mnemo::{route_question, OfferedLabels};
 use mnemo::config::endpoints::TierLadder;
 use mnemo::memory::classifier::{Answer, Classifier};
 
-use super::dispatch_routing::DispatchRoutingRow;
+use super::dispatch_routing::{DispatchRoutingRow, RoutingSettings};
 
 /// The hand-set corpus shipped with the repo (`tests/fixtures/route_eval.jsonl`),
-/// embedded so the app's Run-eval button needs no fixture path at runtime.
+/// embedded so the automatic Laya check needs no fixture path at runtime.
 pub const HAND_SET_JSONL: &str = include_str!("../../tests/fixtures/route_eval.jsonl");
 
 /// The four labels, easiest first — the eval's expected labels (`involved`
@@ -609,9 +610,27 @@ pub async fn evaluate_knn(
     }
 }
 
+/// Score one case's answer: an un-offered label in the answer folds onto the
+/// nearest offered one; any other label counts as no answer. The score
+/// carries the top option's probability, the number the gates are calibrated
+/// on (`route_question::answer_confidence`).
+fn score_case(case: &EvalCase, answer: Option<&Answer>, offered: OfferedLabels) -> CaseScore {
+    let (label, confidence) = match answer {
+        Some(choice @ Answer::Choice { label, .. }) => (
+            fold_label(label, offered),
+            Some(route_question::answer_confidence(choice)),
+        ),
+        _ => (None, None),
+    };
+    CaseScore {
+        text: case.text.clone(),
+        expected: case.expected.clone(),
+        label,
+        confidence,
+    }
+}
+
 /// Ask Laya about every case, one prompt at a time, and collect the answers.
-/// An un-offered label in the answer folds onto the nearest offered one; any
-/// other label counts as no answer.
 pub async fn classify_corpus(
     classifier: &dyn Classifier,
     offered: OfferedLabels,
@@ -623,26 +642,79 @@ pub async fn classify_corpus(
     let mut scores = Vec::with_capacity(cases.len());
     for case in cases {
         let answer = classifier.classify(&case.text, &question).await;
-        // The score carries the top option's probability, the number the
-        // gates are calibrated on (`route_question::answer_confidence`).
-        let (label, confidence) = match &answer {
-            Some(answer) => match answer {
-                Answer::Choice { label, .. } => (
-                    fold_label(label, offered),
-                    Some(route_question::answer_confidence(answer)),
-                ),
-                _ => (None, None),
-            },
-            None => (None, None),
-        };
-        scores.push(CaseScore {
-            text: case.text.clone(),
-            expected: case.expected.clone(),
-            label,
-            confidence,
-        });
+        scores.push(score_case(case, answer.as_ref(), offered));
     }
     scores
+}
+
+/// Consecutive cases Laya may answer nothing at all before the check calls
+/// the classifier dead.
+const DEAD_AFTER_MISSES: usize = 5;
+
+/// [`classify_corpus`] with progress and a dead-classifier guard: every scored
+/// case calls `on_answer`, and [`DEAD_AFTER_MISSES`] consecutive cases with no
+/// answer at all fail the run instead of scoring a wall of silence as a bad
+/// Laya. A `Some` answer resets the count.
+async fn classify_checked(
+    classifier: &dyn Classifier,
+    offered: OfferedLabels,
+    cases: &[EvalCase],
+    on_answer: &(dyn Fn() + Send + Sync),
+) -> Result<Vec<CaseScore>, String> {
+    let Some(question) = route_question::route_question(offered) else {
+        return Ok(Vec::new());
+    };
+    let mut scores = Vec::with_capacity(cases.len());
+    let mut misses = 0;
+    for case in cases {
+        let answer = classifier.classify(&case.text, &question).await;
+        misses = if answer.is_some() { 0 } else { misses + 1 };
+        if misses >= DEAD_AFTER_MISSES {
+            return Err("Laya stopped answering".to_string());
+        }
+        scores.push(score_case(case, answer.as_ref(), offered));
+        on_answer();
+    }
+    Ok(scores)
+}
+
+/// Run the automatic Laya check: the hand set through the four-, three- and
+/// two-label questions, reporting `on_progress(done, total)` after every
+/// answer. Fails when Laya stops answering or answers fewer than 90% of the
+/// four-label cases; a failure carries no record, so the caller writes nothing
+/// and the stored gates stand.
+pub async fn run_check(
+    classifier: &dyn Classifier,
+    on_progress: &(dyn Fn(usize, usize) + Send + Sync),
+) -> Result<EvalRecord, String> {
+    let cases = parse_hand_set(HAND_SET_JSONL)?;
+    let total = 3 * cases.len();
+    let done = AtomicUsize::new(0);
+    let on_answer = || {
+        let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
+        on_progress(finished, total);
+    };
+    // The offered sets the eval has always used:
+    // the four-label question dispatch actually asks, the interim three-label
+    // shape, and the extremes with both middles folded into `hard`.
+    let four_offered = OfferedLabels { trivial: true, routine: true, involved: true, hard: true };
+    let three_offered = OfferedLabels { trivial: true, routine: true, involved: false, hard: true };
+    let two_offered = OfferedLabels { trivial: true, routine: false, involved: false, hard: true };
+    let four_scores = classify_checked(classifier, four_offered, &cases, &on_answer).await?;
+    let answered = four_scores.iter().filter(|score| score.label.is_some()).count();
+    if answered * 10 < cases.len() * 9 {
+        return Err(format!(
+            "Laya answered only {answered} of {} test tasks",
+            cases.len()
+        ));
+    }
+    let three_scores = classify_checked(classifier, three_offered, &cases, &on_answer).await?;
+    let two_scores = classify_checked(classifier, two_offered, &cases, &on_answer).await?;
+    Ok(eval_record(
+        &report(&four_scores, four_offered),
+        &report(&three_scores, three_offered),
+        &report(&two_scores, two_offered),
+    ))
 }
 
 /// `<training_dir>/route_eval.json`: the last eval's suggestions, which the
@@ -667,6 +739,10 @@ pub struct EvalRecord {
     /// The accuracy on the routed four-label prompts at the suggested gate.
     #[serde(default)]
     pub accuracy: Option<f64>,
+    /// The fingerprint of the inputs this check ran on ([`eval_fingerprint`]);
+    /// absent on records written before the check ran itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// The eval record's file: `~/.mnemo/laya/training/route_eval.json`.
@@ -676,20 +752,30 @@ pub fn route_eval_path() -> PathBuf {
 
 /// Read the last eval record; a missing or unreadable file is no record.
 pub fn load_eval_record() -> Option<EvalRecord> {
-    let text = std::fs::read_to_string(route_eval_path()).ok()?;
-    serde_json::from_str(&text).ok()
+    load_eval_record_at(&route_eval_path())
 }
 
 /// Write the eval record, creating the training directory.
 pub fn save_eval_record(record: &EvalRecord) -> Result<(), String> {
-    let path = route_eval_path();
+    save_eval_record_at(&route_eval_path(), record)
+}
+
+/// Read the eval record at `path`; a missing or unreadable file is no record.
+/// Tests pass a temp path, so the real `route_eval.json` is never touched.
+pub fn load_eval_record_at(path: &Path) -> Option<EvalRecord> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Write the eval record to `path`, creating its directory.
+pub fn save_eval_record_at(path: &Path, record: &EvalRecord) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     let encoded = serde_json::to_string_pretty(record)
         .map_err(|error| format!("cannot encode the eval record: {error}"))?;
-    std::fs::write(&path, encoded).map_err(|error| format!("cannot write {}: {error}", path.display()))
+    std::fs::write(path, encoded).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 /// Build the record from the three runs (four-, three- and two-label),
@@ -706,6 +792,59 @@ pub fn eval_record(four: &EvalReport, three: &EvalReport, two: &EvalReport) -> E
         min_confidence_2: two.suggested,
         routed_share: row.map(|row| row.routed_share),
         accuracy: row.map(|row| row.accuracy),
+        fingerprint: None,
+    }
+}
+
+/// The check's fingerprint: the hand set's bytes and Laya's checkpoint stamp,
+/// hashed. The eval is deterministic for those inputs, so a record carrying
+/// this fingerprint needs no re-run.
+pub fn eval_fingerprint(checkpoint_stamp: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(HAND_SET_JSONL.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(checkpoint_stamp.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Whether a check has to run: only a record whose fingerprint matches the
+/// current one still describes the current inputs.
+pub fn needs_check(record: Option<&EvalRecord>, fingerprint: &str) -> bool {
+    record.is_none_or(|record| record.fingerprint.as_deref() != Some(fingerprint))
+}
+
+/// Apply a record's suggested gates onto `settings`: a gate the record
+/// suggests replaces the stored one, a gate it has no suggestion for keeps
+/// what the file holds (exactly the old Apply button's rule). Nothing else in
+/// `settings` is touched.
+pub fn apply_suggested_gates(settings: &mut RoutingSettings, record: &EvalRecord) {
+    if let Some(gate) = record.min_confidence_4 {
+        settings.min_confidence_4 = gate;
+    }
+    if let Some(gate) = record.min_confidence_3 {
+        settings.min_confidence_3 = gate;
+    }
+    if let Some(gate) = record.min_confidence_2 {
+        settings.min_confidence_2 = gate;
+    }
+}
+
+/// One line describing a finished check: how much of the test set Laya
+/// confidently routed and how often that was right. A record with no shares
+/// (no gate reached the floor) still finished.
+pub fn check_summary(record: &EvalRecord) -> String {
+    match (record.routed_share, record.accuracy) {
+        (Some(routed), Some(right)) => format!(
+            "Confident on {:.0}% of test tasks, {:.0}% of those right",
+            routed * 100.0,
+            right * 100.0
+        ),
+        _ => "Check finished".to_string(),
     }
 }
 
@@ -823,6 +962,67 @@ mod tests {
     impl Classifier for StubClassifier {
         async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
             self.answer.clone()
+        }
+    }
+
+    /// A classifier that answers every hand-set text with its expected label
+    /// (a vague text gets `routine`), at a confidence every swept gate clears
+    /// — a perfect Laya, so a test reads the check's arithmetic, not its luck.
+    struct HandSetClassifier {
+        answers: BTreeMap<String, Answer>,
+    }
+
+    impl HandSetClassifier {
+        fn new() -> Self {
+            let cases = parse_hand_set(HAND_SET_JSONL).expect("the shipped hand set parses");
+            let answers = cases
+                .into_iter()
+                .map(|case| {
+                    let label = case
+                        .expected
+                        .unwrap_or_else(|| route_question::LABEL_ROUTINE.to_string());
+                    let answer = Answer::Choice {
+                        label,
+                        confidence: 0.9,
+                        probabilities: BTreeMap::new(),
+                    };
+                    (case.text, answer)
+                })
+                .collect();
+            Self { answers }
+        }
+    }
+
+    #[async_trait]
+    impl Classifier for HandSetClassifier {
+        async fn classify(&self, state: &str, _question: &Question) -> Option<Answer> {
+            self.answers.get(state).cloned()
+        }
+    }
+
+    /// A classifier that never answers, counting how often it was asked.
+    struct CountingDeadClassifier {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Classifier for CountingDeadClassifier {
+        async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// A stored eval record with only its fingerprint set.
+    fn stored_record(fingerprint: Option<&str>) -> EvalRecord {
+        EvalRecord {
+            date: "2026-11-05".to_string(),
+            min_confidence_4: None,
+            min_confidence_3: None,
+            min_confidence_2: None,
+            routed_share: None,
+            accuracy: None,
+            fingerprint: fingerprint.map(str::to_string),
         }
     }
 
@@ -1116,5 +1316,130 @@ mod tests {
         assert_eq!(report.combined_answered, 1);
         assert_eq!(report.combined_correct, 1);
         assert!((report.combined_accuracy - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn run_check_reports_progress_and_builds_a_record() {
+        let stub = HandSetClassifier::new();
+        let progress = std::sync::Mutex::new(Vec::new());
+        let on_progress = |done: usize, total: usize| {
+            progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((done, total));
+        };
+        let record = run_check(&stub, &on_progress)
+            .await
+            .expect("a perfect Laya passes the check");
+        let cases = parse_hand_set(HAND_SET_JSONL).expect("the shipped hand set parses");
+        let total = 3 * cases.len();
+        let progress = progress.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(progress.len(), total);
+        assert_eq!(progress.last(), Some(&(total, total)));
+        assert_eq!(record.min_confidence_4, Some(0.25));
+        assert_eq!(record.routed_share, Some(1.0));
+        assert_eq!(record.fingerprint, None);
+    }
+
+    #[tokio::test]
+    async fn run_check_gives_up_on_a_dead_classifier() {
+        let stub = CountingDeadClassifier { calls: AtomicUsize::new(0) };
+        let no_progress = |_, _| {};
+        let error = run_check(&stub, &no_progress)
+            .await
+            .expect_err("a dead classifier fails the check");
+        assert!(error.contains("stopped answering"), "got: {error}");
+        assert_eq!(stub.calls.load(Ordering::SeqCst), DEAD_AFTER_MISSES);
+    }
+
+    #[tokio::test]
+    async fn run_check_fails_when_most_answers_are_unusable() {
+        // A label outside the ladder is no answer at all, and a stub that
+        // always answers keeps the dead-classifier guard quiet — the
+        // answered-share floor is what fails the run.
+        let stub = StubClassifier {
+            answer: Some(Answer::Choice {
+                label: "bogus".to_string(),
+                confidence: 0.9,
+                probabilities: BTreeMap::new(),
+            }),
+        };
+        let no_progress = |_, _| {};
+        let error = run_check(&stub, &no_progress)
+            .await
+            .expect_err("an unusable answer set fails the check");
+        assert!(error.contains("answered only"), "got: {error}");
+    }
+
+    #[test]
+    fn needs_check_compares_the_fingerprint() {
+        assert!(needs_check(None, "abc"));
+        assert!(needs_check(Some(&stored_record(None)), "abc"));
+        assert!(needs_check(Some(&stored_record(Some("def"))), "abc"));
+        assert!(!needs_check(Some(&stored_record(Some("abc"))), "abc"));
+    }
+
+    #[test]
+    fn eval_fingerprint_changes_with_the_stamp() {
+        let one = eval_fingerprint("checkpoint-a");
+        assert_eq!(one, eval_fingerprint("checkpoint-a"));
+        assert_ne!(one, eval_fingerprint("checkpoint-b"));
+        assert_eq!(one.len(), 64);
+        assert!(one.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn apply_suggested_gates_keeps_a_gate_with_no_suggestion() {
+        let mut settings = RoutingSettings {
+            mode: RoutingMode::Shadow,
+            ..RoutingSettings::default()
+        };
+        let mut record = stored_record(None);
+        record.min_confidence_4 = Some(0.5);
+        record.min_confidence_2 = Some(0.6);
+        apply_suggested_gates(&mut settings, &record);
+        assert_eq!(settings.min_confidence_4, 0.5);
+        assert_eq!(
+            settings.min_confidence_3,
+            RoutingSettings::default().min_confidence_3
+        );
+        assert_eq!(settings.min_confidence_2, 0.6);
+        assert_eq!(settings.mode, RoutingMode::Shadow);
+        assert_eq!(settings.nudges, RoutingSettings::default().nudges);
+    }
+
+    #[test]
+    fn check_summary_words_the_shares() {
+        let mut record = stored_record(None);
+        record.routed_share = Some(0.0169);
+        record.accuracy = Some(1.0);
+        assert_eq!(
+            check_summary(&record),
+            "Confident on 2% of test tasks, 100% of those right"
+        );
+        // A sweep that reached no gate has no shares to word.
+        record.routed_share = None;
+        assert_eq!(check_summary(&record), "Check finished");
+    }
+
+    #[test]
+    fn eval_record_round_trips_at_a_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("training").join("route_eval.json");
+        let mut record = stored_record(Some("abc"));
+        record.min_confidence_4 = Some(0.375);
+        record.routed_share = Some(0.5);
+        record.accuracy = Some(0.9);
+        save_eval_record_at(&path, &record).expect("the record writes");
+        assert_eq!(load_eval_record_at(&path), Some(record));
+        // A record from before the fingerprint existed parses as none.
+        let legacy = r#"{"date": "2026-01-01", "min_confidence_4": 0.4, "routed_share": 0.5, "accuracy": 0.9}"#;
+        std::fs::write(&path, legacy).expect("the legacy record writes");
+        let loaded = load_eval_record_at(&path).expect("the legacy record parses");
+        assert_eq!(loaded.fingerprint, None);
+        assert_eq!(loaded.min_confidence_4, Some(0.4));
+        assert_eq!(loaded.min_confidence_3, None);
+        // A missing file is no record at all.
+        assert_eq!(load_eval_record_at(&dir.path().join("missing.json")), None);
     }
 }

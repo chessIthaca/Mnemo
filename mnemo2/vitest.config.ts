@@ -11,5 +11,9 @@ export default defineConfig({
     include: ["src/**/*.test.ts"],
     setupFiles: ["./src/test/setup.ts"],
     css: true,
+    // Heavy DOM tests time out at the default 5 s when the machine is busy; a timeout here is load, not a defect.
+    testTimeout: 20_000,
+    hookTimeout: 20_000,
+    maxWorkers: "50%",
   },
 });

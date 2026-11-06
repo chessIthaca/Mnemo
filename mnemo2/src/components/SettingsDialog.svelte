@@ -5,12 +5,14 @@
   import { createModelSettingsTransport } from "../lib/modelSettings";
   import { createSafetyTransport } from "../lib/safetySettings";
   import { createAppearanceTransport } from "../lib/sounds";
-  import { currentProject } from "../lib/store";
+  import { app, currentProject } from "../lib/store";
   import { createSettingsTransport, emptyTiers, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import { createSpecsTransport } from "../lib/specsSettings";
+  import { provideUnsavedRegistry } from "../lib/unsavedEdits";
   import AppearancePage from "./AppearancePage.svelte";
   import EndpointsPage from "./EndpointsPage.svelte";
+  import InlineConfirm from "./InlineConfirm.svelte";
   import McpPage from "./McpPage.svelte";
   import ModelsPage from "./ModelsPage.svelte";
   import ProjectPage from "./ProjectPage.svelte";
@@ -73,16 +75,62 @@
   // Read once for the first paint; the effect below re-resolves it on every open.
   let page = $state<Page>(untrack(() => startPage(initialPage)));
 
+  /** The pages' shared answer to "would leaving now drop an edit?". */
+  const registry = provideUnsavedRegistry();
+  /** The action the visible banner would run, parked until the user chooses. */
+  let pendingLeave = $state<(() => void) | null>(null);
+
   // Re-resolved on every open, not just at mount, so the gear always lands on
   // the Project page while a later caller can ask for another one.
   $effect(() => {
-    if (open) page = startPage(initialPage);
+    if (open) {
+      page = startPage(initialPage);
+    } else {
+      // A closed dialog drops any question it was still asking.
+      pendingLeave = null;
+    }
+  });
+
+  /**
+   * Ask before leaving while a page holds unsaved edits, then run `action`.
+   * A question already on screen keeps its own action: Escape, the close
+   * button and the backdrop never retarget it.
+   */
+  function requestLeave(action: () => void): void {
+    if (pendingLeave !== null) return;
+    if (!registry.hasUnsaved()) {
+      action();
+      return;
+    }
+    pendingLeave = action;
+  }
+
+  /** A rail click: the page already showing does nothing, and a new pick replaces the question. */
+  function requestPage(next: Page): void {
+    if (next === page) return;
+    // A different page is a different question — retarget the banner, or ask it.
+    pendingLeave = null;
+    requestLeave(() => (page = next));
+  }
+
+  // The browser's own "changes may not be saved" prompt, only while edits are live.
+  $effect(() => {
+    if (!open) return;
+    const guard = (event: BeforeUnloadEvent): void => {
+      if (!registry.hasUnsaved()) return;
+      event.preventDefault();
+      event.returnValue = true;
+    };
+    window.addEventListener("beforeunload", guard);
+    return () => window.removeEventListener("beforeunload", guard);
   });
 
   let endpoints = $state<EndpointDetailDto[]>([]);
   let tiers = $state<TiersDto>(emptyTiers());
   let loading = $state(false);
   let loadError = $state("");
+  /** A failed tiers re-read after an endpoint change; the Tiers page would be stale. */
+  let tiersStale = $state("");
   const transport = $derived(open ? createSettingsTransport() : null);
   const modelTransport = $derived(open ? createModelSettingsTransport() : null);
   const layaTransport = $derived(open ? createLayaTransport() : null);
@@ -97,6 +145,7 @@
     let cancelled = false;
     loading = true;
     loadError = "";
+    tiersStale = "";
     Promise.all([active.endpoints(), active.tiers()])
       .then(([loadedEndpoints, loadedTiers]) => {
         if (cancelled) return;
@@ -114,14 +163,26 @@
     };
   });
 
-  /** Renames and removals rewrite tier specs on the backend, so re-read them. */
+  /**
+   * Renames and removals rewrite tier specs on the backend, so re-read them.
+   * A failed re-read leaves the Tiers page showing specs that no longer exist,
+   * so say so until a later read succeeds or the dialog reopens.
+   */
   function refreshAfterEndpointChange(next: EndpointDetailDto[]) {
     endpoints = next;
-    void transport?.tiers().then((loaded) => (tiers = loaded)).catch(() => {});
+    void transport
+      ?.tiers()
+      .then((loaded) => {
+        tiers = loaded;
+        tiersStale = "";
+      })
+      .catch((error) => {
+        tiersStale = errorText(error);
+      });
   }
 </script>
 
-<Sheet {open} title="Settings" eyebrow="MNEMO" wide {onclose}>
+<Sheet {open} title="Settings" eyebrow="MNEMO" wide onclose={() => requestLeave(onclose)}>
   {#if !transport}
     <p class="settings-empty">Settings are available in the desktop app.</p>
   {:else}
@@ -131,12 +192,23 @@
           <div class="rail-group">
             <p class="rail-heading">{group.label}</p>
             {#each group.pages as entry (entry.id)}
-              <button class:active={page === entry.id} aria-current={page === entry.id ? "page" : undefined} onclick={() => (page = entry.id)}>{entry.id === "project" ? projectLabel : entry.label}</button>
+              <button class:active={page === entry.id} aria-current={page === entry.id ? "page" : undefined} onclick={() => requestPage(entry.id)}>{entry.id === "project" ? projectLabel : entry.label}</button>
             {/each}
           </div>
         {/each}
       </nav>
       <section class="settings-page">
+        {#if pendingLeave}
+          <InlineConfirm
+            message="Discard unsaved changes?"
+            onkeep={() => (pendingLeave = null)}
+            ondiscard={() => { const run = pendingLeave; pendingLeave = null; run?.(); }}
+          />
+        {/if}
+        {#if tiersStale}
+          <p class="settings-error" role="alert">Could not re-read tiers after the endpoint change: {tiersStale}. Reopen Settings before editing Tiers.</p>
+        {/if}
+
         {#if page === "project"}
           <ProjectPage />
         {:else if page === "specs"}
@@ -144,24 +216,6 @@
             <SpecsPage transport={specsTransport} />
           {:else}
             <p class="settings-empty">Specs settings are available in the desktop app.</p>
-          {/if}
-        {:else if loadError}
-          <p class="settings-error" role="alert">{loadError}</p>
-        {:else if loading}
-          <p class="settings-empty">Loading…</p>
-        {:else if page === "endpoints"}
-          <EndpointsPage {transport} {endpoints} {tiers} onendpoints={refreshAfterEndpointChange} />
-        {:else if page === "models"}
-          {#if modelTransport}
-            <ModelsPage transport={modelTransport} {endpoints} />
-          {:else}
-            <p class="settings-empty">Model settings are available in the desktop app.</p>
-          {/if}
-        {:else if page === "savings"}
-          {#if modelTransport}
-            <SavingsPage transport={modelTransport} {endpoints} />
-          {:else}
-            <p class="settings-empty">Savings settings are available in the desktop app.</p>
           {/if}
         {:else if page === "safety"}
           {#if safetyTransport}
@@ -181,8 +235,26 @@
           {:else}
             <p class="settings-empty">Sound and theme settings are available in the desktop app.</p>
           {/if}
+        {:else if loadError}
+          <p class="settings-error" role="alert">{loadError}</p>
+        {:else if loading}
+          <p class="settings-empty">Loading…</p>
+        {:else if page === "endpoints"}
+          <EndpointsPage {transport} {endpoints} {tiers} onendpoints={refreshAfterEndpointChange} />
+        {:else if page === "models"}
+          {#if modelTransport}
+            <ModelsPage transport={modelTransport} {endpoints} />
+          {:else}
+            <p class="settings-empty">Model settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "savings"}
+          {#if modelTransport}
+            <SavingsPage transport={modelTransport} />
+          {:else}
+            <p class="settings-empty">Savings settings are available in the desktop app.</p>
+          {/if}
         {:else}
-          <TiersPage {transport} {layaTransport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />
+          <TiersPage {transport} {layaTransport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} evalPass={$app.indexing?.laya ?? null} />
         {/if}
       </section>
     </div>

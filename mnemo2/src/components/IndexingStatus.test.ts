@@ -63,6 +63,40 @@ describe("indexing status", () => {
     expect(screen.queryByText("Code index up to date")).toBeNull();
   });
 
+  it("shows the Laya check with its task count and a progress bar", () => {
+    setIndexing(snapshot({ laya: { state: "running", done: 34, total: 207, detail: null } }));
+    render(IndexingStatus);
+    expect(screen.getByText("Checking Laya · 34/207 tasks")).toBeTruthy();
+    const bar = screen.getByRole("progressbar", { name: "Laya check progress" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("16");
+  });
+
+  it("shows the Laya check before its total is known", () => {
+    setIndexing(snapshot({ laya: { state: "running", done: 0, total: 0, detail: null } }));
+    render(IndexingStatus);
+    expect(screen.getByText("Checking Laya")).toBeTruthy();
+  });
+
+  it("confirms the Laya check when it finishes", async () => {
+    vi.useFakeTimers();
+    try {
+      setIndexing(snapshot({ revision: 1, laya: { state: "running", done: 0, total: 207, detail: null } }));
+      render(IndexingStatus);
+      expect(screen.getByText("Checking Laya · 0/207 tasks")).toBeTruthy();
+      setIndexing(snapshot({ revision: 2, laya: { state: "done", done: 207, total: 207, detail: "gates applied" } }));
+      await tick();
+      expect(screen.getByText("Laya checked").getAttribute("title")).toBe("gates applied");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names a failed Laya check", () => {
+    setIndexing(snapshot({ laya: { state: "failed", done: 0, total: 207, detail: "Laya stopped answering" } }));
+    render(IndexingStatus);
+    expect(screen.getByText("Laya check failed").getAttribute("title")).toBe("Laya stopped answering");
+  });
+
   it("holds the project only during a first run's code index", () => {
     setIndexing(snapshot({ firstRun: true, code: { state: "running", done: 0, total: 0, detail: null } }));
     const { unmount } = render(FirstIndexOverlay);

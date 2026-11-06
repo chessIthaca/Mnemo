@@ -1,0 +1,4 @@
+paths:
+  - mnemo2/src/components/SettingsDialog.svelte
+  - mnemo2/src/components/InlineConfirm.svelte
+  - mnemo2/src/lib/unsavedEdits.ts

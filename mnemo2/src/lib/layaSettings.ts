@@ -4,11 +4,11 @@ import { isTauriRuntime } from "./runtime";
 
 /**
  * Decision-model (Laya) settings for the Tiers page: the transport to
- * `laya_status` / `laya_setup` / `laya_disable` / `save_laya_settings`
- * (src-tauri/src/mnemo2/laya_settings.rs), the top control's wire, the
- * view-model metadata (the status wording, the opt-in flags with plain
- * explanations) and the routing draft/wire parsing. Wire fields are
- * snake_case (serde), like every settings DTO in this app.
+ * `laya_status` / `laya_setup` / `laya_disable` / `save_laya_settings` /
+ * `laya_check_start` (src-tauri/src/mnemo2/laya_settings.rs), the top
+ * control's wire, the view-model metadata (the status wording, the opt-in
+ * flags with plain explanations) and the Laya check's summary wording.
+ * Wire fields are snake_case (serde), like every settings DTO in this app.
  */
 
 /** The channel `laya_setup` streams its progress on (kernel `SetupEvent`). */
@@ -37,11 +37,6 @@ export interface LayaFlags {
   reflex: boolean;
 }
 
-/**
- * The `[general.routing]` block of the `laya_status` snapshot: each model
- * target as the page edits it (`"endpoint/model"` or null), the escalate
- * confidence threshold and its enforce gate.
- */
 /** Mnemo1's routing gates, as `laya_status` reports them: the models live on
  * the unified ladder (Settings > Tiers), only the gates remain here. */
 export interface Mnemo1Routing {
@@ -51,16 +46,6 @@ export interface Mnemo1Routing {
   first_prompt_min_confidence: number | null;
   /** Whether a confident decision actually switches the turn's model. */
   enforce: boolean;
-}
-
-/** The `routing` payload of `save_laya_settings`: Mnemo1's gates. Absent keys
- * keep their stored value (the kernel's double-Option keeps absent keys; the
- * page always sends all three). */
-export interface RoutingPatch {
-  threshold: number;
-  enforce: boolean;
-  /** An explicit `null` clears the gate back to the kernel default. */
-  first_prompt_min_confidence: number | null;
 }
 
 /** The coarse runtime state `laya_status` reports. */
@@ -105,129 +90,43 @@ export interface LayaFlagMeta {
   label: string;
   /** One plain sentence of what turning this on does. */
   explanation: string;
-  /** A short extra note — the fine-tune warning, the background training. */
-  note?: string;
 }
 
-/** The warning carried by every flag that needs a fine-tuned checkpoint. */
-const NEEDS_FINETUNE = "Only meaningful against a fine-tuned checkpoint — base models are near-chance on this.";
-
-/** The Laya section's opt-in flags in display order, with one-line
- * explanations. The `routing` flag is not here — the top control owns it —
- * and the `reflex` flag renders with Mnemo1's routing gates. */
+/** The collapsed "Other things Laya can do" section's flags in display order,
+ * with one-line explanations. The `routing` flag is not here — the top
+ * control owns it — and the two Mnemo1-only flags say so in their labels. */
 export const LAYA_FLAG_META: readonly LayaFlagMeta[] = [
   {
     key: "auto_type_memories",
     label: "Auto-type memories",
     explanation: "When a memory is written, a confident classifier may correct its typed prefix (SPEC/DECISION/BUG/…).",
-    note: NEEDS_FINETUNE,
   },
   {
     key: "failure_triage",
     label: "Failure triage",
     explanation: "Failed runs are classified transient / permanent / needs-user / flaky-test, and a confident answer steers the retry and repair paths.",
-    note: NEEDS_FINETUNE,
   },
   {
     key: "failure_triage_knn",
     label: "Learn from logged failures",
     explanation: "A local kNN overlay votes on the most similar logged failures, so new dispositions apply immediately, without a fine-tune.",
-    note: "Rides the local embedder, not the Laya server.",
-  },
-  {
-    key: "auto_finetune",
-    label: "Auto fine-tune",
-    explanation: "At startup, when enough new labeled failures have accumulated, retrains the checkpoint and serves it.",
-    note: "Trains on your local logs in the background; never blocks startup.",
   },
   {
     key: "steer_tool_choice",
     label: "Steer tool choice",
     explanation: "A confident classifier picks whether a search is for a symbol, plain text or a memory; every fallback keeps the built-in heuristics.",
-    note: NEEDS_FINETUNE,
+  },
+  {
+    key: "reflex",
+    label: "Reflex (plan-step tiers, Mnemo1)",
+    explanation: "Each Mnemo1 plan step runs on the tier Laya picks for it.",
+  },
+  {
+    key: "auto_finetune",
+    label: "Auto fine-tune (Mnemo1)",
+    explanation: "Mnemo1 retrains Laya on your local logs at startup, in the background, once enough new failures have been logged.",
   },
 ];
-
-/** The `reflex` flag — Mnemo1's plan-step tiers opt-in, rendered with the
- * routing gates in the collapsed routing details. */
-export const LAYA_REFLEX_META: LayaFlagMeta = {
-  key: "reflex",
-  label: "Reflex (plan-step tiers)",
-  explanation: "One call answers complexity, action and risk for the same state; each plan step then runs on its ladder tier, folded down when empty.",
-  note: NEEDS_FINETUNE,
-};
-
-/** One-line explanation under the status line, per status word. */
-export function layaStatusHint(status: LayaStatusWord): string {
-  switch (status) {
-    case "disabled":
-      return "Off — the engine runs exactly as it does without Laya: no classifier calls, no server.";
-    case "not_installed":
-      return "Enabled, but the managed runtime is not downloaded yet. Install runs uv, a virtualenv, laya-serve and the English checkpoint.";
-    case "installing":
-      return "Downloading the managed runtime — the bar follows its progress.";
-    case "starting":
-      return "Starting the local laya-serve server…";
-    case "ready":
-      return "Ready — the local server answers the engine's decision calls.";
-    case "failed":
-      return "The pipeline failed. Enable restarts it; the error shows what gave up.";
-  }
-}
-
-// ── Draft parsing ────────────────────────────────────────────────────────────
-
-/** Mnemo1's routing gates as the page edits them: the numbers as text. */
-export interface RoutingDraft {
-  threshold: string;
-  firstPrompt: string;
-  /** Carried through unchanged — the top control owns this gate. */
-  enforce: boolean;
-}
-
-/** Seed a routing draft from the wire block. */
-export function routingDraft(routing: Mnemo1Routing): RoutingDraft {
-  return {
-    threshold: String(routing.threshold),
-    firstPrompt:
-      routing.first_prompt_min_confidence === null
-        ? ""
-        : String(routing.first_prompt_min_confidence),
-    enforce: routing.enforce,
-  };
-}
-
-/** Parse a confidence gate: a number from 0 to 1, or null. */
-function parseGate(text: string): number | null {
-  const trimmed = text.trim();
-  if (!/^\d+(?:\.\d+)?$/.test(trimmed)) return null;
-  const parsed = Number(trimmed);
-  return parsed >= 0 && parsed <= 1 ? parsed : null;
-}
-
-/**
- * Parse a routing draft into the `save_laya_settings` payload, or the first
- * field error. The threshold must be a number from 0 to 1; an empty
- * first-prompt gate clears it back to the kernel default.
- */
-export function routingWire(draft: RoutingDraft): { value: RoutingPatch; error?: undefined } | { value?: undefined; error: string } {
-  const threshold = parseGate(draft.threshold);
-  if (threshold === null) {
-    return { error: "Step-lane threshold must be a number from 0 to 1" };
-  }
-  const firstPrompt = draft.firstPrompt.trim();
-  const firstPromptGate = firstPrompt === "" ? 0 : parseGate(firstPrompt);
-  if (firstPrompt !== "" && firstPromptGate === null) {
-    return { error: "First-prompt gate must be a number from 0 to 1, or empty for the default" };
-  }
-  return {
-    value: {
-      threshold,
-      first_prompt_min_confidence: firstPrompt === "" ? null : firstPromptGate,
-      enforce: draft.enforce,
-    },
-  };
-}
 
 // ── Transport ────────────────────────────────────────────────────────────────
 
@@ -245,20 +144,14 @@ export interface LayaTransport {
   setup(): Promise<void>;
   /** Flip the master toggle off and stop every laya-serve sidecar. */
   disable(): Promise<void>;
-  /**
-   * Save the opt-in flags and/or Mnemo1's routing gates; each absent section
-   * is kept. Never sends `enabled` — the backend rejects that key, and the
-   * master toggle rides `setup`/`disable`.
-   */
-  save(flags?: LayaFlags, routing?: RoutingPatch): Promise<void>;
+  /** Save one opt-in flag; the page sends nothing else in the same call. */
+  saveFlag(key: LayaFlagKey, value: boolean): Promise<void>;
   /** Subscribe to the setup events; resolves to the unsubscribe function. */
   onLayaEvent(handler: (event: LayaEvent) => void): Promise<UnlistenFn>;
-  /** The `[routing]` table, the log summary and the last eval record. */
+  /** The `[routing]` table, the log summary and the last check's record. */
   routingStatus(): Promise<RoutingStatusWire>;
-  /** Save the `[routing]` table; returns the fresh snapshot. */
-  saveRoutingSettings(settings: DispatchRoutingSettings): Promise<RoutingStatusWire>;
-  /** Run the routing eval against the open lead's attached Laya. */
-  runRoutingEval(): Promise<RoutingEvalWire>;
+  /** Run the Laya check now, even when the last one is still up to date. */
+  checkLaya(): Promise<void>;
   /** The top control's status: the saved choice plus Laya's readiness (design §7.1). */
   topControl(): Promise<TiersTopControl>;
   /** Save the top control's choice; returns the fresh wire. */
@@ -271,14 +164,12 @@ export function createTauriLayaTransport(bindings: LayaTransportBindings): LayaT
     status: () => bindings.invoke<LayaStatus>("laya_status"),
     setup: () => bindings.invoke<void>("laya_setup"),
     disable: () => bindings.invoke<void>("laya_disable"),
-    save: (flags, routing) =>
-      bindings.invoke<void>("save_laya_settings", { flags: flags ?? null, routing: routing ?? null }),
+    saveFlag: (key, value) =>
+      bindings.invoke<void>("save_laya_settings", { flags: { [key]: value }, routing: null }),
     onLayaEvent: (handler) =>
       bindings.listen<LayaEvent>(LAYA_EVENT_CHANNEL, (event) => handler(event.payload)),
     routingStatus: () => bindings.invoke<RoutingStatusWire>("routing_settings_status"),
-    saveRoutingSettings: (settings) =>
-      bindings.invoke<RoutingStatusWire>("save_routing_settings", { settings }),
-    runRoutingEval: () => bindings.invoke<RoutingEvalWire>("run_routing_eval"),
+    checkLaya: () => bindings.invoke<void>("laya_check_start"),
     topControl: () => bindings.invoke<TiersTopControl>("tiers_top_control_status"),
     saveTopControl: (choice) =>
       bindings.invoke<TiersTopControl>("save_tiers_top_control", { choice }),
@@ -345,7 +236,6 @@ export interface DispatchRoutingSettings {
   fallback_tier: string;
   nudges: boolean;
   min_words: number;
-  effort: Record<string, string>;
 }
 
 /** The dispatch routing log summarised (`routing_log_summary`). */
@@ -361,7 +251,7 @@ export interface RoutingLogSummary {
   eval_date: string | null;
 }
 
-/** The last eval's suggestion, from `<training_dir>/route_eval.json`. */
+/** The last Laya check's record, from `<training_dir>/route_eval.json`. */
 export interface EvalRecord {
   date: string;
   min_confidence_4: number | null;
@@ -369,41 +259,9 @@ export interface EvalRecord {
   min_confidence_2: number | null;
   routed_share: number | null;
   accuracy: number | null;
-}
-
-/** One row of the eval's threshold sweep. */
-export interface EvalThresholdRow {
-  threshold: number;
-  routed: number;
-  correct: number;
-  routed_share: number;
-  accuracy: number;
-}
-
-/** One case the eval's default gate gets wrong. */
-export interface EvalMiss {
-  text: string;
-  expected: string | null;
-  got: string | null;
-  confidence: number | null;
-}
-
-/** One offered-label count's eval report. */
-export interface EvalReport {
-  labels: number;
-  default_gate: number;
-  table: EvalThresholdRow[];
-  suggested: number | null;
-  misses: EvalMiss[];
-}
-
-/** The `run_routing_eval` result: every offered-label count's run and the
- * record written. */
-export interface RoutingEvalWire {
-  four: EvalReport;
-  three: EvalReport;
-  two: EvalReport;
-  record: EvalRecord;
+  /** The inputs the check ran against (test set + checkpoint); a different
+   * one means the record is stale and the check runs again. */
+  fingerprint?: string | null;
 }
 
 /** The routing settings snapshot the page renders. */
@@ -416,21 +274,17 @@ export interface RoutingStatusWire {
 /** The labelled-decision count `suggest`/`auto` unlock at (design §4.8). */
 export const MODE_UNLOCK_DECISIONS = 30;
 
-/** The tiers a dispatch can run on, easiest first — the pickable four.
- * `escalate` is not one: Laya is never offered it, so it is never a
- * fallback either (design §3.2). */
-export const DISPATCH_TIERS: readonly string[] = ["trivial", "routine", "medium", "high"];
-
 /** Shadow-mode decisions so far. */
 export function shadowDecisions(summary: RoutingLogSummary): number {
   return summary.decisions_by_mode.shadow ?? 0;
 }
 
 /**
- * Whether a mode may be selected: `off`/`shadow` always; `suggest` once at
- * least [`MODE_UNLOCK_DECISIONS`] shadow decisions exist; `auto` once at
- * least that many decisions carry an outcome label. A locked mode is
- * reachable through the page's force link, behind a confirm.
+ * Whether a mode is past its unlock count: `off`/`shadow` always;
+ * `suggest` once at least [`MODE_UNLOCK_DECISIONS`] shadow decisions
+ * exist; `auto` once at least that many decisions carry an outcome
+ * label. A below-count mode is still pickable — its card shows a hint
+ * about what it is waiting for.
  */
 export function modeAvailable(mode: RoutingModeName, summary: RoutingLogSummary): boolean {
   switch (mode) {
@@ -444,7 +298,7 @@ export function modeAvailable(mode: RoutingModeName, summary: RoutingLogSummary)
   }
 }
 
-/** Why a mode is locked, for the force link's confirm text. */
+/** Why a mode is below its unlock count, for its card's hint. */
 export function modeUnlockText(mode: RoutingModeName, summary: RoutingLogSummary): string {
   if (mode === "suggest") {
     return `${shadowDecisions(summary)} of ${MODE_UNLOCK_DECISIONS} shadow decisions`;
@@ -457,25 +311,13 @@ export function shareText(share: number | null): string {
   return share === null ? "—" : `${Math.round(share * 100)}%`;
 }
 
-/** The gates' provenance line: the eval's date, or the provisional warning. */
-export function evalDateText(record: EvalRecord | null): string {
-  return record === null ? "provisional defaults, no eval yet" : `eval ${record.date}`;
+/** The one-line summary of the last check — or the promise of the first. */
+export function checkSummaryText(record: EvalRecord | null): string {
+  if (record === null) return "Not checked yet. Laya checks itself when a project opens.";
+  return `Last checked ${record.date}: confident on ${shareText(record.routed_share)} of test tasks, ${shareText(record.accuracy)} of those right.`;
 }
 
-// ── Leaving with unsaved edits ────────────────────────────────────────────────
-
-/**
- * Whether a captured DOM event is the user leaving the Tiers page: an
- * Escape keypress (the settings dialog closes on it) or a click on a button
- * outside the page's own subtree — the settings rail or the dialog's close
- * button and backdrop. The page asks for a confirm before either one drops
- * unsaved dispatch edits; every click inside the page keeps its own meaning.
- */
-export function leavesPage(event: Event, root: HTMLElement | null): boolean {
-  if (event instanceof KeyboardEvent) return event.key === "Escape";
-  if (event.type !== "click") return false;
-  const target = event.target;
-  if (!(target instanceof Element)) return false;
-  if (root !== null && root.contains(target)) return false;
-  return target.closest("button") !== null;
+/** True when the check says Laya will leave most choices to the lead. */
+export function lowCoverage(record: EvalRecord | null): boolean {
+  return record !== null && record.routed_share !== null && record.routed_share < 0.2;
 }

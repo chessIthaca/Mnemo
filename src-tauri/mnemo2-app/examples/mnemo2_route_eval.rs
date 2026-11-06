@@ -17,15 +17,15 @@
 //! loopback port and persists nothing, so a separate process cannot discover
 //! it.
 //!
-//! Run with `cargo run -p mnemo-app --features mnemo2 --bin mnemo2_route_eval
-//! -- --laya-url http://127.0.0.1:PORT`.
+//! Run with `cargo run -p mnemo2-app --example mnemo2_route_eval --
+//! --laya-url http://127.0.0.1:PORT`.
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use mnemo::route_question::OfferedLabels;
+use mnemo::OfferedLabels;
 use mnemo::memory::classifier::{ClassifierStatus, LayaClassifier};
 
 use mnemo_app::mnemo2::dispatch_routing::{self, DispatchRoutingRow};

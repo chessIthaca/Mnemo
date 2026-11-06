@@ -16,6 +16,7 @@
     type McpTransport,
   } from "../lib/mcpSettings";
   import { errorText } from "../lib/settingsState";
+  import { trackUnsaved } from "../lib/unsavedEdits";
 
   /**
    * The MCP servers settings page: the global and the open project's
@@ -59,6 +60,7 @@
   let testError = $state("");
 
   const dirty = $derived(serversKey(servers) !== serversKey(original));
+  trackUnsaved(() => dirty || formOpen);
 
   /** A server copy whose lists and maps the editor may change freely. */
   function cloneServer(server: McpServer): McpServer {

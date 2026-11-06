@@ -1,96 +1,93 @@
+<script module lang="ts">
+  /**
+   * Half-typed replies, kept per worker id: switching tabs or workers unmounts
+   * the thread, and the draft must survive that instead of dying with it.
+   */
+  const drafts = new Map<string, string>();
+</script>
+
 <script lang="ts">
-  import { Send } from "@lucide/svelte";
   import { onMount } from "svelte";
   import { actions } from "../lib/store";
   import { turnStartTimes } from "../lib/elapsed";
+  import { createStickToBottom } from "../lib/stickToBottom";
+  import { workerBox } from "../lib/workerComposer";
   import { workerPhaseLabel } from "../lib/workerActivity";
   import type { Worker } from "../lib/types";
   import ActivityStatus from "./ActivityStatus.svelte";
   import Collapsible from "./Collapsible.svelte";
+  import ComposerBox from "./ComposerBox.svelte";
   import Markdown from "./Markdown.svelte";
   import ToolActivity from "./ToolActivity.svelte";
 
   /**
    * A worker's live conversation — streamed messages and tool calls, screenshot
-   * links, and the private reply box. In `compact` mode (the lead-side worker
-   * panel) the messages scroll on their own and follow the stream while the
-   * reader stays near the bottom; scrolling up to read pauses the follow.
+   * links, and the shared message box. Every view scrolls the messages on their
+   * own and follows the stream while the reader stays near the bottom; scrolling
+   * up to read pauses the follow, and the box stays pinned below. `compact` (the
+   * lead-side worker panel) only drops the duplicate failure block and tightens
+   * the composer's margin.
    */
   let { worker, compact = false }: { worker: Worker; compact?: boolean } = $props();
 
   /** Each tool call's turn start: its card shows how long the turn has run. */
   const turnStarts = $derived(turnStartTimes(worker.messages));
 
-  /** The reader counts as "at the bottom" within this many pixels (same rule as LeadChat). */
-  const STICK_TO_BOTTOM_PX = 48;
+  /** What this worker's box offers now: steer it, message it, or why it can't. */
+  const box = $derived(workerBox(worker));
 
   let reply = $state("");
+  let sending = $state(false);
   let lastWorkerId = "";
   let scroller = $state<HTMLDivElement | null>(null);
   let stream = $state<HTMLDivElement | null>(null);
-  let nearBottom = true;
-  let scrollFrame: number | null = null;
-  let resizeObserver: ResizeObserver | null = null;
+  const follow = createStickToBottom(() => scroller);
 
   $effect(() => {
     const id = worker.id;
     if (id === lastWorkerId) return;
     lastWorkerId = id;
-    reply = "";
-    nearBottom = true;
+    reply = drafts.get(id) ?? "";
+    follow.reset();
   });
 
   onMount(() => {
-    if (!compact) return;
-    if (typeof ResizeObserver !== "undefined") {
-      resizeObserver = new ResizeObserver(() => scheduleScroll());
-      if (stream) resizeObserver.observe(stream);
-    }
-    scheduleScroll();
-    return () => {
-      resizeObserver?.disconnect();
-      resizeObserver = null;
-      if (scrollFrame !== null) {
-        cancelAnimationFrame(scrollFrame);
-        scrollFrame = null;
-      }
-    };
+    follow.schedule();
+    return () => follow.dispose();
   });
 
   // Follow the stream while the reader is near the bottom; the live status
   // row ends the stream, so its changes count as stream growth too.
   $effect(() => {
-    if (!compact) return;
     worker.messages.length;
     worker.activity?.phase;
-    scheduleScroll();
+    follow.schedule();
   });
 
-  function handleScroll() {
-    if (!scroller) return;
-    const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-    nearBottom = distance <= STICK_TO_BOTTOM_PX;
+  // Content that grows between frames (streamed markdown, a tool card) resizes
+  // the stream; follow it while the reader is still at the bottom.
+  $effect(() => {
+    if (stream) return follow.observe(stream);
+  });
+
+  function setReply(text: string) {
+    reply = text;
+    if (text) drafts.set(worker.id, text);
+    else drafts.delete(worker.id);
   }
 
-  function scheduleScroll() {
-    if (!scroller || scrollFrame !== null) return;
-    scrollFrame = requestAnimationFrame(() => {
-      scrollFrame = null;
-      if (!scroller || !nearBottom) return;
-      scroller.scrollTop = scroller.scrollHeight;
-    });
-  }
-
-  function sendReply() {
-    if (!reply.trim()) return;
-    actions.replyWorker(worker.id, reply);
-    reply = "";
-  }
-
-  function replyKeydown(event: KeyboardEvent) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      sendReply();
+  async function sendReply() {
+    const text = reply;
+    const id = worker.id;
+    if (!box.canSend || sending || !text.trim()) return;
+    sending = true;
+    try {
+      // A refused message keeps its text: the box clears only once accepted.
+      if (!(await actions.replyWorker(id, text))) return;
+      if (drafts.get(id) === text) drafts.delete(id);
+      if (id === worker.id && reply === text) reply = "";
+    } finally {
+      sending = false;
     }
   }
 </script>
@@ -138,13 +135,9 @@
 {/snippet}
 
 <section class="thread-panel" class:compact aria-label={`${worker.name} worker conversation`}>
-  {#if compact}
-    <div class="thread-messages" bind:this={scroller} onscroll={handleScroll}>
-      <div class="thread-stream" bind:this={stream}>{@render threadMessages()}</div>
-    </div>
-  {:else}
-    <div class="thread-messages">{@render threadMessages()}</div>
-  {/if}
+  <div class="thread-messages" bind:this={scroller} onscroll={follow.onScroll}>
+    <div class="thread-stream" bind:this={stream}>{@render threadMessages()}</div>
+  </div>
   {#if worker.screenshots.length > 0}
     <div class="screenshot-links" aria-label="Worker screenshots">
       <span>SCREENSHOTS</span>
@@ -155,10 +148,31 @@
       </div>
     </div>
   {/if}
-  <div class="thread-composer">
-    <textarea bind:value={reply} onkeydown={replyKeydown} rows="2" aria-label={`Reply to ${worker.name}`} placeholder={`Message ${worker.name}`} disabled={worker.status === "cancelled"}></textarea>
-    <button class="icon-button" aria-label={`Send reply to ${worker.name}`} disabled={!reply.trim() || worker.status === "cancelled"} onclick={sendReply}><Send size={14} /></button>
-  </div>
+  <form
+    class="thread-composer"
+    onsubmit={(event) => {
+      event.preventDefault();
+      void sendReply();
+    }}
+  >
+    <ComposerBox
+      value={box.mode === "done" ? "" : reply}
+      label={`Reply to ${worker.name}`}
+      placeholder={box.placeholder}
+      disabled={!box.canSend}
+      send={{ ariaLabel: box.sendLabel, enabled: box.canSend && !sending && reply.trim() !== "" }}
+      stop={box.canPause
+        ? {
+            ariaLabel: `Pause ${worker.name}`,
+            text: "Pause",
+            busy: false,
+            onclick: () => actions.pauseWorker(worker.id),
+          }
+        : null}
+      oninput={setReply}
+      onsubmit={() => void sendReply()}
+    />
+  </form>
 </section>
 
 <style>
@@ -181,15 +195,17 @@
   .thread-error-note { margin-top: 12px; padding: 8px 10px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--muted); font-size: var(--text-body); }
   .thread-model-note { margin-top: 12px; padding: 8px 10px; border: 1px dashed var(--line-strong); border-radius: 4px 12px 12px 12px; color: var(--muted); font-size: var(--text-body); }
   .thread-activity { margin-top: 12px; }
-  .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
+  .screenshot-links { display: grid; flex: 0 0 auto; gap: 7px; margin-top: 16px; }
   .screenshot-links > span { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .screenshot-links > div { display: flex; flex-wrap: wrap; gap: 6px; }
-  .thread-composer { display: flex; align-items: flex-end; gap: 8px; margin-top: 16px; padding: 9px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); }
-  .thread-composer textarea { flex: 1; resize: none; border: 0; outline: 0; color: var(--ink); font-size: var(--text-body); }
+  .thread-composer { flex: 0 0 auto; margin-top: 16px; }
 
-  /* Compact: the panel body scrolls the messages alone so the reply box stays put. */
-  .compact { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-  .compact .thread-messages { flex: 1; overflow-y: auto; min-height: 0; }
-  .compact .thread-composer { flex: 0 0 auto; margin-top: 10px; }
+  /* The messages scroll on their own and the box stays pinned below, in every view. */
+  .thread-panel { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; }
+  .thread-messages { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+  /* Compact: the panel body already gives the height and has no padding of its
+     own, so the box keeps its distance from the panel's edges here. */
+  .compact { height: 100%; }
+  .compact .thread-composer { margin: 10px 12px 12px; }
   .thread-stream { min-width: 0; }
 </style>

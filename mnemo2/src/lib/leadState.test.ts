@@ -496,6 +496,23 @@ describe("lead event reducer", () => {
     });
   });
 
+  it("keeps the worker id when the notice's first line carries a turn tag", () => {
+    const entries = leadEntriesFromTranscript({
+      messages: [
+        {
+          role: "user",
+          content:
+            "[TeamManager notice — not the human] worker_id=worker0001 turn=3.2 state=finished\nWorker worker00 finished its turn.\nUse team_status.",
+        },
+      ],
+    });
+    expect(entries[0]).toMatchObject({
+      kind: "team-message",
+      workerId: "worker0001",
+      body: "Worker worker00 finished its turn.\nUse team_status.",
+    });
+  });
+
   it("keeps real tool activity between the text that surrounds it", () => {
     let state = applyLeadEvent(nativeState(3), textEvent(3, "Checking the tree."));
     state = applyLeadEvent(state, {

@@ -8,6 +8,10 @@
 //! with no code index yet is a *first run*: the UI blocks until that first
 //! pass ends. Every later open stays interactive and shows the passes as a
 //! quiet progress indicator.
+//!
+//! The automatic Laya routing check rides the same status as a third pass
+//! (`laya`): it is not an engine pass, but it wants the same progress line.
+//! It never touches `first_run` or the code pass.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -70,6 +74,8 @@ pub struct IndexingSnapshot {
     pub first_run: bool,
     pub code: Option<IndexPass>,
     pub memory: Option<IndexPass>,
+    /// The Laya routing check, started by the app on open (not the engine).
+    pub laya: Option<IndexPass>,
 }
 
 /// Which pass a host event belongs to.
@@ -77,6 +83,7 @@ pub struct IndexingSnapshot {
 pub enum PassKind {
     Code,
     Memory,
+    Laya,
 }
 
 /// Fold one pass event (the `"type"`-tagged wire shape both Mnemo1 streams
@@ -158,6 +165,7 @@ impl IndexingTracker {
             let pass = match kind {
                 PassKind::Code => &mut snapshot.code,
                 PassKind::Memory => &mut snapshot.memory,
+                PassKind::Laya => &mut snapshot.laya,
             };
             *pass = apply_pass_event(pass.take(), event);
         });
@@ -170,6 +178,45 @@ impl IndexingTracker {
             snapshot.first_run = first_run;
             snapshot.code = Some(IndexPass::running());
         });
+    }
+
+    /// Claim the Laya check's pass: `true` when the caller now owns the check,
+    /// `false` when one is already running. The check and the claim share one
+    /// lock, so two callers can never both start a check.
+    pub fn begin_laya(&self) -> bool {
+        let next = {
+            let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            let running = matches!(
+                snapshot.laya,
+                Some(IndexPass {
+                    state: PassState::Running,
+                    ..
+                })
+            );
+            if running {
+                return false;
+            }
+            // A pass that was not running always differs from the fresh one,
+            // so the change is guaranteed and only this revision is bumped.
+            snapshot.laya = Some(IndexPass::running());
+            snapshot.revision += 1;
+            snapshot.clone()
+        };
+        let _ = self.events.send(next);
+        true
+    }
+
+    /// Forget the Laya check's pass (a check that left nothing to show).
+    pub fn clear_laya(&self) {
+        self.update(|snapshot| snapshot.laya = None);
+    }
+
+    /// Track a task so [`stop`](Self::stop) aborts it with the rest.
+    pub fn add_task(&self, task: JoinHandle<()>) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(task);
     }
 
     fn code_running(&self) -> bool {
@@ -318,5 +365,55 @@ mod tests {
             &json!({"type": "done", "summary": "in sync"}),
         );
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn begin_laya_is_single_flight() {
+        let tracker = IndexingTracker::new();
+        assert!(tracker.begin_laya());
+        assert!(!tracker.begin_laya(), "a running check is not started twice");
+        assert_eq!(
+            tracker.snapshot().laya.map(|pass| pass.state),
+            Some(PassState::Running)
+        );
+        tracker.apply(PassKind::Laya, &json!({"type": "done", "summary": "ok"}));
+        assert!(tracker.begin_laya(), "a finished check can run again");
+    }
+
+    #[test]
+    fn laya_pass_folds_progress_and_done() {
+        let tracker = IndexingTracker::new();
+        assert!(tracker.begin_laya());
+        tracker.apply(
+            PassKind::Laya,
+            &json!({"type": "progress", "done": 3, "total": 9}),
+        );
+        let running = tracker.snapshot().laya.expect("running laya pass");
+        assert_eq!((running.done, running.total), (3, 9));
+        assert_eq!(running.state, PassState::Running);
+        tracker.apply(
+            PassKind::Laya,
+            &json!({"type": "done", "summary": "9 checks"}),
+        );
+        let done = tracker.snapshot().laya.expect("done laya pass");
+        assert_eq!(done.state, PassState::Done);
+        assert_eq!(done.done, 9);
+        assert_eq!(done.detail.as_deref(), Some("9 checks"));
+    }
+
+    #[test]
+    fn a_running_laya_pass_does_not_touch_the_code_pass_or_first_run() {
+        let tracker = IndexingTracker::new();
+        tracker.begin_code_pass(true);
+        tracker.apply(PassKind::Code, &json!({"type": "done", "summary": "12 files"}));
+        let before = tracker.snapshot();
+        assert!(tracker.begin_laya());
+        let after = tracker.snapshot();
+        assert_eq!(after.code, before.code);
+        assert_eq!(after.memory, before.memory);
+        assert_eq!(after.first_run, before.first_run);
+        assert_eq!(after.laya.map(|pass| pass.state), Some(PassState::Running));
+        tracker.clear_laya();
+        assert_eq!(tracker.snapshot().laya, None);
     }
 }

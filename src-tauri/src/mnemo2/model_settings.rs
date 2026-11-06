@@ -12,8 +12,8 @@
 //!   (`planning`, `executing`, `bug_fixing`, `reviewing`, `summarize`),
 //!   `general.vision_model`, and the code-indexing (bundled embedding)
 //!   model with its catalog, install surface and status.
-//! - **Savings page** — the `[general.optimizer]` levers + knobs, the
-//!   per-model `[[pricing]]` table, and the `[general.budget]` caps.
+//! - **Savings page** — the `[general.optimizer]` levers + knobs and the
+//!   `[general.budget]` caps.
 //!
 //! No config logic is forked: reads go through [`mnemo::config::Config`]
 //! and the shared embedding catalog; every write rides the one
@@ -27,7 +27,7 @@
 //! `[tiers]` table of `endpoints.toml` rides through untouched.
 //!
 //! **When a save takes effect** — `[models]`, `vision_model`,
-//! `optimizer`, `budget` and `pricing` are read when the engine is
+//! `optimizer` and `budget` are read when the engine is
 //! built, so they apply after the project is reopened (or the lead
 //! restarted); on an OPEN lead the pipeline additionally re-applies
 //! what it can live (vision client, embedder, model resolver — the
@@ -42,7 +42,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
 use mnemo::config::settings_dto::{
-    BudgetConfigDto, ModelRefDto, ModelsConfigDto, PricingDto, SettingsSaveDto, VisionModelDto,
+    BudgetConfigDto, ModelRefDto, ModelsConfigDto, SettingsSaveDto, VisionModelDto,
     deserialize_optional_nullable,
 };
 use mnemo::config::{Config, ModelRef, EMBEDDING_MODEL_SENTINEL_HASH};
@@ -72,8 +72,6 @@ pub struct ModelSettingsWire {
     pub embedding: EmbeddingWire,
     /// The token-optimizer levers + knobs (`[general.optimizer]`).
     pub optimizer: OptimizerWire,
-    /// The per-model pricing table (`[[pricing]]`, `$` per 1M tokens).
-    pub pricing: Vec<PricingWire>,
     /// The deterministic budget caps (`[general.budget]`).
     pub budget: BudgetWire,
 }
@@ -158,20 +156,6 @@ pub struct OptimizerWire {
     pub compress_extra_commands: Vec<String>,
 }
 
-/// One per-model pricing row (`[[pricing]]`, `$` per 1M tokens) — the
-/// numbers the Cost tab's dollar figures are computed from.
-#[derive(Debug, Clone, Serialize)]
-pub struct PricingWire {
-    /// The model id this pricing applies to.
-    pub model: String,
-    /// `$` per 1M input (prompt) tokens.
-    pub input_per_1m: f64,
-    /// `$` per 1M output (completion) tokens.
-    pub output_per_1m: f64,
-    /// `$` per 1M cached prompt tokens (the discounted cache rate).
-    pub cached_per_1m: f64,
-}
-
 /// The deterministic budget caps (`[general.budget]`). Every field is
 /// reported explicitly (the config section omits default values on
 /// disk; the page needs the full picture).
@@ -218,16 +202,6 @@ pub(crate) fn model_settings_read(setup: &Setup) -> Result<ModelSettingsWire, St
             nudge_cooldown_requests: general.optimizer.nudge_cooldown_requests,
             compress_extra_commands: general.optimizer.compress_extra_commands.clone(),
         },
-        pricing: config
-            .pricing
-            .iter()
-            .map(|p| PricingWire {
-                model: p.model.clone(),
-                input_per_1m: p.input_per_1m,
-                output_per_1m: p.output_per_1m,
-                cached_per_1m: p.cached_per_1m,
-            })
-            .collect(),
         budget: BudgetWire {
             enabled: general.budget.enabled,
             max_tokens_per_plan: general.budget.max_tokens_per_plan,
@@ -294,7 +268,7 @@ fn embedding_wire(setup: &Setup, config: &Config) -> EmbeddingWire {
 }// ── Save (the `model_settings_save` core) ──────────────────────────────────
 
 /// Apply one page-owned section. `section` is one of `"models"`,
-/// `"vision"`, `"embedding"`, `"optimizer"`, `"pricing"` or `"budget"`
+/// `"vision"`, `"embedding"`, `"optimizer"` or `"budget"`
 /// (anything else rejects); `value` is that section's payload. Every
 /// write rides `Setup::patch_settings` — the shared validate → persist
 /// → live-rewire pipeline — so only the named section changes.
@@ -308,11 +282,10 @@ pub(crate) async fn model_settings_apply(
         "vision" => apply_vision(setup, value).await,
         "embedding" => apply_embedding(setup, value).await,
         "optimizer" => apply_optimizer(setup, value).await,
-        "pricing" => apply_pricing(setup, value).await,
         "budget" => apply_budget(setup, value).await,
         other => Err(format!(
             "unknown model-settings section '{other}' \
-             (expected models, vision, embedding, optimizer, pricing or budget)"
+             (expected models, vision, embedding, optimizer or budget)"
         )),
     }
 }
@@ -480,21 +453,6 @@ async fn apply_optimizer(setup: &Setup, value: Value) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
-/// The `"pricing"` section: the full `[[pricing]]` array (a save
-/// replaces the table; an empty array clears it).
-async fn apply_pricing(setup: &Setup, value: Value) -> Result<(), String> {
-    let rows: Vec<PricingDto> = serde_json::from_value(value)
-        .map_err(|err| format!("invalid pricing section: {err}"))?;
-    let dto = SettingsSaveDto {
-        pricing: Some(rows),
-        ..Default::default()
-    };
-    setup
-        .patch_settings(dto)
-        .await
-        .map_err(|err| err.to_string())
-}
-
 /// The `"budget"` section: a partial caps object; absent fields keep.
 async fn apply_budget(setup: &Setup, value: Value) -> Result<(), String> {
     let caps: BudgetConfigDto = serde_json::from_value(value)
@@ -521,12 +479,12 @@ pub async fn model_settings_get(
 }
 
 /// Save one page-owned section (`"models"`, `"vision"`, `"embedding"`,
-/// `"optimizer"`, `"pricing"` or `"budget"`), writing only that section
+/// `"optimizer"` or `"budget"`), writing only that section
 /// and keeping every other key. The engine reads `[models]`,
-/// `vision_model`, `optimizer`, `budget` and `pricing` at build time, so
+/// `vision_model`, `optimizer` and `budget` at build time, so
 /// those apply after the project is reopened; an open lead additionally
 /// gets the pipeline's live rewire, and the lead/team catalog is
-/// refreshed so the next dispatch sees the new models and prices.
+/// refreshed so the next dispatch sees the new models.
 #[tauri::command]
 pub async fn model_settings_save(
     state: State<'_, Mnemo2State>,
@@ -713,11 +671,6 @@ simple = ["ep1/exec-model"]
         assert!(!wire.optimizer.archive, "the fixture opts lever 3 out");
         assert_eq!(wire.optimizer.archive_min_chars, 1234);
         assert!(wire.optimizer.delta_reads, "untouched levers stay default");
-        assert_eq!(wire.pricing.len(), 1);
-        assert_eq!(wire.pricing[0].model, "plan-model");
-        assert_eq!(wire.pricing[0].input_per_1m, 1.5);
-        assert_eq!(wire.pricing[0].output_per_1m, 2.5);
-        assert_eq!(wire.pricing[0].cached_per_1m, 0.1);
         assert!(wire.budget.enabled);
         assert_eq!(wire.budget.max_tokens_per_plan, 5000);
         assert_eq!(wire.budget.max_escalations_per_plan, 1, "the default fills in");
@@ -923,42 +876,41 @@ simple = ["ep1/exec-model"]
     }
 
     #[tokio::test]
-    async fn save_pricing_replaces_the_table_and_keeps_tiers() {
+    async fn pricing_section_is_refused_and_leaves_the_table_alone() {
         let (dir, setup) = fixture();
-        model_settings_apply(
-            &setup,
-            "pricing",
-            json!([
-                { "model": "exec-model", "input_per_1m": 0.3, "output_per_1m": 0.9, "cached_per_1m": 0.05 },
-                { "model": "other-model", "input_per_1m": 2.0, "output_per_1m": 6.0, "cached_per_1m": 1.0 }
-            ]),
-        )
-        .await
-        .expect("save");
-        let wire = model_settings_read(&setup).expect("read");
-        assert_eq!(wire.pricing.len(), 2);
-        assert_eq!(wire.pricing[0].model, "exec-model");
-        assert_eq!(wire.pricing[0].input_per_1m, 0.3);
-        assert_eq!(wire.pricing[1].model, "other-model");
-        assert_eq!(wire.pricing[1].output_per_1m, 6.0);
-        // The shared validation rejects negative rates…
-        let err = model_settings_apply(
-            &setup,
-            "pricing",
-            json!([{ "model": "m", "input_per_1m": -1.0, "output_per_1m": 1.0, "cached_per_1m": 1.0 }]),
-        )
-        .await
-        .expect_err("negative rate");
-        assert!(err.contains("non-negative rates"), "{err}");
-        // …and the endpoints.toml rewrite carries [tiers] through.
+        let err = model_settings_apply(&setup, "pricing", json!([]))
+            .await
+            .expect_err("pricing is no longer a section");
+        assert!(err.contains("unknown model-settings section"), "{err}");
+        let config = Config::load(dir.path()).expect("reload");
+        let row = config
+            .pricing_for("plan-model")
+            .expect("the fixture row survives");
+        assert_eq!(row.input_per_1m, 1.5);
+    }
+
+    #[tokio::test]
+    async fn other_saves_keep_the_pricing_table_and_the_tier_ladder() {
+        let (dir, setup) = fixture();
+        model_settings_apply(&setup, "budget", json!({ "max_tokens_per_plan": 999 }))
+            .await
+            .expect("save");
+        let config = Config::load(dir.path()).expect("reload");
+        let row = config
+            .pricing_for("plan-model")
+            .expect("the fixture row survives");
+        assert_eq!(row.input_per_1m, 1.5);
+        assert_eq!(row.output_per_1m, 2.5);
+        assert_eq!(row.cached_per_1m, 0.1);
         let tiers = mnemo::config::endpoints::load_tier_ladder(
             &dir.path().join("endpoints.toml"),
             None,
         )
         .unwrap();
-        assert_eq!(tiers.get("routine").unwrap().models, vec!["ep1/exec-model".to_string()]);
-        let config = Config::load(dir.path()).expect("reload");
-        assert_eq!(config.endpoints.len(), 1, "the endpoint survives the rewrite");
+        assert_eq!(
+            tiers.get("routine").unwrap().models,
+            vec!["ep1/exec-model".to_string()]
+        );
     }
 
     #[tokio::test]

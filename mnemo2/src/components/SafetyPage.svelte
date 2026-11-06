@@ -12,6 +12,7 @@
     type SafetyTransport,
   } from "../lib/safetySettings";
   import { errorText } from "../lib/settingsState";
+  import { trackUnsaved } from "../lib/unsavedEdits";
 
   /**
    * The Safety settings page: the four `[general] safety` approval modes
@@ -42,6 +43,7 @@
 
   const modeDirty = $derived(modeDraft !== (snapshot?.mode ?? modeDraft));
   const rulesDirty = $derived(rulesDiffer(rulesDraft, rulesOriginal));
+  trackUnsaved(() => modeDirty || rulesDirty);
   /** The draft selects the no-prompt mode: show the standing warning. */
   const riskySelected = $derived(safetyModeMeta(modeDraft).risky);
 

@@ -32,6 +32,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::mnemo2::ledger::LeadTeamLedger;
+use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
 use crate::mnemo2::team::{BoardSignal, MessageSender, TeamRuntime, TeamRuntimeOptions};
 use crate::mnemo2::trace_view::TraceSupport;
 use crate::mnemo2::usage::event_session;
@@ -889,7 +890,7 @@ impl LeadRuntime {
             return false;
         };
         let was_attached = team.detach_external_lead();
-        let held = team.take_undelivered_notices();
+        let held = team.current_notices(team.take_undelivered_notices()).await;
         if held.is_empty() {
             return was_attached;
         }
@@ -1113,6 +1114,33 @@ impl LeadRuntime {
         }
     }
 
+    /// Run the automatic Laya check (plan 8106337a) on this lead's engine:
+    /// hand [`crate::mnemo2::laya_check::spawn_laya_check`] this runtime's
+    /// indexing tracker (the pass shows on the project's status line),
+    /// the open team (so the gates it applies take effect without a
+    /// restart) and the real record path. Unforced, the check itself
+    /// skips silently when routing is off, Laya is down or the record's
+    /// fingerprint still matches. Never called from `start_engine` or
+    /// `open` — the project-open path in `ipc` owns that trigger, after
+    /// its indexing forwarder exists.
+    pub async fn start_laya_check(&self, force: bool) -> Result<(), String> {
+        let engine = self.engine_handle().await?;
+        let team = self.team_handle().await.ok();
+        let setup = mnemo::headless::Setup::open(Some(self.config_dir.clone()))
+            .map_err(|error| error.to_string())?
+            .for_engine(&engine);
+        crate::mnemo2::laya_check::spawn_laya_check(
+            crate::mnemo2::laya_check::LayaCheck {
+                setup,
+                config_dir: self.config_dir.clone(),
+                team,
+                tracker: self.indexing.clone(),
+                record_path: crate::mnemo2::route_eval::route_eval_path(),
+            },
+            force,
+        )
+    }
+
     async fn spawn_live(
         &self,
         generation: u64,
@@ -1293,7 +1321,7 @@ async fn pump_team_notifications(
         let Ok(worker) = team.worker(&event.worker_id).await else {
             continue;
         };
-        let (key, detail) = match &event.event.event {
+        let (key, detail, state) = match &event.event.event {
             SerializableAgentEvent::HostToolCall {
                 call_id,
                 name,
@@ -1306,6 +1334,7 @@ async fn pump_team_notifications(
                 (
                     format!("{}:{}:message:{call_id}", worker.id, event.generation),
                     format!("{} reports: {text}", worker.name),
+                    None,
                 )
             }
             SerializableAgentEvent::ApprovalRequest { tool_call_id, .. }
@@ -1314,6 +1343,7 @@ async fn pump_team_notifications(
                 (
                     format!("{}:{}:approval:{tool_call_id}", worker.id, event.generation),
                     format!("{} is blocked waiting for an approval.", worker.name),
+                    Some(NoticeState::Blocked),
                 )
             }
             SerializableAgentEvent::UserQuestion { question_id, .. }
@@ -1322,6 +1352,7 @@ async fn pump_team_notifications(
                 (
                     format!("{}:{}:question:{question_id}", worker.id, event.generation),
                     format!("{} is blocked waiting for an answer.", worker.name),
+                    Some(NoticeState::Blocked),
                 )
             }
             SerializableAgentEvent::Parked { .. }
@@ -1339,6 +1370,7 @@ async fn pump_team_notifications(
                             worker.name
                         ),
                     },
+                    Some(NoticeState::Blocked),
                 )
             }
             SerializableAgentEvent::Error {
@@ -1350,9 +1382,12 @@ async fn pump_team_notifications(
                     worker.id, event.generation, worker.last_activity_ms
                 ),
                 format!(
-                    "{} failed: {error}. To retry it on another model, use team_resume with worker_id={} and a `tier` or `model`, then team_message it to continue.",
-                    worker.name, worker.id
+                    "{} failed: {error}.{}\nTo continue on the same model, team_message it. To retry on another model, use team_resume with worker_id={} and a `tier` or `model`, then team_message it to continue.",
+                    worker.name,
+                    crate::mnemo2::team::tool_errors_text(&worker),
+                    worker.id
                 ),
+                Some(NoticeState::Failed),
             ),
             // A turn that ended Completed: with the lead idling on the turn-end
             // Stop, this is what wakes it to review the work. The turn count
@@ -1367,6 +1402,7 @@ async fn pump_team_notifications(
                         worker.id, event.generation, worker.turns
                     ),
                     finished_notice(&worker),
+                    Some(NoticeState::Finished),
                 )
             }
             SerializableAgentEvent::Finished { .. } if worker.kind == "audit" => {
@@ -1381,6 +1417,7 @@ async fn pump_team_notifications(
                         "{} ({}) finished its read-only audit of worker {} at tip {}. Adjudicate the audit: record team_review on {} with independent_reviewer_id='{}' and a written audit_adjudication. Never merge the audit worker itself.",
                         worker.name, worker.id, target, tip, target, worker.id
                     ),
+                    None,
                 )
             }
             _ => continue,
@@ -1388,9 +1425,11 @@ async fn pump_team_notifications(
         if notified.contains(&key) {
             continue;
         }
+        let tag = state.map(|state| TurnTag::of(&worker, event.generation, state).suffix());
         let text = format!(
-            "{TEAM_NOTICE_PREFIX} worker_id={}\n{detail}\nUse team_status with this exact worker_id. Reply with team_message, or use team_stop/team_compact as appropriate. Never infer lifecycle from Git, files, timestamps, or team.json.",
-            worker.id
+            "{TEAM_NOTICE_PREFIX} worker_id={}{}\n{detail}\nUse team_status with this exact worker_id. Reply with team_message, or use team_stop/team_compact as appropriate. Never infer lifecycle from Git, files, timestamps, or team.json.",
+            worker.id,
+            tag.unwrap_or_default(),
         );
         if deliver_lead_notice(&engine, session_id, &team, text).await {
             notified.insert(key);
@@ -1439,7 +1478,7 @@ async fn deliver_lead_notice(
         return true;
     }
     // Notices an earlier external lead never read go first, in one message.
-    let held = team.take_undelivered_notices();
+    let held = team.current_notices(team.take_undelivered_notices()).await;
     if held.is_empty() {
         return send_to_in_app_lead(engine, session_id, team, text).await;
     }
@@ -5116,8 +5155,9 @@ mod tests {
 
         gate_tx.send(()).expect("release the initial turn");
         wait_for_calls(&llm, 2).await;
-        // The first turn can publish Completed before its accumulated steers
-        // finish their follow-up turn, so wait for the actual transcript.
+        // The steered turn end is not the worker's finished turn any more, so
+        // wait for the accumulated steers to reach the transcript instead of a
+        // status flip.
         for _ in 0..100 {
             let record = team.worker(&worker.id).await.expect("worker transcript");
             let all_delivered = expected.iter().all(|(_sender, _label, text, header)| {
@@ -6406,12 +6446,10 @@ mod tests {
         // The audit never merges and is never itself reviewable.
         let merge_audit = team.merge("auditor01").await;
         assert!(merge_audit.is_err(), "an audit worker must never merge");
+        let merge_audit_error = merge_audit.err().unwrap_or_default();
         assert!(
-            merge_audit
-                .err()
-                .unwrap_or_default()
-                .contains("never merged"),
-            "the audit merge refusal names the reviewer"
+            merge_audit_error.contains("never merged"),
+            "the audit merge refusal names the reviewer: {merge_audit_error}"
         );
         let review_audit = team
             .review(
@@ -8098,6 +8136,255 @@ mod tests {
         assert!(delivered, "after the detach the in-app lead gets the notice");
         assert!(team.drain_external_notices().is_empty());
 
+        lead.shutdown().await;
+    }
+
+    /// The failure notice names the worker's actual last tool errors, not just
+    /// the terminal error, so the lead can see what really went wrong.
+    #[tokio::test]
+    async fn the_failure_notice_names_the_tool_errors() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        // Five consecutive failing batches trip the session's doom guard
+        // (agent::MAX_RETRIES, raised 3 → 5); keep this count in sync.
+        let llm = Arc::new(ScriptedLlm::new(
+            (1..=5)
+                .map(|attempt| {
+                    tool_turn("not_a_real_tool", &format!(r#"{{"attempt":{attempt}}}"#))
+                })
+                .collect(),
+        ));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("lead opens");
+        let team = lead.team_handle().await.expect("lead's actual team");
+        team.attach_external_lead();
+        let worker = team
+            .dispatch_with_id(
+                "fail on a bad tool".into(),
+                None,
+                Some("failedwrk1".into()),
+                None,
+            )
+            .await
+            .expect("worker dispatches");
+        let notices = team.wait_external_notices(Duration::from_secs(30)).await;
+        let failure = notices
+            .iter()
+            .find(|notice| notice.contains("failed:"))
+            .unwrap_or_else(|| panic!("the failure notice among {notices:?}"));
+        assert!(failure.contains(&worker.id), "{failure}");
+        assert!(failure.contains("not_a_real_tool"), "{failure}");
+        assert!(
+            failure.contains("unknown tool 'not_a_real_tool'"),
+            "the tool's own error: {failure}"
+        );
+        assert!(failure.contains("team_message"), "{failure}");
+        lead.shutdown().await;
+    }
+
+    /// A steer ends its turn at the next break and drives a follow-up turn, so
+    /// that turn end is not a finished turn: the lead hears "finished its turn"
+    /// exactly once, after the follow-up really ends.
+    #[tokio::test]
+    async fn a_steered_turn_is_not_a_finished_turn() {
+        use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
+        use crate::mnemo2::team::{MessageSender, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let (follow_up_tx, follow_up_rx) = tokio::sync::oneshot::channel();
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["scripted-a"],
+            vec![
+                (Some(gate_rx), text_turn(&["first turn done"])),
+                (Some(follow_up_rx), text_turn(&["follow-up done"])),
+            ],
+        ));
+        let (lead, _) = open_git_team(&root, &config, &state, llm.clone()).await;
+        let team = lead.team_handle().await.expect("lead's actual team");
+        team.attach_external_lead();
+        let mut events = team.subscribe();
+        let worker = team
+            .dispatch_with_id("steer me".into(), None, Some("steerwrk01".into()), None)
+            .await
+            .expect("worker dispatches");
+        wait_for_calls(&llm, 1).await;
+        // Working means the pump has processed the turn's Started: the steer
+        // flag set below cannot be cleared by that first start any more.
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Working).await;
+
+        team.message(
+            &worker.id,
+            "also check the tests".into(),
+            MessageSender::Lead,
+        )
+        .await
+        .expect("the busy worker takes the steer");
+        gate_tx.send(()).expect("release the first turn");
+
+        // The steered turn end reads Working on the bus; only the follow-up's
+        // Finished reads Completed.
+        let mut finished_statuses: Vec<WorkerStatus> = Vec::new();
+        let mut follow_up_started = false;
+        let mut saw_finished = false;
+        let mut follow_up_gate = Some(follow_up_tx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(received) = tokio::time::timeout(remaining, events.recv()).await else {
+                break;
+            };
+            let Ok(event) = received else { continue };
+            if event.worker_id != worker.id {
+                continue;
+            }
+            match &event.event.event {
+                SerializableAgentEvent::Started if saw_finished => follow_up_started = true,
+                SerializableAgentEvent::Finished { .. } => {
+                    let status = team.worker(&worker.id).await.expect("worker record").status;
+                    finished_statuses.push(status);
+                    if saw_finished {
+                        break;
+                    }
+                    saw_finished = true;
+                    // The follow-up turn is gated: release it only once the
+                    // steered turn end has been observed.
+                    if let Some(gate) = follow_up_gate.take() {
+                        gate.send(()).expect("release the follow-up turn");
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            finished_statuses,
+            vec![WorkerStatus::Working, WorkerStatus::Completed],
+            "the steered turn end is not Completed"
+        );
+        assert!(follow_up_started, "the follow-up turn's Started is on the bus");
+
+        let record = team.worker(&worker.id).await.expect("worker record");
+        assert_eq!(record.status, WorkerStatus::Completed);
+        assert_eq!(record.turns, 1, "the steered turn end never counts as a turn");
+
+        let notices = team.wait_external_notices(Duration::from_secs(30)).await;
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("finished its turn"), "{}", notices[0]);
+        let tag = TurnTag::parse(&notices[0]).expect("the notice carries a turn tag");
+        assert_eq!(tag.state, NoticeState::Finished);
+        assert_eq!(tag.turns, 1);
+        assert_eq!(
+            notices[0].lines().next().expect("a first line"),
+            format!(
+                "{TEAM_NOTICE_PREFIX} worker_id={}{}",
+                worker.id,
+                tag.suffix()
+            ),
+            "the tag rides the first line right after the worker id"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// A steer whose follow-up turn never starts still settles the worker as
+    /// Completed within the grace period: it can never hang in Working.
+    #[tokio::test]
+    async fn a_lost_follow_up_still_finishes() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["scripted-a"],
+            vec![(Some(gate_rx), text_turn(&["only turn"]))],
+        ));
+        let (lead, _) = open_git_team(&root, &config, &state, llm.clone()).await;
+        let team = lead.team_handle().await.expect("lead's actual team");
+        team.attach_external_lead();
+        let worker = team
+            .dispatch_with_id("finish alone".into(), None, Some("loststeer1".into()), None)
+            .await
+            .expect("worker dispatches");
+        // The turn is held open; mark the steer wait while the worker runs and
+        // then let the turn end with no steer and no follow-up.
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Working).await;
+        // The pump clears the flag on the turn's `Started`, which may still be
+        // queued: settle first, then set the flag the held turn end will see.
+        team.set_steer_pending_for_test(&worker.id, true).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        team.set_steer_pending_for_test(&worker.id, true).await;
+        gate_tx.send(()).expect("release the only turn");
+
+        let completed = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        assert_eq!(completed.turns, 1);
+        assert_eq!(llm.calls(), 1, "no follow-up turn ever ran");
+        let notices = team.wait_external_notices(Duration::from_secs(5)).await;
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("finished its turn"), "{}", notices[0]);
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    /// A finished notice that is queued but not yet delivered is dropped when
+    /// the worker starts another turn: it no longer describes that worker.
+    #[tokio::test]
+    async fn a_message_to_a_completed_worker_retracts_its_queued_notice() {
+        use crate::mnemo2::team::{MessageSender, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["scripted-a"],
+            vec![
+                (None, text_turn(&["first turn done"])),
+                (Some(gate_rx), text_turn(&["second turn held"])),
+            ],
+        ));
+        let (lead, _) = open_git_team(&root, &config, &state, llm.clone()).await;
+        let team = lead.team_handle().await.expect("lead's actual team");
+        team.attach_external_lead();
+        let worker = team
+            .dispatch_with_id("finish quietly".into(), None, Some("retract001".into()), None)
+            .await
+            .expect("worker dispatches");
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        let mut queued = false;
+        for _ in 0..250 {
+            if !team.peek_external_notices().is_empty() {
+                queued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(queued, "the finished notice is queued and undrained");
+
+        team.message(&worker.id, "another look".into(), MessageSender::Lead)
+            .await
+            .expect("a new turn starts");
+        wait_for_calls(&llm, 2).await;
+
+        let outcome = team.wait_external(Duration::from_millis(150)).await;
+        assert_eq!(
+            outcome.status,
+            crate::mnemo2::team::ExternalWaitStatus::Timeout,
+            "{outcome:?}"
+        );
+        assert!(outcome.notices.is_empty(), "{:?}", outcome.notices);
+
+        gate_tx.send(()).expect("release the held turn");
+        let _ = team.stop(&worker.id).await;
+        team.shutdown().await;
         lead.shutdown().await;
     }
 

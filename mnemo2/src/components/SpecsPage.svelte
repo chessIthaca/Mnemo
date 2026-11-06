@@ -1,6 +1,7 @@
 <script lang="ts">
   import { currentProject } from "../lib/store";
   import { errorText } from "../lib/settingsState";
+  import { trackUnsaved } from "../lib/unsavedEdits";
   import {
     ORIGIN_META,
     artifactDirty,
@@ -90,6 +91,7 @@
     config !== null &&
       (config.context !== contextDraft || JSON.stringify(ruleRows) !== JSON.stringify(ruleRowsOriginal)),
   );
+  trackUnsaved(() => artifactDirtyNow || configDirty);
 
   // ── Plan preview ────────────────────────────────────────────────────
   let previewName = $state("");

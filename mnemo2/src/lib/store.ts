@@ -1872,22 +1872,26 @@ function noteTeamError(error: unknown): void {
   app.update((state) => withToast(state, leadError(error), "error"));
 }
 
-function replyWorker(workerId: string, body: string) {
+/**
+ * Send one message to a worker. Resolves `true` only when the backend accepted
+ * it, so the caller keeps the text when the send is refused.
+ *
+ * `requireTeam` runs before the first await: a missing runtime reports its
+ * toast synchronously, exactly as the previous fire-and-forget call did.
+ */
+async function replyWorker(workerId: string, body: string): Promise<boolean> {
   const message = body.trim();
-  if (!message) return;
+  if (!message) return false;
   const transport = requireTeam();
-  if (!transport) return;
-  void transport
-    .message(workerId, message)
-    .then(() => syncTeam())
-    .catch(noteTeamError);
-}
-
-function steerWorker(workerId: string) {
-  replyWorker(
-    workerId,
-    "Steer: keep the current scope, avoid unrelated edits, and surface any conflict before continuing.",
-  );
+  if (!transport) return false;
+  try {
+    await transport.message(workerId, message);
+  } catch (error) {
+    noteTeamError(error);
+    return false;
+  }
+  void syncTeam().catch(noteTeamError);
+  return true;
 }
 
 function stopWorker(workerId: string) {
@@ -2985,7 +2989,6 @@ export const actions = {
   setLeadModel,
   retryLead,
   replyWorker,
-  steerWorker,
   stopWorker,
   pauseWorker,
   requestDeleteWorkers,

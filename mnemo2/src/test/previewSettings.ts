@@ -6,7 +6,6 @@ import {
   type ModelSettingsSection,
   type ModelSettingsTransport,
   type OptimizerSettings,
-  type PricingRow,
   type TaskModels,
 } from "../lib/modelSettings";
 import {
@@ -111,12 +110,6 @@ function previewSettings(): ModelSettings {
       nudge_cooldown_requests: 4,
       compress_extra_commands: ["cargo test", "npm run build"],
     },
-    pricing: [
-      { model: "glm-4.6-flash", input_per_1m: 0.12, output_per_1m: 0.39, cached_per_1m: 0.012 },
-      { model: "glm-5.3-flash", input_per_1m: 0.25, output_per_1m: 0.88, cached_per_1m: 0.03 },
-      { model: "gpt-5.2", input_per_1m: 1.25, output_per_1m: 10, cached_per_1m: 0.125 },
-      { model: "qwen3-30b-a3b", input_per_1m: 0.05, output_per_1m: 0.2, cached_per_1m: 0 },
-    ],
     budget: { enabled: true, max_tokens_per_plan: 2_000_000, max_escalations_per_plan: 3, max_retries_per_lane: 2 },
   };
 }
@@ -174,9 +167,6 @@ export function createPreviewModelSettingsTransport(): ModelSettingsTransport {
         break;
       case "optimizer":
         settings.optimizer = { ...settings.optimizer, ...(value as Partial<OptimizerSettings>) };
-        break;
-      case "pricing":
-        settings.pricing = value as PricingRow[];
         break;
       case "budget":
         settings.budget = { ...settings.budget, ...(value as Partial<ModelSettings["budget"]>) };

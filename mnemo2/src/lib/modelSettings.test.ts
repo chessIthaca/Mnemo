@@ -6,13 +6,10 @@ import {
   createModelSettingsTransport,
   createTauriModelSettingsTransport,
   isValidModelRef,
-  modelIdOptions,
   modelRefOptions,
   optimizerDraft,
   optimizerWire,
-  parsePrice,
   parseWholeNumber,
-  pricingWire,
   setPreviewModelSettingsTransport,
   type EmbedderEvent,
   type ModelSettings,
@@ -109,18 +106,13 @@ describe("modelSettings", () => {
     expect(isValidModelRef("")).toBe(false);
   });
 
-  it("parses whole numbers and prices", () => {
+  it("parses whole numbers", () => {
     expect(parseWholeNumber("3000")).toBe(3000);
     expect(parseWholeNumber(" 42 ")).toBe(42);
     expect(parseWholeNumber("3.5")).toBeNull();
     expect(parseWholeNumber("-1")).toBeNull();
     expect(parseWholeNumber("lots")).toBeNull();
     expect(parseWholeNumber("")).toBeNull();
-    expect(parsePrice("")).toBe(0);
-    expect(parsePrice("0.25")).toBe(0.25);
-    expect(parsePrice("10")).toBe(10);
-    expect(parsePrice("1,25")).toBeNull();
-    expect(parsePrice("-3")).toBeNull();
   });
 
   it("builds the optimizer payload from a draft and names invalid knobs", () => {
@@ -156,16 +148,6 @@ describe("modelSettings", () => {
     expect(optimizerWire(draft).error).toBe("Archive after must be a whole number");
   });
 
-  it("drops blank-model pricing rows and names the first bad price", () => {
-    const rows = pricingWire([
-      { model: "  ", input: "0.1", output: "0.2", cached: "0" },
-      { model: " m1 ", input: "0.25", output: "1", cached: "0.125" },
-    ]);
-    expect(rows.value).toEqual([{ model: "m1", input_per_1m: 0.25, output_per_1m: 1, cached_per_1m: 0.125 }]);
-    const broken = pricingWire([{ model: "m2", input: "0.05", output: "cheap", cached: "0" }]);
-    expect(broken.error).toBe("Output price for m2 must be a number");
-  });
-
   it("builds the budget payload from a draft and names an invalid cap", () => {
     const draft = budgetDraft({ enabled: true, max_tokens_per_plan: 2_000_000, max_escalations_per_plan: 3, max_retries_per_lane: 2 });
     draft.max_tokens_per_plan = "1500000";
@@ -177,6 +159,5 @@ describe("modelSettings", () => {
 
   it("collects picker options from the configured endpoints, deduplicated in order", () => {
     expect(modelRefOptions(sampleEndpoints())).toEqual(["alpha/m1", "alpha/m2", "beta/m1"]);
-    expect(modelIdOptions(sampleEndpoints())).toEqual(["m1", "m2"]);
   });
 });

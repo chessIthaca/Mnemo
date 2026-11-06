@@ -64,8 +64,9 @@ jobs:
         run: cargo test --workspace
       - name: Build + test Mnemo2 host (feature-enabled)
         run: |
-          cargo build -p mnemo-app --features mnemo2 --bin mnemo2
+          cargo build -p mnemo2-app
           cargo test -p mnemo-app --features mnemo2 --lib
+          cargo test -p mnemo2-app
       - name: Frontend type-check
         run: npx tsc --noEmit
         working-directory: frontend
@@ -78,8 +79,17 @@ jobs:
       - name: Tauri build (unsigned installers)
         run: npx tauri build
       # NOTE: the workspace root is the REPO ROOT (root Cargo.toml declares
-      # [workspace] members = ["src-tauri"]), so all bundles land under
-      # <repo-root>/target/... — not src-tauri/target (review F1).
+      # [workspace] members = ["src-tauri", "src-tauri/mnemo2-app"]), so all
+      # bundles land under <repo-root>/target/... — not src-tauri/target
+      # (review F1). Mnemo2 is its own package (`mnemo2-app`, with its own
+      # tauri.conf.json), so `npx tauri build` run from that directory bundles
+      # only Mnemo2 + its mnemo2-mcp helper into the SAME bundle dirs, under
+      # distinct Mnemo2_* names — the Mnemo build above stays Mnemo-only.
+      - name: Build the Mnemo2 frontend
+        run: npm run build:mnemo2
+      - name: Tauri build Mnemo2 (unsigned installers)
+        run: npx tauri build
+        working-directory: src-tauri/mnemo2-app
       - name: Upload Windows installers
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -150,8 +160,9 @@ jobs:
           if-no-files-found: warn
       - name: Build + test Mnemo2 host (feature-enabled)
         run: |
-          cargo build -p mnemo-app --features mnemo2 --bin mnemo2
+          cargo build -p mnemo2-app
           cargo test -p mnemo-app --features mnemo2 --lib
+          cargo test -p mnemo2-app
       - name: Fail if tests failed
         if: ${{ steps.rust-tests.outcome == 'failure' }}
         run: |
@@ -218,21 +229,43 @@ jobs:
       # here on purpose — see the gated steps.
       - name: Tauri build (.app + .dmg, aarch64)
         run: npx tauri build --target aarch64-apple-darwin
+      # Stage Mnemo's outputs out of target/ immediately: the Mnemo2 build
+      # below runs `npx tauri build` again, which clears
+      # target/aarch64-apple-darwin/release/bundle/dmg before writing its own
+      # dmg — a dmg left in place would be gone by upload time (run
+      # 42071163294 shipped only Mnemo2_2.0.0_aarch64.dmg next to both zips).
+      #
       # upload-artifact@v4 does not preserve file permissions (the Mach-O
       # exec bit) or symlinks, so a raw .app would not launch after download
       # (review F2). ditto preserves both — zip the .app and upload the zip
       # alongside the real distributable (the .dmg).
-      - name: Zip the .app bundle
+      - name: Stage the Mnemo bundles
         run: |
-          ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/*.app mnemo.app.zip
-      # Same root-target layout note as the Windows job (review F1).
+          mkdir -p dist-macos && cp target/aarch64-apple-darwin/release/bundle/dmg/*.dmg dist-macos/ && ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/Mnemo.app dist-macos/mnemo.app.zip
+      # The separate Mnemo2 installer, built from its own package +
+      # tauri.conf.json. It runs after the signing/notarization env exports
+      # (GITHUB_ENV), so tauri signs + notarizes Mnemo2 exactly like Mnemo;
+      # bundles land in the shared
+      # target/aarch64-apple-darwin/release/bundle dirs under Mnemo2_* names.
+      - name: Build the Mnemo2 frontend
+        run: npm run build:mnemo2
+      - name: Tauri build Mnemo2 (.app + .dmg, aarch64)
+        run: npx tauri build --target aarch64-apple-darwin
+        working-directory: src-tauri/mnemo2-app
+      # Mnemo2's dmg and .app.zip join Mnemo's in the staging dir (ditto for
+      # the same reason as above — the exec bit and symlinks survive the
+      # round trip).
+      - name: Stage the Mnemo2 bundles
+        run: |
+          cp target/aarch64-apple-darwin/release/bundle/dmg/Mnemo2_*.dmg dist-macos/ && ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app dist-macos/mnemo2.app.zip
+      # Same root-target layout note as the Windows job (review F1). The
+      # upload ships the staging dir: each app's dmg + .app.zip was copied
+      # there right after its own build, so no later build can clear it.
       - name: Upload macOS bundles
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: macos-bundles-aarch64
-          path: |
-            mnemo.app.zip
-            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          path: dist-macos/*
           if-no-files-found: error
 
   # The second-consumer example's end-to-end run (master-spec §5.9.10 :924 —

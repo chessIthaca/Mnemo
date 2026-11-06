@@ -1,0 +1,42 @@
+[package]
+name = "mnemo2-app"
+version = "2.0.0"
+edition = "2021"
+description = "The Mnemo2 desktop app (lead + team)"
+license = "MIT"
+default-run = "mnemo2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mnemo-app = { path = "..", features = ["mnemo2"] }
+mnemo = { path = "../..", features = ["browser", "embeddings"] }
+tauri = { version = "2", features = ["unstable", "tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dunce = "1.0"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+custom-protocol = ["mnemo-app/custom-protocol"]
+
+[[bin]]
+name = "mnemo2"
+path = "src/main.rs"
+
+# The stdio helper the "mnemo" Claude Code plugin runs: a console binary that
+# bridges MCP to a running Mnemo2 (or starts one) and answers the plugin hooks.
+[[bin]]
+name = "mnemo2-mcp"
+path = "src/mnemo2_mcp.rs"
+
+[[example]]
+name = "mnemo2_route_eval"
+path = "examples/mnemo2_route_eval.rs"
+
+[dev-dependencies]
+tempfile = "3"

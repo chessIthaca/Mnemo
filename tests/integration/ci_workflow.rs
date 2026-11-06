@@ -204,6 +204,252 @@ fn build_workflow_uploads_installers_to_a_draft_release_first() {
     );
 }
 
+/// One job's body from `.github/workflows/build.yml` — the text after its
+/// `  <job>:` header up to the next job key.
+///
+/// A job block runs to the next 2-space job key (job bodies indent 4 spaces
+/// and steps 6), or to EOF for the last job.
+fn job_block(text: &str, job: &str) -> String {
+    let header = format!("\n  {job}:\n");
+    let start = text
+        .find(&header)
+        .unwrap_or_else(|| panic!("build.yml declares a `{job}:` job"))
+        + header.len();
+    text[start..]
+        .lines()
+        // Stop at the next 2-space job key: two leading spaces, but not the
+        // three or more of a body line.
+        .take_while(|line| !line.starts_with("  ") || line.starts_with("   "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Byte offset of the `- name: <name>` step line inside a job block.
+fn step_offset(block: &str, name: &str) -> usize {
+    let header = format!("\n      - name: {name}");
+    block
+        .find(&header)
+        .unwrap_or_else(|| panic!("the job has no `- name: {name}` step"))
+        + 1
+}
+
+/// The text of the step named `name` inside a job block — from its `- name:`
+/// line to the next step (`      - `) or the end of the block.
+fn step_named<'a>(block: &'a str, name: &str) -> &'a str {
+    let start = step_offset(block, name);
+    let tail = &block[start..];
+    match tail.find("\n      - ") {
+        Some(end) => &tail[..end],
+        None => tail,
+    }
+}
+
+/// Both platform jobs must build the separate Mnemo2 installer with
+/// `npx tauri build` run from `src-tauri/mnemo2-app`.
+///
+/// Mnemo2 is its own Cargo package (`mnemo2-app`) with its own
+/// `tauri.conf.json` (productName Mnemo2, identifier com.mnemo.mnemo2). The
+/// Mnemo bundle (`npx tauri build` at the repo root) packages every `[[bin]]`
+/// of `mnemo-app` — the v2.0.0 tag build died on that ("cannot find
+/// target/release/mnemo2_mcp.exe") — so each app is bundled from its own
+/// package, both landing in the shared `<repo>/target/...` bundle directories
+/// under distinct `Mnemo_*` / `Mnemo2_*` names. Without the Mnemo2 step the
+/// release would ship only the Mnemo installer.
+///
+/// The macOS zip step must zip each bundle separately: the pre-split `*.app`
+/// glob matches two bundles now and `ditto` refuses several sources, so both
+/// apps get their own zip and both zips are uploaded.
+#[test]
+fn build_workflow_bundles_both_apps() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
+
+    for job in ["windows", "macos"] {
+        let block = job_block(&text, job);
+
+        // The Mnemo2 bundle: `npx tauri build` with the nested package as its
+        // working directory.
+        let step_dir = block
+            .find("working-directory: src-tauri/mnemo2-app")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the {job} job must build the separate Mnemo2 installer: \
+                     `npx tauri build` with `working-directory: \
+                     src-tauri/mnemo2-app` is missing"
+                )
+            });
+        let step_start = block[..step_dir]
+            .rfind("\n      - name:")
+            .unwrap_or_else(|| {
+                panic!("the {job} job's Mnemo2 working-directory line is not inside a step")
+            });
+        let step_tail = &block[step_start + 1..];
+        let step_end = step_tail.find("\n      - name:").unwrap_or(step_tail.len());
+        let step = &step_tail[..step_end];
+        assert!(
+            step.contains("npx tauri build"),
+            "the {job} job's step with `working-directory: \
+             src-tauri/mnemo2-app` does not run `npx tauri build`: {step}"
+        );
+        assert_eq!(
+            step.contains("--target aarch64-apple-darwin"),
+            job == "macos",
+            "the Mnemo2 bundle step must target aarch64-apple-darwin on macOS \
+             only, mirroring the Mnemo bundle step"
+        );
+        // The frontend dist (target/mnemo2-dist, the nested config's
+        // frontendDist) must be built before the custom-protocol bundle that
+        // embeds it.
+        assert!(
+            block[..step_start].contains("npm run build:mnemo2"),
+            "the {job} job must build the Mnemo2 frontend (`npm run \
+             build:mnemo2`) before bundling it"
+        );
+        // The Mnemo installer must still be built first on the same runner —
+        // only text BEFORE the Mnemo2 step counts (the Mnemo2 step's own run
+        // line must not satisfy the Mnemo check).
+        assert!(
+            block[..step_start].contains("npx tauri build"),
+            "the {job} job runs no Mnemo `npx tauri build` before the Mnemo2 \
+             one — the Mnemo installer is missing"
+        );
+
+        if job == "windows" {
+            // The upload globs must still match both apps' installers: they
+            // share the bundle dirs, distinguished only by the file names.
+            for glob in [
+                "target/release/bundle/msi/*.msi",
+                "target/release/bundle/nsis/*.exe",
+            ] {
+                assert!(
+                    block.contains(glob),
+                    "the windows upload must keep the `{glob}` glob — it \
+                     matches the Mnemo2 installers too (`Mnemo2_*` next to \
+                     `Mnemo_*`)"
+                );
+            }
+        } else {
+            // One zip per .app, each staged into dist-macos/ — ditto keeps the
+            // exec bit and the symlinks upload-artifact drops.
+            for (bundle, zip) in [
+                ("Mnemo.app", "mnemo.app.zip"),
+                ("Mnemo2.app", "mnemo2.app.zip"),
+            ] {
+                assert!(
+                    block.contains(&format!(
+                        "--keepParent \
+                         target/aarch64-apple-darwin/release/bundle/macos/{bundle} \
+                         dist-macos/{zip}"
+                    )),
+                    "the macos job must zip `{bundle}` separately into \
+                     dist-macos/{zip} (ditto with the pre-split `*.app` glob \
+                     now matches two bundles and refuses several sources)"
+                );
+            }
+            let upload = step_named(&block, "Upload macOS bundles");
+            assert!(
+                upload.lines().any(|line| line.trim() == "path: dist-macos/*"),
+                "the macos upload must ship `dist-macos/*` — it holds both \
+                 apps' zips and dmgs: {upload}"
+            );
+        }
+    }
+}
+
+/// The macOS job must stage each app's `.dmg` into `dist-macos/` right after
+/// that app's own `npx tauri build`, and upload `dist-macos/*`.
+///
+/// `tauri build` clears `target/aarch64-apple-darwin/release/bundle/dmg/`
+/// while bundling, so the second build (Mnemo2) deletes the first build's
+/// (Mnemo's) dmg. Run 42071163294 went green while the
+/// `macos-bundles-aarch64` artifact held `mnemo.app.zip`, `mnemo2.app.zip`
+/// and ONLY `Mnemo2_2.0.0_aarch64.dmg` — the release would ship no Mnemo dmg.
+/// Staging each app's outputs at the point of creation makes their survival
+/// independent of any later build.
+#[test]
+fn build_workflow_stages_each_macos_dmg() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
+    let job = job_block(&text, "macos");
+
+    // Each dmg is copied out before the next build can clear the bundle dir.
+    let order = [
+        "Tauri build (.app + .dmg, aarch64)",
+        "Stage the Mnemo bundles",
+        "Tauri build Mnemo2 (.app + .dmg, aarch64)",
+        "Stage the Mnemo2 bundles",
+        "Upload macOS bundles",
+    ];
+    let offsets: Vec<(&str, usize)> = order
+        .iter()
+        .map(|name| (*name, step_offset(&job, name)))
+        .collect();
+    for pair in offsets.windows(2) {
+        assert!(
+            pair[0].1 < pair[1].1,
+            "the macos job must run `{}` BEFORE `{}` — a dmg staged only after \
+             the next tauri build has already been overwritten by it",
+            pair[0].0,
+            pair[1].0
+        );
+    }
+
+    // Each staging step copies ITS app's dmg out of the shared target dir and
+    // zips that app's bundle next to it.
+    let mnemo = step_named(&job, "Stage the Mnemo bundles");
+    assert!(
+        mnemo.contains("cp target/aarch64-apple-darwin/release/bundle/dmg/*.dmg dist-macos/"),
+        "the Mnemo staging step must copy the Mnemo dmg (`*.dmg` — it is the \
+         only dmg in target/ at that point) into dist-macos/: {mnemo}"
+    );
+    assert!(
+        mnemo.contains(
+            "ditto -c -k --keepParent \
+             target/aarch64-apple-darwin/release/bundle/macos/Mnemo.app \
+             dist-macos/mnemo.app.zip"
+        ),
+        "the Mnemo staging step must zip Mnemo.app into dist-macos/: {mnemo}"
+    );
+    let mnemo2 = step_named(&job, "Stage the Mnemo2 bundles");
+    assert!(
+        mnemo2.contains("cp target/aarch64-apple-darwin/release/bundle/dmg/Mnemo2_*.dmg dist-macos/"),
+        "the Mnemo2 staging step must copy `Mnemo2_*.dmg` into dist-macos/: {mnemo2}"
+    );
+    assert!(
+        mnemo2.contains(
+            "ditto -c -k --keepParent \
+             target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app \
+             dist-macos/mnemo2.app.zip"
+        ),
+        "the Mnemo2 staging step must zip Mnemo2.app into dist-macos/: {mnemo2}"
+    );
+
+    // The upload ships the staging dir — and no longer reads the dmg out of
+    // target/, where the later build's cleanup makes the file list a race.
+    let upload = step_named(&job, "Upload macOS bundles");
+    assert!(
+        upload.lines().any(|line| line.trim() == "path: dist-macos/*"),
+        "the macos upload must ship `dist-macos/*` (both apps' dmg and \
+         .app.zip): {upload}"
+    );
+    assert!(
+        !upload.contains("release/bundle/dmg"),
+        "the macos upload must not read the dmg straight out of target/ — the \
+         Mnemo2 build clears that directory: {upload}"
+    );
+    assert!(
+        upload.contains("if-no-files-found: error"),
+        "the macos upload must keep failing the job on an empty staging dir: \
+         {upload}"
+    );
+}
+
 /// Every `uses:` in this repo's workflows must be pinned to a full 40-hex
 /// commit SHA, with the human version in a trailing `# vN` comment so
 /// Dependabot can keep it current.

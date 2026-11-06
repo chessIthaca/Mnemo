@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { ArrowUpRight, ClipboardCheck, MessageSquareText } from "@lucide/svelte";
   import { actions, app } from "../lib/store";
+  import { createStickToBottom } from "../lib/stickToBottom";
   import { turnStartTimes } from "../lib/elapsed";
   import { workerStatusText } from "../lib/types";
   import { selectNeedsYouWorkers, selectRunningWorkers } from "../lib/workerSelection";
@@ -14,7 +15,6 @@
   import ToolActivity from "./ToolActivity.svelte";
   import ActivityStatus from "./ActivityStatus.svelte";
 
-  const STICK_TO_BOTTOM_PX = 48;
   const runningTool = $derived.by(() => {
     const turnStartedAtMs = $app.leadRuntime.turnStartedAtMs;
     return $app.leadEntries.some((entry) =>
@@ -60,30 +60,17 @@
 
   let scroller = $state<HTMLDivElement>();
   let content = $state<HTMLDivElement>();
-  let nearBottom = true;
-  let scrollFrame: number | null = null;
-  let resizeObserver: ResizeObserver | null = null;
+  const follow = createStickToBottom(() => scroller);
 
   onMount(() => {
-    if (typeof ResizeObserver !== "undefined") {
-      resizeObserver = new ResizeObserver(() => scheduleScroll());
-      if (content) resizeObserver.observe(content);
-    }
-    scheduleScroll();
-    return () => {
-      resizeObserver?.disconnect();
-      resizeObserver = null;
-      if (scrollFrame !== null) {
-        cancelAnimationFrame(scrollFrame);
-        scrollFrame = null;
-      }
-    };
+    follow.schedule();
+    return () => follow.dispose();
   });
 
   $effect(() => {
     $app.leadEntries.length;
     $app.leadRuntime.pending;
-    scheduleScroll();
+    follow.schedule();
   });
 
   // The external-lead panel unmounts the transcript, so re-observe the
@@ -92,27 +79,8 @@
     if (showExternalPanel) return;
     const stream = content;
     if (!stream) return;
-    resizeObserver?.observe(stream);
-    scheduleScroll();
-    return () => {
-      resizeObserver?.unobserve(stream);
-    };
+    return follow.observe(stream);
   });
-
-  function handleScroll() {
-    if (!scroller) return;
-    const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-    nearBottom = distance <= STICK_TO_BOTTOM_PX;
-  }
-
-  function scheduleScroll() {
-    if (!scroller || scrollFrame !== null) return;
-    scrollFrame = requestAnimationFrame(() => {
-      scrollFrame = null;
-      if (!scroller || !nearBottom) return;
-      scroller.scrollTop = scroller.scrollHeight;
-    });
-  }
 </script>
 
 <section class="lead-workspace" aria-label="Lead conversation">
@@ -125,7 +93,7 @@
         <button type="button" onclick={() => (externalRevealed = false)}>Back</button>
       </div>
     {/if}
-  <div class="lead-scroll" bind:this={scroller} onscroll={handleScroll}>
+  <div class="lead-scroll" bind:this={scroller} onscroll={follow.onScroll}>
     <div class="lead-content">
       <div class="lead-stream" bind:this={content}>
       <div class="lead-entries">

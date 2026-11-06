@@ -88,12 +88,12 @@ impl Default for TierLadder {
                 Tier::new(
                     "routine",
                     "Routine",
-                    "Implement a specified function, add tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.",
+                    "Work with a complete spec, even across several files: implement a specified function, add tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.",
                 ),
                 Tier::new(
                     "medium",
                     "Medium",
-                    "A normal multi-file change with a clear spec: a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.",
+                    "A multi-file change where the spec leaves choices to the worker: a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.",
                 ),
                 Tier::new(
                     "high",
@@ -2510,12 +2510,12 @@ mod default_tier_text_tests {
             (
                 "routine",
                 "Routine",
-                "Implement a specified function, add tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.",
+                "Work with a complete spec, even across several files: implement a specified function, add tests for existing code, wire an existing API into a new caller, a UI component from a spec, a schema or DTO field, follow an existing pattern, refactor inside one module.",
             ),
             (
                 "medium",
                 "Medium",
-                "A normal multi-file change with a clear spec: a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.",
+                "A multi-file change where the spec leaves choices to the worker: a feature across a few modules, an endpoint with its tests and UI, a migration of call sites, a non-trivial refactor.",
             ),
             (
                 "high",

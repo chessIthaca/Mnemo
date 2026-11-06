@@ -296,7 +296,7 @@ impl LayaManager {
     }
 
     /// Substitute the server launcher in process-tree regression tests.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     fn with_serve_command(mut self, program: PathBuf, args: Vec<String>) -> Self {
         self.serve_override = Some((program, args));
         self

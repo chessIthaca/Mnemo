@@ -1093,12 +1093,154 @@
       "sections": {}
     },
     {
+      "id": "d283d36f",
+      "status": "closed",
+      "created_at_ms": 1793880917783,
+      "closed_at_ms": 1793909237320,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d283d36f-20261105-200717.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "28b17cf6",
+      "status": "closed",
+      "created_at_ms": 1793882555321,
+      "closed_at_ms": 1793909236572,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-28b17cf6-20261105-200716.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "1317e31a",
+      "status": "closed",
+      "created_at_ms": 1793884778692,
+      "closed_at_ms": 1793909235804,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1317e31a-20261105-200715.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "aa7e9ea2",
+      "status": "closed",
+      "created_at_ms": 1793887750163,
+      "closed_at_ms": 1793909235045,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-aa7e9ea2-20261105-200715.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "49695fec",
+      "status": "closed",
+      "created_at_ms": 1793892515725,
+      "closed_at_ms": 1793909240638,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-49695fec-20261105-200720.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "a41d142b",
+      "status": "closed",
+      "created_at_ms": 1793897787576,
+      "closed_at_ms": 1793909234279,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-a41d142b-20261105-200714.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "205f989a",
+      "status": "closed",
+      "created_at_ms": 1793902452642,
+      "closed_at_ms": 1793909233392,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-205f989a-20261105-200713.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "0d8a1112",
+      "status": "closed",
+      "created_at_ms": 1793907326435,
+      "closed_at_ms": 1793909232528,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-0d8a1112-20261105-200712.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
       "id": "e76ff094",
       "status": "closed",
       "created_at_ms": 1793909772982,
       "closed_at_ms": 1793910121650,
       "report_path": "C:\\mnemo\\.coding\\reviews\\team-e76ff094-20261105-202201.md",
       "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "5aac2023",
+      "status": "closed",
+      "created_at_ms": 1793910315740,
+      "closed_at_ms": 1793914233366,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5aac2023-20261105-213033.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Leaving with unsaved edits asks first",
+              "text": "The settings dialog SHALL ask for confirmation before closing or switching pages while any page holds unsaved edits, and SHALL close or switch without asking when none does.",
+              "scenarios": [
+                {
+                  "name": "Close with unsaved edits",
+                  "when": [
+                    "a settings page has an unsaved edit",
+                    "the user presses the close button, Escape or the backdrop"
+                  ],
+                  "then": [
+                    "the dialog stays open and asks to discard unsaved changes"
+                  ],
+                  "and": [
+                    "Keep editing keeps the edit",
+                    "Discard changes closes the dialog"
+                  ]
+                },
+                {
+                  "name": "Switch page with unsaved edits",
+                  "when": [
+                    "a settings page has an unsaved edit",
+                    "the user picks another page in the rail"
+                  ],
+                  "then": [
+                    "the page does not change until the user chooses Discard changes"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "No unsaved edits",
+                  "when": [
+                    "no settings page has an unsaved edit",
+                    "the user closes the dialog"
+                  ],
+                  "then": [
+                    "the dialog closes at once"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
       "schema": "spec-driven@1",
       "sections": {}
     },
@@ -1180,6 +1322,43 @@
       "closed_at_ms": null,
       "report_path": null,
       "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "9adee90a",
+      "status": "closed",
+      "created_at_ms": 1793918863295,
+      "closed_at_ms": 1793919749948,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-9adee90a-20261105-230229.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Model prices have one editor",
+              "text": "Mnemo2's settings dialog SHALL edit model prices only with each model on the Endpoints page, and the Savings page SHALL NOT offer a pricing table.",
+              "scenarios": [
+                {
+                  "name": "Savings page points to Endpoints",
+                  "when": [
+                    "the user opens the Savings page"
+                  ],
+                  "then": [
+                    "no pricing table is shown",
+                    "a line says prices are set with each model on the Endpoints page"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
       "schema": "spec-driven@1",
       "sections": {}
     },
@@ -1378,6 +1557,101 @@
       "sections": {}
     },
     {
+      "id": "8106337a",
+      "status": "closed",
+      "created_at_ms": 1793920243511,
+      "closed_at_ms": 1793924492199,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-8106337a-20261106-002132.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Laya needs one decision from the user",
+              "text": "The Tiers page SHALL ask only how much Laya helps pick the tier, and SHALL NOT offer inputs for confidence gates, minimum words, fallback tier, kNN, nudges or per-tier dispatch effort.",
+              "scenarios": [
+                {
+                  "name": "Leaving without edits",
+                  "when": [
+                    "the user opens the Tiers page and changes nothing",
+                    "the user picks another page"
+                  ],
+                  "then": [
+                    "the page changes without asking about unsaved edits"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "The Laya check runs itself and shows progress",
+              "text": "Mnemo2 SHALL check Laya when a project opens if the test set or checkpoint changed, SHALL show its progress like indexing, SHALL apply the suggested gates itself, and MUST write nothing when Laya does not answer.",
+              "scenarios": [
+                {
+                  "name": "Stale check at project open",
+                  "when": [
+                    "a project opens with a Laya choice other than off and no matching check"
+                  ],
+                  "then": [
+                    "the status line shows Checking Laya with done and total",
+                    "the gates and the result are saved when it ends"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Nothing changed",
+                  "when": [
+                    "a project opens and the last check's fingerprint matches"
+                  ],
+                  "then": [
+                    "no check runs and the page shows the last result"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Laya does not answer",
+                  "when": [
+                    "the classifier stops answering during a check"
+                  ],
+                  "then": [
+                    "the check shows as failed",
+                    "no record is written and the gates stay as stored"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "d4c6a2be",
+      "status": "closed",
+      "created_at_ms": 1793921826710,
+      "closed_at_ms": 1793923792890,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d4c6a2be-20261106-000952.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "06f1a204",
+      "status": "closed",
+      "created_at_ms": 1793925935280,
+      "closed_at_ms": 1793931734707,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-06f1a204-20261106-022214.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
       "id": "a73885db",
       "status": "closed",
       "created_at_ms": 1793956066589,
@@ -1388,11 +1662,31 @@
       "sections": {}
     },
     {
+      "id": "a8710b6b",
+      "status": "abandoned",
+      "created_at_ms": 1793962826378,
+      "closed_at_ms": 1793962932234,
+      "report_path": null,
+      "abandon_reason": "Verification only, nothing to land. On the rebuilt app a plan decision steered a worker mid-command: it stayed working, and exactly one finished notice arrived, with the new turn tag, after the follow-up ended.",
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
       "id": "8203fd61",
       "status": "closed",
       "created_at_ms": 1793963551140,
       "closed_at_ms": 1793965993464,
       "report_path": "C:\\mnemo\\.coding\\reviews\\team-8203fd61-20261106-115313.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "06d33de4",
+      "status": "closed",
+      "created_at_ms": 1793963644286,
+      "closed_at_ms": 1793964194799,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-06d33de4-20261106-112314.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}

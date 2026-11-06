@@ -3711,7 +3711,9 @@ async fn savings_and_spend_emitted_where_persisted() {
         rows[0].reason,
         crate::agent::budget::BudgetReason::Route.wire_label(),
     );
-    let savings_rows = store.savings_events_rows(None).await.unwrap();
+    let savings_rows =
+        wait_for_savings_row(&store, |r| r.kind == "archive", std::time::Duration::from_secs(5))
+            .await;
     assert_eq!(savings_rows.len(), 1, "the durable savings row co-lands");
     assert_eq!(savings_rows[0].kind, "archive");
     assert_eq!(savings_rows[0].tokens_before, 500);
@@ -13517,6 +13519,30 @@ async fn no_model_override_no_model_changed_events() {
     );
 }
 
+/// Poll the savings ledger until `matches` accepts a row, or `timeout`
+/// elapses. `AgentLoop::record_savings_event` spawns its durable write
+/// (fire-and-forget), so a row a turn emitted can land AFTER the turn
+/// returned — a single read right after the turn races a slow runner.
+/// Returns the matching read, or the last read on timeout, so the caller
+/// keeps asserting against what is actually in the ledger.
+async fn wait_for_savings_row(
+    store: &Arc<dyn crate::memory::MemoryStoreTrait>,
+    matches: impl Fn(&crate::memory::SavingsEvent) -> bool,
+    timeout: std::time::Duration,
+) -> Vec<crate::memory::SavingsEvent> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let rows = store.savings_events_rows(None).await.unwrap();
+        if rows.iter().any(&matches) {
+            return rows;
+        }
+        if std::time::Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn recall_delta_elides_a_repeat_recall_but_not_a_new_one() {
     // Recall-delta lever, end-to-end (backlog 30bacfa2): turn 1 injects the
@@ -13663,16 +13689,15 @@ async fn recall_delta_elides_a_repeat_recall_but_not_a_new_one() {
     );
 
     // The elision reaches the savings ledger (the write is spawned, so poll).
-    let mut row = None;
-    for _ in 0..50 {
-        let rows = store_on.savings_events_rows(None).await.unwrap();
-        if let Some(found) = rows.into_iter().find(|r| r.kind == "recall_delta") {
-            row = Some(found);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let row = row.expect("a recall_delta savings row must reach the ledger");
+    let row = wait_for_savings_row(
+        &store_on,
+        |r| r.kind == "recall_delta",
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .into_iter()
+    .find(|r| r.kind == "recall_delta")
+    .expect("a recall_delta savings row must reach the ledger");
     assert!(
         row.tokens_before > row.tokens_after,
         "the reference block must be the smaller form: {row:?}"
@@ -21015,15 +21040,18 @@ async fn recall_delta_all_elided_set_costs_one_sentinel_line() {
         "the newly recalled row arrives in full: {turn3}"
     );
 
-    // The savings ledger records the sentinel's saved chars.
-    let rows = store.savings_events_rows(None).await.unwrap();
+    // The savings ledger records the sentinel's saved chars — the write is
+    // spawned, so poll for the row the turns emitted instead of reading once.
+    fn sentinel_row(r: &crate::memory::SavingsEvent) -> bool {
+        r.kind == "recall_delta"
+            && r
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("sentinel"))
+    }
+    let rows = wait_for_savings_row(&store, sentinel_row, std::time::Duration::from_secs(5)).await;
     assert!(
-        rows.iter()
-            .any(|r| r.kind == "recall_delta"
-                && r
-                    .detail
-                    .as_deref()
-                    .is_some_and(|d| d.contains("sentinel"))),
+        rows.iter().any(sentinel_row),
         "a savings row names the sentinel: {rows:?}"
     );
 }

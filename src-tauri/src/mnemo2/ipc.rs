@@ -662,6 +662,13 @@ pub async fn lead_open(
             }
         }
     });
+    // The Laya check (plan 8106337a) starts with the project: unforced, it
+    // skips silently when routing is off, Laya is down or the record's
+    // fingerprint still matches. It must come after the indexing forwarder
+    // so the pass is visible, and an error never fails the open.
+    if let Err(error) = runtime.start_laya_check(false).await {
+        eprintln!("mnemo2: the Laya check could not start: {error}");
+    }
     let mut team_events = team.subscribe();
     let team_app = app.clone();
     let team_forwarder = tauri::async_runtime::spawn(async move {

@@ -141,7 +141,7 @@ pub enum MessageSender {
     Lead,
     /// The user replying in mission control.
     User,
-    /// Mnemo2 itself, for a generated repair or route-fix brief.
+    /// Mnemo2 itself, for a generated repair or route-fix brief or a plan-changed notice.
     Mnemo,
 }
 
@@ -2420,8 +2420,9 @@ impl TeamRuntime {
                         .collect::<Vec<_>>()
                 };
                 for worker_id in workers {
+                    // Mnemo2 writes this notice and cannot tell who edited the plan, so it signs it itself.
                     if let Err(error) = team
-                        .message(&worker_id, text.clone(), MessageSender::Lead)
+                        .message(&worker_id, text.clone(), MessageSender::Mnemo)
                         .await
                     {
                         eprintln!(
@@ -16436,6 +16437,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             }
         };
         assert_eq!(notice.text, expected);
+        assert_eq!(notice.sender, MessageSender::Mnemo);
         assert_eq!(
             team.worker(completed_id)
                 .await

@@ -1,27 +1,21 @@
 <script lang="ts">
   import { ArrowDown, ArrowUp, X } from "@lucide/svelte";
   import { untrack } from "svelte";
+  import type { IndexPass } from "../lib/indexingEngine";
   import type { EndpointDetailDto, SettingsTransport, TiersDto } from "../lib/settingsEngine";
   import { allSpecs, cloneTiers, errorText, LAYA_LABELS, moveItem, priceOfSpec } from "../lib/settingsState";
   import {
-    DISPATCH_TIERS,
+    checkSummaryText,
     LAYA_FLAG_META,
-    LAYA_REFLEX_META,
     LAYA_STATUS_META,
-    evalDateText,
-    layaStatusHint,
+    lowCoverage,
     modeAvailable,
     modeUnlockText,
-    routingDraft,
-    routingWire,
     shareText,
-    type DispatchRoutingSettings,
     type LayaEvent,
-    type LayaFlags,
+    type LayaFlagKey,
     type LayaStatus,
     type LayaTransport,
-    type RoutingDraft,
-    type RoutingEvalWire,
     type RoutingStatusWire,
     type TierChoice,
     type TiersTopControl,
@@ -29,10 +23,12 @@
   import { trackUnsaved } from "../lib/unsavedEdits";
 
   /**
-   * The Settings > Tiers page (plan 87932c46, design §7): the top control —
-   * does Laya help pick the tier — the five-rung ladder editor with its
-   * dispatch-text preview, the collapsed routing details and the Laya
-   * section at the bottom. One page owns everything about tiers.
+   * The Settings > Tiers page (plan 8106337a, design §7): one choice — does
+   * Laya help pick the tier — with the self-running Laya check and its
+   * progress under it, the five-rung ladder editor, and three collapsed
+   * sections: what the lead sees, how Laya is doing, and the other things
+   * Laya can do. Every routing knob the old page exposed is applied by the
+   * check itself; the only thing left to save by hand is the ladder.
    */
   let {
     transport,
@@ -40,12 +36,15 @@
     endpoints,
     tiers,
     ontiers,
+    evalPass = null,
   }: {
     transport: SettingsTransport | null;
     layaTransport: LayaTransport | null;
     endpoints: EndpointDetailDto[];
     tiers: TiersDto;
     ontiers: (next: TiersDto) => void;
+    /** The Laya check's pass from the store's indexing snapshot. */
+    evalPass: IndexPass | null;
   } = $props();
 
   // ── §7.1 The top control ────────────────────────────────────────────────
@@ -54,7 +53,7 @@
   let topControl = $state<TiersTopControl | null>(null);
   /** The full Laya snapshot — the runtime state, the flags and Mnemo1's gates. */
   let snapshot = $state<LayaStatus | null>(null);
-  /** The Mnemo2 `[routing]` table, its log summary and the last eval record. */
+  /** The Mnemo2 `[routing]` table, its log summary and the last check's record. */
   let routingStatus = $state<RoutingStatusWire | null>(null);
   let loadError = $state("");
   /** The last setup-pipeline event, while one runs. */
@@ -100,7 +99,7 @@
   const choice = $derived(topControl?.choice ?? "off");
 
   /** Whether Laya helps with the tier at all (the radio labels and the
-   * routing details both follow it). */
+   * check and how-Laya-is-doing sections follow it). */
   const layaHelps = $derived(choice !== "off");
 
   /** Laya's coarse readiness — an in-flight setup reads as installing. */
@@ -154,17 +153,12 @@
     );
   }
 
-  /** Whether a choice has the labelled decisions it unlocks at. */
+  /** Whether a choice is past the labelled decisions it unlocks at — below
+   * that the card shows a hint instead of refusing the pick. */
   function choiceUnlocked(target: TierChoice): boolean {
     if (target === "off" || target === "shadow") return true;
     if (routingStatus === null) return false;
     return modeAvailable(target, routingStatus.summary);
-  }
-
-  /** What a locked choice is missing, for its Force link. */
-  function choiceUnlockText(target: TierChoice): string {
-    if (routingStatus === null) return "no routing log yet";
-    return modeUnlockText(target, routingStatus.summary);
   }
 
   /** Save a choice through the one combined command (design §7.1). */
@@ -175,8 +169,10 @@
     try {
       topControl = await layaTransport.saveTopControl(target);
       // The mode is half of the `[routing]` table — re-read it so the
-      // routing details draft follows, and refresh the summary behind it.
+      // summary and the check's record follow, and refresh the status
+      // behind it.
       await refreshRouting();
+      await refreshAll();
     } catch (error) {
       setupError = errorText(error);
     } finally {
@@ -187,20 +183,7 @@
   /** Pick a radio card: one click, one save. */
   async function pickChoice(target: TierChoice): Promise<void> {
     if (choiceDisabled(target) || target === choice) return;
-    if (!choiceUnlocked(target)) {
-      forceChoice(target);
-      return;
-    }
     await saveChoice(target);
-  }
-
-  /** Force a locked choice on, behind a confirm that names the missing rows. */
-  function forceChoice(target: TierChoice): void {
-    if (routingStatus === null) return;
-    const progress = modeUnlockText(target, routingStatus.summary);
-    const title = CHOICES.find((entry) => entry.choice === target)?.title ?? target;
-    if (!confirm(`${title} unlocks at 30 labelled decisions (${progress}). Force it on anyway?`)) return;
-    void saveChoice(target);
   }
 
   /** Enable + install/start the managed runtime, then re-read everything. */
@@ -245,7 +228,7 @@
     }
   }
 
-  /** Re-read the `[routing]` table + its summary (the routing details draft). */
+  /** Re-read the `[routing]` table + its summary (after a check or a save). */
   async function refreshRouting(): Promise<void> {
     const active = layaTransport;
     if (active === null) return;
@@ -255,6 +238,34 @@
       loadError = errorText(error);
     }
   }
+
+  // ── The Laya check ─────────────────────────────────────────────────────
+
+  /** Whether the check pass is running right now. */
+  const checkRunning = $derived(evalPass?.state === "running");
+
+  /** What went wrong starting a check from the Check again button. */
+  let checkError = $state("");
+
+  /** Run the check on demand; the pass itself streams through the store. */
+  async function checkAgain(): Promise<void> {
+    if (layaTransport === null) return;
+    checkError = "";
+    try {
+      await layaTransport.checkLaya();
+    } catch (error) {
+      checkError = errorText(error);
+    }
+  }
+
+  /** Re-read the routing table whenever a check finishes, so the page shows
+   * the record and the gates the check just applied. */
+  let lastPassState: string | null = null;
+  $effect(() => {
+    const state = evalPass?.state ?? null;
+    if (state === "done" && lastPassState !== "done") void refreshRouting();
+    lastPassState = state;
+  });
 
   // ── §7.2 The ladder ────────────────────────────────────────────────────
 
@@ -334,6 +345,9 @@
     try {
       const stored = await transport.saveTiers(next);
       ontiers(stored);
+      // The stored copy is the truth — a save that normalized a rung (say
+      // `resolves_to`) must not leave the draft dirty against the new wire.
+      draft = cloneTiers(stored);
       ladderSaved = true;
     } catch (error) {
       ladderError = errorText(error);
@@ -377,186 +391,6 @@
     return lines.join("\n");
   });
 
-  // ── §7.3 Routing details (the collapsed block) ─────────────────────────
-
-  /** The Mnemo2 `[routing]` table draft. */
-  let dispatchDraft = $state<DispatchRoutingSettings | null>(null);
-  let dispatchSaving = $state(false);
-  let dispatchError = $state("");
-  let dispatchSaved = $state(false);
-  /** Mnemo1's gates draft (the models live on the ladder above). */
-  let gatesDraft = $state<RoutingDraft | null>(null);
-  let gatesSaving = $state(false);
-  let gatesError = $state("");
-  let gatesSaved = $state(false);
-  /** The opt-in flags draft — the five below plus the reflex in the details. */
-  let flagsDraft = $state<LayaFlags | null>(null);
-  let flagsSaving = $state(false);
-  let flagsError = $state("");
-  let flagsSaved = $state(false);
-  let evalResult = $state<RoutingEvalWire | null>(null);
-  let evalRunning = $state(false);
-  let evalError = $state("");
-
-  /** Seed the flags and Mnemo1's gates whenever a fresh snapshot lands. */
-  $effect(() => {
-    const status = snapshot;
-    if (status === null) return;
-    flagsDraft = { ...status.flags };
-    gatesDraft = routingDraft(status.routing);
-  });
-
-  /** Seed the `[routing]` draft whenever a fresh table lands. */
-  $effect(() => {
-    const routing = routingStatus;
-    if (routing === null) return;
-    dispatchDraft = {
-      ...routing.settings,
-      effort: { ...routing.settings.effort },
-    };
-  });
-
-  const dispatchDirty = $derived(
-    dispatchDraft !== null &&
-    routingStatus !== null &&
-    JSON.stringify(dispatchDraft) !== JSON.stringify(routingStatus.settings),
-  );
-
-  const gatesDirty = $derived(
-    gatesDraft !== null &&
-    snapshot !== null &&
-    JSON.stringify(gatesDraft) !== JSON.stringify(routingDraft(snapshot.routing)),
-  );
-
-  const flagsDirty = $derived(
-    flagsDraft !== null &&
-    snapshot !== null &&
-    JSON.stringify(flagsDraft) !== JSON.stringify(snapshot.flags),
-  );
-
-  /** Save the `[routing]` table; the response re-seeds the draft. */
-  async function saveDispatch(): Promise<boolean> {
-    if (layaTransport === null || dispatchDraft === null) return false;
-    dispatchSaving = true;
-    dispatchError = "";
-    try {
-      routingStatus = await layaTransport.saveRoutingSettings(
-        $state.snapshot(dispatchDraft) as DispatchRoutingSettings,
-      );
-      dispatchSaved = true;
-      return true;
-    } catch (error) {
-      dispatchError = errorText(error);
-      return false;
-    } finally {
-      dispatchSaving = false;
-    }
-  }
-
-  function discardDispatch(): void {
-    if (routingStatus === null) return;
-    dispatchDraft = {
-      ...routingStatus.settings,
-      effort: { ...routingStatus.settings.effort },
-    };
-    dispatchError = "";
-    dispatchSaved = false;
-  }
-
-  /** Write one tier's dispatch effort; an empty value clears it. */
-  function setDispatchEffort(tier: string, value: string): void {
-    if (dispatchDraft === null) return;
-    if (value.trim() === "") delete dispatchDraft.effort[tier];
-    else dispatchDraft.effort[tier] = value.trim();
-    dispatchSaved = false;
-  }
-
-  /** Save Mnemo1's gates — threshold and first-prompt; enforce rides the
-   * top control and is carried through unchanged. */
-  async function saveGates(): Promise<void> {
-    if (layaTransport === null || gatesDraft === null) return;
-    const parsed = routingWire(gatesDraft);
-    if (parsed.value === undefined) {
-      gatesError = parsed.error;
-      return;
-    }
-    gatesSaving = true;
-    gatesError = "";
-    try {
-      await layaTransport.save(undefined, parsed.value);
-      await refreshAll();
-      gatesSaved = true;
-    } catch (error) {
-      gatesError = errorText(error);
-    } finally {
-      gatesSaving = false;
-    }
-  }
-
-  function discardGates(): void {
-    if (snapshot === null) return;
-    gatesDraft = routingDraft(snapshot.routing);
-    gatesError = "";
-    gatesSaved = false;
-  }
-
-  /** Save the opt-in flags (the Laya section's five, or the reflex). */
-  async function saveFlags(next: LayaFlags): Promise<void> {
-    if (layaTransport === null) return;
-    flagsSaving = true;
-    flagsError = "";
-    try {
-      await layaTransport.save($state.snapshot(next) as LayaFlags);
-      await refreshAll();
-      flagsSaved = true;
-    } catch (error) {
-      flagsError = errorText(error);
-    } finally {
-      flagsSaving = false;
-    }
-  }
-
-  /** Toggle the reflex (Mnemo1's plan-step tiers opt-in) in one save. */
-  function toggleReflex(next: boolean): void {
-    if (flagsDraft === null) return;
-    flagsDraft.reflex = next;
-    void saveFlags($state.snapshot(flagsDraft) as LayaFlags);
-  }
-
-  async function runEval(): Promise<void> {
-    if (layaTransport === null) return;
-    evalRunning = true;
-    evalError = "";
-    try {
-      evalResult = await layaTransport.runRoutingEval();
-      await refreshRouting();
-    } catch (error) {
-      evalError = errorText(error);
-    } finally {
-      evalRunning = false;
-    }
-  }
-
-  /** The eval's suggested gates, applied through the normal save path. */
-  async function applySuggestion(): Promise<void> {
-    if (dispatchDraft === null || evalResult === null) return;
-    const record = evalResult.record;
-    if (record.min_confidence_4 !== null) dispatchDraft.min_confidence_4 = record.min_confidence_4;
-    if (record.min_confidence_3 !== null) dispatchDraft.min_confidence_3 = record.min_confidence_3;
-    if (record.min_confidence_2 !== null) dispatchDraft.min_confidence_2 = record.min_confidence_2;
-    await saveDispatch();
-  }
-
-  const evalTables = $derived(
-    evalResult === null
-      ? []
-      : [
-          { title: "Four labels", report: evalResult.four },
-          { title: "Three labels", report: evalResult.three },
-          { title: "Two labels", report: evalResult.two },
-        ],
-  );
-
   /** A count map as "shadow 12 · suggest 3" (empty is "none"). */
   function summaryText(counts: Record<string, number>): string {
     const parts = Object.entries(counts)
@@ -570,11 +404,38 @@
     return summaryText(counts);
   }
 
+  // ── The other Laya flags — one switch, one save ────────────────────────
+
+  /** The flag with a save in flight; every switch disables while one runs. */
+  let flagSaving = $state<LayaFlagKey | null>(null);
+  let flagError = $state("");
+
+  /** Flip one opt-in flag: save it, then re-read; revert the box on failure. */
+  async function toggleFlag(key: LayaFlagKey, input: HTMLInputElement): Promise<void> {
+    if (layaTransport === null) return;
+    const next = input.checked;
+    flagSaving = key;
+    flagError = "";
+    try {
+      await layaTransport.saveFlag(key, next);
+      await refreshAll();
+    } catch (error) {
+      input.checked = !next;
+      flagError = errorText(error);
+    } finally {
+      flagSaving = null;
+    }
+  }
+
   // ── Loading, events and leaving with unsaved edits ─────────────────────
+
+  /** The transport the page loads with — a derived, so prop updates the
+   * load does not care about (the check's progress ticks) never re-run it. */
+  const activeTransport = $derived(layaTransport);
 
   /** Load everything once per transport (the dialog keeps it open). */
   $effect(() => {
-    const active = layaTransport;
+    const active = activeTransport;
     if (active === null) return;
     let cancelled = false;
     loadError = "";
@@ -599,18 +460,11 @@
     };
   });
 
-  /** Any draft the guard should ask about before the page is left. */
-  function hasUnsaved(): boolean {
-    return (
-      ladderChanged ||
-      dispatchDirty ||
-      gatesDirty ||
-      flagsDirty
-    );
-  }
-
-  trackUnsaved(hasUnsaved);
+  /** Only the ladder's own edits hold the page: everything else saves on
+   * its own click or is applied by the check. */
+  trackUnsaved(() => ladderChanged);
 </script>
+
 
 <datalist id="effort-options">
   <option value="low"></option>
@@ -647,10 +501,8 @@
             />
             <span class="choice-title">{entry.title}</span>
             <span class="micro">{entry.blurb}</span>
-            {#if entry.choice !== "off" && !choiceUnlocked(entry.choice) && !choiceDisabled(entry.choice)}
-              <button class="button button-quiet" onclick={() => forceChoice(entry.choice)}>
-                Force on ({choiceUnlockText(entry.choice)})
-              </button>
+            {#if entry.choice !== "off" && !choiceUnlocked(entry.choice) && routingStatus !== null}
+              <span class="micro">Best after {modeUnlockText(entry.choice, routingStatus.summary)}.</span>
             {/if}
           </label>
         {/each}
@@ -675,7 +527,7 @@
             <span class="status-state">{LAYA_STATUS_META[shownStatus]}</span>
           {:else}
             <span class="status-state ok">{topControl.checkpoint ?? "Laya"} ready</span>
-            <span class="micro">kNN: {topControl.knn_rows} labelled workers (answers from {topControl.knn_min_rows})</span>
+            <span class="micro">Learned from {topControl.knn_rows} finished workers (uses them from {topControl.knn_min_rows}).</span>
             <button class="button button-quiet" disabled={setupBusy} onclick={stopLaya}>Turn off</button>
           {/if}
         </div>
@@ -693,6 +545,46 @@
             </div>
           {/if}
           <p class="micro progress-label">{progress.label}</p>
+        {/if}
+        {#if layaHelps && layaTransport !== null && topControl !== null}
+          <div class="check" aria-label="Laya check" role="group">
+            {#if checkRunning && evalPass !== null}
+              <span class="micro">Checking Laya{evalPass.total > 0 ? ` · ${evalPass.done} of ${evalPass.total} test tasks` : ""}…</span>
+              {#if evalPass.total > 0}
+                <div
+                  class="progress"
+                  role="progressbar"
+                  aria-label="Laya check progress"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round((evalPass.done / evalPass.total) * 100)}
+                >
+                  <div style="width: {Math.min(100, Math.round((evalPass.done / evalPass.total) * 100))}%"></div>
+                </div>
+              {:else}
+                <div
+                  class="progress"
+                  role="progressbar"
+                  aria-label="Laya check progress"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                >
+                  <div style="width: 30%"></div>
+                </div>
+              {/if}
+            {:else if evalPass !== null && evalPass.state === "failed"}
+              <p class="section-error" role="alert">The Laya check failed: {evalPass.detail ?? "unknown error"}</p>
+            {:else}
+              <span class="micro">{checkSummaryText(routingStatus?.eval ?? null)}</span>
+              {#if lowCoverage(routingStatus?.eval ?? null)}
+                <span class="micro">Laya leaves most choices to the lead until it has learned from more finished workers.</span>
+              {/if}
+            {/if}
+            <button class="button button-quiet" disabled={checkRunning || shownStatus !== "ready"} onclick={() => void checkAgain()}>
+              Check again
+            </button>
+            {#if checkError}<p class="section-error" role="alert">{checkError}</p>{/if}
+          </div>
         {/if}
         {#if setupError && shownStatus !== "failed"}<p class="section-error" role="alert">{setupError}</p>{/if}
         {#if choiceWarning}<p class="section-error" role="alert">{choiceWarning}</p>{/if}
@@ -815,274 +707,61 @@
     </section>
 
     <!-- (c) The dispatch text the lead sees -->
-    <section class="group" aria-label="Dispatch tier text preview">
-      <header>
-        <h3>Dispatch tier text</h3>
-        <p class="micro">
-          What `team_dispatch` tells the lead about the `tier` parameter — generated from the ladder above (the draft, not the stored copy, so edits preview before saving).
-        </p>
-      </header>
+    <details class="quiet-details">
+      <summary>What the lead sees</summary>
+      <p class="micro">
+        What `team_dispatch` tells the lead about the `tier` parameter — generated from the ladder above (the draft, not the stored copy, so edits preview before saving).
+      </p>
       <pre class="preview">{dispatchPreview}</pre>
-    </section>
+    </details>
 
-    <!-- (d) Routing details — collapsed, and only while Laya helps -->
-    {#if layaHelps}
-      <details class="routing-details">
-        <summary>Routing details</summary>
-        <div class="details-body">
-          {#if routingStatus !== null && dispatchDraft !== null}
-            <section class="group nested" aria-label="Dispatch routing (Mnemo2)">
-              <header>
-                <h4>Dispatch routing (Mnemo2)</h4>
-                <p class="micro">
-                  One Laya question per dispatch, on the step spec and the lead's brief. A mode only logs, suggests or picks the worker's tier at dispatch — it never switches a running session.
-                </p>
-              </header>
-              <div class="knob-list">
-                <div class="knob-row">
-                  <label for="dispatch-gate-4">Four-label gate</label>
-                  <span class="micro">The full ladder asks four labels; this gate decides when the answer is trusted.</span>
-                  <input id="dispatch-gate-4" inputmode="decimal" bind:value={dispatchDraft.min_confidence_4} spellcheck="false" />
-                </div>
-                <div class="knob-row">
-                  <label for="dispatch-gate-3">Three-label gate</label>
-                  <span class="micro">Applies when only three tiers resolve (a reduced ladder).</span>
-                  <input id="dispatch-gate-3" inputmode="decimal" bind:value={dispatchDraft.min_confidence_3} spellcheck="false" />
-                </div>
-                <div class="knob-row">
-                  <label for="dispatch-gate-2">Two-label gate</label>
-                  <span class="micro">The strictest gate — only a two-label question.</span>
-                  <input id="dispatch-gate-2" inputmode="decimal" bind:value={dispatchDraft.min_confidence_2} spellcheck="false" />
-                </div>
-                <div class="knob-row">
-                  <label for="dispatch-min-words">Minimum words</label>
-                  <span class="micro">Steps shorter than this are never classified (the answer would be noise).</span>
-                  <input id="dispatch-min-words" inputmode="numeric" bind:value={dispatchDraft.min_words} spellcheck="false" />
-                </div>
-                <div class="knob-row">
-                  <label for="dispatch-fallback">Fallback tier</label>
-                  <span class="micro">What auto mode runs when no confident answer lands.</span>
-                  <select id="dispatch-fallback" bind:value={dispatchDraft.fallback_tier}>
-                    {#each DISPATCH_TIERS as id (id)}
-                      {#if rungOf(id)}
-                        <option value={id}>{rungOf(id)?.name} ({id})</option>
-                      {/if}
-                    {/each}
-                  </select>
-                </div>
-                <div class="knob-row">
-                  <label for="dispatch-knn-rows">kNN answers from</label>
-                  <span class="micro">The labelled-worker count the local overlay votes at.</span>
-                  <input id="dispatch-knn-rows" inputmode="numeric" bind:value={dispatchDraft.knn_min_rows} spellcheck="false" />
-                </div>
-                <div class="knob-row">
-                  <label for="dispatch-knn-share">kNN vote share</label>
-                  <span class="micro">The agreement share a kNN vote needs to clear.</span>
-                  <input id="dispatch-knn-share" inputmode="decimal" bind:value={dispatchDraft.knn_min_share} spellcheck="false" />
-                </div>
-                <label class="lever-row">
-                  <input type="checkbox" bind:checked={dispatchDraft.nudges} />
-                  <span class="lever-text">
-                    <strong>Nudges</strong>
-                    <span class="micro">A confident answer may nudge the lead toward its tier without taking the choice.</span>
-                  </span>
-                </label>
-              </div>
-              <div class="knob-list">
-                {#each DISPATCH_TIERS as tier (tier)}
-                  <div class="knob-row">
-                    <label for={`dispatch-effort-${tier}`}>{tier} effort</label>
-                    <input
-                      id={`dispatch-effort-${tier}`}
-                      value={dispatchDraft.effort[tier] ?? ""}
-                      placeholder="default"
-                      spellcheck="false"
-                      oninput={(event) => setDispatchEffort(tier, event.currentTarget.value)}
-                    />
-                  </div>
-                {/each}
-              </div>
-              <dl class="summary-list">
-                <div><dt>Decisions</dt><dd>{decisionsText(routingStatus.summary.decisions_by_mode)}</dd></div>
-                <div><dt>Agreement</dt><dd>{shareText(routingStatus.summary.agreement_rate)}</dd></div>
-                <div><dt>Laya accuracy</dt><dd>{shareText(routingStatus.summary.laya_accuracy)}</dd></div>
-                <div><dt>Lead accuracy</dt><dd>{shareText(routingStatus.summary.lead_accuracy)}</dd></div>
-                <div><dt>Labelled</dt><dd>{routingStatus.summary.labelled}</dd></div>
-                <div><dt>Overrides</dt><dd>{summaryText(routingStatus.summary.overrides_by_source)}</dd></div>
-                <div><dt>Nudges</dt><dd>{routingStatus.summary.nudges} ({routingStatus.summary.nudges_acted_on} acted on)</dd></div>
-              </dl>
-              <div class="section-actions">
-                {#if dispatchError}<p class="section-error" role="alert">{dispatchError}</p>{/if}
-                {#if dispatchSaved && !dispatchDirty}<p class="section-note">Saved to mnemo2.toml.</p>{/if}
-                <div class="section-buttons">
-                  <button class="button button-quiet" disabled={dispatchSaving || !dispatchDirty} onclick={discardDispatch}>Discard</button>
-                  <button class="button button-primary" disabled={dispatchSaving || !dispatchDirty} onclick={() => void saveDispatch()}>
-                    {dispatchSaving ? "Saving…" : "Save dispatch routing"}
-                  </button>
-                </div>
-              </div>
-              <div class="eval-block">
-                <div class="section-buttons">
-                  <button class="button button-quiet" disabled={evalRunning} onclick={() => void runEval()}>
-                    {evalRunning ? "Running eval…" : "Run eval"}
-                  </button>
-                  {#if evalResult !== null}
-                    <button class="button button-primary" disabled={dispatchSaving} onclick={() => void applySuggestion()}>
-                      Apply suggested gates
-                    </button>
-                  {/if}
-                </div>
-                {#if evalError}<p class="section-error" role="alert">{evalError}</p>{/if}
-                {#if evalResult !== null}
-                  <p class="micro">Last run {evalDateText(evalResult.record)}.</p>
-                  {#each evalTables as table (table.title)}
-                    <div class="eval-report">
-                      <h4>
-                        {table.title} — suggested
-                        {table.report.suggested === null ? "nothing (the provisional default stands)" : table.report.suggested.toFixed(3)}
-                      </h4>
-                      <table>
-                        <thead>
-                          <tr><th>Gate</th><th>Routed</th><th>Accuracy</th></tr>
-                        </thead>
-                        <tbody>
-                          {#each table.report.table as row (row.threshold)}
-                            <tr>
-                              <td>{row.threshold.toFixed(3)}</td>
-                              <td>{Math.round(row.routed_share * 100)}%</td>
-                              <td>{Math.round(row.accuracy * 100)}%</td>
-                            </tr>
-                          {/each}
-                        </tbody>
-                      </table>
-                      {#if table.report.misses.length > 0}
-                        <p class="micro">Misses at {table.report.default_gate.toFixed(3)}: {table.report.misses.length}</p>
-                        <ul class="miss-list">
-                          {#each table.report.misses.slice(0, 5) as miss (miss.text)}
-                            <li class="micro">
-                              want {miss.expected ?? "no route"} · got {miss.got ?? "no answer"}{miss.confidence === null ? "" : ` (${miss.confidence.toFixed(2)})`} — {miss.text.slice(0, 90)}
-                            </li>
-                          {/each}
-                        </ul>
-                      {/if}
-                    </div>
-                  {/each}
-                {/if}
-              </div>
-            </section>
-
-            {#if gatesDraft !== null && snapshot !== null}
-              <section class="group nested" aria-label="First prompt and step lanes (Mnemo1)">
-                <header>
-                  <h4>First prompt and step lanes (Mnemo1)</h4>
-                  <p class="micro">
-                    The gates for Mnemo1's own routing — the first prompt of every turn and each plan step (the Reflex opt-in). The models live on the ladder above; `enforce` rides the top control.
-                  </p>
-                </header>
-                <div class="knob-list">
-                  <div class="knob-row">
-                    <label for="mnemo1-first-prompt">First-prompt gate</label>
-                    <span class="micro">Empty = the kernel default; a confident first-prompt answer routes the turn.</span>
-                    <input id="mnemo1-first-prompt" inputmode="decimal" bind:value={gatesDraft.firstPrompt} spellcheck="false" />
-                  </div>
-                  <div class="knob-row">
-                    <label for="mnemo1-threshold">Step-lane threshold</label>
-                    <span class="micro">A step-lane decision applies only at confidence ≥ threshold (0–1).</span>
-                    <input id="mnemo1-threshold" inputmode="decimal" bind:value={gatesDraft.threshold} spellcheck="false" />
-                  </div>
-                  <label class="lever-row">
-                    <input type="checkbox" checked={snapshot.flags.reflex} onchange={(event) => toggleReflex(event.currentTarget.checked)} />
-                    <span class="lever-text">
-                      <strong>{LAYA_REFLEX_META.label}</strong>
-                      <span class="micro">{LAYA_REFLEX_META.explanation}</span>
-                      {#if LAYA_REFLEX_META.note}<span class="micro flag-note">{LAYA_REFLEX_META.note}</span>{/if}
-                    </span>
-                  </label>
-                </div>
-                <div class="section-actions">
-                  {#if gatesError}<p class="section-error" role="alert">{gatesError}</p>{/if}
-                  {#if gatesSaved && !gatesDirty}<p class="section-note">Applies to new turns.</p>{/if}
-                  <div class="section-buttons">
-                    <button class="button button-quiet" disabled={gatesSaving || !gatesDirty} onclick={discardGates}>Discard</button>
-                    <button class="button button-primary" disabled={gatesSaving || !gatesDirty} onclick={() => void saveGates()}>
-                      {gatesSaving ? "Saving…" : "Save Mnemo1 gates"}
-                    </button>
-                  </div>
-                </div>
-              </section>
-            {/if}
-          {/if}
-        </div>
+    <!-- (d) How Laya is doing — collapsed, and only while Laya helps -->
+    {#if layaHelps && routingStatus !== null}
+      <details class="quiet-details">
+        <summary>How Laya is doing</summary>
+        <dl class="summary-list">
+          <div><dt>Decisions</dt><dd>{decisionsText(routingStatus.summary.decisions_by_mode)}</dd></div>
+          <div><dt>Agreement</dt><dd>{shareText(routingStatus.summary.agreement_rate)}</dd></div>
+          <div><dt>Laya accuracy</dt><dd>{shareText(routingStatus.summary.laya_accuracy)}</dd></div>
+          <div><dt>Lead accuracy</dt><dd>{shareText(routingStatus.summary.lead_accuracy)}</dd></div>
+          <div><dt>Labelled</dt><dd>{routingStatus.summary.labelled}</dd></div>
+          <div><dt>Overrides</dt><dd>{summaryText(routingStatus.summary.overrides_by_source)}</dd></div>
+          <div><dt>Nudges</dt><dd>{routingStatus.summary.nudges} ({routingStatus.summary.nudges_acted_on} acted on)</dd></div>
+          <div>
+            <dt>Gates</dt>
+            <dd>
+              {routingStatus.settings.min_confidence_4.toFixed(2)} / {routingStatus.settings.min_confidence_3.toFixed(2)} / {routingStatus.settings.min_confidence_2.toFixed(2)}
+            </dd>
+          </div>
+        </dl>
+        <p class="micro">Set by the Laya check.</p>
       </details>
     {/if}
 
-    <!-- (e) The Laya section -->
-    <section class="group" aria-label="Laya">
-      <header>
-        <h3>Laya</h3>
-        <p class="micro">
-          A small local classifier. With it off nothing changes — every fall-back keeps today's behavior byte-for-byte. The tier-picking settings live at the top of this page.
-        </p>
-      </header>
-      {#if snapshot !== null && topControl !== null}
-        <div class="status-row">
-          <span class="status-state">Status: {LAYA_STATUS_META[shownStatus]}</span>
-          {#if !snapshot.enabled && topControl.laya_status !== "not_installed"}
-            <button class="button button-primary" disabled={setupBusy} onclick={startSetup}>{setupBusy ? "Turning on…" : "Turn on"}</button>
-          {:else if topControl.laya_status === "not_installed"}
-            <button class="button button-quiet" disabled={setupBusy} onclick={startSetup}>{setupBusy ? "Installing…" : "Install"}</button>
-          {/if}
-          {#if snapshot.enabled}
-            <button class="button button-quiet" onclick={stopLaya}>Turn off</button>
-          {/if}
+    <!-- (e) The other things Laya can do — collapsed, one switch one save -->
+    {#if snapshot !== null}
+      <details class="quiet-details">
+        <summary>Other things Laya can do</summary>
+        <p class="micro">Most of these work best once Laya has been fine-tuned on your logs. Each switch saves right away and applies to new turns.</p>
+        <div class="lever-list">
+          {#each LAYA_FLAG_META as flag (flag.key)}
+            <label class="lever-row">
+              <input
+                type="checkbox"
+                checked={snapshot.flags[flag.key]}
+                disabled={flagSaving !== null}
+                onchange={(event) => void toggleFlag(flag.key, event.currentTarget)}
+              />
+              <span class="lever-text">
+                <strong>{flag.label}</strong>
+                <span class="micro">{flag.explanation}</span>
+              </span>
+            </label>
+          {/each}
         </div>
-        <p class="micro">{layaStatusHint(shownStatus)}</p>
-        {#if topControl.laya_status === "ready" && topControl.checkpoint !== null}
-          <p class="micro">Checkpoint: {topControl.checkpoint}</p>
-        {/if}
-        {#if flagsDraft !== null}
-          <div class="lever-list">
-            {#each LAYA_FLAG_META as flag (flag.key)}
-              <label class="lever-row">
-                <input type="checkbox" bind:checked={flagsDraft[flag.key]} />
-                <span class="lever-text">
-                  <strong>{flag.label}</strong>
-                  <span class="micro">{flag.explanation}</span>
-                  {#if flag.note}<span class="micro flag-note">{flag.note}</span>{/if}
-                </span>
-              </label>
-            {/each}
-          </div>
-          <div class="section-actions">
-            {#if flagsError}<p class="section-error" role="alert">{flagsError}</p>{/if}
-            {#if flagsSaved && !flagsDirty}<p class="section-note">Applies to new turns.</p>{/if}
-            <div class="section-buttons">
-              <button
-                class="button button-quiet"
-                disabled={flagsSaving || !flagsDirty}
-                onclick={() => {
-                  if (snapshot === null) return;
-                  flagsDraft = { ...snapshot.flags };
-                  flagsError = "";
-                  flagsSaved = false;
-                }}
-              >
-                Discard
-              </button>
-              <button
-                class="button button-primary"
-                disabled={flagsSaving || !flagsDirty}
-                onclick={() => flagsDraft !== null && void saveFlags($state.snapshot(flagsDraft) as LayaFlags)}
-              >
-                {flagsSaving ? "Saving…" : "Save flags"}
-              </button>
-            </div>
-          </div>
-        {/if}
-      {:else}
-        <p class="micro">Loading…</p>
-      {/if}
-    </section>
+        {#if flagError}<p class="section-error" role="alert">{flagError}</p>{/if}
+      </details>
+    {/if}
   </div>
 </div>
 
@@ -1095,9 +774,7 @@
   .group { display: grid; gap: 8px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--canvas); }
   .group header { display: grid; gap: 4px; }
   .group h3 { margin: 0; font-size: var(--text-body); font-weight: 650; }
-  .group h4 { margin: 0; font-size: var(--text-body); font-weight: 650; }
   .micro { color: var(--muted); font-size: var(--text-meta); line-height: 1.45; }
-  .nested { border-style: dashed; }
 
   /* The top control */
   .choice-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
@@ -1112,6 +789,9 @@
   .failure-note { overflow-wrap: anywhere; }
   .progress { height: 6px; border-radius: 4px; background: var(--surface); overflow: hidden; }
   .progress > div { height: 100%; background: var(--accent); transition: width 0.3s; }
+
+  /* The Laya check */
+  .check { display: grid; gap: 6px; }
 
   /* The ladder */
   .tier-card { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
@@ -1137,20 +817,14 @@
   /* The dispatch text preview */
   .preview { margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--canvas); font-size: var(--text-meta); white-space: pre-wrap; overflow-wrap: anywhere; }
 
-  /* Routing details */
-  .routing-details { border: 1px dashed var(--line); border-radius: 14px; background: var(--canvas); padding: 10px 18px; }
-  .routing-details > summary { cursor: pointer; color: var(--muted); font-weight: 650; font-size: var(--text-body); }
-  .details-body { display: grid; gap: 14px; padding: 12px 0 2px; }
-
-  .knob-list { display: grid; gap: 8px; }
-  .knob-row { display: grid; grid-template-columns: minmax(140px, 200px) 1fr minmax(90px, 120px); gap: 8px; align-items: center; }
-  .knob-row label { font-weight: 600; font-size: var(--text-body); }
-  .knob-row input, .knob-row select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
+  /* The collapsed quiet sections */
+  .quiet-details { border: 1px dashed var(--line); border-radius: 14px; background: var(--canvas); padding: 10px 18px; }
+  .quiet-details > summary { cursor: pointer; color: var(--muted); font-weight: 650; font-size: var(--text-body); }
+  .quiet-details > :not(summary) { margin-top: 10px; }
   .lever-list { display: grid; gap: 8px; }
   .lever-row { display: flex; gap: 10px; align-items: start; }
   .lever-row input { margin-top: 3px; accent-color: var(--accent); }
   .lever-text { display: grid; gap: 2px; }
-  .flag-note { font-style: italic; }
   .summary-list { display: grid; gap: 4px; margin: 4px 0 0; }
   .summary-list > div { display: flex; gap: 8px; justify-content: space-between; }
   .summary-list dt { color: var(--muted); font-size: var(--text-meta); }
@@ -1159,11 +833,4 @@
   .section-buttons { display: flex; gap: 8px; }
   .section-error { margin: 0; color: var(--danger); font-size: var(--text-meta); overflow-wrap: anywhere; }
   .section-note { margin: 0; color: var(--accent); font-size: var(--text-meta); }
-  .eval-block { display: grid; gap: 8px; border-top: 1px dashed var(--line); padding-top: 10px; }
-  .eval-report { display: grid; gap: 6px; }
-  .eval-report h4 { margin: 0; font-size: var(--text-meta); }
-  .eval-report table { border-collapse: collapse; font-size: var(--text-meta); }
-  .eval-report th, .eval-report td { padding: 2px 10px 2px 0; text-align: left; }
-  .miss-list { margin: 0; padding-left: 16px; }
-  .status-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 </style>

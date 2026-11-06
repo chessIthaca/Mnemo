@@ -136,6 +136,71 @@ function makeMcpTransport() {
   };
 }
 
+/** A ready Laya transport whose routing wire carries NO `effort` key —
+ * exactly what the real backend sends. The old test fixtures added one,
+ * which is what hid the page's false save prompt for so long. */
+function makeLayaTransport() {
+  const control = {
+    choice: "suggest",
+    mnemo1_enforce: false,
+    laya_routing: true,
+    laya_status: "ready",
+    checkpoint: "Laya (English)",
+    knn_rows: 42,
+    knn_min_rows: 30,
+  };
+  mocks.layaTransport = {
+    status: vi.fn(async () => ({
+      enabled: true,
+      installed: true,
+      status: "ready",
+      flags: {
+        auto_type_memories: true,
+        failure_triage: false,
+        failure_triage_knn: false,
+        auto_finetune: false,
+        steer_tool_choice: false,
+        routing: true,
+        reflex: false,
+      },
+      routing: { threshold: 0.8, first_prompt_min_confidence: null, enforce: false },
+    })),
+    topControl: vi.fn(async () => control),
+    routingStatus: vi.fn(async () => ({
+      settings: {
+        mode: "suggest",
+        min_confidence_4: 0.4,
+        min_confidence_3: 0.475,
+        min_confidence_2: 0.6,
+        knn_min_share: 0.8,
+        knn_min_rows: 30,
+        fallback_tier: "high",
+        nudges: true,
+        min_words: 20,
+      },
+      summary: {
+        decisions_by_mode: { shadow: 31, suggest: 8 },
+        agreement_rate: null,
+        laya_accuracy: null,
+        lead_accuracy: null,
+        labelled: 42,
+        overrides_by_source: {},
+        nudges: 0,
+        nudges_acted_on: 0,
+        eval_date: null,
+      },
+      eval: null,
+    })),
+    setup: vi.fn(async () => undefined),
+    disable: vi.fn(async () => undefined),
+    saveFlag: vi.fn(async () => undefined),
+    checkLaya: vi.fn(async () => undefined),
+    saveTopControl: vi.fn(async () => control),
+    onLayaEvent: vi.fn(async () => () => {}),
+  };
+  return mocks.layaTransport;
+}
+
 async function openDialog() {
   render(SettingsDialog, { open: true, onclose: vi.fn() });
   await screen.findByRole("button", { name: "Edit alpha" });
@@ -464,81 +529,36 @@ describe("SettingsDialog", () => {
     expect(screen.getByText("Model prices are set with each model on the Endpoints page.")).toBeTruthy();
   });
 
-  it("shows the Tiers page's Laya section with status, switches and the kNN count", async () => {
+  it("opens the Tiers page's other Laya features and shows the readiness line", async () => {
     makeTransport();
-    mocks.layaTransport = {
-      status: vi.fn(async () => ({
-        enabled: true,
-        installed: true,
-        status: "ready",
-        flags: {
-          auto_type_memories: true,
-          failure_triage: false,
-          failure_triage_knn: false,
-          auto_finetune: false,
-          steer_tool_choice: false,
-          routing: true,
-          reflex: false,
-        },
-        routing: {
-          threshold: 0.8,
-          first_prompt_min_confidence: null,
-          enforce: false,
-        },
-      })),
-      topControl: vi.fn(async () => ({
-        choice: "suggest",
-        mnemo1_enforce: false,
-        laya_routing: true,
-        laya_status: "ready",
-        checkpoint: "Laya (English)",
-        knn_rows: 42,
-        knn_min_rows: 30,
-      })),
-      routingStatus: vi.fn(async () => ({
-        settings: {
-          mode: "suggest",
-          min_confidence_4: 0.4,
-          min_confidence_3: 0.475,
-          min_confidence_2: 0.6,
-          knn_min_share: 0.8,
-          knn_min_rows: 30,
-          fallback_tier: "high",
-          nudges: true,
-          min_words: 20,
-          effort: {},
-        },
-        summary: {
-          decisions_by_mode: { shadow: 31, suggest: 8 },
-          agreement_rate: null,
-          laya_accuracy: null,
-          lead_accuracy: null,
-          labelled: 42,
-          overrides_by_source: {},
-          nudges: 0,
-          nudges_acted_on: 0,
-          eval_date: null,
-        },
-        eval: null,
-      })),
-      setup: vi.fn(async () => undefined),
-      disable: vi.fn(async () => undefined),
-      save: vi.fn(async () => undefined),
-      saveRoutingSettings: vi.fn(),
-      runRoutingEval: vi.fn(),
-      saveTopControl: vi.fn(),
-      onLayaEvent: vi.fn(async () => () => {}),
-    };
+    makeLayaTransport();
     await openDialog();
     // The retired Decisions tab is gone; the Laya content rides Tiers.
     expect(screen.queryByRole("button", { name: "Decisions" })).toBeNull();
     await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
-    const laya = await screen.findByRole("region", { name: "Laya" });
-    expect(within(laya).getByText("Status: Ready")).toBeTruthy();
+    const other = await screen.findByText("Other things Laya can do");
+    await fireEvent.click(other);
     expect((screen.getByRole("checkbox", { name: /Auto-type memories/ }) as HTMLInputElement).checked).toBe(true);
     // The top control reads its own wire: the checkpoint and the kNN count.
-    expect(await screen.findByText(/kNN: 42 labelled workers/)).toBeTruthy();
+    expect(await screen.findByText(/Learned from 42 finished workers/)).toBeTruthy();
     expect(screen.getByText(/Laya \(English\) ready/)).toBeTruthy();
+  });
+
+  it("passes the store's laya pass to the page", async () => {
+    makeTransport();
+    makeLayaTransport();
+    app.set({
+      ...fixtureState(),
+      indexing: {
+        revision: 3,
+        firstRun: false,
+        code: null,
+        memory: null,
+        laya: { state: "running", done: 34, total: 207, detail: null },
+      },
+    });
+    render(SettingsDialog, { open: true, onclose: vi.fn(), initialPage: "tiers" });
+    expect(await screen.findByText(/Checking Laya/)).toBeTruthy();
   });
 
   it("opens the Tiers page when asked for the retired Decisions page", async () => {
@@ -860,6 +880,20 @@ describe("unsaved edits", () => {
 
     await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Tiers" }).getAttribute("aria-current")).toBe("page"));
+    expect(screen.queryByText("Discard unsaved changes?")).toBeNull();
+    expect(onclose).not.toHaveBeenCalled();
+  });
+
+  it("opening Tiers with no edits does not ask before leaving", async () => {
+    // The routing wire has no `effort` key (see makeLayaTransport), exactly
+    // like the real backend; the old page seeded its draft with one and then
+    // asked about changes that were never made. This is the regression test
+    // for that false save prompt.
+    makeLayaTransport();
+    const onclose = openSettings("tiers");
+    await screen.findByText(/Laya \(English\) ready/);
+    await fireEvent.click(screen.getByRole("button", { name: "Endpoints" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Endpoints" }).getAttribute("aria-current")).toBe("page"));
     expect(screen.queryByText("Discard unsaved changes?")).toBeNull();
     expect(onclose).not.toHaveBeenCalled();
   });

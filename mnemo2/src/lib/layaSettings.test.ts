@@ -1,41 +1,20 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
-  DISPATCH_TIERS,
   LAYA_FLAG_META,
-  LAYA_REFLEX_META,
   LAYA_STATUS_META,
+  checkSummaryText,
   createLayaTransport,
   createTauriLayaTransport,
-  layaStatusHint,
-  routingDraft,
-  routingWire,
+  lowCoverage,
   setPreviewLayaTransport,
-  type LayaFlagKey,
+  type EvalRecord,
   type LayaStatusWord,
   type LayaTransport,
   type LayaTransportBindings,
-  type Mnemo1Routing,
   type TiersTopControl,
 } from "./layaSettings";
 
-/** The Laya section's five wire flag keys — `routing` rides the top control
- * and `reflex` renders with Mnemo1's routing gates. */
-const FIVE_KEYS: LayaFlagKey[] = [
-  "auto_type_memories",
-  "failure_triage",
-  "failure_triage_knn",
-  "auto_finetune",
-  "steer_tool_choice",
-];
-
-/** Mnemo1's routing gates as `laya_status` reports them. */
-const GATES: Mnemo1Routing = {
-  threshold: 0.8,
-  first_prompt_min_confidence: null,
-  enforce: false,
-};
-
-/** A ready top-control wire, for the transport test. */
+/** A ready top-control wire, for the transport tests. */
 const CONTROL: TiersTopControl = {
   choice: "suggest",
   mnemo1_enforce: false,
@@ -45,6 +24,30 @@ const CONTROL: TiersTopControl = {
   knn_rows: 42,
   knn_min_rows: 30,
 };
+
+/** The last check's record, as `routing_settings_status` reports it. */
+const RECORD: EvalRecord = {
+  date: "2026-11-05",
+  min_confidence_4: 0.5,
+  min_confidence_3: 0.475,
+  min_confidence_2: 0.6,
+  routed_share: 0.017,
+  accuracy: 1,
+  fingerprint: null,
+};
+
+/** The Tauri bindings with every invoke recorded, for the transport tests. */
+function recordingBindings() {
+  const calls: { command: string; payload: Record<string, unknown> }[] = [];
+  const bindings = {
+    invoke: (async (command: string, payload?: Record<string, unknown>) => {
+      calls.push({ command, payload: (payload as Record<string, unknown> | undefined) ?? {} });
+      return CONTROL;
+    }) as unknown as LayaTransportBindings["invoke"],
+    listen: (async () => () => {}) as unknown as LayaTransportBindings["listen"],
+  };
+  return { calls, bindings };
+}
 
 describe("layaSettings", () => {
   beforeEach(() => setPreviewLayaTransport(null));
@@ -58,84 +61,48 @@ describe("layaSettings", () => {
     expect(createLayaTransport()).toBeNull();
   });
 
-  it("describes the Laya section's five flags; the routing flag rides the top control and the reflex its own meta", () => {
-    expect(LAYA_FLAG_META.map((flag) => flag.key).sort()).toEqual([...FIVE_KEYS].sort());
+  it("lists the six switches with one plain sentence each, and never the routing flag", () => {
+    expect(LAYA_FLAG_META.map((flag) => flag.key)).toEqual([
+      "auto_type_memories",
+      "failure_triage",
+      "failure_triage_knn",
+      "steer_tool_choice",
+      "reflex",
+      "auto_finetune",
+    ]);
     // Every flag carries a plain one-line explanation.
     for (const flag of LAYA_FLAG_META) expect(flag.explanation.trim()).not.toBe("");
-    // Only auto_finetune rides a base checkpoint; the other classifier tasks warn.
-    for (const flag of LAYA_FLAG_META) {
-      if (flag.key === "auto_finetune") {
-        expect(flag.note).toContain("local");
-        expect(flag.note).toContain("background");
-      } else if (flag.key === "failure_triage_knn") {
-        expect(flag.note).toBeTruthy();
-      } else {
-        expect(flag.note).toContain("fine-tuned checkpoint");
-      }
-    }
-    // The reflex (Mnemo1's plan-step tiers) renders with the routing gates,
-    // so it keeps its own meta and a warning note like the rest.
-    expect(LAYA_REFLEX_META.key).toBe("reflex");
-    expect(LAYA_REFLEX_META.explanation.trim()).not.toBe("");
-    expect(LAYA_REFLEX_META.note).toContain("fine-tuned checkpoint");
+    // The `routing` flag rides the top control; it is not one of the switches.
+    expect(LAYA_FLAG_META.some((flag) => flag.key === "routing")).toBe(false);
   });
 
-  it("words every status and hints each one distinctly", () => {
+  it("words every status", () => {
     const words: LayaStatusWord[] = ["disabled", "not_installed", "installing", "starting", "ready", "failed"];
     expect(new Set(words).size).toBe(6);
     for (const word of words) {
       expect(LAYA_STATUS_META[word].trim()).not.toBe("");
-      expect(layaStatusHint(word).trim()).not.toBe("");
     }
     expect(LAYA_STATUS_META.disabled).toBe("Off");
     expect(LAYA_STATUS_META.not_installed).toBe("Not installed");
   });
 
-  it("seeds a routing draft from the wire gates, with the first-prompt gate as text", () => {
-    expect(routingDraft(GATES)).toEqual({ threshold: "0.8", firstPrompt: "", enforce: false });
-    expect(routingDraft({ ...GATES, first_prompt_min_confidence: 0.5 })).toEqual({
-      threshold: "0.8",
-      firstPrompt: "0.5",
-      enforce: false,
-    });
+  it("words the check summary, and promises the first check before there is one", () => {
+    expect(checkSummaryText(null)).toBe("Not checked yet. Laya checks itself when a project opens.");
+    expect(checkSummaryText(RECORD)).toBe(
+      "Last checked 2026-11-05: confident on 2% of test tasks, 100% of those right.",
+    );
   });
 
-  it("parses the gates into the save payload, keeping enforce through unchanged", () => {
-    const parsed = routingWire({ threshold: " 0.95", firstPrompt: "0.4", enforce: true });
-    expect(parsed.error).toBeUndefined();
-    expect(parsed.value).toEqual({ threshold: 0.95, first_prompt_min_confidence: 0.4, enforce: true });
-  });
-
-  it("clears an empty first-prompt gate back to the kernel default", () => {
-    const parsed = routingWire(routingDraft(GATES));
-    expect(parsed.error).toBeUndefined();
-    expect(parsed.value).toEqual({ threshold: 0.8, first_prompt_min_confidence: null, enforce: false });
-  });
-
-  it("rejects a gate that is not a number from 0 to 1, naming the gate", () => {
-    for (const threshold of ["", "abc", "-0.1", "1.2", "9"]) {
-      const parsed = routingWire({ ...routingDraft(GATES), threshold });
-      expect(parsed.value).toBeUndefined();
-      expect(parsed.error).toBe("Step-lane threshold must be a number from 0 to 1");
-    }
-    const parsed = routingWire({ ...routingDraft(GATES), firstPrompt: "nope" });
-    expect(parsed.value).toBeUndefined();
-    expect(parsed.error).toBe("First-prompt gate must be a number from 0 to 1, or empty for the default");
-  });
-
-  it("lists the four pickable tiers a dispatch can run on — escalate never", () => {
-    expect(DISPATCH_TIERS).toEqual(["trivial", "routine", "medium", "high"]);
+  it("flags low coverage only when Laya answers almost nothing", () => {
+    expect(lowCoverage(null)).toBe(false);
+    expect(lowCoverage(RECORD)).toBe(true);
+    expect(lowCoverage({ ...RECORD, routed_share: 0.5 })).toBe(false);
+    expect(lowCoverage({ ...RECORD, routed_share: null })).toBe(false);
   });
 
   it("wires the top control to its two commands, sending the choice by name", async () => {
-    const calls: { command: string; payload: Record<string, unknown> }[] = [];
-    const transport = createTauriLayaTransport({
-      invoke: (async (command: string, payload?: Record<string, unknown>) => {
-        calls.push({ command, payload: (payload as Record<string, unknown> | undefined) ?? {} });
-        return CONTROL;
-      }) as unknown as LayaTransportBindings["invoke"],
-      listen: (async () => () => {}) as unknown as LayaTransportBindings["listen"],
-    });
+    const { calls, bindings } = recordingBindings();
+    const transport = createTauriLayaTransport(bindings);
     await transport.topControl();
     await transport.saveTopControl("shadow");
     expect(calls.map((call) => call.command)).toEqual([
@@ -143,5 +110,15 @@ describe("layaSettings", () => {
       "save_tiers_top_control",
     ]);
     expect(calls[1].payload).toEqual({ choice: "shadow" });
+  });
+
+  it("saves one flag through save_laya_settings and starts the check through its own command", async () => {
+    const { calls, bindings } = recordingBindings();
+    const transport = createTauriLayaTransport(bindings);
+    await transport.saveFlag("reflex", true);
+    await transport.checkLaya();
+    expect(calls.map((call) => call.command)).toEqual(["save_laya_settings", "laya_check_start"]);
+    // One flag at a time, and never the routing gates — the check owns those.
+    expect(calls[0].payload).toEqual({ flags: { reflex: true }, routing: null });
   });
 });

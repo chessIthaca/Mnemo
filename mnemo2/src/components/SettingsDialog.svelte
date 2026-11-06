@@ -5,7 +5,7 @@
   import { createModelSettingsTransport } from "../lib/modelSettings";
   import { createSafetyTransport } from "../lib/safetySettings";
   import { createAppearanceTransport } from "../lib/sounds";
-  import { currentProject } from "../lib/store";
+  import { app, currentProject } from "../lib/store";
   import { createSettingsTransport, emptyTiers, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import { createSpecsTransport } from "../lib/specsSettings";
@@ -254,7 +254,7 @@
             <p class="settings-empty">Savings settings are available in the desktop app.</p>
           {/if}
         {:else}
-          <TiersPage {transport} {layaTransport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} />
+          <TiersPage {transport} {layaTransport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} evalPass={$app.indexing?.laya ?? null} />
         {/if}
       </section>
     </div>

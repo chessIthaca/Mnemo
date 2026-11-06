@@ -189,4 +189,21 @@ describe("TraceCharts", () => {
     render(TraceCharts, { props: { rows: [], scopeLabel: "this session" } });
     expect(screen.getByText("No model calls in this scope yet.")).toBeTruthy();
   });
+
+  it("plotScale scales the plot heights and defaults to 1", () => {
+    const props: { rows: TraceRow[]; scopeLabel: string } = { rows: [row()], scopeLabel: "this session" };
+
+    const plain = render(TraceCharts, { props: { ...props } });
+    const charts = plain.container.querySelector<HTMLElement>(".charts");
+    expect(charts?.style.getPropertyValue("--plot-scale")).toBe("1");
+
+    const doubled = render(TraceCharts, { props: { ...props, plotScale: 2 } });
+    expect(doubled.container.querySelector<HTMLElement>(".charts")?.style.getPropertyValue("--plot-scale")).toBe("2");
+
+    const huge = render(TraceCharts, { props: { ...props, plotScale: 10 } });
+    expect(huge.container.querySelector<HTMLElement>(".charts")?.style.getPropertyValue("--plot-scale")).toBe("3");
+
+    const tiny = render(TraceCharts, { props: { ...props, plotScale: -1 } });
+    expect(tiny.container.querySelector<HTMLElement>(".charts")?.style.getPropertyValue("--plot-scale")).toBe("0.5");
+  });
 });

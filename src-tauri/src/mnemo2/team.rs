@@ -11130,9 +11130,6 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(persisted.workers[0].error, None);
     }
 
-    /// An audit worker is never mergeable — in particular, a still-running
-    /// (busy) audit must be refused with the audit reason, not the generic
-    /// "worker must be idle" gate, which would hide what it actually is.
     /// A clean merge deletes the worker's branch with Git's safe delete, and
     /// the merge commit keeps the reviewed tip as its second parent, so the
     /// work is still there without the branch ref.

@@ -38,6 +38,7 @@ use super::recall_delta::DeltaDecision;
 use super::StopReason;
 use super::MAX_BAD_JSON_RETRIES;
 use super::MAX_RETRIES;
+use super::TOOL_ERROR_NUDGE_AT;
 use super::REVIEW_REPORT_MAX_FAILURES;
 use crate::memory::{Memory, MemoryTier, ScoredMemory};
 use crate::provider::{
@@ -107,6 +108,12 @@ pub(crate) const CORRECTION_SCHEMA_CAP: usize = 1536;
 /// query lookup so the correction never hijacks the recall query.
 pub(crate) const HARNESS_CORRECTION_PREFIX: &str = "[harness tool-call correction";
 
+/// Prefix marking a harness-attributed tool-error nudge (plan 865249fd): the
+/// consecutive-failing-batch warning pushed when the streak first reaches
+/// [`crate::agent::TOOL_ERROR_NUDGE_AT`]. Shared by the nudge builder and
+/// the auto-recall query lookup so a nudge never hijacks the recall query.
+pub(crate) const HARNESS_ERROR_NUDGE_PREFIX: &str = "[harness tool-error nudge";
+
 /// The pre-prompt routing state for one classified `run_turn` call (backlog
 /// 091e694d): the counters its outcome row needs. `target` is reserved for the
 /// legacy per-iteration arm and is always `None` for route-once.
@@ -161,8 +168,10 @@ pub(crate) struct TurnState {
     /// any non-denial failure counts once (same-time identical failing
     /// calls are one error event — the model sees every error result and
     /// gets a chance to repair); a batch with no failure but at least one
-    /// success resets it to 0. When it reaches MAX_RETRIES the turn is
-    /// aborted so a stuck model can't loop forever.
+    /// success resets it to 0. When it first reaches
+    /// [`crate::agent::TOOL_ERROR_NUDGE_AT`] the harness pushes one
+    /// corrective nudge message (`tool_error_nudge`); when it reaches
+    /// MAX_RETRIES the turn is aborted so a stuck model can't loop forever.
     tool_error_count: u32,
     /// Consecutive bad-JSON counter — LLM-produced malformed/truncated
     /// tool-call arguments. The model can recover by emitting valid JSON,
@@ -1173,7 +1182,9 @@ impl AgentLoop {
             }
 
             // If the model has hit the consecutive-error cap, surface a final
-            // error and stop the turn rather than looping indefinitely.
+            // error and stop the turn rather than looping indefinitely. By
+            // now the harness has already nudged once (TOOL_ERROR_NUDGE_AT,
+            // strictly below the cap) — the model ignored the warning.
             //
             // Terminal exclusivity: emit **only** final Error (no trailing
             // Finished). The provider-exhaustion path already does this. A
@@ -2400,6 +2411,11 @@ impl AgentLoop {
         // result and gets a chance to repair), not N consecutive errors.
         let mut batch_had_error = false;
         let mut batch_had_success = false;
+        // Distinct names of the tools that failed in this batch (plan
+        // 865249fd) — the tool-error nudge names them so the model knows
+        // WHICH calls to stop repeating. Filled only for non-denial
+        // failures, mirroring `batch_had_error`.
+        let mut failed_tools: Vec<String> = Vec::new();
         // Failure triage (Laya, opt-in; backlog 1a4049c1): classify the
         // batch's first non-denial failure ONCE. The class steers the harness
         // auto-retry below (tier 1), the guidance appended to the fed-back
@@ -2699,6 +2715,9 @@ impl AgentLoop {
                 batch_had_success = true;
             } else if !is_user_denial_tool_output(&result.output) {
                 batch_had_error = true;
+                if !failed_tools.contains(&tc.name) {
+                    failed_tools.push(tc.name.clone());
+                }
             }
 
             // Reviewer report-writing retry accounting (backlog 5b46674d):
@@ -3082,6 +3101,10 @@ impl AgentLoop {
         // human input, and it is a plain user-role tail message:
         // cache-stable (the stable head is untouched) and compaction
         // treats it like any user turn.
+        // Whether a corrective message was queued this batch — the
+        // repeat-failure correction wins over the tool-error nudge (one
+        // corrective message per batch, plan 865249fd).
+        let correction_queued = pending_correction.is_some();
         if let Some((tool_name, failed_content)) = pending_correction.take() {
             if let Some(tool) = self.tools.get(&tool_name) {
                 // Render the SAME schema the request carries (plan
@@ -3105,6 +3128,29 @@ impl AgentLoop {
                 // (reduceError counts every error event), none of which
                 // the user wants.
             }
+        }
+
+        // Tool-error nudge (plan 865249fd): when the consecutive
+        // failing-batch streak FIRST reaches TOOL_ERROR_NUDGE_AT, push ONE
+        // corrective nudge message after the batch — the model gets a
+        // warning and a chance to change approach before the MAX_RETRIES
+        // cap cuts the turn off. The exactly-equal check fires it once per
+        // streak (not again at 3, 4, …); the streak resets on a clean
+        // successful batch, so a later streak nudges again. Skipped when a
+        // repeat-failure correction was queued this batch (one corrective
+        // message per batch — the correction wins). Like the correction:
+        // pushed after every tool result (the Anthropic tool_result
+        // ordering holds), harness-attributed, a plain user-role tail
+        // message, and NO event emitted (no red box in the transcript, no
+        // doom-streak extension).
+        if batch_had_error
+            && !correction_queued
+            && state.tool_error_count == TOOL_ERROR_NUDGE_AT
+        {
+            messages.push(Message::user_text(tool_error_nudge(
+                &failed_tools,
+                state.tool_error_count,
+            )));
         }
 
         // The tools phase (stream end → batch finished) is complete:
@@ -5893,18 +5939,25 @@ fn cap_at_whitespace(text: &str, cap: usize) -> &str {
 }
 
 /// The auto-recall query: the latest User-role message text, skipping
-/// harness-attributed corrective messages (repeat-failure circuit
-/// breaker) so a correction never hijacks the recall query for the
-/// remainder of the turn.
+/// harness-attributed messages (the repeat-failure correction and the
+/// tool-error nudge, via [`is_harness_message`]) so neither ever hijacks
+/// the recall query for the remainder of the turn.
 pub(crate) fn last_user_query(messages: &[Message]) -> Option<String> {
     messages
         .iter()
         .rev()
-        .find(|m| {
-            m.role == Role::User
-                && !m.content.as_text().starts_with(HARNESS_CORRECTION_PREFIX)
-        })
+        .find(|m| m.role == Role::User && !is_harness_message(&m.content.as_text()))
         .map(|m| m.content.as_text())
+}
+
+/// Whether `text` starts with a harness-attributed message prefix — the
+/// repeat-failure correction ([`HARNESS_CORRECTION_PREFIX`]) or the
+/// tool-error nudge ([`HARNESS_ERROR_NUDGE_PREFIX`]). Both ride the
+/// provider-facing message list as user-role tails but must never pass as
+/// user input (e.g. in the auto-recall query).
+pub(crate) fn is_harness_message(text: &str) -> bool {
+    text.starts_with(HARNESS_CORRECTION_PREFIX)
+        || text.starts_with(HARNESS_ERROR_NUDGE_PREFIX)
 }
 
 /// The per-call bad-JSON retry guidance (the FIRST failure): it NAMES the
@@ -6032,6 +6085,30 @@ fn tool_call_correction(tool_name: &str, failed_content: &str, schema: &ToolSche
          do not resend the previous arguments unchanged.\n\
          The `{tool_name}` tool's schema:\n{}",
         render_correction_schema(schema)
+    )
+}
+
+/// Build the harness-attributed tool-error nudge (plan 865249fd): pushed
+/// once per error streak when `tool_error_count` first reaches
+/// [`crate::agent::TOOL_ERROR_NUDGE_AT`]. It names the tools that failed
+/// in the current batch (distinct names, at most three) and tells the
+/// model to change approach BEFORE the MAX_RETRIES cap cuts the turn off.
+fn tool_error_nudge(failed_tools: &[String], streak: u32) -> String {
+    let mut tools = failed_tools
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if failed_tools.len() > 3 {
+        tools.push_str(", …");
+    }
+    format!(
+        "{HARNESS_ERROR_NUDGE_PREFIX} — not the user]\n\
+         {streak} tool-call batches in a row have failed (latest: {tools}). Read the error \
+         text in the failed results, fix the cause in the arguments or choose a different \
+         approach; do not resend the same call. If the next batch fails too, change tactics \
+         completely, and if it still fails stop and report what failed instead of retrying."
     )
 }
 

@@ -49,6 +49,8 @@
   const SEARCH_DEBOUNCE_MS = 300;
   const LIST_WIDTH_MIN = 300;
   const LIST_WIDTH_MAX = 720;
+  const INSIGHTS_HEIGHT_MIN = 160;
+  const INSIGHTS_HEIGHT_MAX = 900;
 
   function errorMessage(value: unknown): string {
     return value instanceof Error ? value.message : String(value);
@@ -87,6 +89,15 @@
   let narrow = $state(false);
   let dragging = $state(false);
   let columns: HTMLElement | undefined = $state();
+
+  // The Insights charts' body height in px; null keeps the natural layout.
+  let insightsHeight = $state<number | null>(null);
+  let insightsDragging = $state(false);
+  let insightsBody: HTMLElement | undefined = $state();
+  let traceRoot: HTMLElement | undefined = $state();
+  let plotScale = $state(1);
+  // Plain mirror of the scale currently applied to the plots, for measuring.
+  let appliedScale = 1;
 
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
   let reloadToken = 0;
@@ -173,7 +184,7 @@
   }
 
   function savePrefs(): void {
-    saveTracePrefs($app.projectId, { ...filters, insightsOpen, listWidth });
+    saveTracePrefs($app.projectId, { ...filters, insightsOpen, listWidth, insightsHeight });
   }
 
   /** Coalesce rapid filter changes into one reload. */
@@ -654,7 +665,7 @@
     if (!dragging) return;
     dragging = false;
     const target = event.currentTarget as HTMLElement | null;
-    target?.releasePointerCapture(event.pointerId);
+    target?.releasePointerCapture?.(event.pointerId);
     savePrefs();
   }
 
@@ -668,6 +679,91 @@
     event.preventDefault();
     savePrefs();
   }
+
+  // The Insights charts' drag divider: pointer drag, arrow keys, saved height.
+  function onInsightsDividerPointerDown(event: PointerEvent) {
+    insightsDragging = true;
+    const target = event.currentTarget as HTMLElement | null;
+    target?.setPointerCapture?.(event.pointerId);
+  }
+
+  function onInsightsDividerPointerMove(event: PointerEvent) {
+    if (!insightsDragging || insightsBody === undefined) return;
+    const rect = insightsBody.getBoundingClientRect();
+    insightsHeight = clampInsightsHeight(Math.round(event.clientY - rect.top));
+  }
+
+  function onInsightsDividerPointerUp(event: PointerEvent) {
+    if (!insightsDragging) return;
+    insightsDragging = false;
+    const target = event.currentTarget as HTMLElement | null;
+    target?.releasePointerCapture?.(event.pointerId);
+    savePrefs();
+  }
+
+  function onInsightsDividerKeydown(event: KeyboardEvent) {
+    const step = event.shiftKey ? 60 : 20;
+    const base = insightsHeight ?? insightsBody?.offsetHeight ?? 0;
+    if (event.key === "ArrowDown") {
+      insightsHeight = clampInsightsHeight(base + step);
+    } else if (event.key === "ArrowUp") {
+      insightsHeight = clampInsightsHeight(base - step);
+    } else if (event.key === "Home") {
+      resetInsightsHeight();
+    } else return;
+    event.preventDefault();
+    savePrefs();
+  }
+
+  /** Drop the fixed height and return to the natural layout. */
+  function resetInsightsHeight(): void {
+    insightsHeight = null;
+    savePrefs();
+  }
+
+  /** The largest charts height that still leaves the call list visible. */
+  function insightsHeightMax(): number {
+    const view = traceRoot?.getBoundingClientRect().height ?? 0;
+    return view > 0 ? Math.min(INSIGHTS_HEIGHT_MAX, Math.round(view - 220)) : INSIGHTS_HEIGHT_MAX;
+  }
+
+  function clampInsightsHeight(height: number): number {
+    return Math.max(INSIGHTS_HEIGHT_MIN, Math.min(insightsHeightMax(), height));
+  }
+
+  // Dragging the divider selects no text anywhere on the page.
+  $effect(() => {
+    if (!insightsDragging) return;
+    document.body.classList.add("resizing");
+    return () => document.body.classList.remove("resizing");
+  });
+
+  // Scale the plots so the charts' content tracks the dragged height.
+  $effect(() => {
+    const height = insightsHeight;
+    const body = insightsBody;
+    if (height === null || body === undefined) {
+      plotScale = 1;
+      appliedScale = 1;
+      return;
+    }
+    let plotsSum = 0;
+    for (const plot of body.querySelectorAll<HTMLElement>("[data-plot]")) {
+      plotsSum += plot.offsetHeight;
+    }
+    // The content stack's own height: scrollHeight would clamp to the fixed
+    // box height whenever the box is taller than the content.
+    const natural = (body.firstElementChild as HTMLElement | null)?.offsetHeight ?? body.scrollHeight;
+    if (plotsSum <= 0) {
+      plotScale = 1;
+      appliedScale = 1;
+      return;
+    }
+    const plotsBase = plotsSum / appliedScale;
+    const nonPlot = natural - plotsSum;
+    appliedScale = Math.min(3, Math.max(0.5, (height - nonPlot) / plotsBase));
+    plotScale = appliedScale;
+  });
 
   function toLocalInput(ms: number | null): string {
     if (ms === null) return "";
@@ -685,6 +781,9 @@
       insightsOpen = prefs.insightsOpen ?? true;
       if (typeof prefs.listWidth === "number") {
         listWidth = Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, prefs.listWidth));
+      }
+      if (typeof prefs.insightsHeight === "number" && Number.isFinite(prefs.insightsHeight)) {
+        insightsHeight = Math.min(INSIGHTS_HEIGHT_MAX, Math.max(INSIGHTS_HEIGHT_MIN, prefs.insightsHeight));
       }
     }
     // An entry hand-over wins over the saved filters when one is waiting.
@@ -730,7 +829,7 @@
     savePrefs();
     void reload().then(() => openEntrySelection(wanted));
   });
-</script><section class="trace-view" aria-label="Trace">
+</script><section class="trace-view" aria-label="Trace" bind:this={traceRoot}>
   <header class="trace-head">
     <div>
       <h1>Trace</h1>
@@ -942,9 +1041,26 @@
         {insightsOpen ? "Hide charts" : "Insights"}
       </button>
       {#if insightsOpen}
-        <div class="insights-body">
-          <TraceCharts rows={rows} scopeLabel={insightsScopeLabel} onbucket={applyBucket} />
+        <div
+          class="insights-body"
+          bind:this={insightsBody}
+          style:height={insightsHeight === null ? undefined : `${insightsHeight}px`}
+          style:overflow={insightsHeight === null ? undefined : "auto"}
+        >
+          <TraceCharts rows={rows} scopeLabel={insightsScopeLabel} plotScale={plotScale} onbucket={applyBucket} />
         </div>
+        <button
+          type="button"
+          class="insights-divider"
+          aria-label="Resize the charts (drag or arrow keys)"
+          title="Drag or use arrow keys to resize the charts. Double-click resets."
+          onpointerdown={onInsightsDividerPointerDown}
+          onpointermove={onInsightsDividerPointerMove}
+          onpointerup={onInsightsDividerPointerUp}
+          onpointercancel={onInsightsDividerPointerUp}
+          onkeydown={onInsightsDividerKeydown}
+          ondblclick={resetInsightsHeight}
+        ></button>
       {/if}
     </section>
 
@@ -1113,6 +1229,12 @@
   .insights-toggle { padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: var(--text-meta); font-weight: 650; }
   .insights-toggle:hover { border-color: var(--accent); color: var(--accent-strong); }
   .insights-body { margin-top: 10px; }
+  .insights-divider { display: block; width: 100%; height: 12px; margin: 2px 0 0; padding: 0; border: 0; background: transparent; cursor: row-resize; touch-action: none; }
+  .insights-divider::after { display: block; margin: 5px 0; height: 2px; border-top: 1px solid transparent; content: ""; }
+  .insights-divider:hover::after, .insights-divider:focus-visible::after { border-top-color: var(--accent); }
+  .insights-divider:focus { outline: none; }
+  .insights-divider:focus-visible { outline: none; }
+  :global(body.resizing) { user-select: none; }
   .data-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 8px 26px 4px; border-top: 1px solid var(--line); }
   .data-group { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .data-group.maintenance { margin-left: auto; }

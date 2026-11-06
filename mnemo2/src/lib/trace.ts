@@ -1415,6 +1415,8 @@ export interface TraceViewPrefs extends Partial<TraceFilters> {
   insightsOpen?: boolean;
   /** The list column's width in px; null keeps the 420 px default. */
   listWidth?: number | null;
+  /** The Insights charts' height in px; null or absent keeps the natural layout. */
+  insightsHeight?: number | null;
 }
 
 const PREF_KEY_PREFIX = "mnemo2.trace.";

@@ -593,6 +593,117 @@ describe("TraceView", () => {
     expect(screen.getByRole("button", { name: "Insights" })).toBeTruthy();
   });
 
+  it("the insights divider is a horizontal separator under the charts", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    const { container } = render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("region", { name: "Insights" })).toBeTruthy());
+
+    const divider = screen.getByRole("button", { name: "Resize the charts (drag or arrow keys)" });
+    expect(divider.getAttribute("aria-label")).toBe("Resize the charts (drag or arrow keys)");
+    // The bar sits directly under the charts body.
+    expect(container.querySelector(".insights-body")?.nextElementSibling).toBe(divider);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Hide charts" }));
+    await vi.waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Resize the charts (drag or arrow keys)" })).toBeNull(),
+    );
+  });
+
+  it("dragging the insights divider changes the charts height within its bounds", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    const { container } = render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("region", { name: "Insights" })).toBeTruthy());
+
+    const divider = screen.getByRole("button", { name: "Resize the charts (drag or arrow keys)" });
+    const body = container.querySelector<HTMLElement>(".insights-body");
+    expect(body?.style.height).toBe("");
+
+    const rect = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 100,
+      top: 100,
+      left: 0,
+      right: 800,
+      bottom: 600,
+      width: 800,
+      height: 500,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    await fireEvent.pointerDown(divider, { pointerId: 1 });
+    await fireEvent.pointerMove(divider, { pointerId: 1, clientY: 350 });
+    expect(body?.style.height).toBe("250px");
+
+    // Dragging far past the view clamps to the room that leaves the call list visible.
+    await fireEvent.pointerMove(divider, { pointerId: 1, clientY: 5000 });
+    const capped = Number((body?.style.height ?? "").replace("px", ""));
+    expect(capped).toBeLessThanOrEqual(900);
+    expect(capped).toBeGreaterThan(160);
+
+    await fireEvent.pointerMove(divider, { pointerId: 1, clientY: 40 });
+    expect(body?.style.height).toBe("160px");
+
+    await fireEvent.pointerUp(divider, { pointerId: 1 });
+    expect(JSON.parse(window.localStorage.getItem("mnemo2.trace.mnemo") ?? "{}").insightsHeight).toBe(160);
+
+    rect.mockRestore();
+  });
+
+  it("arrow keys shift and Home resize and reset the insights height", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    window.localStorage.setItem("mnemo2.trace.mnemo", JSON.stringify({ insightsOpen: true, insightsHeight: 400 }));
+    const { container } = render(TraceView);
+    await vi.waitFor(() => expect(screen.getByRole("region", { name: "Insights" })).toBeTruthy());
+
+    const divider = screen.getByRole("button", { name: "Resize the charts (drag or arrow keys)" });
+    const body = container.querySelector<HTMLElement>(".insights-body");
+    await vi.waitFor(() => expect(body?.style.height).toBe("400px"));
+
+    await fireEvent.keyDown(divider, { key: "ArrowDown" });
+    expect(body?.style.height).toBe("420px");
+    await fireEvent.keyDown(divider, { key: "ArrowDown", shiftKey: true });
+    expect(body?.style.height).toBe("480px");
+    await fireEvent.keyDown(divider, { key: "ArrowUp" });
+    expect(body?.style.height).toBe("460px");
+
+    await fireEvent.keyDown(divider, { key: "Home" });
+    expect(body?.style.height).toBe("");
+    expect(JSON.parse(window.localStorage.getItem("mnemo2.trace.mnemo") ?? "{}").insightsHeight).toBeNull();
+  });
+
+  it("the saved insights height is restored, clamped and ignored when not a number", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+
+    window.localStorage.setItem("mnemo2.trace.mnemo", JSON.stringify({ insightsOpen: true, insightsHeight: 400 }));
+    const restored = render(TraceView);
+    await vi.waitFor(() =>
+      expect(restored.container.querySelector<HTMLElement>(".insights-body")?.style.height).toBe("400px"),
+    );
+    restored.unmount();
+
+    window.localStorage.setItem("mnemo2.trace.mnemo", JSON.stringify({ insightsOpen: true, insightsHeight: 99999 }));
+    const clamped = render(TraceView);
+    await vi.waitFor(() =>
+      expect(clamped.container.querySelector<HTMLElement>(".insights-body")?.style.height).toBe("900px"),
+    );
+    clamped.unmount();
+
+    window.localStorage.setItem("mnemo2.trace.mnemo", JSON.stringify({ insightsOpen: true, insightsHeight: "tall" }));
+    const textual = render(TraceView);
+    await vi.waitFor(() => expect(textual.container.querySelector(".insights-body")).toBeTruthy());
+    expect(textual.container.querySelector<HTMLElement>(".insights-body")?.style.height).toBe("");
+    textual.unmount();
+
+    window.localStorage.setItem("mnemo2.trace.mnemo", JSON.stringify({ insightsOpen: true, insightsHeight: null }));
+    const absent = render(TraceView);
+    await vi.waitFor(() => expect(absent.container.querySelector(".insights-body")).toBeTruthy());
+    expect(absent.container.querySelector<HTMLElement>(".insights-body")?.style.height).toBe("");
+  });
+
   it("exports the open call, shows the bundle path and reveals it on demand", async () => {
     installTransport();
     const row = callRow({ id: 7 });

@@ -860,6 +860,21 @@ pub struct MemoryUpdateTool {
     knowledge: Option<KnowledgeSupport>,
 }
 
+/// The refusal message for a database-only edit of a derived (indexer-built)
+/// row (plan 1b46d19e): its source FILE is the truth and the indexer rebuilds
+/// the row from it, so a stored-row edit is either overwritten by the next
+/// reindex or leaves the row disagreeing with its file. Names the sanctioned
+/// fix instead of silently routing the edit to the database.
+fn derived_row_refusal(id: &str, title: &str) -> String {
+    format!(
+        "memory {id} ('{title}') is a derived record — its source file is the truth \
+         and the row is rebuilt from it, so a database-only edit would not stick \
+         and would leave the row disagreeing with its file. Edit the source file \
+         instead (for a knowledge record: memory_amend to add text, memory_supersede \
+         to replace it) or run a reindex."
+    )
+}
+
 impl MemoryUpdateTool {
     pub fn new(store: Arc<dyn MemoryStoreTrait>) -> Self {
         Self {
@@ -897,7 +912,16 @@ impl MemoryUpdateTool {
             };
         }
         let current = match self.store.get_memory(id).await {
-            Ok(Some(m)) => m.content,
+            Ok(Some(m)) => {
+                // A derived row is rebuilt from its source file by the
+                // indexer — a stored-row repair is either overwritten by the
+                // next reindex or leaves the row disagreeing with its file
+                // (plan 1b46d19e).
+                if m.record_class == MemoryClass::Derived {
+                    return ToolResult::error(derived_row_refusal(id, &m.title));
+                }
+                m.content
+            }
             Ok(None) => {
                 return ToolResult::error(format!(
                     "no memory with id '{id}' — nothing was updated (find ids via \
@@ -1065,6 +1089,18 @@ impl Tool for MemoryUpdateTool {
                 Err(e) => ToolResult::error(format!("failed to update knowledge record: {e}")),
             }
         } else {
+            // No working file path for this id — but a DERIVED row still has a
+            // source file the indexer rebuilds it from, so a database-only
+            // edit is refused rather than silently diverging from that file
+            // (plan 1b46d19e). An unknown id still falls through to the
+            // existing "no memory with id" error below.
+            match self.store.get_memory(&id).await {
+                Ok(Some(m)) if m.record_class == MemoryClass::Derived => {
+                    return ToolResult::error(derived_row_refusal(&id, &m.title))
+                }
+                Ok(_) => {}
+                Err(e) => return ToolResult::error(format!("failed to read memory: {e}")),
+            }
             match self
                 .store
                 .update_memory(&id, args.title.as_deref(), args.content.as_deref())
@@ -2561,6 +2597,91 @@ mod tests {
         );
         let m = store.get_memory(&id).await.unwrap().unwrap();
         assert_eq!(m.content, "we use jsonwebtoken for JWT");
+    }
+
+    /// Plan 1b46d19e step 2: a derived knowledge row is rebuilt from its
+    /// source FILE, so a database-only `memory_update` is refused with a
+    /// message naming the fix — title/content and find+replace alike — and
+    /// the row is left byte-identical.
+    #[tokio::test]
+    async fn update_refuses_a_database_only_edit_of_a_derived_knowledge_row() {
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let ks = KnowledgeStore::new(dir.path().join(".coding/knowledge"));
+        let rel = ks
+            .write(
+                MemoryRecordType::Decision,
+                "DECISION: storage",
+                "the store is sqlite",
+            )
+            .unwrap();
+        reindex_knowledge_files(store.as_ref(), ks.dir(), std::slice::from_ref(&rel))
+            .await
+            .unwrap();
+        let id = crate::memory::indexer::knowledge_id(&rel);
+        let before = store.get_memory(&id).await.unwrap().unwrap();
+        assert_eq!(
+            before.record_class,
+            MemoryClass::Derived,
+            "the indexer writes the knowledge row as derived"
+        );
+
+        // No knowledge backing on this tool: the id resolves to no working
+        // file path, which is exactly the database-only branch.
+        let update = MemoryUpdateTool::new(store.clone());
+        for args in [
+            json!({ "id": id.clone(), "content": "overwritten" }),
+            json!({ "id": id.clone(), "title": "untyped" }),
+            json!({ "id": id.clone(), "find": "sqlite", "replace_with": "postgres" }),
+        ] {
+            let result = update.execute(args).await;
+            assert!(!result.success, "{} was not refused", result.output);
+            assert!(
+                result.output.contains("derived record"),
+                "the refusal names the record class: {}",
+                result.output
+            );
+        }
+        let after = store.get_memory(&id).await.unwrap().unwrap();
+        assert_eq!(after.title, before.title, "the typed title survived");
+        assert_eq!(after.content, before.content, "the file digest survived");
+    }
+
+    /// Plan 1b46d19e step 2: a derived row that lost its `data.rel_path` has
+    /// no working file path — `memory_update` refuses instead of silently
+    /// rewriting the stored row, for both the title/content and the
+    /// find+replace forms.
+    #[tokio::test]
+    async fn update_refuses_a_derived_row_that_lost_its_rel_path() {
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, _write, update, _supersede, _delete) =
+            make_knowledge_tools(&dir, store.clone());
+        let mut m = crate::memory::Memory::new(
+            crate::memory::MemoryTier::Semantic,
+            "DECISION: lost its path",
+            "stale digest",
+            1,
+        );
+        m.id = "derived-orphan".to_string();
+        m.record_class = MemoryClass::Derived;
+        m.data = json!({});
+        store.write(m).await.unwrap();
+
+        for args in [
+            json!({ "id": "derived-orphan", "content": "overwritten" }),
+            json!({ "id": "derived-orphan", "find": "stale", "replace_with": "fresh" }),
+        ] {
+            let result = update.execute(args).await;
+            assert!(!result.success, "{} was not refused", result.output);
+            assert!(
+                result.output.contains("derived record"),
+                "the refusal names the record class: {}",
+                result.output
+            );
+        }
+        let row = store.get_memory("derived-orphan").await.unwrap().unwrap();
+        assert_eq!(row.content, "stale digest", "the row is unchanged");
     }
 
     #[tokio::test]

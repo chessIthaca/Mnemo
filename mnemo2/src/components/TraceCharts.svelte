@@ -31,13 +31,23 @@
     rows,
     scopeLabel,
     onbucket,
+    plotScale = 1,
   }: {
     rows: TraceRow[];
     /** The filter summary, e.g. "this session" or "lead · last hour". */
     scopeLabel: string;
     /** Apply a cost bucket as the page's time filter (half-open range). */
     onbucket?: (from_ms: number, to_ms: number) => void;
+    /** Plot height scale; 1 renders today's fixed heights, clamped to 0.5–3. */
+    plotScale?: number;
   } = $props();
+
+  /** Clamp the caller's plot scale into the supported 0.5–3 range. */
+  function clampScale(value: number): number {
+    return Math.min(3, Math.max(0.5, value));
+  }
+
+  const scale = $derived(clampScale(plotScale));
 
   type Tab = "timing" | "tokens" | "cost";
 
@@ -56,7 +66,8 @@
   const TIMING_COLORS: Record<string, string> = {
     retry: "var(--warning)",
     setup: "var(--ink-soft)",
-    connect: "var(--running-ink)",
+    upload: "var(--code-number)",
+    server: "var(--running-ink)",
     firstToken: "var(--code-keyword)",
     generation: "var(--accent)",
     tools: "var(--event-review-ink)",
@@ -208,7 +219,7 @@
   </div>
 {/snippet}
 
-<section class="charts" aria-label="Insights">
+<section class="charts" aria-label="Insights" style:--plot-scale={scale}>
   <header class="charts-head">
     <div class="charts-title">
       <ChartColumn size={15} aria-hidden="true" />
@@ -292,7 +303,7 @@
             {/each}
           </div>
 
-          <div class="chart" role="img" aria-label="Timing per call; values are in the table below.">
+          <div class="chart" data-plot role="img" aria-label="Timing per call; values are in the table below.">
             {#each timing.columns as column, index (column.key)}
               <div class="col" title={timingTip(column)}>
                 <div class="track">
@@ -342,7 +353,8 @@
                     <th scope="col">Call</th>
                     <th scope="col">Setup</th>
                     <th scope="col">Compaction (in Setup)</th>
-                    <th scope="col">Connect</th>
+                    <th scope="col">Upload</th>
+                    <th scope="col">Server wait</th>
                     <th scope="col">First token</th>
                     <th scope="col">Generation</th>
                     <th scope="col">Stalls (in Generation)</th>
@@ -357,7 +369,8 @@
                       <th scope="row">{column.clock}</th>
                       <td>{durationCell(column.setupMs)}</td>
                       <td>{durationCell(column.compactionMs)}</td>
-                      <td>{durationCell(column.connectMs)}</td>
+                      <td>{durationCell(column.uploadMs)}</td>
+                      <td>{durationCell(column.serverMs)}</td>
                       <td>{durationCell(column.firstTokenMs)}</td>
                       <td>{durationCell(column.generationMs)}</td>
                       <td>{durationCell(column.stallMs)}</td>
@@ -420,7 +433,7 @@
             {/each}
           </div>
 
-          <div class="chart" role="img" aria-label="Tokens per call; values are in the table below.">
+          <div class="chart" data-plot role="img" aria-label="Tokens per call; values are in the table below.">
             {#each tokens.columns as column, index (column.key)}
               <div class="col" title={tokenTip(column)}>
                 <div class="track">
@@ -563,7 +576,7 @@
             {/if}
           </div>
 
-          <div class="chart cost-chart" role="group" aria-label="Estimated cost per time bucket; values are in the table below.">
+          <div class="chart cost-chart" data-plot role="group" aria-label="Estimated cost per time bucket; values are in the table below.">
             {#each cost.buckets as bucket, index (bucket.startMs)}
               {#if onbucket && bucket.calls > 0}
                 <button
@@ -788,7 +801,7 @@
     display: flex;
     align-items: stretch;
     gap: 2px;
-    height: 132px;
+    height: calc(132px * var(--plot-scale, 1));
     padding: 6px 2px 2px;
     overflow-x: auto;
     overflow-y: hidden;
@@ -905,7 +918,7 @@
   }
 
   .cost-chart {
-    height: 120px;
+    height: calc(120px * var(--plot-scale, 1));
   }
   .bucket {
     padding: 0;

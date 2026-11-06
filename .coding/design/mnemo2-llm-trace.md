@@ -121,8 +121,8 @@ Rows never show raw error text, base URLs, finish reasons, or a wall of badges. 
 │ same model pricing as Cost.                                             │
 │                                                                      │
 │ Where time went                                                       │
-│ Setup 0.2s → Connect 0.4s → First token 1.1s → Generation 5.9s       │
-│              └ Retry wait 0.8s     └ Includes stalls 0.6s             │
+│ Setup 0.2s → Upload 0.1s → Server wait 0.3s → Generation 5.9s        │
+│              └ Retry wait 0.8s     └ Reasoning 5.1s · stalls 0.6s    │
 │ Tools 0.8s (after the model response; not part of request duration)   │
 │ [Timeline bar with proportional segments and numeric fallbacks]       │
 │ Finish: tool_calls · HTTP 200 · Provider: zai · Endpoint host on hover│
@@ -180,13 +180,13 @@ Use one collapsible **Insights** panel with three tabs, driven by exactly the fi
 Insights   ( Timing ) ( Tokens ) ( Cost )                       Hide
 ┌ Where did request time go? ──────────────────────────────────────────┐
 │ ms ▲                        ▁▂██▂▃                                   │
-│    │ Setup ■ Connect ■ First token ■ Generation ■ Tools ■ Retry ■  │
+│    │ Setup ■ Upload ■ Server wait ■ Generation ■ Tools ■ Retry ■   │
 │    │ Generation bars carry a darker Stall overlay, not extra width. │
 │    └──────────────────────── call start time ─────────────────────▶│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Timing:** keep Mnemo1's per-call stacked concept and error/service/cut indicators, but use friendly labels and the phase spec exactly. Setup (`prep_ms`) contains Compaction (`compact_ms`); Connect (`connect_ms`) is headers wait; First token (`ttft_ms`) follows headers; Generation (`generation_ms`) contains Stall (`stall_ms`); Retry wait (`backoff_ms`) precedes its attempt; Tools (`tools_ms`) is after the response. Never present these as one additive total. Retain only the Total time column option initially; drop the column customization system unless review finds a need.
+**Timing:** keep Mnemo1's per-call stacked concept and error/service/cut indicators, but use friendly labels and the phase spec exactly. Setup (`prep_ms`) contains Compaction (`compact_ms`); the connect window splits into Upload (`upload_ms`, POST sent → request body fully written) and Server wait (`server_ms`, upload done → response headers — for SSE providers headers arrive with the first chunk, so this carries the server's queue + prefill); Connect (`connect_ms`, record creation → headers) and First token (`ttft_ms`) are metric chips, not bar segments; Generation (`generation_ms`) contains Reasoning (`reasoning_ms`) and Stall (`stall_ms`); Retry wait (`backoff_ms`) precedes its attempt; Tools (`tools_ms`) is after the response; `chunks` counts SSE byte-chunks read. Bar segments are non-overlapping; never present them as one additive total. Retain only the Total time column option initially; drop the column customization system unless review finds a need.
 
 **Tokens:** keep the per-call stacked chart with four non-overlapping segments: uncached input `prompt - cached`, cached input `cached`, visible output `completion - reasoning`, and reasoning output `reasoning`. Saturate at zero for inconsistent provider reports. The total is `prompt + completion`; reasoning is never added twice. A Cache reuse summary reports `sum(cached) / sum(prompt)`, not an average of row percentages.
 
@@ -236,10 +236,12 @@ Every label below has a hover/focus explanation and an accessible text value. Te
 | **Estimated cost** | shared `price_tokens` rule | Estimate from current model pricing and final token counts. It can differ from the provider bill and is unavailable without a price. |
 | **Setup** | `prep_ms` | Local time preparing the request: routing, token accounting, recall, and prompt building. |
 | **Compaction** | `compact_ms` | Time spent shortening earlier context. Included in Setup, not extra time. |
-| **Connect** | `connect_ms` | Time from sending the request until response headers arrive: connection, upload, and server acknowledgement. |
-| **First token** | `ttft_ms` | Wait after response headers until the first streamed chunk. |
+| **Connect** | `connect_ms` | Record creation → response headers (compatibility metric, ≈ upload + server wait). For SSE providers headers arrive with the first chunk, so this includes the server's queue + prefill. |
+| **Upload** | `upload_ms` | POST sent → request body fully written to the socket. |
+| **Server wait** | `server_ms` | Upload done → response headers: the server's queue and prefill before the first token. |
+| **First token** | `ttft_ms` | POST sent → first streamed chunk; a metric chip, not a bar segment. |
 | **Generation** | `generation_ms` | Time from the first chunk until the final response/usage chunk. |
-| **Stalls** | `stall_ms` | Silences of more than one second inside Generation. Included in Generation, not extra time. |
+| **Stalls** | `stall_ms` | Silences of more than two seconds inside Generation. Included in Generation, not extra time. |
 | **Tools** | `tools_ms` | Time running the tools requested by this response, after model streaming ends. |
 | **Retry wait** | `backoff_ms` | Delay before a retry attempt; never counted again as Connect. |
 | **Finish** | `finish_reason` | Why the model stopped, translated where known (Completed, Tool calls, Length limit). |

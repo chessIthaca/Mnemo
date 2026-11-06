@@ -2935,6 +2935,175 @@ mod tests {
         fixture.shutdown().await;
     }
 
+    /// The spec-impact gate: a plan whose steps touch a capability's
+    /// governed files is refused without a spec delta for it or an
+    /// explicit no-impact declaration; the refusal names the capability
+    /// and both remedies, and each remedy passes.
+    #[tokio::test]
+    async fn plan_create_refuses_governed_files_without_a_spec_delta() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        std::fs::create_dir_all(fixture.root.join(".coding/openspec")).unwrap();
+        std::fs::write(
+            fixture.root.join(".coding/openspec/config.yaml"),
+            "governed_files:\n  dispatch-routing:\n    - src-tauri/src/mnemo2/team.rs\n",
+        )
+        .unwrap();
+
+        let searched = fixture
+            .call("memory_search", json!({"query": "dispatch routing"}))
+            .await;
+        ok_text(&searched);
+
+        let mut governed = plan_args("Gate the routing table");
+        governed["steps"] =
+            json!(["Edit src-tauri/src/mnemo2/team.rs to gate the routing table"]);
+        let refused = fixture.call("plan_create", governed.clone()).await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("dispatch-routing"), "{text}");
+        assert!(text.contains("spec_deltas"), "{text}");
+        assert!(text.contains("spec_impact"), "{text}");
+
+        // Remedy 1: a spec delta for the capability passes.
+        let mut with_delta = governed.clone();
+        with_delta["spec_deltas"] = json!([{
+            "capability": "dispatch-routing",
+            "added": [{
+                "requirement": "Gate the routing table",
+                "text": "The system SHALL gate the routing table.",
+                "scenarios": [{
+                    "name": "Gated table",
+                    "when": ["a plan's steps touch the routing table"],
+                    "then": ["the gate fires"],
+                    "and": []
+                }]
+            }]
+        }]);
+        let created = ok_text(&fixture.call("plan_create", with_delta).await);
+        assert!(created.contains("Created plan"), "{created}");
+
+        // Remedy 2: the explicit no-impact declaration passes and is
+        // recorded on the plan.
+        let searched = fixture
+            .call("memory_search", json!({"query": "dispatch routing again"}))
+            .await;
+        ok_text(&searched);
+        let mut declared = governed;
+        declared["spec_impact"] =
+            json!({"none": true, "reason": "comment-only change, no behavior moves"});
+        let created = ok_text(&fixture.call("plan_create", declared).await);
+        assert!(created.contains("Created plan"), "{created}");
+        let board = std::fs::read_to_string(
+            fixture.root.join(".coding").join("plans").join("board.json"),
+        )
+        .unwrap();
+        assert!(board.contains("no_spec_impact"), "{board}");
+        assert!(board.contains("comment-only change"), "{board}");
+
+        fixture.shutdown().await;
+    }
+
+    /// A plan touching only un-governed files creates freely, and
+    /// plan_update add_steps applies the same gate to steps added after
+    /// creation.
+    #[tokio::test]
+    async fn plan_update_add_steps_runs_the_spec_impact_gate() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        std::fs::create_dir_all(fixture.root.join(".coding/openspec")).unwrap();
+        std::fs::write(
+            fixture.root.join(".coding/openspec/config.yaml"),
+            "governed_files:\n  dispatch-routing:\n    - src-tauri/src/mnemo2/team.rs\n",
+        )
+        .unwrap();
+
+        let searched = fixture
+            .call("memory_search", json!({"query": "dispatch routing"}))
+            .await;
+        ok_text(&searched);
+        let created = ok_text(&fixture.call("plan_create", plan_args("Free plan")).await);
+        assert!(created.contains("Created plan"), "{created}");
+        let id = created
+            .split_whitespace()
+            .nth(2)
+            .expect("plan id")
+            .to_string();
+
+        let refused = fixture
+            .call(
+                "plan_update",
+                json!({
+                    "plan_id": id,
+                    "add_steps": ["Edit src-tauri/src/mnemo2/team.rs to extend the gate"],
+                }),
+            )
+            .await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("dispatch-routing"), "{text}");
+
+        // The same step passes once the update carries a delta for the
+        // capability.
+        let updated = fixture
+            .call(
+                "plan_update",
+                json!({
+                    "plan_id": id,
+                    "add_steps": ["Edit src-tauri/src/mnemo2/team.rs to extend the gate"],
+                    "spec_deltas": [{
+                        "capability": "dispatch-routing",
+                        "added": [{
+                            "requirement": "Extend the gate",
+                            "text": "The system SHALL extend the gate.",
+                            "scenarios": [{
+                                "name": "Extended gate",
+                                "when": ["a step is added after creation"],
+                                "then": ["the gate still fires"],
+                                "and": []
+                            }]
+                        }]
+                    }],
+                }),
+            )
+            .await;
+        let updated = ok_text(&updated);
+        assert!(updated.contains("Updated plan"), "{updated}");
+
+        fixture.shutdown().await;
+    }
+
+    /// A spec delta that creates a new capability without a
+    /// governed-files entry is refused.
+    #[tokio::test]
+    async fn plan_create_refuses_a_new_capability_without_governed_files() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+
+        let searched = fixture
+            .call("memory_search", json!({"query": "brand new capability"}))
+            .await;
+        ok_text(&searched);
+        let mut args = plan_args("Brand new capability");
+        args["spec_deltas"] = json!([{
+            "capability": "brand-new-capability",
+            "added": [{
+                "requirement": "Fresh requirement",
+                "text": "The system SHALL declare its files.",
+                "scenarios": [{
+                    "name": "Declared files",
+                    "when": ["a new capability is born"],
+                    "then": ["its governed files are declared"],
+                    "and": []
+                }]
+            }]
+        }]);
+        let refused = fixture.call("plan_create", args).await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("brand-new-capability"), "{text}");
+        assert!(text.contains("governed_files"), "{text}");
+
+        fixture.shutdown().await;
+    }
+
     /// The whole external-lead loop: plan on the board over MCP, dispatch a
     /// worker, and the worker's "finished" notice reaches the external lead
     /// (not the in-app one) through the waiter and the next tool result.

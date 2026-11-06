@@ -1173,6 +1173,16 @@
       "sections": {}
     },
     {
+      "id": "e76ff094",
+      "status": "closed",
+      "created_at_ms": 1793909772982,
+      "closed_at_ms": 1793910121650,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-e76ff094-20261105-202201.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
       "id": "5aac2023",
       "status": "closed",
       "created_at_ms": 1793910315740,
@@ -1235,6 +1245,87 @@
       "sections": {}
     },
     {
+      "id": "7bc0b473",
+      "status": "closed",
+      "created_at_ms": 1793910691905,
+      "closed_at_ms": 1793914720312,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-7bc0b473-20261105-213840.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "c74b1987",
+      "status": "closed",
+      "created_at_ms": 1793911692949,
+      "closed_at_ms": 1793914720702,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-c74b1987-20261105-213840.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Non-gating classification never blocks dispatch",
+              "text": "When a dispatch carries an explicit lead or user tier or model choice, the system SHALL start the worker without waiting for the routing classification, SHALL run the classification in the background under the same permit and timeout, and SHALL attach its label to the worker's routing record when it completes, logging it as calibration and training data.",
+              "scenarios": [
+                {
+                  "name": "Explicit-tier dispatch starts without the classification",
+                  "when": [
+                    "a lead dispatches with an explicit tier",
+                    "the routing classifier is still pending"
+                  ],
+                  "then": [
+                    "the worker starts immediately",
+                    "the routing block shows routed_by lead with a null Laya label"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "The background label lands on the record",
+                  "when": [
+                    "the background classification completes"
+                  ],
+                  "then": [
+                    "the worker's routing record carries the Laya tier, confidence and cleared flag",
+                    "the training data records the override label"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Non-explicit dispatches still gate on the classification",
+                  "when": [
+                    "a dispatch carries no explicit tier or model choice"
+                  ],
+                  "then": [
+                    "an unsure classifier refuses a Suggest+auto dispatch",
+                    "a cleared decision runs Laya's tier in Auto mode",
+                    "offline or too-short text produces the same skip reasons as before"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "843cb384",
+      "status": "open",
+      "created_at_ms": 1793913730343,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
       "id": "9adee90a",
       "status": "closed",
       "created_at_ms": 1793918863295,
@@ -1257,6 +1348,200 @@
                   "then": [
                     "no pricing table is shown",
                     "a line says prices are set with each model on the Endpoints page"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "fdc334b4",
+      "status": "closed",
+      "created_at_ms": 1793918981896,
+      "closed_at_ms": 1793920625944,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-fdc334b4-20261105-231705.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "llm-trace",
+          "added": [
+            {
+              "requirement": "Every model call is traced with attribution",
+              "text": "The Trace tab SHALL record every model request and response the engine makes — the lead's and every worker's alike — with full attribution (actor kind, agent name, worker id, plan and step), phase timings, token usage and cost, and SHALL keep them queryable by agent, model, status, purpose and time, and exportable.",
+              "scenarios": [
+                {
+                  "name": "A worker's call appears with its attribution",
+                  "when": [
+                    "a worker makes an LLM call"
+                  ],
+                  "then": [
+                    "the trace list shows the call with the worker's name, plan and step"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Calls are filterable",
+                  "when": [
+                    "the user filters by agent, model, status, purpose or time"
+                  ],
+                  "then": [
+                    "only matching calls remain in the list and the charts"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "Non-overlapping phase segments",
+              "text": "The phase bar SHALL draw non-overlapping segments — Setup (containing Compaction), Upload, Server wait, Generation (containing Reasoning and Stall), Retry wait and Tools — and SHALL render Connect and First token as metric chips rather than bar segments. For SSE providers, response headers arrive with the first chunk, so Server wait carries the server's queue and prefill.",
+              "scenarios": [
+                {
+                  "name": "The bar decomposes a call",
+                  "when": [
+                    "a call has prep, upload, server and generation windows"
+                  ],
+                  "then": [
+                    "the bar shows those segments in order with no overlap and no double-counted window"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Legacy rows collapse absent segments",
+                  "when": [
+                    "a row predates the upload and server stamps"
+                  ],
+                  "then": [
+                    "those segments collapse and the bar renders without NaN"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "Finer live statuses",
+              "text": "An in-flight call SHALL derive its live status from its stamped fields — preparing, uploading, waiting for first token, streaming, or stalled — and terminal calls SHALL classify as complete, failed, cancelled or guard-cut.",
+              "scenarios": [
+                {
+                  "name": "The ladder walks a live call",
+                  "when": [
+                    "a polled row gains its stamps"
+                  ],
+                  "then": [
+                    "the status walks uploading, then waiting for first token, then streaming"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "A stalled stream is visible",
+                  "when": [
+                    "a streaming call goes silent past the stall threshold"
+                  ],
+                  "then": [
+                    "its status shows stalled"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "Agent scoping with Lead default",
+              "text": "The Trace tab SHALL offer an agent dropdown listing Lead first, every observed worker, and All, SHALL default it to Lead, and SHALL scope both the call list and the top Insights charts to the selected agent's calls.",
+              "scenarios": [
+                {
+                  "name": "The tab opens on the Lead",
+                  "when": [
+                    "the trace opens with no saved preference"
+                  ],
+                  "then": [
+                    "the dropdown shows Lead selected and the charts show only the Lead's calls"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "A worker is selectable",
+                  "when": [
+                    "the user picks a worker from the dropdown"
+                  ],
+                  "then": [
+                    "the list and charts show only that worker's calls"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "a707e9fa",
+      "status": "closed",
+      "created_at_ms": 1793919163037,
+      "closed_at_ms": 1793920968987,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-a707e9fa-20261105-232248.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "plan-board",
+          "added": [
+            {
+              "requirement": "Spec-impact gate on plan creation",
+              "text": "plan_create SHALL refuse a plan whose steps touch files governed by a capability's file map unless the plan carries a spec delta for that capability or an explicit no-spec-impact declaration with a reason; the refusal SHALL name the capability and both remedies. A spec delta that creates a new capability SHALL declare its governed files. plan_update add_steps SHALL apply the same gate to steps added after creation.",
+              "scenarios": [
+                {
+                  "name": "A governed-file plan without a delta is refused",
+                  "when": [
+                    "a plan's steps touch a capability's governed files",
+                    "no spec delta for that capability is attached",
+                    "no explicit no-impact declaration is carried"
+                  ],
+                  "then": [
+                    "plan_create refuses",
+                    "the refusal names the capability and both remedies"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "A delta or an explicit declaration passes",
+                  "when": [
+                    "the same plan carries a spec delta for the capability",
+                    "or an explicit no-spec-impact declaration with a reason"
+                  ],
+                  "then": [
+                    "plan_create accepts the plan"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "New capabilities declare their governed files",
+                  "when": [
+                    "a spec delta adds a new capability without a governed-files entry"
+                  ],
+                  "then": [
+                    "the plan is refused until the files are declared"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Steps added later are gated too",
+                  "when": [
+                    "plan_update add_steps names a governed file without a delta or declaration"
+                  ],
+                  "then": [
+                    "the same refusal fires"
                   ],
                   "and": []
                 }
@@ -1367,6 +1652,16 @@
       "sections": {}
     },
     {
+      "id": "a73885db",
+      "status": "closed",
+      "created_at_ms": 1793956066589,
+      "closed_at_ms": 1793963246483,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-a73885db-20261106-110726.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
       "id": "a8710b6b",
       "status": "abandoned",
       "created_at_ms": 1793962826378,
@@ -1377,11 +1672,41 @@
       "sections": {}
     },
     {
+      "id": "8203fd61",
+      "status": "closed",
+      "created_at_ms": 1793963551140,
+      "closed_at_ms": 1793965993464,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-8203fd61-20261106-115313.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
       "id": "06d33de4",
       "status": "closed",
       "created_at_ms": 1793963644286,
       "closed_at_ms": 1793964194799,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-06d33de4-20261106-112314.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "e559295a",
+      "status": "closed",
+      "created_at_ms": 1793964612073,
+      "closed_at_ms": 1793966688322,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-e559295a-20261106-120448.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "865249fd",
+      "status": "closed",
+      "created_at_ms": 1793964868197,
+      "closed_at_ms": 1793968156711,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-865249fd-20261106-122916.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}

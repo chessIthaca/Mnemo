@@ -1165,9 +1165,10 @@ pub struct UiConfig {
     /// an `ask_user` question arrives). Defaults to `true`; set `false` to
     /// silence it.
     pub sound_input_needed: bool,
-    /// Play a short doom tone when repeated errors stop an agent (three
-    /// consecutive errors — the backend `MAX_RETRIES` cap — abort the
-    /// turn). Defaults to `true`; set `false` to silence it.
+    /// Play a short doom tone when repeated errors stop an agent (five
+    /// consecutive failing tool batches — the backend `MAX_RETRIES` cap,
+    /// raised from three by plan 865249fd — abort the turn). Defaults to
+    /// `true`; set `false` to silence it.
     pub sound_stopped_errors: bool,
 }
 

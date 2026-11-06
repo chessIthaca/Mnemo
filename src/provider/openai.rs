@@ -46,6 +46,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::error::{Error, Result};
 use crate::provider::sse_util::{header_str, provider_error};
 use crate::provider::trace::LlmRequestLog;
+use crate::provider::upload_stamp::{stamping_body, UploadStamps};
 use crate::provider::{
     Capabilities, LlmClient, LlmEvent, Message, ProviderKind, ToolChoice, ToolSchema,
 };
@@ -471,6 +472,12 @@ struct PreparedRequest {
     /// [`OpenAiClient::prepare_request_with_context`] as a placeholder that is never
     /// read before the stamp (open_stream always runs before any send).
     post_sent: std::time::Instant,
+    /// Per-request upload/server phase accounting (plan 7bc0b473),
+    /// shared between the stamping body wrapper(s) — one per send
+    /// attempt, so the reasoning_effort fallback retry accumulates both
+    /// attempts' windows — and the stream task, which re-stamps the
+    /// closed windows at every connect stamp site.
+    stamps: Arc<std::sync::Mutex<UploadStamps>>,
 }
 
 impl OpenAiClient {
@@ -636,7 +643,98 @@ impl OpenAiClient {
             // Placeholder until open_stream stamps the real send time
             // immediately before the first POST (see the field doc).
             post_sent: record_created,
+            stamps: Arc::new(std::sync::Mutex::new(UploadStamps::default())),
         })
+    }
+
+    /// POST the prepared request through the stamping body wrapper and
+    /// stamp the finer connect phases around the send (plan 7bc0b473):
+    ///
+    /// - the body ships via [`stamping_body`] — reqwest polls it in
+    ///   pieces and the final piece stamps the upload-done instant
+    ///   (`upload_ms`) live onto the trace record, so the Trace tab can
+    ///   tell "uploading" from "waiting for first token" while the call
+    ///   is in flight;
+    /// - when the response headers arrive (or the attempt dies waiting
+    ///   for them) the server-wait window (`server_ms`, upload done →
+    ///   headers) closes and is stamped live;
+    /// - a transport failure stamps the connect bucket + fails the
+    ///   record exactly like the inline paths did.
+    ///
+    /// `sent_at` is THIS attempt's send anchor: the first send passes
+    /// `post_sent`; the reasoning_effort fallback retry passes its own
+    /// instant (`post_sent` is not re-stamped, so the first attempt's
+    /// anchor would misattribute the retry's upload window).
+    async fn send_with_stamps(
+        &self,
+        prepared: &PreparedRequest,
+        sent_at: std::time::Instant,
+    ) -> Result<reqwest::Response> {
+        // The (log, record id) pair the body wrapper stamps into.
+        let body_trace = match (&prepared.trace, prepared.rec_id) {
+            (Some(log), Some(id)) => Some((log.clone(), id)),
+            _ => None,
+        };
+        let response = self
+            .http_client
+            .post(&prepared.url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Content-Type", "application/json")
+            // Content-Length is set explicitly: a wrapped stream carries
+            // no known length for reqwest, and without the header the
+            // request would switch to chunked transfer-encoding — a
+            // wire-format change for the gateway. The wrapper yields
+            // exactly these bytes, so the length is exact.
+            .header("Content-Length", prepared.body.len())
+            .body(stamping_body(
+                prepared.body.clone().into_bytes(),
+                sent_at,
+                prepared.stamps.clone(),
+                body_trace,
+            ))
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                // Response headers just arrived: close the server-wait
+                // window (upload done → headers) and stamp it live.
+                if let (Some(log), Some(id)) = (&prepared.trace, prepared.rec_id) {
+                    let now = std::time::Instant::now();
+                    if let Some(server_ms) = prepared
+                        .stamps
+                        .lock()
+                        .expect("OpenAiClient upload stamps lock poisoned")
+                        .note_headers(now)
+                    {
+                        log.set_server_ms(id, server_ms);
+                    }
+                }
+                Ok(response)
+            }
+            Err(e) => {
+                if let (Some(log), Some(id)) = (&prepared.trace, prepared.rec_id) {
+                    // Stamp the connect bucket: the request died before any
+                    // response headers arrived (e.g. the full 10s connect
+                    // timeout) — the same window success attributes to
+                    // connect_ms, so failures must too. When the body had
+                    // already been fully written, the server-wait window
+                    // closes at the failure moment (the wait that died).
+                    let now = std::time::Instant::now();
+                    let mut stamps = prepared
+                        .stamps
+                        .lock()
+                        .expect("OpenAiClient upload stamps lock poisoned");
+                    if let Some(server_ms) = stamps.note_headers(now) {
+                        log.set_server_ms(id, server_ms);
+                    }
+                    stamps.stamp(log, id);
+                    log.set_connect_ms(id, prepared.record_created.elapsed().as_millis() as u32);
+                    // Status 0 = no HTTP response at all (transport failure).
+                    log.fail(id, 0, &format!("failed to start stream: {e}"));
+                }
+                Err(Error::Provider(format!("failed to start stream: {e}")))
+            }
+        }
     }
 
     /// Stage 2 of the pipeline: POST the prepared request, check the
@@ -658,29 +756,9 @@ impl OpenAiClient {
         // re-stamp, so a retry's extra wait lands in ttft (the honest
         // user-perceived first-token wait).
         prepared.post_sent = std::time::Instant::now();
-        let mut response = match self
-            .http_client
-            .post(&prepared.url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .body(prepared.body.clone())
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                if let (Some(log), Some(id)) = (&prepared.trace, prepared.rec_id) {
-                    // Stamp the connect bucket: the request died before any
-                    // response headers arrived (e.g. the full 10s connect
-                    // timeout) — the same window success attributes to
-                    // connect_ms, so failures must too.
-                    log.set_connect_ms(id, prepared.record_created.elapsed().as_millis() as u32);
-                    // Status 0 = no HTTP response at all (transport failure).
-                    log.fail(id, 0, &format!("failed to start stream: {e}"));
-                }
-                return Err(Error::Provider(format!("failed to start stream: {e}")));
-            }
-        };
+        let mut response = self
+            .send_with_stamps(prepared, prepared.post_sent)
+            .await?;
 
         if !response.status().is_success() {
             // Self-healing fallback for providers that reject the
@@ -716,6 +794,17 @@ impl OpenAiClient {
                     // whole in-flight window, matching the success path's
                     // connect attribution.
                     log.set_connect_ms(id, prepared.record_created.elapsed().as_millis() as u32);
+                    // Re-stamp the finer upload/server windows at this
+                    // connect stamp site (plan 7bc0b473): both were
+                    // stamped live (upload at body completion, server at
+                    // headers arrival) — this keeps the invariant that
+                    // wherever connect_ms is stamped, the finer phases
+                    // are too.
+                    prepared
+                        .stamps
+                        .lock()
+                        .expect("OpenAiClient upload stamps lock poisoned")
+                        .stamp(log, id);
                     log.fail(id, status.as_u16(), &trace_msg);
                 }
                 provider_error(status, body, &prepared.url, "stream request")
@@ -744,28 +833,13 @@ impl OpenAiClient {
                 } else {
                     self.build_request_body(messages, tools, tool_choice, true)?
                 };
-                response = match self
-                    .http_client
-                    .post(&prepared.url)
-                    .header("Authorization", format!("Bearer {}", self.config.api_key))
-                    .header("Content-Type", "application/json")
-                    .body(prepared.body.clone())
-                    .send()
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(e) => {
-                        if let (Some(log), Some(id)) = (&prepared.trace, prepared.rec_id) {
-                            log.set_connect_ms(
-                                id,
-                                prepared.record_created.elapsed().as_millis() as u32,
-                            );
-                            // Status 0 = no HTTP response at all (transport failure).
-                            log.fail(id, 0, &format!("failed to start stream: {e}"));
-                        }
-                        return Err(Error::Provider(format!("failed to start stream: {e}")));
-                    }
-                };
+                // The retry's own send anchor: `post_sent` still points at
+                // the FIRST attempt, so the retry's upload window would be
+                // misattributed (first send → the retry's upload-done) —
+                // pass this attempt's own instant instead.
+                response = self
+                    .send_with_stamps(prepared, std::time::Instant::now())
+                    .await?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body_text = response.text().await.unwrap_or_default();
@@ -798,6 +872,7 @@ impl OpenAiClient {
             rec_id,
             record_created,
             post_sent,
+            stamps,
             ..
         } = prepared;
         // Bridge the SSE byte stream into our LlmEvent stream via a channel.
@@ -860,6 +935,7 @@ impl OpenAiClient {
             request_start,
             record_created,
             post_sent,
+            stamps,
             think_tags_enabled,
             use_responses_api,
             stop_boundaries: stream_stop_boundaries,

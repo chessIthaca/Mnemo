@@ -1838,6 +1838,9 @@ impl TeamRuntime {
         // App start: sweep checkouts a previous run renamed into the
         // trash folder but could not remove yet (something held them).
         schedule_trash_sweep(&runtime.workspace_root);
+        // App start: a checkout a previous run could not remove (something
+        // held it) is retried now, and the branch it was blocking goes with it.
+        runtime.retry_leftover_cleanups().await;
         Ok(runtime)
     }
 
@@ -6527,9 +6530,7 @@ impl TeamRuntime {
         match cleanup_agent_worktree(&self.workspace_root, &worker).await {
             Err(err) => {
                 self.update_worker(worker_id, |worker| {
-                    worker.error = Some(format!(
-                        "merged, but worktree cleanup needs attention: {err}"
-                    ));
+                    worker.error = Some(format!("{WORKTREE_CLEANUP_ERROR}: {err}"));
                 })
                 .await;
                 self.persist().await?;
@@ -6555,6 +6556,7 @@ impl TeamRuntime {
                 }
             }
         }
+        self.retry_checkout_cleanups_locked(worker_id).await;
         self.sweep_merged_branches(worker_id).await;
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Merged {
@@ -6576,6 +6578,61 @@ impl TeamRuntime {
             }
         }
         Ok(record)
+    }
+
+    /// Retry the checkout removal for merged workers whose earlier removal
+    /// failed: a folder something held at merge time, typically a shell whose
+    /// working folder was inside it. Runs with the merge lock held. A removal
+    /// that works (or finds the folder already gone) clears the note; one
+    /// that still fails leaves the record as it was. Deleting the branch of a
+    /// worker whose checkout is now gone is `sweep_merged_branches`'s job.
+    async fn retry_checkout_cleanups_locked(&self, skip: &str) {
+        let candidates: Vec<WorkerRecord> = {
+            let records = self.records.lock().await;
+            records
+                .iter()
+                .filter(|candidate| {
+                    candidate.id != skip
+                        && candidate.status == WorkerStatus::Merged
+                        && candidate
+                            .error
+                            .as_deref()
+                            .is_some_and(is_worktree_cleanup_error)
+                })
+                .cloned()
+                .collect()
+        };
+        let mut cleared = false;
+        for candidate in candidates {
+            if cleanup_agent_worktree(&self.workspace_root, &candidate)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            self.update_worker(&candidate.id, |worker| {
+                if worker
+                    .error
+                    .as_deref()
+                    .is_some_and(is_worktree_cleanup_error)
+                {
+                    worker.error = None;
+                }
+            })
+            .await;
+            cleared = true;
+        }
+        if cleared {
+            let _ = self.persist().await;
+        }
+    }
+
+    /// App start: retry earlier stuck checkout removals, then the branch
+    /// deletes they were blocking. Takes the merge lock itself.
+    async fn retry_leftover_cleanups(&self) {
+        let _guard = self.merge_lock.lock().await;
+        self.retry_checkout_cleanups_locked("").await;
+        self.sweep_merged_branches("").await;
     }
 
     /// Retry the branch delete for earlier merged workers. Runs inside
@@ -7710,6 +7767,19 @@ async fn sweep_trash(root: &Path) {
 /// worker: the merge landed and only the branch cleanup is outstanding.
 const BRANCH_CLEANUP_ERROR: &str = "merged, but branch cleanup needs attention";
 
+/// The durable notes a failed checkout removal leaves on a merged worker.
+/// `merge_locked` writes the first, `recover_worker` the second; both are
+/// retried by `retry_checkout_cleanups_locked`.
+const WORKTREE_CLEANUP_ERROR: &str = "merged, but worktree cleanup needs attention";
+const RECOVERED_WORKTREE_CLEANUP_ERROR: &str =
+    "merge recovered, but worktree cleanup needs attention";
+
+/// Whether an error is one of the checkout-cleanup notes above.
+fn is_worktree_cleanup_error(error: &str) -> bool {
+    error.starts_with(WORKTREE_CLEANUP_ERROR)
+        || error.starts_with(RECOVERED_WORKTREE_CLEANUP_ERROR)
+}
+
 async fn cleanup_agent_worktree(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
     validate_worker_id(&worker.id)?;
     let worktree = worker_checkout(root, &worker.id);
@@ -7855,9 +7925,7 @@ async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Re
             worker.merge = Some(record);
             worker.error = None;
             if let Err(err) = cleanup_agent_worktree(root, worker).await {
-                worker.error = Some(format!(
-                    "merge recovered, but worktree cleanup needs attention: {err}"
-                ));
+                worker.error = Some(format!("{RECOVERED_WORKTREE_CLEANUP_ERROR}: {err}"));
             }
             return Ok(());
         }
@@ -11687,6 +11755,206 @@ models = [\"scripted-a\", \"scripted-b\"]
             branch_exists(root.path(), &unmerged.branch).await,
             "commits outside the lead branch keep the branch"
         );
+    }
+
+    /// A worker parked in review at one exact, reviewed tip, ready to merge.
+    async fn ready_to_merge(root: &std::path::Path, id: &str) -> WorkerRecord {
+        let mut worker = worker(root, id);
+        worker.status = WorkerStatus::InReview;
+        provision_agent_worktree(
+            root.to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision worker");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        worker
+    }
+
+    /// The regression: an earlier merged worker whose checkout an earlier merge
+    /// could not remove (something held it) is retried by the next merge. The
+    /// removal clears the note, and the existing branch sweep then deletes the
+    /// branch the stuck checkout was blocking.
+    #[tokio::test]
+    async fn a_later_merge_retries_an_earlier_merged_workers_stuck_checkout() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let outside = tempfile::tempdir().expect("outside");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut early = merged_worker(root.path(), "00000001000000000001");
+        let note = format!("{WORKTREE_CLEANUP_ERROR}: could not remove leftover checkout: held");
+        early.error = Some(note.clone());
+        run_git(root.path(), &["branch", &early.branch, "main"]);
+        let worker = ready_to_merge(root.path(), "00000002000000000002").await;
+        // A link at the checkout path is refused by the cleanup, so the note
+        // survives the open-time retry exactly like a checkout something held
+        // on an earlier run. The worker above was provisioned first, so
+        // `.worktrees` exists.
+        create_directory_link(&early.worktree, outside.path());
+        let team =
+            open_test_team(root.path(), state.path(), vec![early.clone(), worker.clone()]).await;
+        assert_eq!(
+            team.worker(&early.id).await.expect("early worker").error,
+            Some(note.clone()),
+            "the note survives the open-time retry while the checkout is held"
+        );
+        // Now the checkout is removable: a plain, unregistered leftover.
+        // Remove only the link itself (a junction comes off with `remove_dir`,
+        // a unix symlink with `remove_file`); the outside folder is untouched.
+        if std::fs::remove_dir(&early.worktree).is_err() {
+            std::fs::remove_file(&early.worktree).expect("unlink the stuck checkout");
+        }
+        std::fs::create_dir_all(&early.worktree).expect("stuck checkout");
+        std::fs::write(early.worktree.join("fragment.txt"), "leftover\n")
+            .expect("leftover file");
+
+        let merged = team.merge(&worker.id).await.expect("merge");
+
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert!(
+            !early.worktree.exists(),
+            "the later merge retries and removes the stuck checkout"
+        );
+        assert_eq!(team.worker(&early.id).await.expect("early worker").error, None);
+        assert!(
+            !branch_exists(root.path(), &early.branch).await,
+            "the sweep deletes the branch the stuck checkout was blocking"
+        );
+        assert!(!branch_exists(root.path(), &worker.branch).await);
+        let persisted = TeamPersistence::new(state.path())
+            .load()
+            .expect("load team")
+            .expect("saved team");
+        let early_persisted = persisted
+            .workers
+            .iter()
+            .find(|worker| worker.id == early.id)
+            .expect("the early worker is persisted");
+        assert_eq!(early_persisted.error, None);
+    }
+
+    /// A stuck checkout that still cannot be removed (a link outside
+    /// `.worktrees`) keeps its exact note, its checkout and its branch through
+    /// every retry, and the outside folder is never touched.
+    #[tokio::test]
+    async fn a_stuck_checkout_that_still_cannot_be_removed_keeps_its_note_and_branch() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        let outside = tempfile::tempdir().expect("outside");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut early = merged_worker(root.path(), "00000001000000000001");
+        let note = format!("{WORKTREE_CLEANUP_ERROR}: could not remove leftover checkout: held");
+        early.error = Some(note.clone());
+        run_git(root.path(), &["branch", &early.branch, "main"]);
+        let worker = ready_to_merge(root.path(), "00000002000000000002").await;
+        std::fs::write(outside.path().join("keep.txt"), "outside\n").expect("outside file");
+        create_directory_link(&early.worktree, outside.path());
+        let team =
+            open_test_team(root.path(), state.path(), vec![early.clone(), worker.clone()]).await;
+
+        let merged = team.merge(&worker.id).await.expect("merge");
+
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert_eq!(
+            team.worker(&early.id).await.expect("early worker").error,
+            Some(note)
+        );
+        assert!(
+            std::fs::symlink_metadata(&early.worktree).is_ok(),
+            "the stuck checkout is still there"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("keep.txt")).expect("outside file"),
+            "outside\n"
+        );
+        assert!(
+            branch_exists(root.path(), &early.branch).await,
+            "the stuck checkout keeps its branch"
+        );
+    }
+
+    /// The retry only touches merged workers whose error is one of the
+    /// checkout-cleanup notes; any other error leaves the checkout alone.
+    #[tokio::test]
+    async fn the_retry_ignores_a_merged_worker_whose_error_is_not_a_checkout_note() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut early = merged_worker(root.path(), "00000001000000000001");
+        early.error = Some("something else needs attention".to_string());
+        run_git(root.path(), &["branch", &early.branch, "main"]);
+        let worker = ready_to_merge(root.path(), "00000002000000000002").await;
+        let team =
+            open_test_team(root.path(), state.path(), vec![early.clone(), worker.clone()]).await;
+        std::fs::create_dir_all(&early.worktree).expect("leftover checkout");
+        std::fs::write(early.worktree.join("fragment.txt"), "leftover\n")
+            .expect("leftover file");
+
+        let merged = team.merge(&worker.id).await.expect("merge");
+
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert!(
+            early.worktree.exists(),
+            "a note that is not a checkout-cleanup note never triggers a retry"
+        );
+        assert_eq!(
+            team.worker(&early.id).await.expect("early worker").error,
+            Some("something else needs attention".to_string())
+        );
+    }
+
+    /// App start retries a checkout a previous run could not remove, clears the
+    /// note and sweeps the branch the stuck checkout was blocking.
+    #[tokio::test]
+    async fn open_retries_a_stuck_checkout_left_by_an_earlier_run() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut early = merged_worker(root.path(), "00000001000000000001");
+        early.error = Some(format!(
+            "{WORKTREE_CLEANUP_ERROR}: could not remove leftover checkout: held"
+        ));
+        run_git(root.path(), &["branch", &early.branch, "main"]);
+        std::fs::create_dir_all(&early.worktree).expect("leftover checkout");
+        std::fs::write(early.worktree.join("fragment.txt"), "leftover\n")
+            .expect("leftover file");
+
+        let team = open_test_team(root.path(), state.path(), vec![early.clone()]).await;
+
+        assert!(
+            !early.worktree.exists(),
+            "the open-time retry removes the leftover checkout"
+        );
+        assert_eq!(team.worker(&early.id).await.expect("early worker").error, None);
+        assert!(
+            !branch_exists(root.path(), &early.branch).await,
+            "the open-time sweep deletes the branch the stuck checkout was blocking"
+        );
+        let persisted = TeamPersistence::new(state.path())
+            .load()
+            .expect("load team")
+            .expect("saved team");
+        assert_eq!(persisted.workers[0].error, None);
     }
 
     /// An audit worker is never mergeable — in particular, a still-running

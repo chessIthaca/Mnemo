@@ -203,8 +203,9 @@
   /* The messages scroll on their own and the box stays pinned below, in every view. */
   .thread-panel { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; }
   .thread-messages { flex: 1 1 0; min-height: 0; overflow-y: auto; }
-  /* Compact: the panel body already gives the height; only the margin tightens. */
+  /* Compact: the panel body already gives the height and has no padding of its
+     own, so the box keeps its distance from the panel's edges here. */
   .compact { height: 100%; }
-  .compact .thread-composer { margin-top: 10px; }
+  .compact .thread-composer { margin: 10px 12px 12px; }
   .thread-stream { min-width: 0; }
 </style>

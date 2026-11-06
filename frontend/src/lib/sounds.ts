@@ -13,8 +13,9 @@
  *   the Complete state (the turn is over; nothing needs the user).
  * - `input` — a soft double-ping: the agent is blocked on the user (an
  *   approval request or a question arrived).
- * - `doom` — a short descending low tone: three consecutive tool errors
- *   stopped the agent (mirrors the backend `agent::MAX_RETRIES` cap).
+ * - `doom` — a short descending low tone: consecutive tool errors stopped
+ *   the agent (the backend `agent::MAX_RETRIES` cap — five consecutive
+ *   failing tool batches since plan 865249fd raised it from three).
  *
  * The tone tables are exported pure data so the vitest suite can pin the
  * shape (ascending chime, double-ping, descending doom, short + quiet);

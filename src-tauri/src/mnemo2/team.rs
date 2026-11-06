@@ -3262,7 +3262,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_merge".to_string(),
-                description: "Merge one reviewed worker only after exact-tip checks and findings close; never targets main and never pushes.".to_string(),
+                description: "Merge one reviewed worker only after exact-tip checks and findings close; never targets main and never pushes. After a clean merge Mnemo2 closes the worker's session, removes its checkout and deletes its branch (a safe delete: a branch that is not fully merged is kept), so never delete worker branches yourself; the merge commit keeps the worker's tip as its second parent.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(120_000),
@@ -6305,15 +6305,38 @@ impl TeamRuntime {
                 return self.worker(worker_id).await;
             }
         }
-        if let Err(err) = cleanup_agent_worktree(&self.workspace_root, &worker).await {
-            self.update_worker(worker_id, |worker| {
-                worker.error = Some(format!(
-                    "merged, but worktree cleanup needs attention: {err}"
-                ));
-            })
-            .await;
-            self.persist().await?;
+        match cleanup_agent_worktree(&self.workspace_root, &worker).await {
+            Err(err) => {
+                self.update_worker(worker_id, |worker| {
+                    worker.error = Some(format!(
+                        "merged, but worktree cleanup needs attention: {err}"
+                    ));
+                })
+                .await;
+                self.persist().await?;
+            }
+            Ok(()) => {
+                // The checkout is gone, so Git no longer holds the branch. The
+                // merge commit keeps the worker's tip as its second parent, so
+                // deleting the branch loses no work.
+                let shared = self
+                    .records
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|other| other.id != worker.id && other.branch == worker.branch);
+                if !shared {
+                    if let Err(err) = delete_merged_branch(&self.workspace_root, &worker).await {
+                        self.update_worker(worker_id, |worker| {
+                            worker.error = Some(format!("{BRANCH_CLEANUP_ERROR}: {err}"));
+                        })
+                        .await;
+                        self.persist().await?;
+                    }
+                }
+            }
         }
+        self.sweep_merged_branches(worker_id).await;
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Merged {
             // The one terminal end a worker is labelled at (design §4.7):
@@ -6334,6 +6357,53 @@ impl TeamRuntime {
             }
         }
         Ok(record)
+    }
+
+    /// Retry the branch delete for earlier merged workers. Runs inside
+    /// `merge_locked`, so the merge lock is held. Best effort and silent: a
+    /// branch Git refuses to delete stays until the next merge.
+    async fn sweep_merged_branches(&self, just_merged: &str) {
+        let candidates: Vec<WorkerRecord> = {
+            let records = self.records.lock().await;
+            records
+                .iter()
+                .filter(|candidate| {
+                    candidate.id != just_merged
+                        && ledger::merged(candidate)
+                        && owns_its_branch(candidate)
+                        && !records.iter().any(|other| {
+                            other.id != candidate.id && other.branch == candidate.branch
+                        })
+                })
+                .cloned()
+                .collect()
+        };
+        let mut cleared = false;
+        for candidate in candidates {
+            // A checkout folder that is still there means its cleanup failed;
+            // leave the whole worker alone.
+            if std::fs::symlink_metadata(worker_checkout(&self.workspace_root, &candidate.id))
+                .is_ok()
+            {
+                continue;
+            }
+            if let Ok(true) = delete_merged_branch(&self.workspace_root, &candidate).await {
+                self.update_worker(&candidate.id, |worker| {
+                    if worker
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with(BRANCH_CLEANUP_ERROR))
+                    {
+                        worker.error = None;
+                    }
+                })
+                .await;
+                cleared = true;
+            }
+        }
+        if cleared {
+            let _ = self.persist().await;
+        }
     }
 
     /// Revert a worker merge on the lead branch before it reaches main.
@@ -7417,6 +7487,10 @@ async fn sweep_trash(root: &Path) {
     }
 }
 
+/// The durable error prefix a failed `git branch -d` leaves on a merged
+/// worker: the merge landed and only the branch cleanup is outstanding.
+const BRANCH_CLEANUP_ERROR: &str = "merged, but branch cleanup needs attention";
+
 async fn cleanup_agent_worktree(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
     validate_worker_id(&worker.id)?;
     let worktree = worker_checkout(root, &worker.id);
@@ -7446,6 +7520,21 @@ async fn cleanup_agent_worktree(root: &Path, worker: &WorkerRecord) -> Result<()
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     Err(last_error)
+}
+
+/// Delete a merged worker's branch with Git's safe delete. `Ok(true)` when
+/// the branch was deleted. `Ok(false)` when there is nothing for this worker
+/// to delete: the branch is not the one its id names, or it is already gone.
+/// `git branch -d` refuses a branch that is not fully merged into the
+/// checked-out lead branch, or that a worktree still uses; that refusal comes
+/// back as `Err` and the branch stays.
+async fn delete_merged_branch(root: &Path, worker: &WorkerRecord) -> Result<bool, String> {
+    if !owns_its_branch(worker) || !branch_exists(root, &worker.branch).await {
+        return Ok(false);
+    }
+    phase3::git_value(root, &["branch", "-d", &worker.branch])
+        .await
+        .map(|_| true)
 }
 
 async fn merge_record_from_git(
@@ -10946,6 +11035,10 @@ models = [\"scripted-a\", \"scripted-b\"]
             .is_some_and(|error| error.contains("retry merge")));
         assert!(team.live.lock().await.contains_key(&worker.id));
         assert!(worker.worktree.exists());
+        assert!(
+            branch_exists(root.path(), &worker.branch).await,
+            "a failed close keeps the branch"
+        );
         let persisted = TeamPersistence::new(state.path())
             .load()
             .expect("load team")
@@ -10958,6 +11051,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert_eq!(merged.error, None);
         assert!(!worker.worktree.exists());
         assert!(!team.live.lock().await.contains_key(&worker.id));
+        assert!(!branch_exists(root.path(), &worker.branch).await);
     }
 
     #[tokio::test]
@@ -11034,6 +11128,241 @@ models = [\"scripted-a\", \"scripted-b\"]
             .expect("load persisted team")
             .expect("saved team");
         assert_eq!(persisted.workers[0].error, None);
+    }
+
+    /// A clean merge deletes the worker's branch with Git's safe delete, and
+    /// the merge commit keeps the reviewed tip as its second parent, so the
+    /// work is still there without the branch ref.
+    #[tokio::test]
+    async fn merge_deletes_the_merged_branch_and_keeps_the_work() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000001000000000001");
+        worker.status = WorkerStatus::InReview;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision worker");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip: tip.clone(),
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+        assert!(branch_exists(root.path(), &worker.branch).await);
+
+        let merged = team.merge(&worker.id).await.expect("merge");
+
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert_eq!(merged.error, None);
+        assert!(!worker.worktree.exists());
+        assert!(
+            !branch_exists(root.path(), &worker.branch).await,
+            "the merge deletes the worker branch"
+        );
+        let commit = merged
+            .merge
+            .as_ref()
+            .expect("the merge record")
+            .commit
+            .clone();
+        assert_eq!(
+            phase3::git_value(root.path(), &["rev-parse", &format!("{commit}^2")])
+                .await
+                .expect("the merge commit's second parent"),
+            tip,
+            "the merge commit keeps the reviewed tip as its second parent"
+        );
+        run_git(root.path(), &["merge-base", "--is-ancestor", &tip, "HEAD"]);
+    }
+
+    #[tokio::test]
+    async fn delete_merged_branch_deletes_a_fully_merged_branch() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let worker = worker(root.path(), "00000001000000000001");
+        run_git(root.path(), &["branch", &worker.branch, "main"]);
+
+        assert_eq!(delete_merged_branch(root.path(), &worker).await, Ok(true));
+        assert!(!branch_exists(root.path(), &worker.branch).await);
+    }
+
+    #[tokio::test]
+    async fn delete_merged_branch_refuses_a_branch_that_is_not_fully_merged() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let worker = worker(root.path(), "00000001000000000001");
+        run_git(root.path(), &["checkout", "-b", &worker.branch]);
+        std::fs::write(root.path().join("unmerged.txt"), "unmerged\n").expect("worker file");
+        run_git(root.path(), &["add", "unmerged.txt"]);
+        run_git(root.path(), &["commit", "-m", "unmerged work"]);
+        run_git(root.path(), &["checkout", "wt/mnemo"]);
+
+        let deleted = delete_merged_branch(root.path(), &worker).await;
+
+        assert!(
+            deleted.is_err(),
+            "Git refuses to delete an unmerged branch: {deleted:?}"
+        );
+        assert!(branch_exists(root.path(), &worker.branch).await);
+    }
+
+    #[tokio::test]
+    async fn delete_merged_branch_skips_a_branch_the_worker_does_not_own() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut other = worker(root.path(), "00000001000000000001");
+        other.branch = "wt/other".to_string();
+        run_git(root.path(), &["branch", "wt/other", "main"]);
+
+        assert_eq!(delete_merged_branch(root.path(), &other).await, Ok(false));
+        assert!(branch_exists(root.path(), "wt/other").await);
+
+        let missing = worker(root.path(), "00000002000000000002");
+        assert_eq!(delete_merged_branch(root.path(), &missing).await, Ok(false));
+    }
+
+    /// The leftover branch of an earlier merged worker — its checkout already
+    /// gone — is deleted by the next merge's sweep.
+    #[tokio::test]
+    async fn a_later_merge_sweeps_an_earlier_merged_workers_leftover_branch() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let early = merged_worker(root.path(), "00000001000000000001");
+        run_git(root.path(), &["branch", &early.branch, "main"]);
+        let mut worker = worker(root.path(), "00000002000000000002");
+        worker.status = WorkerStatus::InReview;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision worker");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team =
+            open_test_team(root.path(), state.path(), vec![early.clone(), worker.clone()]).await;
+
+        let merged = team.merge(&worker.id).await.expect("merge");
+
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert!(!branch_exists(root.path(), &worker.branch).await);
+        assert!(
+            !branch_exists(root.path(), &early.branch).await,
+            "the sweep deletes the earlier merged worker's leftover branch"
+        );
+        assert_eq!(team.worker(&early.id).await.expect("early worker").error, None);
+    }
+
+    /// The sweep keeps every branch it must not touch: a reverted merge, an
+    /// unreleased checkout, and a branch with commits that never reached the
+    /// lead branch.
+    #[tokio::test]
+    async fn the_sweep_keeps_reverted_held_and_unmerged_branches() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+        let mut reverted = merged_worker(root.path(), "00000003000000000003");
+        reverted
+            .merge
+            .as_mut()
+            .expect("the merge record")
+            .revert_commit = Some("deadbeef".into());
+        run_git(root.path(), &["branch", &reverted.branch, "main"]);
+        let held = merged_worker(root.path(), "00000004000000000004");
+        std::fs::create_dir_all(&held.worktree).expect("held checkout");
+        run_git(root.path(), &["branch", &held.branch, "main"]);
+        let unmerged = merged_worker(root.path(), "00000005000000000005");
+        run_git(root.path(), &["checkout", "-b", &unmerged.branch]);
+        std::fs::write(root.path().join("unmerged.txt"), "unmerged\n").expect("unmerged file");
+        run_git(root.path(), &["add", "unmerged.txt"]);
+        run_git(root.path(), &["commit", "-m", "unmerged work"]);
+        run_git(root.path(), &["checkout", "wt/mnemo"]);
+        let mut worker = worker(root.path(), "00000002000000000002");
+        worker.status = WorkerStatus::InReview;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            worker.id.clone(),
+            "wt/mnemo".to_string(),
+        )
+        .await
+        .expect("provision worker");
+        std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+        run_git(&worker.worktree, &["add", "merged.txt"]);
+        run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+        let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+        });
+        let team = open_test_team(
+            root.path(),
+            state.path(),
+            vec![reverted.clone(), held.clone(), unmerged.clone(), worker.clone()],
+        )
+        .await;
+
+        let merged = team.merge(&worker.id).await.expect("merge");
+
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert!(!branch_exists(root.path(), &worker.branch).await);
+        assert!(
+            branch_exists(root.path(), &reverted.branch).await,
+            "a reverted merge keeps its branch"
+        );
+        assert!(
+            branch_exists(root.path(), &held.branch).await,
+            "a checkout that is still there keeps its branch"
+        );
+        assert!(
+            branch_exists(root.path(), &unmerged.branch).await,
+            "commits outside the lead branch keep the branch"
+        );
     }
 
     /// An audit worker is never mergeable — in particular, a still-running

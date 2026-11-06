@@ -314,6 +314,11 @@ pub struct WorkerRecord {
     /// Estimated cost in millionths of a dollar when pricing is configured.
     #[serde(default)]
     pub cost_micros: Option<u64>,
+    /// The last cost-alert threshold the lead was told about, in millionths
+    /// of a dollar: the notice fires once at `cost_notice_usd`, then at each
+    /// doubling. 0 when no notice has gone out yet.
+    #[serde(default)]
+    pub cost_notified_micros: u64,
     /// Worker creation time in Unix epoch milliseconds.
     #[serde(default)]
     pub created_at_ms: u128,
@@ -3085,13 +3090,13 @@ impl TeamRuntime {
         let mut model = json!({"type": "string", "description": model_description});
         let tier_description = match (&guidance, routing_mode) {
             (Some(text), RoutingMode::Off) => format!(
-                "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
+                "Required: choose the cheapest tier that fits the step (a step with a complete spec fits routine or trivial, even across files); the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (Some(text), RoutingMode::Auto) => format!(
-                "Optional: choose the cheapest tier that fits the step, or auto to let Laya choose; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
+                "Optional: choose the cheapest tier that fits the step (a step with a complete spec fits routine or trivial, even across files), or auto to let Laya choose; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (Some(text), _) => format!(
-                "Required: choose the cheapest tier that fits the step, or auto where offered; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
+                "Required: choose the cheapest tier that fits the step (a step with a complete spec fits routine or trivial, even across files), or auto where offered; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (None, _) => "The model tier. No tiers are configured (Settings > Tiers), so omit it and the default model is used.".to_string(),
         };
@@ -4160,6 +4165,7 @@ impl TeamRuntime {
             cached_tokens: 0,
             requests: 0,
             cost_micros: None,
+            cost_notified_micros: 0,
             created_at_ms: millis,
             elapsed_ms: 0,
             turns: 0,
@@ -4371,6 +4377,7 @@ impl TeamRuntime {
             cached_tokens: 0,
             requests: 0,
             cost_micros: None,
+            cost_notified_micros: 0,
             created_at_ms: millis,
             elapsed_ms: 0,
             turns: 0,
@@ -7716,6 +7723,25 @@ fn usage_cost_micros(
     Some(micros.round().min(u64::MAX as f64) as u64)
 }
 
+/// The new highest threshold passed, when a cost notice is due. `threshold`
+/// is 0 when notices are off.
+fn cost_notice_due(cost: u64, notified: u64, threshold: u64) -> Option<u64> {
+    if threshold == 0 || cost < threshold {
+        return None;
+    }
+    let mut level = threshold;
+    loop {
+        let doubled = level.saturating_mul(2);
+        // `saturating_mul` stops growing at the u64 ceiling: stop there too,
+        // so a pathological cost can never spin this loop.
+        if doubled > cost || doubled <= level {
+            break;
+        }
+        level = doubled;
+    }
+    (level > notified).then_some(level)
+}
+
 /// Forward one worker session's events, update its durable record, and refresh
 /// the transcript when the turn ends.
 /// How long a steered turn end waits for its follow-up turn before it counts
@@ -7897,6 +7923,9 @@ async fn pump_worker(
         // both count — and try the one nudge after the record block below
         // releases its lock. `repeated` keeps which kind of streak fired.
         let mut strike_fired: Option<bool> = None;
+        // The cost alert this event owes the lead (plan 06f1a204): filled
+        // inside the record block below, sent once that lock is released.
+        let mut cost_notice: Option<(String, String)> = None;
         // The finished tool call this event (if any) carries, captured beside
         // the strike counter so the record block below can fold it into the
         // worker's current failing streak.
@@ -8033,6 +8062,35 @@ async fn pump_worker(
                         ) {
                             worker.cost_micros =
                                 Some(worker.cost_micros.unwrap_or(0).saturating_add(cost));
+                        }
+                        // The cost alert (plan 06f1a204): the first notice at
+                        // `cost_notice_usd`, then one at each doubling. It
+                        // never stops or changes the worker.
+                        let threshold = (routing
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .cost_notice_usd
+                            .max(0.0)
+                            * 1_000_000.0) as u64;
+                        let spent = worker.cost_micros.unwrap_or(0);
+                        if let Some(level) =
+                            cost_notice_due(spent, worker.cost_notified_micros, threshold)
+                        {
+                            worker.cost_notified_micros = level;
+                            let dollars = spent as f64 / 1_000_000.0;
+                            let model = worker
+                                .model_id
+                                .as_deref()
+                                .or(worker.model.as_deref())
+                                .unwrap_or("-");
+                            let tier = worker.tier.as_deref().unwrap_or("-");
+                            cost_notice = Some((
+                                format!("cost:{worker_id}:{level}"),
+                                format!(
+                                    "worker_id={worker_id} {} has cost about ${dollars:.2} so far: {} requests on {model}, tier {tier}. It keeps running. If that looks wrong, read team_status, then team_message to steer it or team_stop to cancel it.",
+                                    worker.name, worker.requests
+                                ),
+                            ));
                         }
                         // Fold the same report into the durable per-project
                         // accumulator: raw tokens keyed by the observed model,
@@ -8360,6 +8418,9 @@ async fn pump_worker(
         }
         if let Some(row) = pending_outcome.take() {
             mnemo::model_routing::append_row(&routing_log_path, &row);
+        }
+        if let Some((key, text)) = cost_notice.take() {
+            let _ = signals.send(BoardSignal::Notice { key, text });
         }
         if let Some(repeated) = strike_fired.take() {
             let settings = routing
@@ -10238,6 +10299,7 @@ mod tests {
             cached_tokens: 0,
             requests: 0,
             cost_micros: None,
+            cost_notified_micros: 0,
             created_at_ms: 0,
             elapsed_ms: 0,
             turns: 0,
@@ -12846,6 +12908,154 @@ models = [\"scripted-a\", \"scripted-b\"]
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("the nudge notice never arrived");
+    }
+
+    /// Every cost-alert notice on the board-signal stream so far; unrelated
+    /// refreshes and notices drain away.
+    fn drain_cost_notices(
+        notices: &mut broadcast::Receiver<BoardSignal>,
+        worker_id: &str,
+    ) -> Vec<String> {
+        let prefix = format!("cost:{worker_id}:");
+        let mut found = Vec::new();
+        loop {
+            match notices.try_recv() {
+                Ok(BoardSignal::Notice { key, text }) if key.starts_with(&prefix) => {
+                    found.push(text);
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        found
+    }
+
+    /// The cost alert fires at the threshold, then at each doubling — never
+    /// twice for the same level, and never when it is off (plan 06f1a204).
+    #[test]
+    fn cost_notice_due_fires_at_the_threshold_and_each_doubling() {
+        let threshold = 2_000_000;
+        assert_eq!(
+            cost_notice_due(1_999_999, 0, threshold),
+            None,
+            "below the threshold"
+        );
+        assert_eq!(
+            cost_notice_due(2_000_000, 0, threshold),
+            Some(2_000_000),
+            "the threshold itself"
+        );
+        assert_eq!(
+            cost_notice_due(3_000_000, 2_000_000, threshold),
+            None,
+            "between two levels"
+        );
+        assert_eq!(
+            cost_notice_due(4_000_000, 2_000_000, threshold),
+            Some(4_000_000),
+            "the first doubling"
+        );
+        assert_eq!(
+            cost_notice_due(9_000_000, 0, threshold),
+            Some(8_000_000),
+            "the highest doubling passed, not the next one"
+        );
+        assert_eq!(
+            cost_notice_due(u64::MAX, 0, threshold),
+            Some(u64::MAX),
+            "a saturated cost still terminates"
+        );
+        assert_eq!(
+            cost_notice_due(9_000_000, 0, 0),
+            None,
+            "0 turns the alert off"
+        );
+    }
+
+    /// One worker whose estimated cost passes the alert tells the lead once,
+    /// and keeps running: the notice never stops or changes it (plan
+    /// 06f1a204).
+    #[tokio::test]
+    async fn a_worker_past_the_threshold_notifies_the_lead_once() {
+        let responses = vec![vec![
+            mnemo::provider::LlmEvent::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 0,
+                reasoning_tokens: 0,
+                cached_tokens: 0,
+                ttft_ms: None,
+                generation_ms: None,
+            },
+            mnemo::provider::LlmEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            },
+        ]];
+        let (fixture, mut notices) = nudge_fixture(responses).await;
+        // $1 per token on the scripted provider's model: the turn's three
+        // prompt tokens cost $3.00, past the default $2.00 alert.
+        fixture.team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-simple"),
+            ],
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec!["test/scripted-average".into()],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            vec![mnemo::config::PricingEntry {
+                model: "scripted".to_string(),
+                input_per_1m: 1_000_000.0,
+                output_per_1m: 0.0,
+                cached_per_1m: 0.0,
+            }],
+        );
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        // The pump sends the notice right after the record block of the
+        // Usage event, which precedes the Finished event that settled the
+        // worker above — so it is on the stream by now.
+        let found = drain_cost_notices(&mut notices, "routingworker");
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly one cost notice: {found:?}; worker: {settled:?}"
+        );
+        let notice = &found[0];
+        assert!(
+            notice.starts_with("worker_id=routingworker "),
+            "the notice names the worker: {notice}"
+        );
+        assert!(
+            notice.contains("has cost about $3.00 so far"),
+            "the notice names the spend: {notice}"
+        );
+        assert!(
+            notice.contains("1 requests on scripted, tier routine."),
+            "the notice names the request count, model and tier: {notice}"
+        );
+        assert!(
+            notice.ends_with(
+                "It keeps running. If that looks wrong, read team_status, then team_message to steer it or team_stop to cancel it."
+            ),
+            "{notice}"
+        );
+        assert_eq!(
+            settled.cost_notified_micros, 2_000_000,
+            "the record remembers the level the lead was told about: {settled:?}"
+        );
+        assert_eq!(settled.cost_micros, Some(3_000_000), "{settled:?}");
+        assert!(
+            matches!(settled.status, WorkerStatus::Completed),
+            "the alert never stopped or changed the worker: {settled:?}"
+        );
+        assert!(settled.error.is_none(), "{settled:?}");
     }
 
     /// A lead message long enough for drift classification (≥ 20 words).

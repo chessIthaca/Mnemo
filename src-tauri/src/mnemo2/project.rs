@@ -225,10 +225,12 @@ const STATE_GITIGNORE: &str = "# Mnemo2 per-machine session state; never committ
 /// The stamp inside a state folder naming the machine that created it.
 const OWNER_FILE: &str = "owner";
 
-/// This machine's owner id, kept in the app-data dir — the one piece of
+/// This machine's owner id, kept in the Mnemo config dir — the one piece of
 /// Mnemo2 data outside projects. It proves a project's state folder was
 /// created here: a folder that arrived with a repository or archive cannot
 /// carry it, so its transcript is never resumed as the lead's own history.
+/// The app-data dir is the legacy location, read once for migration by
+/// [`machine_owner_id_shared`].
 const OWNER_ID_FILE: &str = "state-owner-id";
 
 /// A project's Mnemo2 state lives inside the project, in `.coding/mnemo2/`:
@@ -239,20 +241,27 @@ pub fn state_dir(root: &Path) -> Result<PathBuf, String> {
     Ok(canonical_root(root)?.join(".coding").join(STATE_SUBDIR))
 }
 
-/// This machine's owner id, created once (atomically) in `app_data`.
-pub fn machine_owner_id(app_data: &Path) -> Result<String, String> {
-    let path = app_data.join(OWNER_ID_FILE);
+/// A machine owner id: exactly 32 ASCII hex characters.
+fn valid_owner_id(id: &str) -> bool {
+    id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// This machine's owner id, created once (atomically) in `dir`. The id now
+/// lives in the Mnemo config dir; an app-data `dir` is the legacy location,
+/// read once for migration by [`machine_owner_id_shared`].
+pub fn machine_owner_id(dir: &Path) -> Result<String, String> {
+    let path = dir.join(OWNER_ID_FILE);
     let read = || {
         std::fs::read_to_string(&path)
             .ok()
             .map(|id| id.trim().to_string())
-            .filter(|id| id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()))
+            .filter(|id| valid_owner_id(id))
     };
     if let Some(id) = read() {
         return Ok(id);
     }
-    std::fs::create_dir_all(app_data)
-        .map_err(|err| format!("could not create {}: {err}", app_data.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
@@ -267,6 +276,39 @@ pub fn machine_owner_id(app_data: &Path) -> Result<String, String> {
         }
         Err(err) => Err(format!("could not create {}: {err}", path.display())),
     }
+}
+
+/// This machine's owner id from the Mnemo config dir — the one location every
+/// launch path shares. The app-data dir is virtualized per MSIX package under
+/// packaged hosts such as Claude Desktop, so an id kept only there diverges
+/// between launch paths and each refuses the other's project stamps. When the
+/// config dir holds no id yet and the legacy app-data dir holds a valid one,
+/// it is copied in once: the first writer wins, and an existing config-dir id
+/// is never overwritten. A missing or invalid legacy file is ignored, and
+/// nothing under `legacy_app_data` is ever written or deleted.
+pub fn machine_owner_id_shared(config_dir: &Path, legacy_app_data: &Path) -> Result<String, String> {
+    let target = config_dir.join(OWNER_ID_FILE);
+    if !target.exists() {
+        let legacy = std::fs::read_to_string(legacy_app_data.join(OWNER_ID_FILE))
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| valid_owner_id(id));
+        if let Some(id) = legacy {
+            std::fs::create_dir_all(config_dir)
+                .map_err(|err| format!("could not create {}: {err}", config_dir.display()))?;
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    file.write_all(id.as_bytes())
+                        .map_err(|err| format!("could not write {}: {err}", target.display()))?;
+                }
+                // Another instance created it first: use theirs.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(format!("could not write {}: {err}", target.display())),
+            }
+        }
+    }
+    machine_owner_id(config_dir)
 }
 
 /// The verified state folder for a read-only operation, or its would-be path
@@ -340,8 +382,21 @@ pub fn open_state_dir(root: &Path, owner: &str, create: bool) -> Result<Option<P
             .filter_map(Result::ok)
             .any(|entry| entry.file_name() != ".gitignore");
         if holds_state {
+            // Name both ids when the stamp is a plain owner id so the
+            // mismatch can be compared; no other file content is echoed.
+            let detail = std::fs::symlink_metadata(&stamp)
+                .is_ok_and(|meta| meta.is_file())
+                .then(|| std::fs::read_to_string(&stamp).ok())
+                .flatten()
+                .filter(|id| valid_owner_id(id.trim()))
+                .map(|id| format!(
+                    " Its stamp is {} in {}; this machine's id is {owner}.",
+                    id.trim(),
+                    stamp.display()
+                ))
+                .unwrap_or_default();
             return Err(format!(
-                "{} was not created by Mnemo2 on this machine (it may have come with the repository), so its conversation and worker history are not loaded. Delete or rename that folder to start a fresh session here.",
+                "{} was not created by Mnemo2 on this machine (it may have come with the repository), so its conversation and worker history are not loaded.{detail} Delete or rename that folder to start a fresh session here.",
                 dir.display()
             ));
         }
@@ -885,6 +940,10 @@ mod tests {
         // Another machine's stamp is just as foreign.
         std::fs::write(shipped.join("owner"), "ffffffffffffffffffffffffffffffff").expect("foreign stamp");
         assert!(open_state_dir(root, OWNER, false).is_err());
+        let foreign = open_state_dir(root, OWNER, false).expect_err("foreign stamp is refused");
+        assert!(foreign.contains("ffffffffffffffffffffffffffffffff"), "{foreign}");
+        assert!(foreign.contains(OWNER), "{foreign}");
+        assert!(foreign.contains("not created by Mnemo2 on this machine"), "{foreign}");
 
         // Renaming it away starts fresh; the new folder is stamped and trusted.
         std::fs::rename(&shipped, root.join(".coding").join("mnemo2.shipped")).expect("rename");
@@ -927,6 +986,103 @@ mod tests {
         let first = machine_owner_id(app_data.path()).expect("created");
         assert_eq!(first.len(), 32);
         assert_eq!(machine_owner_id(app_data.path()).expect("reused"), first);
+    }
+
+    #[test]
+    fn two_app_data_views_converge_on_one_shared_owner_id() {
+        let config = tempdir().expect("config");
+        let view_a = tempdir().expect("view a");
+        let view_b = tempdir().expect("view b");
+        let project = tempdir().expect("project");
+
+        // Instance A resolves its owner id through one app-data view and
+        // stamps the project with it.
+        let a = machine_owner_id_shared(config.path(), view_a.path()).expect("owner id");
+        let stamped = open_state_dir(project.path(), &a, true)
+            .expect("state dir")
+            .expect("created");
+
+        // Instance B sees a different app-data view; it must resolve the
+        // same id and open the project instance A stamped.
+        let b = machine_owner_id_shared(config.path(), view_b.path()).expect("owner id");
+        let reopened =
+            open_state_dir(project.path(), &b, false).expect("the stamped project opens");
+        assert_eq!(b, a, "both app-data views converge on one shared owner id");
+        assert_eq!(reopened, Some(stamped));
+    }
+
+    #[test]
+    fn the_legacy_app_data_owner_id_migrates_once_into_the_config_dir() {
+        let config = tempdir().expect("config");
+        let legacy = tempdir().expect("legacy app data");
+        std::fs::write(legacy.path().join(OWNER_ID_FILE), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("legacy id");
+
+        // The legacy id migrates into the config dir verbatim.
+        let migrated = machine_owner_id_shared(config.path(), legacy.path()).expect("migrated");
+        assert_eq!(migrated, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            std::fs::read_to_string(config.path().join(OWNER_ID_FILE)).expect("config id"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        // A different legacy id never overwrites the migrated one.
+        let other = tempdir().expect("other legacy app data");
+        std::fs::write(other.path().join(OWNER_ID_FILE), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .expect("other legacy id");
+        assert_eq!(
+            machine_owner_id_shared(config.path(), other.path()).expect("reused"),
+            migrated
+        );
+        assert_eq!(
+            std::fs::read_to_string(config.path().join(OWNER_ID_FILE)).expect("config id"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        // A config dir that already holds an id is never overwritten.
+        let settled = tempdir().expect("settled config");
+        std::fs::write(settled.path().join(OWNER_ID_FILE), "cccccccccccccccccccccccccccccccc")
+            .expect("existing id");
+        assert_eq!(
+            machine_owner_id_shared(settled.path(), other.path()).expect("kept"),
+            "cccccccccccccccccccccccccccccccc"
+        );
+        assert_eq!(
+            std::fs::read_to_string(settled.path().join(OWNER_ID_FILE)).expect("config id"),
+            "cccccccccccccccccccccccccccccccc"
+        );
+    }
+
+    #[test]
+    fn an_invalid_legacy_owner_id_is_ignored() {
+        let config = tempdir().expect("config");
+        let legacy = tempdir().expect("legacy app data");
+        std::fs::write(legacy.path().join(OWNER_ID_FILE), "not-an-id").expect("invalid legacy id");
+
+        // A fresh id is created in the config dir; the legacy file is untouched.
+        let fresh = machine_owner_id_shared(config.path(), legacy.path()).expect("fresh id");
+        assert_eq!(fresh.len(), 32);
+        assert!(fresh.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            std::fs::read_to_string(config.path().join(OWNER_ID_FILE)).expect("config id"),
+            fresh
+        );
+        assert_eq!(
+            std::fs::read_to_string(legacy.path().join(OWNER_ID_FILE)).expect("legacy untouched"),
+            "not-an-id"
+        );
+    }
+
+    #[test]
+    fn a_malformed_stamp_is_not_echoed_in_the_refusal() {
+        let project = tempdir().expect("project");
+        let dir = open_state_dir(project.path(), OWNER, true)
+            .expect("state dir")
+            .expect("created");
+        std::fs::write(dir.join(OWNER_FILE), "secret-not-hex").expect("malformed stamp");
+        let refused = open_state_dir(project.path(), OWNER, false).expect_err("refused");
+        assert!(refused.contains("not created by Mnemo2 on this machine"), "{refused}");
+        assert!(!refused.contains("secret-not-hex"), "{refused}");
     }
 
     #[tokio::test]

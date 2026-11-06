@@ -106,9 +106,14 @@ only the app.
   paths, multi-MB transcripts), and a lead save must never dirty the checkout
   that merges and cleanup require clean. Because a repository or archive can
   ship its own `.coding/mnemo2/`, the folder is trusted only when stamped
-  (`owner`) with this machine's random id (`state-owner-id`, the one Mnemo2
-  file kept in the app-data dir): an unstamped or foreign-stamped folder that
-  holds state is refused, never resumed, and the start screen says why. The
+  (`owner`) with this machine's random id (`state-owner-id`, kept in the
+  Mnemo config dir — `~/.mnemo`, or `$MNEMO_HOME` — so Mnemo2 started by the
+  Claude plugin and started by hand agree): an unstamped or foreign-stamped
+  folder that holds state is refused, never resumed, and the start screen
+  says why. A previous app-data copy of the id is migrated once, first
+  launch wins; a folder stamped with the other id is refused once, recovered
+  by renaming `.coding/mnemo2` aside. A different `MNEMO_HOME` between
+  launches gives a different id. The
   `.coding` and `mnemo2` folders must be real folders (no links/junctions)
   resolving inside the project, and the `.gitignore` is rewritten on every
   open. Earlier builds kept this state in the app-data directory

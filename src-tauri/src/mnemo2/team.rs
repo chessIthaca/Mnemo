@@ -861,6 +861,12 @@ struct LiveWorker {
     /// Beside the session handle, never persisted; a reroute resets it
     /// ([`TeamRuntime::change_model`]).
     strikes: Arc<Mutex<route_question::Strikes>>,
+    /// A steer was sent and its follow-up turn has not started: set before the
+    /// `SessionCommand::Steer` goes out, cleared by the follow-up's `Started`,
+    /// by `Exited`, by a final `Error`, and by the follow-up deadline in
+    /// [`pump_worker`]. A steered turn end is not a finished turn, so the pump
+    /// holds it until the follow-up starts or the deadline settles it.
+    steer_pending: Arc<AtomicBool>,
 }
 
 impl LiveWorker {
@@ -2675,6 +2681,24 @@ impl TeamRuntime {
         self.external_state().queue.drain(..).collect()
     }
 
+    /// Keep the notices that still describe their worker: a tagged notice
+    /// whose worker moved on, or no longer exists, is dropped. Untagged
+    /// notices always stay.
+    pub(crate) async fn current_notices(&self, notices: Vec<String>) -> Vec<String> {
+        let records = self.records.lock().await;
+        notices
+            .into_iter()
+            .filter(
+                |notice| match crate::mnemo2::notice_tag::TurnTag::parse(notice) {
+                    Some(tag) => records
+                        .iter()
+                        .any(|worker| worker.id == tag.worker_id && tag.still_current(worker)),
+                    None => true,
+                },
+            )
+            .collect()
+    }
+
     /// Put notices that were drained but never reached the external lead
     /// (the response write failed) back at the front of its queue, in their
     /// original order. If the lead detached meanwhile they join the
@@ -2740,7 +2764,7 @@ impl TeamRuntime {
             let woken = self.external_wake.notified();
             tokio::pin!(woken);
             woken.as_mut().enable();
-            let notices = self.drain_external_notices();
+            let notices = self.current_notices(self.drain_external_notices()).await;
             if !notices.is_empty() {
                 return ExternalWait {
                     notices,
@@ -2754,7 +2778,7 @@ impl TeamRuntime {
                 };
             }
             if tokio::time::timeout_at(deadline, woken).await.is_err() {
-                let notices = self.drain_external_notices();
+                let notices = self.current_notices(self.drain_external_notices()).await;
                 let status = if !notices.is_empty() {
                     ExternalWaitStatus::Notices
                 } else if self.external_lead_attached() {
@@ -2764,6 +2788,15 @@ impl TeamRuntime {
                 };
                 return ExternalWait { notices, status };
             }
+        }
+    }
+
+    /// Test seam for the lost-follow-up path: mark a live worker as waiting for
+    /// a steered turn's follow-up without sending a steer.
+    #[cfg(test)]
+    pub(crate) async fn set_steer_pending_for_test(&self, worker_id: &str, pending: bool) {
+        if let Some(live) = self.live.lock().await.get(worker_id) {
+            live.steer_pending.store(pending, Ordering::SeqCst);
         }
     }
 
@@ -4349,6 +4382,7 @@ impl TeamRuntime {
         let busy = Arc::new(AtomicBool::new(true));
         let receiver = session.events();
         let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
+        let steer_pending = Arc::new(AtomicBool::new(false));
         let pump = tokio::spawn(pump_worker(
             id.clone(),
             generation,
@@ -4367,6 +4401,7 @@ impl TeamRuntime {
             self.routing.clone(),
             self.signals.clone(),
             strikes.clone(),
+            steer_pending.clone(),
             self.models.clone(),
             self.tiers.clone(),
             self.live.clone(),
@@ -4396,6 +4431,7 @@ impl TeamRuntime {
                 pump,
                 cleanup_retry_only: false,
                 strikes,
+                steer_pending,
             },
         );
         self.update_worker(&id, |worker| {
@@ -4552,13 +4588,14 @@ impl TeamRuntime {
         }
         let previous_inbox = record.inbox.clone();
         let delivered_text = format!("{}\n{text}", sender.header());
-        let (busy, idle, sent) = {
+        let (busy, idle, steer_pending, sent) = {
             let live = self.live.lock().await;
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running; resume it first"))?;
             live.admit_session_command(worker_id)?;
             let busy = live.busy.clone();
+            let steer_pending = live.steer_pending.clone();
             let idle = !busy.load(Ordering::SeqCst);
             let kind = kind.unwrap_or(if idle {
                 InboxKind::Prompt
@@ -4600,12 +4637,23 @@ impl TeamRuntime {
                     images: Vec::new(),
                 }
             };
+            // A steer ends the current turn at its next break and drives a
+            // follow-up turn: mark the wait before the command can land, so the
+            // pump never reads the steered turn end as a finished turn.
+            if !idle {
+                steer_pending.store(true, Ordering::SeqCst);
+            }
             let result = live.session.send(command).await;
-            (busy, idle, result)
+            (busy, idle, steer_pending, result)
         };
         if let Err(err) = sent {
             if idle {
                 busy.store(false, Ordering::SeqCst);
+            }
+            if !idle {
+                // The steer never reached the session: there is no follow-up
+                // turn to wait for.
+                steer_pending.store(false, Ordering::SeqCst);
             }
             self.update_worker(worker_id, |worker| worker.inbox = previous_inbox)
                 .await;
@@ -4919,6 +4967,7 @@ impl TeamRuntime {
         let busy = Arc::new(AtomicBool::new(false));
         let receiver = session.events();
         let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
+        let steer_pending = Arc::new(AtomicBool::new(false));
         let pump = tokio::spawn(pump_worker(
             worker_id.to_string(),
             generation,
@@ -4937,6 +4986,7 @@ impl TeamRuntime {
             self.routing.clone(),
             self.signals.clone(),
             strikes.clone(),
+            steer_pending.clone(),
             self.models.clone(),
             self.tiers.clone(),
             self.live.clone(),
@@ -4951,6 +5001,7 @@ impl TeamRuntime {
                 pump,
                 cleanup_retry_only: false,
                 strikes,
+                steer_pending,
             },
         );
         self.update_worker(worker_id, |worker| {
@@ -7540,6 +7591,14 @@ fn usage_cost_micros(
 
 /// Forward one worker session's events, update its durable record, and refresh
 /// the transcript when the turn ends.
+/// How long a steered turn end waits for its follow-up turn before it counts
+/// as finished, so a lost steer can never leave a worker Working forever.
+const FOLLOW_UP_GRACE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(200)
+} else {
+    std::time::Duration::from_secs(60)
+};
+
 // Each parameter is one shared worker handle — the pump's wiring stays flat.
 #[allow(clippy::too_many_arguments)]
 async fn pump_worker(
@@ -7560,6 +7619,7 @@ async fn pump_worker(
     routing: Arc<std::sync::RwLock<RoutingSettings>>,
     signals: broadcast::Sender<BoardSignal>,
     strikes: Arc<Mutex<route_question::Strikes>>,
+    steer_pending: Arc<AtomicBool>,
     models: Arc<std::sync::RwLock<Vec<LeadModel>>>,
     tiers: Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
     live: Arc<Mutex<HashMap<String, LiveWorker>>>,
@@ -7567,6 +7627,14 @@ async fn pump_worker(
     board: Option<Arc<PlanBoard>>,
 ) {
     let mut turn_active = false;
+    // A steered turn end is held here until its follow-up turn starts (the
+    // held `Finished`) or `FOLLOW_UP_GRACE` passes (the deadline). Both are
+    // cleared by `Started`, `Exited`, a final `Error`, and the deadline.
+    let mut follow_up_deadline: Option<tokio::time::Instant> = None;
+    let mut held_finished: Option<SessionEvent> = None;
+    // A `Parked` that settled a held steered turn end: its held `Finished` is
+    // re-sent after `save_workers`, so the finished notice reads Completed.
+    let mut settled_parked_finish: Option<SessionEvent> = None;
     let mut plan_stamp = worker_plan_stamp(&records, &worker_id).await;
     // The `outcome` row owed when the worker lands in a terminal status this
     // iteration; appended once the record save below has persisted it.
@@ -7578,7 +7646,71 @@ async fn pump_worker(
     let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut previous_signature: Option<String> = None;
     loop {
-        let event = match receiver.recv().await {
+        // While a steered turn end waits for its follow-up, the receive is
+        // bounded by an absolute deadline: the bus is engine-wide, so another
+        // session's events must neither satisfy nor extend this wait.
+        let received = match follow_up_deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                Ok(received) => received,
+                Err(_) => {
+                    // The follow-up never started: settle the steered turn end
+                    // as this worker's finished turn, so a lost steer can never
+                    // leave it Working forever.
+                    let mut found = false;
+                    let mut completed = false;
+                    {
+                        let mut records = records.lock().await;
+                        if let Some(worker) = records.iter_mut().find(|worker| {
+                            worker.id == worker_id
+                                && (worker.generation == 0 || worker.generation == generation)
+                        }) {
+                            if worker.compacting {
+                                // A real compaction is running; its own events
+                                // follow, so give it another grace period.
+                                follow_up_deadline =
+                                    Some(tokio::time::Instant::now() + FOLLOW_UP_GRACE);
+                                continue;
+                            }
+                            found = true;
+                            if matches!(
+                                worker.status,
+                                WorkerStatus::Working
+                                    | WorkerStatus::Fixing
+                                    | WorkerStatus::Dispatching
+                            ) {
+                                worker.status = WorkerStatus::Completed;
+                                worker.turns = worker.turns.saturating_add(1);
+                                completed = true;
+                            }
+                        }
+                    }
+                    steer_pending.store(false, Ordering::SeqCst);
+                    follow_up_deadline = None;
+                    let held = held_finished.take();
+                    if !found {
+                        // The worker was deleted or replaced: nothing to
+                        // settle and no notice to fire.
+                        continue;
+                    }
+                    busy.store(false, Ordering::SeqCst);
+                    if completed {
+                        let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+                    }
+                    if let Some(event) = held {
+                        // The held turn end, now that the record reads
+                        // Completed: this fires the normal finished notice.
+                        let _ = events.send(TeamEvent {
+                            worker_id: worker_id.clone(),
+                            generation,
+                            event,
+                        });
+                    }
+                    continue;
+                }
+            },
+            None => receiver.recv().await,
+        };
+        let event = match received {
             Ok(event) => event,
             // A slow consumer skips what it missed rather than abandoning
             // the worker's ledger mid-turn.
@@ -7590,6 +7722,14 @@ async fn pump_worker(
         // its record (status, telemetry, model, errors).
         if !event.is_from(session_id) {
             continue;
+        }
+        // A follow-up turn started: the steer's turn end is not this worker's
+        // finished turn, so the held event and the deadline end here. This
+        // runs before the record block, so a paused worker clears the wait too.
+        if matches!(event.event, SerializableAgentEvent::Started) {
+            steer_pending.store(false, Ordering::SeqCst);
+            follow_up_deadline = None;
+            held_finished = None;
         }
         if let SerializableAgentEvent::HostToolCall {
             call_id,
@@ -7856,6 +7996,25 @@ async fn pump_worker(
                         ));
                         terminal = true;
                     }
+                    SerializableAgentEvent::Finished { .. }
+                        if steer_pending.load(Ordering::SeqCst)
+                            && matches!(
+                                worker.status,
+                                WorkerStatus::Working
+                                    | WorkerStatus::Fixing
+                                    | WorkerStatus::Dispatching
+                            ) =>
+                    {
+                        // A steer ended this turn at its next break and drives a
+                        // follow-up turn (`StopReason::Steer`): the worker has
+                        // not finished. Status, busy and the turn count stay as
+                        // they are; `Started` clears the wait, and the deadline
+                        // settles it as finished if that turn never starts.
+                        follow_up_deadline =
+                            Some(tokio::time::Instant::now() + FOLLOW_UP_GRACE);
+                        held_finished = Some(event.clone());
+                        changed = true;
+                    }
                     SerializableAgentEvent::Finished { .. } => {
                         let completed_turn = turn_active;
                         turn_active = false;
@@ -7891,6 +8050,10 @@ async fn pump_worker(
                         turn_active = false;
                         worker.compacting = false;
                         busy.store(false, Ordering::SeqCst);
+                        // The session is gone: no follow-up turn is coming.
+                        steer_pending.store(false, Ordering::SeqCst);
+                        follow_up_deadline = None;
+                        held_finished = None;
                         worker.pending = None;
                         if !matches!(
                             worker.status,
@@ -7914,7 +8077,29 @@ async fn pump_worker(
                     SerializableAgentEvent::Parked { .. } => {
                         turn_active = false;
                         busy.store(false, Ordering::SeqCst);
-                        if !matches!(
+                        // A parked session has nothing queued: when it parks
+                        // while a steered turn end is held, no follow-up turn is
+                        // coming, so settle that turn end as finished now —
+                        // clearer than waiting for the deadline. Rare race: a
+                        // steer that lands right after a natural finish can
+                        // settle as Completed and send a notice, then `Started`
+                        // flips the worker back to Working, and
+                        // `current_notices` drops that notice at delivery while
+                        // it is still queued.
+                        if held_finished.is_some()
+                            && matches!(
+                                worker.status,
+                                WorkerStatus::Working
+                                    | WorkerStatus::Fixing
+                                    | WorkerStatus::Dispatching
+                            )
+                        {
+                            worker.status = WorkerStatus::Completed;
+                            worker.turns = worker.turns.saturating_add(1);
+                            steer_pending.store(false, Ordering::SeqCst);
+                            follow_up_deadline = None;
+                            settled_parked_finish = held_finished.take();
+                        } else if !matches!(
                             worker.status,
                             WorkerStatus::Completed
                                 | WorkerStatus::Interrupted
@@ -7944,6 +8129,11 @@ async fn pump_worker(
                     SerializableAgentEvent::Error { error, retrying } => {
                         if !retrying {
                             turn_active = false;
+                            // A final error ends the turn for good: no
+                            // follow-up turn is coming.
+                            steer_pending.store(false, Ordering::SeqCst);
+                            follow_up_deadline = None;
+                            held_finished = None;
                         }
                         if worker.compacting {
                             worker.compacting = false;
@@ -7997,6 +8187,15 @@ async fn pump_worker(
         });
         if terminal || changed {
             let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+        }
+        if let Some(held) = settled_parked_finish.take() {
+            // The held turn end, now that the record reads Completed: this
+            // fires the normal finished notice.
+            let _ = events.send(TeamEvent {
+                worker_id: worker_id.clone(),
+                generation,
+                event: held,
+            });
         }
         if audit_release {
             // The record with the report and the `Completed` status is
@@ -9367,6 +9566,14 @@ fn executor_gate_rules() -> Vec<GateRule> {
     rules.push(deny_rule("shell", format!(r"{pre}gh\s+pr\b")));
     rules
 }
+
+/// A bare worker record for tests in sibling modules (`notice_tag`): the
+/// shape the team test fixture builds, without a checkout on disk.
+#[cfg(test)]
+pub(crate) fn test_worker_record(id: &str) -> WorkerRecord {
+    tests::worker(std::path::Path::new("."), id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9861,7 +10068,7 @@ mod tests {
         run_git(root, &["commit", "-m", "seed"]);
     }
 
-    fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
+    pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         let branch = agent_branch(id);
         WorkerRecord {
             id: id.to_string(),
@@ -10009,6 +10216,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
                 strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
+                steer_pending: Arc::new(AtomicBool::new(false)),
             },
         );
     }
@@ -10102,6 +10310,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                     cleanup_retry_only: false,
                     busy: Arc::new(AtomicBool::new(false)),
                     strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
+                    steer_pending: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -10598,6 +10807,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
                 strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
+                steer_pending: Arc::new(AtomicBool::new(false)),
             },
         );
 
@@ -15339,6 +15549,86 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(plan_read.parameters.get("required").is_none());
         team.shutdown().await;
     }
+
+    /// A tagged notice describes one turn of one worker: a notice whose worker
+    /// moved on, or no longer exists, is dropped at delivery. An untagged
+    /// notice (a report, a plan change) always stays.
+    #[tokio::test]
+    async fn current_notices_drop_a_moved_on_worker() {
+        use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
+        use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut completed = worker(root.path(), "00000001000000000001");
+        completed.status = WorkerStatus::Completed;
+        completed.turns = 2;
+        let mut working = worker(root.path(), "00000001000000000002");
+        working.status = WorkerStatus::Working;
+        let team = open_test_team(
+            root.path(),
+            state.path(),
+            vec![completed.clone(), working.clone()],
+        )
+        .await;
+
+        let tagged = |worker: &WorkerRecord, state| {
+            format!(
+                "{TEAM_NOTICE_PREFIX} worker_id={}{}\nthe detail",
+                worker.id,
+                TurnTag::of(worker, 1, state).suffix()
+            )
+        };
+        let current_finished = tagged(&completed, NoticeState::Finished);
+        let stale_finished = tagged(&working, NoticeState::Finished);
+        let unknown = tagged(
+            &worker(root.path(), "00000001000000000009"),
+            NoticeState::Finished,
+        );
+        let untagged = format!("{TEAM_NOTICE_PREFIX}\nplan changed");
+        let plain = "worker alpha finished its turn".to_string();
+
+        let kept = team
+            .current_notices(vec![
+                current_finished.clone(),
+                stale_finished,
+                unknown,
+                untagged.clone(),
+                plain.clone(),
+            ])
+            .await;
+        assert_eq!(kept, vec![current_finished, untagged, plain]);
+        team.shutdown().await;
+    }
+
+    /// A stale notice drained from the queue must not end the wait: the lead
+    /// keeps waiting for a notice that still describes its worker.
+    #[tokio::test]
+    async fn waiting_skips_stale_notices() {
+        use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
+        use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut working = worker(root.path(), "00000001000000000002");
+        working.status = WorkerStatus::Working;
+        let team = open_test_team(root.path(), state.path(), vec![working.clone()]).await;
+        assert!(team.attach_external_lead(), "the external lead attaches");
+        let stale = format!(
+            "{TEAM_NOTICE_PREFIX} worker_id={}{}\nstale detail",
+            working.id,
+            TurnTag::of(&working, 1, NoticeState::Finished).suffix()
+        );
+        assert!(team.push_external_notice(stale), "the notice is queued");
+
+        let outcome = team.wait_external(std::time::Duration::from_millis(150)).await;
+        assert_eq!(outcome.status, ExternalWaitStatus::Timeout, "{outcome:?}");
+        assert!(outcome.notices.is_empty(), "{:?}", outcome.notices);
+        team.shutdown().await;
+    }
+
 
     #[tokio::test]
     async fn plan_read_returns_the_current_plan() {

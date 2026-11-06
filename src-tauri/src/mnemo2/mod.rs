@@ -22,6 +22,10 @@ pub mod indexing;
 /// The real worker team runtime.
 pub mod team;
 
+/// The turn tag a team notice's first line carries, so a stale notice is
+/// dropped at delivery.
+pub(crate) mod notice_tag;
+
 /// Laya's dispatch-time routing decision: the classified text, the shared
 /// gate, and the dispatch routing log's rows (design
 /// `.coding/design/mnemo2-laya-routing.md` §4.2–§4.8).

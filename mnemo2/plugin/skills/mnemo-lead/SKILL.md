@@ -42,6 +42,7 @@ Dispatch by `tier`, not by model name. Five tiers, cheapest first:
 Rules:
 
 - Choose the cheapest tier that fits the step. The tier's first available model runs the worker.
+- A step with a complete spec goes on `routine` or `trivial`, even when it spans several files: the spec already made the design decisions, and the cheap tier follows them at a fraction of the cost. Move up only when the spec leaves real decisions to the worker, or when Laya names a higher tier at about 0.75 confidence or more. A Laya answer below that is not a reason to move up.
 - An empty tier runs on the nearest tier below it that has a model, and the dispatch result says so ("medium has no model; ran on routine"). Fix rounds and audits fold the same way.
 - The `tier` parameter of `team_dispatch` lists each tier's name, definition, models and prices. Read it before choosing.
 - Pass `model` only when the tier's first model does not fit. It must be a model some tier names; anything else is refused with the allowed list.

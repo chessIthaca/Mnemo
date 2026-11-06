@@ -5778,13 +5778,9 @@ mod tests {
             .expect("merged source")
             .replace("\r\n", "\n");
         assert_eq!(merged_source, "pub fn feature() {}\n");
-        run_git(
-            root.path(),
-            &[
-                "show-ref",
-                "--verify",
-                &format!("refs/heads/{}", worker.branch),
-            ],
+        assert!(
+            !branch_exists(root.path(), &worker.branch),
+            "the merge deletes the worker branch; the merge commit keeps its tip"
         );
         let main_tip = crate::mnemo2::phase3::git_value(root.path(), &["rev-parse", "main"])
             .await

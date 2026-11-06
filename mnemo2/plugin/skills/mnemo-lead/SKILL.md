@@ -98,9 +98,11 @@ A worker's turn ends with a "finished its turn" notice. Then:
    - the worker idle with a clean worktree;
    - a clean, non-main lead checkout.
 
+   After a clean merge Mnemo2 closes the worker's session, removes its checkout and deletes its branch (`git branch -d`, so a branch that is not fully merged is kept). Never delete worker branches or checkouts yourself. The merge commit keeps the worker's tip as its second parent, so no work is lost. If cleanup could not finish, `team_status` shows an `error` that starts with "merged, but", and the next merge retries the branch delete for earlier merged workers whose checkout is gone.
+
    The merge ticks the plan step and may close the plan. A notice follows.
 7. A merge conflict aborts the merge, leaves the lead branch clean, marks the worker `conflict` and clears its review and checks. Nothing is auto-resolved, and you do not resolve it by hand on the lead branch. Read the diagnostic in `team_status` (`error`), `team_message` the worker with the conflicting files and what landed meanwhile, then check, review and merge again. If it cannot be reconciled, ask the user.
-8. `team_revert_merge` backs a merge out of the lead branch, only while that merge has not reached `main`. The step reopens if no other merged task remains.
+8. `team_revert_merge` backs a merge out of the lead branch, only while that merge has not reached `main`. The step reopens if no other merged task remains. The worker's branch is already deleted by then; the merge commit still holds its work.
 
 After the last step merges, the plan closes when the team review passes, and a review report is written under `.coding/reviews/`. Tell the user the outcome and the report path.
 

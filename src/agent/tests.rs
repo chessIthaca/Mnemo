@@ -1490,7 +1490,7 @@ async fn successful_tool_results_are_not_wrapped_in_tool_error_marker() {
 #[tokio::test]
 async fn max_retries_aborts_after_consecutive_tool_errors() {
     // A tool that runs but FAILS (read_files with an EMPTY files array)
-    // returns success:false. After MAX_RETRIES (3) consecutive such failures
+    // returns success:false. After MAX_RETRIES consecutive such failures
     // the agent must emit a final Error and stop — it must not loop forever.
     // (Bad-JSON errors use the separate MAX_BAD_JSON_RETRIES cap, tested
     // below.)
@@ -1519,12 +1519,11 @@ async fn max_retries_aborts_after_consecutive_tool_errors() {
             },
         ]
     };
-    let provider = Arc::new(MockProvider::sequence(vec![
-        fail_call(1),
-        fail_call(2),
-        fail_call(3),
-        fail_call(4),
-    ]));
+    let provider = Arc::new(MockProvider::sequence(
+        (1..=super::MAX_RETRIES as usize + 1)
+            .map(fail_call)
+            .collect(),
+    ));
 
     let agent = AgentLoop::new(
         test_config(provider, registry, workflow, sandbox.clone()),
@@ -1565,21 +1564,22 @@ async fn max_retries_aborts_after_consecutive_tool_errors() {
         "MAX_RETRIES abort must not also emit Finished (terminal exclusivity)"
     );
     // The tool-execution-error abort fires AFTER the per-call loop feeds each
-    // result back (the cap check is after the batch). So all 3 failing calls
-    // push a tool message, then the 3rd trips the cap.
+    // result back (the cap check is after the batch). So all MAX_RETRIES
+    // failing calls push a tool message, then the last one trips the cap.
     let tool_msgs: Vec<_> = messages.iter().filter(|m| m.role == Role::Tool).collect();
     assert_eq!(
         tool_msgs.len(),
-        3,
-        "expected exactly 3 tool-error messages before the cap fired, got {}",
+        super::MAX_RETRIES as usize,
+        "expected exactly {} tool-error messages before the cap fired, got {}",
+        super::MAX_RETRIES,
         tool_msgs.len()
     );
     // The repeat-failure circuit breaker is ADDITIVE to the cap: it fires
     // on EVERY batch whose failure repeats a prior identical one (the
-    // reminder is cheap and the model needs it each time), so the 2nd
-    // AND 3rd batches each push one harness-attributed corrective user
-    // message — the 3rd's lands in history for the next turn even though
-    // the cap aborts this one.
+    // reminder is cheap and the model needs it each time), so every batch
+    // from the 2nd to the last pushes one harness-attributed corrective
+    // user message — the last one lands in history for the next turn even
+    // though the cap aborts this one.
     let correction_positions: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -1591,9 +1591,11 @@ async fn max_retries_aborts_after_consecutive_tool_errors() {
         .collect();
     assert_eq!(
         correction_positions.len(),
-        2,
-        "the breaker must fire once per repeat-failure batch (after the 2nd \
-         and 3rd identical failures) even when the cap aborts on the 3rd"
+        super::MAX_RETRIES as usize - 1,
+        "the breaker must fire once per repeat-failure batch (after every \
+         identical failure from the 2nd on) even when the cap aborts on the \
+         {}th",
+        super::MAX_RETRIES
     );
     let tool_positions: Vec<usize> = messages
         .iter()
@@ -1601,17 +1603,381 @@ async fn max_retries_aborts_after_consecutive_tool_errors() {
         .filter(|(_, m)| m.role == Role::Tool)
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(tool_positions.len(), 3);
-    assert!(
-        correction_positions[0] > tool_positions[1]
-            && correction_positions[0] < tool_positions[2],
-        "the first correction must follow the 2nd tool result and precede the 3rd"
-    );
-    assert!(
-        correction_positions[1] > tool_positions[2],
-        "the second correction must follow the 3rd tool result"
-    );
+    assert_eq!(tool_positions.len(), super::MAX_RETRIES as usize);
+    for (i, correction_pos) in correction_positions.iter().enumerate() {
+        assert!(
+            *correction_pos > tool_positions[i + 1],
+            "correction {} must follow tool result {}",
+            i + 1,
+            i + 2
+        );
+        if i + 2 < tool_positions.len() {
+            assert!(
+                *correction_pos < tool_positions[i + 2],
+                "correction {} must precede tool result {}",
+                i + 1,
+                i + 3
+            );
+        }
+    }
     let _ = outcome;
+}
+
+// ---------------------------------------------------------------------------
+// Tool-error nudge (plan 865249fd): the cap moved 3 → 5 and the harness
+// pushes ONE corrective nudge when the streak first reaches
+// TOOL_ERROR_NUDGE_AT (2), so a model that is still exploring gets a
+// warning and a chance to change approach before the cap cuts the turn
+// off. The nudge rides the provider-facing list as a harness-attributed
+// user-role tail (like the repeat-failure correction) and emits NO event.
+// ---------------------------------------------------------------------------
+
+/// A call to a tool name that is NOT in the registry: the harness executes
+/// it and returns success:false with an error text DISTINCT per name
+/// ("unknown tool '{name}' …"), so consecutive batches of these never trip
+/// the repeat-failure correction (unlike `failing_read_call`, whose
+/// byte-identical error does). The fixture for the tool-error nudge tests.
+fn unknown_tool_batch(id: &str, name: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index: 0,
+            id: id.into(),
+            name: name.into(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 0,
+            fragment: "{}".into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
+/// Positions of the user-role nudge messages and of all tool results in
+/// `messages` (the nudge must sit after its batch's tool results).
+fn nudge_and_tool_positions(messages: &[Message]) -> (Vec<usize>, Vec<usize>) {
+    let nudges = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == Role::User
+                && m.content
+                    .as_text()
+                    .starts_with(super::turn::HARNESS_ERROR_NUDGE_PREFIX)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let tools = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::Tool)
+        .map(|(i, _)| i)
+        .collect();
+    (nudges, tools)
+}
+
+#[tokio::test]
+async fn four_failing_batches_then_success_is_not_aborted() {
+    // Plan 865249fd acceptance: 4 consecutive failing batches is BELOW the
+    // raised cap — the turn must run the successful 5th batch and finish
+    // normally (the old 3-batch cap killed live workers that were still
+    // exploring).
+    let mut responses: Vec<Vec<LlmEvent>> = (1..=4)
+        .map(|i| unknown_tool_batch(&format!("call_{i}"), &format!("missing_tool_{i}")))
+        .collect();
+    let mut success = read_files_call(0, "call_ok", "present.txt");
+    success.push(LlmEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    responses.push(success);
+    responses.push(text_stop("done"));
+    let (outcome, messages, mut fanin_rx) =
+        guard_test_harness(responses, "read then recover", &[("present.txt", "contents")]).await;
+    assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        if let AgentEvent::Error { error, retrying: false } = ev {
+            panic!("4 failing batches must not abort the turn: {error}");
+        }
+    }
+    let tool_results = messages.iter().filter(|m| m.role == Role::Tool).count();
+    assert_eq!(tool_results, 5, "4 failures + 1 success all execute");
+}
+
+#[tokio::test]
+async fn the_fifth_consecutive_failing_batch_aborts_the_turn() {
+    // Plan 865249fd acceptance: the 5th consecutive failing batch ends the
+    // turn with the final Error naming the (new) cap, and no trailing
+    // Finished event.
+    let responses: Vec<Vec<LlmEvent>> = (1..=super::MAX_RETRIES as usize + 1)
+        .map(|i| unknown_tool_batch(&format!("call_{i}"), &format!("missing_tool_{i}")))
+        .collect();
+    let (_outcome, _messages, mut fanin_rx) =
+        guard_test_harness(responses, "keep failing", &[]).await;
+    let mut abort = None;
+    let mut saw_finished = false;
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        match ev {
+            AgentEvent::Error { error, retrying: false } => abort = Some(error),
+            AgentEvent::Finished { .. } => saw_finished = true,
+            _ => {}
+        }
+    }
+    let abort = abort.expect("the 5th consecutive failing batch must abort");
+    assert!(
+        abort.contains(&format!(
+            "Aborting turn: {} consecutive tool errors (the model may be stuck).",
+            super::MAX_RETRIES
+        )),
+        "the abort text must name the raised cap; got: {abort}"
+    );
+    assert!(!saw_finished, "the abort must not also emit Finished");
+}
+
+#[tokio::test]
+async fn the_second_failing_batch_adds_one_nudge_message_after_its_tool_results() {
+    // Plan 865249fd acceptance: after exactly the 2nd consecutive failing
+    // batch the provider-facing list gains ONE user-role message starting
+    // with the nudge prefix, naming the failed tool(s) of THAT batch,
+    // placed after the batch's tool results — and NO AgentEvent carries it
+    // (no red box in the transcript, no doom-streak extension).
+    let responses = vec![
+        unknown_tool_batch("call_1", "missing_tool_1"),
+        unknown_tool_batch("call_2", "missing_tool_2"),
+        text_stop("done"),
+    ];
+    let (_outcome, messages, mut fanin_rx) =
+        guard_test_harness(responses, "fail twice", &[]).await;
+    let (nudge_positions, tool_positions) = nudge_and_tool_positions(&messages);
+    assert_eq!(nudge_positions.len(), 1, "exactly one nudge: {messages:?}");
+    let nudge = messages[nudge_positions[0]].content.as_text();
+    assert!(
+        nudge.contains("2 tool-call batches in a row have failed"),
+        "the nudge names the streak: {nudge}"
+    );
+    assert!(
+        nudge.contains("missing_tool_2"),
+        "the nudge names the failed tool of the current batch: {nudge}"
+    );
+    assert!(
+        !nudge.contains("missing_tool_1"),
+        "only the current batch's failed tools are named: {nudge}"
+    );
+    assert_eq!(tool_positions.len(), 2);
+    assert!(
+        nudge_positions[0] > tool_positions[1],
+        "the nudge must follow the 2nd batch's tool results"
+    );
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        assert!(
+            !format!("{ev:?}").contains(super::turn::HARNESS_ERROR_NUDGE_PREFIX),
+            "no AgentEvent may carry the nudge: {ev:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_second_nudge_on_the_third_to_fifth_failing_batches() {
+    // The exactly-equal streak check fires the nudge ONCE per streak: the
+    // 3rd, 4th and 5th consecutive failing batches add no further nudge.
+    let responses: Vec<Vec<LlmEvent>> = (1..=super::MAX_RETRIES as usize + 1)
+        .map(|i| unknown_tool_batch(&format!("call_{i}"), &format!("missing_tool_{i}")))
+        .collect();
+    let (_outcome, messages, _fanin_rx) =
+        guard_test_harness(responses, "keep failing", &[]).await;
+    let (nudge_positions, tool_positions) = nudge_and_tool_positions(&messages);
+    assert_eq!(tool_positions.len(), super::MAX_RETRIES as usize);
+    assert_eq!(nudge_positions.len(), 1, "one nudge per streak: {messages:?}");
+}
+
+#[tokio::test]
+async fn a_correction_batch_does_not_also_get_the_nudge() {
+    // One corrective message per batch: when the 2nd consecutive failing
+    // batch is an IDENTICAL repeat (the repeat-failure correction fires),
+    // it gets only the correction — not the nudge.
+    let mut first = failing_read_call(0, "call_1");
+    first.push(LlmEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    let mut second = failing_read_call(0, "call_2");
+    second.push(LlmEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    let responses = vec![first, second, text_stop("done")];
+    let (_outcome, messages, _fanin_rx) = guard_test_harness(responses, "read a file", &[]).await;
+    let corrections = messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content
+                    .as_text()
+                    .starts_with(super::turn::HARNESS_CORRECTION_PREFIX)
+        })
+        .count();
+    assert_eq!(corrections, 1, "the identical repeat fires the correction");
+    let (nudge_positions, _) = nudge_and_tool_positions(&messages);
+    assert!(
+        nudge_positions.is_empty(),
+        "a correction batch must not also get the nudge: {messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_batch_resets_the_streak_so_the_nudge_fires_again() {
+    // The streak resets on a clean successful batch, so a LATER streak
+    // nudges again at its own 2nd failure: fail, fail (nudge), succeed,
+    // fail, fail (nudge again).
+    let mut responses: Vec<Vec<LlmEvent>> = vec![
+        unknown_tool_batch("call_1", "missing_tool_1"),
+        unknown_tool_batch("call_2", "missing_tool_2"),
+    ];
+    let mut success = read_files_call(0, "call_ok", "present.txt");
+    success.push(LlmEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    responses.push(success);
+    responses.push(unknown_tool_batch("call_3", "missing_tool_3"));
+    responses.push(unknown_tool_batch("call_4", "missing_tool_4"));
+    responses.push(text_stop("done"));
+    let (_outcome, messages, _fanin_rx) = guard_test_harness(
+        responses,
+        "fail, recover, fail again",
+        &[("present.txt", "x")],
+    )
+    .await;
+    let (nudge_positions, _) = nudge_and_tool_positions(&messages);
+    assert_eq!(nudge_positions.len(), 2, "each streak nudges once: {messages:?}");
+    assert!(
+        messages[nudge_positions[1]]
+            .content
+            .as_text()
+            .contains("2 tool-call batches"),
+        "the second nudge also names a 2-batch streak"
+    );
+}
+
+#[tokio::test]
+async fn user_denials_do_not_count_toward_the_nudge() {
+    // Plan 865249fd acceptance: a user denial is a deliberate safety
+    // choice, not a stuck model — it counts neither toward the cap nor
+    // toward the nudge. Two DENIED batches (ApproveEachAction) leave no
+    // nudge in the message list and the turn finishes normally.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    // Executing is required so the workflow ToolFilter allows `file_write`
+    // at dispatch; this test is about denials, not Planning denial.
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan("write", "g", "c", vec!["write out.txt".into()])
+            .unwrap();
+    }
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let denied_write = |n: usize| {
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: format!("call_{n}"),
+                name: "file_write".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: r#"{"path":"out.txt","content":"x"}"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]
+    };
+    let provider = Arc::new(MockProvider::sequence(vec![
+        denied_write(1),
+        denied_write(2),
+        text_stop("done"),
+    ]));
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox: sandbox.clone(),
+            safety_mode: SafetyMode::ApproveEachAction,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("write twice")];
+    let fanin_tx2 = fanin_tx.clone();
+    let turn = tokio::spawn(async move {
+        let outcome = agent
+            .run_turn(&mut messages, &fanin_tx2, 1, &mut cmd_rx, None)
+            .await
+            .unwrap();
+        (outcome, messages)
+    });
+    // Deny every approval request (two denied batches) from a background
+    // task so no polling race can drop an event.
+    let denier = tokio::spawn(async move {
+        let mut denials = 0;
+        while let Some((_id, ev)) = fanin_rx.recv().await {
+            if let AgentEvent::ApprovalRequest { responder, .. } = ev {
+                let _ = responder.send(crate::runtime::Approval::Deny);
+                denials += 1;
+            }
+        }
+        denials
+    });
+    let (outcome, messages) = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+        .await
+        .expect("the turn completes")
+        .unwrap();
+    drop(fanin_tx);
+    let denials = denier.await.unwrap();
+    assert_eq!(denials, 2, "both file_write batches must surface approvals");
+    assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    let (nudge_positions, _) = nudge_and_tool_positions(&messages);
+    assert!(
+        nudge_positions.is_empty(),
+        "user denials must not count toward the nudge: {messages:?}"
+    );
+}
+
+#[test]
+fn last_user_query_skips_harness_nudges() {
+    // Plan 865249fd acceptance: `last_user_query` skips BOTH harness
+    // message kinds, so a nudge (or correction) never becomes the
+    // auto-recall query.
+    let nudge = format!(
+        "{} — not the user]\n2 tool-call batches in a row have failed (latest: x).",
+        super::turn::HARNESS_ERROR_NUDGE_PREFIX
+    );
+    let correction = format!(
+        "{} — not the user]\nYour last two calls to `x` failed identically.",
+        super::turn::HARNESS_CORRECTION_PREFIX
+    );
+    let messages = vec![
+        Message::user_text("real question"),
+        Message::user_text(correction),
+        Message::user_text(nudge.clone()),
+    ];
+    assert_eq!(
+        super::turn::last_user_query(&messages),
+        Some("real question".to_string())
+    );
+    // A nudge BEFORE a real question must not shadow it either.
+    let messages = vec![Message::user_text(nudge), Message::user_text("later question")];
+    assert_eq!(
+        super::turn::last_user_query(&messages),
+        Some("later question".to_string())
+    );
+    // Only harness messages → no query at all.
+    let messages = vec![Message::user_text(super::turn::HARNESS_ERROR_NUDGE_PREFIX)];
+    assert_eq!(super::turn::last_user_query(&messages), None);
 }
 
 #[tokio::test]
@@ -1624,7 +1990,7 @@ async fn repeat_failure_injects_schema_correction_on_second_identical_error() {
     // corrective message carrying the tool's actual schema, pushed after
     // the batch (Anthropic requires tool results to immediately follow the
     // tool_use message). Two identical failures, then a clean text response
-    // (below the MAX_RETRIES cap of 3, so the turn ends normally).
+    // (below the MAX_RETRIES cap of 5, so the turn ends normally).
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),
@@ -14375,7 +14741,7 @@ async fn mixed_error_success_batch_is_one_interaction_and_resets_ring() {
     // repetition ring accumulated it; the third identical response tripped
     // the guard even though the model saw an error after every interaction.
     // Post-fix the mixed batch is ONE error interaction, so the break (if
-    // any) comes from MAX_RETRIES at the same error across three
+    // any) comes from MAX_RETRIES at the same error across MAX_RETRIES
     // interactions — never from a repetition guard (removed 2027-01-24).
     let mixed_batch = |i: usize| {
         let mut r = failing_read_call(0, &format!("call_f{i}"));
@@ -14385,7 +14751,9 @@ async fn mixed_error_success_batch_is_one_interaction_and_resets_ring() {
         });
         r
     };
-    let responses = vec![mixed_batch(1), mixed_batch(2), mixed_batch(3)];
+    let responses: Vec<Vec<LlmEvent>> = (0..super::MAX_RETRIES as usize)
+        .map(|i| mixed_batch(i + 1))
+        .collect();
     let (_outcome, messages, mut fanin_rx) = guard_test_harness(
         responses,
         "read both files",
@@ -14394,9 +14762,11 @@ async fn mixed_error_success_batch_is_one_interaction_and_resets_ring() {
     .await;
     let tool_results = messages.iter().filter(|m| m.role == Role::Tool).count();
     assert_eq!(
-        tool_results, 6,
-        "all three mixed batches must execute — an error-following response \
-         is a repair attempt, not repetition"
+        tool_results,
+        2 * super::MAX_RETRIES as usize,
+        "all {} mixed batches must execute — an error-following response \
+         is a repair attempt, not repetition",
+        super::MAX_RETRIES
     );
     let mut terminal_error = None;
     while let Ok((_, ev)) = fanin_rx.try_recv() {
@@ -14404,11 +14774,12 @@ async fn mixed_error_success_batch_is_one_interaction_and_resets_ring() {
             terminal_error = Some(error);
         }
     }
-    let err = terminal_error.expect("three consecutive error interactions must abort");
+    let err = terminal_error.expect("MAX_RETRIES consecutive error interactions must abort");
     assert!(
         err.contains("consecutive tool errors"),
-        "the break must come from MAX_RETRIES (the same error across three \
-         interactions), not the repetition guard; got: {err}"
+        "the break must come from MAX_RETRIES (the same error across {} \
+         interactions), not the repetition guard; got: {err}",
+        super::MAX_RETRIES
     );
     assert!(
         !err.contains("repetition guard"),
@@ -14418,12 +14789,13 @@ async fn mixed_error_success_batch_is_one_interaction_and_resets_ring() {
 
 #[tokio::test]
 async fn error_retries_owned_by_max_retries_not_repetition_guard() {
-    // Pin (backlog 7f72d3d7): the same failing call re-emitted across three
-    // DIFFERENT LLM interactions is an error-repair loop — owned by
+    // Pin (backlog 7f72d3d7): the same failing call re-emitted across
+    // consecutive DIFFERENT LLM interactions is an error-repair loop —
+    // owned by
     // MAX_RETRIES ("consecutive tool errors"), never by the (since-removed)
     // repetition guard — error-following responses are repair attempts, and
     // the model gets a repair chance between interactions.
-    let responses: Vec<Vec<LlmEvent>> = (0..4)
+    let responses: Vec<Vec<LlmEvent>> = (0..super::MAX_RETRIES as usize + 1)
         .map(|i| {
             let mut r = failing_read_call(0, &format!("call_{i}"));
             r.push(LlmEvent::Finish {
@@ -15109,7 +15481,7 @@ async fn auto_retry_budget_exhausts_then_falls_back_to_guidance() {
 
 #[tokio::test]
 async fn max_retries_abort_names_the_classified_class_and_resolves_rows() {
-    // Three consecutive classified failures trip MAX_RETRIES: the abort
+    // MAX_RETRIES consecutive classified failures trip the cap: the abort
     // message names the last classified class (observability for a
     // fine-tuned pipeline), and the pending guidance rows resolve as
     // cap_reached — never guessed, never left dangling.
@@ -15123,12 +15495,12 @@ async fn max_retries_abort_names_the_classified_class_and_resolves_rows() {
         calls: calls.clone(),
         mode: FlakyMode::AlwaysFail,
     }));
-    let provider = Arc::new(CountingProvider::sequence(vec![
-        one_call_batch("call_1", "shell"),
-        one_call_batch("call_2", "shell"),
-        one_call_batch("call_3", "shell"),
-        text_stop("unreached"),
-    ]));
+    let provider = Arc::new(CountingProvider::sequence(
+        (1..=super::MAX_RETRIES)
+            .map(|i| one_call_batch(&format!("call_{i}"), "shell"))
+            .chain(std::iter::once(text_stop("unreached")))
+            .collect(),
+    ));
     let log = dir.path().join("triage.jsonl");
     let agent = AgentLoop::new(
         test_config(
@@ -15151,16 +15523,16 @@ async fn max_retries_abort_names_the_classified_class_and_resolves_rows() {
 
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
-        3,
+        super::MAX_RETRIES as usize,
         "a permanent classification must not trigger a harness retry"
     );
     assert_eq!(
         provider.call_count(),
-        3,
-        "the abort fires before a fourth request"
+        super::MAX_RETRIES as usize,
+        "the abort fires before one more request past the cap"
     );
     let texts = tool_texts(&messages);
-    assert_eq!(texts.len(), 3);
+    assert_eq!(texts.len(), super::MAX_RETRIES as usize);
     assert!(
         texts.iter().all(|t| t.contains("PERMANENT")),
         "every classified failure carries the permanent guidance; got: {texts:?}"
@@ -15175,7 +15547,11 @@ async fn max_retries_abort_names_the_classified_class_and_resolves_rows() {
         "the abort message must name the last classified class; got: {abort}"
     );
     let rows = super::failure_triage::read_rows(&log);
-    assert_eq!(rows.len(), 3, "each classified failure logs exactly once");
+    assert_eq!(
+        rows.len(),
+        super::MAX_RETRIES as usize,
+        "each classified failure logs exactly once"
+    );
     assert!(rows.iter().all(|r| r.action == "guidance"));
     assert!(rows
         .iter()
@@ -15197,12 +15573,12 @@ async fn disabled_triage_keeps_the_pre_classifier_failure_path() {
         calls: calls.clone(),
         mode: FlakyMode::AlwaysFail,
     }));
-    let provider = Arc::new(CountingProvider::sequence(vec![
-        one_call_batch("call_1", "file_read"),
-        one_call_batch("call_2", "file_read"),
-        one_call_batch("call_3", "file_read"),
-        text_stop("unreached"),
-    ]));
+    let provider = Arc::new(CountingProvider::sequence(
+        (1..=super::MAX_RETRIES)
+            .map(|i| one_call_batch(&format!("call_{i}"), "file_read"))
+            .chain(std::iter::once(text_stop("unreached")))
+            .collect(),
+    ));
     let log = dir.path().join("triage.jsonl");
     let agent = AgentLoop::new(
         test_config(
@@ -15225,11 +15601,11 @@ async fn disabled_triage_keeps_the_pre_classifier_failure_path() {
 
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
-        3,
+        super::MAX_RETRIES as usize,
         "a disabled gate must never auto-retry"
     );
     let texts = tool_texts(&messages);
-    assert_eq!(texts.len(), 3);
+    assert_eq!(texts.len(), super::MAX_RETRIES as usize);
     assert!(
         texts.iter().all(|t| t.contains("[tool error]")),
         "failures feed back exactly as before; got: {texts:?}"
@@ -18158,10 +18534,11 @@ async fn an_involved_session_strikes_toward_the_high_tier() {
     });
     let agent = routing_agent(dir.path(), routed_provider("default-model", "from-default"), resolver, gate);
     let (_outcome, mut rx) = run_routing_turn_observed(&agent, "wire the feature across modules").await;
-    // Three consecutive tool errors abort the turn (the stuck-model breaker),
-    // but the events still show the whole path: the involved first prompt
-    // served the turn on the medium tier's model, and the strike nudge fired
-    // BEFORE the abort, toward the high tier.
+    // Three consecutive tool errors strike the nudge (the turn itself now
+    // runs on to the MAX_RETRIES cap of 5, so it ends on the scripted
+    // "done" response), and the events still show the whole path: the
+    // involved first prompt served the turn on the medium tier's model,
+    // and the strike nudge fired toward the high tier.
     let events = drain_routing_events(&mut rx);
     assert!(events.iter().any(|event| matches!(
         event,

@@ -1179,7 +1179,10 @@ fn resolve_tier_over(
 const NUDGE_LADDER: [&str; 5] = ["trivial", "routine", "medium", "high", "escalate"];
 
 /// Consecutive failed or verbatim-repeated tool calls that fire a nudge
-/// (design §4.6).
+/// (design §4.6). Deliberately still 3 after plan 865249fd raised the
+/// session's doom-guard cap (`MAX_RETRIES`, src/agent/mod.rs) 3 → 5: the
+/// stuck-worker nudge tells the lead early, while the worker itself keeps
+/// running to the 5th consecutive failing batch before the turn aborts.
 const NUDGE_STRIKE_LIMIT: u32 = 3;
 
 /// The enabled-tier ladder over a model inventory and its tier assignment:
@@ -12772,11 +12775,21 @@ models = [\"scripted-a\", \"scripted-b\"]
             .to_string()
     }
 
+    /// The session's consecutive-failing-batch cap — `MAX_RETRIES` in
+    /// src/agent/mod.rs, raised 3 → 5 by plan 865249fd. It is `pub(crate)`
+    /// in the mnemo crate, so not reachable from src-tauri; mirrored here
+    /// for the tests that script a worker into the doom-guard failure.
+    /// Keep in sync with src/agent/mod.rs.
+    const TEST_MAX_RETRIES: usize = 5;
+
     /// Three failing tool calls in a row nudge the lead once — and only
-    /// once, even when the streak keeps failing (design §4.6).
+    /// once, even when the streak keeps failing (design §4.6). The nudge
+    /// fires at Laya's strike limit (3); the worker itself now runs on to
+    /// the doom-guard cap (TEST_MAX_RETRIES, plan 865249fd) before it
+    /// lands Failed.
     #[tokio::test]
     async fn three_failing_tool_calls_nudge_once() {
-        let responses = (1..=3)
+        let responses = (1..=TEST_MAX_RETRIES)
             .map(|attempt| tool_call_batch(&format!("call-{attempt}"), "not_a_real_tool", &format!("{{\"attempt\":{attempt}}}")))
             .chain([vec![
                 mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
@@ -12822,10 +12835,11 @@ models = [\"scripted-a\", \"scripted-b\"]
             Some("high"),
             "the nudge is marked on the record: {settled:?}"
         );
-        // Three consecutive real failures also trip the session's own
-        // doom guard, so the worker lands Failed — exactly when the nudge
-        // telling the lead to resume on a stronger tier is useful. The
-        // nudge never stopped or switched anything itself.
+        // TEST_MAX_RETRIES consecutive real failures also trip the
+        // session's own doom guard, so the worker lands Failed — after the
+        // nudge (at the 3rd strike) has already told the lead to resume on
+        // a stronger tier. The nudge never stopped or switched anything
+        // itself.
         assert!(
             matches!(settled.status, WorkerStatus::Failed),
             "the doom guard, not the nudge, failed the worker: {settled:?}"
@@ -12873,7 +12887,7 @@ models = [\"scripted-a\", \"scripted-b\"]
     /// `team_resume` on a stronger tier can still take the nudge.
     #[tokio::test]
     async fn failed_worker_does_not_log_nudge_ignored() {
-        let responses = (1..=3)
+        let responses = (1..=TEST_MAX_RETRIES)
             .map(|attempt| {
                 tool_call_batch(
                     &format!("call-{attempt}"),
@@ -12921,7 +12935,7 @@ models = [\"scripted-a\", \"scripted-b\"]
     /// there, once — a repeated stop writes nothing more.
     #[tokio::test]
     async fn stopped_after_failure_logs_nudge_ignored_once() {
-        let responses = (1..=3)
+        let responses = (1..=TEST_MAX_RETRIES)
             .map(|attempt| {
                 tool_call_batch(
                     &format!("call-{attempt}"),
@@ -12988,6 +13002,73 @@ models = [\"scripted-a\", \"scripted-b\"]
                 .count(),
             1,
             "nudge_ignored logs once: {:?}",
+            fixture.rows()
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// Plan 865249fd: the strike nudge to the lead still fires at the 3rd
+    /// failing call (Laya's limit stays 3), but the raised doom-guard cap
+    /// (TEST_MAX_RETRIES) lets the worker keep running — 3 failures then a
+    /// success finishes the turn normally instead of landing Failed.
+    #[tokio::test]
+    async fn a_worker_still_runs_after_the_strike_nudge_until_the_fifth_error() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .chain([tool_call_batch(
+                "call-ok",
+                "read_files",
+                "{\"files\":[\"README.md\"]}",
+            )])
+            .chain([vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ]])
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        wait_route_row(&fixture).await;
+        // The stuck-worker nudge row logged at the 3rd failure, as before.
+        let row = eventually(|| async {
+            fixture
+                .rows()
+                .into_iter()
+                .find(|row| matches!(row, DispatchRoutingRow::Nudge { .. }))
+        })
+        .await;
+        assert!(
+            matches!(
+                &row,
+                DispatchRoutingRow::Nudge {
+                    reason,
+                    detail,
+                    ..
+                } if reason == "strikes"
+                    && detail == "looks stuck (3 failing tool calls in a row)"
+            ),
+            "the strike nudge row: {row:?}"
+        );
+        // ...but the worker kept running past the nudge and finished
+        // normally on the successful 4th batch — not Failed.
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert!(
+            matches!(settled.status, WorkerStatus::Completed),
+            "3 failures no longer fail the worker — it runs on to the \
+             success: {settled:?}"
+        );
+        assert!(
+            fixture
+                .rows()
+                .iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::Outcome { status, .. } if status == "failed")),
+            "no failed outcome row: {:?}",
             fixture.rows()
         );
         fixture.team.shutdown().await;

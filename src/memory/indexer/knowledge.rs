@@ -22,8 +22,8 @@ use crate::memory::{
 };
 
 use super::{
-    budgeted_digest, content_hash, first_content_line, truncate_title, write_derived, IndexReport,
-    SourceRecord,
+    budgeted_digest, content_hash, first_content_line, row_matches_source, truncate_title,
+    write_derived, IndexReport, SourceRecord,
 };
 
 /// Re-index a small set of knowledge files that changed on disk (a write
@@ -159,8 +159,19 @@ pub async fn reindex_knowledge_files(
     for source in &sources {
         let hash = content_hash(source);
         let memory_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, source.key.as_bytes()).to_string();
-        match store.index_state_get(&source.key).await? {
-            Some((old_hash, _)) if old_hash == hash => report.skipped += 1,
+        let state = store.index_state_get(&source.key).await?;
+        // Unchanged requires the row to mirror its source, not just the
+        // content hash: the hash lives in `derived_index_state` and never
+        // sees a row another writer overwrote, so a hash-only test would
+        // skip a drifted row for ever.
+        let unchanged = match &state {
+            Some((old_hash, _)) if *old_hash == hash => {
+                row_matches_source(store, &memory_id, source).await?
+            }
+            _ => false,
+        };
+        match state {
+            Some(_) if unchanged => report.skipped += 1,
             Some((_, old_id)) => {
                 let id = if store
                     .update_memory(&old_id, Some(&source.title), Some(&source.content))

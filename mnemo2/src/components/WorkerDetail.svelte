@@ -242,7 +242,7 @@
     </p>
   {/if}
 
-  <div class="detail-body">
+  <div class="detail-body" class:thread-tab={tab === "thread"}>
     {#if tab === "review"}
       <section class="checks-panel">
         <div class="checks-heading"><span>BRANCH-TIP CHECKS</span><code>{worker.worktree}</code></div>
@@ -310,8 +310,8 @@
 </article>
 
 <style>
-  .worker-detail { height: 100%; overflow-y: auto; padding: 0 18px 18px; scrollbar-gutter: stable; }
-  .worker-hero { position: sticky; top: 0; z-index: 10; padding-top: 10px; border-bottom: 1px solid var(--line); background: var(--canvas); }
+  .worker-detail { display: flex; flex-direction: column; height: 100%; overflow-y: auto; padding: 0 18px 18px; scrollbar-gutter: stable; }
+  .worker-hero { position: sticky; top: 0; z-index: 10; flex: 0 0 auto; padding-top: 10px; border-bottom: 1px solid var(--line); background: var(--canvas); }
   .worker-primary { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
   .worker-identity { display: flex; flex: 1; align-items: flex-start; gap: 8px; min-width: 0; }
   .avatar { display: grid; flex: 0 0 auto; width: 30px; height: 30px; place-items: center; border-radius: 8px; background: hsl(var(--hue) 32% var(--avatar-bg-lightness)); color: hsl(var(--hue) 30% var(--avatar-ink-lightness)); font-size: var(--text-meta); font-weight: 750; }
@@ -360,6 +360,9 @@
   .detail-tabs button.active { background: var(--surface-soft); color: var(--ink); }
   .detail-tabs button span { display: inline-grid; min-width: 13px; height: 13px; place-items: center; border-radius: 4px; background: var(--surface); color: var(--muted); font-size: var(--text-meta); }
   .detail-body { padding-top: 12px; }
+  .detail-body:not(.thread-tab) { flex: 0 0 auto; }
+  .detail-body.thread-tab { display: flex; flex: 1 0 320px; flex-direction: column; }
+  .detail-body.thread-tab > :global(.thread-panel) { flex: 1 1 240px; min-height: 240px; }
   .worker-blocker { margin: 8px 0 0; padding: 7px 9px; border: 1px solid var(--warning-blocker-line); border-radius: 6px; background: var(--warning-soft); color: var(--ink-soft); font-size: var(--text-meta); line-height: 1.5; }
   .checks-panel, .merge-panel { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
   .checks-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 7px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }

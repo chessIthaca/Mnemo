@@ -1,6 +1,6 @@
+import { app } from "../lib/store";
 import {
   setPreviewLayaTransport,
-  type DispatchRoutingSettings,
   type LayaEvent,
   type LayaStatus,
   type LayaTransport,
@@ -49,7 +49,8 @@ const CONTROL: TiersTopControl = {
   knn_min_rows: 30,
 };
 
-/** The in-memory transport: a clone of the sample status, a streaming setup, a real-shaped save. */
+/** The in-memory transport: a clone of the sample status, a streaming setup,
+ * a one-flag save, and a check that drives the store's indexing snapshot. */
 function createPreviewLayaTransport(): LayaTransport {
   let status = structuredClone(READY);
   let control = structuredClone(CONTROL);
@@ -68,7 +69,6 @@ function createPreviewLayaTransport(): LayaTransport {
       fallback_tier: "high",
       nudges: true,
       min_words: 20,
-      effort: {},
     },
     summary: {
       decisions_by_mode: { shadow: 31, suggest: 8 },
@@ -81,18 +81,19 @@ function createPreviewLayaTransport(): LayaTransport {
       nudges_acted_on: 1,
       eval_date: null,
     },
-    eval: null,
+    eval: {
+      date: "2026-11-05",
+      min_confidence_4: 0.5,
+      min_confidence_3: 0.475,
+      min_confidence_2: 0.6,
+      routed_share: 0.017,
+      accuracy: 1,
+      fingerprint: null,
+    },
   };
   return {
     status: async () => structuredClone(status),
     routingStatus: async () => structuredClone(routingStatus),
-    saveRoutingSettings: async (settings: DispatchRoutingSettings) => {
-      routingStatus = { ...routingStatus, settings: structuredClone(settings) };
-      return structuredClone(routingStatus);
-    },
-    runRoutingEval: async () => {
-      throw new Error("the routing eval needs the desktop app: it asks the lead's attached Laya");
-    },
     topControl: async () => structuredClone(control),
     saveTopControl: async (choice: TierChoice) => {
       const enforce = choice === "auto";
@@ -136,18 +137,32 @@ function createPreviewLayaTransport(): LayaTransport {
       status = { ...status, enabled: false, status: "disabled" };
       control = { ...control, laya_status: "disabled" };
     },
-    save: async (flags, routing) => {
-      if (flags) status = { ...status, flags: { ...status.flags, ...flags } };
-      if (routing) {
-        status = {
-          ...status,
-          routing: {
-            threshold: routing.threshold,
-            first_prompt_min_confidence: routing.first_prompt_min_confidence,
-            enforce: routing.enforce,
+    saveFlag: async (key, value) => {
+      status = { ...status, flags: { ...status.flags, [key]: value } };
+    },
+    checkLaya: async () => {
+      // The check's progress rides the store's indexing snapshot: advance a
+      // running laya pass in the same shape the desktop app broadcasts it.
+      let done = 0;
+      const timer = setInterval(() => {
+        done = Math.min(207, done + 9);
+        app.update((state) => ({
+          ...state,
+          indexing: {
+            revision: done + 1,
+            firstRun: false,
+            code: state.indexing?.code ?? null,
+            memory: state.indexing?.memory ?? null,
+            laya: {
+              state: done < 207 ? "running" : "done",
+              done,
+              total: 207,
+              detail: done < 207 ? null : "Confident on 2% of test tasks, 100% of those right",
+            },
           },
-        };
-      }
+        }));
+        if (done >= 207) clearInterval(timer);
+      }, 80);
     },
     onLayaEvent: async (handler) => {
       handlers.push(handler);

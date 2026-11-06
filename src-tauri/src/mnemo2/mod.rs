@@ -22,6 +22,10 @@ pub mod indexing;
 /// The real worker team runtime.
 pub mod team;
 
+/// The turn tag a team notice's first line carries, so a stale notice is
+/// dropped at delivery.
+pub(crate) mod notice_tag;
+
 /// Laya's dispatch-time routing decision: the classified text, the shared
 /// gate, and the dispatch routing log's rows (design
 /// `.coding/design/mnemo2-laya-routing.md` §4.2–§4.8).
@@ -92,6 +96,9 @@ pub mod run_file;
 /// e02de747).
 pub mod laya_settings;
 
+/// The automatic Laya check (plan 8106337a): the routing eval the app runs by itself, plus its Check-again command.
+pub mod laya_check;
+
 /// The Safety settings commands (approval mode + the project's safety
 /// rules) — the backend of the Settings dialog's Safety page (plan
 /// f1bd54e5).
@@ -126,7 +133,7 @@ pub mod model_label;
 
 /// Model-role settings for the Models and Savings pages: per-task
 /// models, vision, the code-indexing (embedding) model with install
-/// progress, optimizer levers, per-model pricing and budget caps.
+/// progress, optimizer levers and budget caps.
 pub mod model_settings;
 
 /// The Memory tab's read-only command surface: the project's knowledge
@@ -552,9 +559,8 @@ pub fn run() {
             ipc::lead_open,
             laya_settings::laya_status,
             laya_settings::routing_settings_status,
-            laya_settings::save_routing_settings,
             laya_settings::routing_log_summary,
-            laya_settings::run_routing_eval,
+            laya_check::laya_check_start,
             laya_settings::laya_setup,
             laya_settings::laya_disable,
             laya_settings::save_laya_settings,

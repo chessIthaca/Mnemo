@@ -27,7 +27,7 @@ Verification: `cargo test --lib agent::factory`, `cargo test --test integration 
 build.yml run 42037069902 macOS `cargo test --workspace`: agent::factory::tests::free_default_excludes_the_reviewer_channel (left 36, right 42) and agent::factory::tests::tool_selection_exclude_carves_named_tools (left 35, right 41) fail; tests/integration/headless.rs close_and_wait_rejects_a_full_command_queue fails "the pending turn leaves its command queue full" (line 1448).
 
 ## Regression test
-src/agent/factory.rs free_default_excludes_the_reviewer_channel and tool_selection_exclude_carves_named_tools (platform-aware counts); tests/integration/headless.rs close_and_wait_rejects_a_full_command_queue (ignored on macOS with reason)
+free_default_excludes_the_reviewer_channel
 
 ## Progress
 - 2026-11-05 step 1 done: step 1 merged: macTestFix04 (macTestFix04) on deepseek-v4.1-flash:1017, merge commit ddb65deb; review: Factory tool-count expectations now add the 6 on-screen browser tools only on Windows; the full-command-queue test is ignored on macOS with a documented race (the agent task drains try_send commands mid-turn there), still covered on Windows/Linux.

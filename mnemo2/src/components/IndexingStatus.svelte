@@ -2,15 +2,50 @@
   import { onDestroy, untrack } from "svelte";
   import { Check } from "@lucide/svelte";
   import { app } from "../lib/store";
-  import { runningPasses, type IndexPass } from "../lib/indexingEngine";
+  import { runningPasses, type IndexPass, type PassKind } from "../lib/indexingEngine";
 
-  type Kind = "code" | "memory";
+  type Kind = PassKind;
   /** How long a just-finished pass stays visible, so a fast pass is still seen. */
   const FINISHED_MS = 4000;
 
+  /** What each pass is doing, as its running line reads it. */
+  const RUNNING_TEXT: Record<Kind, string> = {
+    code: "Indexing code",
+    memory: "Updating memory",
+    laya: "Checking Laya",
+  };
+  /** The unit each pass counts. */
+  const UNIT_TEXT: Record<Kind, string> = {
+    code: "files",
+    memory: "sources",
+    laya: "tasks",
+  };
+  /** Each pass's progress bar name. */
+  const PROGRESS_LABEL: Record<Kind, string> = {
+    code: "Code index progress",
+    memory: "Memory update progress",
+    laya: "Laya check progress",
+  };
+  /** The confirmation each pass shows for a moment after it ends. */
+  const FINISHED_TEXT: Record<Kind, string> = {
+    code: "Code index up to date",
+    memory: "Memory up to date",
+    laya: "Laya checked",
+  };
+  /** What each pass shows when it fails. */
+  const FAILED_TEXT: Record<Kind, string> = {
+    code: "Code index failed",
+    memory: "Memory update failed",
+    laya: "Laya check failed",
+  };
+
   const passes = $derived(runningPasses($app.indexing));
   const failed = $derived(
-    ([["code", $app.indexing?.code], ["memory", $app.indexing?.memory]] as const)
+    ([
+      ["code", $app.indexing?.code],
+      ["memory", $app.indexing?.memory],
+      ["laya", $app.indexing?.laya],
+    ] as const)
       .filter(([, pass]) => pass?.state === "failed")
       .map(([kind, pass]) => ({ kind, error: pass?.detail ?? "unknown error" })),
   );
@@ -27,7 +62,7 @@
   });
 
   function track(indexing: typeof $app.indexing) {
-    for (const kind of ["code", "memory"] as const) {
+    for (const kind of ["code", "memory", "laya"] as const) {
       const pass = indexing?.[kind] ?? null;
       if (pass?.state === "running") {
         seenRunning[kind] = true;
@@ -48,10 +83,9 @@
   });
 
   function label(kind: Kind, pass: IndexPass): string {
-    const what = kind === "code" ? "Indexing code" : "Updating memory";
+    const what = RUNNING_TEXT[kind];
     if (pass.total === 0) return what;
-    const unit = kind === "code" ? "files" : "sources";
-    return `${what} · ${pass.done.toLocaleString()}/${pass.total.toLocaleString()} ${unit}`;
+    return `${what} · ${pass.done.toLocaleString()}/${pass.total.toLocaleString()} ${UNIT_TEXT[kind]}`;
   }
 
   function fraction(pass: IndexPass): number | null {
@@ -67,7 +101,7 @@
       class="bar"
       class:counting={share === null}
       role="progressbar"
-      aria-label={kind === "code" ? "Code index progress" : "Memory update progress"}
+      aria-label={PROGRESS_LABEL[kind]}
       aria-valuemin="0"
       aria-valuemax="100"
       aria-valuenow={share === null ? undefined : Math.round(share * 100)}
@@ -77,12 +111,12 @@
 {#each finished as { kind, title } (kind)}
   <span class="indexing finished" role="status" title={title || undefined}>
     <Check size={11} aria-hidden="true" />
-    {kind === "code" ? "Code index up to date" : "Memory up to date"}
+    {FINISHED_TEXT[kind]}
   </span>
 {/each}
 {#each failed as { kind, error } (kind)}
   <span class="indexing failed" title={error}>
-    {kind === "code" ? "Code index failed" : "Memory update failed"}
+    {FAILED_TEXT[kind]}
   </span>
 {/each}
 

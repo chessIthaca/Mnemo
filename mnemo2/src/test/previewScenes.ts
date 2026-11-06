@@ -2254,7 +2254,7 @@ export const previewScenes: PreviewScene[] = [
     name: "settings-models",
     title: "Settings: Models and Savings",
     description:
-      "The settings dialog's Models page (per-task, vision, code indexing, budget) and Savings page (levers, pricing) against seeded data.",
+      "The settings dialog's Models page (per-task, vision, code indexing, budget) and Savings page (levers) against seeded data.",
     // The dialog opens from component-local state, so the scene mounts it
     // directly with the preview fakes seeded; `build` keeps the app shell
     // valid for the scenes test.
@@ -2272,7 +2272,7 @@ export const previewScenes: PreviewScene[] = [
     name: "settings-tiers",
     title: "Settings: Tiers",
     description:
-      "The settings dialog's Tiers page: the top control (does Laya help pick the tier?) with its readiness line and kNN count, the five-rung ladder editor with fold hints and Laya labels, the dispatch tier-text preview, the collapsed routing details and the Laya section at the bottom.",
+      "The settings dialog's Tiers page: the top control (does Laya help pick the tier?) with its readiness line and Laya check, the five-rung ladder editor with fold hints and Laya labels, and three collapsed sections: what the lead sees, how Laya is doing, other things Laya can do.",
     // Same mount pattern as settings-models; the rail click opens the
     // Tiers page directly so the scene shows the page it names.
     build: missionControl,

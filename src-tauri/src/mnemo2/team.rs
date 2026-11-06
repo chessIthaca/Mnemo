@@ -141,7 +141,7 @@ pub enum MessageSender {
     Lead,
     /// The user replying in mission control.
     User,
-    /// Mnemo2 itself, for a generated repair or route-fix brief.
+    /// Mnemo2 itself, for a generated repair or route-fix brief or a plan-changed notice.
     Mnemo,
 }
 
@@ -234,6 +234,16 @@ impl ChangeSource {
     }
 }
 
+/// One failed tool call in a worker's current failing streak: the tool's
+/// name and its cleaned output.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolErrorNote {
+    /// The tool that failed.
+    pub tool: String,
+    /// The failed call's output: whitespace collapsed and length-capped.
+    pub output: String,
+}
+
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -304,6 +314,11 @@ pub struct WorkerRecord {
     /// Estimated cost in millionths of a dollar when pricing is configured.
     #[serde(default)]
     pub cost_micros: Option<u64>,
+    /// The last cost-alert threshold the lead was told about, in millionths
+    /// of a dollar: the notice fires once at `cost_notice_usd`, then at each
+    /// doubling. 0 when no notice has gone out yet.
+    #[serde(default)]
+    pub cost_notified_micros: u64,
     /// Worker creation time in Unix epoch milliseconds.
     #[serde(default)]
     pub created_at_ms: u128,
@@ -365,6 +380,11 @@ pub struct WorkerRecord {
     pub merge: Option<MergeRecord>,
     /// The last error, when the worker failed or conflicted.
     pub error: Option<String>,
+    /// The current streak of failed tool calls, oldest first, cleared by a
+    /// successful call. Only the latest [`TOOL_ERRORS_KEPT`] are kept, each
+    /// output capped at [`TOOL_ERROR_CHARS`] characters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_errors: Vec<ToolErrorNote>,
     /// The board plan this task was dispatched under (validated by the plan
     /// board at dispatch).
     #[serde(default)]
@@ -861,6 +881,12 @@ struct LiveWorker {
     /// Beside the session handle, never persisted; a reroute resets it
     /// ([`TeamRuntime::change_model`]).
     strikes: Arc<Mutex<route_question::Strikes>>,
+    /// A steer was sent and its follow-up turn has not started: set before the
+    /// `SessionCommand::Steer` goes out, cleared by the follow-up's `Started`,
+    /// by `Exited`, by a final `Error`, and by the follow-up deadline in
+    /// [`pump_worker`]. A steered turn end is not a finished turn, so the pump
+    /// holds it until the follow-up starts or the deadline settles it.
+    steer_pending: Arc<AtomicBool>,
 }
 
 impl LiveWorker {
@@ -1142,6 +1168,52 @@ const NUDGE_LADDER: [&str; 5] = ["trivial", "routine", "medium", "high", "escala
 /// (design §4.6).
 const NUDGE_STRIKE_LIMIT: u32 = 3;
 
+/// How many failed tool calls a worker's streak keeps: enough for the lead to
+/// see the last few errors without unbounded growth.
+const TOOL_ERRORS_KEPT: usize = 3;
+
+/// How many characters of one failed call's output the streak keeps.
+const TOOL_ERROR_CHARS: usize = 300;
+
+/// Fold one finished tool call into the worker's current failing streak: a
+/// successful call clears it, a failed one appends the tool and its cleaned
+/// output, keeping only the latest [`TOOL_ERRORS_KEPT`].
+fn note_tool_outcome(worker: &mut WorkerRecord, tool: &str, success: bool, output: &str) {
+    if success {
+        worker.tool_errors.clear();
+        return;
+    }
+    let collapsed = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut note: String = collapsed.chars().take(TOOL_ERROR_CHARS).collect();
+    if collapsed.chars().count() > TOOL_ERROR_CHARS {
+        note.push('…');
+    }
+    worker.tool_errors.push(ToolErrorNote {
+        tool: tool.to_string(),
+        output: note,
+    });
+    let overflow = worker.tool_errors.len().saturating_sub(TOOL_ERRORS_KEPT);
+    if overflow > 0 {
+        worker.tool_errors.drain(..overflow);
+    }
+}
+
+/// The worker's current failing streak as notice text: empty when the last
+/// tool call succeeded, otherwise the kept failures, oldest first.
+pub(crate) fn tool_errors_text(worker: &WorkerRecord) -> String {
+    if worker.tool_errors.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("\nLast tool errors:");
+    for note in &worker.tool_errors {
+        text.push_str("\n- ");
+        text.push_str(&note.tool);
+        text.push_str(": ");
+        text.push_str(&note.output);
+    }
+    text
+}
+
 /// The enabled-tier ladder over a model inventory and its tier assignment:
 /// a tier is enabled when at least one of the models the tier names is
 /// available. [`TeamRuntime::enabled_routing_tiers`] over shared handles,
@@ -1162,18 +1234,29 @@ fn enabled_tiers_over(
 }
 
 /// Directly modelled tiers for nudges. Unlike dispatch routing, a nudge must
-/// not target an empty tier that would fold back to the worker's current one.
+/// not target an empty tier that would fold back to the worker's current one,
+/// nor a tier whose first available model is the model the worker already
+/// runs: a suggestion that changes nothing is noise.
 fn direct_tiers_over(
     models: &[LeadModel],
     tiers: &mnemo::headless::TiersDto,
+    current_model: Option<&str>,
 ) -> EnabledTiers {
     let ladder = tier_ladder_from_dto(tiers);
     let direct = |tier| {
-        ladder.get(tier).is_some_and(|rung| {
-            rung.models
-                .iter()
-                .any(|spec| models.iter().any(|model| model.spec == *spec))
-        })
+        let Some(rung) = ladder.get(tier) else {
+            return false;
+        };
+        // The model a dispatch on this tier would actually run: the first
+        // spec in the rung that the inventory serves.
+        let first = rung
+            .models
+            .iter()
+            .find(|spec| models.iter().any(|model| model.spec == **spec));
+        match first {
+            Some(spec) => current_model != Some(spec.as_str()),
+            None => false,
+        }
     };
     EnabledTiers {
         trivial: direct("trivial"),
@@ -1274,7 +1357,8 @@ async fn claim_nudge(
 /// Deliver a claimed nudge: queue the lead notice on the board-signal bus
 /// (the runtime delivers it prefixed like every TeamManager notice) and
 /// append the `Nudge` row (design §4.7) behind the same `logs_routing`
-/// gate as the reroute rows. Never switches the worker's model.
+/// gate as the reroute rows. Never switches the worker's model. `tool_errors`
+/// is the strike nudge's failing-streak text (empty for every other nudge).
 fn deliver_nudge(
     signals: &broadcast::Sender<BoardSignal>,
     routing_log_path: &Path,
@@ -1282,11 +1366,17 @@ fn deliver_nudge(
     claim: &ClaimedNudge,
     reason: &str,
     detail: &str,
+    tool_errors: &str,
 ) {
+    let tool_errors = if tool_errors.is_empty() {
+        String::new()
+    } else {
+        format!("{tool_errors}\nRead these first: a tool problem is not fixed by a stronger model.")
+    };
     let _ = signals.send(BoardSignal::Notice {
         key: format!("nudge:{worker_id}"),
         text: format!(
-            "worker_id={worker_id} Laya nudge: {} {detail}; consider team_resume with tier {}.",
+            "worker_id={worker_id} Laya nudge: {} {detail}; consider team_resume with tier {}.{tool_errors}",
             claim.name, claim.to_tier
         ),
     });
@@ -1350,9 +1440,19 @@ struct StrikeNudges<'a> {
 /// already nudged, has no routing record, or sits on the top enabled
 /// tier.
 async fn try_strike_nudge(worker_id: &str, nudges: StrikeNudges<'_>, repeated: bool) {
+    // The worker's model and its current failing streak come from one lock
+    // read; the records lock must be released before `claim_nudge` takes it.
+    let (current_model, tool_errors) = {
+        let records = nudges.records.lock().await;
+        let Some(worker) = records.iter().find(|worker| worker.id == worker_id) else {
+            return;
+        };
+        (worker.model.clone(), tool_errors_text(worker))
+    };
     let enabled = direct_tiers_over(
         &nudges.models.read().unwrap_or_else(|e| e.into_inner()),
         &nudges.tiers.read().unwrap_or_else(|e| e.into_inner()),
+        current_model.as_deref(),
     );
     let Some(claim) =
         claim_nudge(nudges.records, worker_id, enabled, nudges.settings.mode, None).await
@@ -1371,6 +1471,7 @@ async fn try_strike_nudge(worker_id: &str, nudges: StrikeNudges<'_>, repeated: b
         &claim,
         reason,
         detail,
+        &tool_errors,
     );
 }
 
@@ -2118,14 +2219,16 @@ impl TeamRuntime {
     }
 
     /// Nudge destinations have their own models, so a nudge cannot fold back
-    /// onto the tier the worker is already running.
-    fn direct_nudge_tiers(&self) -> EnabledTiers {
+    /// onto the tier the worker is already running, nor onto a tier whose
+    /// first available model is the model the worker already runs.
+    fn direct_nudge_tiers(&self, current_model: Option<&str>) -> EnabledTiers {
         direct_tiers_over(
             &self.current_models(),
             &self.tiers
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            current_model,
         )
     }
 
@@ -2317,8 +2420,9 @@ impl TeamRuntime {
                         .collect::<Vec<_>>()
                 };
                 for worker_id in workers {
+                    // Mnemo2 writes this notice and cannot tell who edited the plan, so it signs it itself.
                     if let Err(error) = team
-                        .message(&worker_id, text.clone(), MessageSender::Lead)
+                        .message(&worker_id, text.clone(), MessageSender::Mnemo)
                         .await
                     {
                         eprintln!(
@@ -2675,6 +2779,24 @@ impl TeamRuntime {
         self.external_state().queue.drain(..).collect()
     }
 
+    /// Keep the notices that still describe their worker: a tagged notice
+    /// whose worker moved on, or no longer exists, is dropped. Untagged
+    /// notices always stay.
+    pub(crate) async fn current_notices(&self, notices: Vec<String>) -> Vec<String> {
+        let records = self.records.lock().await;
+        notices
+            .into_iter()
+            .filter(
+                |notice| match crate::mnemo2::notice_tag::TurnTag::parse(notice) {
+                    Some(tag) => records
+                        .iter()
+                        .any(|worker| worker.id == tag.worker_id && tag.still_current(worker)),
+                    None => true,
+                },
+            )
+            .collect()
+    }
+
     /// Put notices that were drained but never reached the external lead
     /// (the response write failed) back at the front of its queue, in their
     /// original order. If the lead detached meanwhile they join the
@@ -2740,7 +2862,7 @@ impl TeamRuntime {
             let woken = self.external_wake.notified();
             tokio::pin!(woken);
             woken.as_mut().enable();
-            let notices = self.drain_external_notices();
+            let notices = self.current_notices(self.drain_external_notices()).await;
             if !notices.is_empty() {
                 return ExternalWait {
                     notices,
@@ -2754,7 +2876,7 @@ impl TeamRuntime {
                 };
             }
             if tokio::time::timeout_at(deadline, woken).await.is_err() {
-                let notices = self.drain_external_notices();
+                let notices = self.current_notices(self.drain_external_notices()).await;
                 let status = if !notices.is_empty() {
                     ExternalWaitStatus::Notices
                 } else if self.external_lead_attached() {
@@ -2764,6 +2886,15 @@ impl TeamRuntime {
                 };
                 return ExternalWait { notices, status };
             }
+        }
+    }
+
+    /// Test seam for the lost-follow-up path: mark a live worker as waiting for
+    /// a steered turn's follow-up without sending a steer.
+    #[cfg(test)]
+    pub(crate) async fn set_steer_pending_for_test(&self, worker_id: &str, pending: bool) {
+        if let Some(live) = self.live.lock().await.get(worker_id) {
+            live.steer_pending.store(pending, Ordering::SeqCst);
         }
     }
 
@@ -2960,13 +3091,13 @@ impl TeamRuntime {
         let mut model = json!({"type": "string", "description": model_description});
         let tier_description = match (&guidance, routing_mode) {
             (Some(text), RoutingMode::Off) => format!(
-                "Required: choose the cheapest tier that fits the step; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
+                "Required: choose the cheapest tier that fits the step (a step with a complete spec fits routine or trivial, even across files); the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (Some(text), RoutingMode::Auto) => format!(
-                "Optional: choose the cheapest tier that fits the step, or auto to let Laya choose; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
+                "Optional: choose the cheapest tier that fits the step (a step with a complete spec fits routine or trivial, even across files), or auto to let Laya choose; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (Some(text), _) => format!(
-                "Required: choose the cheapest tier that fits the step, or auto where offered; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
+                "Required: choose the cheapest tier that fits the step (a step with a complete spec fits routine or trivial, even across files), or auto where offered; the worker runs on that tier's first available model; an empty tier folds down.\n{text}"
             ),
             (None, _) => "The model tier. No tiers are configured (Settings > Tiers), so omit it and the default model is used.".to_string(),
         };
@@ -4035,6 +4166,7 @@ impl TeamRuntime {
             cached_tokens: 0,
             requests: 0,
             cost_micros: None,
+            cost_notified_micros: 0,
             created_at_ms: millis,
             elapsed_ms: 0,
             turns: 0,
@@ -4055,6 +4187,7 @@ impl TeamRuntime {
             fixer_finding_id: None,
             merge: None,
             error: None,
+            tool_errors: Vec::new(),
             opening_prompt: None,
             plan_id: None,
             plan_step: None,
@@ -4245,6 +4378,7 @@ impl TeamRuntime {
             cached_tokens: 0,
             requests: 0,
             cost_micros: None,
+            cost_notified_micros: 0,
             created_at_ms: millis,
             elapsed_ms: 0,
             turns: 0,
@@ -4266,6 +4400,7 @@ impl TeamRuntime {
             fixer_finding_id: None,
             merge: None,
             error: None,
+            tool_errors: Vec::new(),
             plan_id: plan.as_ref().map(|plan| plan.plan_id.clone()),
             plan_step: plan.map(|plan| plan.step),
             tier,
@@ -4349,6 +4484,7 @@ impl TeamRuntime {
         let busy = Arc::new(AtomicBool::new(true));
         let receiver = session.events();
         let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
+        let steer_pending = Arc::new(AtomicBool::new(false));
         let pump = tokio::spawn(pump_worker(
             id.clone(),
             generation,
@@ -4367,6 +4503,7 @@ impl TeamRuntime {
             self.routing.clone(),
             self.signals.clone(),
             strikes.clone(),
+            steer_pending.clone(),
             self.models.clone(),
             self.tiers.clone(),
             self.live.clone(),
@@ -4396,6 +4533,7 @@ impl TeamRuntime {
                 pump,
                 cleanup_retry_only: false,
                 strikes,
+                steer_pending,
             },
         );
         self.update_worker(&id, |worker| {
@@ -4552,13 +4690,14 @@ impl TeamRuntime {
         }
         let previous_inbox = record.inbox.clone();
         let delivered_text = format!("{}\n{text}", sender.header());
-        let (busy, idle, sent) = {
+        let (busy, idle, steer_pending, sent) = {
             let live = self.live.lock().await;
             let live = live
                 .get(worker_id)
                 .ok_or_else(|| format!("worker '{worker_id}' is not running; resume it first"))?;
             live.admit_session_command(worker_id)?;
             let busy = live.busy.clone();
+            let steer_pending = live.steer_pending.clone();
             let idle = !busy.load(Ordering::SeqCst);
             let kind = kind.unwrap_or(if idle {
                 InboxKind::Prompt
@@ -4600,12 +4739,23 @@ impl TeamRuntime {
                     images: Vec::new(),
                 }
             };
+            // A steer ends the current turn at its next break and drives a
+            // follow-up turn: mark the wait before the command can land, so the
+            // pump never reads the steered turn end as a finished turn.
+            if !idle {
+                steer_pending.store(true, Ordering::SeqCst);
+            }
             let result = live.session.send(command).await;
-            (busy, idle, result)
+            (busy, idle, steer_pending, result)
         };
         if let Err(err) = sent {
             if idle {
                 busy.store(false, Ordering::SeqCst);
+            }
+            if !idle {
+                // The steer never reached the session: there is no follow-up
+                // turn to wait for.
+                steer_pending.store(false, Ordering::SeqCst);
             }
             self.update_worker(worker_id, |worker| worker.inbox = previous_inbox)
                 .await;
@@ -4619,6 +4769,9 @@ impl TeamRuntime {
                 WorkerStatus::Working
             };
             worker.pending = None;
+            // A delivered message starts the worker over: a stale failure is
+            // no longer the record's truth.
+            worker.error = None;
         })
         .await;
         self.persist().await?;
@@ -4649,11 +4802,11 @@ impl TeamRuntime {
         else {
             return;
         };
-        let enabled = self.direct_nudge_tiers();
         // The pre-checks run without detaching: a worker without a routing
         // record, already nudged, or on the top enabled tier never spends
-        // a classifier call on drift.
-        let worth_asking = {
+        // a classifier call on drift. The enabled set is built from this
+        // worker's own model, so a nudge never suggests the model it runs.
+        let (enabled, worth_asking) = {
             let records = self.records.lock().await;
             let Some(worker) = records.iter().find(|worker| worker.id == worker_id) else {
                 return;
@@ -4661,8 +4814,12 @@ impl TeamRuntime {
             let Some(routing) = worker.routing.as_ref() else {
                 return;
             };
-            routing.nudged.is_none()
-                && next_tier_above(enabled, &final_tier(worker)).is_some()
+            let enabled = self.direct_nudge_tiers(worker.model.as_deref());
+            (
+                enabled,
+                routing.nudged.is_none()
+                    && next_tier_above(enabled, &final_tier(worker)).is_some(),
+            )
         };
         if !worth_asking {
             return;
@@ -4717,6 +4874,7 @@ impl TeamRuntime {
                 &claim,
                 "drift",
                 &detail,
+                "",
             );
         });
     }
@@ -4869,12 +5027,36 @@ impl TeamRuntime {
     }
 
     async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
-        let live = self.live.lock().await;
-        if let Some(live) = live.get(worker_id) {
-            live.admit_session_command(worker_id)?;
-            return Err(format!("worker '{worker_id}' is already running"));
+        let live_idle = {
+            let live = self.live.lock().await;
+            match live.get(worker_id) {
+                Some(live) => {
+                    live.admit_session_command(worker_id)?;
+                    Some(!live.busy.load(Ordering::SeqCst))
+                }
+                None => None,
+            }
+        };
+        if let Some(idle) = live_idle {
+            let record = self.worker(worker_id).await?;
+            // A failed worker whose session is still alive and idle is
+            // recoverable in place: the lead can keep the same model with
+            // `team_message`, or retry on another one through a resume that
+            // respawns the session.
+            if idle && record.status == WorkerStatus::Failed {
+                self.update_worker(worker_id, |worker| {
+                    worker.status = WorkerStatus::Idle;
+                    worker.error = None;
+                    worker.pending = None;
+                })
+                .await;
+                self.persist().await?;
+                return self.worker(worker_id).await;
+            }
+            return Err(format!(
+                "worker '{worker_id}' is already running; team_message it to continue"
+            ));
         }
-        drop(live);
         let active = self.live.lock().await.len();
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
@@ -4919,6 +5101,7 @@ impl TeamRuntime {
         let busy = Arc::new(AtomicBool::new(false));
         let receiver = session.events();
         let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
+        let steer_pending = Arc::new(AtomicBool::new(false));
         let pump = tokio::spawn(pump_worker(
             worker_id.to_string(),
             generation,
@@ -4937,6 +5120,7 @@ impl TeamRuntime {
             self.routing.clone(),
             self.signals.clone(),
             strikes.clone(),
+            steer_pending.clone(),
             self.models.clone(),
             self.tiers.clone(),
             self.live.clone(),
@@ -4951,6 +5135,7 @@ impl TeamRuntime {
                 pump,
                 cleanup_retry_only: false,
                 strikes,
+                steer_pending,
             },
         );
         self.update_worker(worker_id, |worker| {
@@ -5415,7 +5600,7 @@ impl TeamRuntime {
             .clone();
         if settings.mode != RoutingMode::Off && settings.nudges {
             if let Some(finding) = escalation_finding {
-                let enabled = self.direct_nudge_tiers();
+                let enabled = self.direct_nudge_tiers(updated.model.as_deref());
                 if let Some(claim) =
                     claim_nudge(&self.records, worker_id, enabled, settings.mode, None).await
                 {
@@ -5444,6 +5629,7 @@ impl TeamRuntime {
                         &claim,
                         "review",
                         &detail,
+                        "",
                     );
                     if settings.mode == RoutingMode::Auto {
                         self.auto_escalate_worker(worker_id).await?;
@@ -7538,8 +7724,35 @@ fn usage_cost_micros(
     Some(micros.round().min(u64::MAX as f64) as u64)
 }
 
+/// The new highest threshold passed, when a cost notice is due. `threshold`
+/// is 0 when notices are off.
+fn cost_notice_due(cost: u64, notified: u64, threshold: u64) -> Option<u64> {
+    if threshold == 0 || cost < threshold {
+        return None;
+    }
+    let mut level = threshold;
+    loop {
+        let doubled = level.saturating_mul(2);
+        // `saturating_mul` stops growing at the u64 ceiling: stop there too,
+        // so a pathological cost can never spin this loop.
+        if doubled > cost || doubled <= level {
+            break;
+        }
+        level = doubled;
+    }
+    (level > notified).then_some(level)
+}
+
 /// Forward one worker session's events, update its durable record, and refresh
 /// the transcript when the turn ends.
+/// How long a steered turn end waits for its follow-up turn before it counts
+/// as finished, so a lost steer can never leave a worker Working forever.
+const FOLLOW_UP_GRACE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(200)
+} else {
+    std::time::Duration::from_secs(60)
+};
+
 // Each parameter is one shared worker handle — the pump's wiring stays flat.
 #[allow(clippy::too_many_arguments)]
 async fn pump_worker(
@@ -7560,6 +7773,7 @@ async fn pump_worker(
     routing: Arc<std::sync::RwLock<RoutingSettings>>,
     signals: broadcast::Sender<BoardSignal>,
     strikes: Arc<Mutex<route_question::Strikes>>,
+    steer_pending: Arc<AtomicBool>,
     models: Arc<std::sync::RwLock<Vec<LeadModel>>>,
     tiers: Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
     live: Arc<Mutex<HashMap<String, LiveWorker>>>,
@@ -7567,6 +7781,14 @@ async fn pump_worker(
     board: Option<Arc<PlanBoard>>,
 ) {
     let mut turn_active = false;
+    // A steered turn end is held here until its follow-up turn starts (the
+    // held `Finished`) or `FOLLOW_UP_GRACE` passes (the deadline). Both are
+    // cleared by `Started`, `Exited`, a final `Error`, and the deadline.
+    let mut follow_up_deadline: Option<tokio::time::Instant> = None;
+    let mut held_finished: Option<SessionEvent> = None;
+    // A `Parked` that settled a held steered turn end: its held `Finished` is
+    // re-sent after `save_workers`, so the finished notice reads Completed.
+    let mut settled_parked_finish: Option<SessionEvent> = None;
     let mut plan_stamp = worker_plan_stamp(&records, &worker_id).await;
     // The `outcome` row owed when the worker lands in a terminal status this
     // iteration; appended once the record save below has persisted it.
@@ -7578,7 +7800,71 @@ async fn pump_worker(
     let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut previous_signature: Option<String> = None;
     loop {
-        let event = match receiver.recv().await {
+        // While a steered turn end waits for its follow-up, the receive is
+        // bounded by an absolute deadline: the bus is engine-wide, so another
+        // session's events must neither satisfy nor extend this wait.
+        let received = match follow_up_deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                Ok(received) => received,
+                Err(_) => {
+                    // The follow-up never started: settle the steered turn end
+                    // as this worker's finished turn, so a lost steer can never
+                    // leave it Working forever.
+                    let mut found = false;
+                    let mut completed = false;
+                    {
+                        let mut records = records.lock().await;
+                        if let Some(worker) = records.iter_mut().find(|worker| {
+                            worker.id == worker_id
+                                && (worker.generation == 0 || worker.generation == generation)
+                        }) {
+                            if worker.compacting {
+                                // A real compaction is running; its own events
+                                // follow, so give it another grace period.
+                                follow_up_deadline =
+                                    Some(tokio::time::Instant::now() + FOLLOW_UP_GRACE);
+                                continue;
+                            }
+                            found = true;
+                            if matches!(
+                                worker.status,
+                                WorkerStatus::Working
+                                    | WorkerStatus::Fixing
+                                    | WorkerStatus::Dispatching
+                            ) {
+                                worker.status = WorkerStatus::Completed;
+                                worker.turns = worker.turns.saturating_add(1);
+                                completed = true;
+                            }
+                        }
+                    }
+                    steer_pending.store(false, Ordering::SeqCst);
+                    follow_up_deadline = None;
+                    let held = held_finished.take();
+                    if !found {
+                        // The worker was deleted or replaced: nothing to
+                        // settle and no notice to fire.
+                        continue;
+                    }
+                    busy.store(false, Ordering::SeqCst);
+                    if completed {
+                        let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+                    }
+                    if let Some(event) = held {
+                        // The held turn end, now that the record reads
+                        // Completed: this fires the normal finished notice.
+                        let _ = events.send(TeamEvent {
+                            worker_id: worker_id.clone(),
+                            generation,
+                            event,
+                        });
+                    }
+                    continue;
+                }
+            },
+            None => receiver.recv().await,
+        };
+        let event = match received {
             Ok(event) => event,
             // A slow consumer skips what it missed rather than abandoning
             // the worker's ledger mid-turn.
@@ -7590,6 +7876,14 @@ async fn pump_worker(
         // its record (status, telemetry, model, errors).
         if !event.is_from(session_id) {
             continue;
+        }
+        // A follow-up turn started: the steer's turn end is not this worker's
+        // finished turn, so the held event and the deadline end here. This
+        // runs before the record block, so a paused worker clears the wait too.
+        if matches!(event.event, SerializableAgentEvent::Started) {
+            steer_pending.store(false, Ordering::SeqCst);
+            follow_up_deadline = None;
+            held_finished = None;
         }
         if let SerializableAgentEvent::HostToolCall {
             call_id,
@@ -7630,6 +7924,13 @@ async fn pump_worker(
         // both count — and try the one nudge after the record block below
         // releases its lock. `repeated` keeps which kind of streak fired.
         let mut strike_fired: Option<bool> = None;
+        // The cost alert this event owes the lead (plan 06f1a204): filled
+        // inside the record block below, sent once that lock is released.
+        let mut cost_notice: Option<(String, String)> = None;
+        // The finished tool call this event (if any) carries, captured beside
+        // the strike counter so the record block below can fold it into the
+        // worker's current failing streak.
+        let mut tool_outcome: Option<(String, bool, String)> = None;
         match &event.event {
             SerializableAgentEvent::ToolCallStart { index, id, name } => {
                 // A provider may supersede an unexecuted call at the same
@@ -7658,6 +7959,7 @@ async fn pump_worker(
                     if strikes.lock().await.observe(signature, failed) {
                         strike_fired = Some(repeated);
                     }
+                    tool_outcome = Some((name.clone(), result.success, result.output.clone()));
                 }
             }
             _ => {}
@@ -7691,6 +7993,13 @@ async fn pump_worker(
                 worker.last_activity_ms = activity_ms;
                 if worker.created_at_ms > 0 {
                     worker.elapsed_ms = activity_ms.saturating_sub(worker.created_at_ms);
+                }
+                if let Some((tool, success, output)) = &tool_outcome {
+                    let had_errors = !worker.tool_errors.is_empty();
+                    note_tool_outcome(worker, tool, *success, output);
+                    if !*success || had_errors {
+                        changed = true;
+                    }
                 }
                 match &event.event {
                     SerializableAgentEvent::Started
@@ -7754,6 +8063,35 @@ async fn pump_worker(
                         ) {
                             worker.cost_micros =
                                 Some(worker.cost_micros.unwrap_or(0).saturating_add(cost));
+                        }
+                        // The cost alert (plan 06f1a204): the first notice at
+                        // `cost_notice_usd`, then one at each doubling. It
+                        // never stops or changes the worker.
+                        let threshold = (routing
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .cost_notice_usd
+                            .max(0.0)
+                            * 1_000_000.0) as u64;
+                        let spent = worker.cost_micros.unwrap_or(0);
+                        if let Some(level) =
+                            cost_notice_due(spent, worker.cost_notified_micros, threshold)
+                        {
+                            worker.cost_notified_micros = level;
+                            let dollars = spent as f64 / 1_000_000.0;
+                            let model = worker
+                                .model_id
+                                .as_deref()
+                                .or(worker.model.as_deref())
+                                .unwrap_or("-");
+                            let tier = worker.tier.as_deref().unwrap_or("-");
+                            cost_notice = Some((
+                                format!("cost:{worker_id}:{level}"),
+                                format!(
+                                    "worker_id={worker_id} {} has cost about ${dollars:.2} so far: {} requests on {model}, tier {tier}. It keeps running. If that looks wrong, read team_status, then team_message to steer it or team_stop to cancel it.",
+                                    worker.name, worker.requests
+                                ),
+                            ));
                         }
                         // Fold the same report into the durable per-project
                         // accumulator: raw tokens keyed by the observed model,
@@ -7856,6 +8194,25 @@ async fn pump_worker(
                         ));
                         terminal = true;
                     }
+                    SerializableAgentEvent::Finished { .. }
+                        if steer_pending.load(Ordering::SeqCst)
+                            && matches!(
+                                worker.status,
+                                WorkerStatus::Working
+                                    | WorkerStatus::Fixing
+                                    | WorkerStatus::Dispatching
+                            ) =>
+                    {
+                        // A steer ended this turn at its next break and drives a
+                        // follow-up turn (`StopReason::Steer`): the worker has
+                        // not finished. Status, busy and the turn count stay as
+                        // they are; `Started` clears the wait, and the deadline
+                        // settles it as finished if that turn never starts.
+                        follow_up_deadline =
+                            Some(tokio::time::Instant::now() + FOLLOW_UP_GRACE);
+                        held_finished = Some(event.clone());
+                        changed = true;
+                    }
                     SerializableAgentEvent::Finished { .. } => {
                         let completed_turn = turn_active;
                         turn_active = false;
@@ -7891,6 +8248,10 @@ async fn pump_worker(
                         turn_active = false;
                         worker.compacting = false;
                         busy.store(false, Ordering::SeqCst);
+                        // The session is gone: no follow-up turn is coming.
+                        steer_pending.store(false, Ordering::SeqCst);
+                        follow_up_deadline = None;
+                        held_finished = None;
                         worker.pending = None;
                         if !matches!(
                             worker.status,
@@ -7914,7 +8275,29 @@ async fn pump_worker(
                     SerializableAgentEvent::Parked { .. } => {
                         turn_active = false;
                         busy.store(false, Ordering::SeqCst);
-                        if !matches!(
+                        // A parked session has nothing queued: when it parks
+                        // while a steered turn end is held, no follow-up turn is
+                        // coming, so settle that turn end as finished now —
+                        // clearer than waiting for the deadline. Rare race: a
+                        // steer that lands right after a natural finish can
+                        // settle as Completed and send a notice, then `Started`
+                        // flips the worker back to Working, and
+                        // `current_notices` drops that notice at delivery while
+                        // it is still queued.
+                        if held_finished.is_some()
+                            && matches!(
+                                worker.status,
+                                WorkerStatus::Working
+                                    | WorkerStatus::Fixing
+                                    | WorkerStatus::Dispatching
+                            )
+                        {
+                            worker.status = WorkerStatus::Completed;
+                            worker.turns = worker.turns.saturating_add(1);
+                            steer_pending.store(false, Ordering::SeqCst);
+                            follow_up_deadline = None;
+                            settled_parked_finish = held_finished.take();
+                        } else if !matches!(
                             worker.status,
                             WorkerStatus::Completed
                                 | WorkerStatus::Interrupted
@@ -7944,6 +8327,11 @@ async fn pump_worker(
                     SerializableAgentEvent::Error { error, retrying } => {
                         if !retrying {
                             turn_active = false;
+                            // A final error ends the turn for good: no
+                            // follow-up turn is coming.
+                            steer_pending.store(false, Ordering::SeqCst);
+                            follow_up_deadline = None;
+                            held_finished = None;
                         }
                         if worker.compacting {
                             worker.compacting = false;
@@ -7998,6 +8386,15 @@ async fn pump_worker(
         if terminal || changed {
             let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
         }
+        if let Some(held) = settled_parked_finish.take() {
+            // The held turn end, now that the record reads Completed: this
+            // fires the normal finished notice.
+            let _ = events.send(TeamEvent {
+                worker_id: worker_id.clone(),
+                generation,
+                event: held,
+            });
+        }
         if audit_release {
             // The record with the report and the `Completed` status is
             // persisted above; end the live session exactly as
@@ -8022,6 +8419,9 @@ async fn pump_worker(
         }
         if let Some(row) = pending_outcome.take() {
             mnemo::model_routing::append_row(&routing_log_path, &row);
+        }
+        if let Some((key, text)) = cost_notice.take() {
+            let _ = signals.send(BoardSignal::Notice { key, text });
         }
         if let Some(repeated) = strike_fired.take() {
             let settings = routing
@@ -8093,6 +8493,10 @@ async fn pump_worker(
                 let Some(worktree) = worktree else {
                     return;
                 };
+                // The tip probe runs outside the ledger lock, so a review recorded
+                // while it ran (the lead reviewing the commit it just made) is newer
+                // than this observation and cannot be stale against it.
+                let tip_read_ms = phase3::now_ms();
                 let current_tip = phase3::tip(&worktree).await.ok();
                 {
                     let mut records = records.lock().await;
@@ -8107,21 +8511,48 @@ async fn pump_worker(
                         worker.used_tokens = snapshot.used_tokens;
                         worker.max_tokens = snapshot.max_tokens;
                         worker.pending = snapshot.pending;
-                        if current_tip.as_ref().is_some_and(|tip| {
-                            worker
-                                .review
-                                .as_ref()
-                                .is_some_and(|review| review.tip != *tip)
-                                || worker.checks.iter().any(|check| check.tip != *tip)
-                        }) {
-                            worker.review = None;
-                            worker.checks.clear();
-                        }
+                        clear_review_for_a_newer_tip(worker, current_tip.as_deref(), tip_read_ms);
                     }
                 }
                 let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
             });
         }
+    }
+}
+
+/// Drop a review and its checks when this transcript snapshot saw a worker
+/// commit that the review does not cover.
+///
+/// `tip_read_ms` is the moment before the snapshot's `git rev-parse` ran. A
+/// review recorded at or after it describes whatever `HEAD` is now, so a tip
+/// this probe read earlier cannot make it stale: the review merely landed
+/// while the probe was in flight. Before that guard a slow runner let the lead
+/// commit and review inside that window, the refresh dropped both, and the
+/// merge failed with "the current worker tip has not been reviewed" (macOS CI
+/// run 42071163294). Keeping such a review is safe — [`validate_merge`]
+/// re-reads the live tip and every check tip before it merges.
+fn clear_review_for_a_newer_tip(
+    worker: &mut WorkerRecord,
+    current_tip: Option<&str>,
+    tip_read_ms: u128,
+) {
+    let review_is_newer = worker
+        .review
+        .as_ref()
+        .is_some_and(|review| review.reviewed_at_ms >= tip_read_ms);
+    if review_is_newer {
+        return;
+    }
+    let tip_moved = current_tip.is_some_and(|tip| {
+        worker
+            .review
+            .as_ref()
+            .is_some_and(|review| review.tip != tip)
+            || worker.checks.iter().any(|check| check.tip != tip)
+    });
+    if tip_moved {
+        worker.review = None;
+        worker.checks.clear();
     }
 }
 
@@ -8657,6 +9088,9 @@ fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
     }
     if let Some(merge) = &worker.merge {
         view["merge"] = json!({ "commit": merge.commit });
+    }
+    if !worker.tool_errors.is_empty() {
+        view["tool_errors"] = json!(worker.tool_errors);
     }
     view
 }
@@ -9336,6 +9770,14 @@ fn executor_gate_rules() -> Vec<GateRule> {
     rules.push(deny_rule("shell", format!(r"{pre}gh\s+pr\b")));
     rules
 }
+
+/// A bare worker record for tests in sibling modules (`notice_tag`): the
+/// shape the team test fixture builds, without a checkout on disk.
+#[cfg(test)]
+pub(crate) fn test_worker_record(id: &str) -> WorkerRecord {
+    tests::worker(std::path::Path::new("."), id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9830,7 +10272,7 @@ mod tests {
         run_git(root, &["commit", "-m", "seed"]);
     }
 
-    fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
+    pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         let branch = agent_branch(id);
         WorkerRecord {
             id: id.to_string(),
@@ -9858,6 +10300,7 @@ mod tests {
             cached_tokens: 0,
             requests: 0,
             cost_micros: None,
+            cost_notified_micros: 0,
             created_at_ms: 0,
             elapsed_ms: 0,
             turns: 0,
@@ -9877,6 +10320,7 @@ mod tests {
             fixer_finding_id: None,
             merge: None,
             error: None,
+            tool_errors: Vec::new(),
             plan_id: None,
             plan_step: None,
             tier: None,
@@ -9978,6 +10422,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
                 strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
+                steer_pending: Arc::new(AtomicBool::new(false)),
             },
         );
     }
@@ -10071,6 +10516,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                     cleanup_retry_only: false,
                     busy: Arc::new(AtomicBool::new(false)),
                     strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
+                    steer_pending: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -10567,6 +11013,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 cleanup_retry_only: false,
                 busy: Arc::new(AtomicBool::new(false)),
                 strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
+                steer_pending: Arc::new(AtomicBool::new(false)),
             },
         );
 
@@ -12464,6 +12911,154 @@ models = [\"scripted-a\", \"scripted-b\"]
         panic!("the nudge notice never arrived");
     }
 
+    /// Every cost-alert notice on the board-signal stream so far; unrelated
+    /// refreshes and notices drain away.
+    fn drain_cost_notices(
+        notices: &mut broadcast::Receiver<BoardSignal>,
+        worker_id: &str,
+    ) -> Vec<String> {
+        let prefix = format!("cost:{worker_id}:");
+        let mut found = Vec::new();
+        loop {
+            match notices.try_recv() {
+                Ok(BoardSignal::Notice { key, text }) if key.starts_with(&prefix) => {
+                    found.push(text);
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        found
+    }
+
+    /// The cost alert fires at the threshold, then at each doubling — never
+    /// twice for the same level, and never when it is off (plan 06f1a204).
+    #[test]
+    fn cost_notice_due_fires_at_the_threshold_and_each_doubling() {
+        let threshold = 2_000_000;
+        assert_eq!(
+            cost_notice_due(1_999_999, 0, threshold),
+            None,
+            "below the threshold"
+        );
+        assert_eq!(
+            cost_notice_due(2_000_000, 0, threshold),
+            Some(2_000_000),
+            "the threshold itself"
+        );
+        assert_eq!(
+            cost_notice_due(3_000_000, 2_000_000, threshold),
+            None,
+            "between two levels"
+        );
+        assert_eq!(
+            cost_notice_due(4_000_000, 2_000_000, threshold),
+            Some(4_000_000),
+            "the first doubling"
+        );
+        assert_eq!(
+            cost_notice_due(9_000_000, 0, threshold),
+            Some(8_000_000),
+            "the highest doubling passed, not the next one"
+        );
+        assert_eq!(
+            cost_notice_due(u64::MAX, 0, threshold),
+            Some(u64::MAX),
+            "a saturated cost still terminates"
+        );
+        assert_eq!(
+            cost_notice_due(9_000_000, 0, 0),
+            None,
+            "0 turns the alert off"
+        );
+    }
+
+    /// One worker whose estimated cost passes the alert tells the lead once,
+    /// and keeps running: the notice never stops or changes it (plan
+    /// 06f1a204).
+    #[tokio::test]
+    async fn a_worker_past_the_threshold_notifies_the_lead_once() {
+        let responses = vec![vec![
+            mnemo::provider::LlmEvent::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 0,
+                reasoning_tokens: 0,
+                cached_tokens: 0,
+                ttft_ms: None,
+                generation_ms: None,
+            },
+            mnemo::provider::LlmEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            },
+        ]];
+        let (fixture, mut notices) = nudge_fixture(responses).await;
+        // $1 per token on the scripted provider's model: the turn's three
+        // prompt tokens cost $3.00, past the default $2.00 alert.
+        fixture.team.set_catalog(
+            vec![
+                lead_model("scripted-difficult"),
+                lead_model("scripted-average"),
+                lead_model("scripted-simple"),
+            ],
+            tiers_dto! {
+                difficult: vec!["test/scripted-difficult".into()],
+                average: vec!["test/scripted-average".into()],
+                simple: vec!["test/scripted-simple".into()],
+            },
+            vec![mnemo::config::PricingEntry {
+                model: "scripted".to_string(),
+                input_per_1m: 1_000_000.0,
+                output_per_1m: 0.0,
+                cached_per_1m: 0.0,
+            }],
+        );
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        // The pump sends the notice right after the record block of the
+        // Usage event, which precedes the Finished event that settled the
+        // worker above — so it is on the stream by now.
+        let found = drain_cost_notices(&mut notices, "routingworker");
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly one cost notice: {found:?}; worker: {settled:?}"
+        );
+        let notice = &found[0];
+        assert!(
+            notice.starts_with("worker_id=routingworker "),
+            "the notice names the worker: {notice}"
+        );
+        assert!(
+            notice.contains("has cost about $3.00 so far"),
+            "the notice names the spend: {notice}"
+        );
+        assert!(
+            notice.contains("1 requests on scripted, tier routine."),
+            "the notice names the request count, model and tier: {notice}"
+        );
+        assert!(
+            notice.ends_with(
+                "It keeps running. If that looks wrong, read team_status, then team_message to steer it or team_stop to cancel it."
+            ),
+            "{notice}"
+        );
+        assert_eq!(
+            settled.cost_notified_micros, 2_000_000,
+            "the record remembers the level the lead was told about: {settled:?}"
+        );
+        assert_eq!(settled.cost_micros, Some(3_000_000), "{settled:?}");
+        assert!(
+            matches!(settled.status, WorkerStatus::Completed),
+            "the alert never stopped or changed the worker: {settled:?}"
+        );
+        assert!(settled.error.is_none(), "{settled:?}");
+    }
+
     /// A lead message long enough for drift classification (≥ 20 words).
     fn drift_message() -> String {
         "This change turned out to touch the shared routing contract after all, \
@@ -12510,9 +13105,22 @@ models = [\"scripted-a\", \"scripted-b\"]
             "the strike nudge row: {row:?}"
         );
         let notice = wait_nudge_notice(&mut notices, "routingworker").await;
+        let prefix = "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier high.\nLast tool errors:";
+        assert!(notice.starts_with(prefix), "{notice}");
         assert_eq!(
-            notice,
-            "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier high."
+            notice.matches("\n- not_a_real_tool: ").count(),
+            3,
+            "the failed call's tool name, once per kept failure: {notice}"
+        );
+        assert!(
+            notice.contains("unknown tool 'not_a_real_tool'"),
+            "the failed call's actual output: {notice}"
+        );
+        assert!(
+            notice.ends_with(
+                "\nRead these first: a tool problem is not fixed by a stronger model."
+            ),
+            "{notice}"
         );
         let settled = wait_worker_settled(&fixture.team, "routingworker").await;
         assert_eq!(
@@ -12557,6 +13165,220 @@ models = [\"scripted-a\", \"scripted-b\"]
             "the route, the nudge, and the outcome rows: {:?}",
             fixture.rows()
         );
+        fixture.team.shutdown().await;
+    }
+
+    /// The failing-tool streak keeps the last three calls, collapses each
+    /// output's whitespace, cuts it at the character limit without splitting a
+    /// character, and a successful call clears it.
+    #[test]
+    fn note_tool_outcome_keeps_the_last_three_and_clears_on_success() {
+        let mut worker = worker(std::path::Path::new("."), "streak0001");
+        for (index, tool) in ["file_read", "shell", "git", "plan_read"]
+            .iter()
+            .enumerate()
+        {
+            note_tool_outcome(&mut worker, tool, false, &format!("  failed\n\ncall {index}  "));
+        }
+        let tools: Vec<&str> = worker
+            .tool_errors
+            .iter()
+            .map(|note| note.tool.as_str())
+            .collect();
+        assert_eq!(tools, ["shell", "git", "plan_read"], "only the last three");
+        assert_eq!(worker.tool_errors[0].output, "failed call 1");
+
+        // A multi-byte output is cut by character, never mid-character.
+        let long = "é".repeat(TOOL_ERROR_CHARS + 5);
+        note_tool_outcome(&mut worker, "shell", false, &long);
+        let kept = worker.tool_errors.last().expect("the newest failure");
+        assert_eq!(kept.output.chars().count(), TOOL_ERROR_CHARS + 1);
+        assert!(kept.output.ends_with('…'), "{kept:?}");
+        assert_eq!(
+            kept.output.chars().take(TOOL_ERROR_CHARS).collect::<String>(),
+            "é".repeat(TOOL_ERROR_CHARS)
+        );
+        assert_eq!(
+            tool_errors_text(&worker),
+            format!(
+                "\nLast tool errors:\n- git: failed call 2\n- plan_read: failed call 3\n- shell: {}…",
+                "é".repeat(TOOL_ERROR_CHARS)
+            )
+        );
+
+        // A success clears the streak, and an empty streak has no text.
+        note_tool_outcome(&mut worker, "file_read", true, "ok");
+        assert!(worker.tool_errors.is_empty());
+        assert!(tool_errors_text(&worker).is_empty());
+    }
+
+    /// The strike nudge carries the actual failed calls — the tool name and
+    /// its output for each of the last three failures — and the warning that a
+    /// stronger model does not fix a tool problem.
+    #[tokio::test]
+    async fn the_strike_nudge_shows_the_tool_errors() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, mut notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let notice = wait_nudge_notice(&mut notices, "routingworker").await;
+        let prefix = "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier high.\nLast tool errors:";
+        assert!(notice.starts_with(prefix), "{notice}");
+        assert_eq!(
+            notice.matches("\n- not_a_real_tool: ").count(),
+            3,
+            "the tool's name on each kept failure: {notice}"
+        );
+        assert!(
+            notice.contains("unknown tool 'not_a_real_tool'"),
+            "the tool's own error: {notice}"
+        );
+        assert!(
+            notice.ends_with("\nRead these first: a tool problem is not fixed by a stronger model."),
+            "{notice}"
+        );
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert_eq!(settled.tool_errors.len(), 3, "{settled:?}");
+        fixture.team.shutdown().await;
+    }
+
+    /// `team_status` reports each worker's current failing streak, and omits
+    /// the field for a worker whose last call succeeded.
+    #[tokio::test]
+    async fn team_status_reports_tool_errors() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut failing = reviewed_worker(root.path(), "00000001000000000003");
+        failing.tool_errors = vec![
+            ToolErrorNote {
+                tool: "shell".to_string(),
+                output: "exit status 1".to_string(),
+            },
+            ToolErrorNote {
+                tool: "git".to_string(),
+                output: "no such branch".to_string(),
+            },
+        ];
+        let clean = reviewed_worker(root.path(), "00000001000000000004");
+        let team = open_test_team(root.path(), state.path(), vec![failing, clean]).await;
+        let answer = team_status_answer(&team, json!({})).await;
+        let entries = answer["result"].as_array().expect("a worker array");
+        assert_eq!(entries[0]["tool_errors"][0]["tool"], "shell");
+        assert_eq!(entries[0]["tool_errors"][1]["output"], "no such branch");
+        assert!(
+            entries[1].get("tool_errors").is_none(),
+            "a clean worker has no tool_errors key: {}",
+            entries[1]
+        );
+        team.shutdown().await;
+    }
+
+    /// A failed worker whose session is alive and idle resumes in place:
+    /// `team_resume` makes it idle instead of dead-ending on "already
+    /// running", clears the error, and keeps the failing streak readable.
+    #[tokio::test]
+    async fn resume_makes_a_failed_worker_with_a_live_session_idle() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let failed = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert_eq!(failed.status, WorkerStatus::Failed, "{failed:?}");
+        assert!(
+            fixture.team.live.lock().await.contains_key("routingworker"),
+            "the failed worker's session is still live"
+        );
+        let resumed = fixture
+            .team
+            .resume("routingworker")
+            .await
+            .expect("a failed worker with a live idle session resumes");
+        assert_eq!(resumed.status, WorkerStatus::Idle, "{resumed:?}");
+        assert!(resumed.error.is_none(), "{resumed:?}");
+        assert!(resumed.pending.is_none(), "{resumed:?}");
+        assert_eq!(resumed.tool_errors.len(), 3, "the errors stay readable");
+        fixture.team.shutdown().await;
+    }
+
+    /// A worker that is actually running still refuses a resume, now pointing
+    /// the lead at `team_message`.
+    #[tokio::test]
+    async fn resume_still_refuses_a_running_worker() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut busy = worker(root.path(), "00000001000000000005");
+        busy.status = WorkerStatus::Working;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            busy.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the running worker");
+        let team = open_test_team(root.path(), state.path(), vec![busy.clone()]).await;
+        spawn_live_worker(&team, &busy).await;
+        team.live
+            .lock()
+            .await
+            .get(&busy.id)
+            .expect("the live worker")
+            .busy
+            .store(true, Ordering::SeqCst);
+        let error = team
+            .resume(&busy.id)
+            .await
+            .expect_err("resume refuses a running worker");
+        assert!(error.contains("already running"), "{error}");
+        assert!(error.contains("team_message"), "{error}");
+        team.shutdown().await;
+    }
+
+    /// A delivered message starts the worker over: the stale failure error is
+    /// cleared from the record.
+    #[tokio::test]
+    async fn a_message_clears_a_failed_workers_error() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let failed = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert!(failed.error.is_some(), "{failed:?}");
+        let messaged = fixture
+            .team
+            .message(
+                "routingworker",
+                "that tool does not exist; read the file instead".to_string(),
+                MessageSender::Lead,
+            )
+            .await
+            .expect("a failed worker with a live session takes a message");
+        assert!(messaged.error.is_none(), "{messaged:?}");
         fixture.team.shutdown().await;
     }
 
@@ -12920,6 +13742,12 @@ models = [\"scripted-a\", \"scripted-b\"]
         .expect("save routing settings");
         let mut record = worker(root.path(), "nudgereview001");
         record.tier = Some("routine".into());
+        // A failing streak on the record must never leak into a review nudge:
+        // the review, not a tool, is what the lead is being asked to act on.
+        record.tool_errors = vec![ToolErrorNote {
+            tool: "shell".to_string(),
+            output: "exit status 1".to_string(),
+        }];
         record.routing = Some(WorkerRouting {
             laya_tier: Some("routine".into()),
             confidence: Some(0.62),
@@ -12956,6 +13784,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             },
             Vec::new(),
         );
+        let mut notices = team.subscribe_board();
 
         let first = team
             .review(&record.id, "first pass".into(), vec![open_finding("finding1")], evidence())
@@ -12981,6 +13810,15 @@ models = [\"scripted-a\", \"scripted-b\"]
             second.routing.as_ref().expect("routed").nudged.as_deref(),
             Some("high"),
             "the second high review round nudged: {second:?}"
+        );
+        let review_notice = wait_nudge_notice(&mut notices, &record.id).await;
+        assert!(
+            !review_notice.contains("Last tool errors"),
+            "a review nudge never shows tool errors: {review_notice}"
+        );
+        assert!(
+            !review_notice.contains("Read these first"),
+            "{review_notice}"
         );
         let rows = std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
             .unwrap_or_default()
@@ -15279,12 +16117,19 @@ models = [\"scripted-a\", \"scripted-b\"]
         .await;
         assert_eq!(switched.tier.as_deref(), Some("high"));
         assert!(switched.routing.expect("routing").nudged.is_none());
-        let raw = std::fs::read_to_string(fixture.log_path()).expect("routing log");
-        assert!(raw.lines().any(|line| {
-            serde_json::from_str::<Value>(line).is_ok_and(|row| {
-                row["source"] == "escalation" && row["nudged"] == true
-            })
-        }), "{raw}");
+        // The row is appended after the ledger save, so poll for it: the
+        // in-memory switch can be visible before the file write lands.
+        eventually(|| async {
+            let raw = std::fs::read_to_string(fixture.log_path()).ok()?;
+            raw.lines()
+                .any(|line| {
+                    serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                        row["source"] == "escalation" && row["nudged"] == true
+                    })
+                })
+                .then_some(())
+        })
+        .await;
         fixture.team.shutdown().await;
     }
 
@@ -15308,6 +16153,86 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(plan_read.parameters.get("required").is_none());
         team.shutdown().await;
     }
+
+    /// A tagged notice describes one turn of one worker: a notice whose worker
+    /// moved on, or no longer exists, is dropped at delivery. An untagged
+    /// notice (a report, a plan change) always stays.
+    #[tokio::test]
+    async fn current_notices_drop_a_moved_on_worker() {
+        use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
+        use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut completed = worker(root.path(), "00000001000000000001");
+        completed.status = WorkerStatus::Completed;
+        completed.turns = 2;
+        let mut working = worker(root.path(), "00000001000000000002");
+        working.status = WorkerStatus::Working;
+        let team = open_test_team(
+            root.path(),
+            state.path(),
+            vec![completed.clone(), working.clone()],
+        )
+        .await;
+
+        let tagged = |worker: &WorkerRecord, state| {
+            format!(
+                "{TEAM_NOTICE_PREFIX} worker_id={}{}\nthe detail",
+                worker.id,
+                TurnTag::of(worker, 1, state).suffix()
+            )
+        };
+        let current_finished = tagged(&completed, NoticeState::Finished);
+        let stale_finished = tagged(&working, NoticeState::Finished);
+        let unknown = tagged(
+            &worker(root.path(), "00000001000000000009"),
+            NoticeState::Finished,
+        );
+        let untagged = format!("{TEAM_NOTICE_PREFIX}\nplan changed");
+        let plain = "worker alpha finished its turn".to_string();
+
+        let kept = team
+            .current_notices(vec![
+                current_finished.clone(),
+                stale_finished,
+                unknown,
+                untagged.clone(),
+                plain.clone(),
+            ])
+            .await;
+        assert_eq!(kept, vec![current_finished, untagged, plain]);
+        team.shutdown().await;
+    }
+
+    /// A stale notice drained from the queue must not end the wait: the lead
+    /// keeps waiting for a notice that still describes its worker.
+    #[tokio::test]
+    async fn waiting_skips_stale_notices() {
+        use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
+        use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut working = worker(root.path(), "00000001000000000002");
+        working.status = WorkerStatus::Working;
+        let team = open_test_team(root.path(), state.path(), vec![working.clone()]).await;
+        assert!(team.attach_external_lead(), "the external lead attaches");
+        let stale = format!(
+            "{TEAM_NOTICE_PREFIX} worker_id={}{}\nstale detail",
+            working.id,
+            TurnTag::of(&working, 1, NoticeState::Finished).suffix()
+        );
+        assert!(team.push_external_notice(stale), "the notice is queued");
+
+        let outcome = team.wait_external(std::time::Duration::from_millis(150)).await;
+        assert_eq!(outcome.status, ExternalWaitStatus::Timeout, "{outcome:?}");
+        assert!(outcome.notices.is_empty(), "{:?}", outcome.notices);
+        team.shutdown().await;
+    }
+
 
     #[tokio::test]
     async fn plan_read_returns_the_current_plan() {
@@ -15512,6 +16437,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             }
         };
         assert_eq!(notice.text, expected);
+        assert_eq!(notice.sender, MessageSender::Mnemo);
         assert_eq!(
             team.worker(completed_id)
                 .await
@@ -15535,5 +16461,41 @@ models = [\"scripted-a\", \"scripted-b\"]
             1
         );
         team.shutdown().await;
+    }
+
+    /// A refresh reads the worker tip outside the ledger lock, so the lead can
+    /// commit and review inside that window: the review then postdates the
+    /// probe and covers the current tip. Clearing it made the merge fail with
+    /// "the current worker tip has not been reviewed" (plan 0d8a1112, macOS CI
+    /// run 42071163294).
+    #[test]
+    fn a_refresh_that_read_the_tip_before_the_review_keeps_that_review() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        let mut worker = reviewed_worker(root.path(), "00000001000000000001");
+        {
+            let review = worker.review.as_mut().expect("review");
+            review.tip = "reviewed-tip".to_string();
+            review.reviewed_at_ms = 200;
+        }
+        worker.checks[0].tip = "reviewed-tip".to_string();
+
+        // The probe ran at 100 ms, the lead's commit and review landed at 200.
+        clear_review_for_a_newer_tip(&mut worker, Some("older-tip"), 100);
+        assert!(
+            worker.review.is_some(),
+            "a review recorded after the tip probe is not stale"
+        );
+        assert_eq!(worker.checks.len(), 1, "its check survives with it");
+
+        // A probe that ran after the review, but on the reviewed commit.
+        clear_review_for_a_newer_tip(&mut worker, Some("reviewed-tip"), 300);
+        assert!(worker.review.is_some(), "the reviewed tip is never stale");
+
+        // A probe that ran after the review and saw a newer commit is a real
+        // verdict: the review no longer covers the worker's tip.
+        clear_review_for_a_newer_tip(&mut worker, Some("newer-tip"), 300);
+        assert!(worker.review.is_none(), "an older review is cleared");
+        assert!(worker.checks.is_empty(), "and so are its checks");
     }
 }

@@ -267,7 +267,12 @@ describe("TiersPage", () => {
   it("shows the checkpoint and the kNN labelled-worker count when ready", async () => {
     renderPage({ laya: makeLaya({ control: { choice: "suggest", laya_status: "ready", checkpoint: "Laya (English)", knn_rows: 42, knn_min_rows: 30 } }) });
     expect(await screen.findByText("Laya (English) ready")).toBeTruthy();
-    expect(screen.getByText("Learned from 42 finished workers (uses them from 30).")).toBeTruthy();
+    expect(screen.getByText("Learned from 42 finished workers.")).toBeTruthy();
+  });
+
+  it("says when Laya starts using what it has learned, while it is below that count", async () => {
+    renderPage({ laya: makeLaya({ control: { choice: "suggest", laya_status: "ready", knn_rows: 12, knn_min_rows: 30 } }) });
+    expect(await screen.findByText("Learned from 12 finished workers; it starts using them at 30.")).toBeTruthy();
   });
 
   it("saves the picked choice once through the combined command", async () => {
@@ -311,7 +316,7 @@ describe("TiersPage", () => {
     const helping = renderPage({ laya: makeLaya({ control: { choice: "suggest" } }) });
     const helpingScope = within(helping.container);
     // The kNN line only renders once the control's wire has loaded.
-    await waitFor(() => expect(helpingScope.getByText("Learned from 42 finished workers (uses them from 30).")).toBeTruthy());
+    await waitFor(() => expect(helpingScope.getByText("Learned from 42 finished workers.")).toBeTruthy());
     expect(helpingScope.getByText("Laya: involved")).toBeTruthy();
     expect(helpingScope.getByText("Laya: hard")).toBeTruthy();
     expect(helpingScope.getByText("Laya: routine")).toBeTruthy();

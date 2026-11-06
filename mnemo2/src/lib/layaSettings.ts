@@ -150,7 +150,7 @@ export interface LayaTransport {
   onLayaEvent(handler: (event: LayaEvent) => void): Promise<UnlistenFn>;
   /** The `[routing]` table, the log summary and the last check's record. */
   routingStatus(): Promise<RoutingStatusWire>;
-  /** Start the Laya check (the backend skips it when the fingerprint matches). */
+  /** Run the Laya check now, even when the last one is still up to date. */
   checkLaya(): Promise<void>;
   /** The top control's status: the saved choice plus Laya's readiness (design §7.1). */
   topControl(): Promise<TiersTopControl>;

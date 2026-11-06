@@ -132,7 +132,7 @@
         return `Laya is still coming up — ${CHOICES.find((entry) => entry.choice === choice)?.title.toLowerCase()} applies once it is ready.`;
       }
       if (topControl.laya_status !== "ready") {
-        return "This choice needs Laya running — install or turn it on below; the lead's tier stands until then.";
+        return "This choice needs Laya running: install or turn it on above. The lead's tier stands until then.";
       }
     }
     const expected = choiceHalves(choice);
@@ -527,7 +527,9 @@
             <span class="status-state">{LAYA_STATUS_META[shownStatus]}</span>
           {:else}
             <span class="status-state ok">{topControl.checkpoint ?? "Laya"} ready</span>
-            <span class="micro">Learned from {topControl.knn_rows} finished workers (uses them from {topControl.knn_min_rows}).</span>
+            <span class="micro">
+              Learned from {topControl.knn_rows} finished workers{topControl.knn_rows < topControl.knn_min_rows ? `; it starts using them at ${topControl.knn_min_rows}` : ""}.
+            </span>
             <button class="button button-quiet" disabled={setupBusy} onclick={stopLaya}>Turn off</button>
           {/if}
         </div>
@@ -767,20 +769,20 @@
 
 <style>
   .tiers-page { display: flex; min-height: 0; flex: 1; flex-direction: column; }
-  .tiers-scroll { display: grid; flex: 1; align-content: start; gap: 18px; padding: 18px 24px; overflow-y: auto; }
+  .tiers-scroll { display: grid; flex: 1; grid-template-columns: minmax(0, 1fr); align-content: start; gap: 18px; padding: 18px 24px; overflow-y: auto; }
   .load-error { margin: 0; padding: 18px 24px; color: var(--danger); font-size: var(--text-body); overflow-wrap: anywhere; }
   .load-note { margin: 0; padding: 18px 24px; color: var(--muted); font-size: var(--text-body); }
 
-  .group { display: grid; gap: 8px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--canvas); }
+  .group { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--canvas); }
   .group header { display: grid; gap: 4px; }
   .group h3 { margin: 0; font-size: var(--text-body); font-weight: 650; }
   .micro { color: var(--muted); font-size: var(--text-meta); line-height: 1.45; }
 
   /* The top control */
-  .choice-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .choice-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
   .choice-card { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); cursor: pointer; align-content: start; }
   .choice-card.selected { border-color: var(--accent); box-shadow: var(--shadow-chip); }
-  .choice-card input { accent-color: var(--accent); }
+  .choice-card input { justify-self: start; margin: 0; accent-color: var(--accent); }
   .choice-card:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
   .choice-title { font-weight: 650; font-size: var(--text-body); }
   .readiness { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
@@ -792,9 +794,10 @@
 
   /* The Laya check */
   .check { display: grid; gap: 6px; }
+  .check .button { justify-self: start; }
 
   /* The ladder */
-  .tier-card { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  .tier-card { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
   .tier-head { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
   .tier-name { display: grid; gap: 2px; flex: 1; max-width: 320px; }
   .tier-name input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }

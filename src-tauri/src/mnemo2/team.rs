@@ -234,6 +234,16 @@ impl ChangeSource {
     }
 }
 
+/// One failed tool call in a worker's current failing streak: the tool's
+/// name and its cleaned output.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolErrorNote {
+    /// The tool that failed.
+    pub tool: String,
+    /// The failed call's output: whitespace collapsed and length-capped.
+    pub output: String,
+}
+
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -365,6 +375,11 @@ pub struct WorkerRecord {
     pub merge: Option<MergeRecord>,
     /// The last error, when the worker failed or conflicted.
     pub error: Option<String>,
+    /// The current streak of failed tool calls, oldest first, cleared by a
+    /// successful call. Only the latest [`TOOL_ERRORS_KEPT`] are kept, each
+    /// output capped at [`TOOL_ERROR_CHARS`] characters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_errors: Vec<ToolErrorNote>,
     /// The board plan this task was dispatched under (validated by the plan
     /// board at dispatch).
     #[serde(default)]
@@ -1148,6 +1163,52 @@ const NUDGE_LADDER: [&str; 5] = ["trivial", "routine", "medium", "high", "escala
 /// (design §4.6).
 const NUDGE_STRIKE_LIMIT: u32 = 3;
 
+/// How many failed tool calls a worker's streak keeps: enough for the lead to
+/// see the last few errors without unbounded growth.
+const TOOL_ERRORS_KEPT: usize = 3;
+
+/// How many characters of one failed call's output the streak keeps.
+const TOOL_ERROR_CHARS: usize = 300;
+
+/// Fold one finished tool call into the worker's current failing streak: a
+/// successful call clears it, a failed one appends the tool and its cleaned
+/// output, keeping only the latest [`TOOL_ERRORS_KEPT`].
+fn note_tool_outcome(worker: &mut WorkerRecord, tool: &str, success: bool, output: &str) {
+    if success {
+        worker.tool_errors.clear();
+        return;
+    }
+    let collapsed = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut note: String = collapsed.chars().take(TOOL_ERROR_CHARS).collect();
+    if collapsed.chars().count() > TOOL_ERROR_CHARS {
+        note.push('…');
+    }
+    worker.tool_errors.push(ToolErrorNote {
+        tool: tool.to_string(),
+        output: note,
+    });
+    let overflow = worker.tool_errors.len().saturating_sub(TOOL_ERRORS_KEPT);
+    if overflow > 0 {
+        worker.tool_errors.drain(..overflow);
+    }
+}
+
+/// The worker's current failing streak as notice text: empty when the last
+/// tool call succeeded, otherwise the kept failures, oldest first.
+pub(crate) fn tool_errors_text(worker: &WorkerRecord) -> String {
+    if worker.tool_errors.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("\nLast tool errors:");
+    for note in &worker.tool_errors {
+        text.push_str("\n- ");
+        text.push_str(&note.tool);
+        text.push_str(": ");
+        text.push_str(&note.output);
+    }
+    text
+}
+
 /// The enabled-tier ladder over a model inventory and its tier assignment:
 /// a tier is enabled when at least one of the models the tier names is
 /// available. [`TeamRuntime::enabled_routing_tiers`] over shared handles,
@@ -1168,18 +1229,29 @@ fn enabled_tiers_over(
 }
 
 /// Directly modelled tiers for nudges. Unlike dispatch routing, a nudge must
-/// not target an empty tier that would fold back to the worker's current one.
+/// not target an empty tier that would fold back to the worker's current one,
+/// nor a tier whose first available model is the model the worker already
+/// runs: a suggestion that changes nothing is noise.
 fn direct_tiers_over(
     models: &[LeadModel],
     tiers: &mnemo::headless::TiersDto,
+    current_model: Option<&str>,
 ) -> EnabledTiers {
     let ladder = tier_ladder_from_dto(tiers);
     let direct = |tier| {
-        ladder.get(tier).is_some_and(|rung| {
-            rung.models
-                .iter()
-                .any(|spec| models.iter().any(|model| model.spec == *spec))
-        })
+        let Some(rung) = ladder.get(tier) else {
+            return false;
+        };
+        // The model a dispatch on this tier would actually run: the first
+        // spec in the rung that the inventory serves.
+        let first = rung
+            .models
+            .iter()
+            .find(|spec| models.iter().any(|model| model.spec == **spec));
+        match first {
+            Some(spec) => current_model != Some(spec.as_str()),
+            None => false,
+        }
     };
     EnabledTiers {
         trivial: direct("trivial"),
@@ -1280,7 +1352,8 @@ async fn claim_nudge(
 /// Deliver a claimed nudge: queue the lead notice on the board-signal bus
 /// (the runtime delivers it prefixed like every TeamManager notice) and
 /// append the `Nudge` row (design §4.7) behind the same `logs_routing`
-/// gate as the reroute rows. Never switches the worker's model.
+/// gate as the reroute rows. Never switches the worker's model. `tool_errors`
+/// is the strike nudge's failing-streak text (empty for every other nudge).
 fn deliver_nudge(
     signals: &broadcast::Sender<BoardSignal>,
     routing_log_path: &Path,
@@ -1288,11 +1361,17 @@ fn deliver_nudge(
     claim: &ClaimedNudge,
     reason: &str,
     detail: &str,
+    tool_errors: &str,
 ) {
+    let tool_errors = if tool_errors.is_empty() {
+        String::new()
+    } else {
+        format!("{tool_errors}\nRead these first: a tool problem is not fixed by a stronger model.")
+    };
     let _ = signals.send(BoardSignal::Notice {
         key: format!("nudge:{worker_id}"),
         text: format!(
-            "worker_id={worker_id} Laya nudge: {} {detail}; consider team_resume with tier {}.",
+            "worker_id={worker_id} Laya nudge: {} {detail}; consider team_resume with tier {}.{tool_errors}",
             claim.name, claim.to_tier
         ),
     });
@@ -1356,9 +1435,19 @@ struct StrikeNudges<'a> {
 /// already nudged, has no routing record, or sits on the top enabled
 /// tier.
 async fn try_strike_nudge(worker_id: &str, nudges: StrikeNudges<'_>, repeated: bool) {
+    // The worker's model and its current failing streak come from one lock
+    // read; the records lock must be released before `claim_nudge` takes it.
+    let (current_model, tool_errors) = {
+        let records = nudges.records.lock().await;
+        let Some(worker) = records.iter().find(|worker| worker.id == worker_id) else {
+            return;
+        };
+        (worker.model.clone(), tool_errors_text(worker))
+    };
     let enabled = direct_tiers_over(
         &nudges.models.read().unwrap_or_else(|e| e.into_inner()),
         &nudges.tiers.read().unwrap_or_else(|e| e.into_inner()),
+        current_model.as_deref(),
     );
     let Some(claim) =
         claim_nudge(nudges.records, worker_id, enabled, nudges.settings.mode, None).await
@@ -1377,6 +1466,7 @@ async fn try_strike_nudge(worker_id: &str, nudges: StrikeNudges<'_>, repeated: b
         &claim,
         reason,
         detail,
+        &tool_errors,
     );
 }
 
@@ -2124,14 +2214,16 @@ impl TeamRuntime {
     }
 
     /// Nudge destinations have their own models, so a nudge cannot fold back
-    /// onto the tier the worker is already running.
-    fn direct_nudge_tiers(&self) -> EnabledTiers {
+    /// onto the tier the worker is already running, nor onto a tier whose
+    /// first available model is the model the worker already runs.
+    fn direct_nudge_tiers(&self, current_model: Option<&str>) -> EnabledTiers {
         direct_tiers_over(
             &self.current_models(),
             &self.tiers
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            current_model,
         )
     }
 
@@ -4088,6 +4180,7 @@ impl TeamRuntime {
             fixer_finding_id: None,
             merge: None,
             error: None,
+            tool_errors: Vec::new(),
             opening_prompt: None,
             plan_id: None,
             plan_step: None,
@@ -4299,6 +4392,7 @@ impl TeamRuntime {
             fixer_finding_id: None,
             merge: None,
             error: None,
+            tool_errors: Vec::new(),
             plan_id: plan.as_ref().map(|plan| plan.plan_id.clone()),
             plan_step: plan.map(|plan| plan.step),
             tier,
@@ -4667,6 +4761,9 @@ impl TeamRuntime {
                 WorkerStatus::Working
             };
             worker.pending = None;
+            // A delivered message starts the worker over: a stale failure is
+            // no longer the record's truth.
+            worker.error = None;
         })
         .await;
         self.persist().await?;
@@ -4697,11 +4794,11 @@ impl TeamRuntime {
         else {
             return;
         };
-        let enabled = self.direct_nudge_tiers();
         // The pre-checks run without detaching: a worker without a routing
         // record, already nudged, or on the top enabled tier never spends
-        // a classifier call on drift.
-        let worth_asking = {
+        // a classifier call on drift. The enabled set is built from this
+        // worker's own model, so a nudge never suggests the model it runs.
+        let (enabled, worth_asking) = {
             let records = self.records.lock().await;
             let Some(worker) = records.iter().find(|worker| worker.id == worker_id) else {
                 return;
@@ -4709,8 +4806,12 @@ impl TeamRuntime {
             let Some(routing) = worker.routing.as_ref() else {
                 return;
             };
-            routing.nudged.is_none()
-                && next_tier_above(enabled, &final_tier(worker)).is_some()
+            let enabled = self.direct_nudge_tiers(worker.model.as_deref());
+            (
+                enabled,
+                routing.nudged.is_none()
+                    && next_tier_above(enabled, &final_tier(worker)).is_some(),
+            )
         };
         if !worth_asking {
             return;
@@ -4765,6 +4866,7 @@ impl TeamRuntime {
                 &claim,
                 "drift",
                 &detail,
+                "",
             );
         });
     }
@@ -4917,12 +5019,36 @@ impl TeamRuntime {
     }
 
     async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
-        let live = self.live.lock().await;
-        if let Some(live) = live.get(worker_id) {
-            live.admit_session_command(worker_id)?;
-            return Err(format!("worker '{worker_id}' is already running"));
+        let live_idle = {
+            let live = self.live.lock().await;
+            match live.get(worker_id) {
+                Some(live) => {
+                    live.admit_session_command(worker_id)?;
+                    Some(!live.busy.load(Ordering::SeqCst))
+                }
+                None => None,
+            }
+        };
+        if let Some(idle) = live_idle {
+            let record = self.worker(worker_id).await?;
+            // A failed worker whose session is still alive and idle is
+            // recoverable in place: the lead can keep the same model with
+            // `team_message`, or retry on another one through a resume that
+            // respawns the session.
+            if idle && record.status == WorkerStatus::Failed {
+                self.update_worker(worker_id, |worker| {
+                    worker.status = WorkerStatus::Idle;
+                    worker.error = None;
+                    worker.pending = None;
+                })
+                .await;
+                self.persist().await?;
+                return self.worker(worker_id).await;
+            }
+            return Err(format!(
+                "worker '{worker_id}' is already running; team_message it to continue"
+            ));
         }
-        drop(live);
         let active = self.live.lock().await.len();
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
@@ -5466,7 +5592,7 @@ impl TeamRuntime {
             .clone();
         if settings.mode != RoutingMode::Off && settings.nudges {
             if let Some(finding) = escalation_finding {
-                let enabled = self.direct_nudge_tiers();
+                let enabled = self.direct_nudge_tiers(updated.model.as_deref());
                 if let Some(claim) =
                     claim_nudge(&self.records, worker_id, enabled, settings.mode, None).await
                 {
@@ -5495,6 +5621,7 @@ impl TeamRuntime {
                         &claim,
                         "review",
                         &detail,
+                        "",
                     );
                     if settings.mode == RoutingMode::Auto {
                         self.auto_escalate_worker(worker_id).await?;
@@ -7770,6 +7897,10 @@ async fn pump_worker(
         // both count — and try the one nudge after the record block below
         // releases its lock. `repeated` keeps which kind of streak fired.
         let mut strike_fired: Option<bool> = None;
+        // The finished tool call this event (if any) carries, captured beside
+        // the strike counter so the record block below can fold it into the
+        // worker's current failing streak.
+        let mut tool_outcome: Option<(String, bool, String)> = None;
         match &event.event {
             SerializableAgentEvent::ToolCallStart { index, id, name } => {
                 // A provider may supersede an unexecuted call at the same
@@ -7798,6 +7929,7 @@ async fn pump_worker(
                     if strikes.lock().await.observe(signature, failed) {
                         strike_fired = Some(repeated);
                     }
+                    tool_outcome = Some((name.clone(), result.success, result.output.clone()));
                 }
             }
             _ => {}
@@ -7831,6 +7963,13 @@ async fn pump_worker(
                 worker.last_activity_ms = activity_ms;
                 if worker.created_at_ms > 0 {
                     worker.elapsed_ms = activity_ms.saturating_sub(worker.created_at_ms);
+                }
+                if let Some((tool, success, output)) = &tool_outcome {
+                    let had_errors = !worker.tool_errors.is_empty();
+                    note_tool_outcome(worker, tool, *success, output);
+                    if !*success || had_errors {
+                        changed = true;
+                    }
                 }
                 match &event.event {
                     SerializableAgentEvent::Started
@@ -8887,6 +9026,9 @@ fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
     }
     if let Some(merge) = &worker.merge {
         view["merge"] = json!({ "commit": merge.commit });
+    }
+    if !worker.tool_errors.is_empty() {
+        view["tool_errors"] = json!(worker.tool_errors);
     }
     view
 }
@@ -10115,6 +10257,7 @@ mod tests {
             fixer_finding_id: None,
             merge: None,
             error: None,
+            tool_errors: Vec::new(),
             plan_id: None,
             plan_step: None,
             tier: None,
@@ -12751,9 +12894,22 @@ models = [\"scripted-a\", \"scripted-b\"]
             "the strike nudge row: {row:?}"
         );
         let notice = wait_nudge_notice(&mut notices, "routingworker").await;
+        let prefix = "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier high.\nLast tool errors:";
+        assert!(notice.starts_with(prefix), "{notice}");
         assert_eq!(
-            notice,
-            "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier high."
+            notice.matches("\n- not_a_real_tool: ").count(),
+            3,
+            "the failed call's tool name, once per kept failure: {notice}"
+        );
+        assert!(
+            notice.contains("unknown tool 'not_a_real_tool'"),
+            "the failed call's actual output: {notice}"
+        );
+        assert!(
+            notice.ends_with(
+                "\nRead these first: a tool problem is not fixed by a stronger model."
+            ),
+            "{notice}"
         );
         let settled = wait_worker_settled(&fixture.team, "routingworker").await;
         assert_eq!(
@@ -12798,6 +12954,220 @@ models = [\"scripted-a\", \"scripted-b\"]
             "the route, the nudge, and the outcome rows: {:?}",
             fixture.rows()
         );
+        fixture.team.shutdown().await;
+    }
+
+    /// The failing-tool streak keeps the last three calls, collapses each
+    /// output's whitespace, cuts it at the character limit without splitting a
+    /// character, and a successful call clears it.
+    #[test]
+    fn note_tool_outcome_keeps_the_last_three_and_clears_on_success() {
+        let mut worker = worker(std::path::Path::new("."), "streak0001");
+        for (index, tool) in ["file_read", "shell", "git", "plan_read"]
+            .iter()
+            .enumerate()
+        {
+            note_tool_outcome(&mut worker, tool, false, &format!("  failed\n\ncall {index}  "));
+        }
+        let tools: Vec<&str> = worker
+            .tool_errors
+            .iter()
+            .map(|note| note.tool.as_str())
+            .collect();
+        assert_eq!(tools, ["shell", "git", "plan_read"], "only the last three");
+        assert_eq!(worker.tool_errors[0].output, "failed call 1");
+
+        // A multi-byte output is cut by character, never mid-character.
+        let long = "é".repeat(TOOL_ERROR_CHARS + 5);
+        note_tool_outcome(&mut worker, "shell", false, &long);
+        let kept = worker.tool_errors.last().expect("the newest failure");
+        assert_eq!(kept.output.chars().count(), TOOL_ERROR_CHARS + 1);
+        assert!(kept.output.ends_with('…'), "{kept:?}");
+        assert_eq!(
+            kept.output.chars().take(TOOL_ERROR_CHARS).collect::<String>(),
+            "é".repeat(TOOL_ERROR_CHARS)
+        );
+        assert_eq!(
+            tool_errors_text(&worker),
+            format!(
+                "\nLast tool errors:\n- git: failed call 2\n- plan_read: failed call 3\n- shell: {}…",
+                "é".repeat(TOOL_ERROR_CHARS)
+            )
+        );
+
+        // A success clears the streak, and an empty streak has no text.
+        note_tool_outcome(&mut worker, "file_read", true, "ok");
+        assert!(worker.tool_errors.is_empty());
+        assert!(tool_errors_text(&worker).is_empty());
+    }
+
+    /// The strike nudge carries the actual failed calls — the tool name and
+    /// its output for each of the last three failures — and the warning that a
+    /// stronger model does not fix a tool problem.
+    #[tokio::test]
+    async fn the_strike_nudge_shows_the_tool_errors() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, mut notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let notice = wait_nudge_notice(&mut notices, "routingworker").await;
+        let prefix = "worker_id=routingworker Laya nudge: routingworker looks stuck (3 failing tool calls in a row); consider team_resume with tier high.\nLast tool errors:";
+        assert!(notice.starts_with(prefix), "{notice}");
+        assert_eq!(
+            notice.matches("\n- not_a_real_tool: ").count(),
+            3,
+            "the tool's name on each kept failure: {notice}"
+        );
+        assert!(
+            notice.contains("unknown tool 'not_a_real_tool'"),
+            "the tool's own error: {notice}"
+        );
+        assert!(
+            notice.ends_with("\nRead these first: a tool problem is not fixed by a stronger model."),
+            "{notice}"
+        );
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert_eq!(settled.tool_errors.len(), 3, "{settled:?}");
+        fixture.team.shutdown().await;
+    }
+
+    /// `team_status` reports each worker's current failing streak, and omits
+    /// the field for a worker whose last call succeeded.
+    #[tokio::test]
+    async fn team_status_reports_tool_errors() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut failing = reviewed_worker(root.path(), "00000001000000000003");
+        failing.tool_errors = vec![
+            ToolErrorNote {
+                tool: "shell".to_string(),
+                output: "exit status 1".to_string(),
+            },
+            ToolErrorNote {
+                tool: "git".to_string(),
+                output: "no such branch".to_string(),
+            },
+        ];
+        let clean = reviewed_worker(root.path(), "00000001000000000004");
+        let team = open_test_team(root.path(), state.path(), vec![failing, clean]).await;
+        let answer = team_status_answer(&team, json!({})).await;
+        let entries = answer["result"].as_array().expect("a worker array");
+        assert_eq!(entries[0]["tool_errors"][0]["tool"], "shell");
+        assert_eq!(entries[0]["tool_errors"][1]["output"], "no such branch");
+        assert!(
+            entries[1].get("tool_errors").is_none(),
+            "a clean worker has no tool_errors key: {}",
+            entries[1]
+        );
+        team.shutdown().await;
+    }
+
+    /// A failed worker whose session is alive and idle resumes in place:
+    /// `team_resume` makes it idle instead of dead-ending on "already
+    /// running", clears the error, and keeps the failing streak readable.
+    #[tokio::test]
+    async fn resume_makes_a_failed_worker_with_a_live_session_idle() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let failed = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert_eq!(failed.status, WorkerStatus::Failed, "{failed:?}");
+        assert!(
+            fixture.team.live.lock().await.contains_key("routingworker"),
+            "the failed worker's session is still live"
+        );
+        let resumed = fixture
+            .team
+            .resume("routingworker")
+            .await
+            .expect("a failed worker with a live idle session resumes");
+        assert_eq!(resumed.status, WorkerStatus::Idle, "{resumed:?}");
+        assert!(resumed.error.is_none(), "{resumed:?}");
+        assert!(resumed.pending.is_none(), "{resumed:?}");
+        assert_eq!(resumed.tool_errors.len(), 3, "the errors stay readable");
+        fixture.team.shutdown().await;
+    }
+
+    /// A worker that is actually running still refuses a resume, now pointing
+    /// the lead at `team_message`.
+    #[tokio::test]
+    async fn resume_still_refuses_a_running_worker() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        let mut busy = worker(root.path(), "00000001000000000005");
+        busy.status = WorkerStatus::Working;
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            busy.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision the running worker");
+        let team = open_test_team(root.path(), state.path(), vec![busy.clone()]).await;
+        spawn_live_worker(&team, &busy).await;
+        team.live
+            .lock()
+            .await
+            .get(&busy.id)
+            .expect("the live worker")
+            .busy
+            .store(true, Ordering::SeqCst);
+        let error = team
+            .resume(&busy.id)
+            .await
+            .expect_err("resume refuses a running worker");
+        assert!(error.contains("already running"), "{error}");
+        assert!(error.contains("team_message"), "{error}");
+        team.shutdown().await;
+    }
+
+    /// A delivered message starts the worker over: the stale failure error is
+    /// cleared from the record.
+    #[tokio::test]
+    async fn a_message_clears_a_failed_workers_error() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        let failed = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert!(failed.error.is_some(), "{failed:?}");
+        let messaged = fixture
+            .team
+            .message(
+                "routingworker",
+                "that tool does not exist; read the file instead".to_string(),
+                MessageSender::Lead,
+            )
+            .await
+            .expect("a failed worker with a live session takes a message");
+        assert!(messaged.error.is_none(), "{messaged:?}");
         fixture.team.shutdown().await;
     }
 
@@ -13161,6 +13531,12 @@ models = [\"scripted-a\", \"scripted-b\"]
         .expect("save routing settings");
         let mut record = worker(root.path(), "nudgereview001");
         record.tier = Some("routine".into());
+        // A failing streak on the record must never leak into a review nudge:
+        // the review, not a tool, is what the lead is being asked to act on.
+        record.tool_errors = vec![ToolErrorNote {
+            tool: "shell".to_string(),
+            output: "exit status 1".to_string(),
+        }];
         record.routing = Some(WorkerRouting {
             laya_tier: Some("routine".into()),
             confidence: Some(0.62),
@@ -13197,6 +13573,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             },
             Vec::new(),
         );
+        let mut notices = team.subscribe_board();
 
         let first = team
             .review(&record.id, "first pass".into(), vec![open_finding("finding1")], evidence())
@@ -13222,6 +13599,15 @@ models = [\"scripted-a\", \"scripted-b\"]
             second.routing.as_ref().expect("routed").nudged.as_deref(),
             Some("high"),
             "the second high review round nudged: {second:?}"
+        );
+        let review_notice = wait_nudge_notice(&mut notices, &record.id).await;
+        assert!(
+            !review_notice.contains("Last tool errors"),
+            "a review nudge never shows tool errors: {review_notice}"
+        );
+        assert!(
+            !review_notice.contains("Read these first"),
+            "{review_notice}"
         );
         let rows = std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
             .unwrap_or_default()
@@ -15520,12 +15906,19 @@ models = [\"scripted-a\", \"scripted-b\"]
         .await;
         assert_eq!(switched.tier.as_deref(), Some("high"));
         assert!(switched.routing.expect("routing").nudged.is_none());
-        let raw = std::fs::read_to_string(fixture.log_path()).expect("routing log");
-        assert!(raw.lines().any(|line| {
-            serde_json::from_str::<Value>(line).is_ok_and(|row| {
-                row["source"] == "escalation" && row["nudged"] == true
-            })
-        }), "{raw}");
+        // The row is appended after the ledger save, so poll for it: the
+        // in-memory switch can be visible before the file write lands.
+        eventually(|| async {
+            let raw = std::fs::read_to_string(fixture.log_path()).ok()?;
+            raw.lines()
+                .any(|line| {
+                    serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                        row["source"] == "escalation" && row["nudged"] == true
+                    })
+                })
+                .then_some(())
+        })
+        .await;
         fixture.team.shutdown().await;
     }
 

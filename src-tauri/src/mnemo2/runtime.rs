@@ -1382,8 +1382,10 @@ async fn pump_team_notifications(
                     worker.id, event.generation, worker.last_activity_ms
                 ),
                 format!(
-                    "{} failed: {error}. To retry it on another model, use team_resume with worker_id={} and a `tier` or `model`, then team_message it to continue.",
-                    worker.name, worker.id
+                    "{} failed: {error}.{}\nTo continue on the same model, team_message it. To retry on another model, use team_resume with worker_id={} and a `tier` or `model`, then team_message it to continue.",
+                    worker.name,
+                    crate::mnemo2::team::tool_errors_text(&worker),
+                    worker.id
                 ),
                 Some(NoticeState::Failed),
             ),
@@ -8112,6 +8114,50 @@ mod tests {
         assert!(delivered, "after the detach the in-app lead gets the notice");
         assert!(team.drain_external_notices().is_empty());
 
+        lead.shutdown().await;
+    }
+
+    /// The failure notice names the worker's actual last tool errors, not just
+    /// the terminal error, so the lead can see what really went wrong.
+    #[tokio::test]
+    async fn the_failure_notice_names_the_tool_errors() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_turn("not_a_real_tool", r#"{"attempt":1}"#),
+            tool_turn("not_a_real_tool", r#"{"attempt":2}"#),
+            tool_turn("not_a_real_tool", r#"{"attempt":3}"#),
+        ]));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("lead opens");
+        let team = lead.team_handle().await.expect("lead's actual team");
+        team.attach_external_lead();
+        let worker = team
+            .dispatch_with_id(
+                "fail on a bad tool".into(),
+                None,
+                Some("failedwrk1".into()),
+                None,
+            )
+            .await
+            .expect("worker dispatches");
+        let notices = team.wait_external_notices(Duration::from_secs(30)).await;
+        let failure = notices
+            .iter()
+            .find(|notice| notice.contains("failed:"))
+            .unwrap_or_else(|| panic!("the failure notice among {notices:?}"));
+        assert!(failure.contains(&worker.id), "{failure}");
+        assert!(failure.contains("not_a_real_tool"), "{failure}");
+        assert!(
+            failure.contains("unknown tool 'not_a_real_tool'"),
+            "the tool's own error: {failure}"
+        );
+        assert!(failure.contains("team_message"), "{failure}");
         lead.shutdown().await;
     }
 

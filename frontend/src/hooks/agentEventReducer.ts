@@ -119,9 +119,12 @@ export function isUserDenialToolOutput(output: string): boolean {
 /**
  * How many consecutive errors (failed tool results and/or error events) must
  * pile up before a FINAL error (the agent stopping) triggers the doom sound.
- * Mirrors the backend `agent::MAX_RETRIES` consecutive-tool-error cap, but
- * also covers the provider-retry path (its retrying errors are part of the
- * same user-visible "three errors and it stopped" experience).
+ * Deliberately a LOWER BOUND of the backend `agent::MAX_RETRIES` cap (five
+ * consecutive failing tool batches since plan 865249fd raised it from
+ * three), not an exact mirror: the doom sound fires as soon as the streak
+ * looks fatal, and also covers the provider-retry path (its retrying errors
+ * are part of the same user-visible "errors piling up and it stopped"
+ * experience).
  */
 export const DOOM_ERROR_STREAK = 3;
 

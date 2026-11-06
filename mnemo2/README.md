@@ -414,9 +414,9 @@ all live. Setup and day-to-day use are in
   serialized into the local non-`main` lead branch, aborts verified conflict-only
   merges without auto-resolution, never pushes, and supports guarded revert
   before landing. Successful merge closes the worker session, removes a verified
-  clean worktree and deletes the merged branch with a safe `git branch -d` (a
-  branch that is not fully merged is kept). The merge commit keeps the worker
-  tip as its second parent for audit; new dirty work is retained.
+  clean worktree (a worktree with new dirty work is retained) and deletes the
+  merged branch with a safe `git branch -d` (a branch that is not fully merged
+  is kept). The merge commit keeps the worker tip as its second parent for audit.
 - **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`).
   There is no per-lead-turn delegation cap (removed by user decision 2026-10-31)
   and no cumulative worker token or cost budget. Worker sessions have no

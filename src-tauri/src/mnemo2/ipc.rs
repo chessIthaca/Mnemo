@@ -269,12 +269,15 @@ impl Mnemo2State {
 }
 
 /// This machine's owner id, which stamps and verifies project state folders.
+/// The id lives in the Mnemo config dir so every launch path shares it; the
+/// app-data file is read once for migration.
 pub(crate) fn state_owner(app: &AppHandle) -> Result<String, String> {
+    let config_dir = mnemo::config::resolve_config_dir(None);
     let app_data = app
         .path()
         .app_data_dir()
         .map_err(|err| format!("could not resolve the Mnemo2 app data dir: {err}"))?;
-    project::machine_owner_id(&app_data)
+    project::machine_owner_id_shared(&config_dir, &app_data)
 }
 
 /// The UI's approval decision on the wire.

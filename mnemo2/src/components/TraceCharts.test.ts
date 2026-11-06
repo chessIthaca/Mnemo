@@ -41,11 +41,14 @@ function row(overrides: Partial<TraceRow> = {}): TraceRow {
     generation_ms: 4000,
     reasoning_ms: 600,
     connect_ms: 500,
+    upload_ms: null,
+    server_ms: null,
     tools_ms: 800,
     prep_ms: 1000,
     compact_ms: 300,
     backoff_ms: 200,
     stall_ms: 400,
+    chunks: null,
     error: null,
     cancelled: false,
     response_truncated: false,
@@ -108,6 +111,8 @@ describe("TraceCharts", () => {
     expect(details?.textContent).toContain("Values table");
     const table = details?.querySelector("table");
     expect(table?.textContent).toContain("Compaction (in Setup)");
+    expect(table?.textContent).toContain("Upload");
+    expect(table?.textContent).toContain("Server wait");
     expect(table?.textContent).toContain("First token");
     expect(table?.textContent).toContain("400 ms");
     expect(table?.querySelectorAll("tbody tr")).toHaveLength(1);
@@ -183,5 +188,22 @@ describe("TraceCharts", () => {
   it("explains an empty scope instead of drawing a blank chart", () => {
     render(TraceCharts, { props: { rows: [], scopeLabel: "this session" } });
     expect(screen.getByText("No model calls in this scope yet.")).toBeTruthy();
+  });
+
+  it("plotScale scales the plot heights and defaults to 1", () => {
+    const props: { rows: TraceRow[]; scopeLabel: string } = { rows: [row()], scopeLabel: "this session" };
+
+    const plain = render(TraceCharts, { props: { ...props } });
+    const charts = plain.container.querySelector<HTMLElement>(".charts");
+    expect(charts?.style.getPropertyValue("--plot-scale")).toBe("1");
+
+    const doubled = render(TraceCharts, { props: { ...props, plotScale: 2 } });
+    expect(doubled.container.querySelector<HTMLElement>(".charts")?.style.getPropertyValue("--plot-scale")).toBe("2");
+
+    const huge = render(TraceCharts, { props: { ...props, plotScale: 10 } });
+    expect(huge.container.querySelector<HTMLElement>(".charts")?.style.getPropertyValue("--plot-scale")).toBe("3");
+
+    const tiny = render(TraceCharts, { props: { ...props, plotScale: -1 } });
+    expect(tiny.container.querySelector<HTMLElement>(".charts")?.style.getPropertyValue("--plot-scale")).toBe("0.5");
   });
 });

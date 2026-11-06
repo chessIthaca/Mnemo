@@ -92,7 +92,7 @@ fn spec_deltas_schema() -> serde_json::Value {
     });
     json!({
         "type": "array",
-        "description": "OpenSpec changes for capabilities under .coding/openspec/specs/. Encouraged when a plan changes specified behavior, never required. Deltas are validated against the current spec and earlier deltas on the same plan; their scenarios also serve as acceptance scenarios.",
+        "description": "OpenSpec changes for capabilities under .coding/openspec/specs/. Required when the plan's steps touch a capability's governed files (.coding/openspec/config.yaml governed_files). Deltas are validated against the current spec and earlier deltas on the same plan; their scenarios also serve as acceptance scenarios.",
         "items": {
             "type": "object",
             "properties": {
@@ -190,6 +190,16 @@ fn spec_notes(steps: &[(usize, &str)]) -> String {
 
 // ── plan_create ───────────────────────────────────────────────────────────
 
+/// The explicit no-spec-impact declaration of `plan_create`: `none`
+/// with a reason exempts the plan from the spec-impact gate.
+#[derive(Debug, Deserialize)]
+struct SpecImpact {
+    #[serde(default)]
+    none: bool,
+    #[serde(default)]
+    reason: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateArgs {
     title: String,
@@ -210,6 +220,8 @@ struct CreateArgs {
     sections: Option<BTreeMap<String, String>>,
     #[serde(default)]
     backlog_id: Option<String>,
+    #[serde(default)]
+    spec_impact: Option<SpecImpact>,
 }
 
 /// `plan_create` — open a new plan on the board.
@@ -247,9 +259,11 @@ impl Tool for PlanCreateTool {
              name the files each step touches. List the observable outcomes in \
              `acceptance_scenarios` (or add them later with plan_update \
              `add_acceptance_scenarios`): workers receive them, and a review_risk='high' \
-             dispatch on this plan requires at least one. OpenSpec `spec_deltas` are encouraged \
-             when specified behavior changes, never required, and are checked against \
-             .coding/openspec/specs/; delta scenarios also count as acceptance scenarios. \
+              dispatch on this plan requires at least one. OpenSpec `spec_deltas` are checked \
+              against .coding/openspec/specs/ and REQUIRED when the steps touch a capability's \
+              governed files (.coding/openspec/config.yaml `governed_files`) — plan_create \
+              refuses without one; delta scenarios also count as acceptance scenarios. A plan \
+              that changes no specified behavior declares that explicitly with `spec_impact`. \
              When the plan fulfils a backlog idea handed over with Plan this, pass its \
              `backlog_id` to mark the item done with this plan (an unknown id only warns). \
              Delegate each step with team_dispatch(plan_id, step, ...). The plan stays on disk after it closes.",
@@ -266,7 +280,8 @@ impl Tool for PlanCreateTool {
                     "acceptance_scenarios": {"type": "array", "items": {"type": "string"}, "description": "Observable outcomes the finished work must show, one per entry: a command and its result, a persisted state, a concurrency or security property, a UI behavior. Kept in the plan's '## Acceptance scenarios' section and given to every worker; a review_risk='high' dispatch requires at least one."},
                     "spec_deltas": spec_deltas_schema(),
                     "sections": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Additional OpenSpec artifact markdown keyed by artifact id. The schema's refusal names any required section and supplies its template and rules."},
-                    "backlog_id": {"type": "string", "description": "The id of the backlog item this plan fulfils (the id a Plan this notice named). The item is marked done with this plan's id and title; an unknown id is only a warning."}
+                    "backlog_id": {"type": "string", "description": "The id of the backlog item this plan fulfils (the id a Plan this notice named). The item is marked done with this plan's id and title; an unknown id is only a warning."},
+                    "spec_impact": {"type": "object", "properties": {"none": {"type": "boolean", "description": "True declares this plan changes no specified behavior."}, "reason": {"type": "string", "description": "Why no spec delta is needed; required when none is true."}}, "required": ["none", "reason"], "description": "Explicit no-spec-impact declaration: exempts the plan from the spec-impact gate that otherwise requires a spec delta for every capability whose governed files the steps touch."}
                 },
                 "required": ["title", "goal", "context", "steps"]
             }),
@@ -300,6 +315,9 @@ impl Tool for PlanCreateTool {
             interfaces: args.interfaces,
             acceptance: args.acceptance_scenarios,
             spec_deltas: args.spec_deltas,
+            no_spec_impact: args
+                .spec_impact
+                .and_then(|impact| impact.none.then_some(impact.reason)),
         };
         let plan = match self
             .board
@@ -424,8 +442,9 @@ impl Tool for PlanUpdateTool {
              `progress` (commits, review status, what is next), append to the context (stable \
              why, constraints, intent only — never status, because every worker brief copies \
              it), add steps, add observable acceptance scenarios (required before a \
-             review_risk='high' dispatch), append OpenSpec `spec_deltas` (encouraged, never required, \
-             checked against .coding/openspec/specs/ and this plan's earlier deltas), record a \
+              review_risk='high' dispatch), append OpenSpec `spec_deltas` (required when the \
+              added steps touch a capability's governed files — the same gate as plan_create — \
+              checked against .coding/openspec/specs/ and this plan's earlier deltas), record a \
              bug_fixing plan's regression test, or flag a feature-scale fix with landed_design \
              (closing then needs a \"Landed design\" context paragraph).",
             json!({

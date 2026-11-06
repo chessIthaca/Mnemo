@@ -2708,12 +2708,34 @@ mod tests {
             )
             .await;
         assert!(dispatched.success, "{}", dispatched.output);
+        // The explicit tier never waits on the classification (plan
+        // c74b1987): the dispatch answers while the label is deferred.
         assert!(dispatched.output.contains(
-            "Laya: high (0.71) — you chose routine; logged as an override."
+            "Laya: classifying in the background; the label will land on the routing record."
         ));
         tokio::time::timeout(std::time::Duration::from_secs(10), server.next_arrival())
             .await
             .expect("the worker's first request arrives");
+        // The deferred label lands on the record and survives the real
+        // session start; `routed_by` resolved at dispatch time, so the
+        // override is corpus-only and the record keeps "lead".
+        let routing = {
+            let mut routing = None;
+            for _ in 0..400 {
+                if let Ok(worker) = team.worker("routingworker").await {
+                    if let Some(block) = worker.routing {
+                        if block.laya_tier.is_some() {
+                            routing = Some(block);
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            routing.expect("the deferred label landed")
+        };
+        assert_eq!(routing.laya_tier.as_deref(), Some("high"));
+        assert_eq!(routing.routed_by, "lead");
         let status = team.handle_lead_host_tool("team_status", serde_json::json!({})).await;
         assert!(status.success, "{}", status.output);
         let status: serde_json::Value = serde_json::from_str(&status.output).expect("status JSON");
@@ -2723,7 +2745,7 @@ mod tests {
             .find(|worker| worker["id"] == "routingworker")
             .expect("routing worker status");
         assert_eq!(worker["routing"]["laya_tier"], "high");
-        assert_eq!(worker["routing"]["routed_by"], "lead_override");
+        assert_eq!(worker["routing"]["routed_by"], "lead");
         team.shutdown().await;
 
     }
@@ -8123,11 +8145,15 @@ mod tests {
         init_git(root.path());
         run_git(root.path(), &["checkout", "-b", "wt/lead"]);
         write_config(config.path(), &["scripted-a"]);
-        let llm = Arc::new(ScriptedLlm::new(vec![
-            tool_turn("not_a_real_tool", r#"{"attempt":1}"#),
-            tool_turn("not_a_real_tool", r#"{"attempt":2}"#),
-            tool_turn("not_a_real_tool", r#"{"attempt":3}"#),
-        ]));
+        // Five consecutive failing batches trip the session's doom guard
+        // (agent::MAX_RETRIES, raised 3 → 5); keep this count in sync.
+        let llm = Arc::new(ScriptedLlm::new(
+            (1..=5)
+                .map(|attempt| {
+                    tool_turn("not_a_real_tool", &format!(r#"{{"attempt":{attempt}}}"#))
+                })
+                .collect(),
+        ));
         let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
             .await
             .expect("lead opens");

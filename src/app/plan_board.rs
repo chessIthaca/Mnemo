@@ -15,7 +15,7 @@
 //! records and the [`TeamLedger`] use them (`tick`, `untick`); each method
 //! says which.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::backlog::{BacklogStatus, BacklogStore};
 use crate::app::openspec::archive;
-use crate::app::openspec::schema::{ResolvedSchema, Schema};
+use crate::app::openspec::schema::{OpenSpecConfig, ResolvedSchema, Schema};
 use crate::app::team_ledger::{PlanReview, TeamLedger};
 use crate::app::tool::workflow::plan::{
     bug_fixing_gate, collapse_whitespace, context_issue, escape_section_markers,
@@ -101,6 +101,10 @@ pub struct BoardPlan {
     pub schema: String,
     /// Additional schema artifacts keyed by artifact id.
     pub sections: BTreeMap<String, String>,
+    /// The explicit no-spec-impact declaration's reason, when the plan
+    /// carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_spec_impact: Option<String>,
     pub steps: Vec<BoardStep>,
 }
 
@@ -123,6 +127,10 @@ pub struct PlanDraft {
     pub acceptance: Vec<String>,
     /// OpenSpec changes to validate, store, and render with this plan.
     pub spec_deltas: Vec<Delta>,
+    /// The explicit no-spec-impact declaration's reason: presence
+    /// declares the plan changes no specified behavior, exempting it
+    /// from the spec-impact gate.
+    pub no_spec_impact: Option<String>,
 }
 
 /// What `plan_update` takes. Nothing already recorded is rewritten.
@@ -192,6 +200,9 @@ struct BoardEntry {
     /// Additional schema artifacts keyed by artifact id.
     #[serde(default)]
     sections: BTreeMap<String, String>,
+    /// The explicit no-spec-impact declaration's reason, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_spec_impact: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -390,6 +401,25 @@ impl PlanBoard {
             ));
         }
         self.validate_spec_deltas(&draft.spec_deltas)?;
+        // The spec-impact gate (2026-11-05): a plan touching a
+        // capability's governed files carries a delta for it or an
+        // explicit no-impact declaration — and that declaration needs a
+        // reason.
+        let no_spec_impact = match draft.no_spec_impact.as_deref().map(str::trim) {
+            Some(reason) if reason.is_empty() => {
+                return Err("the no-spec-impact declaration needs a reason".to_string());
+            }
+            declared => declared.map(str::to_string),
+        };
+        let issues = self.spec_impact_issues(
+            &steps,
+            &draft.spec_deltas,
+            &draft.spec_deltas,
+            no_spec_impact.is_some(),
+        )?;
+        if !issues.is_empty() {
+            return Err(resumability_gate_error("spec impact not covered", &issues));
+        }
         let resolved = Schema::resolve(&self.openspec_dir(), None)?;
         let _guard = self.guard();
         let mut board = self.load_board()?;
@@ -409,6 +439,12 @@ impl PlanBoard {
         }
         add_scenarios(&mut plan, draft.acceptance.iter().chain(&lifted));
         plan.bug_symptom = bug.filter(|_| draft.kind == PlanKind::BugFixing);
+        if let Some(reason) = &no_spec_impact {
+            push_line(
+                &mut plan.decisions,
+                format!("- {}: no spec impact: {reason}", today()),
+            );
+        }
         let entry = BoardEntry {
             id: id.clone(),
             status: BoardStatus::Open,
@@ -419,6 +455,7 @@ impl PlanBoard {
             spec_deltas: draft.spec_deltas,
             schema: resolved.schema.reference(),
             sections,
+            no_spec_impact,
         };
         self.validate_artifacts(&resolved, &plan, &entry.spec_deltas, &entry.sections)?;
         self.validate_artifacts(&resolved, &plan, &entry.spec_deltas, &entry.sections)?;
@@ -499,10 +536,25 @@ impl PlanBoard {
                 }
             }
         }
-        if !edit.spec_deltas.is_empty() {
+        let added_steps = clean_steps(&edit.add_steps);
+        if !edit.spec_deltas.is_empty() || !added_steps.is_empty() {
             let mut combined = entry.spec_deltas.clone();
             combined.extend(edit.spec_deltas.iter().cloned());
-            self.validate_spec_deltas(&combined)?;
+            if !edit.spec_deltas.is_empty() {
+                self.validate_spec_deltas(&combined)?;
+            }
+            // The spec-impact gate also covers steps added after
+            // creation: a governed file named by a new step needs a
+            // delta or the plan's explicit no-impact declaration.
+            let issues = self.spec_impact_issues(
+                &added_steps,
+                &combined,
+                &edit.spec_deltas,
+                entry.no_spec_impact.is_some(),
+            )?;
+            if !issues.is_empty() {
+                return Err(resumability_gate_error("spec impact not covered", &issues));
+            }
         }
         let (extra, lifted) = lift_acceptance(edit.context_append.as_deref().unwrap_or(""));
         if !extra.is_empty() {
@@ -525,7 +577,7 @@ impl PlanBoard {
                 push_line(&mut plan.progress, format!("- {}: {note}", today()));
             }
         }
-        for text in clean_steps(&edit.add_steps) {
+        for text in added_steps {
             let index = plan.steps.len();
             plan.steps.push(crate::app::workflow::Step {
                 index,
@@ -1389,6 +1441,80 @@ impl PlanBoard {
         Ok(())
     }
 
+    /// The spec-impact gate (2026-11-05): OpenSpec is enforced, not
+    /// encouraged. A plan whose steps touch a capability's governed files
+    /// (config.yaml `governed_files`) must carry a spec delta for that
+    /// capability or an explicit no-spec-impact declaration with a reason,
+    /// and a delta that creates a new capability must find its governed
+    /// files declared in the map. `deltas` is every delta the plan will
+    /// carry (a hit capability is covered by any of them); `new_deltas`
+    /// is the subset this call adds, which the new-capability rule
+    /// applies to. Returns one refusal block per ungated capability, in
+    /// map order.
+    fn spec_impact_issues(
+        &self,
+        steps: &[String],
+        deltas: &[Delta],
+        new_deltas: &[Delta],
+        declared_none: bool,
+    ) -> Result<Vec<String>, String> {
+        let config = OpenSpecConfig::load(&self.openspec_dir())?;
+        let mut issues = Vec::new();
+        if !declared_none {
+            let paths: Vec<String> = steps.iter().flat_map(|text| step_paths(text)).collect();
+            for (capability, files) in &config.governed_files {
+                if files.is_empty()
+                    || deltas.iter().any(|delta| delta.capability == *capability)
+                {
+                    continue;
+                }
+                let touched: Vec<&str> = files
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|file| paths.iter().any(|path| same_repo_path(path, file)))
+                    .collect();
+                if touched.is_empty() {
+                    continue;
+                }
+                issues.push(format!(
+                    "the steps touch {} — governed by the '{capability}' capability, \
+                     but this plan carries no spec delta for it. Either attach one \
+                     (plan_create or plan_update spec_deltas with capability \
+                     '{capability}'), or declare no spec impact explicitly with a \
+                     reason (plan_create spec_impact: {{\"none\": true, \"reason\": \
+                     \"...\"}})",
+                    touched
+                        .iter()
+                        .map(|file| format!("'{file}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for delta in new_deltas {
+            if !seen.insert(delta.capability.clone())
+                || load_current_spec(&self.specs_dir(), &delta.capability)?.is_some()
+            {
+                continue;
+            }
+            if !config
+                .governed_files
+                .get(&delta.capability)
+                .is_some_and(|files| !files.is_empty())
+            {
+                issues.push(format!(
+                    "the spec delta creates the new capability '{}', which declares \
+                     no governed files. Add its 'governed_files' entry to \
+                     .coding/openspec/config.yaml naming the files whose changes \
+                     affect it, then retry",
+                    delta.capability
+                ));
+            }
+        }
+        Ok(issues)
+    }
+
     fn load(&self, id: &str) -> Result<(BoardEntry, PlanFile), String> {
         let entry = self
             .load_board()?
@@ -1534,6 +1660,7 @@ fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
         spec_deltas: entry.spec_deltas.clone(),
         schema: entry.schema.clone(),
         sections: entry.sections.clone(),
+        no_spec_impact: entry.no_spec_impact.clone(),
         steps: plan
             .steps
             .iter()
@@ -1545,6 +1672,19 @@ fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
             })
             .collect(),
     }
+}
+
+/// Whether two repo-relative paths name the same file: separators are
+/// normalized to `/` and leading `./` segments stripped, so a step's
+/// path matches a governed entry written either way. Exact paths only —
+/// v1 has no globs.
+fn same_repo_path(step: &str, governed: &str) -> bool {
+    let normalize = |path: &str| {
+        path.replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string()
+    };
+    normalize(step) == normalize(governed)
 }
 
 fn unknown(id: &str) -> String {
@@ -1787,7 +1927,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             openspec.join("config.yaml"),
-            "schema: custom\ncontext: Project schema context.\nrules:\n  research:\n    - Cite the inspected files.\n    - Name the evidence.\n",
+            "schema: custom\ncontext: Project schema context.\ngoverned_files:\n  importer:\n    - src/importer_core.rs\nrules:\n  research:\n    - Cite the inspected files.\n    - Name the evidence.\n",
         )
         .unwrap();
     }
@@ -1826,6 +1966,21 @@ mod tests {
             spec.add_requirement(requirement(name));
         }
         std::fs::write(folder.join("spec.md"), spec.render()).unwrap();
+    }
+
+    /// Declare the importer capability's governed files: the
+    /// new-capability rule refuses a delta that creates a capability
+    /// with no spec until its files are declared in this map. The
+    /// declared file is deliberately not one the draft steps name, so
+    /// only plans carrying an importer delta are affected.
+    fn declare_governed(dir: &Path) {
+        let openspec = dir.join("openspec");
+        std::fs::create_dir_all(&openspec).unwrap();
+        std::fs::write(
+            openspec.join("config.yaml"),
+            "governed_files:\n  importer:\n    - src/importer_core.rs\n",
+        )
+        .unwrap();
     }
 
     fn complete_steps(board: &PlanBoard, id: &str) {
@@ -2795,6 +2950,7 @@ mod tests {
     #[test]
     fn plan_update_can_modify_a_requirement_added_by_an_earlier_delta() {
         let dir = tempfile::tempdir().unwrap();
+        declare_governed(dir.path());
         let board = board(dir.path());
         let plan = board
             .create(PlanDraft {
@@ -2838,6 +2994,7 @@ mod tests {
     #[test]
     fn delta_scenarios_alone_satisfy_the_high_risk_acceptance_contract() {
         let dir = tempfile::tempdir().unwrap();
+        declare_governed(dir.path());
         let board = board(dir.path());
         let plan = board
             .create(PlanDraft {
@@ -2865,6 +3022,7 @@ mod tests {
     #[test]
     fn board_json_round_trips_deltas_and_plan_rewrites_keep_spec_changes() {
         let dir = tempfile::tempdir().unwrap();
+        declare_governed(dir.path());
         let board = board(dir.path());
         let plan = board
             .create(PlanDraft {
@@ -2914,6 +3072,7 @@ mod tests {
     #[tokio::test]
     async fn close_with_added_delta_merges_the_spec_and_writes_the_archive() {
         let dir = tempfile::tempdir().unwrap();
+        declare_governed(dir.path());
         let board = board(dir.path());
         let plan = board
             .create(PlanDraft {
@@ -3118,6 +3277,7 @@ mod tests {
     #[tokio::test]
     async fn a_close_retries_after_the_archive_succeeded_but_the_report_failed() {
         let dir = tempfile::tempdir().unwrap();
+        declare_governed(dir.path());
         let board = board(dir.path());
         let plan = board
             .create(PlanDraft {

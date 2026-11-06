@@ -478,7 +478,47 @@ struct RoutedDispatch {
     reasoning_effort: Option<String>,
     routing: Option<WorkerRouting>,
     rows: Vec<DispatchRoutingRow>,
+    /// The classification an explicit-choice dispatch defers to the
+    /// background (plan c74b1987): `Some` only when the lead's tier or
+    /// model choice made the inline await pure overhead. The dispatch
+    /// returns with a null Laya label; the spawned task writes the corpus
+    /// rows and attaches the label to the worker's routing record.
+    pending: Option<PendingClassification>,
     error: Option<String>,
+}
+
+/// Everything the background classification of an explicit-choice dispatch
+/// needs: the same classifier, permit, timeout and corpus rows as the
+/// inline path, plus the dispatch-time choices those rows record. The
+/// worker id is attached when the task is spawned, after provisioning.
+struct PendingClassification {
+    /// The classifier resolved at dispatch time, exactly like the inline
+    /// path's.
+    classifier: std::sync::Arc<dyn mnemo::memory::classifier::Classifier>,
+    /// The kNN overlay over the routing log, cloned at dispatch time.
+    knn: Option<Arc<RouteKnn>>,
+    /// The serialized routing permit, shared with the inline path and the
+    /// drift checks.
+    permit: Arc<tokio::sync::Semaphore>,
+    /// The classified step text plus brief.
+    text: String,
+    /// The tiers that resolve to a model.
+    enabled: EnabledTiers,
+    /// The dispatch-routing settings snapshot at dispatch time.
+    settings: RoutingSettings,
+    /// The plan the dispatch ran under, for the corpus rows.
+    plan_id: String,
+    /// The 1-based step for the corpus rows.
+    step: usize,
+    /// The lead's requested tier, when one was passed.
+    explicit_tier: Option<String>,
+    /// The tier the lead's choice resolved to.
+    chosen_tier: Option<String>,
+    /// The model spec the dispatch runs on.
+    chosen_model: Option<String>,
+    /// Whether a model choice was passed: the override comparison reads the
+    /// resolved tier then, the requested tier otherwise.
+    model_choice: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1165,7 +1205,10 @@ fn resolve_tier_over(
 const NUDGE_LADDER: [&str; 5] = ["trivial", "routine", "medium", "high", "escalate"];
 
 /// Consecutive failed or verbatim-repeated tool calls that fire a nudge
-/// (design §4.6).
+/// (design §4.6). Deliberately still 3 after plan 865249fd raised the
+/// session's doom-guard cap (`MAX_RETRIES`, src/agent/mod.rs) 3 → 5: the
+/// stuck-worker nudge tells the lead early, while the worker itself keeps
+/// running to the 5th consecutive failing batch before the turn aborts.
 const NUDGE_STRIKE_LIMIT: u32 = 3;
 
 /// How many failed tool calls a worker's streak keeps: enough for the lead to
@@ -1976,6 +2019,7 @@ impl TeamRuntime {
                 reasoning_effort,
                 routing: None,
                 rows: Vec::new(),
+                pending: None,
                 error: None,
             });
         }
@@ -1991,6 +2035,67 @@ impl TeamRuntime {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         });
+        // An explicit lead/user choice never waits on the classification
+        // (plan c74b1987): the decision cannot change what runs — refusals
+        // only occur on non-explicit paths — so it runs in the background
+        // under the same permit and timeout, writes the same corpus rows,
+        // and attaches its label to the worker's routing record when it
+        // lands. Skip conditions (too short, one tier, no classifier) stay
+        // inline: their outcome is decided without a call, exactly as
+        // before.
+        if has_explicit_choice
+            && classified_text.is_some()
+            && enabled.offered().count() >= 2
+        {
+            if let Some(classifier) = classifier {
+                let (chosen_model, chosen_tier) =
+                    self.lead_choice_with_tier(explicit_tier, request.model.clone())?;
+                let reasoning_effort = request.reasoning_effort.clone().or_else(|| {
+                    chosen_tier.as_deref().and_then(|tier| {
+                        self.tier_ladder()
+                            .get(tier)
+                            .and_then(|rung| rung.effort.clone())
+                    })
+                });
+                let routing = WorkerRouting {
+                    laya_tier: None,
+                    confidence: None,
+                    cleared: false,
+                    lead_tier: explicit_tier
+                        .map(str::to_string)
+                        .or_else(|| chosen_tier.clone()),
+                    routed_by: "lead".to_string(),
+                    ran_tier: chosen_tier.clone(),
+                    nudged: None,
+                };
+                return Ok(RoutedDispatch {
+                    model: chosen_model.clone(),
+                    tier: chosen_tier.clone(),
+                    reasoning_effort,
+                    routing: Some(routing),
+                    rows: Vec::new(),
+                    pending: Some(PendingClassification {
+                        classifier,
+                        knn: self.route_knn.clone(),
+                        permit: self.routing_permit.clone(),
+                        text: classified_text.unwrap_or_default(),
+                        enabled,
+                        settings,
+                        plan_id: request
+                            .plan
+                            .as_ref()
+                            .map(|plan| plan.plan_id.clone())
+                            .unwrap_or_default(),
+                        step: request.plan.as_ref().map_or(0, |plan| plan.step + 1),
+                        explicit_tier: explicit_tier.map(str::to_string),
+                        chosen_tier: chosen_tier.clone(),
+                        chosen_model,
+                        model_choice: request.model.is_some(),
+                    }),
+                    error: None,
+                });
+            }
+        }
         let (decision, skip_reason): (Option<DispatchRoutingDecision>, Option<&'static str>) =
             if classified_text.is_none() {
                 (None, Some("too_short"))
@@ -2089,6 +2194,8 @@ impl TeamRuntime {
                     .and_then(|rung| rung.effort.clone())
             })
         });
+        let ran_tier = refusal.is_none().then(|| chosen_tier.clone()).flatten();
+        let ran_model = refusal.is_none().then(|| chosen_model.clone()).flatten();
         let routing = WorkerRouting {
             laya_tier: decision
                 .as_ref()
@@ -2105,77 +2212,45 @@ impl TeamRuntime {
                 })
                 .flatten(),
             routed_by: routed_by.to_string(),
-            ran_tier: refusal.is_none().then(|| chosen_tier.clone()).flatten(),
+            ran_tier: ran_tier.clone(),
             nudged: None,
         };
         let plan_id = request.plan.as_ref().map(|plan| plan.plan_id.clone());
         let step = request.plan.as_ref().map(|plan| plan.step + 1);
-        let skip = skip_reason;
-        use sha2::Digest as _;
-        let text_sha256 = sha2::Sha256::digest(
-            classified_text.as_deref().unwrap_or("").as_bytes(),
-        )
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
         let ts = unix_ms();
-        let row = DispatchRoutingRow::Route {
+        let row = dispatch_route_row(
             ts,
-            worker_id: request.worker_id.clone().unwrap_or_default(),
-            plan_id: plan_id.unwrap_or_default(),
-            step: step.unwrap_or_default(),
-            mode: settings.mode,
-            text_sha256,
-            label: decision
-                .as_ref()
-                .map(|decision| decision.label.clone())
-                .unwrap_or_default(),
-            confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
-            probabilities: decision
-                .as_ref()
-                .map(|decision| decision.probabilities.clone())
-                .unwrap_or_default(),
-            tier: routing.laya_tier.clone(),
-            threshold: decision.as_ref().map_or_else(
-                || threshold_for(enabled.offered().count(), &settings),
-                |decision| {
-                    if decision.source == "knn" {
-                        settings.knn_min_share
-                    } else {
-                        threshold_for(enabled.offered().count(), &settings)
-                    }
-                },
-            ),
-            cleared: routing.cleared,
-            lead_tier: routing.lead_tier.clone(),
-            ran_tier: refusal.is_none().then(|| chosen_tier.clone()).flatten(),
-            ran_model: refusal.is_none().then(|| chosen_model.clone()).flatten(),
-            text: classified_text.unwrap_or_default(),
-            skip: skip.map(str::to_string),
-            source: decision.as_ref().map(|decision| decision.source.to_string()),
-            knn_label: decision.as_ref().and_then(|decision| decision.knn_label.clone()),
-            knn_share: decision.as_ref().and_then(|decision| decision.knn_share),
-            knn_k: decision.as_ref().and_then(|decision| decision.knn_k),
-        };
+            request.worker_id.as_deref().unwrap_or_default(),
+            plan_id.as_deref().unwrap_or_default(),
+            step.unwrap_or_default(),
+            settings.mode,
+            decision.as_ref(),
+            skip_reason,
+            routing.laya_tier.as_deref(),
+            routing.cleared,
+            routing.lead_tier.as_deref(),
+            ran_tier.as_deref(),
+            ran_model.as_deref(),
+            classified_text.as_deref().unwrap_or_default(),
+            enabled,
+            &settings,
+        );
         let mut rows = vec![row];
         if routed_by == "lead_override" {
             if let Some(laya_tier) = routing.laya_tier.clone() {
-                rows.push(DispatchRoutingRow::LeadOverride {
+                rows.push(dispatch_lead_override_row(
                     ts,
-                    worker_id: request.worker_id.clone().unwrap_or_default(),
-                    plan_id: request
-                        .plan
-                        .as_ref()
-                        .map(|plan| plan.plan_id.clone())
-                        .unwrap_or_default(),
-                    step: request.plan.as_ref().map_or(0, |plan| plan.step + 1),
-                    laya_tier: Some(laya_tier),
-                    lead_tier: chosen_tier.clone().unwrap_or_else(|| "custom".into()),
-                    requested_tier: explicit_tier
+                    request.worker_id.as_deref().unwrap_or_default(),
+                    plan_id.as_deref().unwrap_or_default(),
+                    step.unwrap_or_default(),
+                    &laya_tier,
+                    chosen_tier.as_deref(),
+                    explicit_tier
                         .map(str::to_string)
-                        .filter(|requested| Some(requested.as_str()) != chosen_tier.as_deref()),
-                    confidence: decision.as_ref().map_or(0.0, |decision| decision.confidence),
-                });
+                        .filter(|requested| Some(requested.as_str()) != chosen_tier.as_deref())
+                        .as_deref(),
+                    decision.as_ref().map_or(0.0, |decision| decision.confidence),
+                ));
             }
         }
         Ok(RoutedDispatch {
@@ -2184,8 +2259,136 @@ impl TeamRuntime {
             reasoning_effort,
             routing: Some(routing),
             rows,
+            pending: None,
             error: refusal,
         })
+    }
+
+    /// Run the classification an explicit-choice dispatch deferred
+    /// (plan c74b1987): the same permit and 3-second timeout as the
+    /// inline path, the same corpus rows, and — when the worker record
+    /// still exists — the label attached to its routing block, following
+    /// the nudge path's live-record mutation. The dispatch has already
+    /// returned; nothing here can block or fail it, so a record gone to
+    /// cleanup drops the attach silently while the corpus rows still land.
+    fn spawn_pending_classification(&self, pending: PendingClassification, worker_id: String) {
+        let records = self.records.clone();
+        let routing_log_path = self.routing_log_path.clone();
+        let usage = self.usage.clone();
+        let save_lock = self.save_lock.clone();
+        let persistence = self.persistence.clone();
+        tokio::spawn(async move {
+            let attempt = async {
+                let _permit = pending
+                    .permit
+                    .acquire()
+                    .await
+                    .map_err(|_| "Laya routing is closed".to_string())?;
+                Ok::<Option<DispatchRoutingDecision>, String>(
+                    classify_dispatch(
+                        pending.classifier.as_ref(),
+                        pending.knn.as_deref(),
+                        &pending.text,
+                        pending.enabled,
+                        &pending.settings,
+                    )
+                    .await,
+                )
+            };
+            // The same 3-second budget as the inline path, permit wait
+            // included; a closed permit or a timeout is an offline skip.
+            let decision = match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                attempt,
+            )
+            .await
+            {
+                Ok(Ok(decision)) => decision,
+                Ok(Err(_)) | Err(_) => None,
+            };
+            let skip = decision.is_none().then_some("offline");
+            let laya_tier = decision
+                .as_ref()
+                .and_then(|decision| decision.tier)
+                .map(str::to_string);
+            let cleared = decision.as_ref().is_some_and(|decision| decision.cleared);
+            let lead_tier = pending
+                .explicit_tier
+                .clone()
+                .or_else(|| pending.chosen_tier.clone());
+            let ts = unix_ms();
+            let row = dispatch_route_row(
+                ts,
+                &worker_id,
+                &pending.plan_id,
+                pending.step,
+                pending.settings.mode,
+                decision.as_ref(),
+                skip,
+                laya_tier.as_deref(),
+                cleared,
+                lead_tier.as_deref(),
+                pending.chosen_tier.as_deref(),
+                pending.chosen_model.as_deref(),
+                &pending.text,
+                pending.enabled,
+                &pending.settings,
+            );
+            mnemo::model_routing::append_row(&routing_log_path, &row);
+            // The override row an explicit choice logs when Laya cleared a
+            // different tier — the same condition the inline path's
+            // `routed_by` computation applies to an explicit choice.
+            let cleared_tier = decision
+                .as_ref()
+                .filter(|decision| decision.cleared)
+                .and_then(|decision| decision.tier);
+            let lead_choice_tier = if pending.model_choice {
+                pending.chosen_tier.as_deref()
+            } else {
+                pending.explicit_tier.as_deref()
+            };
+            if cleared_tier.is_some() && cleared_tier != lead_choice_tier {
+                if let Some(laya_tier) = laya_tier.clone() {
+                    let row = dispatch_lead_override_row(
+                        ts,
+                        &worker_id,
+                        &pending.plan_id,
+                        pending.step,
+                        &laya_tier,
+                        pending.chosen_tier.as_deref(),
+                        pending
+                            .explicit_tier
+                            .as_deref()
+                            .map(str::to_string)
+                            .filter(|requested| {
+                                Some(requested.as_str()) != pending.chosen_tier.as_deref()
+                            })
+                            .as_deref(),
+                        decision.as_ref().map_or(0.0, |decision| decision.confidence),
+                    );
+                    mnemo::model_routing::append_row(&routing_log_path, &row);
+                }
+            }
+            // Attach the label to the live record; a record gone to cleanup
+            // drops the attach silently — the corpus rows above still land.
+            let attached = {
+                let mut records = records.lock().await;
+                records
+                    .iter_mut()
+                    .find(|worker| worker.id == worker_id)
+                    .and_then(|worker| worker.routing.as_mut())
+                    .map(|routing| {
+                        routing.laya_tier = laya_tier.clone();
+                        routing.confidence =
+                            decision.as_ref().map(|decision| decision.confidence);
+                        routing.cleared = cleared;
+                    })
+                    .is_some()
+            };
+            if attached {
+                let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+            }
+        });
     }
 
     /// The tier a model spec belongs to: the first ladder rung whose list
@@ -3411,7 +3614,9 @@ impl TeamRuntime {
                     reasoning_effort,
                     brief,
                 )
-                .await;
+                .await
+                // Audits are never classified: no deferred label can land.
+                .map(|(worker, reused)| (worker, reused, false));
             return dispatch_result(
                 result,
                 "team_audit_dispatch",
@@ -3631,6 +3836,7 @@ impl TeamRuntime {
             read_back,
         })
         .await
+        .map(|(worker, reused, _)| (worker, reused))
     }
 
     /// Plan-free dispatch, kept for tests that exercise worker lifecycle only.
@@ -3664,7 +3870,7 @@ impl TeamRuntime {
             read_back: false,
         })
         .await
-        .map(|(worker, _)| worker)
+        .map(|(worker, _, _)| worker)
     }
 
     #[cfg(test)]
@@ -3688,16 +3894,20 @@ impl TeamRuntime {
             read_back: false,
         })
         .await
-        .map(|(worker, _)| worker)
+        .map(|(worker, _, _)| worker)
     }
 
+    /// The one dispatch entry point. The returned triple is the worker, the
+    /// idempotent-reuse flag, and whether a deferred classification is
+    /// running in the background (plan c74b1987) — the dispatch answer
+    /// reports that instead of a label that has not landed yet.
     async fn dispatch_request(
         &self,
         request: DispatchRequest,
-    ) -> Result<(WorkerRecord, bool), String> {
+    ) -> Result<(WorkerRecord, bool, bool), String> {
         let routed = self.prepare_dispatch_routing(&request).await?;
         let result = self.dispatch_locked(request, routed).await;
-        if matches!(result, Ok((_, false))) {
+        if matches!(result, Ok((_, false, _))) {
             self.signal_board_changed();
         }
         result
@@ -3739,7 +3949,7 @@ impl TeamRuntime {
         &self,
         request: DispatchRequest,
         routed: Option<RoutedDispatch>,
-    ) -> Result<(WorkerRecord, bool), String> {
+    ) -> Result<(WorkerRecord, bool, bool), String> {
         let DispatchRequest {
             brief,
             tier,
@@ -3830,9 +4040,9 @@ impl TeamRuntime {
                     return self
                         .start_worker(existing)
                         .await
-                        .map(|worker| (worker, true));
+                        .map(|worker| (worker, true, false));
                 }
-                return Ok((existing, true));
+                return Ok((existing, true, false));
             }
         }
         // The plan board refuses before any record, branch, or worktree exists.
@@ -3858,7 +4068,7 @@ impl TeamRuntime {
             }
             None => None,
         };
-        let (model, reasoning_effort, tier, routing, routing_rows, routing_error) =
+        let (model, reasoning_effort, tier, routing, routing_rows, routing_error, routing_pending) =
             if dispatch_routing {
                 let routed = routed
                     .ok_or_else(|| "dispatch routing was not prepared".to_string())?;
@@ -3869,9 +4079,10 @@ impl TeamRuntime {
                     routed.routing,
                     routed.rows,
                     routed.error,
+                    routed.pending,
                 )
             } else {
-                (model, reasoning_effort, tier, None, Vec::new(), None)
+                (model, reasoning_effort, tier, None, Vec::new(), None, None)
             };
         if let Some(error) = routing_error {
             for row in &routing_rows {
@@ -3915,6 +4126,7 @@ impl TeamRuntime {
         // Provisioning leaves the worker stopped; the read-back flag lands on
         // the stored record before its session starts, so the opening kickoff
         // matches the record the session was started from.
+        let mut pending_spawned = false;
         let result = match provisioned {
             Ok(record) => {
                 for mut row in routing_rows {
@@ -3927,6 +4139,13 @@ impl TeamRuntime {
                     worker.routing = routing_for_record;
                 })
                 .await;
+                // The classification an explicit-choice dispatch deferred:
+                // spawned now that the worker id exists, never blocking the
+                // dispatch that has already returned without it.
+                if let Some(pending) = routing_pending {
+                    self.spawn_pending_classification(pending, record.id.clone());
+                    pending_spawned = true;
+                }
                 self.start_worker(WorkerRecord {
                     read_back,
                     routing,
@@ -3953,7 +4172,7 @@ impl TeamRuntime {
                 }
             }
         }
-        result.map(|worker| (worker, false))
+        result.map(|worker| (worker, false, pending_spawned))
     }
 
     /// Dispatch one fresh read-only independent audit of an implementation
@@ -9233,17 +9452,109 @@ fn worker_result(result: Result<WorkerRecord, String>, action: &str) -> ToolResu
     }
 }
 
+/// The training-corpus `Route` row for one dispatch classification: the
+/// single construction shared by the inline path and the deferred
+/// explicit-choice classification, so both write identical rows.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_route_row(
+    ts: u64,
+    worker_id: &str,
+    plan_id: &str,
+    step: usize,
+    mode: RoutingMode,
+    decision: Option<&DispatchRoutingDecision>,
+    skip: Option<&str>,
+    laya_tier: Option<&str>,
+    cleared: bool,
+    lead_tier: Option<&str>,
+    ran_tier: Option<&str>,
+    ran_model: Option<&str>,
+    text: &str,
+    enabled: EnabledTiers,
+    settings: &RoutingSettings,
+) -> DispatchRoutingRow {
+    use sha2::Digest as _;
+    let text_sha256 = sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    DispatchRoutingRow::Route {
+        ts,
+        worker_id: worker_id.to_string(),
+        plan_id: plan_id.to_string(),
+        step,
+        mode,
+        text_sha256,
+        label: decision
+            .map(|decision| decision.label.clone())
+            .unwrap_or_default(),
+        confidence: decision.map_or(0.0, |decision| decision.confidence),
+        probabilities: decision
+            .map(|decision| decision.probabilities.clone())
+            .unwrap_or_default(),
+        tier: laya_tier.map(str::to_string),
+        threshold: decision.map_or_else(
+            || threshold_for(enabled.offered().count(), settings),
+            |decision| {
+                if decision.source == "knn" {
+                    settings.knn_min_share
+                } else {
+                    threshold_for(enabled.offered().count(), settings)
+                }
+            },
+        ),
+        cleared,
+        lead_tier: lead_tier.map(str::to_string),
+        ran_tier: ran_tier.map(str::to_string),
+        ran_model: ran_model.map(str::to_string),
+        text: text.to_string(),
+        skip: skip.map(str::to_string),
+        source: decision.map(|decision| decision.source.to_string()),
+        knn_label: decision.and_then(|decision| decision.knn_label.clone()),
+        knn_share: decision.and_then(|decision| decision.knn_share),
+        knn_k: decision.and_then(|decision| decision.knn_k),
+    }
+}
+
+/// The `LeadOverride` corpus row an explicit choice logs when it overrode a
+/// tier Laya cleared: shared by the inline path and the deferred
+/// classification so both write identical rows. `lead_tier` is the tier
+/// the choice resolved to (`custom` when it has none) and
+/// `requested_tier` the tier the lead asked for when that differs.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_lead_override_row(
+    ts: u64,
+    worker_id: &str,
+    plan_id: &str,
+    step: usize,
+    laya_tier: &str,
+    lead_tier: Option<&str>,
+    requested_tier: Option<&str>,
+    confidence: f64,
+) -> DispatchRoutingRow {
+    DispatchRoutingRow::LeadOverride {
+        ts,
+        worker_id: worker_id.to_string(),
+        plan_id: plan_id.to_string(),
+        step,
+        laya_tier: Some(laya_tier.to_string()),
+        lead_tier: lead_tier.unwrap_or("custom").to_string(),
+        requested_tier: requested_tier.map(str::to_string),
+        confidence,
+    }
+}
+
 /// A dispatch answer: the compact worker entry next to the idempotent-reuse
 /// flag. `data` keeps the whole record, as the single-worker answers do.
 fn dispatch_result(
-    result: Result<(WorkerRecord, bool), String>,
+    result: Result<(WorkerRecord, bool, bool), String>,
     action: &str,
     mode: RoutingMode,
     fold_request: Option<String>,
     explicit_model: bool,
 ) -> ToolResult {
     match result {
-        Ok((worker, reused)) => {
+        Ok((worker, reused, laya_pending)) => {
             let routing = worker.routing.as_ref();
             let requested = if explicit_model {
                 None
@@ -9280,7 +9591,7 @@ fn dispatch_result(
             }))
             .unwrap_or_else(|_| action.to_string());
             let mut lines = Vec::new();
-            if let Some(line) = dispatch_routing_line(mode, routing) {
+            if let Some(line) = dispatch_routing_line(mode, routing, laya_pending) {
                 lines.push(line);
             }
             if let Some(note) = &routing_note {
@@ -9300,10 +9611,23 @@ fn dispatch_result(
     }
 }
 
-fn dispatch_routing_line(mode: RoutingMode, routing: Option<&WorkerRouting>) -> Option<String> {
+fn dispatch_routing_line(
+    mode: RoutingMode,
+    routing: Option<&WorkerRouting>,
+    laya_pending: bool,
+) -> Option<String> {
     let routing = routing?;
     if mode == RoutingMode::Off {
         return None;
+    }
+    // An explicit-choice dispatch returns before its classification lands
+    // (plan c74b1987): say so instead of misreporting the still-null label
+    // as an offline classifier.
+    if laya_pending {
+        return Some(
+            "Laya: classifying in the background; the label will land on the routing record."
+                .to_string(),
+        );
     }
     // The dispatch-time ran tier (audit finding M1): a later manual reroute
     // may have moved the worker to another tier, but what the dispatch ran
@@ -12285,7 +12609,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         existing.brief = "BRIEF-91x".to_string();
         let team = open_test_team(root.path(), state.path(), vec![existing.clone()]).await;
 
-        let (reused, fresh) = team
+        let (reused, fresh, _) = team
             .dispatch_request(DispatchRequest {
                 brief: "BRIEF-91x".to_string(),
                 tier: None,
@@ -12998,6 +13322,32 @@ models = [\"scripted-a\", \"scripted-b\"]
         panic!("the polled condition never became true");
     }
 
+    /// Wait until the deferred classification of an explicit-choice dispatch
+    /// has written its `Route` row — the sync point for every assertion
+    /// about an async dispatch's corpus and record (plan c74b1987).
+    async fn wait_route_row(fixture: &RoutingFixture) -> DispatchRoutingRow {
+        eventually(|| async {
+            fixture
+                .rows()
+                .into_iter()
+                .find(|row| matches!(row, DispatchRoutingRow::Route { .. }))
+        })
+        .await
+    }
+
+    /// Wait until the deferred label has landed on the worker's routing
+    /// block, then return the block.
+    async fn wait_laya_label(team: &TeamRuntime, worker_id: &str) -> WorkerRouting {
+        eventually(|| async {
+            team.worker(worker_id)
+                .await
+                .expect("worker")
+                .routing
+                .filter(|routing| routing.confidence.is_some())
+        })
+        .await
+    }
+
     /// A scripted LLM client (the team module's scripted-mock seam): every
     /// `complete` serves the next scripted batch, then a plain text stop —
     /// so a dispatched worker runs real turns, executes real tool calls,
@@ -13396,11 +13746,21 @@ models = [\"scripted-a\", \"scripted-b\"]
             .to_string()
     }
 
+    /// The session's consecutive-failing-batch cap — `MAX_RETRIES` in
+    /// src/agent/mod.rs, raised 3 → 5 by plan 865249fd. It is `pub(crate)`
+    /// in the mnemo crate, so not reachable from src-tauri; mirrored here
+    /// for the tests that script a worker into the doom-guard failure.
+    /// Keep in sync with src/agent/mod.rs.
+    const TEST_MAX_RETRIES: usize = 5;
+
     /// Three failing tool calls in a row nudge the lead once — and only
-    /// once, even when the streak keeps failing (design §4.6).
+    /// once, even when the streak keeps failing (design §4.6). The nudge
+    /// fires at Laya's strike limit (3); the worker itself now runs on to
+    /// the doom-guard cap (TEST_MAX_RETRIES, plan 865249fd) before it
+    /// lands Failed.
     #[tokio::test]
     async fn three_failing_tool_calls_nudge_once() {
-        let responses = (1..=3)
+        let responses = (1..=TEST_MAX_RETRIES)
             .map(|attempt| tool_call_batch(&format!("call-{attempt}"), "not_a_real_tool", &format!("{{\"attempt\":{attempt}}}")))
             .chain([vec![
                 mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
@@ -13410,6 +13770,8 @@ models = [\"scripted-a\", \"scripted-b\"]
         let (fixture, mut notices) = nudge_fixture(responses).await;
         let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
+        // The deferred Route row lands before the nudge and outcome rows.
+        wait_route_row(&fixture).await;
         let row = eventually(|| async {
             fixture
                 .rows()
@@ -13457,10 +13819,11 @@ models = [\"scripted-a\", \"scripted-b\"]
             Some("high"),
             "the nudge is marked on the record: {settled:?}"
         );
-        // Three consecutive real failures also trip the session's own
-        // doom guard, so the worker lands Failed — exactly when the nudge
-        // telling the lead to resume on a stronger tier is useful. The
-        // nudge never stopped or switched anything itself.
+        // TEST_MAX_RETRIES consecutive real failures also trip the
+        // session's own doom guard, so the worker lands Failed — after the
+        // nudge (at the 3rd strike) has already told the lead to resume on
+        // a stronger tier. The nudge never stopped or switched anything
+        // itself.
         assert!(
             matches!(settled.status, WorkerStatus::Failed),
             "the doom guard, not the nudge, failed the worker: {settled:?}"
@@ -13482,17 +13845,23 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
         // A failure is resumable, not terminal: the doom-guard failure
         // logs the outcome but never nudge_ignored — a team_resume on a
-        // stronger tier can still take the nudge.
+        // stronger tier can still take the nudge. The dispatch's Route row
+        // lands in the background (plan c74b1987), so the three rows are
+        // asserted as a set, not an order.
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 3, "the route, the nudge, and the outcome rows: {rows:?}");
         assert!(
-            matches!(
-                fixture.rows().as_slice(),
-                [DispatchRoutingRow::Route { .. },
-                 DispatchRoutingRow::Nudge { .. },
-                 DispatchRoutingRow::Outcome { status, .. }]
-                    if status == "failed"
-            ),
-            "the route, the nudge, and the outcome rows: {:?}",
-            fixture.rows()
+            rows.iter().any(|row| matches!(row, DispatchRoutingRow::Route { .. })),
+            "the deferred route row landed: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| matches!(row, DispatchRoutingRow::Nudge { .. })),
+            "the strike nudge row: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, DispatchRoutingRow::Outcome { status, .. } if status == "failed")),
+            "the failed outcome row: {rows:?}"
         );
         fixture.team.shutdown().await;
     }
@@ -13616,7 +13985,9 @@ models = [\"scripted-a\", \"scripted-b\"]
     /// running", clears the error, and keeps the failing streak readable.
     #[tokio::test]
     async fn resume_makes_a_failed_worker_with_a_live_session_idle() {
-        let responses = (1..=3)
+        // TEST_MAX_RETRIES failing calls trip the session's doom guard
+        // (raised 3 → 5); only the last TOOL_ERRORS_KEPT errors are kept.
+        let responses = (1..=TEST_MAX_RETRIES)
             .map(|attempt| {
                 tool_call_batch(
                     &format!("call-{attempt}"),
@@ -13684,7 +14055,9 @@ models = [\"scripted-a\", \"scripted-b\"]
     /// cleared from the record.
     #[tokio::test]
     async fn a_message_clears_a_failed_workers_error() {
-        let responses = (1..=3)
+        // TEST_MAX_RETRIES failing calls trip the session's doom guard
+        // (raised 3 → 5), which is what lands the worker Failed.
+        let responses = (1..=TEST_MAX_RETRIES)
             .map(|attempt| {
                 tool_call_batch(
                     &format!("call-{attempt}"),
@@ -13716,7 +14089,7 @@ models = [\"scripted-a\", \"scripted-b\"]
     /// `team_resume` on a stronger tier can still take the nudge.
     #[tokio::test]
     async fn failed_worker_does_not_log_nudge_ignored() {
-        let responses = (1..=3)
+        let responses = (1..=TEST_MAX_RETRIES)
             .map(|attempt| {
                 tool_call_batch(
                     &format!("call-{attempt}"),
@@ -13764,7 +14137,7 @@ models = [\"scripted-a\", \"scripted-b\"]
     /// there, once — a repeated stop writes nothing more.
     #[tokio::test]
     async fn stopped_after_failure_logs_nudge_ignored_once() {
-        let responses = (1..=3)
+        let responses = (1..=TEST_MAX_RETRIES)
             .map(|attempt| {
                 tool_call_batch(
                     &format!("call-{attempt}"),
@@ -13831,6 +14204,73 @@ models = [\"scripted-a\", \"scripted-b\"]
                 .count(),
             1,
             "nudge_ignored logs once: {:?}",
+            fixture.rows()
+        );
+        fixture.team.shutdown().await;
+    }
+
+    /// Plan 865249fd: the strike nudge to the lead still fires at the 3rd
+    /// failing call (Laya's limit stays 3), but the raised doom-guard cap
+    /// (TEST_MAX_RETRIES) lets the worker keep running — 3 failures then a
+    /// success finishes the turn normally instead of landing Failed.
+    #[tokio::test]
+    async fn a_worker_still_runs_after_the_strike_nudge_until_the_fifth_error() {
+        let responses = (1..=3)
+            .map(|attempt| {
+                tool_call_batch(
+                    &format!("call-{attempt}"),
+                    "not_a_real_tool",
+                    &format!("{{\"attempt\":{attempt}}}"),
+                )
+            })
+            .chain([tool_call_batch(
+                "call-ok",
+                "read_files",
+                "{\"files\":[\"README.md\"]}",
+            )])
+            .chain([vec![
+                mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
+                mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
+            ]])
+            .collect::<Vec<_>>();
+        let (fixture, _notices) = nudge_fixture(responses).await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        wait_route_row(&fixture).await;
+        // The stuck-worker nudge row logged at the 3rd failure, as before.
+        let row = eventually(|| async {
+            fixture
+                .rows()
+                .into_iter()
+                .find(|row| matches!(row, DispatchRoutingRow::Nudge { .. }))
+        })
+        .await;
+        assert!(
+            matches!(
+                &row,
+                DispatchRoutingRow::Nudge {
+                    reason,
+                    detail,
+                    ..
+                } if reason == "strikes"
+                    && detail == "looks stuck (3 failing tool calls in a row)"
+            ),
+            "the strike nudge row: {row:?}"
+        );
+        // ...but the worker kept running past the nudge and finished
+        // normally on the successful 4th batch — not Failed.
+        let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+        assert!(
+            matches!(settled.status, WorkerStatus::Completed),
+            "3 failures no longer fail the worker — it runs on to the \
+             success: {settled:?}"
+        );
+        assert!(
+            fixture
+                .rows()
+                .iter()
+                .all(|row| !matches!(row, DispatchRoutingRow::Outcome { status, .. } if status == "failed")),
+            "no failed outcome row: {:?}",
             fixture.rows()
         );
         fixture.team.shutdown().await;
@@ -14011,7 +14451,7 @@ models = [\"scripted-a\", \"scripted-b\"]
                 ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
             },
             routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
             vec![vec![
                 mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
                 mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
@@ -14020,6 +14460,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         .await;
         let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
+        // The dispatch's deferred classification holds the permit for the
+        // stub's delay; the drift classification below waits for it and
+        // still fits its own 3-second budget (1 s permit wait + 1 s ask).
         wait_worker_settled(&fixture.team, "routingworker").await;
         let started = std::time::Instant::now();
         fixture
@@ -14440,10 +14883,14 @@ models = [\"scripted-a\", \"scripted-b\"]
         .await;
         let result = fixture.dispatch(Some("routine"), None).await;
         assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("Laya would pick routine (0.62)."));
+        // The explicit choice never waits on the classification: the label
+        // is deferred, not offline.
+        assert!(result.output.contains(
+            "Laya: classifying in the background; the label will land on the routing record."
+        ));
         let worker = fixture.team.worker("routingworker").await.expect("worker");
         assert_eq!(worker.tier.as_deref(), Some("routine"));
-        let routing = worker.routing.expect("routing metadata");
+        let routing = wait_laya_label(&fixture.team, "routingworker").await;
         assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
         assert_eq!(routing.lead_tier.as_deref(), Some("routine"));
         assert_eq!(routing.routed_by, "lead");
@@ -14473,9 +14920,12 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .await;
         assert!(fixture.dispatch(Some("routine"), None).await.success);
+        let rows = eventually(|| async {
+            let rows = fixture.rows();
+            (rows.len() == 2).then_some(rows)
+        })
+        .await;
         assert_eq!(fixture.classifier.calls(), 1);
-        let rows = fixture.rows();
-        assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(matches!(
             &rows[1],
             crate::mnemo2::dispatch_routing::DispatchRoutingRow::LeadOverride {
@@ -14484,16 +14934,11 @@ models = [\"scripted-a\", \"scripted-b\"]
                 ..
             } if laya == "high" && lead_tier == "routine"
         ));
+        // `routed_by` resolves at dispatch time (plan c74b1987): the record
+        // keeps "lead" even though the corpus logged the override.
         assert_eq!(
-            fixture
-                .team
-                .worker("routingworker")
-                .await
-                .expect("worker")
-                .routing
-                .expect("routing")
-                .routed_by,
-            "lead_override"
+            wait_laya_label(&fixture.team, "routingworker").await.routed_by,
+            "lead"
         );
         fixture.team.shutdown().await;
     }
@@ -14597,8 +15042,17 @@ models = [\"scripted-a\", \"scripted-b\"]
         let worker = fixture.team.worker("routingworker").await.expect("worker");
         assert_eq!(worker.model.as_deref(), Some("test/scripted-simple"));
         assert_eq!(worker.tier.as_deref(), Some("trivial"));
-        assert_eq!(worker.routing.expect("routing").routed_by, "lead_override");
-        assert_eq!(fixture.rows().len(), 2);
+        // `routed_by` resolves at dispatch time (plan c74b1987): the override
+        // is corpus-only, the record keeps "lead".
+        assert_eq!(
+            wait_laya_label(&fixture.team, "routingworker").await.routed_by,
+            "lead"
+        );
+        eventually(|| async {
+            let rows = fixture.rows();
+            (rows.len() == 2).then_some(rows)
+        })
+        .await;
         fixture.team.shutdown().await;
     }
 
@@ -14631,6 +15085,104 @@ models = [\"scripted-a\", \"scripted-b\"]
         fixture.team.shutdown().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn explicit_choice_dispatch_never_waits_for_the_classification() {
+        let fixture = routing_fixture_with(
+            crate::mnemo2::dispatch_routing::RoutingSettings {
+                mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+                ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+            },
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let result = fixture.dispatch(Some("routine"), None).await;
+        let elapsed = started.elapsed();
+        assert!(result.success, "{}", result.output);
+        // The worker starts while the never-resolving classifier is still
+        // pending: no 3-second wait — virtual time has not moved at all.
+        assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        let routing = worker.routing.expect("routing");
+        assert_eq!(routing.routed_by, "lead");
+        assert_eq!(routing.laya_tier, None);
+        assert_eq!(routing.confidence, None);
+        assert!(!routing.cleared);
+        // The background classification still runs — under the same
+        // 3-second timeout, so its Route row lands as an offline skip once
+        // the never-resolving classifier times out.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(matches!(
+            fixture.rows().as_slice(),
+            [crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
+                skip: Some(reason),
+                ..
+            }] if reason == "offline"
+        ));
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deferred_label_lands_on_the_record_and_the_ledger() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        // The deferred label lands on the routing record...
+        let routing = wait_laya_label(&fixture.team, "routingworker").await;
+        assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
+        assert_eq!(routing.confidence, Some(0.62));
+        assert!(routing.cleared);
+        assert_eq!(routing.routed_by, "lead");
+        // ...and the ledger effort row records Laya's say next to the
+        // lead's routed_by.
+        fixture
+            .team
+            .stop("routingworker")
+            .await
+            .expect("stop the worker");
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        let review = crate::mnemo2::ledger::plan_review(
+            &[worker],
+            &fixture.plan_id,
+            "Ship the routing plan",
+        );
+        let report = match review {
+            mnemo::app::team_ledger::PlanReview::Ready { report } => report,
+            other => panic!("the stopped worker closes the plan: {other:?}"),
+        };
+        assert!(report.contains("routine 0.62"), "{report}");
+        assert!(report.contains("| lead |"), "{report}");
+        fixture.team.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deferred_classification_honors_the_permit() {
+        let fixture = routing_fixture(
+            crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.62),
+            true,
+        )
+        .await;
+        // The permit is held elsewhere: the dispatch still returns at once,
+        // and the background classification waits for the same permit
+        // before it asks Laya.
+        let _permit = fixture.team.routing_permit.acquire().await.expect("permit");
+        let result = fixture.dispatch(Some("routine"), None).await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fixture.classifier.calls(), 0);
+        drop(_permit);
+        wait_route_row(&fixture).await;
+        assert_eq!(fixture.classifier.calls(), 1);
+        fixture.team.shutdown().await;
+    }
+
     #[tokio::test]
     async fn redispatch_does_not_classify_twice() {
         let fixture = routing_fixture(
@@ -14643,16 +15195,14 @@ models = [\"scripted-a\", \"scripted-b\"]
         let reused = fixture.dispatch(Some("routine"), None).await;
         assert!(reused.success, "{}", reused.output);
         assert!(reused.output.contains("\"reused\":true"));
+        // Only the first dispatch classifies — in the background; the reuse
+        // drops its deferred classification entirely.
+        wait_route_row(&fixture).await;
         assert_eq!(fixture.classifier.calls(), 1);
         assert_eq!(fixture.rows().len(), 1);
         assert_eq!(
-            fixture
-                .team
-                .worker("routingworker")
+            wait_laya_label(&fixture.team, "routingworker")
                 .await
-                .expect("worker")
-                .routing
-                .expect("stored routing")
                 .confidence,
             Some(0.62)
         );
@@ -14668,6 +15218,8 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .await;
         assert!(fixture.dispatch(Some("routine"), None).await.success);
+        // The deferred Route row lands before the reroute rows below.
+        wait_route_row(&fixture).await;
         // A pending nudge travels with the reroute row and leaves the record.
         fixture
             .team
@@ -14729,6 +15281,8 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .await;
         assert!(fixture.dispatch(Some("routine"), None).await.success);
+        // The deferred Route row lands before the reroute rows below.
+        wait_route_row(&fixture).await;
         let resumed = fixture
             .team
             .handle_lead_host_tool(
@@ -14786,6 +15340,8 @@ models = [\"scripted-a\", \"scripted-b\"]
             Vec::new(),
         );
         assert!(fixture.dispatch(Some("routine"), None).await.success);
+        // The deferred Route row lands before the reroute rows below.
+        wait_route_row(&fixture).await;
         fixture
             .team
             .change_model(
@@ -14951,10 +15507,15 @@ models = [\"scripted-a\", \"scripted-b\"]
             matches!(worker.status, WorkerStatus::Failed),
             "{worker:?}"
         );
-        // Failed-and-stopped is terminal (design §4.7): the dispatch's route
-        // row is followed by one outcome row, and no label — the worker never
-        // merged.
-        let rows = fixture.rows();
+        // Failed-and-stopped is terminal (design §4.7): the dispatch's
+        // deferred route row is followed by one outcome row, and no label —
+        // the worker never merged.
+        wait_route_row(&fixture).await;
+        let rows = eventually(|| async {
+            let rows = fixture.rows();
+            matches!(rows.last(), Some(DispatchRoutingRow::Outcome { .. })).then_some(rows)
+        })
+        .await;
         assert!(
             matches!(
                 rows.last(),
@@ -14980,16 +15541,21 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .await;
         // Laya clears difficult, the lead passes average: an override that
-        // runs average.
+        // runs average — deferred, so the dispatch answers before the label.
         let first = fixture.dispatch(Some("routine"), None).await;
         assert!(first.success, "{}", first.output);
         assert!(
-            first
-                .output
-                .contains("you chose routine; logged as an override."),
+            first.output.contains(
+                "Laya: classifying in the background; the label will land on the routing record."
+            ),
             "{}",
             first.output
         );
+        // The label lands: Laya cleared difficult while the lead chose
+        // average — an override in the corpus, `lead` on the record.
+        let routing = wait_laya_label(&fixture.team, "routingworker").await;
+        assert_eq!(routing.laya_tier.as_deref(), Some("high"));
+        assert_eq!(routing.routed_by, "lead");
         // The worker's tier changes afterwards, on the same model: the
         // record's mutable tier now reads 'difficult' while the dispatch ran
         // average. (A switch that also moved the model is refused by the
@@ -15005,9 +15571,7 @@ models = [\"scripted-a\", \"scripted-b\"]
         let reused = fixture.dispatch(Some("routine"), None).await;
         assert!(reused.success, "{}", reused.output);
         assert!(
-            reused
-                .output
-                .contains("you chose routine; logged as an override."),
+            reused.output.contains("Laya would pick high (0.91)."),
             "the reused dispatch keeps the dispatch-time tier: {}",
             reused.output
         );
@@ -15216,6 +15780,8 @@ models = [\"scripted-a\", \"scripted-b\"]
         )
         .await;
         assert!(fixture.dispatch(Some("routine"), None).await.success);
+        // The deferred Route row lands before the reroute row below.
+        wait_route_row(&fixture).await;
         // Routing is switched off after the worker was routed: the worker's
         // own decision still makes it calibration data.
         *fixture.team.routing.write().unwrap_or_else(|e| e.into_inner()) =
@@ -15395,9 +15961,21 @@ models = [\"scripted-a\", \"scripted-b\"]
             .await,
         );
         let merge_guard = fixture.team.merge_lock.lock().await;
-        let dispatch_fixture = std::sync::Arc::clone(&fixture);
+        let dispatch_team = std::sync::Arc::clone(&fixture.team);
+        let plan_id = fixture.plan_id.clone();
         let dispatch = tokio::spawn(async move {
-            dispatch_fixture.dispatch(Some("routine"), None).await
+            dispatch_team
+                .dispatch_on_plan(
+                    "Implement the requested routing behavior and verify it with focused regression tests".into(),
+                    None,
+                    None,
+                    Some("routingworker".into()),
+                    None,
+                    false,
+                    &plan_id,
+                    1,
+                )
+                .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while fixture.classifier.calls() == 0 {
@@ -15409,7 +15987,8 @@ models = [\"scripted-a\", \"scripted-b\"]
         assert!(!dispatch.is_finished(), "dispatch still waits for merge_lock");
         drop(merge_guard);
         let result = dispatch.await.expect("dispatch task");
-        assert!(result.success, "{}", result.output);
+        let (worker, _) = result.expect("the non-explicit IPC dispatch succeeds");
+        assert_eq!(worker.id, "routingworker");
         fixture.team.shutdown().await;
     }
 
@@ -15557,7 +16136,10 @@ models = [\"scripted-a\", \"scripted-b\"]
         );
         assert!(first.success, "{}", first.output);
         assert!(second.success, "{}", second.output);
-        assert_eq!(fixture.classifier.calls(), 2);
+        // Only the provisioning dispatch classifies — in the background;
+        // the idempotent reuse drops its deferred classification.
+        wait_route_row(&fixture).await;
+        assert_eq!(fixture.classifier.calls(), 1);
         assert_eq!(fixture.rows().len(), 1, "exactly one Route row is committed");
         fixture.team.shutdown().await;
     }
@@ -15579,7 +16161,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         let result = fixture.dispatch(Some("routine"), None).await;
         assert!(!result.success);
         assert_eq!(result.output, "all 0 worker slots are busy");
-        assert_eq!(fixture.classifier.calls(), 1);
+        // The deferred classification is dropped: no worker was provisioned,
+        // so nothing classifies and no row is written.
+        assert_eq!(fixture.classifier.calls(), 0);
         assert!(!fixture.log_path().exists());
         fixture.team.shutdown().await;
     }
@@ -15598,7 +16182,9 @@ models = [\"scripted-a\", \"scripted-b\"]
         let result = fixture.dispatch(Some("routine"), None).await;
         assert!(!result.success);
         assert!(result.output.contains("not a usable Git checkout"));
-        assert_eq!(fixture.classifier.calls(), 1);
+        // The deferred classification is dropped: provisioning failed, so
+        // nothing classifies and no row is written.
+        assert_eq!(fixture.classifier.calls(), 0);
         assert!(!fixture.log_path().exists());
         std::fs::rename(parked, git).expect("restore git metadata");
         fixture.team.shutdown().await;
@@ -15617,7 +16203,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             nudged: None,
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), false).as_deref(),
             Some("Laya: high (0.71) — you chose routine; logged as an override.")
         );
         // The dispatch-time ran tier decides the override line (audit finding
@@ -15627,7 +16213,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), false).as_deref(),
             Some(
                 "Laya: high (0.71) — you ran high (requested routine); logged as an override."
             )
@@ -15640,21 +16226,21 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), false).as_deref(),
             Some("Laya would pick routine (0.62).")
         );
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Suggest, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Suggest, Some(&routing), false).as_deref(),
             Some("Laya: routine (0.62) — matches your tier.")
         );
-        assert_eq!(dispatch_routing_line(RoutingMode::Off, Some(&routing)), None);
+        assert_eq!(dispatch_routing_line(RoutingMode::Off, Some(&routing), false), None);
         let routing = WorkerRouting {
             routed_by: "laya".into(),
             lead_tier: None,
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing), false).as_deref(),
             Some("Laya: routed to routine (0.62).")
         );
         let routing = WorkerRouting {
@@ -15665,7 +16251,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Auto, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Auto, Some(&routing), false).as_deref(),
             Some("Laya: unsure (0.39).")
         );
         let routing = WorkerRouting {
@@ -15674,9 +16260,18 @@ models = [\"scripted-a\", \"scripted-b\"]
             ..routing
         };
         assert_eq!(
-            dispatch_routing_line(RoutingMode::Shadow, Some(&routing)).as_deref(),
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), false).as_deref(),
             Some("Laya: offline.")
         );
+        // A deferred classification (plan c74b1987) is pending, not offline —
+        // and Off never prints a routing line, pending or not.
+        assert_eq!(
+            dispatch_routing_line(RoutingMode::Shadow, Some(&routing), true).as_deref(),
+            Some(
+                "Laya: classifying in the background; the label will land on the routing record."
+            )
+        );
+        assert_eq!(dispatch_routing_line(RoutingMode::Off, Some(&routing), true), None);
     }
 
     #[tokio::test]
@@ -15769,7 +16364,7 @@ models = [\"scripted-a\", \"scripted-b\"]
             true,
         )
         .await;
-        let (worker, reused) = fixture
+        let (_, reused) = fixture
             .team
             .dispatch_on_plan(
                 "Implement the IPC-dispatched step and run its regression tests".into(),
@@ -15784,9 +16379,11 @@ models = [\"scripted-a\", \"scripted-b\"]
             .await
             .expect("IPC dispatch");
         assert!(!reused);
+        // The explicit model choice defers the classification: the label
+        // and its Route row land in the background.
+        let routing = wait_laya_label(&fixture.team, "ipcworker").await;
         assert_eq!(fixture.classifier.calls(), 1);
         assert_eq!(fixture.rows().len(), 1);
-        let routing = worker.routing.expect("IPC worker routing");
         assert_eq!(routing.laya_tier.as_deref(), Some("routine"));
         assert_eq!(routing.lead_tier.as_deref(), Some("routine"));
         assert_eq!(routing.routed_by, "lead");
@@ -16040,19 +16637,26 @@ models = [\"scripted-a\", \"scripted-b\"]
             let model = format!("test/scripted-{ran}");
             let result = fixture.dispatch(Some(requested), Some(&model)).await;
             assert!(result.success, "{requested} -> {ran}: {}", result.output);
-            assert!(result.output.contains(&format!(
-                "Laya: {requested} (0.91) — you ran {ran} (requested {requested}); logged as an override."
-            )));
+            // The explicit choice defers the classification: the dispatch
+            // answers before the label lands.
+            assert!(result.output.contains(
+                "Laya: classifying in the background; the label will land on the routing record."
+            ));
             let worker = fixture.team.worker("routingworker").await.expect("worker");
             assert_eq!(worker.tier.as_deref(), Some(ran));
             assert_eq!(worker.model.as_deref(), Some(model.as_str()));
             assert_eq!(worker.reasoning_effort.as_deref(), Some(expected_effort));
-            let routing = worker.routing.expect("routing");
+            let routing = wait_laya_label(&fixture.team, "routingworker").await;
             assert_eq!(routing.lead_tier.as_deref(), Some(requested));
             assert_eq!(routing.laya_tier.as_deref(), Some(requested));
-            assert_eq!(routing.routed_by, "lead_override");
-            let rows = fixture.rows();
-            assert_eq!(rows.len(), 2);
+            // `routed_by` resolves at dispatch time (plan c74b1987): the
+            // override is corpus-only, the record keeps "lead".
+            assert_eq!(routing.routed_by, "lead");
+            let rows = eventually(|| async {
+                let rows = fixture.rows();
+                (rows.len() == 2).then_some(rows)
+            })
+            .await;
             assert!(matches!(
                 &rows[0],
                 crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route {
@@ -16119,9 +16723,14 @@ models = [\"scripted-a\", \"scripted-b\"]
             .await
             .expect("auto-id IPC dispatch");
         assert!(!reused);
+        // The explicit model choice defers the classification: the Route
+        // row lands in the background, stamped with the real worker id.
+        let rows = eventually(|| async {
+            let rows = fixture.rows();
+            (rows.len() == 1).then_some(rows)
+        })
+        .await;
         assert_eq!(fixture.classifier.calls(), 1);
-        let rows = fixture.rows();
-        assert_eq!(rows.len(), 1);
         assert!(matches!(
             &rows[0],
             crate::mnemo2::dispatch_routing::DispatchRoutingRow::Route { worker_id, .. }

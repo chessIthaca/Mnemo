@@ -86,10 +86,26 @@ pub use loop_impl::{drop_cancelled_steers, AgentLoop, AgentLoopConfig, StopReaso
 /// batch without a failure (but with at least one success) so a long turn
 /// with occasional failures doesn't accumulate to the cap unfairly.
 ///
+/// Before the cap cuts the turn off, the harness first nudges the model to
+/// change approach: when the streak first reaches [`TOOL_ERROR_NUDGE_AT`]
+/// one corrective nudge message is pushed (see `turn::tool_error_nudge`),
+/// so a model that is still exploring gets a chance to recover instead of
+/// being killed mid-flight (plan 865249fd — the old cap of 3 killed live
+/// background workers that were still exploring).
+///
 /// This does NOT count LLM-produced malformed tool-call arguments (bad JSON) —
 /// those are a transient output issue the model can recover from by emitting
 /// valid JSON, so they use the separate, higher [`MAX_BAD_JSON_RETRIES`] cap.
-pub(crate) const MAX_RETRIES: u32 = 3;
+pub(crate) const MAX_RETRIES: u32 = 5;
+
+/// The consecutive failing-batch count at which the harness pushes ONE
+/// corrective nudge message (plan 865249fd): when `tool_error_count` first
+/// reaches this value, `turn::tool_error_nudge` appends a user-role tail
+/// message telling the model to read the error text and change approach —
+/// once per error streak (the streak resets on a clean successful batch, so
+/// a later streak nudges again). Strictly below [`MAX_RETRIES`], so the
+/// model gets repair chances after the nudge before the turn is aborted.
+pub(crate) const TOOL_ERROR_NUDGE_AT: u32 = 2;
 
 /// Maximum consecutive `write_review_report` failures before aborting the
 /// turn (backlog 5b46674d). Distinct from [`MAX_RETRIES`]: this counter is

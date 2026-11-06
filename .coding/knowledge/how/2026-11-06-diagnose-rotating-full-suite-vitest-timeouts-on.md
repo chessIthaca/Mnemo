@@ -1,0 +1,6 @@
++++
+title = "diagnose rotating full-suite vitest timeouts on this machine (background load, not defects)"
+created = "2026-11-06"
++++
+
+The dev machine runs heavy background processes (CurseForge, Steam, python batch jobs, OneDrive) that spike CPU unpredictably for minutes at a time. A full `npx vitest run` in mnemo2 (106 files, one worker per file, default 5s test timeout) then fails a rotating subset of heavy DOM tests — observed: TopBar "switches between Lead, Team, Cost, Graph and Plans", WorkerPanel "flags a failed worker / hands off to Mission Control", App.navigation "restores an unsent draft", SettingsDialog "adds an endpoint from a preset" — a DIFFERENT subset each run, all of which pass in isolation and on a stashed baseline. Diagnosis procedure that settled it: (1) run the failing file alone — passes; (2) run the full suite with `--testTimeout=25000` — 100% green proves the failures are timeout exhaustion, not defects; (3) a stashed-baseline full-suite run in a calm window also passes. Per-file durations fluctuate ~2x with load (SettingsDialog.test.ts: 43-49s calm vs 80-105s contended, same tree). When a full mnemo2 vitest run fails 1-5 heavy DOM tests, check machine load before suspecting the diff: measure with `Get-CimInstance Win32_Processor | Select-Object -ExpandProperty LoadPercentage` and re-run with a raised timeout for the true signal.

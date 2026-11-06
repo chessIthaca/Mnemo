@@ -1270,6 +1270,91 @@
       ],
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "8106337a",
+      "status": "closed",
+      "created_at_ms": 1793920243511,
+      "closed_at_ms": 1793924492199,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-8106337a-20261106-002132.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Laya needs one decision from the user",
+              "text": "The Tiers page SHALL ask only how much Laya helps pick the tier, and SHALL NOT offer inputs for confidence gates, minimum words, fallback tier, kNN, nudges or per-tier dispatch effort.",
+              "scenarios": [
+                {
+                  "name": "Leaving without edits",
+                  "when": [
+                    "the user opens the Tiers page and changes nothing",
+                    "the user picks another page"
+                  ],
+                  "then": [
+                    "the page changes without asking about unsaved edits"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "The Laya check runs itself and shows progress",
+              "text": "Mnemo2 SHALL check Laya when a project opens if the test set or checkpoint changed, SHALL show its progress like indexing, SHALL apply the suggested gates itself, and MUST write nothing when Laya does not answer.",
+              "scenarios": [
+                {
+                  "name": "Stale check at project open",
+                  "when": [
+                    "a project opens with a Laya choice other than off and no matching check"
+                  ],
+                  "then": [
+                    "the status line shows Checking Laya with done and total",
+                    "the gates and the result are saved when it ends"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Nothing changed",
+                  "when": [
+                    "a project opens and the last check's fingerprint matches"
+                  ],
+                  "then": [
+                    "no check runs and the page shows the last result"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Laya does not answer",
+                  "when": [
+                    "the classifier stops answering during a check"
+                  ],
+                  "then": [
+                    "the check shows as failed",
+                    "no record is written and the gates stay as stored"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "d4c6a2be",
+      "status": "closed",
+      "created_at_ms": 1793921826710,
+      "closed_at_ms": 1793923792890,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d4c6a2be-20261106-000952.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

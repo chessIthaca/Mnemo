@@ -1365,6 +1365,26 @@
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "a8710b6b",
+      "status": "abandoned",
+      "created_at_ms": 1793962826378,
+      "closed_at_ms": 1793962932234,
+      "report_path": null,
+      "abandon_reason": "Verification only, nothing to land. On the rebuilt app a plan decision steered a worker mid-command: it stayed working, and exactly one finished notice arrived, with the new turn tag, after the follow-up ended.",
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "06d33de4",
+      "status": "closed",
+      "created_at_ms": 1793963644286,
+      "closed_at_ms": 1793964194799,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-06d33de4-20261106-112314.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

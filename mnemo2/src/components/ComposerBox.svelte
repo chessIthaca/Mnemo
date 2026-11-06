@@ -5,7 +5,7 @@
     enabled: boolean;
   }
 
-  /** The interrupt button beside the box, shown while the send action is unavailable. */
+  /** The interrupt button beside the box. */
   export interface BoxStop {
     ariaLabel: string;
     text: string;

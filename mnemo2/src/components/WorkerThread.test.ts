@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
 import type { Worker, WorkerThreadEntry } from "../lib/types";
 import { createWorkers, fixtureState } from "../test/fixtures";
@@ -13,8 +13,69 @@ function worker(overrides: Partial<Worker> = {}): Worker {
   return { ...createWorkers()[0], status: "failed", error: failure, ...overrides };
 }
 
+let frames: Map<number, FrameRequestCallback>;
+let nextFrame: number;
+let resizeCallbacks: ResizeObserverCallback[];
+
+class ResizeObserverStub {
+  disconnect = vi.fn();
+  constructor(callback: ResizeObserverCallback) {
+    resizeCallbacks.push(callback);
+  }
+  observe() {}
+  unobserve() {}
+}
+
+/** Run every frame the thread requested, oldest first. */
+function flushFrame() {
+  const callbacks = [...frames.values()];
+  frames.clear();
+  for (const callback of callbacks) callback(16);
+}
+
+/** Pin the thread scroller's metrics so the follow rule can be observed. */
+function threadScroller(container: HTMLElement): HTMLDivElement {
+  const scroller = container.querySelector(".thread-messages") as HTMLDivElement | null;
+  if (!scroller) throw new Error("worker thread scroller not rendered");
+  return scroller;
+}
+
+function scrollMetrics(
+  scroller: HTMLDivElement,
+  values: { scrollHeight: number; clientHeight: number; scrollTop: number },
+) {
+  Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: values.scrollHeight });
+  Object.defineProperty(scroller, "clientHeight", { configurable: true, value: values.clientHeight });
+  scroller.scrollTop = values.scrollTop;
+}
+
+/** A worker message entry the follow tests can append. */
+function message(id: string): WorkerThreadEntry {
+  return { id, from: "worker", body: `Line ${id} while the thread grows.`, time: "now" };
+}
+
 describe("WorkerThread", () => {
-  beforeEach(() => app.set(fixtureState()));
+  beforeEach(() => {
+    app.set(fixtureState());
+    frames = new Map();
+    nextFrame = 1;
+    resizeCallbacks = [];
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        const id = nextFrame++;
+        frames.set(id, callback);
+        return id;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn((id: number) => frames.delete(id)));
+    vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
 
   it("shows the failure block with the full error text when the worker failed", () => {
     const { container } = render(WorkerThread, { worker: worker() });
@@ -224,5 +285,47 @@ describe("WorkerThread", () => {
 
     render(WorkerThread, { worker: worker({ id: "pause-2", name: "Kai", status: "idle" }) });
     expect(screen.queryByRole("button", { name: "Pause Kai" })).toBeNull();
+  });
+
+  it("mission control follows new messages at the bottom", async () => {
+    const base = worker({ id: "follow-1", status: "working", error: null });
+    const { container, rerender } = render(WorkerThread, { worker: base });
+    const scroller = threadScroller(container);
+    scrollMetrics(scroller, { scrollHeight: 1000, clientHeight: 600, scrollTop: 400 });
+
+    await rerender({ worker: { ...base, messages: [...base.messages, message("follow-new")] } });
+    flushFrame();
+
+    expect(scroller.scrollTop).toBe(1000);
+  });
+
+  it("mission control leaves a reader who scrolled up alone", async () => {
+    const base = worker({ id: "follow-2", status: "working", error: null });
+    const { container, rerender } = render(WorkerThread, { worker: base });
+    const scroller = threadScroller(container);
+    scrollMetrics(scroller, { scrollHeight: 1000, clientHeight: 600, scrollTop: 400 });
+
+    scroller.scrollTop = 160; // 240 px above the tail: the reader is reading history.
+    await fireEvent.scroll(scroller);
+
+    await rerender({ worker: { ...base, messages: [...base.messages, message("follow-later")] } });
+    flushFrame();
+
+    expect(scroller.scrollTop).toBe(160);
+  });
+
+  it("keeps the message box outside the scrolling messages", () => {
+    const full = render(WorkerThread, { worker: worker({ id: "pin-1", status: "working" }) });
+    const compact = render(WorkerThread, {
+      worker: worker({ id: "pin-2", status: "working" }),
+      compact: true,
+    });
+
+    for (const { container } of [full, compact]) {
+      const messages = container.querySelector(".thread-messages");
+      if (!messages) throw new Error("thread scroller missing");
+      expect(messages.querySelector(".thread-composer")).toBeNull();
+      expect(container.querySelector(".thread-composer")).not.toBeNull();
+    }
   });
 });

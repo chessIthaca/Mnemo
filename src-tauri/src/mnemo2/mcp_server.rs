@@ -909,9 +909,9 @@ impl Shared {
         let waiter_alive = team.external_waiter_alive();
         let summary = team.external_summary().await;
         let notices = if peek {
-            team.peek_external_notices()
+            team.current_notices(team.peek_external_notices()).await
         } else {
-            team.drain_external_notices()
+            team.current_notices(team.drain_external_notices()).await
         };
         let reply = Response::json(
             200,
@@ -1217,7 +1217,10 @@ impl Shared {
         };
         // Drain last, so the notices are as fresh as the answer; if the
         // response cannot be written they are put back (see `Reply`).
-        let notices = target.team.drain_external_notices();
+        let notices = target
+            .team
+            .current_notices(target.team.drain_external_notices())
+            .await;
         if !notices.is_empty() {
             text.push_str("\n\nSince your last call:\n- ");
             text.push_str(&notices.join("\n- "));

@@ -349,7 +349,12 @@ export function leadEntriesFromTranscript(
       const body = messageText(message.content).trim();
       if (message.role === "user" && body.startsWith(TEAM_NOTICE_PREFIX)) {
         const firstLine = body.indexOf("\n");
-        const workerId = body.slice(TEAM_NOTICE_PREFIX.length, firstLine === -1 ? body.length : firstLine);
+        // The first line may carry a turn tag after the id
+        // (`worker_id=<id> turn=<generation>.<turns> state=<state>`): the id
+        // is the token right after the prefix.
+        const workerId = body
+          .slice(TEAM_NOTICE_PREFIX.length, firstLine === -1 ? body.length : firstLine)
+          .split(" ")[0];
         entries.push({
           id: `history-team-${index}`,
           kind: "team-message",

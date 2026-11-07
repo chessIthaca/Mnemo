@@ -21,7 +21,9 @@
 //!   bare `mnemo::` paths. Test code is exempt (the same rule the
 //!   lib-side `kernel_does_not_import_app` applies); the stripper
 //!   below is its twin — the lib-side cfg(test) `boundary` module in
-//!   src/lib.rs — so this test target stands alone.
+//!   src/lib.rs — so this test target stands alone. The scan covers
+//!   `src-tauri/src` plus the separate `mnemo2-app` crate (`src` and
+//!   `examples`), and skips test-only files.
 //!
 //! D3 lands the scanner `#[ignore]`d — D4 routes the ~60 production
 //! references (job-05 §B fact 5's worklist) and D4's commit drops the
@@ -29,6 +31,15 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// The scanned surface: the app crate plus the separate `mnemo2-app`
+/// crate (`src` and `examples`) — its helper binary imports the kernel
+/// directly, so the boundary must cover it too.
+const ROOTS: [&str; 3] = [
+    "src-tauri/src",
+    "src-tauri/mnemo2-app/src",
+    "src-tauri/mnemo2-app/examples",
+];
 
 /// The structural G10 proof (job 5 D1): the feature lattice exists and
 /// gates the slices — `app` and `headless` are optional, `headless`
@@ -71,10 +82,31 @@ fn kernel_builds_without_app_feature() {
 #[test]
 fn tauri_uses_only_public_api() {
     let mut sources = Vec::new();
-    app_sources(Path::new("src-tauri/src"), &mut sources);
+    for root in ROOTS {
+        app_sources(Path::new(root), &mut sources);
+    }
     assert!(
         !sources.is_empty(),
         "the app sources must be found (run from the workspace root)"
+    );
+    // The scan is only a boundary proof if the mnemo2-app crate is
+    // really in it — a wrong root (a typo, a move) must fail loudly
+    // rather than pass silently over one crate.
+    let normalised: Vec<String> = sources
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert!(
+        normalised
+            .iter()
+            .any(|path| path.contains("mnemo2-app/src/mnemo2_mcp/")),
+        "the mnemo2-app crate must be scanned"
+    );
+    assert!(
+        normalised
+            .iter()
+            .any(|path| path.contains("mnemo2-app/examples/")),
+        "the mnemo2-app crate must be scanned"
     );
     // The three banned module PATHS — BARE forms (the substring
     // subsumes every `::`-qualified use) — plus the alias/grouped-
@@ -126,6 +158,75 @@ fn tauri_uses_only_public_api() {
          mnemo::headless / mnemo::app / the crate-root re-exports:\n{}",
         violations.join("\n")
     );
+}
+
+/// Guard: a file is only exempt from the boundary scan when it really
+/// is a test-only file — some declaring file in the same directory (or
+/// one level up) puts it under `#[cfg(test)]` with a `#[path =
+/// "..."]` attribute or a `mod <stem>;` declaration. A production
+/// file cannot hide by being called `tests.rs`.
+#[test]
+fn test_only_files_are_declared_under_cfg_test() {
+    let mut declaring = Vec::new();
+    let mut candidates = Vec::new();
+    for root in ROOTS {
+        all_sources(Path::new(root), &mut declaring);
+        test_sources(Path::new(root), &mut candidates);
+    }
+    assert!(
+        !candidates.is_empty(),
+        "the test-only sources must be found (run from the workspace root)"
+    );
+    let mut undeclared = Vec::new();
+    for candidate in &candidates {
+        let name = candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let stem = candidate
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        let dir = candidate.parent();
+        let up = dir.and_then(|dir| dir.parent());
+        let declared = declaring.iter().any(|file| {
+            let file_dir = file.parent();
+            (file_dir == dir || file_dir == up) && declares_test_module(file, name, stem)
+        });
+        if !declared {
+            undeclared.push(candidate.display().to_string());
+        }
+    }
+    assert!(
+        undeclared.is_empty(),
+        "a test-only-named file must be declared under #[cfg(test)] — a \
+         production file cannot hide behind tests.rs / *_tests.rs / \
+         testutil.rs (declare it with #[path = \"...\"] or `mod <stem>;`):\n{}",
+        undeclared.join("\n")
+    );
+}
+
+/// `is_test_source`'s names: the three test-only spellings, and the
+/// production lookalikes that must keep being scanned.
+#[test]
+fn test_source_names_are_recognised() {
+    for path in [
+        "tests.rs",
+        "serve_tests.rs",
+        "testutil.rs",
+        "src/x/tests.rs",
+    ] {
+        assert!(
+            is_test_source(Path::new(path)),
+            "`{path}` is a test-only source"
+        );
+    }
+    for path in ["serve.rs", "latest.rs", "contests.rs", "main.rs"] {
+        assert!(
+            !is_test_source(Path::new(path)),
+            "`{path}` is production code and must be scanned"
+        );
+    }
 }
 
 /// The code part of a line — everything before a `//` line comment,
@@ -192,17 +293,88 @@ fn code_part(line: &str) -> &str {
     line
 }
 
-/// Collect every `.rs` under `src-tauri/src` (the app's production
-/// tree; no exclusions — the whole crate is the scanned surface).
-fn app_sources(root: &Path, out: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(root).expect("src-tauri/src readable") {
+/// Whether `path` names a test-only source: `tests.rs`, `*_tests.rs`
+/// or `testutil.rs`. Test code may reference kernel internals freely,
+/// so such a file never reaches the boundary scan — exactly as
+/// `strip_test_items` exempts inline `#[cfg(test)]` items. The
+/// mnemo2-app crate declares them with `#[path = "..."]` under
+/// `#[cfg(test)]`, and the team/runtime splits put their tests in such
+/// files too.
+fn is_test_source(path: &Path) -> bool {
+    match path.file_stem().and_then(|stem| stem.to_str()) {
+        Some(stem) => stem == "tests" || stem == "testutil" || stem.ends_with("_tests"),
+        None => false,
+    }
+}
+
+/// Collect every `.rs` under `root` — the unfiltered walk the
+/// declaration guard reads module declarations from.
+fn all_sources(root: &Path, out: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(root).unwrap_or_else(|_| panic!("{} readable", root.display()));
+    for entry in entries {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {
-            app_sources(&path, out);
+            all_sources(&path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
             out.push(path);
         }
     }
+}
+
+/// Collect every production `.rs` under `root` (the whole tree):
+/// test-only files (`tests.rs`, `*_tests.rs`, `testutil.rs`) are
+/// skipped because test code may reference kernel internals, exactly
+/// as `strip_test_items` exempts inline `#[cfg(test)]` items; the
+/// mnemo2-app crate and the team/runtime splits put their tests in
+/// such files.
+fn app_sources(root: &Path, out: &mut Vec<PathBuf>) {
+    let mut found = Vec::new();
+    all_sources(root, &mut found);
+    for path in found {
+        if !is_test_source(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// Collect ONLY the test-only `.rs` under `root` — the files
+/// `app_sources` skips; `test_only_files_are_declared_under_cfg_test`
+/// proves each one is declared under `#[cfg(test)]`.
+fn test_sources(root: &Path, out: &mut Vec<PathBuf>) {
+    let mut found = Vec::new();
+    all_sources(root, &mut found);
+    for path in found {
+        if is_test_source(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// Whether `declaring` puts the file named `name` (module stem `stem`)
+/// under `#[cfg(test)]` — the declaration is a `#[cfg(test)]` line
+/// followed within the next two lines by `#[path = "….rs"]` (the
+/// crate's convention) or by `mod <stem>;`.
+fn declares_test_module(declaring: &Path, name: &str, stem: &str) -> bool {
+    let Ok(src) = fs::read_to_string(declaring) else {
+        return false;
+    };
+    let lines: Vec<&str> = src.lines().collect();
+    let mod_line = format!("mod {stem};");
+    for (idx, line) in lines.iter().enumerate() {
+        if line.trim() != "#[cfg(test)]" {
+            continue;
+        }
+        for next in lines.iter().skip(idx + 1).take(2) {
+            let next = next.trim();
+            let path_attr = next
+                .strip_prefix("#[path = \"")
+                .and_then(|rest| rest.strip_suffix("\"]"));
+            if path_attr.is_some_and(|attr| attr.ends_with(name)) || next == mod_line {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Strip `#[cfg(test)]`-attributed items from a source — the twin of

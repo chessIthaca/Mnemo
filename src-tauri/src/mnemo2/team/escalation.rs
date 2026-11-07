@@ -22,7 +22,8 @@ use super::nudge::append_reroute_metadata;
 use super::persistence::TeamPersistence;
 use super::record::{note_model, ChangeSource, WorkerRecord};
 use super::routing::{final_tier, resolve_tier_over, tier_ladder_from_dto};
-use super::{save_workers, status_name, unix_ms, BoardSignal, LiveWorker, TeamRuntime};
+use super::pump::save_workers;
+use super::{status_name, unix_ms, BoardSignal, LiveWorker, TeamRuntime};
 
 /// The shared state an automatic idle escalation touches. The worker pump and
 /// the lead review path both have these handles already.

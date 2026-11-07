@@ -3,20 +3,25 @@ use super::*;
 use std::collections::VecDeque;
 
 use mnemo::app::worktrees::provision_agent_worktree;
-use mnemo::headless::GateVerdict;
-use mnemo::tool::SafetyLevel;
-use serde_json::json;
+use mnemo::headless::{GateVerdict, Transcript};
+use mnemo::tool::{SafetyLevel, ToolResult};
+use serde_json::{json, Value};
 
-use crate::mnemo2::dispatch_routing::outcome_label;
+use crate::mnemo2::dispatch_routing::{outcome_label, DispatchRoutingRow};
+use crate::mnemo2::phase3::{Finding, ReviewEvidence, ReviewRecord};
 
+use super::control::recover_worker;
 use super::dispatch::{
     dispatch_routing_line, require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
 };
 use super::guardrails::executor_guardrails;
 use super::lead_tools::worker_status_view;
-use super::nudge::TOOL_ERROR_CHARS;
-use super::persistence::{TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE};
-use super::record::WORKER_INBOX_LIMIT;
+use super::nudge::{note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
+use super::persistence::{PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE};
+use super::pump::{cost_notice_due, usage_cost_micros, worker_host_tool_result};
+use super::record::{append_inbox, audit_finished, WORKER_INBOX_LIMIT};
+use super::review::clear_review_for_a_newer_tip;
+use super::routing::final_tier;
 
 macro_rules! tiers_dto {
     (difficult: $difficult:expr, average: $average:expr, simple: $simple:expr $(,)?) => {{

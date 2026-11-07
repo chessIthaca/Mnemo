@@ -24,7 +24,8 @@ use super::guardrails::guardrails_for;
 use super::nudge::NUDGE_STRIKE_LIMIT;
 use super::record::{kickoff_message, note_model, session_model_spec, WorkerRecord, WorkerStatus};
 use super::routing::{logs_label, outcome_row};
-use super::{pump_worker, LiveWorker, TeamRuntime};
+use super::pump::pump_worker;
+use super::{LiveWorker, TeamRuntime};
 
 /// The inputs one live worker session needs: where and on what it runs, its
 /// transcript to resume from, its trace identity, and the task pinned into

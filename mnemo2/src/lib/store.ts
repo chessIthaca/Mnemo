@@ -1,4 +1,4 @@
-import { derived, get, writable } from "svelte/store";
+import { get } from "svelte/store";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
 import { createProjectTransport, type ProjectPreferences, type ProjectRecord, type ProjectTransport } from "./projectEngine";
 import type { RepoPathRef } from "./repoPaths";
@@ -22,20 +22,17 @@ import {
 import { boardFromSnapshot } from "./boardState";
 import { createWorkbenchTransport, type WorkbenchTransport } from "./workbenchEngine";
 import { createBrowserTransport, type BrowserTransport } from "./browserEngine";
-import { workerScreenshotPaths } from "./workbenchState";
 import {
   applyModelSwitch,
   applyWorkerLiveEvent,
   emptyWorkerLive,
   STREAM_ONLY_EVENTS,
-  workerThreadFromRecord,
   type WorkerLive,
 } from "./workerThread";
 import { applyWorkerEvent, applyWorkerStatus } from "./workerActivity";
-import { leadEventSound, loadSoundToggles, notifySound, workerTransitionSound } from "./sounds";
+import { leadEventSound, notifySound, workerTransitionSound } from "./sounds";
 import { applyStoredTheme } from "./theme";
 import type { TraceEntry } from "./trace";
-import { logUi } from "./uiLog";
 import {
   createOpenWorkerTransport,
   openWorkerNotice,
@@ -46,18 +43,11 @@ import {
   deletionDiscardsWork,
   deletionPreviewFromWire,
   emptyProjectUsage,
-  findingFromWire,
   findingToWire,
-  inboxFromWire,
   projectUsageFrom,
-  reviewEvidenceFrom,
   reviewEvidenceToWire,
-  reviewRiskFrom,
-  waitsOnUser,
   workerDisplayName,
-  workerKindFrom,
   type TeamEvent,
-  type TeamMergeRecord,
   type TeamMessage,
   type TeamWorkerRecord,
 } from "./teamState";
@@ -68,15 +58,11 @@ import {
   leadEventAffectsUsage,
   leadEventNeedsSnapshot,
 } from "./leadState";
-import { insertActivityCard, type ActivityCard } from "./teamActivity";
 import type {
   AppState,
-  Check,
   Finding,
   LeadAnswerInput,
-  LeadEntry,
   LeadEvent,
-  MergeRecord,
   Project,
   ReviewEvidence,
   TeamFilter,
@@ -86,9 +72,14 @@ import type {
   WorkerStatus,
   WorkbenchTab,
 } from "./types";
+// The `./store/*` imports come last on purpose: `core` creates `app` and reads
+// the sound toggles at import time, exactly where store.ts used to do it inline.
+import { app, createInitialState, leadError, nextId, withToast } from "./store/core";
+import { clampBoardWidth, clampWorkbenchWidth, viewportWidth } from "./store/layout";
+import { buildWorker, mergeTeamActivity } from "./store/workerView";
 
-let sequence = 0;
-const nextId = (prefix: string) => `${prefix}-${++sequence}`;
+export { SESSION_START_MS, app, createInitialState, currentProject, needsYouCount, selectedWorker } from "./store/core";
+export { MIN_LEAD_WIDTH, MIN_WORKBENCH_WIDTH, maxWorkbenchWidth, clampWorkbenchWidth, MIN_BOARD_WIDTH, MIN_BOARD_OUTPUT_WIDTH, BOARD_DIVIDER_WIDTH, maxBoardWidth, clampBoardWidth, defaultBoardWidth } from "./store/layout";
 
 let leadTransport: LeadTransport | null = null;
 let leadUnlisten: (() => void) | null = null;
@@ -134,10 +125,6 @@ let preferenceSave: {
   transport: ProjectTransport;
 } | null = null;
 let preferenceTimer: ReturnType<typeof setTimeout> | null = null;
-
-function leadError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 async function disconnectWorkbench(): Promise<void> {
   diffRequest += 1;
@@ -281,74 +268,6 @@ async function connectNativeLead(project: Project, allowConflict = false): Promi
 }
 
 /**
- * When this app instance booted, as the anchor for the Trace route's
- * "This session" time filter — the engine starts with the app, so its ring
- * holds nothing older.
- */
-export const SESSION_START_MS = Date.now();
-
-export function createInitialState(): AppState {
-  return {
-    route: "start",
-    projectId: null,
-    projects: [],
-    workers: [],
-    leadEntries: [],
-    leadDraft: { text: "", images: [] },
-    leadRuntime: initialLeadRuntime(),
-    selectedWorkerId: null,
-    teamPeekOpen: false,
-    teamFilter: "all",
-    teamSlots: 0,
-    teamActive: 0,
-    projectUsage: emptyProjectUsage(),
-    workbenchOpen: false,
-    workbenchTab: "browser",
-    workbenchWidth: 480,
-    /** No saved mission-control split until the user drags or the project restores one. */
-    boardWidth: null,
-    /** No Trace-route filter hand-over until an entry point plants one. */
-    traceEntry: null,
-    /** No plan hand-over until the Memory tab plants one. */
-    planDocumentId: null,
-    /** No file hand-over until the Memory tab plants one. */
-    workbenchFile: null,
-    workerPanelId: null,
-    browserUrl: "about:blank",
-    browserTitle: "",
-    browserLoading: false,
-    browserSupported: null,
-    browserError: null,
-    browserImage: null,
-    plan: null,
-    planItems: [],
-    board: [],
-    diff: null,
-    diffFiles: [],
-    diffWorkerId: null,
-    diffLoading: false,
-    diffError: null,
-    projectConflict: null,
-    indexing: null,
-    externalLead: noExternalLead(),
-    cleanupProjectId: null,
-    cleanupBusy: false,
-    workerDeletion: null,
-    closeProjectPending: false,
-    newProjectParent: null,
-    creatingProject: false,
-    toast: null,
-  };
-}
-
-export const app = writable<AppState>(createInitialState());
-
-// Notification-sound toggles ([ui] sound_*): read once at startup so the store
-// can gate on them; the Appearance page pushes every later save through
-// applySoundToggles, so a flipped toggle applies to the very next event.
-void loadSoundToggles();
-
-/**
  * Whether the layout leaves room for the native Browser pane. The pane is an
  * OS window above the whole UI, so it may only show on the open Browser tab
  * of the Lead view with no drawer, sheet, or preview over it.
@@ -380,37 +299,6 @@ app.subscribe((state) => {
     void pushBrowserVisibility();
   }
 });
-
-export const currentProject = derived(app, ($app) =>
-  $app.projects.find((project) => project.id === $app.projectId) ?? null,
-);
-
-export const selectedWorker = derived(app, ($app) =>
-  $app.workers.find((worker) => worker.id === $app.selectedWorkerId) ?? null,
-);
-
-export const needsYouCount = derived(
-  app,
-  ($app) => $app.workers.filter((worker) => worker.needsYou).length,
-);
-
-function withToast(state: AppState, message: string, level: ToastLevel = "info"): AppState {
-  logUi(level, message, { source: "toast", route: state.route });
-  return { ...state, toast: { id: ++sequence, message, level } };
-}
-
-function updateWorker(
-  state: AppState,
-  workerId: string,
-  change: (worker: Worker) => Worker,
-): AppState {
-  return {
-    ...state,
-    workers: state.workers.map((worker) =>
-      worker.id === workerId ? change(worker) : worker,
-    ),
-  };
-}
 
 async function flushWorkbenchPreferences(): Promise<void> {
   if (preferenceTimer) {
@@ -1281,33 +1169,6 @@ function setWorkbenchTab(workbenchTab: WorkbenchTab) {
   schedulePreferenceSave();
 }
 
-/** The narrowest the lead's conversation may get; the side panel yields the rest of the window. */
-export const MIN_LEAD_WIDTH = 420;
-/** The narrowest the workbench or the worker panel may be dragged to. */
-export const MIN_WORKBENCH_WIDTH = 320;
-
-/** The window width the side-panel bounds are measured against. */
-function viewportWidth(): number {
-  return typeof window === "undefined" ? Number.POSITIVE_INFINITY : window.innerWidth;
-}
-
-/**
- * The widest a side panel may get in a window this wide: every pixel the lead
- * does not need, but never below the panel's own floor.
- */
-export function maxWorkbenchWidth(windowWidth: number): number {
-  return Math.max(MIN_WORKBENCH_WIDTH, windowWidth - MIN_LEAD_WIDTH);
-}
-
-/**
- * Keep a side-panel width between its floor and the window-relative ceiling.
- * Always a whole pixel: a scaled display hands the drag handlers fractional
- * coordinates, and the saved preference field is a `u32`.
- */
-export function clampWorkbenchWidth(workbenchWidth: number, windowWidth: number): number {
-  return Math.round(Math.min(maxWorkbenchWidth(windowWidth), Math.max(MIN_WORKBENCH_WIDTH, workbenchWidth)));
-}
-
 function setWorkbenchWidth(workbenchWidth: number) {
   app.update((state) => ({
     ...state,
@@ -1329,36 +1190,6 @@ function reclampWorkbenchWidth(windowWidth: number = viewportWidth()) {
     return { ...state, workbenchWidth };
   });
   if (changed) schedulePreferenceSave();
-}
-
-/**
- * The narrowest the mission-control worker list may be dragged to. The worker
- * rows keep a fixed 152px status column, so the list needs real room.
- */
-export const MIN_BOARD_WIDTH = 300;
-/** The narrowest the mission-control worker output may get; the list yields the rest. */
-export const MIN_BOARD_OUTPUT_WIDTH = 420;
-/** The draggable divider's own column between the list and the output, in CSS pixels. */
-export const BOARD_DIVIDER_WIDTH = 9;
-/** Share of the layout the worker list takes when nothing is saved (today's 0.88fr/1.12fr). */
-const DEFAULT_BOARD_SHARE = 0.44;
-
-/** The widest the worker list may get in a window this wide. */
-export function maxBoardWidth(windowWidth: number): number {
-  return Math.max(MIN_BOARD_WIDTH, windowWidth - MIN_BOARD_OUTPUT_WIDTH - BOARD_DIVIDER_WIDTH);
-}
-
-/**
- * Keep a worker-list width between its floor and the window-relative ceiling,
- * in whole pixels so the saved `u32` preference can never see a float.
- */
-export function clampBoardWidth(boardWidth: number, windowWidth: number): number {
-  return Math.round(Math.min(maxBoardWidth(windowWidth), Math.max(MIN_BOARD_WIDTH, boardWidth)));
-}
-
-/** The width a window this wide opens mission control with when nothing is saved. */
-export function defaultBoardWidth(windowWidth: number): number {
-  return clampBoardWidth(Math.round(windowWidth * DEFAULT_BOARD_SHARE), windowWidth);
 }
 
 /** Drag the mission-control divider; `null` restores the default proportion. */
@@ -2272,115 +2103,6 @@ async function stopAll(): Promise<void> {
   await performTeam((transport) => transport.stopAll());
 }
 
-function timeFromMs(milliseconds: number): string {
-  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "unknown";
-  return new Date(milliseconds).toLocaleTimeString();
-}
-
-function elapsedFromMs(milliseconds: number): string {
-  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "—";
-  const seconds = Math.floor(milliseconds / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  return `${Math.floor(hours / 24)}d`;
-}
-
-function mergeFromRecord(worker: TeamWorkerRecord, merge: TeamMergeRecord): MergeRecord {
-  return {
-    id: `merge-${worker.id}-${merge.commit}`,
-    workerId: worker.id,
-    commit: merge.commit,
-    branch: merge.branch,
-    target: merge.target,
-    files: merge.files,
-    additions: merge.additions,
-    deletions: merge.deletions,
-    checks: merge.checks,
-    reviewSummary: merge.review_summary,
-    model: merge.worker_model ?? worker.model_id ?? worker.model ?? "",
-    tokens: merge.worker_tokens,
-    cost: merge.cost_micros == null ? null : merge.cost_micros / 1_000_000,
-    time: timeFromMs(merge.merged_at_ms),
-    revertCommit: merge.revert_commit ?? undefined,
-  };
-}
-
-
-function workerTimeline(record: TeamWorkerRecord): Worker["timeline"] {
-  const time = (milliseconds: number) => milliseconds > 0 ? timeFromMs(milliseconds) : undefined;
-  const timeline: Worker["timeline"] = [{
-    id: `${record.id}-created`,
-    label: "Task dispatched",
-    detail: record.brief,
-    status: "done",
-    time: time(record.created_at_ms),
-  }];
-  if (record.turns > 0 || record.last_activity_ms > 0) {
-    timeline.push({
-      id: `${record.id}-activity`,
-      label: "Worker activity",
-      detail: `${record.turns} completed turn(s) · ${record.total_tokens} cumulative tokens`,
-      status: ["working", "dispatching", "fixing"].includes(record.status) ? "active" : "done",
-      time: time(record.last_activity_ms),
-    });
-  }
-  for (const check of record.checks) {
-    timeline.push({
-      id: `${record.id}-check-${check.name}`,
-      label: check.name,
-      detail: check.detail || `Exact worker tip ${check.tip}`,
-      status: check.status === "passed" ? "done" : check.status === "failed" ? "failed" : "active",
-      time: time(record.last_activity_ms),
-    });
-  }
-  if (record.review) {
-    timeline.push({
-      id: `${record.id}-review-${record.review.reviewed_at_ms}`,
-      label: "Lead review recorded",
-      detail: record.review.summary,
-      status: record.findings.some((finding) => finding.status === "open") ? "active" : "done",
-      time: time(record.review.reviewed_at_ms),
-    });
-  }
-  if (record.merge) {
-    timeline.push({
-      id: `${record.id}-merge-${record.merge.commit}`,
-      label: record.merge.revert_commit ? "Merge reverted" : `Landed in ${record.merge.target}`,
-      detail: record.merge.revert_commit ?? record.merge.commit,
-      status: "done",
-      time: time(record.merge.merged_at_ms),
-    });
-  }
-  if (record.status === "cancelled") {
-    timeline.push({
-      id: `${record.id}-cleaned`,
-      label: "Checkout cleaned",
-      detail: record.error ?? "The branch is retained for review.",
-      status: "done",
-    });
-  } else if (["failed", "conflict", "needs_you"].includes(record.status)) {
-    timeline.push({
-      id: `${record.id}-attention`,
-      label: "Needs attention",
-      detail: record.error ?? "The worker stopped before finishing; open its thread for its last message.",
-      status: "failed",
-      time: time(record.last_activity_ms),
-    });
-  } else if (["stopped", "interrupted"].includes(record.status)) {
-    timeline.push({
-      id: `${record.id}-stopped`,
-      label: "Session stopped",
-      detail: "The branch and worktree are retained.",
-      status: "done",
-      time: time(record.last_activity_ms),
-    });
-  }
-  return timeline;
-}
-
 function workerFromRecord(
   record: TeamWorkerRecord,
   index: number,
@@ -2392,168 +2114,7 @@ function workerFromRecord(
   const activity = applyWorkerStatus(workerActivity.get(record.id) ?? null, status, Date.now());
   if (activity) workerActivity.set(record.id, activity);
   else workerActivity.delete(record.id);
-  const progress: Record<WorkerStatus, number> = {
-    dispatching: 10,
-    working: 45,
-    needs_you: 45,
-    idle: 50,
-    paused: 45,
-    interrupted: 45,
-    completed: 70,
-    stopped: 70,
-    in_review: 85,
-    fixing: 75,
-    merging: 95,
-    merged: 100,
-    conflict: 85,
-    failed: 70,
-    cancelled: 0,
-  };
-  return {
-    id: record.id,
-    name: workerDisplayName(record.id, record.name),
-    initials: workerDisplayName(record.id, record.name).replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "W",
-    hue: (index * 47 + 12) % 360,
-    task: record.brief,
-    summary: record.error ?? "",
-    error: record.error ?? null,
-    status,
-    model: record.model_id ?? record.model ?? "",
-    modelSpec: record.model,
-    tier: record.tier ?? undefined,
-    reasoningEffort: record.reasoning_effort ?? undefined,
-    branch: record.branch,
-    worktree: record.worktree,
-    files: [],
-    tokens: record.total_tokens,
-    cost: record.cost_micros == null ? null : record.cost_micros / 1_000_000,
-    elapsed: elapsedFromMs(record.elapsed_ms),
-    turns: record.turns,
-    compacting: record.compacting === true,
-    progress: progress[status],
-    lastActivity: timeFromMs(record.last_activity_ms),
-    createdAtMs: record.created_at_ms,
-    activity,
-    needsYou:
-      waitsOnUser(record.pending) || ["needs_you", "conflict", "failed"].includes(record.status),
-    fixerFindingId: record.fixer_finding_id ?? undefined,
-    kind: workerKindFrom(record.kind),
-    reviewRisk: reviewRiskFrom(record.review_risk),
-    auditTarget: record.audit_target ?? undefined,
-    auditTip: record.audit_tip ?? undefined,
-    reportDelivered: record.report_delivered === true,
-    routing: record.routing ?? null,
-    planId: record.plan_id ?? null,
-    planStep: record.plan_step ?? null,
-    checks: record.checks.map((check) => ({
-      name: check.name,
-      status:
-        check.status === "passed" || check.status === "failed"
-          ? (check.status as Check["status"])
-          : "running",
-      detail: check.detail ?? "",
-      tip: check.tip,
-    })),
-    findings: record.findings.map(findingFromWire),
-    review: record.review
-      ? {
-          summary: record.review.summary,
-          tip: record.review.tip,
-          reviewedAtMs: record.review.reviewed_at_ms,
-          evidence: reviewEvidenceFrom(record.review.evidence),
-        }
-      : undefined,
-    messages: workerThreadFromRecord(record, messages),
-    inbox: (record.inbox ?? []).map(inboxFromWire),
-    screenshots: workerScreenshotPaths(record.transcript),
-    timeline: workerTimeline(record),
-    diff: record.merge
-      ? {
-          files: record.merge.files,
-          additions: record.merge.additions,
-          deletions: record.merge.deletions,
-        }
-      : { files: 0, additions: 0, deletions: 0 },
-    merge: record.merge ? mergeFromRecord(record, record.merge) : undefined,
-  };
-}
-
-function mergeTeamActivity(
-  entries: LeadEntry[],
-  messages: TeamMessage[],
-  workers: TeamWorkerRecord[],
-): LeadEntry[] {
-  const next = entries.slice();
-  // Each entry keeps the name it was recorded with, so it still names its
-  // worker after that worker leaves the team list.
-  const names = new Map(workers.map((worker) => [worker.id, workerDisplayName(worker.id, worker.name)]));
-  const nameOf = (workerId: string, id: string) => {
-    const known = names.get(workerId);
-    if (known) return known;
-    const previous = next.find((entry) => entry.id === id);
-    return previous && "workerName" in previous && previous.workerName ? previous.workerName : workerId;
-  };
-  // A card already shown keeps its place; a new one goes where it happened,
-  // never just to the bottom (that replayed every review after a restart).
-  const fresh: ActivityCard[] = [];
-  const upsert = (entry: ActivityCard) => {
-    const index = next.findIndex((candidate) => candidate.id === entry.id);
-    if (index === -1) fresh.push(entry);
-    else next[index] = entry;
-  };
-  for (const message of messages) {
-    const id = `team-${message.worker_id}-${message.at_ms}`;
-    const attributed = next.some((entry) =>
-      entry.id !== id && entry.kind === "team-message" &&
-      entry.workerId === message.worker_id && message.text.trim().length > 0 &&
-      entry.body.includes(message.text),
-    );
-    if (attributed) {
-      const duplicate = next.findIndex((entry) => entry.id === id);
-      if (duplicate !== -1) next.splice(duplicate, 1);
-      continue;
-    }
-    upsert({
-      id,
-      kind: "team-message",
-      workerId: message.worker_id,
-      workerName: nameOf(message.worker_id, id),
-      body: message.text,
-      time: timeFromMs(message.at_ms),
-      atMs: message.at_ms,
-    });
-  }
-  for (const worker of workers) {
-    if (worker.review) {
-      const name = workerDisplayName(worker.id, worker.name);
-      upsert({
-        id: `review-${worker.id}-${worker.review.reviewed_at_ms}`,
-        kind: "review",
-        workerId: worker.id,
-        workerName: name,
-        title: `Reviewed ${name}’s work`,
-        body: worker.review.summary,
-        time: timeFromMs(worker.review.reviewed_at_ms),
-        atMs: worker.review.reviewed_at_ms,
-      });
-    }
-    if (worker.merge) {
-      const record = mergeFromRecord(worker, worker.merge);
-      upsert({
-        id: record.id,
-        kind: "merge",
-        workerId: worker.id,
-        workerName: workerDisplayName(worker.id, worker.name),
-        record,
-        time: record.time,
-        atMs: worker.merge.merged_at_ms,
-      });
-    }
-  }
-  fresh
-    .sort((left, right) => (left.atMs ?? 0) - (right.atMs ?? 0))
-    .forEach((card) => insertActivityCard(next, card));
-  return next;
+  return buildWorker(record, index, messages, status, activity);
 }
 
 /** Each worker's streamed activity since its transcript was last saved. */

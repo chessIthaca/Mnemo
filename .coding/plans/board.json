@@ -1730,6 +1730,17 @@
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "baadab0b",
+      "status": "closed",
+      "created_at_ms": 1794008719596,
+      "closed_at_ms": 1794010151453,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-baadab0b-20261107-000911.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Merge-time checkout and branch cleanup is not specified by any capability under .coding/openspec/specs (dispatch-routing, external-lead, tier-ladder and worker-brief govern routing, the external lead, tiers and briefs; a search of all specs finds no mention of checkout, worktree or cleanup). The plan only adds a retry of an existing best-effort cleanup in src-tauri/src/mnemo2/team.rs."
     }
   ]
 }

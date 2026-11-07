@@ -740,4 +740,3 @@ pub(super) fn clear_review_for_a_newer_tip(
         worker.checks.clear();
     }
 }
-

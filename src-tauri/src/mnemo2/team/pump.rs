@@ -1082,4 +1082,3 @@ fn limit_label(which: mnemo::provider::LimitKind) -> &'static str {
         LimitKind::Idle => "idle",
     }
 }
-

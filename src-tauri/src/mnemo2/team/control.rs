@@ -895,4 +895,3 @@ pub(super) async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRe
     }
     Ok(())
 }
-

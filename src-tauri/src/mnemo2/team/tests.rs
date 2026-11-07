@@ -1,10 +1,14 @@
 use super::*;
 
+use std::collections::VecDeque;
+
 use mnemo::headless::GateVerdict;
+use mnemo::tool::SafetyLevel;
 
 use crate::mnemo2::dispatch_routing::outcome_label;
 
 use super::guardrails::executor_guardrails;
+use super::lead_tools::worker_status_view;
 use super::nudge::TOOL_ERROR_CHARS;
 use super::persistence::{TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE};
 use super::record::WORKER_INBOX_LIMIT;

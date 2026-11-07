@@ -2,10 +2,12 @@ use super::*;
 
 use mnemo::headless::GateVerdict;
 
+use crate::mnemo2::dispatch_routing::outcome_label;
+
 use super::guardrails::executor_guardrails;
+use super::nudge::TOOL_ERROR_CHARS;
 use super::persistence::{TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE};
 use super::record::WORKER_INBOX_LIMIT;
-
 
 macro_rules! tiers_dto {
     (difficult: $difficult:expr, average: $average:expr, simple: $simple:expr $(,)?) => {{

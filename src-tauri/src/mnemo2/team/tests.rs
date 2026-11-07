@@ -2,11 +2,16 @@ use super::*;
 
 use std::collections::VecDeque;
 
+use mnemo::app::worktrees::provision_agent_worktree;
 use mnemo::headless::GateVerdict;
 use mnemo::tool::SafetyLevel;
+use serde_json::json;
 
 use crate::mnemo2::dispatch_routing::outcome_label;
 
+use super::dispatch::{
+    dispatch_routing_line, require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
+};
 use super::guardrails::executor_guardrails;
 use super::lead_tools::worker_status_view;
 use super::nudge::TOOL_ERROR_CHARS;

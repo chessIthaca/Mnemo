@@ -16,7 +16,8 @@ use crate::mnemo2::phase3::{self, ReviewEvidence};
 
 use super::record::{ChangeSource, MessageSender, WorkerRecord};
 use super::routing::tier_ids;
-use super::{dispatch_result, DispatchRequest, DispatchSource, PlanRef, TeamRuntime};
+use super::dispatch::{dispatch_result, DispatchRequest, DispatchSource, PlanRef};
+use super::TeamRuntime;
 
 impl TeamRuntime {
     /// The lead's team delegation, review, and repair host tools.

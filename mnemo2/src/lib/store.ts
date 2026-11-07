@@ -1,7 +1,6 @@
 import { get } from "svelte/store";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
-import { createProjectTransport, type ProjectPreferences, type ProjectRecord, type ProjectTransport } from "./projectEngine";
-import type { RepoPathRef } from "./repoPaths";
+import { createProjectTransport, type ProjectRecord } from "./projectEngine";
 import { probeMnemo2Host } from "./runtime";
 import { createStreamCoalescer } from "./streamCoalescer";
 import {
@@ -20,8 +19,6 @@ import {
   type ExternalLeadEvent,
 } from "./externalLeadEngine";
 import { boardFromSnapshot } from "./boardState";
-import { createWorkbenchTransport, type WorkbenchTransport } from "./workbenchEngine";
-import { createBrowserTransport, type BrowserTransport } from "./browserEngine";
 import {
   applyModelSwitch,
   applyWorkerLiveEvent,
@@ -32,7 +29,6 @@ import {
 import { applyWorkerEvent, applyWorkerStatus } from "./workerActivity";
 import { leadEventSound, notifySound, workerTransitionSound } from "./sounds";
 import { applyStoredTheme } from "./theme";
-import type { TraceEntry } from "./trace";
 import {
   createOpenWorkerTransport,
   openWorkerNotice,
@@ -59,24 +55,72 @@ import {
   leadEventNeedsSnapshot,
 } from "./leadState";
 import type {
-  AppState,
   Finding,
   LeadAnswerInput,
   LeadEvent,
   Project,
   ReviewEvidence,
-  TeamFilter,
   ToastLevel,
   Worker,
   WorkerActivity,
   WorkerStatus,
-  WorkbenchTab,
 } from "./types";
 // The `./store/*` imports come last on purpose: `core` creates `app` and reads
-// the sound toggles at import time, exactly where store.ts used to do it inline.
+// the sound toggles at import time, exactly where store.ts used to do it
+// inline, and `browser` installs the native-pane visibility subscription.
 import { app, createInitialState, leadError, nextId, withToast } from "./store/core";
-import { clampBoardWidth, clampWorkbenchWidth, viewportWidth } from "./store/layout";
 import { buildWorker, mergeTeamActivity } from "./store/workerView";
+import { discardPendingPreferences, flushWorkbenchPreferences, hasPendingPreferences } from "./store/preferences";
+import {
+  browserBack,
+  browserForward,
+  browserOverlay,
+  browserReload,
+  connectBrowser,
+  ensureBrowser,
+  navigateBrowser,
+  openBrowser,
+  openExternalBrowser,
+  setBrowserRect,
+  setBrowserVisible,
+} from "./store/browser";
+import {
+  closeScreenshot,
+  closeWorkbench,
+  disconnectWorkbench,
+  openScreenshot,
+  openWorkerDiff,
+  openWorkbench,
+  reclampBoardWidth,
+  reclampWorkbenchWidth,
+  refreshDiff,
+  restoreWorkbench,
+  scheduleDiffSync,
+  selectDiffWorker,
+  setBoardWidth,
+  setWorkbenchTab,
+  setWorkbenchWidth,
+} from "./store/workbench";
+import {
+  clearPlanDocument,
+  clearTraceEntry,
+  clearWorkbenchFile,
+  closeWorkerPanel,
+  openCost,
+  openFileInWorkbench,
+  openGraph,
+  openLead,
+  openMemory,
+  openPlanDocument,
+  openPlans,
+  openRepoPath,
+  openTeam,
+  openTrace,
+  openWorkerPanel,
+  selectWorker,
+  setTeamFilter,
+  toggleTeamPeek,
+} from "./store/navigation";
 
 export { SESSION_START_MS, app, createInitialState, currentProject, needsYouCount, selectedWorker } from "./store/core";
 export { MIN_LEAD_WIDTH, MIN_WORKBENCH_WIDTH, maxWorkbenchWidth, clampWorkbenchWidth, MIN_BOARD_WIDTH, MIN_BOARD_OUTPUT_WIDTH, BOARD_DIVIDER_WIDTH, maxBoardWidth, clampBoardWidth, defaultBoardWidth } from "./store/layout";
@@ -106,42 +150,6 @@ let externalLeadEvents = 0;
 let openWorkerUnlisten: (() => void) | null = null;
 let openWorkerStart: Promise<void> | null = null;
 let openWorkerToken = 0;
-let workbenchTransport: WorkbenchTransport | null = null;
-let diffRequest = 0;
-let diffSyncTimer: ReturnType<typeof setTimeout> | null = null;
-let browserTransport: BrowserTransport | null = null;
-let browserUnlisten: (() => void)[] = [];
-let browserToken = 0;
-/** Orders native visibility requests (see `browser_set_visible`). */
-let browserVisibilitySeq = 0;
-/** Whether the mounted Browser tab wants its native pane on screen. */
-let browserTabWantsPane = false;
-/** The visibility last sent to the native pane. */
-let browserPaneShown = false;
-let preferenceSave: {
-  projectId: string;
-  workspaceRoot: string;
-  preferences: ProjectPreferences;
-  transport: ProjectTransport;
-} | null = null;
-let preferenceTimer: ReturnType<typeof setTimeout> | null = null;
-
-async function disconnectWorkbench(): Promise<void> {
-  diffRequest += 1;
-  if (diffSyncTimer) {
-    clearTimeout(diffSyncTimer);
-    diffSyncTimer = null;
-  }
-  workbenchTransport = null;
-  browserToken += 1;
-  for (const unlisten of browserUnlisten) unlisten();
-  browserUnlisten = [];
-  const browser = browserTransport;
-  browserTransport = null;
-  browserTabWantsPane = false;
-  browserPaneShown = false;
-  if (browser) await browser.close().catch(() => {});
-}
 
 async function stopNativeLead(): Promise<void> {
   const unlisten = leadUnlisten;
@@ -267,109 +275,6 @@ async function connectNativeLead(project: Project, allowConflict = false): Promi
   }
 }
 
-/**
- * Whether the layout leaves room for the native Browser pane. The pane is an
- * OS window above the whole UI, so it may only show on the open Browser tab
- * of the Lead view with no drawer, sheet, or preview over it.
- */
-function browserPaneAllowed(state: AppState): boolean {
-  return (
-    state.route === "lead" &&
-    state.workbenchOpen &&
-    state.workbenchTab === "browser" &&
-    !state.teamPeekOpen &&
-    !state.browserImage
-  );
-}
-
-/** Send the pane's desired visibility as a new, ordered request. */
-function pushBrowserVisibility(): Promise<void> {
-  const wanted = browserTabWantsPane && browserPaneAllowed(get(app));
-  browserPaneShown = wanted;
-  const seq = ++browserVisibilitySeq;
-  return browserCommand((transport) => transport.setVisible(wanted, seq));
-}
-
-// The layout, not a component's mount/unmount, has the final say: any change
-// that covers the Browser tab (another tab, the team drawer, the Team view,
-// a closed workbench) hides the pane, and uncovering it shows it again.
-app.subscribe((state) => {
-  if (!browserTransport) return;
-  if ((browserTabWantsPane && browserPaneAllowed(state)) !== browserPaneShown) {
-    void pushBrowserVisibility();
-  }
-});
-
-async function flushWorkbenchPreferences(): Promise<void> {
-  if (preferenceTimer) {
-    clearTimeout(preferenceTimer);
-    preferenceTimer = null;
-  }
-  const pending = preferenceSave;
-  preferenceSave = null;
-  if (!pending) return;
-  try {
-    await pending.transport.savePreferences(pending.workspaceRoot, pending.preferences);
-  } catch (error) {
-    app.update((state) => state.projectId === pending.projectId
-      ? withToast(state, `Could not save workbench preferences: ${leadError(error)}`, "error")
-      : state);
-  }
-}
-
-function schedulePreferenceSave(): void {
-  const state = get(app);
-  const transport = createProjectTransport();
-  const project = state.projects.find((item) => item.id === state.projectId);
-  if (!transport || !project) return;
-  preferenceSave = {
-    projectId: project.id,
-    workspaceRoot: project.path,
-    transport,
-    preferences: {
-      workbench_open: state.workbenchOpen,
-      workbench_tab: state.workbenchTab,
-      workbench_width: Math.round(state.workbenchWidth),
-      browser_url: state.browserUrl,
-      diff_worker_id: state.diffWorkerId,
-      board_width: state.boardWidth === null ? null : Math.round(state.boardWidth),
-    },
-  };
-  if (preferenceTimer) clearTimeout(preferenceTimer);
-  preferenceTimer = setTimeout(() => {
-    preferenceTimer = null;
-    void flushWorkbenchPreferences();
-  }, 200);
-}
-
-async function restoreWorkbench(project: Project): Promise<void> {
-  const transport = createProjectTransport();
-  if (!transport || !(await probeMnemo2Host())) return;
-  try {
-    const preferences = await transport.preferences();
-    app.update((state) => state.projectId === project.id ? {
-      ...state,
-      workbenchOpen: preferences.workbench_open,
-      workbenchTab: preferences.workbench_tab,
-      workbenchWidth: preferences.workbench_width,
-      browserUrl: preferences.browser_url,
-      browserImage: null,
-      diffWorkerId: preferences.diff_worker_id,
-      boardWidth: preferences.board_width,
-      diff: null,
-      diffFiles: [],
-      diffError: null,
-    } : state);
-    if (preferences.workbench_open && preferences.workbench_tab === "diff") {
-      void refreshDiff();
-    }
-  } catch (error) {
-    app.update((state) => state.projectId === project.id
-      ? withToast(state, `Could not restore workbench preferences: ${leadError(error)}`, "error")
-      : state);
-  }
-}
-
 function projectFromRecord(record: ProjectRecord): Project {
   return {
     id: record.path,
@@ -394,7 +299,7 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
     app.update((state) => withToast(state, "That project is not registered.", "error"));
     return;
   }
-  if (preferenceSave) await flushWorkbenchPreferences();
+  if (hasPendingPreferences()) await flushWorkbenchPreferences();
   if (project.available === false) {
     app.update((state) => withToast(state, project.description || "The project folder is unavailable.", "error"));
     return;
@@ -721,7 +626,7 @@ async function openFolder(): Promise<void> {
 }
 
 async function closeProjectNow(): Promise<void> {
-  if (preferenceSave) await flushWorkbenchPreferences();
+  if (hasPendingPreferences()) await flushWorkbenchPreferences();
   leadSessionToken += 1;
   await stopNativeLead();
   await disconnectTeam();
@@ -873,522 +778,6 @@ async function createProject(name: string): Promise<void> {
 
 function cancelNewProject(): void {
   if (!get(app).creatingProject) app.update((state) => ({ ...state, newProjectParent: null }));
-}
-
-function openLead() {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "lead" : state.route,
-    teamPeekOpen: false,
-  }));
-}
-
-function openTeam() {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "team" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
-  }));
-}
-
-/** Show the project's spend and savings; needs an open project. */
-function openCost() {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "cost" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
-  }));
-}
-
-/** Show the project's code graph; needs an open project. */
-function openGraph() {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "graph" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
-  }));
-}
-
-/** Show every board plan with its expandable details; needs an open project. */
-function openPlans() {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "plans" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
-  }));
-}
-
-/** Show the project's knowledge records and memories; needs an open project. */
-function openMemory() {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "memory" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
-  }));
-}
-
-/**
- * Open the Trace route — every model call, in detail. Optional filters carry
- * an entry point's hand-over (a worker from mission control, a lead turn
- * from the chat); the view consumes them once and they never enter a URL.
- */
-function openTrace(filters?: TraceEntry) {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "trace" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
-    traceEntry: filters ?? null,
-  }));
-}
-
-/** Clear a consumed Trace hand-over so returning to the route starts unfiltered. */
-function clearTraceEntry() {
-  app.update((state) => (state.traceEntry === null ? state : { ...state, traceEntry: null }));
-}
-
-/**
- * Open a plan document: the Memory tab's link to `.coding/plans/<id>.md`. The
- * Plans route expands the plan, reads its document and scrolls it into view;
- * an id the board does not hold shows a short not-found note.
- */
-function openPlanDocument(planId: string) {
-  const id = planId.trim();
-  if (id === "") return;
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "plans" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
-    planDocumentId: id,
-  }));
-}
-
-/** Clear a consumed plan hand-over so returning to the route starts collapsed. */
-function clearPlanDocument() {
-  app.update((state) => (state.planDocumentId === null ? state : { ...state, planDocumentId: null }));
-}
-
-/**
- * Open a project file in the Workbench: the Memory tab's link to a path a
- * record names. The Files tab reads it through its own `openPath` and reveals
- * `line` when the reference carries one.
- */
-function openFileInWorkbench(path: string, line: number | null = null) {
-  const target = path.trim();
-  if (target === "") return;
-  const at = line !== null && Number.isInteger(line) && line > 0 ? line : null;
-  openWorkbench("files");
-  app.update((state) => ({ ...state, workbenchFile: { path: target, line: at } }));
-}
-
-/** Clear a consumed file hand-over so returning to the tab opens the tree. */
-function clearWorkbenchFile() {
-  app.update((state) => (state.workbenchFile === null ? state : { ...state, workbenchFile: null }));
-}
-
-/**
- * Open a repository path a Markdown view names: a plan document goes to the
- * Plans route, anything else to the Workbench's Files tab at its line. This is
- * the one action every Markdown surface passes as `onOpenPath`.
- */
-function openRepoPath(ref: RepoPathRef) {
-  if (ref.kind === "plan" && ref.planId !== null) openPlanDocument(ref.planId);
-  else openFileInWorkbench(ref.path, ref.line);
-}
-
-function toggleTeamPeek() {
-  app.update((state) => ({ ...state, teamPeekOpen: !state.teamPeekOpen }));
-}
-
-function selectWorker(workerId: string) {
-  app.update((state) => {
-    if (!state.workers.some((worker) => worker.id === workerId)) return state;
-    return {
-      ...state,
-      route: "team",
-      selectedWorkerId: workerId,
-      teamPeekOpen: false,
-      workbenchOpen: false,
-    };
-  });
-}
-
-function setTeamFilter(teamFilter: TeamFilter) {
-  app.update((state) => ({ ...state, teamFilter }));
-}
-
-/**
- * Stream a worker's output beside the lead chat. The route stays on "lead",
- * the Workbench gives way, and unknown ids are ignored.
- */
-function openWorkerPanel(workerId: string) {
-  app.update((state) => {
-    if (!state.workers.some((worker) => worker.id === workerId)) return state;
-    return {
-      ...state,
-      route: state.projectId ? "lead" : state.route,
-      teamPeekOpen: false,
-      workbenchOpen: false,
-      workerPanelId: workerId,
-    };
-  });
-}
-
-/** Close the lead-side worker output panel; the Workbench stays closed. */
-function closeWorkerPanel() {
-  app.update((state) => ({ ...state, workerPanelId: null }));
-}
-
-async function refreshDiff(): Promise<void> {
-  const current = get(app);
-  const workerId = current.diffWorkerId ?? current.selectedWorkerId ?? current.workers[0]?.id;
-  if (!workerId) {
-    diffRequest += 1;
-    app.update((state) => ({
-      ...state,
-      diff: null,
-      diffFiles: [],
-      diffLoading: false,
-      diffError: null,
-    }));
-    return;
-  }
-  const transport = workbenchTransport ?? createWorkbenchTransport();
-  if (!transport) {
-    app.update((state) => ({
-      ...state,
-      diffLoading: false,
-      diffError: "Open Mnemo2's desktop app to read real worker diffs.",
-    }));
-    return;
-  }
-  workbenchTransport = transport;
-  const request = ++diffRequest;
-  const projectId = current.projectId;
-  app.update((state) => ({ ...state, diffWorkerId: workerId, diffLoading: true, diffError: null }));
-  try {
-    const snapshot = await transport.diff(workerId);
-    app.update((state) => {
-      if (
-        request !== diffRequest ||
-        state.projectId !== projectId ||
-        state.diffWorkerId !== workerId ||
-        workbenchTransport !== transport
-      ) return state;
-      return {
-        ...state,
-        diff: snapshot,
-        diffFiles: snapshot.files,
-        diffLoading: false,
-        workers: state.workers.map((worker) => worker.id === workerId ? {
-          ...worker,
-          files: snapshot.files.map((file) => file.path),
-          diff: {
-            files: snapshot.total_files,
-            additions: snapshot.total_additions,
-            deletions: snapshot.total_deletions,
-          },
-        } : worker),
-      };
-    });
-  } catch (error) {
-    app.update((state) => {
-      if (request !== diffRequest || state.projectId !== projectId) return state;
-      return {
-        ...state,
-        diff: null,
-        diffFiles: [],
-        diffLoading: false,
-        diffError: leadError(error),
-      };
-    });
-  }
-}
-
-function scheduleDiffSync(): void {
-  const state = get(app);
-  if (!state.workbenchOpen || state.workbenchTab !== "diff" || diffSyncTimer) return;
-  diffSyncTimer = setTimeout(() => {
-    diffSyncTimer = null;
-    void refreshDiff();
-  }, 800);
-}
-
-function selectDiffWorker(workerId: string): void {
-  if (!get(app).workers.some((worker) => worker.id === workerId)) return;
-  app.update((state) => ({
-    ...state,
-    diffWorkerId: workerId,
-    diff: null,
-    diffFiles: [],
-    diffError: null,
-  }));
-  schedulePreferenceSave();
-  void refreshDiff();
-}
-
-function openWorkerDiff(workerId: string): void {
-  if (!get(app).workers.some((worker) => worker.id === workerId)) return;
-  app.update((state) => ({
-    ...state,
-    diffWorkerId: workerId,
-    diff: null,
-    diffFiles: [],
-    diffError: null,
-  }));
-  openWorkbench("diff");
-}
-
-function openWorkbench(workbenchTab: WorkbenchTab = "browser") {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "lead" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: true,
-    workerPanelId: null,
-    workbenchTab,
-  }));
-  if (workbenchTab === "diff" && get(app).leadRuntime.mode === "native") void refreshDiff();
-  schedulePreferenceSave();
-}
-
-function closeWorkbench() {
-  app.update((state) => ({ ...state, workbenchOpen: false }));
-  schedulePreferenceSave();
-}
-
-function setWorkbenchTab(workbenchTab: WorkbenchTab) {
-  app.update((state) => ({ ...state, workbenchOpen: true, workerPanelId: null, workbenchTab }));
-  if (workbenchTab === "diff" && get(app).leadRuntime.mode === "native") void refreshDiff();
-  schedulePreferenceSave();
-}
-
-function setWorkbenchWidth(workbenchWidth: number) {
-  app.update((state) => ({
-    ...state,
-    workbenchWidth: clampWorkbenchWidth(workbenchWidth, viewportWidth()),
-  }));
-  schedulePreferenceSave();
-}
-
-/**
- * Re-clamp a saved or dragged width after the window shrank, so a wide panel
- * never squeezes the lead below its minimum. No-op while the width still fits.
- */
-function reclampWorkbenchWidth(windowWidth: number = viewportWidth()) {
-  let changed = false;
-  app.update((state) => {
-    const workbenchWidth = clampWorkbenchWidth(state.workbenchWidth, windowWidth);
-    if (workbenchWidth === state.workbenchWidth) return state;
-    changed = true;
-    return { ...state, workbenchWidth };
-  });
-  if (changed) schedulePreferenceSave();
-}
-
-/** Drag the mission-control divider; `null` restores the default proportion. */
-function setBoardWidth(boardWidth: number | null) {
-  app.update((state) => ({
-    ...state,
-    boardWidth: boardWidth === null ? null : clampBoardWidth(boardWidth, viewportWidth()),
-  }));
-  schedulePreferenceSave();
-}
-
-/**
- * Re-clamp a saved or dragged list width after the window shrank, so the worker
- * output never falls below its minimum. A default proportion adapts by itself.
- */
-function reclampBoardWidth(windowWidth: number = viewportWidth()) {
-  let changed = false;
-  app.update((state) => {
-    if (state.boardWidth === null) return state;
-    const boardWidth = clampBoardWidth(state.boardWidth, windowWidth);
-    if (boardWidth === state.boardWidth) return state;
-    changed = true;
-    return { ...state, boardWidth };
-  });
-  if (changed) schedulePreferenceSave();
-}
-
-function approximateBrowserUrl(value: string): string {
-  if (/^https?:\/\//i.test(value)) return value;
-  if (/^(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(value)) return `http://${value}`;
-  return `https://${value}`;
-}
-
-function applyBrowserSnapshot(snapshot: { supported: boolean; url: string; title: string; loading: boolean }): void {
-  app.update((state) => ({
-    ...state,
-    browserSupported: snapshot.supported,
-    browserUrl: snapshot.url,
-    browserTitle: snapshot.title,
-    browserLoading: snapshot.loading,
-  }));
-  schedulePreferenceSave();
-}
-
-async function connectBrowser(): Promise<BrowserTransport | null> {
-  if (browserTransport) return browserTransport;
-  const transport = createBrowserTransport();
-  if (!transport) return null;
-  const token = ++browserToken;
-  if (!(await probeMnemo2Host()) || token !== browserToken) return null;
-  browserTransport = transport;
-  try {
-    const [supported, snapshot, unlisten, openUnlisten] = await Promise.all([
-      transport.supported(),
-      transport.snapshot(),
-      transport.onEvent((event) => {
-        if (token === browserToken) applyBrowserSnapshot(event);
-      }),
-      transport.onOpenRequest((event) => {
-        if (token === browserToken) void navigateBrowser(event.url);
-      }),
-    ]);
-    if (token !== browserToken) {
-      unlisten();
-      openUnlisten();
-      return null;
-    }
-    browserUnlisten = [unlisten, openUnlisten];
-    app.update((state) => ({
-      ...state,
-      browserSupported: supported,
-      browserUrl: snapshot.url === "about:blank" ? state.browserUrl : snapshot.url,
-      browserTitle: snapshot.title,
-      browserLoading: snapshot.loading,
-      browserError: null,
-    }));
-    return transport;
-  } catch (error) {
-    if (token === browserToken) {
-      browserTransport = null;
-      app.update((state) => ({ ...state, browserError: leadError(error) }));
-    }
-    return null;
-  }
-}
-
-async function browserCommand(operation: (transport: BrowserTransport) => Promise<unknown>): Promise<void> {
-  const transport = await connectBrowser();
-  if (!transport) return;
-  try {
-    await operation(transport);
-  } catch (error) {
-    app.update((state) => ({ ...state, browserError: leadError(error) }));
-  }
-}
-
-function ensureBrowser(rect: Parameters<BrowserTransport["ensure"]>[0], url: string): Promise<void> {
-  return browserCommand(async (transport) => {
-    await transport.ensure(rect, url);
-  });
-}
-
-function setBrowserRect(rect: Parameters<BrowserTransport["setRect"]>[0]): Promise<void> {
-  return browserCommand((transport) => transport.setRect(rect));
-}
-
-function setBrowserVisible(visible: boolean): Promise<void> {
-  browserTabWantsPane = visible;
-  return pushBrowserVisibility();
-}
-
-function browserOverlay(enter: boolean): void {
-  void browserCommand((transport) => transport.overlay(enter));
-}
-
-function browserBack(): void {
-  void browserCommand((transport) => transport.history("back"));
-}
-
-function browserForward(): void {
-  void browserCommand((transport) => transport.history("forward"));
-}
-
-function browserReload(): void {
-  void browserCommand((transport) => transport.reload());
-}
-
-function openExternalBrowser(): void {
-  const url = get(app).browserUrl;
-  if (url === "about:blank") return;
-  if (!createBrowserTransport()) {
-    window.open(url, "_blank", "noopener,noreferrer");
-    return;
-  }
-  void browserCommand((transport) => transport.openExternal(url));
-}
-
-function openBrowser(url: string): void {
-  void navigateBrowser(url);
-}
-
-async function navigateBrowser(url: string): Promise<void> {
-  const value = url.trim();
-  if (!value) return;
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "lead" : state.route,
-    browserUrl: approximateBrowserUrl(value),
-    browserTitle: "",
-    browserImage: null,
-    browserError: null,
-    workbenchOpen: true,
-    workbenchTab: "browser",
-  }));
-  schedulePreferenceSave();
-  const transport = await connectBrowser();
-  if (!transport) return;
-  try {
-    await transport.navigate(value);
-  } catch (error) {
-    app.update((state) => ({ ...state, browserError: leadError(error) }));
-  }
-}
-
-async function openScreenshot(workerId: string, path: string): Promise<void> {
-  const transport = workbenchTransport ?? createWorkbenchTransport();
-  if (!transport) {
-    app.update((state) => ({ ...state, browserError: "Screenshots need the native shell." }));
-    return;
-  }
-  workbenchTransport = transport;
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "lead" : state.route,
-    workbenchOpen: true,
-    workbenchTab: "browser",
-    browserImage: { dataUrl: "", label: path.split("/").pop() ?? "Worker screenshot" },
-    browserLoading: true,
-    browserError: null,
-  }));
-  try {
-    const dataUrl = await transport.screenshot(workerId, path);
-    app.update((state) => ({
-      ...state,
-      browserImage: state.browserImage ? { ...state.browserImage, dataUrl } : null,
-      browserLoading: false,
-    }));
-  } catch (error) {
-    app.update((state) => ({
-      ...state,
-      browserImage: null,
-      browserLoading: false,
-      browserError: leadError(error),
-    }));
-  }
-}
-
-function closeScreenshot(): void {
-  app.update((state) => ({ ...state, browserImage: null }));
 }
 
 /**
@@ -2464,11 +1853,7 @@ function dismissToast() {
 }
 
 function resetDemo() {
-  preferenceSave = null;
-  if (preferenceTimer) {
-    clearTimeout(preferenceTimer);
-    preferenceTimer = null;
-  }
+  discardPendingPreferences();
   leadSessionToken += 1;
   void stopNativeLead();
   void disconnectTeam();

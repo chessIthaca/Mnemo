@@ -1,6 +1,7 @@
 # plan-board
 
 ## Purpose
+How the plan board ties plans to the project's OpenSpec current-state specs: plan_create and plan_update refuse steps that touch a capability's governed files unless the plan carries a spec delta or an explicit no-spec-impact declaration.
 
 ## Requirements
 

@@ -1,6 +1,7 @@
 # llm-trace
 
 ## Purpose
+What the Trace tab records for every model call the engine makes, the lead's and each worker's alike: attribution, phase timings, live status and agent scoping, so calls can be inspected, filtered and exported.
 
 ## Requirements
 

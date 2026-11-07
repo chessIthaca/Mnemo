@@ -446,5 +446,4 @@ impl TeamRuntime {
         }
         self.start_worker(record).await
     }
-
 }

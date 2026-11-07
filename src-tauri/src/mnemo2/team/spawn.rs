@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mnemo::{PermissionPolicy, route_question};
 use mnemo::app::worktrees::{agent_short_id, current_branch, provision_agent_worktree};
 use mnemo::headless::{AgentSession, SessionCommand, SpawnOptions, Transcript};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
+use mnemo::{PermissionPolicy, route_question};
 
 use crate::mnemo2::phase3;
 
@@ -433,5 +433,4 @@ impl TeamRuntime {
             }
         }
     }
-
 }

@@ -2,20 +2,25 @@ use super::*;
 
 use std::collections::VecDeque;
 
-use mnemo::app::worktrees::provision_agent_worktree;
+use mnemo::app::worktrees::{agent_branch, agent_short_id, provision_agent_worktree};
 use mnemo::headless::{GateVerdict, Transcript};
 use mnemo::tool::{SafetyLevel, ToolResult};
 use serde_json::{json, Value};
 
-use crate::mnemo2::dispatch_routing::{outcome_label, DispatchRoutingRow};
-use crate::mnemo2::phase3::{Finding, ReviewEvidence, ReviewRecord};
+use crate::mnemo2::dispatch_routing::{outcome_label, DispatchRoutingRow, RoutingMode};
+use crate::mnemo2::phase3::{Finding, MergeRecord, ReviewEvidence, ReviewRecord};
 
 use super::control::recover_worker;
+use super::deletion::{
+    branch_exists, checkout_is_registered, move_checkout_to_trash, sweep_trash, trash_entries,
+    validated_checkout, worker_checkout, worktree_list_paths,
+};
 use super::dispatch::{
     dispatch_routing_line, require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
 };
 use super::guardrails::executor_guardrails;
 use super::lead_tools::worker_status_view;
+use super::merge::{delete_merged_branch, validate_merge, WORKTREE_CLEANUP_ERROR};
 use super::nudge::{note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
 use super::persistence::{PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE};
 use super::pump::{cost_notice_due, usage_cost_micros, worker_host_tool_result};

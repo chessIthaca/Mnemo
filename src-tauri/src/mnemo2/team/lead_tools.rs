@@ -532,10 +532,15 @@ impl TeamRuntime {
     }
 }
 
+/// Strip every transcript, plus the transcript-revision bookkeeping only the
+/// window's own sync uses, from a tool answer handed to a lead session or an
+/// external client.
 fn without_transcripts(value: &mut Value) {
     match value {
         Value::Object(object) => {
             object.remove("transcript");
+            object.remove("transcript_revs");
+            object.remove("omitted_transcripts");
             for nested in object.values_mut() {
                 without_transcripts(nested);
             }

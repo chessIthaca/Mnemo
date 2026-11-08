@@ -19,7 +19,7 @@ use std::sync::Arc;
 use mnemo::app::plan_board::{BoardPlan, BoardStatus, BoardStep, PlanBoard};
 use mnemo::route_question;
 use mnemo::headless::{
-    AgentSession, Engine, SessionEvent, SessionId,
+    AgentSession, Engine, SessionEvent, SessionId, Transcript,
 };
 use mnemo::EmbedderGetter;
 use mnemo::RouteKnn;
@@ -157,6 +157,20 @@ pub struct BoardSnapshot {
     pub plans: Vec<BoardPlanView>,
 }
 
+/// The next per-worker transcript revision.
+///
+/// A revision names one immutable transcript value: a worker always replaces
+/// its transcript with a fresh `Arc`, so a cached revision is reused only
+/// while the pointer still matches. The counter is process-global and never
+/// reset, so revisions stay unique across reopened runtimes.
+static TRANSCRIPT_REVS: AtomicU64 = AtomicU64::new(1);
+
+/// Each worker's current transcript value with the revision that describes it,
+/// keyed by worker id. A sync reuses the revision only while the cached `Arc`
+/// is the same allocation as the worker's transcript, so a replaced transcript
+/// is detected by pointer identity alone.
+type TranscriptRevisionCache = HashMap<String, (Arc<Transcript>, u64)>;
+
 /// The team's public snapshot.
 #[derive(Clone, Debug, Serialize)]
 pub struct TeamSnapshot {
@@ -169,6 +183,13 @@ pub struct TeamSnapshot {
     /// Durable per-project usage and estimated cost across the lead and
     /// every worker; totals survive restarts and worker deletion.
     pub usage: ProjectUsageView,
+    /// Each worker's transcript revision; it changes whenever that worker's
+    /// transcript is replaced. The window sends back the revisions it holds.
+    pub transcript_revs: HashMap<String, u64>,
+    /// Workers whose transcript was left out (sent empty) because the caller
+    /// already holds that revision.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub omitted_transcripts: Vec<String>,
 }
 
 /// One event forwarded from a worker session, tagged with its worker id.
@@ -307,6 +328,10 @@ pub struct TeamRuntime {
     /// usage recording, and cleanup so no usage report can be lost to a
     /// stale interleaving of concurrent ledger saves.
     save_lock: Arc<Mutex<()>>,
+    /// The transcript revision handed to each worker's current transcript
+    /// value, cached beside the `Arc` it describes so a sync can tell which
+    /// transcripts the window already holds.
+    transcript_revs: Arc<std::sync::Mutex<TranscriptRevisionCache>>,
     board: std::sync::Mutex<Option<Arc<PlanBoard>>>,
     signals: broadcast::Sender<BoardSignal>,
     /// The external lead's attach flag, notice queue and activity clock.
@@ -387,6 +412,7 @@ impl TeamRuntime {
             persistence,
             usage: Arc::new(Mutex::new(usage)),
             save_lock: Arc::new(Mutex::new(())),
+            transcript_revs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             board: std::sync::Mutex::new(None),
             signals,
             external: std::sync::Mutex::new(ExternalLead::default()),
@@ -648,9 +674,61 @@ impl TeamRuntime {
         self.usage.lock().await.clone()
     }
 
-    /// The current team state.
+    /// The current team state, every worker's transcript included.
+    ///
+    /// Callers that only show or report the ledger (set_slots, deletion, the
+    /// lead's MCP tools) want this; the window's sync path calls
+    /// [`TeamRuntime::snapshot_known`] so it never re-receives transcripts it
+    /// already holds.
     pub async fn snapshot(&self) -> TeamSnapshot {
-        let workers = self.records.lock().await.clone();
+        self.snapshot_known(&HashMap::new()).await
+    }
+
+    /// The current team state, without the transcripts the caller holds.
+    ///
+    /// `known` maps a worker id to the transcript revision the caller already
+    /// received. A worker whose transcript is still that revision comes back
+    /// with an empty transcript and its id in
+    /// [`TeamSnapshot::omitted_transcripts`]; every other worker travels in
+    /// full. Revisions are cached beside the `Arc` they describe, so an
+    /// unchanged transcript costs nothing and a replaced one is detected by
+    /// pointer identity alone.
+    pub async fn snapshot_known(&self, known: &HashMap<String, u64>) -> TeamSnapshot {
+        let mut transcript_revs = HashMap::new();
+        let mut omitted_transcripts = Vec::new();
+        let workers = {
+            let records = self.records.lock().await;
+            // The revision cache is a plain std mutex: held only for the
+            // clone-and-store below, never across an await.
+            let mut revisions = self
+                .transcript_revs
+                .lock()
+                .expect("transcript revision lock poisoned");
+            let workers: Vec<WorkerRecord> = records
+                .iter()
+                .map(|record| {
+                    let mut record = record.clone();
+                    let rev = match revisions.get(&record.id) {
+                        Some((cached, rev)) if Arc::ptr_eq(cached, &record.transcript) => *rev,
+                        _ => {
+                            let rev = TRANSCRIPT_REVS.fetch_add(1, Ordering::SeqCst);
+                            revisions
+                                .insert(record.id.clone(), (Arc::clone(&record.transcript), rev));
+                            rev
+                        }
+                    };
+                    if known.get(&record.id) == Some(&rev) {
+                        record.transcript = Arc::default();
+                        omitted_transcripts.push(record.id.clone());
+                    }
+                    transcript_revs.insert(record.id.clone(), rev);
+                    record
+                })
+                .collect();
+            // Forget the revisions of workers the ledger no longer has.
+            revisions.retain(|id, _| transcript_revs.contains_key(id));
+            workers
+        };
         let active = self.live.lock().await.len();
         let usage = self.usage.lock().await.clone();
         let pricing = self
@@ -663,6 +741,8 @@ impl TeamRuntime {
             slots: self.persistence.slots.load(Ordering::SeqCst),
             active,
             usage: usage.view(&pricing),
+            transcript_revs,
+            omitted_transcripts,
         }
     }
 

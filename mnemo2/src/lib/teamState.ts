@@ -240,6 +240,52 @@ export interface TeamSnapshot {
   active: number;
   /** Durable usage for the whole project, including lead and deleted workers. */
   usage: ProjectUsageView;
+  /**
+   * Each worker's transcript revision as of this snapshot. The window sends
+   * back the revisions it holds so the host can leave those transcripts out.
+   */
+  transcript_revs?: Record<string, number>;
+  /** Workers whose transcript was left out because the window already holds it. */
+  omitted_transcripts?: string[];
+}
+
+/** One worker transcript as the window holds it, with the revision it came from. */
+export interface CachedTranscript {
+  rev: number;
+  transcript: TeamWorkerRecord["transcript"];
+}
+
+/**
+ * Put back the transcripts the host left out because the window holds them,
+ * and remember the ones it sent. Returns null when a left-out transcript is
+ * missing from the cache (or its revision differs): the caller then clears
+ * the cache and asks again for everything.
+ */
+export function restoreTranscripts(
+  snapshot: TeamSnapshot,
+  cache: Map<string, CachedTranscript>,
+): TeamSnapshot | null {
+  const omitted = new Set(snapshot.omitted_transcripts ?? []);
+  const revisions = snapshot.transcript_revs;
+  const workers: TeamWorkerRecord[] = [];
+  for (const record of snapshot.workers) {
+    if (omitted.has(record.id)) {
+      const cached = cache.get(record.id);
+      if (!cached || cached.rev !== revisions?.[record.id]) return null;
+      workers.push({ ...record, transcript: cached.transcript });
+      continue;
+    }
+    const rev = revisions?.[record.id];
+    if (typeof rev === "number") {
+      cache.set(record.id, { rev, transcript: record.transcript });
+    }
+    workers.push(record);
+  }
+  const ids = new Set(snapshot.workers.map((record) => record.id));
+  for (const id of [...cache.keys()]) {
+    if (!ids.has(id)) cache.delete(id);
+  }
+  return { ...snapshot, workers };
 }
 
 export interface TeamMessage {

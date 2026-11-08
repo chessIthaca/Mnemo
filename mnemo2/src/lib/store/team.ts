@@ -13,6 +13,8 @@ import { applyWorkerEvent, applyWorkerStatus } from "../workerActivity";
 import { notifySound, workerTransitionSound } from "../sounds";
 import {
   projectUsageFrom,
+  restoreTranscripts,
+  type CachedTranscript,
   type TeamEvent,
   type TeamMessage,
   type TeamWorkerRecord,
@@ -63,6 +65,8 @@ function workerFromRecord(
 const workerLive = new Map<string, WorkerLive>();
 /** Each worker's saved thread and the record it came from. */
 const workerSaved = new Map<string, { generation: number; length: number; thread: Worker["messages"] }>();
+/** Each worker's transcript the last team snapshots delivered, keyed by worker id. */
+const transcriptCache = new Map<string, CachedTranscript>();
 
 /** A worker's thread: its saved conversation plus the live tail on top. */
 function composeThread(workerId: string): Worker["messages"] | null {
@@ -176,12 +180,24 @@ export async function syncTeam(): Promise<void> {
   if (!transport) return;
   const token = teamToken;
   const projectId = get(app).projectId;
+  // Tell the host which transcript revisions the window already holds: it
+  // leaves those workers' transcripts out and the cache puts them back below.
+  const known: Record<string, number> = {};
+  for (const [id, cached] of transcriptCache) known[id] = cached.rev;
   try {
-    const [snapshot, messages] = await Promise.all([
-      transport.snapshot(),
+    const [raw, messages] = await Promise.all([
+      transport.snapshot(known),
       transport.messages(),
     ]);
     if (token !== teamToken) return;
+    const snapshot = restoreTranscripts(raw, transcriptCache);
+    if (!snapshot) {
+      // The host holds a thread the window cannot rebuild: drop the cache and
+      // ask again for everything.
+      transcriptCache.clear();
+      scheduleTeamSync();
+      return;
+    }
     // Merges tick steps and workers move through statuses; the board follows.
     const before = new Map(get(app).workers.map((worker) => [worker.id, worker]));
     const boardStale =
@@ -263,6 +279,7 @@ export async function disconnectTeam(): Promise<void> {
   teamToken += 1;
   workerLive.clear();
   workerSaved.clear();
+  transcriptCache.clear();
   workerActivity.clear();
   if (teamSyncTimer) {
     clearTimeout(teamSyncTimer);

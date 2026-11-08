@@ -8754,3 +8754,57 @@ fn a_refresh_that_read_the_tip_before_the_review_keeps_that_review() {
     assert!(worker.review.is_none(), "an older review is cleared");
     assert!(worker.checks.is_empty(), "and so are its checks");
 }
+
+/// `session_search` is offered to the lead only and answers from the real
+/// per-worker transcript files under the state directory.
+#[tokio::test]
+async fn session_search_is_a_lead_tool_and_answers() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    assert!(
+        team.lead_host_tools()
+            .iter()
+            .any(|tool| tool.name == "session_search"),
+        "the lead is offered session_search"
+    );
+    assert!(
+        !team
+            .worker_host_tools()
+            .iter()
+            .any(|tool| tool.name == "session_search"),
+        "a worker is not offered session_search"
+    );
+
+    std::fs::create_dir_all(state.path().join("transcripts")).expect("transcripts dir");
+    std::fs::write(
+        state.path().join("transcripts").join("agent-abc.json"),
+        json!({
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "the flux capacitor test flaked twice"}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write the transcript");
+
+    let found = team
+        .handle_lead_host_tool("session_search", json!({"query": "flux capacitor"}))
+        .await;
+    assert!(found.success, "{}", found.output);
+    assert!(found.output.starts_with("1 matches"), "{}", found.output);
+    assert!(found.output.contains("agent-abc #1 user:"), "{}", found.output);
+    assert!(found.output.contains("flaked"), "{}", found.output);
+
+    let one = team
+        .handle_lead_host_tool("session_search", json!({"worker": "agent-abc", "seq": 1}))
+        .await;
+    assert!(one.success, "{}", one.output);
+    assert!(one.output.starts_with("agent-abc #1 user"), "{}", one.output);
+    assert!(one.output.contains("flaked"), "{}", one.output);
+
+    team.shutdown().await;
+}

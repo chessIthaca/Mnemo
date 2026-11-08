@@ -55,6 +55,9 @@ pub mod backlog;
 /// The lead's team ledger for the TeamLead workflow.
 pub(crate) mod ledger;
 
+/// Host-side batching of streamed deltas before they cross into the window.
+pub(crate) mod delta_batch;
+
 /// The typed Tauri command surface for the lead conversation.
 pub mod ipc;
 

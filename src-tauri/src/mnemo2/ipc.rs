@@ -37,6 +37,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use mnemo::{Approval, UserAnswer};
 
+use crate::mnemo2::delta_batch::forward_batched;
 use crate::mnemo2::mcp_server::{McpServer, OpenFailure};
 use crate::mnemo2::phase3::{Finding, ReviewEvidence};
 use crate::mnemo2::project::{self, ProjectPreferences, ProjectRecord};
@@ -361,18 +362,27 @@ fn notification_key(worker: &WorkerRecord) -> String {
     )
 }
 
-async fn notify_worker_event(
-    app: &AppHandle,
-    team: &Arc<TeamRuntime>,
-    event: &crate::mnemo2::team::TeamEvent,
-) {
-    if !matches!(
+/// Whether a team event is one the desktop notification path acts on: a
+/// worker finishing, a final (non-retrying) error, an approval request, or
+/// a user question.
+fn wants_notification(event: &crate::mnemo2::team::TeamEvent) -> bool {
+    matches!(
         &event.event.event,
         mnemo::SerializableAgentEvent::Finished { .. }
             | mnemo::SerializableAgentEvent::Error { retrying: false, .. }
             | mnemo::SerializableAgentEvent::ApprovalRequest { .. }
             | mnemo::SerializableAgentEvent::UserQuestion { .. }
-    ) {
+    )
+}
+
+/// Show the desktop notification for a worker's attention-worthy event
+/// (see [`wants_notification`]), once per worker state.
+async fn notify_worker_event(
+    app: &AppHandle,
+    team: &Arc<TeamRuntime>,
+    event: &crate::mnemo2::team::TeamEvent,
+) {
+    if !wants_notification(event) {
         return;
     }
     let Ok(worker) = team.worker(&event.worker_id).await else {
@@ -614,19 +624,11 @@ pub async fn lead_open(
     *state.marker_root.lock().await = Some(root.clone());
     *state.preferences.lock().await = Some((root.clone(), preferences));
     state.notified.lock().await.clear();
-    let mut events = runtime.subscribe();
+    let events = runtime.subscribe();
     let app_handle = app.clone();
-    let forwarder = tauri::async_runtime::spawn(async move {
-        loop {
-            match events.recv().await {
-                Ok(event) => {
-                    let _ = app_handle.emit(LEAD_EVENT_CHANNEL, &event);
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    let forwarder = tauri::async_runtime::spawn(forward_batched(events, move |event| {
+        let _ = app_handle.emit(LEAD_EVENT_CHANNEL, &event);
+    }));
     let team = match runtime.team_handle().await {
         Ok(team) => team,
         Err(error) => {
@@ -669,20 +671,22 @@ pub async fn lead_open(
     if let Err(error) = runtime.start_laya_check(false).await {
         eprintln!("mnemo2: the Laya check could not start: {error}");
     }
-    let mut team_events = team.subscribe();
+    let team_events = team.subscribe();
     let team_app = app.clone();
-    let team_forwarder = tauri::async_runtime::spawn(async move {
-        loop {
-            match team_events.recv().await {
-                Ok(event) => {
-                    let _ = team_app.emit(TEAM_EVENT_CHANNEL, &event);
-                    notify_worker_event(&team_app, &team, &event).await;
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+    let team_forwarder = tauri::async_runtime::spawn(forward_batched(
+        team_events,
+        move |event| {
+            let _ = team_app.emit(TEAM_EVENT_CHANNEL, &event);
+            // A slow desktop notification must never delay the next
+            // event: only attention-worthy events spawn their own task.
+            if wants_notification(&event) {
+                let (app, team, event) = (team_app.clone(), team.clone(), event);
+                tauri::async_runtime::spawn(async move {
+                    notify_worker_event(&app, &team, &event).await;
+                });
             }
-        }
-    });
+        },
+    ));
     *state.runtime.lock().await = Some(runtime);
     *state.forwarder.lock().await = Some(forwarder);
     *state.team_forwarder.lock().await = Some(team_forwarder);

@@ -466,6 +466,47 @@ fn a_young_ledger_temp_survives_a_load() {
     assert_eq!(loaded.workers.len(), 1);
 }
 
+#[test]
+fn a_reader_never_sees_the_ledger_missing() {
+    // Regression: a save replaces the ledger atomically. Moving the live ledger
+    // aside first left `team.json` absent for a window a reader could observe,
+    // and a concurrent `decode` would report "no ledger".
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = Arc::new(TeamPersistence::new(dir.path()));
+    let team = PersistedTeam {
+        workers: vec![worker(root.path(), "00000007000000000007")],
+        slots: Some(4),
+        usage: ProjectUsage::default(),
+    };
+    persistence.save(&team).expect("first save");
+
+    let writer = {
+        let persistence = Arc::clone(&persistence);
+        let team = team.clone();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                persistence.save(&team).expect("save the ledger");
+            }
+        })
+    };
+    let path = dir.path().join(TEAM_STATE_FILE);
+    let mut reads = 0_u32;
+    while !writer.is_finished() {
+        match std::fs::read(&path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                panic!("team.json was missing while a save replaced it");
+            }
+            // A share violation while the file is being replaced is fine.
+            Err(_) => {}
+        }
+        reads += 1;
+    }
+    writer.join().expect("the writer finishes");
+    assert!(reads > 0, "the reader ran while the writer was saving");
+}
+
 #[tokio::test]
 async fn usage_reports_reach_the_ledger_within_the_flush_delay() {
     // Regression (PERF-2): every usage report used to rewrite the whole

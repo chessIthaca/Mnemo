@@ -225,51 +225,27 @@ impl TeamPersistence {
         ));
         retry_io(|| std::fs::write(&temp, &bytes))
             .map_err(|err| format!("could not write the team ledger: {err}"))?;
+        // Replace the ledger, never move it aside first: `rename` swaps the
+        // target atomically, so a reader (a concurrent `decode`) can never find
+        // `team.json` missing and read that as "no ledger".
         let backup = self.path.with_extension("json.bak");
-        if !self.path.exists() && backup.exists() {
-            match retry_io(|| std::fs::rename(&backup, &self.path)) {
-                Ok(()) => {}
-                // Another writer restored the ledger first: its snapshot stands.
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(format!("could not restore the team ledger backup: {err}"));
-                }
-            }
-        }
-        if backup.exists() {
-            match retry_io(|| std::fs::remove_file(&backup)) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(format!("could not clear the old team ledger backup: {err}"));
-                }
-            }
-        }
-        if self.path.exists() {
-            match retry_io(|| std::fs::rename(&self.path, &backup)) {
-                Ok(()) => {}
-                // Another writer moved the ledger between the check and the
-                // rename; every writer persists a consistent snapshot, so the
-                // newest temp still replaces it below.
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(format!("could not back up the team ledger: {err}")),
-            }
-        }
         let result = match retry_io(|| std::fs::rename(&temp, &self.path)) {
             Ok(()) => {
-                let _ = std::fs::remove_file(backup);
+                // A backup only survives an older build's crash or a failed
+                // save of ours; the replaced ledger makes it redundant.
+                let _ = std::fs::remove_file(&backup);
                 Ok(())
             }
             Err(err) => {
-                if backup.exists() {
-                    let _ = retry_io(|| std::fs::rename(&backup, &self.path));
-                }
+                // The ledger itself was never touched and still stands.
+                let _ = std::fs::remove_file(&temp);
                 Err(format!("could not replace the team ledger: {err}"))
             }
         };
         if result.is_ok() {
             // Only once team.json names the removed workers are their files
-            // unreachable: until then the backup ledger still needs them.
+            // unreachable: a save that did not replace the ledger still lists
+            // them.
             self.sweep_orphan_transcripts(team);
         }
         result

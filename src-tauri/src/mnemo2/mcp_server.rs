@@ -50,7 +50,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use mnemo::app::plan_board::BoardStatus;
+use mnemo::app::plan_board::{BoardStatus, NO_DURABLE_RECORD_NUDGE};
 use mnemo::tool::agent::sandbox::Sandbox;
 use mnemo::tool::agent::search::SearchTool;
 use mnemo::tool::agent::search_read::SearchReadTool;
@@ -75,7 +75,7 @@ pub const EXTERNAL_LEAD_CHANNEL: &str = "mnemo2://external-lead";
 /// The short lead brief MCP `initialize` returns. `{helper}` becomes the
 /// helper executable's path, so the lead can start the waiter without PATH.
 pub const LEAD_INSTRUCTIONS: &str = "You lead a Mnemo2 team for this project: workers run on the user's own endpoints in tiers (trivial/routine/medium/high/escalate); you plan, dispatch, review and merge with the team_* tools.\n\
-- Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs; memory_write SPEC:/DECISION:/HOW: learnings before close (see mnemo-lead skill).\n\
+- Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs; memory_write SPEC:/DECISION:/HOW: what the repository cannot show (see mnemo-lead skill).\n\
 - For code use search (or search_read) and graph_* before Grep or Glob; for project history and decisions use memory_search first.\n\
 - Plan first: plan_create (then plan_show, plan_update, plan_step_done). Each team_dispatch needs a plan_id and step; one worker per step with a precise brief and `tier` (tier beats model).\n\
 - A finished worker sends a notice: team_check, then team_review; close findings with team_resolve_finding; team_merge after the review passes.\n\
@@ -1206,8 +1206,12 @@ impl Shared {
                     );
                 }
             } else if name == "team_merge" {
-                result.output.push('\n');
-                result.output.push_str(EXTERNAL_LEAD_MEMORY_REMINDER);
+                // A close that nudged already names memory_write; the standing
+                // reminder would stack a second memory line on the same answer.
+                if !result.output.contains(NO_DURABLE_RECORD_NUDGE) {
+                    result.output.push('\n');
+                    result.output.push_str(EXTERNAL_LEAD_MEMORY_REMINDER);
+                }
             }
         }
         let mut text = if is_code_search_tool(name) {

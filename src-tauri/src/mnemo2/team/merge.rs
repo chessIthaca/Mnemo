@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use mnemo::app::plan_board::CloseOutcome;
+use mnemo::app::plan_board::{CloseOutcome, NO_DURABLE_RECORD_NUDGE};
 use mnemo::app::team_ledger::TeamLedger;
 use mnemo::app::worktrees::{agent_branch, current_branch, remove_agent_worktree};
 
@@ -696,6 +696,7 @@ impl TeamRuntime {
             CloseOutcome::Closed {
                 report_path,
                 retired_notes,
+                knowledge_nudge,
             } => {
                 let relative = project_relative(&self.workspace_root, &report_path);
                 lines.push(format!(
@@ -706,7 +707,11 @@ impl TeamRuntime {
                         "{retired_notes} plan-scoped memory note(s) were retired into that report. Read them and re-store any durable fact without plan or branch references."
                     ));
                 }
-                if self.external_lead_attached() {
+                // One memory line per close: the nudge when the plan
+                // established nothing durable, the standing reminder otherwise.
+                if knowledge_nudge {
+                    lines.push(NO_DURABLE_RECORD_NUDGE.to_string());
+                } else if self.external_lead_attached() {
                     lines.push(EXTERNAL_LEAD_MEMORY_REMINDER.to_string());
                 }
                 notice = Some(format!("closed:{plan_id}:{relative}"));

@@ -73,7 +73,7 @@ impl OpenSpecConfig {
                 return Err(format!("could not read '{}': {error}", path.display()));
             }
         };
-        let mut config: Self = serde_norway::from_str(&text)
+        let mut config = Self::parse(&text)
             .map_err(|error| format!("could not parse '{}': {error}", path.display()))?;
         config.warnings = config
             .extra
@@ -81,6 +81,16 @@ impl OpenSpecConfig {
             .map(|key| format!("{}: unknown field '{key}'", path.display()))
             .collect();
         Ok(config)
+    }
+
+    /// Parse `config.yaml` text. A file holding only comments, or nothing, is
+    /// the empty configuration.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let value: Value = serde_norway::from_str(text).map_err(|error| error.to_string())?;
+        if value.is_null() {
+            return Ok(Self::default());
+        }
+        serde_norway::from_str(text).map_err(|error| error.to_string())
     }
 }
 
@@ -633,5 +643,16 @@ mod tests {
         assert!(config.schema.is_none());
         assert!(config.context.is_empty());
         assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn parse_treats_a_comment_only_file_as_empty() {
+        for text in ["# only a comment\n", ""] {
+            let config = OpenSpecConfig::parse(text).expect("parse");
+            assert!(config.schema.is_none(), "{text:?}");
+            assert!(config.governed_files.is_empty(), "{text:?}");
+            assert!(config.context.is_empty(), "{text:?}");
+            assert!(config.rules.is_empty(), "{text:?}");
+        }
     }
 }

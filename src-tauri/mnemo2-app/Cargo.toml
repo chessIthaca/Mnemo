@@ -38,5 +38,9 @@ path = "src/mnemo2_mcp.rs"
 name = "mnemo2_route_eval"
 path = "examples/mnemo2_route_eval.rs"
 
+[[example]]
+name = "mnemo2_memory_eval"
+path = "examples/mnemo2_memory_eval.rs"
+
 [dev-dependencies]
 tempfile = "3"

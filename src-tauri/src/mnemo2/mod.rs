@@ -36,6 +36,11 @@ pub mod dispatch_routing;
 /// the Laya page's Run-eval button.
 pub mod route_eval;
 
+/// The memory recall eval's core (the hand-written question set, `score_run`,
+/// `memory_eval.json`) — shared by the `mnemo2-app` package's
+/// `mnemo2_memory_eval` example CLI (plan 373dec00, step 1).
+pub mod memory_eval;
+
 /// Best-effort naming of the processes holding a worker checkout's files.
 pub mod lock_holders;
 

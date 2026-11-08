@@ -565,6 +565,8 @@ pub fn run() {
             ipc::external_lead_status,
             ipc::external_open_failed,
             ipc::lead_open,
+            ipc::laya_learnings_offers,
+            ipc::laya_learnings_decide,
             laya_settings::laya_status,
             laya_settings::routing_settings_status,
             laya_settings::routing_log_summary,

@@ -3,9 +3,6 @@
 // See LICENSE in the repository root.
 
 #![deny(warnings)]
-// Wired in by the next step (export after a merge, the project-open check,
-// and the two commands); remove this allow with the wiring.
-#![allow(dead_code)]
 
 //! Laya's routing decisions travelling with the repository and the installer.
 //!

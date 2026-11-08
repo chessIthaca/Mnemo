@@ -449,6 +449,18 @@ impl TeamRuntime {
                     self.append_dispatch_routing_row(&row);
                 }
             }
+            // A project that keeps .coding/laya carries its decisions in git.
+            // Best effort and off the merge path: a failed export never fails
+            // a merge. It must follow the appends above, or the merge's own
+            // outcome row misses the bundle.
+            let (log, root) = (self.routing_log_path.clone(), self.workspace_root.clone());
+            let _export = tokio::task::spawn_blocking(move || {
+                if let Err(error) =
+                    crate::mnemo2::laya_learnings::export_project_learnings(&log, &root)
+                {
+                    eprintln!("mnemo2: could not refresh the Laya learnings: {error}");
+                }
+            });
         }
         Ok(record)
     }

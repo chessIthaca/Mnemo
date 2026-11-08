@@ -5795,6 +5795,167 @@ async fn merge_appends_an_outcome_with_the_derived_label() {
     team.shutdown().await;
 }
 
+/// A project that keeps `.coding/laya` carries its decisions in git: the
+/// merge refreshes the bundle with the outcome row it just appended.
+#[tokio::test]
+async fn a_merge_refreshes_the_project_learnings() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    std::fs::create_dir_all(root.path().join(".coding/laya")).expect("the learnings folder");
+    std::fs::create_dir_all(root.path().join(".coding/plans")).expect("the plans folder");
+    std::fs::write(root.path().join(".coding/plans/plan0001.md"), "# Plan\n").expect("plan file");
+    let mut worker = worker(root.path(), "00000002000000000002");
+    worker.status = WorkerStatus::InReview;
+    worker.plan_id = Some("plan0001".into());
+    worker.plan_step = Some(0);
+    worker.tier = Some("routine".into());
+    worker.model = Some("test/scripted-average".into());
+    worker.routing = Some(WorkerRouting {
+        laya_tier: Some("routine".into()),
+        confidence: Some(0.62),
+        cleared: true,
+        lead_tier: Some("routine".into()),
+        routed_by: "lead".into(),
+        ran_tier: Some("routine".into()),
+        nudged: None,
+    });
+    worker.reroutes = vec![DispatchRoutingRow::LeadReroute {
+        ts: 1,
+        worker_id: worker.id.clone(),
+        plan_id: "plan0001".into(),
+        step: 1,
+        from_tier: "routine".into(),
+        to_tier: "high".into(),
+        from_model: Some("test/scripted-average".into()),
+        to_model: Some("test/scripted-difficult".into()),
+        status: "idle".into(),
+        review_rounds: 0,
+        fix_rounds: 0,
+        nudged: false,
+    }];
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        worker.id.clone(),
+        "wt/mnemo".to_string(),
+    )
+    .await
+    .expect("provision the worker checkout");
+    std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+    run_git(&worker.worktree, &["add", "merged.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+    worker.checks = vec![WorkerCheck {
+        name: "cargo test --workspace".into(),
+        status: "passed".into(),
+        detail: None,
+        tip: tip.clone(),
+    }];
+    worker.review = Some(ReviewRecord {
+        summary: "reviewed".into(),
+        tip,
+        reviewed_at_ms: 1,
+        evidence: Some(evidence()),
+    });
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+    let merged = team.merge(&worker.id).await.expect("merge the worker");
+    assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+    // The export is best effort and off the merge path, so poll for it.
+    let bundle_path = root.path().join(".coding/laya/dispatch_routing.jsonl");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let bundle = std::fs::read_to_string(&bundle_path).unwrap_or_default();
+        let exported: Vec<DispatchRoutingRow> = bundle
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a bundle row"))
+            .collect();
+        let exported_outcome = exported.iter().any(|row| {
+            matches!(
+                row,
+                DispatchRoutingRow::Outcome {
+                    worker_id,
+                    plan_id,
+                    status,
+                    label: Some(label),
+                    ..
+                }
+                    if worker_id == "00000002000000000002"
+                        && plan_id == "plan0001"
+                        && status == "merged"
+                        && label == "high"
+            )
+        });
+        if exported_outcome {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the merge's outcome row reached the bundle: {bundle:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    team.shutdown().await;
+}
+
+/// A project without `.coding/laya` exports nothing: its decisions stay on
+/// this machine.
+#[tokio::test]
+async fn a_merge_without_the_folder_writes_no_learnings() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mut worker = worker(root.path(), "00000002000000000002");
+    worker.status = WorkerStatus::InReview;
+    worker.plan_id = Some("plan0001".into());
+    worker.plan_step = Some(0);
+    worker.tier = Some("routine".into());
+    worker.model = Some("test/scripted-average".into());
+    worker.routing = Some(WorkerRouting {
+        laya_tier: Some("routine".into()),
+        confidence: Some(0.62),
+        cleared: true,
+        lead_tier: Some("routine".into()),
+        routed_by: "lead".into(),
+        ran_tier: Some("routine".into()),
+        nudged: None,
+    });
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        worker.id.clone(),
+        "wt/mnemo".to_string(),
+    )
+    .await
+    .expect("provision the worker checkout");
+    std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+    run_git(&worker.worktree, &["add", "merged.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+    worker.checks = vec![WorkerCheck {
+        name: "cargo test --workspace".into(),
+        status: "passed".into(),
+        detail: None,
+        tip: tip.clone(),
+    }];
+    worker.review = Some(ReviewRecord {
+        summary: "reviewed".into(),
+        tip,
+        reviewed_at_ms: 1,
+        evidence: Some(evidence()),
+    });
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+    let merged = team.merge(&worker.id).await.expect("merge the worker");
+    assert!(matches!(merged.status, WorkerStatus::Merged), "{merged:?}");
+    // Give a stray export time to land before asserting it never happens.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !root.path().join(".coding/laya").exists(),
+        "a project without the folder exports nothing"
+    );
+    team.shutdown().await;
+}
+
 #[tokio::test]
 async fn failed_worker_outcome_has_no_label() {
     // Routing on, so the worker carries a decision and its terminal

@@ -4217,6 +4217,8 @@ struct StubDispatchClassifier {
     /// (1-based) and later wait until `open` reads true; earlier calls
     /// answer at once. `None`: no call ever waits.
     gate: Option<(usize, tokio::sync::watch::Receiver<bool>)>,
+    /// Every text Laya was asked about, in call order.
+    texts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl StubDispatchClassifier {
@@ -4226,6 +4228,7 @@ impl StubDispatchClassifier {
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             delay: std::time::Duration::ZERO,
             gate: None,
+            texts: std::sync::Arc::default(),
         }
     }
 
@@ -4249,15 +4252,23 @@ impl StubDispatchClassifier {
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    fn texts(&self) -> Vec<String> {
+        self.texts.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl mnemo::memory::Classifier for StubDispatchClassifier {
     async fn classify(
         &self,
-        _state: &str,
+        state: &str,
         _question: &mnemo::memory::Question,
     ) -> Option<mnemo::memory::Answer> {
+        self.texts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(state.to_string());
         let call = self
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -4863,6 +4874,54 @@ fn drift_message() -> String {
          so please be extra careful with the integration boundary and run the \
          full regression battery once more before you call the step done."
         .to_string()
+}
+
+/// An answer to a read-back in the shape the 2026-11-08 nudges fired on: long
+/// enough for the drift check, and it adds no work.
+const READ_BACK_ANSWER: &str = "Answers are in the plan's Decisions as the step's read-back answers: your proposals stand on all four questions, so proceed with the step as specified, implement it, run the verification commands and commit on your branch.";
+
+/// A nudge fixture whose Laya reads every text as hard, so any message that
+/// reaches the drift check nudges a routine worker.
+async fn hard_reading_nudge_fixture() -> (RoutingFixture, broadcast::Receiver<BoardSignal>) {
+    nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+        std::time::Duration::ZERO,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Send a lead message that adds real scope, wait for its drift nudge, and
+/// return every text Laya was asked about. The nudge is the sync point for the
+/// no-drift tests: drift checks take the routing permit one at a time in the
+/// order they were spawned, so a check an earlier message started has already
+/// asked Laya by the time this nudge lands.
+async fn classified_when_scope_nudges(fixture: &RoutingFixture) -> Vec<String> {
+    fixture
+        .team
+        .message("routingworker", drift_message(), MessageSender::ExternalLead)
+        .await
+        .expect("deliver the scope message");
+    let row = eventually(|| async {
+        fixture
+            .rows()
+            .into_iter()
+            .find(|row| matches!(row, DispatchRoutingRow::Nudge { .. }))
+    })
+    .await;
+    assert!(
+        matches!(
+            &row,
+            DispatchRoutingRow::Nudge { reason, from_tier, to_tier, .. }
+                if reason == "drift" && from_tier == "routine" && to_tier == "high"
+        ),
+        "the drift nudge row: {row:?}"
+    );
+    fixture.classifier.texts()
 }
 
 /// The session's consecutive-failing-batch cap — `MAX_RETRIES` in
@@ -5637,6 +5696,123 @@ async fn drift_never_blocks_the_message() {
         fixture.classifier.calls(),
         2,
         "the dispatch and the drift check each asked Laya once"
+    );
+    fixture.team.shutdown().await;
+}
+
+/// A read-back worker's first lead message answers its questions and adds no
+/// work: Laya never reads it, and the worker's one nudge stays available for a
+/// later message that really adds scope (design §4.6).
+#[tokio::test]
+async fn read_back_answer_draws_no_drift_nudge() {
+    assert!(
+        READ_BACK_ANSWER.split_whitespace().count()
+            >= crate::mnemo2::dispatch_routing::MIN_WORDS,
+        "long enough for the drift check"
+    );
+    let (fixture, _notices) = hard_reading_nudge_fixture().await;
+    let result = fixture
+        .team
+        .handle_lead_host_tool(
+            "team_dispatch",
+            json!({
+                "worker_id": "routingworker",
+                "plan_id": fixture.plan_id,
+                "step": 1,
+                "tier": "routine",
+                "read_back": true,
+                "brief": "Implement the step exactly and run its focused regression tests.",
+            }),
+        )
+        .await;
+    assert!(result.success, "{}", result.output);
+    wait_worker_settled(&fixture.team, "routingworker").await;
+    wait_route_row(&fixture).await;
+    assert_eq!(
+        fixture.classifier.calls(),
+        1,
+        "only the dispatch classified before the answer"
+    );
+    fixture
+        .team
+        .message(
+            "routingworker",
+            READ_BACK_ANSWER.to_string(),
+            MessageSender::ExternalLead,
+        )
+        .await
+        .expect("deliver the read-back answer");
+    wait_worker_settled(&fixture.team, "routingworker").await;
+    let classified = classified_when_scope_nudges(&fixture).await;
+    assert!(
+        !classified.iter().any(|text| text == READ_BACK_ANSWER),
+        "the read-back answer reached the drift check: {classified:#?}"
+    );
+    assert!(
+        classified.contains(&drift_message()),
+        "the scope message after the answer is still read: {classified:#?}"
+    );
+    assert_eq!(
+        fixture.classifier.calls(),
+        2,
+        "the dispatch and the scope message each asked Laya once"
+    );
+    fixture.team.shutdown().await;
+}
+
+/// A routed fix prompt is Mnemo2 restating review findings: Laya never reads
+/// it, and the worker's one nudge stays available (design §4.6).
+#[tokio::test]
+async fn route_fix_prompt_draws_no_drift_nudge() {
+    let (fixture, _notices) = hard_reading_nudge_fixture().await;
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    wait_worker_settled(&fixture.team, "routingworker").await;
+    wait_route_row(&fixture).await;
+    assert_eq!(
+        fixture.classifier.calls(),
+        1,
+        "only the dispatch classified before the fix"
+    );
+    fixture
+        .team
+        .review(
+            "routingworker",
+            "first pass".into(),
+            vec![open_finding("finding1")],
+            evidence(),
+        )
+        .await
+        .expect("record the review");
+    let routed = fixture
+        .team
+        .route_fix("routingworker", "finding1")
+        .await
+        .expect("route the finding back to the worker");
+    let prompt = routed.inbox.last().expect("the fix prompt reached the inbox");
+    assert_eq!(prompt.kind, InboxKind::Fix, "{prompt:?}");
+    assert!(
+        prompt.text.split_whitespace().count()
+            >= crate::mnemo2::dispatch_routing::MIN_WORDS,
+        "long enough for the drift check: {}",
+        prompt.text
+    );
+    wait_worker_settled(&fixture.team, "routingworker").await;
+    let classified = classified_when_scope_nudges(&fixture).await;
+    assert!(
+        !classified
+            .iter()
+            .any(|text| text.starts_with("Fix review finding")),
+        "the fix prompt reached the drift check: {classified:#?}"
+    );
+    assert!(
+        classified.contains(&drift_message()),
+        "the scope message after the fix is still read: {classified:#?}"
+    );
+    assert_eq!(
+        fixture.classifier.calls(),
+        2,
+        "the dispatch and the scope message each asked Laya once"
     );
     fixture.team.shutdown().await;
 }

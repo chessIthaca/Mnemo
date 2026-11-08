@@ -361,6 +361,7 @@ impl TeamRuntime {
             status: WorkerStatus::Dispatching,
             generation: 0,
             transcript: Arc::default(),
+            saved_messages: 0,
             pending: None,
             used_tokens: 0,
             max_tokens: 0,

@@ -1017,6 +1017,10 @@ fn a_missing_conversation_is_flagged_not_recreated() {
         .error
         .clone()
         .expect("the lost conversation is flagged");
+    assert_eq!(
+        loaded.workers[0].saved_messages, 0,
+        "the in-memory record never carries the saved count"
+    );
     assert!(
         error.contains("lostconv01"),
         "the flag names the missing file: {error}"
@@ -1072,6 +1076,45 @@ fn a_new_worker_is_not_flagged_and_gets_no_file() {
         "a worker that never ran is not flagged: {:?}",
         loaded.workers[0].error
     );
+}
+
+#[test]
+fn a_worker_interrupted_in_its_first_turn_is_not_flagged() {
+    // A worker stopped or interrupted during its first turn has requests but
+    // never saved a conversation, which is not a loss: only a file the ledger
+    // recorded as written can go missing.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    let mut record = worker(root.path(), "interrupted1");
+    record.requests = 3;
+    record.turns = 0;
+    record.brief_sent = true;
+    record.transcript = Arc::default();
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![record],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("save the ledger");
+    let file = dir
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join("interrupted1.json");
+    assert!(!file.exists(), "an empty transcript gets no file");
+
+    let loaded = TeamPersistence::new(dir.path())
+        .load()
+        .expect("load")
+        .expect("some ledger");
+    assert!(
+        loaded.workers[0].error.is_none(),
+        "nothing was saved, so nothing is missing: {:?}",
+        loaded.workers[0].error
+    );
+    assert_eq!(loaded.workers[0].saved_messages, 0);
+    assert!(!file.exists());
 }
 
 #[test]
@@ -1451,6 +1494,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         status: WorkerStatus::Completed,
         generation: 0,
         transcript: Arc::default(),
+        saved_messages: 0,
         pending: None,
         used_tokens: 0,
         max_tokens: 0,
@@ -2136,8 +2180,6 @@ async fn merge_closes_a_live_session_before_finishing_its_checkout() {
     run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
     let mut worker = worker(root.path(), "00000001000000000001");
     worker.status = WorkerStatus::InReview;
-    // A reviewed worker ran, so it has a conversation to load again.
-    worker.transcript = transcript_of(&["reviewed work"]);
     provision_agent_worktree(
         root.path().to_path_buf(),
         worker.id.clone(),
@@ -3163,9 +3205,6 @@ fn reviewed_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
 fn merged_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
     let mut worker = worker(root, id);
     worker.status = WorkerStatus::Merged;
-    // A merged worker ran: it has a conversation, so a reload must neither flag
-    // it as lost nor treat it as one that never spoke.
-    worker.transcript = transcript_of(&["merged"]);
     worker.merge = Some(MergeRecord {
         commit: "abcdef0123456789".to_string(),
         worker_tip: "0123456789abcdef".to_string(),

@@ -169,11 +169,10 @@ impl TeamPersistence {
             match file.try_exists() {
                 Ok(true) => {}
                 Ok(false) => {
-                    // A missing file keeps the embedded transcript, which for a
-                    // current ledger is the empty placeholder. An empty file
-                    // would hide the loss, so the record carries it instead.
-                    let ran = worker.requests > 0 || worker.turns > 0 || worker.brief_sent;
-                    if worker.transcript.messages.is_empty() && ran {
+                    // A file the ledger says held saved messages is gone: the
+                    // conversation is lost. An empty file would hide it, so the
+                    // record carries it instead.
+                    if worker.saved_messages > 0 {
                         let path = format!("{TRANSCRIPTS_DIR}/{}.json", worker.id);
                         let missing =
                             format!("this worker's saved conversation is missing ({path})");
@@ -217,6 +216,11 @@ impl TeamPersistence {
                     // writes a valid file (or none, when it is empty).
                 }
             }
+        }
+        // The count is only meaningful on disk: the in-memory record and every
+        // IPC snapshot start from zero again.
+        for worker in &mut team.workers {
+            worker.saved_messages = 0;
         }
         Ok(())
     }
@@ -379,6 +383,7 @@ impl TeamPersistence {
                     if self.transcript_file(&worker.id).is_some() {
                         WorkerRecord {
                             transcript: Arc::default(),
+                            saved_messages: worker.transcript.messages.len(),
                             ..worker.clone()
                         }
                     } else {

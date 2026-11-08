@@ -216,6 +216,12 @@ pub struct WorkerRecord {
     /// never mutate through it: the ledger compares transcripts with
     /// `Arc::ptr_eq`.
     pub transcript: Arc<Transcript>,
+    /// How many transcript messages the ledger's writer saved to this worker's
+    /// own file. Only meaningful on disk: the in-memory record and every IPC
+    /// snapshot carry 0. A load uses it to tell a conversation that was lost
+    /// (file gone, count above zero) from a worker that never had one.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub saved_messages: usize,
     /// The interaction the worker is blocked on, if any.
     pub pending: Option<PendingInteraction>,
     /// Latest context-window usage reported by the session.
@@ -427,6 +433,12 @@ pub(super) fn validate_worker_id(worker_id: &str) -> Result<(), String> {
 }
 
 pub(super) const WORKER_INBOX_LIMIT: usize = 200;
+
+/// Serde helper: `saved_messages` is omitted from the ledger at 0, which is
+/// every in-memory record and every worker that never saved a conversation.
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
 
 pub(super) fn append_inbox(worker: &mut WorkerRecord, entry: InboxEntry) {
     let overflow = worker

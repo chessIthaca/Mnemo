@@ -85,6 +85,13 @@ export interface MemoryDetail {
   strength: number;
   /** Wiki-link targets the file body carries (`[[target]]`, verbatim). */
   links: string[];
+  /**
+   * What shows the record is true: the file's front-matter `evidence`, else
+   * the row's `data.evidence`, else the extractor's `data.how_known`.
+   */
+  evidence: string | null;
+  /** True when the record is a claim that states none of the above. */
+  unconfirmed: boolean;
   /** The records whose links point here. */
   backlinks: MemoryRow[];
 }

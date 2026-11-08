@@ -151,6 +151,10 @@ pub struct KnowledgeRecord {
     pub supersedes: Option<String>,
     /// The creation date from front matter (`YYYY-MM-DD`), when present.
     pub created: Option<String>,
+    /// What shows the record is true — a test name, a file and line, a run,
+    /// or that the user said so (plan 373dec00). Optional: records written
+    /// before the field existed parse as `None` and keep their exact bytes.
+    pub evidence: Option<String>,
     /// The markdown body after the front matter (unbounded, verbatim).
     pub body: String,
     /// Wiki-links extracted from the body.
@@ -316,6 +320,10 @@ pub fn parse_file(rel_path: &str, contents: &str) -> Option<KnowledgeRecord> {
             (!c.is_empty()).then(|| c.to_string())
         })
         .or_else(|| date_from_slug(&slug).map(str::to_string));
+    let evidence = front.as_ref().and_then(|f| {
+        let e = f.evidence.as_deref()?.trim();
+        (!e.is_empty()).then(|| e.to_string())
+    });
 
     Some(KnowledgeRecord {
         record_type,
@@ -326,6 +334,7 @@ pub fn parse_file(rel_path: &str, contents: &str) -> Option<KnowledgeRecord> {
         status,
         supersedes,
         created,
+        evidence,
         body,
     })
 }
@@ -339,6 +348,7 @@ struct FrontMatter {
     status: Option<String>,
     supersedes: Option<String>,
     created: Option<String>,
+    evidence: Option<String>,
 }
 
 /// Split a file into (optional front-matter TOML text, body). Front matter is
@@ -459,13 +469,14 @@ pub fn replace_unique(body: &str, find: &str, replace_with: &str) -> Result<Stri
 
 /// Front matter rendered back to TOML for file rewrites. Only the fields
 /// that apply are emitted, in a stable order (title, supersedes, created,
-/// then status — the status default `live` is omitted since the parser
-/// defaults to it).
+/// evidence, then status — the status default `live` is omitted since the
+/// parser defaults to it).
 fn render_front_matter(
     title: &str,
     status: KnowledgeStatus,
     supersedes: Option<&str>,
     created: Option<&str>,
+    evidence: Option<&str>,
 ) -> String {
     fn escape(s: &str) -> String {
         s.replace('\\', "\\\\")
@@ -479,6 +490,9 @@ fn render_front_matter(
     }
     if let Some(c) = created {
         out.push_str(&format!("created = \"{}\"\n", escape(c)));
+    }
+    if let Some(e) = evidence {
+        out.push_str(&format!("evidence = \"{}\"\n", escape(e)));
     }
     if status == KnowledgeStatus::Superseded {
         out.push_str("status = \"superseded\"\n");
@@ -579,6 +593,21 @@ impl KnowledgeStore {
     /// and `live` status. A slug collision (same date + title already on
     /// disk) suffixes `-2`, `-3`, … so a rewrite never clobbers history.
     pub fn write(&self, record_type: MemoryRecordType, title: &str, body: &str) -> Result<String> {
+        self.write_with_evidence(record_type, title, body, None)
+    }
+
+    /// [`Self::write`] with the record's evidence. `evidence` is trimmed and
+    /// a blank one is no evidence at all. Nothing is refused for lacking it:
+    /// an unevidenced record is still written, it is just flagged as
+    /// unconfirmed when it comes back from search (plan 373dec00 step 4).
+    pub fn write_with_evidence(
+        &self,
+        record_type: MemoryRecordType,
+        title: &str,
+        body: &str,
+        evidence: Option<&str>,
+    ) -> Result<String> {
+        let evidence = evidence.map(str::trim).filter(|e| !e.is_empty());
         let dir = dir_for_record_type(record_type).ok_or_else(|| {
             Error::Memory(format!(
                 "record type '{record_type}' has no knowledge home (spec/decision/bug/how only)"
@@ -605,7 +634,7 @@ impl KnowledgeStore {
                 std::fs::create_dir_all(path.parent().unwrap())?;
                 let file = format!(
                     "{}\n{}\n",
-                    render_front_matter(&title, KnowledgeStatus::Live, None, Some(&date)),
+                    render_front_matter(&title, KnowledgeStatus::Live, None, Some(&date), evidence),
                     body
                 );
                 std::fs::write(path, file)?;
@@ -644,9 +673,21 @@ impl KnowledgeStore {
         let created = date_from_slug(slug)
             .map(str::to_string)
             .or_else(|| Some(self.stamped_date()));
+        // An overwrite keeps the evidence already on file: a re-finish
+        // rewrites the same record and must not silently un-confirm it.
+        let evidence = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| parse_file(&rel, &text))
+            .and_then(|record| record.evidence);
         let file = format!(
             "{}\n{}\n",
-            render_front_matter(&title, KnowledgeStatus::Live, None, created.as_deref()),
+            render_front_matter(
+                &title,
+                KnowledgeStatus::Live,
+                None,
+                created.as_deref(),
+                evidence.as_deref()
+            ),
             body
         );
         std::fs::write(path, file)?;
@@ -668,6 +709,7 @@ impl KnowledgeStore {
         rel_path: &str,
         new_title: Option<&str>,
         new_body: Option<&str>,
+        new_evidence: Option<&str>,
     ) -> Result<String> {
         let _guard = self
             .lock
@@ -704,13 +746,21 @@ impl KnowledgeStore {
             None => record.title.clone(),
         };
         let body = new_body.unwrap_or(&record.body);
+        // `None` (or a blank string) keeps the record's current evidence —
+        // an update that says nothing about evidence must not erase it.
+        let evidence = new_evidence
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .or_else(|| record.evidence.clone());
         let file = format!(
             "{}\n{}\n",
             render_front_matter(
                 &title,
                 record.status,
                 record.supersedes.as_deref(),
-                record.created.as_deref()
+                record.created.as_deref(),
+                evidence.as_deref()
             ),
             body
         );
@@ -762,7 +812,8 @@ impl KnowledgeStore {
                 &record.title,
                 record.status,
                 record.supersedes.as_deref(),
-                record.created.as_deref()
+                record.created.as_deref(),
+                record.evidence.as_deref()
             ),
             body.trim_end()
         );
@@ -929,7 +980,8 @@ impl KnowledgeStore {
                 &record.title,
                 record.status,
                 record.supersedes.as_deref(),
-                record.created.as_deref()
+                record.created.as_deref(),
+                record.evidence.as_deref()
             ),
             body
         );
@@ -960,6 +1012,21 @@ impl KnowledgeStore {
     /// file's status to `superseded`. Supersede-not-delete: the old file
     /// stays on disk as history. Returns the successor's rel path.
     pub fn supersede(&self, old_rel: &str, new_title: &str, new_body: &str) -> Result<String> {
+        self.supersede_with_evidence(old_rel, new_title, new_body, None)
+    }
+
+    /// [`Self::supersede`] with the successor's evidence. A successor does
+    /// NOT inherit the old record's evidence — it is a new claim and must
+    /// state how it is known itself (plan 373dec00 step 4). The old file's
+    /// flip preserves the OLD record's own evidence.
+    pub fn supersede_with_evidence(
+        &self,
+        old_rel: &str,
+        new_title: &str,
+        new_body: &str,
+        evidence: Option<&str>,
+    ) -> Result<String> {
+        let evidence = evidence.map(str::trim).filter(|e| !e.is_empty());
         let _guard = self
             .lock
             .lock()
@@ -1010,7 +1077,8 @@ impl KnowledgeStore {
                 &new_title,
                 KnowledgeStatus::Live,
                 Some(&old.slug),
-                Some(&date)
+                Some(&date),
+                evidence
             ),
             new_body
         );
@@ -1022,7 +1090,8 @@ impl KnowledgeStore {
                 &old.title,
                 KnowledgeStatus::Superseded,
                 old.supersedes.as_deref(),
-                old.created.as_deref()
+                old.created.as_deref(),
+                old.evidence.as_deref()
             ),
             old.body
         );
@@ -1360,13 +1429,166 @@ mod tests {
         let rel = ks
             .write(MemoryRecordType::Bug, "os error 5", "old body")
             .unwrap();
-        ks.update(&rel, Some("OS error 5 misdirection"), Some("new body"))
+        ks.update(
+            &rel,
+            Some("OS error 5 misdirection"),
+            Some("new body"),
+            None,
+        )
             .unwrap();
         let text = read_file(&format!(".coding/knowledge/{rel}"), &dir);
         let rec = parse_file(&rel, &text).unwrap();
         assert_eq!(rec.title, "OS error 5 misdirection");
         assert_eq!(rec.body, "new body");
         assert_eq!(rec.status, KnowledgeStatus::Live);
+    }
+
+    #[test]
+    fn evidence_round_trips_through_the_knowledge_file() {
+        let (dir, ks) = make_store();
+        let rel = ks
+            .write_with_evidence(
+                MemoryRecordType::Spec,
+                "Evidence ride-along",
+                "Body text.",
+                Some("  tests/memory.rs::evidence_round_trips  "),
+            )
+            .unwrap();
+        let text = read_file(&format!(".coding/knowledge/{rel}"), &dir);
+        // The field sits after `created`, escaped like every other string.
+        assert!(
+            text.starts_with(
+                "+++\ntitle = \"Evidence ride-along\"\ncreated = \"2026-02-01\"\n\
+                 evidence = \"tests/memory.rs::evidence_round_trips\"\n+++\n"
+            ),
+            "{text}"
+        );
+        let rec = parse_file(&rel, &text).unwrap();
+        assert_eq!(
+            rec.evidence.as_deref(),
+            Some("tests/memory.rs::evidence_round_trips")
+        );
+        // A blank evidence string is no evidence at all.
+        let blank = ks
+            .write_with_evidence(MemoryRecordType::Spec, "Blank evidence", "b", Some("   "))
+            .unwrap();
+        let rec = parse_file(&blank, &read_file(&format!(".coding/knowledge/{blank}"), &dir))
+            .unwrap();
+        assert_eq!(rec.evidence, None);
+    }
+
+    #[test]
+    fn old_knowledge_files_parse_unchanged() {
+        let (dir, ks) = make_store();
+        // A file written before the field existed: front matter with no
+        // `evidence` key parses to None and the record keeps every other
+        // field and its exact body.
+        let spec = dir.path().join(".coding/knowledge/spec");
+        std::fs::create_dir_all(&spec).unwrap();
+        let text = "+++\ntitle = \"Old record\"\ncreated = \"2026-01-02\"\n\
+                    supersedes = \"2026-01-01-prior\"\n+++\nold body\n";
+        std::fs::write(spec.join("2026-01-02-old-record.md"), text).unwrap();
+        let rel = "spec/2026-01-02-old-record.md";
+        let rec = parse_file(rel, text).unwrap();
+        assert_eq!(rec.evidence, None);
+        assert_eq!(rec.title, "Old record");
+        assert_eq!(rec.created.as_deref(), Some("2026-01-02"));
+        assert_eq!(rec.supersedes.as_deref(), Some("2026-01-01-prior"));
+        assert_eq!(rec.body, "old body");
+        // The store still reads it, and an unaffected rewrite leaves the file
+        // byte-identical (no evidence key invented).
+        assert_eq!(
+            ks.resolve(MemoryRecordType::Spec, "2026-01-02-old-record"),
+            Some(rel.to_string())
+        );
+        assert_eq!(read_file(&format!(".coding/knowledge/{rel}"), &dir), text);
+    }
+
+    #[test]
+    fn evidence_survives_update_amend_and_replace() {
+        let (dir, ks) = make_store();
+        let rel = ks
+            .write_with_evidence(
+                MemoryRecordType::How,
+                "Rebuild the index",
+                "Run the rebuild.",
+                Some("settings, Memory, Rebuild"),
+            )
+            .unwrap();
+        let evidence = || -> Option<String> {
+            let text = read_file(&format!(".coding/knowledge/{rel}"), &dir);
+            parse_file(&rel, &text).unwrap().evidence
+        };
+        // update() with no new evidence keeps the record's.
+        ks.update(&rel, Some("Rebuild the index from files"), None, None)
+            .unwrap();
+        assert_eq!(evidence().as_deref(), Some("settings, Memory, Rebuild"));
+        // amend() keeps it.
+        ks.amend(&rel, "Amended: the button also rebuilds the graph.").unwrap();
+        assert_eq!(evidence().as_deref(), Some("settings, Memory, Rebuild"));
+        // replace_in_body() keeps it.
+        ks.replace_in_body(&rel, "rebuilds the graph", "reindexes the graph").unwrap();
+        assert_eq!(evidence().as_deref(), Some("settings, Memory, Rebuild"));
+        // A later update CAN replace it.
+        ks.update(&rel, None, None, Some("verified 2026-02-02")).unwrap();
+        assert_eq!(evidence().as_deref(), Some("verified 2026-02-02"));
+    }
+
+    #[test]
+    fn a_successor_does_not_inherit_evidence() {
+        let (dir, ks) = make_store();
+        let old = ks
+            .write_with_evidence(
+                MemoryRecordType::Decision,
+                "Old storage",
+                "old body",
+                Some("the 2026-01-05 benchmark"),
+            )
+            .unwrap();
+        let successor = ks.supersede(&old, "New storage", "new body").unwrap();
+        let succ_text = read_file(&format!(".coding/knowledge/{successor}"), &dir);
+        assert_eq!(parse_file(&successor, &succ_text).unwrap().evidence, None);
+        // The old file keeps ITS evidence through the superseded flip.
+        let old_text = read_file(&format!(".coding/knowledge/{old}"), &dir);
+        let old_rec = parse_file(&old, &old_text).unwrap();
+        assert_eq!(old_rec.status, KnowledgeStatus::Superseded);
+        assert_eq!(old_rec.evidence.as_deref(), Some("the 2026-01-05 benchmark"));
+        // A successor that states its own evidence carries just that.
+        let second = ks
+            .supersede_with_evidence(&old, "Newer storage", "newer body", Some("the 2026-02-02 run"))
+            .unwrap();
+        let text = read_file(&format!(".coding/knowledge/{second}"), &dir);
+        assert_eq!(
+            parse_file(&second, &text).unwrap().evidence.as_deref(),
+            Some("the 2026-02-02 run")
+        );
+    }
+
+    #[test]
+    fn write_at_keeps_existing_evidence() {
+        let (dir, ks) = make_store();
+        let rel = ks
+            .write_at(MemoryRecordType::Bug, "plan-1", "Plan 1 outcome", "first body")
+            .unwrap();
+        ks.update(&rel, None, None, Some("tests/plan_close.rs::bug_capture"))
+            .unwrap();
+        // A re-finish rewrites the same slug: the evidence must survive it.
+        let again = ks
+            .write_at(
+                MemoryRecordType::Bug,
+                "plan-1",
+                "Plan 1 outcome",
+                "second body",
+            )
+            .unwrap();
+        assert_eq!(again, rel);
+        let text = read_file(&format!(".coding/knowledge/{rel}"), &dir);
+        let rec = parse_file(&rel, &text).unwrap();
+        assert_eq!(rec.body, "second body");
+        assert_eq!(
+            rec.evidence.as_deref(),
+            Some("tests/plan_close.rs::bug_capture")
+        );
     }
 
     #[test]
@@ -1627,7 +1849,8 @@ mod tests {
             .update(
                 &rel,
                 None,
-                Some("see .coding/knowledge/spec/2026-02-01-clamp.md")
+                Some("see .coding/knowledge/spec/2026-02-01-clamp.md"),
+                None
             )
             .is_err());
 

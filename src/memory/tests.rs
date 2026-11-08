@@ -805,6 +805,114 @@ async fn stale_record_ranks_below_fresh_of_equal_relevance() {
 }
 
 #[tokio::test]
+async fn an_unconfirmed_row_ranks_below_an_equal_confirmed_one() {
+    // Plan 373dec00 step 4: confirmation is a +0.05 BONUS, never a penalty.
+    // Two rows of identical text and strength differ only in `data.evidence`,
+    // so the bonus alone decides the order — and the unconfirmed row keeps
+    // the score it always had (it is not pushed down).
+    let store = make_store();
+    let mut confirmed = Memory::new(
+        MemoryTier::Semantic,
+        "clamp fact",
+        "the clamp guards the pipeline",
+        1000,
+    );
+    confirmed.data = serde_json::json!({ "evidence": "tests/clamp.rs::guards" });
+    store.write(confirmed).await.unwrap();
+    let unconfirmed = Memory::new(
+        MemoryTier::Semantic,
+        "clamp fact",
+        "the clamp guards the pipeline",
+        1000,
+    );
+    store.write(unconfirmed).await.unwrap();
+
+    let results = store
+        .recall_peek("clamp pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0].memory.is_confirmed(),
+        "the confirmed row takes the top slot: {:?}",
+        results.iter().map(|r| &r.memory.title).collect::<Vec<_>>()
+    );
+    assert!(
+        results[1].memory.is_unconfirmed(),
+        "the other row is the unconfirmed one"
+    );
+    // Equal text: the delta is exactly the bonus, not a downrank of the peer.
+    // Tiebreaker-sized (0.005): the eval showed a 0.05 bonus reordered
+    // non-ties and cost hit@5 (0.400 -> 0.325) — most BUG digests and
+    // extracted facts count as confirmed at once, so a big bonus acts as a
+    // class re-weighting instead of a tiebreak.
+    let delta = results[0].score - results[1].score;
+    assert!(
+        (delta - 0.005).abs() < 1e-9,
+        "the confirmed row gains exactly 0.005, got {delta}"
+    );
+}
+
+#[test]
+fn a_bug_with_a_regression_test_counts_as_confirmed() {
+    let mut bug = Memory::new(
+        MemoryTier::Semantic,
+        "BUG: os error 5 on the rebuild",
+        "root cause and fix in the file",
+        1000,
+    );
+    bug.record_type = MemoryRecordType::Bug;
+    // Nothing in the text names a regression test: still unconfirmed.
+    assert!(!bug.is_confirmed());
+    assert!(bug.is_unconfirmed());
+    // The indexer's finding (`data.regression_test`) confirms it.
+    bug.data = serde_json::json!({ "regression_test": true });
+    assert!(bug.is_confirmed());
+    assert!(!bug.is_unconfirmed());
+    // So does the record's own text naming one.
+    let mut named = Memory::new(
+        MemoryTier::Semantic,
+        "BUG: os error 5 on the rebuild",
+        "regression test: rebuild_keeps_the_lock",
+        1000,
+    );
+    named.record_type = MemoryRecordType::Bug;
+    assert!(named.is_confirmed());
+    // The same text on a non-BUG record is not a confirmation.
+    let mut spec = Memory::new(
+        MemoryTier::Semantic,
+        "SPEC: the rebuild",
+        "regression test: rebuild_keeps_the_lock",
+        1000,
+    );
+    spec.record_type = MemoryRecordType::Spec;
+    assert!(!spec.is_confirmed());
+}
+
+#[test]
+fn a_digest_row_is_never_marked_unconfirmed() {
+    // PLAN/REVIEW digests point at a file rather than claiming something of
+    // their own, and episodic rows are history: none of them is ever marked,
+    // with or without evidence.
+    for record_type in [MemoryRecordType::Plan, MemoryRecordType::Review] {
+        let mut digest = Memory::new(
+            MemoryTier::Semantic,
+            "PLAN: some plan",
+            "the plan's gist",
+            1000,
+        );
+        digest.record_type = record_type;
+        assert!(!digest.is_claim(), "{record_type} is not a claim");
+        assert!(!digest.is_unconfirmed(), "{record_type} is never marked");
+    }
+    for tier in [MemoryTier::Episodic, MemoryTier::Working] {
+        let mut row = Memory::new(tier, "Session summary", "worked on the clamp", 1000);
+        row.record_type = MemoryRecordType::None;
+        assert!(!row.is_unconfirmed(), "{tier} is never marked");
+    }
+}
+
+#[tokio::test]
 async fn staleness_grace_follows_the_configured_decay_tau() {
     // Review 084978b3 LOW-2: the staleness grace was hardcoded at 7 days
     // while the adjacent strength-decay tau is live-configurable — a 30-day

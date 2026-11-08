@@ -406,11 +406,24 @@ pub(super) fn build_knowledge_metas(
                 }
                 None => None,
             };
-            let data = serde_json::json!({
+            let mut data = serde_json::json!({
                 "kind": "knowledge",
                 "rel_path": record.rel_path,
                 "links": record.links,
             });
+            // How the record is known (plan 373dec00 step 4): the file's
+            // front-matter evidence rides the row digest, and a BUG whose
+            // body names a regression test counts as confirmed even without
+            // one. Rows gain these on the next corpus change — no forced
+            // migration.
+            if let Some(evidence) = record.evidence.as_deref() {
+                data["evidence"] = serde_json::Value::String(evidence.to_string());
+            }
+            if record.record_type == MemoryRecordType::Bug
+                && record.body.to_lowercase().contains("regression")
+            {
+                data["regression_test"] = serde_json::Value::Bool(true);
+            }
             (
                 record.source_key(),
                 KnowledgeMeta {

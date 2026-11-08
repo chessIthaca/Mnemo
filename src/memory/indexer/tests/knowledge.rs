@@ -98,6 +98,68 @@ async fn knowledge_files_index_as_derived_typed_records() {
 }
 
 #[tokio::test]
+async fn the_reassert_keeps_evidence_in_row_data() {
+    // Plan 373dec00 step 4: the row digest carries how the record is known.
+    // A corpus change re-asserts the metadata; the evidence must survive it,
+    // and a BUG whose body names a regression test is confirmed by that.
+    let dir = tempdir().unwrap();
+    write_knowledge(
+        dir.path(),
+        "bug/2026-08-23-lock-timeout.md",
+        "+++\ntitle = \"Lock timeout on open\"\ncreated = \"2026-08-23\"\n\
+         evidence = \"tests/store.rs::open_keeps_the_lock\"\n+++\n\n\
+         Symptom: open hangs. Root cause: a leaked guard. The regression test \
+         open_keeps_the_lock pins it.\n",
+    );
+    let store = make_store();
+    index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+
+    let id = knowledge_id("knowledge:bug/2026-08-23-lock-timeout");
+    let m = store.get_memory(&id).await.unwrap().expect("row indexed");
+    assert_eq!(
+        m.data.get("evidence").and_then(|v| v.as_str()),
+        Some("tests/store.rs::open_keeps_the_lock")
+    );
+    assert_eq!(m.data.get("regression_test").and_then(|v| v.as_bool()), Some(true));
+    assert!(m.is_confirmed(), "the row is a confirmed claim");
+
+    // A corpus change re-asserts the metadata (the reconcile path): the
+    // evidence survives the second pass.
+    write_knowledge(
+        dir.path(),
+        "bug/2026-08-23-lock-timeout.md",
+        "+++\ntitle = \"Lock timeout on open\"\ncreated = \"2026-08-23\"\n\
+         evidence = \"tests/store.rs::open_keeps_the_lock\"\n+++\n\n\
+         Symptom: open hangs. Root cause: a leaked guard, now released. The \
+         regression test open_keeps_the_lock pins it.\n",
+    );
+    let second = index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.indexed, 1);
+    let m = store.get_memory(&id).await.unwrap().expect("row reindexed");
+    assert_eq!(
+        m.data.get("evidence").and_then(|v| v.as_str()),
+        Some("tests/store.rs::open_keeps_the_lock"),
+        "the re-assert keeps the evidence: {:?}",
+        m.data
+    );
+    assert_eq!(m.data.get("rel_path").and_then(|v| v.as_str()), Some("bug/2026-08-23-lock-timeout.md"));
+}
+
+#[tokio::test]
 async fn knowledge_supersede_chain_marks_predecessor() {
     let dir = tempdir().unwrap();
     let pred = "+++\ntitle = \"Old decision\"\nstatus = \"superseded\"\ncreated = \"2026-08-20\"\n+++\n\nThe old way.\n";

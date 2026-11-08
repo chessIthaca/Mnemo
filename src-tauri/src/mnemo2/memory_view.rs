@@ -248,6 +248,12 @@ pub struct MemoryDetail {
     pub strength: f64,
     /// The wiki-link targets the file body carries (`[[target]]`, verbatim).
     pub links: Vec<String>,
+    /// What shows the record is true — the file's front-matter `evidence`,
+    /// else the row's `data.evidence`, else the extractor's `data.how_known`
+    /// (plan 373dec00 step 4).
+    pub evidence: Option<String>,
+    /// True when the record is a claim that states none of the above.
+    pub unconfirmed: bool,
     /// The records whose links point here.
     pub backlinks: Vec<MemoryRow>,
 }
@@ -575,6 +581,16 @@ async fn backlinks_of(store: &dyn MemoryStoreTrait, id: &str) -> Result<Vec<Memo
     Ok(rows.iter().map(MemoryRow::from_memory).collect())
 }
 
+/// A non-blank string field in a row's `data` JSON, trimmed — `None` when the
+/// key is absent, not a string, or only whitespace.
+fn data_note(data: &serde_json::Value, key: &str) -> Option<String> {
+    data.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// One record in full: the knowledge file's Markdown when the row derives from
 /// a file, else the memory's own digest, plus its links and backlinks.
 async fn read_record(
@@ -596,6 +612,7 @@ async fn read_record(
     let mut created = None;
     let mut status = None;
     let mut links = Vec::new();
+    let mut file_evidence = None;
     if let (Some(rel), Some(dir)) = (rel.as_deref(), knowledge_dir) {
         // The file is the truth for a knowledge record; a file that moved or
         // is on another branch degrades to the row's digest instead of
@@ -610,6 +627,7 @@ async fn read_record(
                 markdown = record.body;
                 created = record.created;
                 status = Some(record.status);
+                file_evidence = record.evidence.clone();
                 links = record.links.into_iter().map(|link| link.target).collect();
             }
         }
@@ -631,6 +649,10 @@ async fn read_record(
         access_count: memory.access_count,
         strength: memory.strength,
         links,
+        evidence: file_evidence
+            .or_else(|| data_note(&memory.data, "evidence"))
+            .or_else(|| data_note(&memory.data, "how_known")),
+        unconfirmed: memory.is_unconfirmed(),
         backlinks,
     })
 }

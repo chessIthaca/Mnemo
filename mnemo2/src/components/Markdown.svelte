@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { renderMarkdown } from "../lib/markdown";
   import { repoPathTarget, splitRepoPaths, type RepoPathRef } from "../lib/repoPaths";
 
@@ -13,13 +13,58 @@
     /** When given, the repository paths the text names become clickable. */
     onOpenPath?: (ref: RepoPathRef) => void;
   } = $props();
+
+  /** Streamed text grows by appends; re-render it at most this often. */
+  const STREAM_RENDER_MS = 150;
+  let shown = $state(untrack(() => source)); // the source the html was rendered from
+  let lastShownAt = 0; // Date.now() of the last `shown` change; 0 so the first change renders at once
+  let pending: ReturnType<typeof setTimeout> | null = null;
+
+  function show(next: string): void {
+    shown = next;
+    lastShownAt = Date.now();
+  }
+
+  function cancelPending(): void {
+    if (pending !== null) {
+      clearTimeout(pending);
+      pending = null;
+    }
+  }
+
+  // A streamed reply appends to its text on every chunk, and re-parsing the
+  // whole markdown for each chunk is O(n^2) on the main thread. So appends
+  // re-render at most every 150 ms, with the newest text within 150 ms of the
+  // last chunk; any other change (a replaced or rewritten text) renders at once.
+  $effect(() => {
+    const next = source;
+    untrack(() => {
+      if (next === shown) return;
+      const appended = shown.length > 0 && next.startsWith(shown);
+      const since = Date.now() - lastShownAt;
+      if (!appended || since >= STREAM_RENDER_MS) {
+        cancelPending();
+        show(next);
+        return;
+      }
+      if (pending === null) {
+        pending = setTimeout(() => {
+          pending = null;
+          show(source);
+        }, STREAM_RENDER_MS - since);
+      }
+    });
+  });
+
+  onDestroy(cancelPending);
+
   let container = $state<HTMLDivElement | null>(null);
   let cachedSource = "";
   let cachedHtml = "";
   const html = $derived.by(() => {
-    if (source !== cachedSource) {
-      cachedSource = source;
-      cachedHtml = renderMarkdown(source);
+    if (shown !== cachedSource) {
+      cachedSource = shown;
+      cachedHtml = renderMarkdown(shown);
     }
     return cachedHtml;
   });

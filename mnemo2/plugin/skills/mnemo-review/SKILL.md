@@ -65,15 +65,15 @@ When the review is current, no finding is open and all checks passed on the curr
 - After a merge that other open work depends on, run the project's tests on the lead branch before dispatching dependents.
 - After parallel steps, do the plan's "Integration check" step yourself (run the combined result), then `plan_step_done`.
 - If the merge makes things worse and has not reached `main`, `team_revert_merge`.
-- Leave the worker's branch and checkout alone: `team_merge` deletes the branch after a clean merge. If `team_status` shows an `error` starting with "merged, but", tell the user.
+- Leave the worker's branch and checkout alone: `team_merge` deletes the branch after a clean merge. If `team_status` shows an `error` starting with "merged, but", tell the user; Mnemo2 retries it at the next merge and at its next start.
 - A conflict is not auto-resolved. See the Review and merge cycle in the `mnemo-lead` skill.
 
 Finish with a short report to the user: what merged, what the checks showed, what you decided about findings, and what is still running. If more workers are active, make sure one background waiter is running.
 
 ## 8. Record what the work established
 
-After each merge, write what the work taught the project to Mnemo's memory, not only to the user — the `team_merge` result ends with a reminder line:
+After each merge, write what the work taught the project to Mnemo's memory, not only to the user — the `team_merge` result ends with one memory line (the nudge, or a reminder):
 
-- `memory_write` the durable facts with a typed title: `SPEC:` how the feature now works, `DECISION:` a choice and its rationale, `HOW:` a recurring workflow. Keep each record compact and pointer-first, and leave out plan IDs, branch names and commit hashes — a record carrying them is a plan-scoped note, retired at plan close, and does not satisfy the close gate.
-- While you are the attached lead, an `implementation` or `research` plan cannot close until such a record was written, amended or superseded after the plan was created, so record with the merge instead of waiting for the "cannot close yet" notice. A `bug_fixing` plan captures its `BUG:` record automatically at close; check that the captured record tells the truth (symptom, root cause, fix, regression test) and `memory_update` it if it does not.
+- `memory_write` the durable facts with a typed title: `SPEC:` how the feature now works, `DECISION:` a choice and its rationale, `HOW:` a recurring workflow. Keep each record compact and pointer-first, and leave out plan IDs, branch names and commit hashes — a record carrying them is a plan-scoped note, retired at plan close, and does not count as durable knowledge.
+- While you are the attached lead, an `implementation` or `research` plan closes with or without a new durable record, and its close result nudges you when none was written, amended or superseded since the plan was created — so record what the repository cannot show with the merge, and skip the write if the work taught nothing durable. A `bug_fixing` plan captures its `BUG:` record automatically at close; check that the captured record tells the truth (symptom, root cause, fix, regression test) and `memory_update` it if it does not.
 - A merge that makes a stored fact wrong calls for `memory_supersede`, never a second live record. `memory_update` refines a still-current record; `memory_amend` appends a dated amendment.

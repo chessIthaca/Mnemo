@@ -3,8 +3,8 @@
   import { actions, app } from "./lib/store";
   import ControlRoom from "./components/ControlRoom.svelte";
   import CostView from "./components/CostView.svelte";
-  import GraphView from "./components/GraphView.svelte";
   import FirstIndexOverlay from "./components/FirstIndexOverlay.svelte";
+  import LayaLearningsSheet from "./components/LayaLearningsSheet.svelte";
   import LeadChat from "./components/LeadChat.svelte";
   import MemoryView from "./components/MemoryView.svelte";
   import PlansView from "./components/PlansView.svelte";
@@ -12,7 +12,6 @@
   import TeamPeek from "./components/TeamPeek.svelte";
   import Toast from "./components/Toast.svelte";
   import TopBar from "./components/TopBar.svelte";
-  import TraceView from "./components/TraceView.svelte";
   import WorkerPanel from "./components/WorkerPanel.svelte";
   import Workbench from "./components/Workbench.svelte";
   import WorkerDeleteSheet from "./components/WorkerDeleteSheet.svelte";
@@ -46,17 +45,26 @@
       {:else if $app.route === "cost"}
         <CostView />
       {:else if $app.route === "trace"}
-        <TraceView />
+        {#await import("./components/TraceView.svelte") then { default: TraceView }}
+          <TraceView />
+        {:catch error}
+          <p class="view-load-error">Could not load this view: {String(error)}</p>
+        {/await}
       {:else if $app.route === "plans"}
         <PlansView />
       {:else if $app.route === "memory"}
         <MemoryView />
       {:else}
-        <GraphView />
+        {#await import("./components/GraphView.svelte") then { default: GraphView }}
+          <GraphView />
+        {:catch error}
+          <p class="view-load-error">Could not load this view: {String(error)}</p>
+        {/await}
       {/if}
     </div>
     {#if $app.teamPeekOpen && $app.route === "lead"}<TeamPeek />{/if}
     <WorkerDeleteSheet />
+    <LayaLearningsSheet />
     <FirstIndexOverlay />
   </div>
 {/if}
@@ -66,6 +74,7 @@
   .workspace-shell { display: flex; height: 100vh; height: 100dvh; min-height: 0; flex-direction: column; }
   .workspace-main { display: flex; flex: 1; min-height: 0; }
   .lead-column { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
+  .view-load-error { margin: 24px; color: var(--danger); font-size: var(--text-body); overflow-wrap: anywhere; }
   @media (max-width: 760px) { .workspace-main { padding-bottom: 64px; } }
 </style>
 

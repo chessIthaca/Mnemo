@@ -17,7 +17,6 @@ import {
 /** A ready top-control wire, for the transport tests. */
 const CONTROL: TiersTopControl = {
   choice: "suggest",
-  mnemo1_enforce: false,
   laya_routing: true,
   laya_status: "ready",
   checkpoint: "Laya (English)",

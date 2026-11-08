@@ -113,17 +113,10 @@
       : (topControl?.laya_status ?? "disabled"),
   );
 
-  /** The Mnemo1 halves the saved choice writes (the table the backend pins). */
-  function choiceHalves(target: TierChoice): { enforce: boolean; laya_routing: boolean } {
-    if (target === "off") return { enforce: false, laya_routing: false };
-    if (target === "auto") return { enforce: true, laya_routing: true };
-    return { enforce: false, laya_routing: true };
-  }
-
   /**
    * A warning when the saved choice cannot run: Laya is not up (install,
-   * turn on or retry applies it once it is), or Mnemo1's halves on disk
-   * disagree with the choice (a hand-edited config).
+   * turn on or retry applies it once it is), or Mnemo1's routing flag on
+   * disk disagrees with the choice (a hand-edited config).
    */
   const choiceWarning = $derived.by(() => {
     if (topControl === null) return null;
@@ -135,9 +128,8 @@
         return "This choice needs Laya running: install or turn it on above. The lead's tier stands until then.";
       }
     }
-    const expected = choiceHalves(choice);
-    if (topControl.mnemo1_enforce !== expected.enforce || topControl.laya_routing !== expected.laya_routing) {
-      return "Mnemo1's routing gates on disk do not match this choice — picking the choice again realigns them.";
+    if (topControl.laya_routing !== (choice !== "off")) {
+      return "Mnemo1's Laya routing flag on disk does not match this choice — picking the choice again realigns it.";
     }
     return null;
   });
@@ -485,7 +477,7 @@
       <header>
         <h3>Does Laya help pick the tier?</h3>
         <p class="micro">
-          One choice drives both apps — Mnemo2's dispatch routing and Mnemo1's first-prompt and step-lane routing.
+          Sets how Mnemo2 picks a worker's tier, and turns Laya's routing on or off in Mnemo1. Whether Mnemo1 switches models stays in Mnemo1's own settings.
         </p>
       </header>
       <div class="choice-grid" role="radiogroup" aria-label="Who picks the tier">

@@ -22,8 +22,8 @@ use crate::memory::{
 };
 
 use super::{
-    budgeted_digest, content_hash, first_content_line, truncate_title, write_derived, IndexReport,
-    SourceRecord,
+    budgeted_digest, content_hash, first_content_line, row_matches_source, truncate_title,
+    write_derived, IndexReport, SourceRecord,
 };
 
 /// Re-index a small set of knowledge files that changed on disk (a write
@@ -159,8 +159,19 @@ pub async fn reindex_knowledge_files(
     for source in &sources {
         let hash = content_hash(source);
         let memory_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, source.key.as_bytes()).to_string();
-        match store.index_state_get(&source.key).await? {
-            Some((old_hash, _)) if old_hash == hash => report.skipped += 1,
+        let state = store.index_state_get(&source.key).await?;
+        // Unchanged requires the row to mirror its source, not just the
+        // content hash: the hash lives in `derived_index_state` and never
+        // sees a row another writer overwrote, so a hash-only test would
+        // skip a drifted row for ever.
+        let unchanged = match &state {
+            Some((old_hash, _)) if *old_hash == hash => {
+                row_matches_source(store, &memory_id, source).await?
+            }
+            _ => false,
+        };
+        match state {
+            Some(_) if unchanged => report.skipped += 1,
             Some((_, old_id)) => {
                 let id = if store
                     .update_memory(&old_id, Some(&source.title), Some(&source.content))
@@ -219,10 +230,16 @@ pub async fn reindex_knowledge_files(
             (_, Some(e)) => Some(e),
             (computed, None) => computed,
         };
+        // The check pass owns `moved_paths`: carry its stamp across this
+        // re-assert (plan 373dec00 step 13); the rest is the file's metadata.
+        let data = crate::memory::health::keep_moved_paths(&meta.data, &row.data);
         store
-            .set_derived_metadata(&memory_id, superseded_by, &meta.data)
+            .set_derived_metadata(&memory_id, superseded_by, &data)
             .await?;
     }
+    // Every knowledge write keeps the generated map current (plan 373dec00
+    // step 6). Best effort, blocking pool, no-op when the bytes match.
+    crate::memory::knowledge_index::regenerate_blocking(knowledge_dir.to_path_buf()).await;
     Ok(report)
 }
 
@@ -395,11 +412,24 @@ pub(super) fn build_knowledge_metas(
                 }
                 None => None,
             };
-            let data = serde_json::json!({
+            let mut data = serde_json::json!({
                 "kind": "knowledge",
                 "rel_path": record.rel_path,
                 "links": record.links,
             });
+            // How the record is known (plan 373dec00 step 4): the file's
+            // front-matter evidence rides the row digest, and a BUG whose
+            // body names a regression test counts as confirmed even without
+            // one. Rows gain these on the next corpus change — no forced
+            // migration.
+            if let Some(evidence) = record.evidence.as_deref() {
+                data["evidence"] = serde_json::Value::String(evidence.to_string());
+            }
+            if record.record_type == MemoryRecordType::Bug
+                && record.body.to_lowercase().contains("regression")
+            {
+                data["regression_test"] = serde_json::Value::Bool(true);
+            }
             (
                 record.source_key(),
                 KnowledgeMeta {

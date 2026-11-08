@@ -662,10 +662,10 @@
     },
     {
       "id": "2ba2168a",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793701715574,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1794167363251,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-2ba2168a-20261108-194923.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
@@ -692,10 +692,10 @@
     },
     {
       "id": "5779641d",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793730848627,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1794163387729,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5779641d-20261108-184307.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
@@ -762,10 +762,10 @@
     },
     {
       "id": "3ec1abde",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793833547893,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1794166160753,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3ec1abde-20261108-192920.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
@@ -1317,10 +1317,10 @@
     },
     {
       "id": "843cb384",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793913730343,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1794161968875,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-843cb384-20261108-181928.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
@@ -1720,6 +1720,319 @@
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "1b46d19e",
+      "status": "closed",
+      "created_at_ms": 1793995092781,
+      "closed_at_ms": 1793996105614,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1b46d19e-20261106-201505.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "baadab0b",
+      "status": "closed",
+      "created_at_ms": 1794008719596,
+      "closed_at_ms": 1794010151453,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-baadab0b-20261107-000911.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Merge-time checkout and branch cleanup is not specified by any capability under .coding/openspec/specs (dispatch-routing, external-lead, tier-ladder and worker-brief govern routing, the external lead, tiers and briefs; a search of all specs finds no mention of checkout, worktree or cleanup). The plan only adds a retry of an existing best-effort cleanup in src-tauri/src/mnemo2/team.rs."
+    },
+    {
+      "id": "2b1e9c1b",
+      "status": "closed",
+      "created_at_ms": 1794083796586,
+      "closed_at_ms": 1794084958076,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-2b1e9c1b-20261107-205558.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only and documentation changes: tests/boundary.rs, a test in mnemo2/mod.rs and two spec Purpose lines. No specified behavior changes."
+    },
+    {
+      "id": "e7a6d30a",
+      "status": "closed",
+      "created_at_ms": 1794084015718,
+      "closed_at_ms": 1794085522060,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e7a6d30a-20261107-210522.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Pure test-code move within one file group; no specified behavior, governed file or spec changes."
+    },
+    {
+      "id": "42953435",
+      "status": "closed",
+      "created_at_ms": 1794084269311,
+      "closed_at_ms": 1794096156466,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-42953435-20261108-000236.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Pure code move: team.rs is split into child modules with identical behavior; no requirement of dispatch-routing, external-lead, tier-ladder or worker-brief changes. Step 8 updates the governed-files map so the same gate keeps covering the moved code."
+    },
+    {
+      "id": "fe45dea4",
+      "status": "closed",
+      "created_at_ms": 1794084782172,
+      "closed_at_ms": 1794091216232,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-fe45dea4-20261107-224016.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Frontend-only refactor of an ungoverned module (mnemo2/src/lib/store.ts is not in any capability's governed_files); no specified behavior changes."
+    },
+    {
+      "id": "3bc2457b",
+      "status": "closed",
+      "created_at_ms": 1794119881586,
+      "closed_at_ms": 1794120484973,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3bc2457b-20261108-064804.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only change in src-tauri/src/mnemo2/team/tests.rs; no specified behaviour changes."
+    },
+    {
+      "id": "bc3e948a",
+      "status": "closed",
+      "created_at_ms": 1794120856085,
+      "closed_at_ms": 1794138629616,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-bc3e948a-20261108-115029.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Performance-only: no specified dispatch-routing, external-lead, tier-ladder or worker-brief behavior changes. The team.json layout is not part of any capability spec; tool outputs (team_status, MCP) stay byte-identical."
+    },
+    {
+      "id": "aa44321b",
+      "status": "closed",
+      "created_at_ms": 1794120925111,
+      "closed_at_ms": 1794124649339,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-aa44321b-20261108-075729.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Performance-only: event payloads merge adjacent same-kind deltas the window concatenates anyway, and the board/memory/open paths return identical results. No team.rs specified behavior (dispatch routing, external lead, tiers, worker briefs) changes."
+    },
+    {
+      "id": "01f40b19",
+      "status": "closed",
+      "created_at_ms": 1794120995334,
+      "closed_at_ms": 1794121948875,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-01f40b19-20261108-071228.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Window rendering performance only; no capability spec governs these components or the build."
+    },
+    {
+      "id": "cf3ce043",
+      "status": "closed",
+      "created_at_ms": 1794127152842,
+      "closed_at_ms": 1794138631724,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-cf3ce043-20261108-115031.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Routing decisions travel with the repository and the installer",
+              "text": "A project that keeps a `.coding/laya/` folder SHALL carry its own routing decisions in `.coding/laya/dispatch_routing.jsonl`, as verbatim rows of the routing log whose plan belongs to that project, and the Mnemo2 installer SHALL ship that file. When a project opens, the system SHALL import a shipped copy by appending only, SHALL import silently when this computer has no decisions the copy lacks, and SHALL ask the user before importing when it has.",
+              "scenarios": [
+                {
+                  "name": "A fresh computer imports silently",
+                  "when": [
+                    "a project opens on a computer whose routing log lacks the shipped rows and has none of its own"
+                  ],
+                  "then": [
+                    "the rows are appended to the routing log without a question"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "A conflicting copy asks",
+                  "when": [
+                    "a project opens and this computer has decisions the shipped copy lacks, and the copy has decisions this computer lacks"
+                  ],
+                  "then": [
+                    "the user is asked whether to update"
+                  ],
+                  "and": [
+                    "updating appends the missing rows and removes nothing",
+                    "declining leaves the log unchanged and the same copy does not ask again"
+                  ]
+                },
+                {
+                  "name": "Only opted-in projects export",
+                  "when": [
+                    "a worker merges in a project without a .coding/laya folder"
+                  ],
+                  "then": [
+                    "no decision rows are written into that project"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No external-lead, tier-ladder or worker-brief requirement changes: team/merge.rs only gains a best-effort learnings export after the outcome row, and team/tests.rs only gains tests for it. The new behavior is specified by this plan's dispatch-routing delta."
+    },
+    {
+      "id": "373dec00",
+      "status": "closed",
+      "created_at_ms": 1794127622605,
+      "closed_at_ms": 1794155643660,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-373dec00-20261108-163403.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Memory is not an OpenSpec capability today, and no dispatch-routing, external-lead, tier-ladder, worker-brief or plan-board requirement changes. The plan-close gate is explicitly left alone."
+    },
+    {
+      "id": "41fcd8e7",
+      "status": "closed",
+      "created_at_ms": 1794162023590,
+      "closed_at_ms": 1794163027662,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-41fcd8e7-20261108-183707.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Declares an argument the handler, the dispatch validation and the tool description already have. No OpenSpec requirement covers review_risk or the team_dispatch schema, and no specified behaviour changes."
+    },
+    {
+      "id": "c8ca85c6",
+      "status": "closed",
+      "created_at_ms": 1794162427636,
+      "closed_at_ms": 1794164070634,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-c8ca85c6-20261108-185430.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Drift nudges read only new guidance",
+              "text": "The system SHALL run the drift check only on a lead or user message that can carry new work. It SHALL NOT classify text Mnemo2 generated itself (a route-fix brief or a plan-changed notice) or the first lead or user message a read-back worker receives, so those messages never produce a drift nudge and never spend the worker's one nudge. Any other lead or user message of at least `min_words` words SHALL still be classified in the background, and SHALL nudge the lead when the answer clears on a tier above the worker's.",
+              "scenarios": [
+                {
+                  "name": "Read-back answer",
+                  "when": [
+                    "a worker dispatched with read_back receives its first lead message of at least min_words words"
+                  ],
+                  "then": [
+                    "Laya is not asked about that message",
+                    "no drift nudge is sent"
+                  ],
+                  "and": [
+                    "the worker's one nudge stays available"
+                  ]
+                },
+                {
+                  "name": "Plan notices before the read-back answer",
+                  "when": [
+                    "a read-back worker has received only Mnemo2 plan-changed notices",
+                    "the lead then sends its answer"
+                  ],
+                  "then": [
+                    "Laya is not asked about the answer"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Route-fix prompt",
+                  "when": [
+                    "team_route_fix delivers a fix brief to a worker"
+                  ],
+                  "then": [
+                    "Laya is not asked about the brief as drift",
+                    "no drift nudge is sent"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "A later message adds scope",
+                  "when": [
+                    "a worker receives a lead message of at least min_words words that is not its read-back answer",
+                    "Laya clears the message on a tier above the worker's"
+                  ],
+                  "then": [
+                    "the lead gets a \"this got harder\" notice",
+                    "a nudge row with reason drift is logged"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No requirement of external-lead, tier-ladder or worker-brief changes: those capabilities govern the team/*.rs files only because of the module split. The one requirement this plan adds is the dispatch-routing delta attached to it."
+    },
+    {
+      "id": "a8838c43",
+      "status": "abandoned",
+      "created_at_ms": 1794162547085,
+      "closed_at_ms": 1794162735408,
+      "report_path": null,
+      "abandon_reason": "Throwaway live check, finished. Custom schema gate and audit slot release were both observed in the running app; nothing was meant to merge.",
+      "schema": "livecheck@1",
+      "sections": {
+        "research": "# Findings\n\nThis is a live check. The step only adds a note file, so there is nothing to investigate.\n"
+      },
+      "no_spec_impact": "A throwaway live check that adds one note file on a branch that is never merged."
+    },
+    {
+      "id": "6cea1ebb",
+      "status": "closed",
+      "created_at_ms": 1794164364848,
+      "closed_at_ms": 1794166159011,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-6cea1ebb-20261108-192919.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Bug fixes that restore intended behaviour: no specified requirement in dispatch-routing, external-lead, plan-board, settings-dialog or worker-brief changes."
+    },
+    {
+      "id": "c28fc0c1",
+      "status": "abandoned",
+      "created_at_ms": 1794166106164,
+      "closed_at_ms": 1794166133363,
+      "report_path": null,
+      "abandon_reason": "Throwaway live recheck, finished: the title stayed as written after a create and an update with '# ' and '## ' headings in a custom section.",
+      "schema": "livecheck@1",
+      "sections": {
+        "research": "# Findings\n\n## Details\n\nA heading inside this section must stay inside it, even after an update.\n"
+      },
+      "no_spec_impact": "A throwaway live recheck that changes nothing and is abandoned straight away."
+    },
+    {
+      "id": "1fa8cc92",
+      "status": "closed",
+      "created_at_ms": 1794167509562,
+      "closed_at_ms": 1794168852906,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1fa8cc92-20261108-201412.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No requirement in the tier-ladder, dispatch-routing or settings specs mentions Mnemo1's enforce gate; only the design note does, and this plan updates it."
     }
   ]
 }

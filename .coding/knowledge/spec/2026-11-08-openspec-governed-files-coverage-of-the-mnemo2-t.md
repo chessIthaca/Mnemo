@@ -1,0 +1,6 @@
++++
+title = "openspec governed-files coverage of the mnemo2/team module children"
+created = "2026-11-08"
++++
+
+`.coding/openspec/config.yaml` `governed_files` uses exact repo-relative paths (no globs). After the mnemo2/team.rs module split, the capabilities dispatch-routing, external-lead, tier-ladder and worker-brief each list the retained `src-tauri/src/mnemo2/team.rs` module root plus all 17 children: `src-tauri/src/mnemo2/team/{record,persistence,guardrails,routing,nudge,escalation,external_lead,lead_tools,dispatch,spawn,audit,control,review,pump,merge,deletion,tests}.rs` — a plan step touching any of them needs a spec delta for those capabilities or a spec_impact declaration. The `.coding/openspec/specs/{external-lead,worker-brief}/.mnemo.yaml` path globs include `src-tauri/src/mnemo2/team/*.rs`; dispatch-routing/.mnemo.yaml and tier-ladder/.mnemo.yaml never listed team.rs. Comment pointers in config.yaml: external-lead state -> team/external_lead.rs; escalate-tier dispatch refusal -> team/dispatch.rs + team/routing.rs; worker brief assembly -> team/dispatch.rs, plan_read host tool -> team/pump.rs, plan-change worker notices -> team.rs board observer via team/control.rs `message` (lead_tools.rs holds only worker_host_tools).

@@ -1,0 +1,8 @@
++++
+title = "measure Mnemo's memory recall with mnemo2_memory_eval before and after a memory change"
+created = "2026-11-08"
++++
+
+From src-tauri/mnemo2-app: `cargo run --example mnemo2_memory_eval -- --coding <project>\.coding`. It copies memory.db into a temp dir, opens the copy with the configured embedder, runs 40 questions from src-tauri/tests/fixtures/memory_eval.jsonl through recall_peek and writes .coding/tmp/memory_eval.json with `score`, `control` and `misses`. Two numbers read differently: `control` asks each record by its exact title and should sit at 1.00 (a drop means ranking or the harness broke, as 0.65 did before durable records stopped aging); `score` uses deliberately paraphrased questions, so it is hard mode, for before/after comparison and not an absolute grade. Compare runs close in time because the store grows. noise@5 counts untyped facts and synthetic rows in the top five; `misses` shows what came back instead. The record's `commit` is the store project's HEAD, not the code under test.
+
+Amended 2026-11-08: Reference results on this repo after the memory work of 2026-11-08, against the first baseline. Paraphrased: hit@1 0.025 to 0.150, hit@5 0.100 to 0.425, MRR 0.056 to 0.284, noise@5 0.410 to 0.255. Exact-title control: hit@1 0.475 to 0.925, hit@5 0.650 to 1.000, MRR 0.547 to 0.958, noise@5 0.480 to 0.235. Nearly all of the gain came from one change: durable records stopped aging in recall. Clearing rows can raise noise@5 slightly, because freed slots go to untyped facts, so read it beside hit@5. The eval only reports misses in detail, and the top_recalled list stays empty until sessions run on a build with recall_count.

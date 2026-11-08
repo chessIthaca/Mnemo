@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use crate::error::Result;
-use crate::memory::types::{EpisodicData, Memory, MemoryData, MemoryTier};
+use crate::memory::types::{EpisodicData, Memory, MemoryClass, MemoryData, MemoryTier};
 use crate::memory::MemoryStoreTrait;
 use crate::provider::trace::LlmRequestContext;
 use crate::provider::{LlmClient, Message};
@@ -368,6 +368,33 @@ async fn synthesize_with_llm(
     Ok((narrative, key_decisions, files_modified, concepts))
 }
 
+/// The semantic-extraction prompt (plan 373dec00 step 2).
+///
+/// Guidance says what memory is FOR — what a future session cannot get by
+/// reading the repository or git — instead of imposing fixed salience rules
+/// or banned words: the article's evidence is that fixed write rules cost
+/// more memory gain than they save. `how_known` is optional; output that
+/// omits it must keep parsing.
+pub(crate) fn semantic_extraction_prompt(
+    narrative: &str,
+    corpus_section: &str,
+    existing_section: &str,
+) -> String {
+    format!(
+        "Extract what a future session on this project could not get by reading the repository or \
+         git. Return a JSON array of objects with a 'fact' field, a 'confidence' field (0-1), an \
+         optional 'how_known' field (what shows the fact is true: a test, a file, a run, or that \
+         the user said so), and an optional 'id' field — the id of the existing fact this entry \
+         refines or corrects. Omit 'id' for genuinely new facts.\n\n\
+         What earns a place: why a choice was made, what was tried and failed, a trap, a user \
+         preference, a rule and how it was verified. Git and the plan board already record what \
+         was committed, merged or finished, and the code shows what it does — do not restate \
+         those. If a fact restates what the repository or git already makes plain, leave it \
+         out.\n\n\
+         Summary:\n{narrative}{corpus_section}{existing_section}"
+    )
+}
+
 /// Extract cross-session semantic facts from an episodic narrative.
 ///
 /// `corpus` (the plans/reviews digest) is appended to the prompt when
@@ -391,6 +418,13 @@ async fn extract_semantic_facts(
     // List the newest existing facts so the LLM can refine them in place
     // (via the optional 'id' field) instead of duplicating near-misses.
     let mut existing = store.list_by_tier(MemoryTier::Semantic).await?;
+    // Derived rows (typed knowledge records, plan/review/backlog/spec
+    // digests) are rebuilt from their source files by the indexer —
+    // consolidation owns only AUTHORED facts. A derived row is never listed
+    // (the LLM cannot name its id) and never rewritten: an id that names one
+    // finds no `existing_hit`, so the fact is written as a new authored
+    // memory.
+    existing.retain(|m| m.record_class != MemoryClass::Derived);
         existing.sort_by_key(|a| std::cmp::Reverse(a.last_accessed_at));
     existing.truncate(EXISTING_FACTS_LIMIT);
     let existing_section = if existing.is_empty() {
@@ -411,9 +445,7 @@ async fn extract_semantic_facts(
             "\n\nExisting facts (id: text) — set 'id' when an entry refines or corrects one of these:\n{lines}"
         )
     };
-    let prompt = format!(
-        "Extract distinct, reusable facts about this project from the session summary. Return a JSON array of objects with a 'fact' field, a 'confidence' field (0-1), and optionally an 'id' field — the id of the existing fact this entry refines or corrects. Omit 'id' for genuinely new facts.\n\nSummary:\n{narrative}{corpus_section}{existing_section}"
-    );
+    let prompt = semantic_extraction_prompt(narrative, &corpus_section, &existing_section);
     let messages = vec![Message::user_text(prompt)];
     let stream = llm
         .complete_with_context(&messages, &[], None, llm_context)
@@ -436,10 +468,15 @@ async fn extract_semantic_facts(
                 .get("confidence")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.5);
-            let data = crate::memory::types::SemanticData {
-                fact: fact_str.to_string(),
-                confidence,
-            };
+            // Provenance is optional in the output and old rows lack it; a
+            // refinement that omits it KEEPS the prior row's answer instead
+            // of forgetting how the fact is known (plan 373dec00 step 2).
+            let how_known = fact
+                .get("how_known")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             // When the LLM names the fact this entry refines, rewrite that
             // memory in place (same id, bumped strength, preserved history)
             // so reinforcement compounds instead of duplicating near-misses.
@@ -449,6 +486,17 @@ async fn extract_semantic_facts(
                     .iter()
                     .find(|m| m.id == id && m.tier == MemoryTier::Semantic)
             });
+            let prior_how_known = existing_hit
+                .and_then(|prior| {
+                    serde_json::from_value::<crate::memory::types::SemanticData>(prior.data.clone())
+                        .ok()
+                })
+                .and_then(|d| d.how_known);
+            let data = crate::memory::types::SemanticData {
+                fact: fact_str.to_string(),
+                confidence,
+                how_known: how_known.or(prior_how_known),
+            };
             let mut mem = match existing_hit {
                 Some(prior) => {
                     let mut m = prior.clone();
@@ -508,7 +556,10 @@ async fn extract_procedural_workflows(
         format!("\n\nPrior plans and review reports:\n{corpus}")
     };
     // Fetch existing workflows once; name matches below compound in place.
-    let existing = store.list_by_tier(MemoryTier::Procedural).await?;
+    let mut existing = store.list_by_tier(MemoryTier::Procedural).await?;
+    // Same rule as semantic facts: consolidation never compounds onto a
+    // derived row.
+    existing.retain(|m| m.record_class != MemoryClass::Derived);
     let prompt = format!(
         "Identify any recurring workflow or procedure from this session summary — a named sequence of steps with a trigger condition and expected outcome. Return a JSON array of objects with fields: name, steps (array), trigger_condition, expected_outcome, frequency (integer). If none, return [].\n\nSummary:\n{narrative}{corpus_section}"
     );
@@ -1154,6 +1205,7 @@ mod tests {
         seed.data = serde_json::to_value(crate::memory::types::SemanticData {
             fact: "The build uses cargo workspaces.".to_string(),
             confidence: 0.6,
+            how_known: None,
         })
         .unwrap();
         store.write(seed).await.unwrap();
@@ -1224,6 +1276,425 @@ mod tests {
             .find(|m| m.id != "fact-known")
             .expect("new fact written");
         assert!(fresh.content.contains("cargo test unpiped"));
+    }
+
+    #[tokio::test]
+    async fn extracted_facts_keep_how_known_and_tolerate_its_absence() {
+        // Plan 373dec00 step 2: the extractor may say HOW a fact is known
+        // (a test, a file, a run, the user said so). It round-trips through
+        // the row's existing `data` JSON — the old shape keeps parsing, and a
+        // refinement that omits it keeps what the row already knew.
+        let embedder: Arc<dyn crate::memory::embedder::Embedder> = Arc::new(HashEmbedder::new());
+        let store = MemoryStore::open_in_memory(embedder).unwrap();
+        store
+            .record_tool_event(
+                Some("sess-hk"),
+                "file_read",
+                serde_json::json!({"path": "Cargo.toml"}),
+                "contents",
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "agent inspected Cargo.toml",
+                "key_decisions": [],
+                "files_modified": ["Cargo.toml"],
+                "concepts": []
+            })
+            .to_string(),
+            serde_json::json!([
+                {
+                    "fact": "The build uses cargo workspaces.",
+                    "confidence": 0.9,
+                    "how_known": "Cargo.toml lists two workspace members; cargo test passes."
+                },
+                {"fact": "Tests run via cargo test unpiped.", "confidence": 0.7}
+            ])
+            .to_string(),
+            "[]".to_string(),
+        ]);
+        consolidate_session(
+            &store,
+            "sess-hk",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
+
+        let semantic = store.list_by_tier(MemoryTier::Semantic).await.unwrap();
+        let with_evidence = semantic
+            .iter()
+            .find(|m| m.content.contains("cargo workspaces"))
+            .expect("the evidenced fact was written");
+        let data: crate::memory::types::SemanticData =
+            serde_json::from_value(with_evidence.data.clone()).unwrap();
+        assert_eq!(
+            data.how_known.as_deref(),
+            Some("Cargo.toml lists two workspace members; cargo test passes.")
+        );
+        let without = semantic
+            .iter()
+            .find(|m| m.content.contains("cargo test unpiped"))
+            .expect("the bare fact was written");
+        let data: crate::memory::types::SemanticData =
+            serde_json::from_value(without.data.clone()).unwrap();
+        assert!(
+            data.how_known.is_none(),
+            "output without how_known still parses: {data:?}"
+        );
+        assert!(
+            without.data.get("how_known").is_none(),
+            "the old row shape stays byte-identical when how_known is absent"
+        );
+        // A pre-field `data` payload (the shape already in the store) keeps
+        // deserializing — no schema migration.
+        assert!(
+            serde_json::from_value::<crate::memory::types::SemanticData>(
+                serde_json::json!({"fact": "old row shape", "confidence": 0.5})
+            )
+            .is_ok()
+        );
+
+        // A refinement that omits how_known KEEPS the prior answer.
+        let evidenced_id = with_evidence.id.clone();
+        store
+            .record_tool_event(
+                Some("sess-hk2"),
+                "file_read",
+                serde_json::json!({"path": "Cargo.toml"}),
+                "contents",
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "agent re-read Cargo.toml",
+                "key_decisions": [],
+                "files_modified": ["Cargo.toml"],
+                "concepts": []
+            })
+            .to_string(),
+            serde_json::json!([
+                {
+                    "id": evidenced_id.clone(),
+                    "fact": "The build uses a cargo workspace with two members.",
+                    "confidence": 0.95
+                }
+            ])
+            .to_string(),
+            "[]".to_string(),
+        ]);
+        consolidate_session(
+            &store,
+            "sess-hk2",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
+        let refined = store.list_by_tier(MemoryTier::Semantic).await.unwrap();
+        let refined = refined
+            .iter()
+            .find(|m| m.id == evidenced_id)
+            .expect("refined row keeps its id");
+        let data: crate::memory::types::SemanticData =
+            serde_json::from_value(refined.data.clone()).unwrap();
+        assert_eq!(
+            data.how_known.as_deref(),
+            Some("Cargo.toml lists two workspace members; cargo test passes."),
+            "a refinement without how_known keeps the prior provenance"
+        );
+        assert!(refined.content.contains("two members"));
+    }
+
+    #[tokio::test]
+    async fn extraction_prompt_says_what_memory_is_for() {
+        // Plan 373dec00 step 2: the prompt says what memory is FOR — what a
+        // future session cannot get from the repository or git — instead of
+        // fixed salience rules, and it asks for optional provenance.
+        let embedder: Arc<dyn crate::memory::embedder::Embedder> = Arc::new(HashEmbedder::new());
+        let store = MemoryStore::open_in_memory(embedder).unwrap();
+        store
+            .record_tool_event(
+                Some("sess-prompt"),
+                "file_read",
+                serde_json::json!({"path": "src/main.rs"}),
+                "contents",
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "agent read src/main.rs",
+                "key_decisions": [],
+                "files_modified": ["src/main.rs"],
+                "concepts": []
+            })
+            .to_string(),
+            "[]".to_string(),
+            "[]".to_string(),
+        ]);
+        consolidate_session(
+            &store,
+            "sess-prompt",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
+
+        let prompts = llm.prompts().await;
+        assert_eq!(prompts.len(), 3, "synthesis + semantic + procedural");
+        let prompt = &prompts[1];
+        for needle in [
+            "could not get by reading the repository or git",
+            "why a choice was made",
+            "what was tried and failed",
+            "a trap",
+            "a user preference",
+            "a rule and how it was verified",
+            "Git and the plan board already record",
+            "how_known",
+            "a test, a file, a run, or that the user said so",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "the extraction prompt must say {needle:?}: {prompt}"
+            );
+        }
+        assert!(
+            prompt.contains("agent read src/main.rs"),
+            "the session narrative still reaches the extractor: {prompt}"
+        );
+        // The old one-line guidance said nothing about what memory is for.
+        assert!(!prompt.contains("distinct, reusable facts"));
+    }
+
+    #[tokio::test]
+    async fn semantic_extraction_leaves_derived_knowledge_rows_alone() {
+        // Regression (plan 1b46d19e): a derived knowledge row is rebuilt from
+        // its FILE by the indexer — consolidation owns only authored facts.
+        // Before the `retain` in `extract_semantic_facts`, an LLM answering
+        // with the knowledge row's id rewrote it with a 60-char untyped title,
+        // the raw fact as content and `SemanticData` as data (rel_path lost)
+        // while the file never changed. The id must find no hit instead: the
+        // fact lands as a NEW authored memory and the row stays untouched.
+        let embedder: Arc<dyn crate::memory::embedder::Embedder> = Arc::new(HashEmbedder::new());
+        let store = MemoryStore::open_in_memory(embedder).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ks = crate::memory::KnowledgeStore::new(dir.path().join(".coding/knowledge"));
+        let rel = ks
+            .write(
+                crate::memory::MemoryRecordType::Decision,
+                "DECISION: a clean team_merge deletes the merged worker's branch",
+                "A clean team_merge deletes the merged worker's branch with git branch -d.",
+            )
+            .unwrap();
+        // The indexer writes the row from the file (tier Semantic, class
+        // Derived, typed prefix, rel_path data).
+        crate::memory::indexer::reindex_knowledge_files(
+            &store,
+            ks.dir(),
+            std::slice::from_ref(&rel),
+        )
+        .await
+        .unwrap();
+        let id = crate::memory::indexer::knowledge_id(&rel);
+        let before = store
+            .get_memory(&id)
+            .await
+            .unwrap()
+            .expect("knowledge row indexed");
+        assert_eq!(before.record_class, MemoryClass::Derived);
+        assert_eq!(
+            before.record_type,
+            crate::memory::MemoryRecordType::Decision
+        );
+        assert!(before.title.starts_with("DECISION:"));
+
+        store
+            .record_tool_event(
+                Some("sess-derived"),
+                "file_read",
+                serde_json::json!({"path": "Cargo.toml"}),
+                "contents",
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Canned responses: synthesis, then ONE fact whose `id` names the
+        // derived knowledge row (the drift shape), then no workflows.
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "agent read Cargo.toml",
+                "key_decisions": [],
+                "files_modified": ["Cargo.toml"],
+                "concepts": []
+            })
+            .to_string(),
+            serde_json::json!([
+                {"id": id, "fact": "Mnemo2 automatically attempts merged-worker branch cleanup after a clean merge.", "confidence": 0.99}
+            ])
+            .to_string(),
+            "[]".to_string(),
+        ]);
+        consolidate_session(
+            &store,
+            "sess-derived",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
+
+        // (1) The knowledge row is unchanged: typed title, digest content,
+        // record type/class, rel_path + links data, and no session tag.
+        let after = store
+            .get_memory(&id)
+            .await
+            .unwrap()
+            .expect("knowledge row still present");
+        assert_eq!(after.title, before.title, "typed title preserved");
+        assert_eq!(after.content, before.content, "digest content preserved");
+        assert_eq!(
+            after.record_type,
+            crate::memory::MemoryRecordType::Decision,
+            "record type preserved"
+        );
+        assert_eq!(after.record_class, MemoryClass::Derived);
+        assert_eq!(after.data, before.data, "rel_path + links data preserved");
+        assert!(
+            after.source_session_ids.is_empty(),
+            "consolidation must not tag a derived row with the session"
+        );
+
+        // (2) The derived row was never listed as a refinable fact (its id
+        // must not reach the extraction prompt — the base instructions
+        // themselves always mention the optional 'id' FIELD).
+        let prompts = llm.prompts().await;
+        assert!(
+            !prompts[1].contains(&id),
+            "derived knowledge row id must not be listed"
+        );
+
+        // (3) The fact is not lost: it was written as a NEW authored row.
+        let semantic = store.list_by_tier(MemoryTier::Semantic).await.unwrap();
+        let authored: Vec<_> = semantic
+            .iter()
+            .filter(|m| m.record_class == MemoryClass::Authored)
+            .collect();
+        assert_eq!(authored.len(), 1, "the fact lands as one authored row");
+        assert_ne!(authored[0].id, id, "a new id, not the knowledge row");
+        assert!(authored[0].content.contains("merged-worker branch cleanup"));
+    }
+
+    #[tokio::test]
+    async fn procedural_extraction_does_not_compound_onto_a_derived_row() {
+        // Same rule as semantic facts: a derived procedural row is rebuilt
+        // from its source by the indexer, so consolidation must not compound
+        // onto it — the workflow lands as a NEW authored row.
+        let embedder: Arc<dyn crate::memory::embedder::Embedder> = Arc::new(HashEmbedder::new());
+        let store = MemoryStore::open_in_memory(embedder).unwrap();
+
+        // Seed 'review protocol' exactly like the compounding test, but as a
+        // DERIVED row (frequency 3, strength 0.7, known id).
+        let mut seed = Memory::new(
+            MemoryTier::Procedural,
+            "review protocol",
+            "spawn reviewer; fix findings",
+            0,
+        );
+        seed.id = "proc-derived".to_string();
+        seed.strength = 0.7;
+        seed.record_class = MemoryClass::Derived;
+        seed.data = serde_json::to_value(crate::memory::types::ProceduralData {
+            name: "review protocol".to_string(),
+            steps: vec!["spawn reviewer".to_string(), "fix findings".to_string()],
+            trigger_condition: "end of implementation plan".to_string(),
+            expected_outcome: "review report closed".to_string(),
+            frequency: 3,
+        })
+        .unwrap();
+        store.write(seed).await.unwrap();
+
+        store
+            .record_tool_event(
+                Some("sess-proc-derived"),
+                "file_write",
+                serde_json::json!({"path": "src/b.rs"}),
+                "written",
+                None,
+            )
+            .await
+            .unwrap();
+
+        // LLM returns the same workflow name (different casing) — without
+        // the retain it would compound onto the derived row.
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "agent ran the review protocol again",
+                "key_decisions": [],
+                "files_modified": ["src/b.rs"],
+                "concepts": []
+            })
+            .to_string(),
+            "[]".to_string(),
+            serde_json::json!([
+                {
+                    "name": "Review Protocol",
+                    "steps": ["spawn reviewer", "fix findings", "re-run tests"],
+                    "trigger_condition": "end of implementation plan",
+                    "expected_outcome": "all findings fixed",
+                    "frequency": 1
+                }
+            ])
+            .to_string(),
+        ]);
+        consolidate_session(
+            &store,
+            "sess-proc-derived",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
+
+        let procedural = store.list_by_tier(MemoryTier::Procedural).await.unwrap();
+        assert_eq!(procedural.len(), 2, "derived row untouched, new row added");
+        let derived = procedural
+            .iter()
+            .find(|m| m.id == "proc-derived")
+            .expect("derived row still present");
+        assert_eq!(derived.record_class, MemoryClass::Derived);
+        assert!(
+            (derived.strength - 0.7).abs() < 1e-9,
+            "strength untouched by consolidation"
+        );
+        assert_eq!(
+            derived.data["frequency"].as_u64(),
+            Some(3),
+            "frequency untouched"
+        );
+        assert_eq!(derived.content, "spawn reviewer; fix findings");
+        let authored = procedural
+            .iter()
+            .find(|m| m.id != "proc-derived")
+            .expect("workflow written as a new authored row");
+        assert_eq!(authored.record_class, MemoryClass::Authored);
+        let authored_data: crate::memory::types::ProceduralData =
+            serde_json::from_value(authored.data.clone()).unwrap();
+        assert_eq!(authored_data.frequency, 1);
     }
 
     #[tokio::test]

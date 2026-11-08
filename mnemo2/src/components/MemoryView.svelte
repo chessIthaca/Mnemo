@@ -500,6 +500,9 @@
                 {#if detail.quarantined}
                   <span class="badge warn" title={detail.quarantined}>QUARANTINED</span>
                 {/if}
+                {#if detail.unconfirmed}
+                  <span class="badge" title="The record does not say how it is known">UNCONFIRMED</span>
+                {/if}
               </p>
               <h2>{displayTitle(detail.title)}</h2>
               <p class="record-meta">
@@ -514,6 +517,9 @@
                 <span>{detail.created ?? formatRecordDate(detail.created_at)}</span>
                 <span>{detail.access_count} {detail.access_count === 1 ? "recall" : "recalls"}</span>
               </p>
+              {#if detail.evidence}
+                <p class="record-evidence">Evidence: {detail.evidence}</p>
+              {/if}
             </header>
 
             <Markdown source={detail.markdown} onOpenPath={actions.openRepoPath} />
@@ -634,6 +640,7 @@
   .record-head h2 { margin: 8px 0 6px; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; letter-spacing: -0.02em; }
   .record-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0; color: var(--muted); font-size: var(--text-meta); }
   .record-meta code { padding: 1px 5px; border-radius: 4px; background: var(--surface-soft); font-family: var(--font-mono); font-size: var(--text-meta); }
+.record-evidence { margin: 0; color: var(--muted); font-size: var(--text-meta); }
   .record :global(.markdown) { font-size: var(--text-body); }
   .record-links { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--line); }
   .record-links h3 { margin: 0 0 6px; color: var(--muted); font-size: var(--text-meta); font-weight: 660; text-transform: uppercase; letter-spacing: 0.05em; }

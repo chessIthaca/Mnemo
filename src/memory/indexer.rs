@@ -36,7 +36,9 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::memory::knowledge::{KNOWLEDGE_DIR_NAME, KnowledgeRecord};
-use crate::memory::{Memory, MemoryClass, MemorySearchConfig, MemoryStoreTrait, MemoryTier};
+use crate::memory::{
+    Memory, MemoryClass, MemoryRecordType, MemorySearchConfig, MemoryStoreTrait, MemoryTier,
+};
 
 mod backlog;
 mod knowledge;
@@ -107,6 +109,9 @@ pub async fn index_derived(
     let knowledge_dir = plans_dir
         .parent()
         .map(|p| p.join(KNOWLEDGE_DIR_NAME));
+    // Keep a handle for the INDEX.md regeneration after the loop — the scan
+    // closure below takes ownership of the original.
+    let knowledge_dir_for_index = knowledge_dir.clone();
     let config = store.memory_search_config();
     let (sources, knowledge_records, scan_errors) = tokio::task::spawn_blocking(move || {
         scan_sources(&plans, &backlog, knowledge_dir.as_deref(), &config)
@@ -130,12 +135,25 @@ pub async fn index_derived(
         seen.insert(source.key.clone());
         let hash = content_hash(source);
         let memory_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, source.key.as_bytes()).to_string();
-        match store.index_state_get(&source.key).await? {
-            // Unchanged: the stored hash matches — no re-embed, no write.
-            // (A knowledge row may still need metadata reconciliation — the
-            // post-loop pass handles that, not the skip path.)
-            Some((old_hash, _)) if old_hash == hash => report.skipped += 1,
-            // Changed: update in place (re-embeds + re-derives the record
+        let state = store.index_state_get(&source.key).await?;
+        // Unchanged requires the row to mirror its source, not just the
+        // content hash: the hash lives in `derived_index_state` and never
+        // sees a row another writer overwrote, so a hash-only test would
+        // skip a drifted row for ever.
+        let unchanged = match &state {
+            Some((old_hash, _)) if *old_hash == hash => {
+                row_matches_source(store, &memory_id, source).await?
+            }
+            _ => false,
+        };
+        match state {
+            // Unchanged: the stored hash matches AND the row still mirrors
+            // the source — no re-embed, no write. (A knowledge row may still
+            // need metadata reconciliation — the post-loop pass handles
+            // that, not the skip path.)
+            Some(_) if unchanged => report.skipped += 1,
+            // Changed — or hash-equal but the row drifted from its source or
+            // vanished: update in place (re-embeds + re-derives the record
             // type from the title). If the row vanished out from under the
             // state table, fall back to a fresh write. The in-place update
             // leaves `superseded_by`/`data` alone for the post-loop
@@ -203,12 +221,23 @@ pub async fn index_derived(
     if knowledge_touched {
         for (key, meta) in &metas {
             let memory_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string();
-            if store.get_memory(&memory_id).await?.is_some() {
-                store
-                    .set_derived_metadata(&memory_id, meta.superseded_by.as_deref(), &meta.data)
-                    .await?;
-            }
+            let Some(row) = store.get_memory(&memory_id).await? else {
+                continue;
+            };
+            // The check pass owns `moved_paths` — a reconcile re-asserts the
+            // FILE's metadata and would otherwise drop the stamp it wrote
+            // (plan 373dec00 step 13). Everything else comes from the file.
+            let data = crate::memory::health::keep_moved_paths(&meta.data, &row.data);
+            store
+                .set_derived_metadata(&memory_id, meta.superseded_by.as_deref(), &data)
+                .await?;
         }
+    }
+    // The generated knowledge map follows the corpus (plan 373dec00 step 6).
+    // It is a convenience file: a failure is one stderr line, never an indexing
+    // error, and the regenerate pass is a no-op when nothing changed.
+    if let Some(dir) = knowledge_dir_for_index {
+        crate::memory::knowledge_index::regenerate_blocking(dir).await;
     }
     Ok(report)
 }
@@ -254,6 +283,28 @@ async fn write_derived(
     memory.superseded_by = superseded_by.map(str::to_string);
     store.write(memory).await?;
     Ok(())
+}
+
+/// Whether the stored row still mirrors its source: a derived, semantic-tier
+/// row whose title and content equal the source's and whose record type is the
+/// one its title prefix implies. The content hash alone cannot tell — it lives
+/// in `derived_index_state` and never sees the row, so a row overwritten by
+/// another writer would be skipped for ever. A missing row does not match.
+async fn row_matches_source(
+    store: &dyn MemoryStoreTrait,
+    memory_id: &str,
+    source: &SourceRecord,
+) -> Result<bool> {
+    Ok(match store.get_memory(memory_id).await? {
+        Some(row) => {
+            row.record_class == MemoryClass::Derived
+                && row.tier == MemoryTier::Semantic
+                && row.title == source.title
+                && row.content == source.content
+                && row.record_type == MemoryRecordType::from_title(&source.title)
+        }
+        None => false,
+    })
 }
 
 // ── Scanning ────────────────────────────────────────────────────────────────
@@ -319,7 +370,16 @@ pub async fn corpus_is_stale(
     for source in &sources {
         seen.insert(source.key.clone());
         match store.index_state_get(&source.key).await? {
-            Some((old_hash, _)) if old_hash == content_hash(source) => {}
+            Some((old_hash, _)) if old_hash == content_hash(source) => {
+                // The hash lives in the state table and never sees the row —
+                // a row that drifted from its (unchanged) source must count
+                // as stale so the startup reconcile repairs it.
+                let memory_id =
+                    Uuid::new_v5(&Uuid::NAMESPACE_URL, source.key.as_bytes()).to_string();
+                if !row_matches_source(store, &memory_id, source).await? {
+                    return Ok(true);
+                }
+            }
             _ => return Ok(true), // new or changed source
         }
     }

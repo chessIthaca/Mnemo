@@ -90,3 +90,45 @@ When a dispatch carries an explicit lead or user tier or model choice, the syste
 - **THEN** an unsure classifier refuses a Suggest+auto dispatch
 - **AND** a cleared decision runs Laya's tier in Auto mode
 - **AND** offline or too-short text produces the same skip reasons as before
+
+### Requirement: Routing decisions travel with the repository and the installer
+A project that keeps a `.coding/laya/` folder SHALL carry its own routing decisions in `.coding/laya/dispatch_routing.jsonl`, as verbatim rows of the routing log whose plan belongs to that project, and the Mnemo2 installer SHALL ship that file. When a project opens, the system SHALL import a shipped copy by appending only, SHALL import silently when this computer has no decisions the copy lacks, and SHALL ask the user before importing when it has.
+
+#### Scenario: A fresh computer imports silently
+- **WHEN** a project opens on a computer whose routing log lacks the shipped rows and has none of its own
+- **THEN** the rows are appended to the routing log without a question
+
+#### Scenario: A conflicting copy asks
+- **WHEN** a project opens and this computer has decisions the shipped copy lacks, and the copy has decisions this computer lacks
+- **THEN** the user is asked whether to update
+- **AND** updating appends the missing rows and removes nothing
+- **AND** declining leaves the log unchanged and the same copy does not ask again
+
+#### Scenario: Only opted-in projects export
+- **WHEN** a worker merges in a project without a .coding/laya folder
+- **THEN** no decision rows are written into that project
+
+### Requirement: Drift nudges read only new guidance
+The system SHALL run the drift check only on a lead or user message that can carry new work. It SHALL NOT classify text Mnemo2 generated itself (a route-fix brief or a plan-changed notice) or the first lead or user message a read-back worker receives, so those messages never produce a drift nudge and never spend the worker's one nudge. Any other lead or user message of at least `min_words` words SHALL still be classified in the background, and SHALL nudge the lead when the answer clears on a tier above the worker's.
+
+#### Scenario: Read-back answer
+- **WHEN** a worker dispatched with read_back receives its first lead message of at least min_words words
+- **THEN** Laya is not asked about that message
+- **AND** no drift nudge is sent
+- **AND** the worker's one nudge stays available
+
+#### Scenario: Plan notices before the read-back answer
+- **WHEN** a read-back worker has received only Mnemo2 plan-changed notices
+- **WHEN** the lead then sends its answer
+- **THEN** Laya is not asked about the answer
+
+#### Scenario: Route-fix prompt
+- **WHEN** team_route_fix delivers a fix brief to a worker
+- **THEN** Laya is not asked about the brief as drift
+- **AND** no drift nudge is sent
+
+#### Scenario: A later message adds scope
+- **WHEN** a worker receives a lead message of at least min_words words that is not its read-back answer
+- **WHEN** Laya clears the message on a tier above the worker's
+- **THEN** the lead gets a "this got harder" notice
+- **AND** a nudge row with reason drift is logged

@@ -154,6 +154,11 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
     // Name the session when Claude Code does: the server re-attaches an
     // idle-released lead only for the session that staked it.
     let mut body = json!({ "root": instance.root, "mode": wire_mode });
+    if mode == NoticesMode::SessionStart {
+        // Only a real SessionStart pays for the knowledge map (plan 373dec00
+        // step 6); a PostToolUse drain carries the same "drain" mode.
+        body["session_start"] = json!(true);
+    }
     if let Some(session) = hook_session(&input) {
         body["session"] = json!(session);
     }

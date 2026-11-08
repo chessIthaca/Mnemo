@@ -70,6 +70,8 @@ const DETAILS: Record<string, MemoryDetail> = {
     access_count: 9,
     strength: 0.9,
     links: ["spec/2027-02-09-knowledge-as-files"],
+    evidence: "tests/memory_view.rs::reads_the_store",
+    unconfirmed: false,
     backlinks: [DECISION],
   },
   [DECISION.id]: {
@@ -88,6 +90,8 @@ const DETAILS: Record<string, MemoryDetail> = {
     access_count: 4,
     strength: 0.9,
     links: [],
+    evidence: null,
+    unconfirmed: true,
     backlinks: [],
   },
   [HOW.id]: {
@@ -106,6 +110,8 @@ const DETAILS: Record<string, MemoryDetail> = {
     access_count: 2,
     strength: 0.9,
     links: [],
+    evidence: null,
+    unconfirmed: false,
     backlinks: [],
   },
 };
@@ -188,6 +194,29 @@ describe("MemoryView", () => {
     expect(article.getByText("spec/2027-02-09-knowledge-as-files")).toBeTruthy();
     // The Markdown body is rendered, not printed: its heading is a real heading.
     expect(article.getByRole("heading", { level: 2, name: "Why the store" })).toBeTruthy();
+  });
+
+  it("shows how a record is known, and marks a claim that does not say", async () => {
+    // Plan 373dec00 step 4: the reading pane carries the evidence line when
+    // the record has one, and an UNCONFIRMED badge when it does not.
+    render(MemoryView);
+    await waitFor(() => expect(reader()).toBeTruthy());
+    const article = within(reader());
+    expect(
+      article.getByText("Evidence: tests/memory_view.rs::reads_the_store"),
+    ).toBeTruthy();
+    expect(article.queryByText("UNCONFIRMED")).toBeNull();
+
+    // The DECISION record states no evidence at all.
+    const decisionRow = [...listPane().querySelectorAll("button.record-row")].find((button) =>
+      button.querySelector(".record-title")?.textContent?.includes("the tab is read-only"),
+    ) as HTMLButtonElement;
+    await fireEvent.click(decisionRow);
+    await waitFor(() =>
+      expect(article.getByRole("heading", { level: 2, name: "the tab is read-only" })).toBeTruthy(),
+    );
+    expect(article.getByText("UNCONFIRMED")).toBeTruthy();
+    expect(article.queryByText(/^Evidence: /)).toBeNull();
   });
 
   it("opens a backlinked record when it is clicked", async () => {

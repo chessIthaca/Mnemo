@@ -422,6 +422,9 @@ all live. Setup and day-to-day use are in
   clean worktree (a worktree with new dirty work is retained) and deletes the
   merged branch with a safe `git branch -d` (a branch that is not fully merged
   is kept). The merge commit keeps the worker tip as its second parent for audit.
+  A checkout that could not be removed because something still held it is
+  retried at every later merge and at every Mnemo2 start; the worker's note
+  clears when the folder is gone, and its branch is deleted then.
 - **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`).
   There is no per-lead-turn delegation cap (removed by user decision 2026-10-31)
   and no cumulative worker token or cost budget. Worker sessions have no

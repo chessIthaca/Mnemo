@@ -181,7 +181,7 @@
         {:else if !auditFinished && (worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted" || (audit && worker.status === "failed"))}
           <button class="toolbar-button" type="button" aria-label="Resume" title="Resume worker" onclick={() => actions.resumeWorker(worker.id)}><Play size={10} /> Resume</button>
         {/if}
-        <button class="toolbar-button" type="button" aria-label="Stop" title="Stop worker" disabled={["stopped", "merging", "merged", "cancelled"].includes(worker.status)} onclick={() => actions.stopWorker(worker.id)}><Square size={10} /> Stop</button>
+        {#if !auditFinished}<button class="toolbar-button" type="button" aria-label="Stop" title="Stop worker" disabled={["stopped", "merging", "merged", "cancelled"].includes(worker.status)} onclick={() => actions.stopWorker(worker.id)}><Square size={10} /> Stop</button>{/if}
         <button class="toolbar-button danger" type="button" aria-label={`Delete ${worker.name}`} title="Delete this worker and its history" disabled={worker.status === "merging"} onclick={() => actions.requestDeleteWorkers([worker.id])}><Trash2 size={10} /> Delete</button>
       </div>
     </div>

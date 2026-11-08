@@ -160,15 +160,24 @@ pub struct PlanEdit {
     pub landed_design: bool,
 }
 
+/// The close nudge shown when an attached external lead closed an
+/// implementation or research plan without recording durable knowledge: a
+/// prompt to record what the repository cannot show, never a refusal.
+pub const NO_DURABLE_RECORD_NUDGE: &str = "This plan closed without a new durable record. If it established something the repository cannot show (why a choice was made, a trap, a root cause), record it now with memory_write.";
+
 /// The result of [`PlanBoard::try_close`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseOutcome {
     /// The plan closed; the review report is at `report_path`.
     /// `retired_notes` counts the plan-scoped memory notes the close
-    /// retired into the report (`memory::plan_scope`).
+    /// retired into the report (`memory::plan_scope`). `knowledge_nudge` is
+    /// set when the attached external lead closed an implementation or
+    /// research plan with no new durable record, so the close result can
+    /// prompt for one without blocking the close.
     Closed {
         report_path: String,
         retired_notes: usize,
+        knowledge_nudge: bool,
     },
     /// Steps are still undone.
     NotReady { reasons: Vec<String> },
@@ -944,6 +953,7 @@ impl PlanBoard {
                 return CloseOutcome::Closed {
                     report_path: entry.report_path.unwrap_or_default(),
                     retired_notes: 0,
+                    knowledge_nudge: false,
                 };
             }
             BoardStatus::Abandoned => {
@@ -984,17 +994,12 @@ impl PlanBoard {
                 reasons: vec![reason],
             };
         }
-        if self.external_lead_attached.load(Ordering::Acquire)
+        // An attached external lead is nudged, never blocked, when a plan
+        // established nothing durable: the write belongs to the plan only when
+        // the plan taught something the repository cannot show.
+        let knowledge_nudge = self.external_lead_attached.load(Ordering::Acquire)
             && matches!(plan.kind, PlanKind::Implementation | PlanKind::Research)
-            && !matches!(self.has_durable_knowledge_since(entry.created_at_ms).await, Ok(true))
-        {
-            return CloseOutcome::Blocked {
-                reasons: vec![
-                    "Record what this plan established with memory_write (a durable SPEC:/DECISION:/HOW: title; no plan IDs, branch names or commit hashes), then call plan_step_done on the last step to close."
-                        .to_string(),
-                ],
-            };
-        }
+            && !matches!(self.has_durable_knowledge_since(entry.created_at_ms).await, Ok(true));
         if self.reviews_dir.as_os_str().is_empty() {
             return CloseOutcome::Blocked {
                 reasons: vec!["no reviews directory is configured".to_string()],
@@ -1008,6 +1013,7 @@ impl PlanBoard {
                     return CloseOutcome::Closed {
                         report_path: existing,
                         retired_notes: 0,
+                        knowledge_nudge: false,
                     }
                 }
                 Err(reason) => {
@@ -1022,6 +1028,7 @@ impl PlanBoard {
         CloseOutcome::Closed {
             report_path,
             retired_notes,
+            knowledge_nudge,
         }
     }
 
@@ -2555,6 +2562,7 @@ mod tests {
             CloseOutcome::Closed {
                 report_path: report_path.clone(),
                 retired_notes: 0,
+                knowledge_nudge: false,
             }
         );
         assert!(dir
@@ -2595,6 +2603,7 @@ mod tests {
         let CloseOutcome::Closed {
             report_path,
             retired_notes,
+            ..
         } = board.try_close(&plan.id, &FakeLedger::passing()).await
         else {
             panic!("expected a close");
@@ -2724,7 +2733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_close_requires_a_new_durable_learning() {
+    async fn external_close_nudges_without_a_new_durable_learning() {
         use crate::memory::{HashEmbedder, Memory, MemoryStore, MemoryTier};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2745,11 +2754,20 @@ mod tests {
         board.tick(&plan.id, 1, "ok").unwrap();
         let ledger = FakeLedger::passing();
 
-        let CloseOutcome::Blocked { reasons } = board.try_close(&plan.id, &ledger).await else {
-            panic!("an old learning must not satisfy the external-lead gate");
+        let CloseOutcome::Closed {
+            knowledge_nudge, ..
+        } = board.try_close(&plan.id, &ledger).await
+        else {
+            panic!("an old learning must not stop the close");
         };
-        assert!(reasons[0].contains("memory_write"), "{reasons:?}");
-        assert!(reasons[0].contains("plan_step_done"), "{reasons:?}");
+        assert!(
+            knowledge_nudge,
+            "an old learning must not clear the nudge"
+        );
+
+        let second = create(&board, "Second importer");
+        board.tick(&second.id, 0, "ok").unwrap();
+        board.tick(&second.id, 1, "ok").unwrap();
 
         let mut note = Memory::new(
             MemoryTier::Episodic,
@@ -2757,7 +2775,7 @@ mod tests {
             "Use the parser selected for this plan.",
             (now_ms() / 1000) as i64,
         );
-        note.data = serde_json::json!({"plan_scoped": true, "plan_ids": [plan.id]});
+        note.data = serde_json::json!({"plan_scoped": true, "plan_ids": [second.id]});
         store.write(note).await.unwrap();
         store
             .write(Memory::new(
@@ -2786,11 +2804,20 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(matches!(
-            board.try_close(&plan.id, &ledger).await,
-            CloseOutcome::Blocked { .. }
-        ));
+        let CloseOutcome::Closed {
+            knowledge_nudge, ..
+        } = board.try_close(&second.id, &ledger).await
+        else {
+            panic!("non-durable notes must not stop the close");
+        };
+        assert!(
+            knowledge_nudge,
+            "plan-scoped and commit-bound notes are not durable"
+        );
 
+        let third = create(&board, "Third importer");
+        board.tick(&third.id, 0, "ok").unwrap();
+        board.tick(&third.id, 1, "ok").unwrap();
         store
             .write(Memory::new(
                 MemoryTier::Semantic,
@@ -2800,12 +2827,42 @@ mod tests {
             ))
             .await
             .unwrap();
-        let outcome = board.try_close(&plan.id, &ledger).await;
-        assert!(matches!(outcome, CloseOutcome::Closed { .. }), "{outcome:?}");
+        let CloseOutcome::Closed {
+            knowledge_nudge, ..
+        } = board.try_close(&third.id, &ledger).await
+        else {
+            panic!("a durable record must not stop the close");
+        };
+        assert!(
+            !knowledge_nudge,
+            "a fresh durable record must clear the nudge"
+        );
     }
 
     #[tokio::test]
-    async fn external_research_close_also_requires_a_learning() {
+    async fn an_in_app_close_never_nudges() {
+        use crate::memory::{HashEmbedder, MemoryStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let board = board(dir.path()).with_memory(store);
+        let plan = create(&board, "Importer");
+        board.tick(&plan.id, 0, "ok").unwrap();
+        board.tick(&plan.id, 1, "ok").unwrap();
+        let CloseOutcome::Closed {
+            knowledge_nudge, ..
+        } = board.try_close(&plan.id, &FakeLedger::passing()).await
+        else {
+            panic!("an in-app plan closes");
+        };
+        assert!(
+            !knowledge_nudge,
+            "no external lead is attached, so no nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_research_close_also_nudges_without_a_learning() {
         use crate::memory::{HashEmbedder, MemoryStore};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2820,14 +2877,17 @@ mod tests {
             })
             .unwrap();
         board.tick(&plan.id, 0, "ok").unwrap();
-        assert!(matches!(
-            board.try_close(&plan.id, &FakeLedger::passing()).await,
-            CloseOutcome::Blocked { .. }
-        ));
+        let CloseOutcome::Closed {
+            knowledge_nudge, ..
+        } = board.try_close(&plan.id, &FakeLedger::passing()).await
+        else {
+            panic!("a research plan closes without a record");
+        };
+        assert!(knowledge_nudge, "research plans are nudged too");
     }
 
     #[tokio::test]
-    async fn amended_knowledge_satisfies_the_external_close_gate() {
+    async fn amended_knowledge_clears_the_close_nudge() {
         use crate::memory::{HashEmbedder, Memory, MemoryStore, MemoryTier};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2854,16 +2914,28 @@ mod tests {
         board.tick(&plan.id, 0, "ok").unwrap();
         board.tick(&plan.id, 1, "ok").unwrap();
         let ledger = FakeLedger::passing();
-        assert!(matches!(
-            board.try_close(&plan.id, &ledger).await,
-            CloseOutcome::Blocked { .. }
-        ));
+        let CloseOutcome::Closed {
+            knowledge_nudge, ..
+        } = board.try_close(&plan.id, &ledger).await
+        else {
+            panic!("an unamended record must not stop the close");
+        };
+        assert!(knowledge_nudge, "the record predates the plan");
 
+        let second = create(&board, "Second importer");
+        board.tick(&second.id, 0, "ok").unwrap();
+        board.tick(&second.id, 1, "ok").unwrap();
         std::fs::write(&path, "# SPEC: Importer\n\nAmended durable contract.\n").unwrap();
-        assert!(matches!(
-            board.try_close(&plan.id, &ledger).await,
-            CloseOutcome::Closed { .. }
-        ));
+        let CloseOutcome::Closed {
+            knowledge_nudge, ..
+        } = board.try_close(&second.id, &ledger).await
+        else {
+            panic!("an amendment must not stop the close");
+        };
+        assert!(
+            !knowledge_nudge,
+            "an amendment after the plan was created is durable"
+        );
     }
 
     #[test]
@@ -3274,6 +3346,49 @@ mod tests {
         assert!(dir.path().join("openspec/specs/importer/spec.md").is_file());
     }
 
+    /// A section body that opens with `# ` / `## ` lines must stay inside its
+    /// section (review L3 class, backlog 77ff8f45): board.json keeps the raw
+    /// text, the plan render escapes those lines, and the archive therefore
+    /// still carries the lead's words without a backslash.
+    #[tokio::test]
+    async fn a_section_heading_does_not_rename_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        research_schema(dir.path(), true);
+        let board = board(dir.path());
+        let plan = board
+            .create_with_sections(
+                PlanDraft {
+                    spec_deltas: vec![added_delta("importer", "Preserve source rows")],
+                    ..draft("Custom archive")
+                },
+                research_section("# Findings\n\nInspected src/import.rs."),
+            )
+            .unwrap();
+        board
+            .update_with_sections(
+                &plan.id,
+                PlanEdit::default(),
+                Some(research_section(
+                    "# Findings\n\nInspected src/import.rs again.",
+                )),
+            )
+            .unwrap();
+
+        let parsed =
+            PlanFile::read_from_file(&dir.path().join("plans").join(format!("{}.md", plan.id)))
+                .unwrap();
+        assert_eq!(parsed.title, "Custom archive");
+
+        complete_steps(&board, &plan.id);
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+        let archive = archive_dir(dir.path(), &plan.id, "custom-archive");
+        let research = std::fs::read_to_string(archive.join("research.md")).unwrap();
+        assert_eq!(research, "# Findings\n\nInspected src/import.rs again.\n");
+    }
+
     #[tokio::test]
     async fn a_close_retries_after_the_archive_succeeded_but_the_report_failed() {
         let dir = tempfile::tempdir().unwrap();
@@ -3445,10 +3560,13 @@ mod tests {
             )
             .unwrap();
         board.tick(&plan.id, 0, "merged").unwrap();
-        assert!(matches!(
-            board.try_close(&plan.id, &FakeLedger::passing()).await,
-            CloseOutcome::Closed { .. }
-        ));
+        let CloseOutcome::Closed {
+            knowledge_nudge, ..
+        } = board.try_close(&plan.id, &FakeLedger::passing()).await
+        else {
+            panic!("a bug_fixing plan closes");
+        };
+        assert!(!knowledge_nudge, "bug_fixing plans are exempt");
     }
 
     #[tokio::test]
@@ -3465,7 +3583,10 @@ mod tests {
         board.tick(&plan.id, 1, "ok").unwrap();
         assert!(matches!(
             board.try_close(&plan.id, &FakeLedger::passing()).await,
-            CloseOutcome::Closed { .. }
+            CloseOutcome::Closed {
+                knowledge_nudge: false,
+                ..
+            }
         ));
 
         let plan = create(&external, "Store-less external");
@@ -3475,7 +3596,10 @@ mod tests {
             external
                 .try_close(&plan.id, &FakeLedger::passing())
                 .await,
-            CloseOutcome::Closed { .. }
+            CloseOutcome::Closed {
+                knowledge_nudge: false,
+                ..
+            }
         ));
     }
 }

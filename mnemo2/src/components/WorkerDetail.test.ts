@@ -239,7 +239,7 @@ describe("worker thread model-switch note", () => {
 describe("WorkerDetail finished audit", () => {
   beforeEach(() => app.set(fixtureState()));
 
-  it("hides Resume, Compact and Steer for a finished audit and points the lead at its report", () => {
+  it("hides Resume, Compact, Steer and Stop for a finished audit and points the lead at its report", () => {
     const audit = createAuditWorker();
     render(WorkerDetail, { worker: audit });
 
@@ -247,6 +247,7 @@ describe("WorkerDetail finished audit", () => {
     expect(screen.queryByRole("button", { name: "Steer" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Compact" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
     // Delete stays: the lead can still clean the finished audit up.
     expect(screen.getByRole("button", { name: "Delete Ada" })).toBeTruthy();
   });
@@ -256,6 +257,7 @@ describe("WorkerDetail finished audit", () => {
     render(WorkerDetail, { worker: audit });
 
     expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     expect(screen.queryByText("Audit finished; its report is with the lead.")).toBeNull();
   });
 });

@@ -36,6 +36,11 @@ pub mod dispatch_routing;
 /// the Laya page's Run-eval button.
 pub mod route_eval;
 
+/// The memory recall eval's core (the hand-written question set, `score_run`,
+/// `memory_eval.json`) — shared by the `mnemo2-app` package's
+/// `mnemo2_memory_eval` example CLI (plan 373dec00, step 1).
+pub mod memory_eval;
+
 /// Best-effort naming of the processes holding a worker checkout's files.
 pub mod lock_holders;
 
@@ -54,6 +59,14 @@ pub mod backlog;
 
 /// The lead's team ledger for the TeamLead workflow.
 pub(crate) mod ledger;
+
+/// Host-side batching of streamed deltas before they cross into the window.
+pub(crate) mod delta_batch;
+
+/// Laya's dispatch routing decisions travelling with the project's git
+/// checkout and the installer: the bundle's export, the import check, and
+/// the answer to a conflicting copy.
+pub(crate) mod laya_learnings;
 
 /// The typed Tauri command surface for the lead conversation.
 pub mod ipc;
@@ -557,6 +570,8 @@ pub fn run() {
             ipc::external_lead_status,
             ipc::external_open_failed,
             ipc::lead_open,
+            ipc::laya_learnings_offers,
+            ipc::laya_learnings_decide,
             laya_settings::laya_status,
             laya_settings::routing_settings_status,
             laya_settings::routing_log_summary,
@@ -879,5 +894,262 @@ mod tests {
         let build_script = include_str!("../../build.rs");
         assert!(build_script.contains("cargo:rustc-link-arg-tests="));
         assert!(build_script.contains("resource.lib"));
+    }
+
+    /// The Tauri commands `generate_handler!` registers, by bare name.
+    ///
+    /// Reads the real registration out of this file: everything between the
+    /// first `generate_handler![` and the first `]` after it; entries are
+    /// comma-separated, `//` comments are stripped first, and only the last
+    /// `::` path segment survives (`graph::graph_status` -> `graph_status`).
+    fn registered_commands(source: &str) -> Vec<String> {
+        let Some(start) = source.find("generate_handler![") else {
+            return Vec::new();
+        };
+        let body = &source[start + "generate_handler![".len()..];
+        let Some(end) = body.find(']') else {
+            return Vec::new();
+        };
+        body[..end]
+            .split(',')
+            .filter_map(|piece| {
+                let piece = piece
+                    .lines()
+                    .map(|line| line.split("//").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let piece = piece.trim();
+                if piece.is_empty() {
+                    return None;
+                }
+                Some(piece.rsplit("::").next().unwrap_or(piece).to_string())
+            })
+            .collect()
+    }
+
+    /// The command names a TypeScript or Svelte source passes to `invoke`.
+    ///
+    /// Only a literal argument counts: `invoke[<T>]( "<name>" ...)`, where the
+    /// string opens right after the parenthesis (whitespace and newlines are
+    /// fine) and closes with the same quote character. That skips plugin calls
+    /// (`invoke("plugin:...")`), dynamic arguments (`invoke(command)`) and
+    /// lookalikes (`reinvoke(...)`).
+    fn invoked_commands(source: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for (at, _) in source.match_indices("invoke") {
+            // `reinvoke(` and `useInvoke2` are not calls; `bindings.invoke`
+            // and a bare `.invoke` are.
+            if let Some(before) = source[..at].chars().next_back() {
+                if before.is_alphanumeric() || before == '_' {
+                    continue;
+                }
+            }
+            let mut rest = source[at + "invoke".len()..].trim_start();
+            // Skip a generic argument list, counting nesting; a `=>` arrow
+            // (`invoke<() => void>`) must not close it early.
+            if rest.starts_with('<') {
+                let mut depth = 0usize;
+                let mut closed = false;
+                let mut previous: Option<char> = None;
+                for (index, ch) in rest.char_indices() {
+                    match ch {
+                        '<' => depth += 1,
+                        '>' if previous != Some('=') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                rest = &rest[index + ch.len_utf8()..];
+                                closed = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    previous = Some(ch);
+                }
+                if !closed {
+                    continue;
+                }
+                rest = rest.trim_start();
+            }
+            let Some(rest) = rest.strip_prefix('(') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(quote) = rest.chars().next() else {
+                continue;
+            };
+            if quote != '"' && quote != '\'' && quote != '`' {
+                continue;
+            }
+            let body = &rest[1..];
+            let name_len = body
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if name_len == 0 {
+                continue;
+            }
+            let name = &body[..name_len];
+            if !body[name_len..].starts_with(quote) {
+                continue;
+            }
+            names.push(name.to_string());
+        }
+        names
+    }
+
+    /// Every non-test `.ts`/`.svelte` file under `dir`, recursively.
+    fn frontend_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                if name != "node_modules" {
+                    frontend_sources(&path, out);
+                }
+                continue;
+            }
+            if name.ends_with(".test.ts") || name.ends_with(".d.ts") {
+                continue;
+            }
+            if name.ends_with(".ts") || name.ends_with(".svelte") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every command the frontend calls by string must be registered in the
+    /// `generate_handler!` list above; a Rust-side rename that misses a caller
+    /// only fails at runtime otherwise.
+    #[test]
+    fn every_frontend_invoke_string_is_a_registered_command() {
+        let registered: std::collections::BTreeSet<String> =
+            registered_commands(include_str!("mod.rs")).into_iter().collect();
+        assert!(
+            registered.len() >= 100,
+            "found only {} registered commands - did the generate_handler list move?",
+            registered.len()
+        );
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mnemo2/src");
+        let mut files = Vec::new();
+        frontend_sources(&root, &mut files);
+        let mut invoked: Vec<(String, String)> = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+            let relative = file
+                .strip_prefix(&root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for name in invoked_commands(&source) {
+                invoked.push((relative.clone(), name));
+            }
+        }
+
+        let distinct: std::collections::BTreeSet<&String> =
+            invoked.iter().map(|(_, name)| name).collect();
+        assert!(
+            distinct.len() >= 100,
+            "found only {} frontend invoke strings - did the call shape change?",
+            distinct.len()
+        );
+
+        let mut missing: Vec<String> = invoked
+            .iter()
+            .filter(|(_, name)| !registered.contains(name))
+            .map(|(file, name)| format!("{file}: {name}"))
+            .collect();
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "frontend invoke strings with no registered Tauri command (renamed or removed in Rust?):\n{}",
+            missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn registered_commands_reads_paths_and_comments() {
+        // Never spell the real macro text in one literal: the test above reads
+        // this very file and takes the FIRST registration it finds.
+        let fixture = concat!(
+            "tauri::generate_handler",
+            "![\n",
+            "            module::one,\n",
+            "            // a comment line,\n",
+            "            two,\n",
+            "]"
+        );
+        assert_eq!(registered_commands(fixture), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn invoked_commands_reads_every_call_shape() {
+        let fixture = concat!(
+            "const items = await bindings.invoke<BacklogItem[]>(\"backlog_items\");\n",
+            "const spec = await invoke<string | null>(\"read_capability_spec\", { capability });\n",
+            "await store\n",
+            "  .invoke<void>(\n",
+            "    \"lead_prompt\",\n",
+            "    {}\n",
+            "  );\n",
+            "const single = await invoke<Record<string, number>>('single_quoted');\n",
+            "const arrow = await invoke<() => void>(\"arrow_generic\");\n",
+            "await invoke(\"plugin:dialog|open\", { options });\n",
+            "await invoke(command, args);\n",
+            "await reinvoke(\"nope\");\n",
+        );
+        assert_eq!(
+            invoked_commands(fixture),
+            vec![
+                "backlog_items",
+                "read_capability_spec",
+                "lead_prompt",
+                "single_quoted",
+                "arrow_generic",
+            ]
+        );
+    }
+
+    #[test]
+    fn frontend_sources_skip_tests_and_declarations() {
+        let root = tempfile::tempdir().expect("temp dir");
+        for path in [
+            "a.ts",
+            "a.test.ts",
+            "b.d.ts",
+            "c.svelte",
+            "node_modules/x.ts",
+            "sub/d.ts",
+        ] {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+            std::fs::write(&file, "").expect("write file");
+        }
+
+        let mut found = Vec::new();
+        frontend_sources(root.path(), &mut found);
+        let found: Vec<String> = found
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root.path())
+                    .expect("relative")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(found, vec!["a.ts", "c.svelte", "sub/d.ts"]);
     }
 }

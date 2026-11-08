@@ -210,9 +210,6 @@ export type TierChoice = RoutingModeName;
 export interface TiersTopControl {
   /** The saved choice (`off` = the lead picks). */
   choice: TierChoice;
-  /** Mnemo1's `[general.routing] enforce` half of the choice — reported so
-   * a hand-edited config can show a mismatch warning. */
-  mnemo1_enforce: boolean;
   /** Mnemo1's `[general.laya] routing` half of the choice. */
   laya_routing: boolean;
   /** Laya's coarse readiness word. */

@@ -50,7 +50,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use mnemo::app::plan_board::BoardStatus;
+use mnemo::app::plan_board::{BoardStatus, NO_DURABLE_RECORD_NUDGE};
 use mnemo::tool::agent::sandbox::Sandbox;
 use mnemo::tool::agent::search::SearchTool;
 use mnemo::tool::agent::search_read::SearchReadTool;
@@ -75,7 +75,7 @@ pub const EXTERNAL_LEAD_CHANNEL: &str = "mnemo2://external-lead";
 /// The short lead brief MCP `initialize` returns. `{helper}` becomes the
 /// helper executable's path, so the lead can start the waiter without PATH.
 pub const LEAD_INSTRUCTIONS: &str = "You lead a Mnemo2 team for this project: workers run on the user's own endpoints in tiers (trivial/routine/medium/high/escalate); you plan, dispatch, review and merge with the team_* tools.\n\
-- Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs; memory_write SPEC:/DECISION:/HOW: learnings before close (see mnemo-lead skill).\n\
+- Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs; memory_write SPEC:/DECISION:/HOW: what the repository cannot show (see mnemo-lead skill).\n\
 - For code use search (or search_read) and graph_* before Grep or Glob; for project history and decisions use memory_search first.\n\
 - Plan first: plan_create (then plan_show, plan_update, plan_step_done). Each team_dispatch needs a plan_id and step; one worker per step with a precise brief and `tier` (tier beats model).\n\
 - A finished worker sends a notice: team_check, then team_review; close findings with team_resolve_finding; team_merge after the review passes.\n\
@@ -907,7 +907,21 @@ impl Shared {
         };
         let active_workers = team.live_worker_turns().await;
         let waiter_alive = team.external_waiter_alive();
-        let summary = team.external_summary().await;
+        // The knowledge map rides only a real SessionStart (plan 373dec00 step
+        // 6): a PostToolUse drain sends the same "drain" mode without the
+        // flag, so it never pays for the file read. A missing INDEX.md (a
+        // project without a corpus, or before the first pass) adds nothing.
+        let session_start = body
+            .get("session_start")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut summary = team.external_summary().await;
+        if session_start {
+            if let Some(map) = mnemo::memory::knowledge_index::knowledge_map_at(&target.root) {
+                summary.push_str("\n\n");
+                summary.push_str(&map);
+            }
+        }
         let notices = if peek {
             team.current_notices(team.peek_external_notices()).await
         } else {
@@ -1206,8 +1220,12 @@ impl Shared {
                     );
                 }
             } else if name == "team_merge" {
-                result.output.push('\n');
-                result.output.push_str(EXTERNAL_LEAD_MEMORY_REMINDER);
+                // A close that nudged already names memory_write; the standing
+                // reminder would stack a second memory line on the same answer.
+                if !result.output.contains(NO_DURABLE_RECORD_NUDGE) {
+                    result.output.push('\n');
+                    result.output.push_str(EXTERNAL_LEAD_MEMORY_REMINDER);
+                }
             }
         }
         let mut text = if is_code_search_tool(name) {
@@ -2383,6 +2401,7 @@ mod tests {
         for expected in [
             "team_dispatch",
             "team_status",
+            "session_search",
             "team_merge",
             "plan_create",
             "plan_list",
@@ -2565,7 +2584,8 @@ mod tests {
         })
     }
 
-    /// Every `.md` file under `dir`.
+    /// Every record `.md` file under `dir` — the generated `INDEX.md` map
+    /// (plan 373dec00 step 6) is not a record and is skipped.
     fn markdown_files(dir: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let mut pending = vec![dir.to_path_buf()];
@@ -2574,7 +2594,9 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     pending.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "md") {
+                } else if path.extension().is_some_and(|ext| ext == "md")
+                    && path.file_name() != Some(std::ffi::OsStr::new("INDEX.md"))
+                {
                     found.push(path);
                 }
             }
@@ -3104,6 +3126,76 @@ mod tests {
         fixture.shutdown().await;
     }
 
+    /// A lead that follows the schema can request a high-risk dispatch: the
+    /// listed team_dispatch schema offers review_risk, and the value reaches
+    /// the worker's record through tools/call.
+    #[tokio::test]
+    async fn external_lead_high_risk_dispatch_over_mcp_records_the_risk() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        fixture.rpc(initialize()).await;
+        let (_, listed) = fixture
+            .rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            }))
+            .await;
+        let tools = listed["result"]["tools"].as_array().expect("tools");
+        let dispatch = tools
+            .iter()
+            .find(|tool| tool["name"] == "team_dispatch")
+            .expect("team_dispatch");
+        assert_eq!(
+            dispatch["inputSchema"]["properties"]["review_risk"]["enum"],
+            json!(["standard", "high"]),
+            "{dispatch}"
+        );
+        let required = dispatch["inputSchema"]["required"].as_array().expect("required");
+        assert!(!required.contains(&json!("review_risk")), "{dispatch}");
+        ok_text(&fixture.call("memory_search", json!({"query": "high-risk dispatch"})).await);
+        let created = ok_text(
+            &fixture
+                .call(
+                    "plan_create",
+                    json!({
+                        "title": "High-risk plan",
+                        "goal": "Prove a schema-following lead can request a high-risk dispatch",
+                        "context": "The external lead creates this plan over MCP; src/lib.rs is the anchor file for the change.",
+                        "steps": ["**One** - edit src/lib.rs"],
+                        "acceptance_scenarios": ["A high-risk worker cannot merge without an independent audit."]
+                    }),
+                )
+                .await,
+        );
+        let plan_id = created
+            .strip_prefix("Created plan ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("a plan id")
+            .to_string();
+        ok_text(
+            &fixture
+                .call(
+                    "team_dispatch",
+                    json!({
+                        "worker_id": "extrisk001",
+                        "plan_id": plan_id,
+                        "step": 1,
+                        "brief": "write src/lib.rs",
+                        "review_risk": "high"
+                    }),
+                )
+                .await,
+        );
+        let worker = fixture
+            .team()
+            .await
+            .worker("extrisk001")
+            .await
+            .expect("the dispatched worker");
+        assert_eq!(worker.review_risk, "high");
+        fixture.shutdown().await;
+    }
+
     /// The whole external-lead loop: plan on the board over MCP, dispatch a
     /// worker, and the worker's "finished" notice reaches the external lead
     /// (not the in-app one) through the waiter and the next tool result.
@@ -3463,6 +3555,52 @@ mod tests {
         assert_eq!(other["attached"], false);
         let (status, _) = fixture.post("/lead/notices", Some("tok-123"), &[], "{}").await;
         assert_eq!(status, 400, "a root is required");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_knowledge_map_rides_only_a_session_start_drain() {
+        // The map is appended to the summary only when the hook says it is a
+        // real SessionStart (plan 373dec00 step 6): a PostToolUse drain uses
+        // the same "drain" mode without the flag and must never pay for the
+        // read. A project without an INDEX.md adds nothing either.
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+
+        let plain = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "drain" }))
+            .await;
+        let summary = plain["summary"].as_str().expect("summary");
+        assert!(!summary.contains("Project knowledge"), "{summary}");
+
+        let index = fixture.root.join(".coding/knowledge/INDEX.md");
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        std::fs::write(
+            &index,
+            "# Project knowledge index\n\n## src/agent (3)\n- SPEC: a - spec/a.md\n\n## general (4)\n- HOW: b - how/b.md\n",
+        )
+        .unwrap();
+
+        let drain = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "drain" }))
+            .await;
+        let summary = drain["summary"].as_str().expect("summary");
+        assert!(
+            !summary.contains("Project knowledge"),
+            "a drain without the flag gets no map: {summary}"
+        );
+
+        let start = fixture
+            .lead_post(
+                "/lead/notices",
+                json!({ "root": root, "mode": "drain", "session_start": true }),
+            )
+            .await;
+        let summary = start["summary"].as_str().expect("summary");
+        assert!(
+            summary.contains("Project knowledge (7 records): src/agent 3, general 4."),
+            "a SessionStart carries the map: {summary}"
+        );
         fixture.shutdown().await;
     }
 

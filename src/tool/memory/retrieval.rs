@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::memory::health;
 use crate::memory::{MemoryFilter, MemoryRecordType, MemoryStoreTrait};
 use crate::provider::ToolSchema;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
@@ -31,6 +32,41 @@ use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 /// output. (Successor of the old CONTEXT_PACK_CAP_CHARS 2048, which
 /// despite its name governed search output.)
 const SEARCH_CAP_CHARS: usize = 6144;
+
+/// The `[cites moved paths: a -> b; c gone]` suffix for a hit whose knowledge
+/// file cites paths the repo has moved past — the memory check pass stamps
+/// `data.moved_paths` (plan 373dec00 step 5). Empty for an unaffected row.
+///
+/// At most [`health::ANNOTATION_MAX_ENTRIES`] entries render, then `+N more`,
+/// so a record citing dozens of gone paths cannot blow `SEARCH_CAP_CHARS`.
+fn moved_paths_note(data: &serde_json::Value) -> String {
+    let Some(entries) = data
+        .get(health::MOVED_PATHS_KEY)
+        .and_then(|value| value.as_array())
+    else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for entry in entries.iter().take(health::ANNOTATION_MAX_ENTRIES) {
+        let Some(from) = entry.get("from").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        match entry.get("to").and_then(|value| value.as_str()) {
+            Some(to) => parts.push(format!("{from} -> {to}")),
+            None => parts.push(format!("{from} gone")),
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    if entries.len() > health::ANNOTATION_MAX_ENTRIES {
+        parts.push(format!(
+            "+{} more",
+            entries.len() - health::ANNOTATION_MAX_ENTRIES
+        ));
+    }
+    format!(" [cites moved paths: {}]", parts.join("; "))
+}
 
 /// Format one scored memory as a recall-style line — the same
 /// `[tier] title (id: …, score: …)` shape as `memory_recall` (the frontend
@@ -53,8 +89,21 @@ fn format_hit(sm: &crate::memory::ScoredMemory) -> String {
     } else {
         ""
     };
+    // A claim that does not say how it is known (plan 373dec00 step 4):
+    // flag it so an unverified recollection is never mistaken for checked
+    // knowledge. The suffix sits AFTER the pinned "(id/score/strength)"
+    // group, with the other tags, so the frontend parser still matches.
+    let unconfirmed = if sm.memory.is_unconfirmed() {
+        " [unconfirmed]"
+    } else {
+        ""
+    };
+    // A knowledge record whose cited source paths the repo has moved past:
+    // say so before the agent trusts the claim (the memory check pass stamps
+    // `data.moved_paths`; plan 373dec00 step 5).
+    let moved = moved_paths_note(&sm.memory.data);
     format!(
-        "[{}] {} (id: {}, score: {:.2}, strength: {:.2}){}{}\n  {}\n\n",
+        "[{}] {} (id: {}, score: {:.2}, strength: {:.2}){}{}{}{}\n  {}\n\n",
         sm.memory.tier,
         sm.memory.title,
         sm.memory.id,
@@ -62,6 +111,8 @@ fn format_hit(sm: &crate::memory::ScoredMemory) -> String {
         sm.memory.strength,
         superseded,
         quarantined,
+        unconfirmed,
+        moved,
         sm.memory.content.chars().take(200).collect::<String>(),
     )
 }
@@ -216,8 +267,16 @@ impl Tool for MemorySearchTool {
                             } else {
                                 ""
                             };
+                            // The same tags as a search hit, in the same
+                            // order, after the title (plan 373dec00 step 4).
+                            let unconfirmed = if m.is_unconfirmed() {
+                                " [unconfirmed]"
+                            } else {
+                                ""
+                            };
+                            let moved = moved_paths_note(&m.data);
                             out.push_str(&format!(
-                                "{}  {}  {}  {}  {}{}{}\n",
+                                "{}  {}  {}  {}  {}{}{}{}{}\n",
                                 m.id,
                                 m.tier,
                                 m.record_type,
@@ -225,6 +284,8 @@ impl Tool for MemorySearchTool {
                                 m.title,
                                 superseded,
                                 quarantined,
+                                unconfirmed,
+                                moved,
                             ));
                         }
                         ToolResult::success(out)
@@ -338,6 +399,81 @@ mod tests {
                 result.output
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_marks_rows_without_evidence_unconfirmed() {
+        // Plan 373dec00 step 4: an unconfirmed claim is flagged in SEARCH and
+        // BROWSE, as a SUFFIX after the pinned `(id/score/strength)` group —
+        // a leading tag would read as the tier to the frontend's parser.
+        let store = make_store();
+        let mut confirmed = Memory::new(
+            MemoryTier::Semantic,
+            "SPEC: the clamp",
+            "the clamp guards the storage pipeline",
+            1000,
+        );
+        confirmed.data = serde_json::json!({ "evidence": "tests/clamp.rs::guards" });
+        store.write(confirmed).await.unwrap();
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "SPEC: the hatch",
+                "the hatch guards the storage pipeline",
+                1000,
+            ))
+            .await
+            .unwrap();
+        let tool = MemorySearchTool::new(store);
+
+        let result = tool.execute(json!({"query": "clamp hatch storage"})).await;
+        assert!(result.success, "{}", result.output);
+        let confirmed_line = result
+            .output
+            .lines()
+            .find(|line| line.contains("the clamp"))
+            .unwrap_or_else(|| panic!("confirmed hit missing: {}", result.output));
+        let unconfirmed_line = result
+            .output
+            .lines()
+            .find(|line| line.contains("the hatch"))
+            .unwrap_or_else(|| panic!("unconfirmed hit missing: {}", result.output));
+        assert!(
+            !confirmed_line.contains("[unconfirmed]"),
+            "an evidenced row is not marked: {confirmed_line}"
+        );
+        assert!(
+            unconfirmed_line.ends_with("[unconfirmed]"),
+            "the unconfirmed row carries the suffix: {unconfirmed_line}"
+        );
+        let group_end = unconfirmed_line.find("strength: ").expect("pinned group");
+        assert!(
+            unconfirmed_line[group_end..].contains("[unconfirmed]"),
+            "the suffix sits after the (id, score, strength) group: {unconfirmed_line}"
+        );
+
+        // BROWSE carries the same tag, in the same position.
+        let browse = tool.execute(json!({})).await;
+        assert!(browse.success, "{}", browse.output);
+        let browse_unconfirmed = browse
+            .output
+            .lines()
+            .find(|line| line.contains("the hatch"))
+            .unwrap();
+        assert!(
+            browse_unconfirmed.ends_with("[unconfirmed]"),
+            "browse marks it too: {browse_unconfirmed}"
+        );
+        assert!(
+            !browse
+                .output
+                .lines()
+                .find(|line| line.contains("the clamp"))
+                .unwrap()
+                .contains("[unconfirmed]"),
+            "and does not mark the evidenced row: {}",
+            browse.output
+        );
     }
 
     #[tokio::test]

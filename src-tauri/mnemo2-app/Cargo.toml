@@ -1,6 +1,6 @@
 [package]
 name = "mnemo2-app"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "The Mnemo2 desktop app (lead + team)"
 license = "MIT"
@@ -37,6 +37,10 @@ path = "src/mnemo2_mcp.rs"
 [[example]]
 name = "mnemo2_route_eval"
 path = "examples/mnemo2_route_eval.rs"
+
+[[example]]
+name = "mnemo2_memory_eval"
+path = "examples/mnemo2_memory_eval.rs"
 
 [dev-dependencies]
 tempfile = "3"

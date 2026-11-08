@@ -58,6 +58,12 @@ pub const MANAGED_GITIGNORE_ENTRIES: &[&str] = &[
     ".coding/instance.json",
     // Scratch shards from in-session payload-decomposition workarounds.
     ".coding/tmp-shard/",
+    // The memory check pass's report and its rename cache, and the generated
+    // knowledge map (plus any leftover temp file) — all derived per checkout
+    // from the knowledge records, never committed (plan 373dec00 steps 5-6).
+    ".coding/knowledge/HEALTH.md",
+    ".coding/knowledge/.health-state.json",
+    ".coding/knowledge/INDEX.md*",
     // Parallel run-all linked worktrees — disposable working trees.
     ".worktrees/",
 ];

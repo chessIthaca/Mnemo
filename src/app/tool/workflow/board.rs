@@ -18,6 +18,7 @@ use serde_json::json;
 
 use crate::app::plan_board::{
     BoardPlan, BoardStatus, CloseOutcome, PlanBoard, PlanDraft, PlanEdit,
+    NO_DURABLE_RECORD_NUDGE,
 };
 use crate::app::team_ledger::TeamLedger;
 use crate::app::tool::workflow::plan::StepNumber;
@@ -770,12 +771,17 @@ impl Tool for PlanStepDoneTool {
             CloseOutcome::Closed {
                 report_path,
                 retired_notes,
+                knowledge_nudge,
             } => {
                 output.push_str(&format!(" Plan closed; review report: {report_path}"));
                 if retired_notes > 0 {
                     output.push_str(&format!(
                         " {retired_notes} plan-scoped memory note(s) were retired into that report; re-store any durable fact from them without plan or branch references."
                     ));
+                }
+                if knowledge_nudge {
+                    output.push(' ');
+                    output.push_str(NO_DURABLE_RECORD_NUDGE);
                 }
             }
             CloseOutcome::NotReady { reasons } => {
@@ -1296,6 +1302,29 @@ mod tests {
                 .execute(json!({"plan_id": id, "step": 0}))
                 .await
                 .success
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_step_done_shows_the_close_nudge() {
+        use crate::memory::{HashEmbedder, MemoryStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let board = Arc::new(
+            PlanBoard::new(dir.path().join("plans"), dir.path().join("reviews"))
+                .with_memory(store),
+        );
+        board.set_external_lead_attached(true);
+        let id = create(&board).await;
+        let tool = PlanStepDoneTool::new(board.clone(), Arc::new(FakeLedger::passing()));
+        tool.execute(json!({"plan_id": id, "step": 1})).await;
+        let res = tool.execute(json!({"plan_id": id, "step": 2})).await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output.contains("closed without a new durable record"),
+            "{}",
+            res.output
         );
     }
 

@@ -42,7 +42,12 @@ export interface TeamTransportBindings {
 
 /** The frontend's typed view of the native team commands. */
 export interface TeamTransport {
-  snapshot(): Promise<TeamSnapshot>;
+  /**
+   * The team state. `knownTranscripts` maps each worker id to the transcript
+   * revision the window already holds: those transcripts come back empty and
+   * are named in `omitted_transcripts`.
+   */
+  snapshot(knownTranscripts?: Record<string, number>): Promise<TeamSnapshot>;
   dispatch(
     brief: string,
     planId: string,
@@ -108,7 +113,10 @@ export function createTauriTeamTransport(
   bindings: TeamTransportBindings,
 ): TeamTransport {
   return {
-    snapshot: () => bindings.invoke<TeamSnapshot>("team_snapshot"),
+    snapshot: (knownTranscripts) =>
+      bindings.invoke<TeamSnapshot>("team_snapshot", {
+        knownTranscripts: knownTranscripts ?? null,
+      }),
     dispatch: (brief, planId, step, model, workerId, reasoningEffort) =>
       bindings.invoke<TeamWorkerRecord>("team_dispatch", {
         brief,

@@ -149,9 +149,9 @@ The first and most prominent control answers one question: **Does Laya help pick
 | **No: the lead picks** (default) | Laya is never asked. `team_dispatch` needs a tier. Mnemo1 keeps the session's model. Model switches and outcomes are still logged as labels (so the kNN can learn for later). |
 | **Watch only** (shadow) | Laya and the kNN are asked and logged; the lead's tier always runs. Mnemo1: logged, not switched (`enforce = false`). |
 | **Suggest** | A dispatch with tier `auto` runs on the routed tier when it clears the gate and is refused when it does not. Mnemo1: unchanged (shadow). |
-| **Auto** | Like suggest, with a fallback tier when the gate is not cleared. Mnemo1: `enforce = true`, the first prompt switches to the routed tier. |
+| **Auto** | Like suggest, with a fallback tier when the gate is not cleared. Mnemo1: unchanged (shadow), unless its own settings turn enforcement on. |
 
-This one control drives both apps: it writes `mnemo2.toml [routing] mode` and Mnemo1's `[general.routing] enforce` (auto = on, otherwise off) plus `[general.laya] routing` (off only for "No"). Suggest and Auto keep their existing unlock rule (30 labelled decisions) with the "force" link.
+This one control drives both apps: it writes `mnemo2.toml [routing] mode` and `[general.laya] routing` (off only for "No"); `[general.routing] enforce` is set only in Mnemo1's own Classifier settings. Suggest and Auto keep their existing unlock rule (30 labelled decisions) with the "force" link.
 
 **When Laya is not ready the control says so, in place:**
 - *Not installed*: the three Laya choices are disabled with "Laya is not installed — Install Laya (≈ 1.2 GB)" and an install button that runs the existing installer with its progress bar. "No: the lead picks" stays selected.

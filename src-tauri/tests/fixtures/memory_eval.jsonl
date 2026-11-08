@@ -1,0 +1,52 @@
+# The memory recall eval's hand set (plan 373dec00, step 1). Forty real
+# knowledge records — ten each of bug, decision, how and spec — sampled
+# across the whole date range of .coding/knowledge/ (2026-08 to 2027-01).
+# Each line is one JSON object:
+#   {"q": "<question>", "expect": ["<knowledge file stem>", ...], "kind": "<kind>"}
+#
+# The questions are written the way a user would ask them WITHOUT having seen
+# the record: paraphrased, never reusing the title's distinctive words. The
+# lead reads every question on review; a fixture that copied titles would
+# flatter the score. `expect` may name several stems when sibling records
+# answer the question equally. Superseded records are not used — default
+# recall excludes them, so a question about one could never be answered.
+{"q": "Why does the window freeze for ten seconds at a time while the main thread shows no CPU use?", "expect": ["2026-08-22-trace-rs-records-log-path-lock-order-inversion-s"], "kind": "bug"}
+{"q": "Why does a tool's chat bubble keep its spinning indicator forever after I cut into a reply mid-stream, or when the arguments arrive malformed?", "expect": ["2026-08-30-tool-cards-stuck-running-after-mid-stream-steer"], "kind": "bug"}
+{"q": "How can a model I chose by hand get silently replaced by an automatic selection that was already in flight?", "expect": ["2026-11-03-manual-model-picks-must-mark-route-state-before"], "kind": "bug"}
+{"q": "Why does choosing a project folder bounce me back to the chooser with no explanation?", "expect": ["2026-12-23-open-existing-project-silently-re-shows-the-swit"], "kind": "bug"}
+{"q": "A one-word greeting to one vendor's model came back as the hidden footer text plus a long repeated thought - what generated it, and which repetition guard missed it?", "expect": ["2027-01-07-deepseek-hello-turn-failure-fresh-eyes-analysis"], "kind": "bug"}
+{"q": "When a queue item is put back to waiting and the scheduler retries it, why does the whole batch stop making progress?", "expect": ["2027-01-07-slid-resolution-with-a-re-queued-pending-item-st"], "kind": "bug"}
+{"q": "Why did one specially configured agent spawn change the behaviour of every later ordinary spawn?", "expect": ["2027-01-11-derived-clone-shared-the-arc-wrapped-policy-fact"], "kind": "bug"}
+{"q": "Why did the bookkeeping notes from a completed merge end up uncommitted in the working tree with no way to push them?", "expect": ["2027-01-11-merge-to-main-wrote-its-landing-records-after-th"], "kind": "bug"}
+{"q": "Name three ways a file could still be modified even though the workspace guard is supposed to protect it.", "expect": ["2027-01-11-sandbox-path-protection-is-defeatable-hardlinks"], "kind": "bug"}
+{"q": "Why did two tests fail at the branch tip after a change that turned every cost-saving switch on by default?", "expect": ["2027-01-11-wt-mnemo-tip-12a65d1-was-red-stale-optimizer-exp"], "kind": "bug"}
+{"q": "If a note about finished work contains no branch marker, should I assume it already landed on the mainline?", "expect": ["2026-08-22-branch-status-default-rule-in-memory-records"], "kind": "decision"}
+{"q": "Why may an agent drive a web page at any phase instead of hiding that ability until execution starts?", "expect": ["2026-08-27-browser-tools-visible-in-every-workflow-state-ap"], "kind": "decision"}
+{"q": "Which model runs the primary assistant while work is under review, and who actually consumes the model slot configured for reviews?", "expect": ["2026-09-01-models-reviewing-is-reviewer-spawn-only-main-age"], "kind": "decision"}
+{"q": "How do I get the frontend type checker running in a fresh checkout with no network, and keep a dev server alive after the command returns?", "expect": ["2026-11-06-mnemo2-worktree-env-offline-svelte-check-install"], "kind": "decision"}
+{"q": "Do helper agents inherit the parent's plan state, and should loading of the latest plan be skipped for them?", "expect": ["2026-12-31-bc235340-skip-load-latest-for-subagents-supersed"], "kind": "decision"}
+{"q": "Why are requests to one vendor's models rearranged so the changeable block moves to the front, and what now catches loops of any period?", "expect": ["2027-01-07-deepseek-vendor-requests-fold-the-volatile-tail-2"], "kind": "decision"}
+{"q": "When I redirect a running task with a new instruction, should the queued item go back to the waiting list?", "expect": ["2027-01-11-backlog-steer-semantics-a-steer-is-a-course-corr"], "kind": "decision"}
+{"q": "In which phases may an agent unlock a deferred group of tools, and does that work inside a skill?", "expect": ["2027-01-11-load-tools-allowed-everywhere-mcp-reveal-gate-li-2"], "kind": "decision"}
+{"q": "Why does the advertised set of tool definitions stay byte-identical across different kinds of work, and how does a landing handle a remote it cannot reach?", "expect": ["2027-01-11-one-frozen-tool-surface-for-all-plan-kinds-narro-2"], "kind": "decision"}
+{"q": "What must happen before a finished helper's folder can be deleted on Windows, when something may still hold its database open?", "expect": ["2027-01-11-worker-checkout-removal-waits-for-every-owner-of"], "kind": "decision"}
+{"q": "After fixing review findings, what exactly should the second review pass look at so it does not see an empty change?", "expect": ["2026-08-22-finish-gate-on-findings-verdict"], "kind": "how"}
+{"q": "What sped up the development loop the most on this machine, and what is still slow?", "expect": ["2026-08-30-build-test-perf-baseline-bottlenecks-2026-09-19"], "kind": "how"}
+{"q": "How do you restore a damaged file while a merge is still in progress, and resolve it without hand-transcribing lines?", "expect": ["2026-09-03-mid-merge-conflict-repair-via-git-stages-content"], "kind": "how"}
+{"q": "How does the app remove several finished helpers at once without one failure stopping the rest, and get rid of their folders quickly?", "expect": ["2026-11-02-mnemo2-delete-flow-per-worker-results-batch-git"], "kind": "how"}
+{"q": "The frontend checker is not found inside a secondary checkout - how do I run it there?", "expect": ["2026-11-04-running-mnemo2-svelte-check-in-a-git-worktree"], "kind": "how"}
+{"q": "What half-finished wiring did the rollout of a middle difficulty rung leave behind, and what has to change before the old tests can offer it?", "expect": ["2026-11-04-step-2-seams-for-unified-tiers-four-label-routin"], "kind": "how"}
+{"q": "How do I prove a function returns without waiting on background work, without relying on how long the call takes?", "expect": ["2026-11-08-test-that-detached-async-work-never-blocks-a-cal"], "kind": "how"}
+{"q": "What are the working fixes for the newer lint that flags a lock guard living across an await, and for the one about an oversized enum variant?", "expect": ["2027-01-11-clippy-1-95-await-holding-lock-large-enum-varian"], "kind": "how"}
+{"q": "How do I pull the repository's vulnerability alerts without getting a 404 from the browser fetch?", "expect": ["2027-01-11-read-mnemo-s-github-security-code-scanning-pages"], "kind": "how"}
+{"q": "How can an edit tool write a literal backslash-n into a Rust char literal when it keeps turning it into a real line break?", "expect": ["2027-01-11-write-literal-backslash-escapes-through-file-edi"], "kind": "how"}
+{"q": "How do the knowledge files merge across clones, and what branch layout does the repository use now?", "expect": ["2026-08-23-coding-merge-semantics-working-branch-options"], "kind": "spec"}
+{"q": "If the model starts a tool call and the turn is cut or the arguments are malformed, what does the user finally see for that call?", "expect": ["2026-08-30-announced-tool-calls-always-get-a-terminal-toolr-2"], "kind": "spec"}
+{"q": "What does the symbol browser show while the background parser is still working, and what changes when it finishes?", "expect": ["2026-11-02-mnemo2-s-graph-tab-warns-while-the-code-index-re"], "kind": "spec"}
+{"q": "Which routing controls remain in the tiers settings page, and how does the assistant's model-choice check run by itself?", "expect": ["2026-11-06-laya-asks-one-question-and-checks-itself-like-in"], "kind": "spec"}
+{"q": "How are the steps of a plan shown now - is the full explanation always visible?", "expect": ["2027-01-05-plan-steps-ui-headline-collapsible-details-merge"], "kind": "spec"}
+{"q": "Does the usage table now include failed attempts and the compression requests, and how are their cache numbers represented?", "expect": ["2027-01-07-request-stats-covers-errors-summarizer-calls-and"], "kind": "spec"}
+{"q": "What happens when an append edit has nothing to append, or when a model sends a JSON array as a string?", "expect": ["2027-01-11-file-tool-hardening-affordances-eof-newline-empt"], "kind": "spec"}
+{"q": "How are old session digests kept from crowding out fresh facts, and when do the raw events of a finished turn get folded into a summary?", "expect": ["2027-01-11-memory-recall-staleness-de-rank-turn-boundary-au"], "kind": "spec"}
+{"q": "Should the side panel's width be saved in pixels, and how is it kept sensible as the window is resized?", "expect": ["2027-01-11-right-panel-width-is-a-window-fraction-with-an-i-2"], "kind": "spec"}
+{"q": "Which commit existed only on one machine's branch, and why was the pair of old and new notes only half-applied?", "expect": ["2027-01-11-wt-mnemo-branch-topology-local-only-laya-files-c"], "kind": "spec"}

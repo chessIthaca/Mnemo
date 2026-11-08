@@ -1,0 +1,9 @@
++++
+title = "the memory check pass flags records the repo has moved past"
+created = "2026-11-08"
+evidence = "src/memory/health.rs tests a_renamed_path_reports_its_new_home, a_reconcile_keeps_the_stamp, toml_headers_are_not_links; the rebuilt app stamped 92 rows on this repo"
++++
+
+After the memory reconcile settles on a Mnemo2 open (a 1.5 s quiet window, because an in-sync reconcile emits nothing), src/memory/health.rs walks the live knowledge files and writes a generated, gitignored .coding/knowledge/HEALTH.md only when its bytes change: records citing missing paths, broken links, duplicate titles among SPEC/DECISION/BUG/HOW, and agent.md's size per scope. It stamps data.moved_paths on affected rows, and memory_search shows `[cites moved paths: a -> b; c gone]`. Authored bodies are never edited. The window shows the pass as running, then the counts as a hover title on "Memory up to date"; a failed reconcile stays visible.
+
+Traps it was built around. `git log --follow` finds nothing for a path renamed away, so a rename is resolved with `git log -1 --diff-filter=D -- <path>` then `git diff-tree -r -M --name-status --no-commit-id <commit>`, following a chain up to 5 hops. Resolutions are cached by path in .health-state.json because history only grows; a git failure is not cached. The startup sweeps run before the reconcile, so the reconcile lands after the quiet window and re-asserts each row's data: both reconcile paths carry the stamp over through keep_moved_paths, and only the pass changes or removes it. `[[bin]]`, `[[patch.unused]]` and `[[tier]]` in a body are TOML headers, not links, so only targets with a `/` or a leading date count; the corpus has effectively no wiki links, so no link repair is needed. To run the pass on a store copy, root it at a checkout that has the sources, or every citation reads as missing.

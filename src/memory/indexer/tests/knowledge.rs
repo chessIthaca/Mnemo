@@ -16,6 +16,23 @@ fn knowledge_id(key: &str) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
 }
 
+/// Overwrite a derived row the way session-end consolidation did: an untyped
+/// title/content plus a `SemanticData` payload, while the source FILE and the
+/// `derived_index_state` content hash stay untouched.
+async fn clobber(store: &MemoryStore, id: &str) {
+    let mut m = Memory::new(
+        MemoryTier::Semantic,
+        "Files are the truth: a worker's untyped fact",
+        "a different fact entirely",
+        1,
+    );
+    m.id = id.to_string();
+    m.record_class = MemoryClass::Derived;
+    m.data = serde_json::json!({"fact": "a different fact entirely", "confidence": 0.9});
+    m.source_session_ids = vec!["sess-1".to_string()];
+    store.write(m).await.unwrap();
+}
+
 const KNOWLEDGE_DECISION: &str = "+++\ntitle = \"Typed records as files\"\ncreated = \"2026-08-23\"\n+++\n\nFiles are the truth. See [[spec/2026-08-23-branch-strategy]].\n";
 
 #[tokio::test]
@@ -78,6 +95,68 @@ async fn knowledge_files_index_as_derived_typed_records() {
     .unwrap();
     assert_eq!(second.indexed, 0);
     assert_eq!(second.skipped, 1);
+}
+
+#[tokio::test]
+async fn the_reassert_keeps_evidence_in_row_data() {
+    // Plan 373dec00 step 4: the row digest carries how the record is known.
+    // A corpus change re-asserts the metadata; the evidence must survive it,
+    // and a BUG whose body names a regression test is confirmed by that.
+    let dir = tempdir().unwrap();
+    write_knowledge(
+        dir.path(),
+        "bug/2026-08-23-lock-timeout.md",
+        "+++\ntitle = \"Lock timeout on open\"\ncreated = \"2026-08-23\"\n\
+         evidence = \"tests/store.rs::open_keeps_the_lock\"\n+++\n\n\
+         Symptom: open hangs. Root cause: a leaked guard. The regression test \
+         open_keeps_the_lock pins it.\n",
+    );
+    let store = make_store();
+    index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+
+    let id = knowledge_id("knowledge:bug/2026-08-23-lock-timeout");
+    let m = store.get_memory(&id).await.unwrap().expect("row indexed");
+    assert_eq!(
+        m.data.get("evidence").and_then(|v| v.as_str()),
+        Some("tests/store.rs::open_keeps_the_lock")
+    );
+    assert_eq!(m.data.get("regression_test").and_then(|v| v.as_bool()), Some(true));
+    assert!(m.is_confirmed(), "the row is a confirmed claim");
+
+    // A corpus change re-asserts the metadata (the reconcile path): the
+    // evidence survives the second pass.
+    write_knowledge(
+        dir.path(),
+        "bug/2026-08-23-lock-timeout.md",
+        "+++\ntitle = \"Lock timeout on open\"\ncreated = \"2026-08-23\"\n\
+         evidence = \"tests/store.rs::open_keeps_the_lock\"\n+++\n\n\
+         Symptom: open hangs. Root cause: a leaked guard, now released. The \
+         regression test open_keeps_the_lock pins it.\n",
+    );
+    let second = index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.indexed, 1);
+    let m = store.get_memory(&id).await.unwrap().expect("row reindexed");
+    assert_eq!(
+        m.data.get("evidence").and_then(|v| v.as_str()),
+        Some("tests/store.rs::open_keeps_the_lock"),
+        "the re-assert keeps the evidence: {:?}",
+        m.data
+    );
+    assert_eq!(m.data.get("rel_path").and_then(|v| v.as_str()), Some("bug/2026-08-23-lock-timeout.md"));
 }
 
 #[tokio::test]
@@ -302,6 +381,52 @@ async fn reindex_knowledge_files_updates_just_the_given_files() {
     .unwrap();
     assert_eq!(second.indexed, 0);
     assert_eq!(second.skipped, 1);
+}
+
+#[tokio::test]
+async fn the_index_regenerates_after_a_knowledge_write() {
+    // Every knowledge write regenerates `.coding/knowledge/INDEX.md` (plan
+    // 373dec00 step 6): the map lists the new record's typed title and path,
+    // and a later write replaces the file's bytes.
+    let dir = tempdir().unwrap();
+    write_knowledge(
+        dir.path(),
+        "spec/2026-08-23-branch-strategy.md",
+        "+++\ntitle = \"Branch strategy\"\ncreated = \"2026-08-23\"\n+++\n\nTrunk based. Cites src/agent/turn.rs.\n",
+    );
+    let store = make_store();
+    let knowledge_dir = dir.path().join(".coding/knowledge");
+    let index_path = knowledge_dir.join("INDEX.md");
+    reindex_knowledge_files(
+        store.as_ref(),
+        &knowledge_dir,
+        &["spec/2026-08-23-branch-strategy.md".to_string()],
+    )
+    .await
+    .unwrap();
+    let first = std::fs::read_to_string(&index_path).unwrap();
+    assert!(first.contains("## src/agent (1)"), "{first}");
+    assert!(
+        first.contains("- SPEC: Branch strategy - spec/2026-08-23-branch-strategy.md"),
+        "{first}"
+    );
+
+    // A second record in a new area: the next pass re-renders the file.
+    write_knowledge(
+        dir.path(),
+        "how/2026-08-23-release.md",
+        "+++\ntitle = \"Release checklist\"\ncreated = \"2026-08-23\"\n+++\n\nRun scripts/release.ps1.\n",
+    );
+    reindex_knowledge_files(
+        store.as_ref(),
+        &knowledge_dir,
+        &["how/2026-08-23-release.md".to_string()],
+    )
+    .await
+    .unwrap();
+    let second = std::fs::read_to_string(&index_path).unwrap();
+    assert_ne!(first, second, "a write re-renders the index");
+    assert!(second.contains("## scripts (1)"), "{second}");
 }
 
 #[tokio::test]
@@ -838,4 +963,240 @@ async fn lowered_config_budget_truncates_derived_digest() {
         "pointer line survives truncation: {}",
         m.content
     );
+}
+
+// ── Drift repair (regression: a row overwritten from another writer) ────
+
+/// THE regression: a hash-equal row that drifted from its (unchanged) file —
+/// another writer overwrote it — is repaired by the next full reindex instead
+/// of being skipped for ever by the hash shortcut.
+#[tokio::test]
+async fn full_reindex_repairs_a_row_that_drifted_from_its_file() {
+    let dir = tempdir().unwrap();
+    write_knowledge(
+        dir.path(),
+        "decision/2026-08-23-typed-records.md",
+        KNOWLEDGE_DECISION,
+    );
+    let store = make_store();
+    let first = index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.indexed, 1);
+
+    let id = knowledge_id("knowledge:decision/2026-08-23-typed-records");
+    clobber(&store, &id).await;
+    // Precondition: the row no longer mirrors its file (untyped title,
+    // `none` record type) while the state hash still matches the file —
+    // exactly the state the old hash-only skip never healed.
+    let drifted = store.get_memory(&id).await.unwrap().unwrap();
+    assert_eq!(drifted.record_type, MemoryRecordType::None);
+    assert_ne!(drifted.title, "DECISION: Typed records as files");
+
+    // The repair: the drifted row is no longer hidden by the hash shortcut.
+    let second = index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.indexed, 1);
+    assert_eq!(second.skipped, 0);
+
+    let repaired = store.get_memory(&id).await.unwrap().unwrap();
+    assert_eq!(repaired.title, "DECISION: Typed records as files");
+    assert!(
+        repaired.content.contains("Files are the truth."),
+        "{}",
+        repaired.content
+    );
+    assert_eq!(repaired.record_type, MemoryRecordType::Decision);
+    assert_eq!(repaired.record_class, MemoryClass::Derived);
+    assert_eq!(
+        repaired.data["rel_path"],
+        "decision/2026-08-23-typed-records.md"
+    );
+    assert_eq!(
+        repaired.data["links"][0]["target"],
+        "spec/2026-08-23-branch-strategy"
+    );
+
+    // And a further run is a no-op skip again.
+    let third = index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(third.indexed, 0);
+    assert_eq!(third.skipped, 1);
+}
+
+/// The targeted twin: a file-backed write's `reindex_knowledge_files` call
+/// repairs a drifted row from its file just like the full reindex does.
+#[tokio::test]
+async fn targeted_reindex_repairs_a_row_that_drifted_from_its_file() {
+    let dir = tempdir().unwrap();
+    write_knowledge(
+        dir.path(),
+        "decision/2026-08-23-typed-records.md",
+        KNOWLEDGE_DECISION,
+    );
+    let store = make_store();
+    index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+
+    let id = knowledge_id("knowledge:decision/2026-08-23-typed-records");
+    clobber(&store, &id).await;
+
+    let report = reindex_knowledge_files(
+        store.as_ref(),
+        &dir.path().join(".coding/knowledge"),
+        &["decision/2026-08-23-typed-records.md".to_string()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.indexed, 1);
+    assert_eq!(report.skipped, 0);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let repaired = store.get_memory(&id).await.unwrap().unwrap();
+    assert_eq!(repaired.title, "DECISION: Typed records as files");
+    assert!(
+        repaired.content.contains("Files are the truth."),
+        "{}",
+        repaired.content
+    );
+    assert_eq!(repaired.record_type, MemoryRecordType::Decision);
+    assert_eq!(repaired.record_class, MemoryClass::Derived);
+    assert_eq!(
+        repaired.data["rel_path"],
+        "decision/2026-08-23-typed-records.md"
+    );
+    assert_eq!(
+        repaired.data["links"][0]["target"],
+        "spec/2026-08-23-branch-strategy"
+    );
+}
+
+/// A drifted row must also make the corpus stale, so the startup reconcile
+/// runs and repairs it (the hash-only staleness test stayed silent).
+#[tokio::test]
+async fn corpus_is_stale_while_a_row_drifted_from_its_file() {
+    let dir = tempdir().unwrap();
+    write_knowledge(
+        dir.path(),
+        "decision/2026-08-23-typed-records.md",
+        KNOWLEDGE_DECISION,
+    );
+    let store = make_store();
+    index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !corpus_is_stale(
+            store.as_ref(),
+            &plans_dir(dir.path()),
+            &backlog_path(dir.path())
+        )
+        .await
+        .unwrap(),
+        "a just-indexed corpus is not stale"
+    );
+
+    let id = knowledge_id("knowledge:decision/2026-08-23-typed-records");
+    clobber(&store, &id).await;
+    assert!(
+        corpus_is_stale(
+            store.as_ref(),
+            &plans_dir(dir.path()),
+            &backlog_path(dir.path())
+        )
+        .await
+        .unwrap(),
+        "a drifted row makes the corpus stale"
+    );
+
+    index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !corpus_is_stale(
+            store.as_ref(),
+            &plans_dir(dir.path()),
+            &backlog_path(dir.path())
+        )
+        .await
+        .unwrap(),
+        "the reindex repaired the row — fresh again"
+    );
+}
+
+/// A derived row deleted while its `derived_index_state` entry survived is
+/// recreated from its file by the next reindex (the hash matched, but the row
+/// was missing — the old shortcut skipped it forever).
+#[tokio::test]
+async fn reindex_recreates_a_row_that_vanished_while_its_state_remained() {
+    let dir = tempdir().unwrap();
+    write_knowledge(
+        dir.path(),
+        "decision/2026-08-23-typed-records.md",
+        KNOWLEDGE_DECISION,
+    );
+    let store = make_store();
+    index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+
+    let id = knowledge_id("knowledge:decision/2026-08-23-typed-records");
+    store.delete_memory(&id).await.unwrap();
+    assert!(store.get_memory(&id).await.unwrap().is_none());
+
+    let report = index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.indexed, 1, "the vanished row is recreated");
+
+    let recreated = store
+        .get_memory(&id)
+        .await
+        .unwrap()
+        .expect("row recreated from its file");
+    assert_eq!(recreated.title, "DECISION: Typed records as files");
+    assert_eq!(recreated.record_class, MemoryClass::Derived);
 }

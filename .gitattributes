@@ -50,3 +50,7 @@
 # the union collision-free (a duplicate id line would only occur if the same
 # item was edited on both sides, which the store tolerates on load).
 .coding/backlog.jsonl merge=union
+
+# Laya's dispatch routing learnings: two computers appending their own rows
+# must merge by concatenation, never a conflict.
+.coding/laya/dispatch_routing.jsonl merge=union

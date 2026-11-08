@@ -86,7 +86,6 @@ function status(overrides: Partial<LayaStatus> = {}): LayaStatus {
 function control(overrides: Partial<TiersTopControl> = {}): TiersTopControl {
   return {
     choice: "suggest",
-    mnemo1_enforce: false,
     laya_routing: true,
     laya_status: "ready",
     checkpoint: "Laya (English)",
@@ -170,12 +169,10 @@ function makeLaya(
       routingWireSnapshot({ mode: nextControl.choice, ...routing.settings }, routing.summary, routing.eval ?? null),
     ),
     saveTopControl: vi.fn(async (choice) => {
-      const enforce = choice === "auto";
       const layaRouting = choice !== "off";
       nextControl = {
         ...nextControl,
         choice,
-        mnemo1_enforce: enforce,
         laya_routing: layaRouting,
       };
       return structuredClone(nextControl);
@@ -256,6 +253,25 @@ describe("TiersPage", () => {
     await screen.findByRole("button", { name: "Turn on" });
     expect(screen.getByText("Laya is off")).toBeTruthy();
     expect(screen.getByText(/needs Laya running/)).toBeTruthy();
+  });
+
+  it("shows no warning for Auto when the Laya routing flag is on", async () => {
+    renderPage({ laya: makeLaya({ control: { choice: "auto", laya_routing: true } }) });
+    await screen.findByText("Laya (English) ready");
+    expect((screen.getByRole("radio", { name: /^Auto/ }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.queryByText(/does not match this choice/)).toBeNull();
+  });
+
+  it("warns when the Laya routing flag disagrees with the choice", async () => {
+    renderPage({ laya: makeLaya({ control: { choice: "auto", laya_routing: false } }) });
+    expect(await screen.findByText(/does not match this choice/)).toBeTruthy();
+  });
+
+  it("says Mnemo1's model switching stays in its own settings", async () => {
+    renderPage();
+    expect(
+      await screen.findByText(/Whether Mnemo1 switches models stays in Mnemo1's own settings\./),
+    ).toBeTruthy();
   });
 
   it("offers Retry with the failure's error after a failed start", async () => {

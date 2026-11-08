@@ -5,9 +5,12 @@ import {
   emptyProjectUsageView,
   initialTeamState,
   projectUsageFrom,
+  restoreTranscripts,
   reviewEvidenceFrom,
   reviewEvidenceToWire,
+  type CachedTranscript,
   type TeamEvent,
+  type TeamSnapshot,
   workerDisplayName,
   type TeamWorkerRecord,
 } from "./teamState";
@@ -424,5 +427,67 @@ describe("workerDisplayName", () => {
   it("keeps the short form for a generated id and any other name as is", () => {
     expect(workerDisplayName("0000000a019a1b2c3d4e", "Worker 0000000a")).toBe("Worker 0000000a");
     expect(workerDisplayName("w1", "Ana")).toBe("Ana");
+  });
+});
+
+describe("restoreTranscripts", () => {
+  const snapshot = (workers: TeamWorkerRecord[]): TeamSnapshot => ({
+    workers,
+    slots: 2,
+    active: 1,
+    usage: emptyProjectUsageView(),
+  });
+  const other: TeamWorkerRecord = { ...worker, id: "w2", transcript: { messages: [] } };
+
+  it("remembers the revision and transcript of every worker it received", () => {
+    const cache = new Map<string, CachedTranscript>();
+    const restored = restoreTranscripts(
+      { ...snapshot([worker, other]), transcript_revs: { w1: 4, w2: 5 } },
+      cache,
+    );
+    expect(restored?.workers).toHaveLength(2);
+    expect(cache.get("w1")).toEqual({ rev: 4, transcript: worker.transcript });
+    expect(cache.get("w2")).toEqual({ rev: 5, transcript: other.transcript });
+  });
+
+  it("puts a cached transcript back without mutating the record it was left out of", () => {
+    const cache = new Map<string, CachedTranscript>([
+      ["w1", { rev: 4, transcript: worker.transcript }],
+    ]);
+    const input: TeamSnapshot = {
+      ...snapshot([worker]),
+      transcript_revs: { w1: 4 },
+      omitted_transcripts: ["w1"],
+    };
+    const restored = restoreTranscripts(input, cache);
+    expect(restored?.workers[0].transcript).toBe(worker.transcript);
+    expect(restored?.workers[0]).not.toBe(input.workers[0]);
+    expect(input.workers[0]).toBe(worker);
+    expect(input.workers[0].transcript).toBe(worker.transcript);
+  });
+
+  it("returns null when a left-out transcript is missing or its revision differs", () => {
+    const omitted: TeamSnapshot = {
+      ...snapshot([worker]),
+      transcript_revs: { w1: 4 },
+      omitted_transcripts: ["w1"],
+    };
+    expect(restoreTranscripts(omitted, new Map())).toBeNull();
+    expect(
+      restoreTranscripts(
+        omitted,
+        new Map([["w1", { rev: 3, transcript: worker.transcript }]]),
+      ),
+    ).toBeNull();
+  });
+
+  it("forgets cached workers the snapshot no longer carries", () => {
+    const cache = new Map<string, CachedTranscript>([
+      ["w1", { rev: 4, transcript: worker.transcript }],
+      ["gone", { rev: 1, transcript: other.transcript }],
+    ]);
+    restoreTranscripts({ ...snapshot([worker]), transcript_revs: { w1: 4 } }, cache);
+    expect(cache.has("gone")).toBe(false);
+    expect(cache.get("w1")?.rev).toBe(4);
   });
 });

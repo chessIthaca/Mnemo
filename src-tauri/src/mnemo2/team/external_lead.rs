@@ -14,7 +14,7 @@ use mnemo::headless::SessionId;
 use crate::mnemo2::ledger;
 
 use super::lead_tools::TeamLeadStatus;
-use super::record::WorkerStatus;
+use super::record::{audit_finished, WorkerStatus};
 use super::{unix_ms, TeamRuntime};
 
 /// How long an attached external lead may go without calling in before it is
@@ -519,15 +519,16 @@ impl TeamRuntime {
                 workers
                     .iter()
                     .filter(|w| {
-                        matches!(
-                            w.status,
-                            WorkerStatus::Completed
-                                | WorkerStatus::InReview
-                                | WorkerStatus::NeedsYou
-                                | WorkerStatus::Failed
-                                | WorkerStatus::Conflict
-                                | WorkerStatus::Interrupted
-                        )
+                        !audit_finished(w)
+                            && matches!(
+                                w.status,
+                                WorkerStatus::Completed
+                                    | WorkerStatus::InReview
+                                    | WorkerStatus::NeedsYou
+                                    | WorkerStatus::Failed
+                                    | WorkerStatus::Conflict
+                                    | WorkerStatus::Interrupted
+                            )
                     })
                     .count(),
                 workers.iter().filter(|w| ledger::merged(w)).count(),

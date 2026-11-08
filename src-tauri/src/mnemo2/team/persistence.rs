@@ -4,6 +4,17 @@
 
 //! The `team.json` ledger: the persisted shape, its backup-recoverable
 //! store, and the legacy tier-id conversion.
+//!
+//! Two instances can share one state dir through "Open anyway"
+//! (`project::attach(root, true)`). Between them `team.json` is
+//! last-writer-wins, as it always was, and a worker one instance never knew is
+//! safe from the other's saves. Two limits are accepted: driving the *same*
+//! worker from both instances means the last replaced transcript wins, and a
+//! save does not notice foreign bytes behind an unchanged `Arc`; and deleting a
+//! worker in one instance while another saves it can leave that record without
+//! a transcript file, which load reports on the record's `error`. The old
+//! format was worse on both counts, since any stale save replaced every
+//! worker's transcript.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -146,15 +157,39 @@ impl TeamPersistence {
     /// A file that cannot be read fails the load: `team.json` keeps only a
     /// placeholder, so the save that follows a load would erase the worker's
     /// conversation with it. A file that reads but does not decode is kept
-    /// aside as `<id>.json.corrupt` - its bytes are never destroyed - logged,
-    /// and rewritten by the next save.
+    /// aside as `<id>.json.corrupt` - its bytes are never destroyed, and a
+    /// rename that cannot do that fails the load too - logged, and rewritten by
+    /// the next save. A worker that ran whose file is gone is flagged on the
+    /// record instead: one lost file must not block the project.
     fn attach_transcripts(&self, team: &mut PersistedTeam) -> Result<(), String> {
         for worker in &mut team.workers {
             let Some(file) = self.transcript_file(&worker.id) else {
                 continue;
             };
-            if !file.exists() {
-                continue;
+            match file.try_exists() {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A missing file keeps the embedded transcript, which for a
+                    // current ledger is the empty placeholder. An empty file
+                    // would hide the loss, so the record carries it instead.
+                    let ran = worker.requests > 0 || worker.turns > 0 || worker.brief_sent;
+                    if worker.transcript.messages.is_empty() && ran {
+                        let path = format!("{TRANSCRIPTS_DIR}/{}.json", worker.id);
+                        let missing =
+                            format!("this worker's saved conversation is missing ({path})");
+                        eprintln!("team: {missing}");
+                        if worker.error.is_none() {
+                            worker.error = Some(missing);
+                        }
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "could not inspect the transcript for {}: {error}",
+                        worker.id
+                    ));
+                }
             }
             let bytes = retry_io(|| std::fs::read(&file)).map_err(|err| {
                 format!("could not read the transcript for {}: {err}", worker.id)
@@ -167,14 +202,19 @@ impl TeamPersistence {
                 }
                 Err(error) => {
                     let kept = corrupt_path(&file);
+                    retry_io(|| std::fs::rename(&file, &kept)).map_err(|err| {
+                        format!(
+                            "could not keep the damaged transcript for {} aside: {err}",
+                            worker.id
+                        )
+                    })?;
                     eprintln!(
                         "team: transcript for {} could not be decoded ({error}); kept as {}",
                         worker.id,
                         kept.display()
                     );
-                    let _ = retry_io(|| std::fs::rename(&file, &kept));
                     // The embedded copy stands, unrecorded, so the next save
-                    // writes a valid file.
+                    // writes a valid file (or none, when it is empty).
                 }
             }
         }
@@ -292,7 +332,16 @@ impl TeamPersistence {
             let Some(file) = self.transcript_file(&worker.id) else {
                 continue;
             };
-            if same_arc.contains(&worker.id) && file.exists() {
+            let exists = file.exists();
+            // An empty transcript needs no file: a load yields the same empty
+            // value either way, and writing one would hide a conversation that
+            // was lost. A worker whose file exists is still rewritten, so a
+            // transcript that really became empty cannot leave stale content
+            // winning.
+            if worker.transcript.messages.is_empty() && !exists {
+                continue;
+            }
+            if exists && same_arc.contains(&worker.id) {
                 continue;
             }
             pending.push((worker.id.clone(), file, worker.transcript.clone()));
@@ -357,20 +406,26 @@ impl TeamPersistence {
             .map(|worker| worker.id.as_str())
             .collect();
         let removed: Vec<String> = {
-            let mut written = self.written_guard();
-            let gone: Vec<String> = written
+            let written = self.written_guard();
+            written
                 .keys()
                 .filter(|id| !known.contains(id.as_str()))
                 .cloned()
-                .collect();
-            for id in &gone {
-                written.remove(id);
-            }
-            gone
+                .collect()
         };
         for id in removed {
-            if let Some(file) = self.transcript_file(&id) {
-                let _ = std::fs::remove_file(&file);
+            let Some(file) = self.transcript_file(&id) else {
+                continue;
+            };
+            let gone = match retry_io(|| std::fs::remove_file(&file)) {
+                Ok(()) => true,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                // Keep the record so the next save retries: an unknown file is
+                // deliberately preserved, so nothing else would remove it.
+                Err(_) => false,
+            };
+            if gone {
+                self.written_guard().remove(&id);
             }
         }
         let Some(dir) = self.transcripts_dir() else {

@@ -828,6 +828,47 @@ fn a_removed_worker_loses_its_transcript_file() {
 }
 
 #[test]
+fn a_failed_transcript_removal_is_retried() {
+    // A denied removal keeps the id recorded, because an unknown file is
+    // deliberately preserved and would otherwise never be removed.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    let mut record = worker(root.path(), "stubborn01");
+    record.transcript = transcript_of(&["drop"]);
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![record],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("first save");
+    let file = dir.path().join(TRANSCRIPTS_DIR).join("stubborn01.json");
+
+    std::fs::remove_file(&file).expect("remove the transcript file");
+    std::fs::create_dir(&file).expect("block the transcript path");
+    std::fs::write(file.join("child"), "blocker").expect("non-empty directory");
+    persistence
+        .save(&PersistedTeam {
+            workers: Vec::new(),
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("a failed removal does not fail the save");
+
+    std::fs::remove_dir_all(&file).expect("unblock the transcript path");
+    std::fs::write(&file, "stale").expect("a stale transcript file");
+    persistence
+        .save(&PersistedTeam {
+            workers: Vec::new(),
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("the retried removal succeeds");
+    assert!(!file.exists(), "the kept entry retries and removes the file");
+}
+
+#[test]
 fn a_transcript_this_instance_never_knew_survives_a_save() {
     // Two instances can share a state dir ("Open anyway"), so an unknown
     // `<id>.json` belongs to the other instance's worker, not to an orphan this
@@ -941,9 +982,134 @@ fn a_corrupt_transcript_is_kept_aside() {
     assert!(!file.exists(), "the damaged file is moved aside");
 
     persistence.save(&loaded).expect("repairing save");
-    let stored: Transcript = serde_json::from_slice(&std::fs::read(&file).expect("rewritten file"))
-        .expect("valid transcript file");
-    assert_eq!(stored.messages.len(), 0);
+    assert!(
+        !file.exists(),
+        "an empty transcript does not recreate the file"
+    );
+}
+
+#[test]
+fn a_missing_conversation_is_flagged_not_recreated() {
+    // A deleted conversation file must stay visible: the record is flagged and
+    // no empty file is written in its place, which would make the loss look
+    // like a worker that never spoke.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    let mut record = worker(root.path(), "lostconv01");
+    record.transcript = transcript_of(&["hello"]);
+    record.requests = 3;
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![record],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("first save");
+    let file = dir.path().join(TRANSCRIPTS_DIR).join("lostconv01.json");
+    assert!(file.exists());
+    std::fs::remove_file(&file).expect("delete the conversation file");
+
+    let reopened = TeamPersistence::new(dir.path());
+    let loaded = reopened.load().expect("load").expect("some ledger");
+    assert!(loaded.workers[0].transcript.messages.is_empty());
+    let error = loaded.workers[0]
+        .error
+        .clone()
+        .expect("the lost conversation is flagged");
+    assert!(
+        error.contains("lostconv01"),
+        "the flag names the missing file: {error}"
+    );
+
+    reopened.save(&loaded).expect("save the loaded ledger");
+    assert!(
+        !file.exists(),
+        "an empty transcript does not recreate a missing file"
+    );
+
+    let again = TeamPersistence::new(dir.path())
+        .load()
+        .expect("load")
+        .expect("some ledger");
+    assert!(
+        again.workers[0].error.is_some(),
+        "a fresh load still flags the loss"
+    );
+}
+
+#[test]
+fn a_new_worker_is_not_flagged_and_gets_no_file() {
+    // A worker that never ran has nothing to lose: no flag, and an empty
+    // transcript needs no file.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    let mut record = worker(root.path(), "fresh00001");
+    record.requests = 0;
+    record.turns = 0;
+    record.brief_sent = false;
+    record.transcript = Arc::default();
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![record],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("save the ledger");
+    assert!(!dir
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join("fresh00001.json")
+        .exists());
+
+    let loaded = TeamPersistence::new(dir.path())
+        .load()
+        .expect("load")
+        .expect("some ledger");
+    assert!(
+        loaded.workers[0].error.is_none(),
+        "a worker that never ran is not flagged: {:?}",
+        loaded.workers[0].error
+    );
+}
+
+#[test]
+fn a_damaged_transcript_that_cannot_be_moved_refuses_to_load() {
+    // If the damaged file cannot be kept aside, the load must refuse: the open
+    // save would otherwise replace the only copy of the bytes.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let ledger = PersistedTeam {
+        workers: vec![worker(root.path(), "stuck00001")],
+        slots: Some(4),
+        usage: ProjectUsage::default(),
+    };
+    std::fs::write(
+        dir.path().join(TEAM_STATE_FILE),
+        serde_json::to_vec(&ledger).expect("ledger JSON"),
+    )
+    .expect("write the ledger");
+    let transcripts = dir.path().join(TRANSCRIPTS_DIR);
+    std::fs::create_dir_all(&transcripts).expect("transcripts dir");
+    let file = transcripts.join("stuck00001.json");
+    std::fs::write(&file, "not json").expect("corrupt transcript file");
+    let blocked = transcripts.join("stuck00001.json.corrupt");
+    std::fs::create_dir(&blocked).expect("block the corrupt path");
+    std::fs::write(blocked.join("child"), "blocker").expect("non-empty directory");
+
+    let error = TeamPersistence::new(dir.path())
+        .load()
+        .expect_err("the load refuses to overwrite the damaged bytes");
+    assert!(
+        error.contains("stuck00001"),
+        "the failure names the worker: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("the original bytes"),
+        b"not json".to_vec(),
+        "the damaged bytes are still there"
+    );
 }
 
 #[test]
@@ -1970,6 +2136,8 @@ async fn merge_closes_a_live_session_before_finishing_its_checkout() {
     run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
     let mut worker = worker(root.path(), "00000001000000000001");
     worker.status = WorkerStatus::InReview;
+    // A reviewed worker ran, so it has a conversation to load again.
+    worker.transcript = transcript_of(&["reviewed work"]);
     provision_agent_worktree(
         root.path().to_path_buf(),
         worker.id.clone(),
@@ -2995,6 +3163,9 @@ fn reviewed_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
 fn merged_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
     let mut worker = worker(root, id);
     worker.status = WorkerStatus::Merged;
+    // A merged worker ran: it has a conversation, so a reload must neither flag
+    // it as lost nor treat it as one that never spoke.
+    worker.transcript = transcript_of(&["merged"]);
     worker.merge = Some(MergeRecord {
         commit: "abcdef0123456789".to_string(),
         worker_tip: "0123456789abcdef".to_string(),

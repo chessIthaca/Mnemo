@@ -996,6 +996,38 @@ fn merge_moved_paths(data: &serde_json::Value, moved: &[MovedPath]) -> Option<se
     Some(serde_json::Value::Object(map))
 }
 
+/// The indexer's fresh metadata `data` carrying the row's existing
+/// `moved_paths` stamp over — the reconcile-safe form of a knowledge row's
+/// metadata (plan 373dec00 step 13).
+///
+/// Both reconcile paths re-assert a knowledge row's `data` from its FILE
+/// (a full [`crate::memory::indexer::index_derived`] run when the corpus
+/// changed, and the targeted reindex on every knowledge write). That fresh
+/// value knows nothing about the stamp this pass writes, so without this
+/// carry-over a routine reconcile — which happens on any open whose corpus
+/// moved — would silently erase it. Only [`MOVED_PATHS_KEY`] is inherited:
+/// `links`, `rel_path` and the rest always come from the file, which is their
+/// truth. The pass itself ([`merge_moved_paths`]) stays the one writer that
+/// sets or removes the stamp.
+pub(crate) fn keep_moved_paths(
+    fresh: &serde_json::Value,
+    existing: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(stamped) = existing.get(MOVED_PATHS_KEY) else {
+        return fresh.clone();
+    };
+    match fresh {
+        serde_json::Value::Object(map) => {
+            let mut merged = map.clone();
+            merged.insert(MOVED_PATHS_KEY.to_string(), stamped.clone());
+            serde_json::Value::Object(merged)
+        }
+        // A non-object fresh value cannot carry the key; the fresh value
+        // stands (the next pass re-stamps it if the record still earns it).
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1516,6 +1548,56 @@ mod tests {
         assert!(!size.team.over_budget());
     }
 
+    /// Index the project's corpus the way a project open does — the knowledge
+    /// dir is the plans dir's sibling, so this sees `.coding/knowledge/`.
+    async fn index_corpus(project: &Project, store: &Arc<dyn MemoryStoreTrait>) {
+        let coding = project.root().join(".coding");
+        crate::memory::indexer::index_derived(
+            store.as_ref(),
+            &coding.join("plans"),
+            &coding.join("backlog.jsonl"),
+            &|_, _| {},
+        )
+        .await
+        .expect("index run");
+    }
+
+    /// The knowledge row for a rel path (the pass stamps rows by that id).
+    async fn knowledge_row(store: &Arc<dyn MemoryStoreTrait>, rel: &str) -> Memory {
+        store
+            .get_memory(&knowledge_id(rel))
+            .await
+            .unwrap()
+            .expect("knowledge row")
+    }
+
+    #[test]
+    fn keep_moved_paths_copies_only_that_key() {
+        let fresh = json!({"kind": "knowledge", "rel_path": "bug/x.md", "links": ["fresh"]});
+        let stamped = json!([{"from": "src/gone.rs", "to": null}]);
+        let existing = json!({
+            "kind": "knowledge",
+            "rel_path": "bug/x.md",
+            "links": ["stale"],
+            "moved_paths": stamped.clone(),
+        });
+
+        let merged = keep_moved_paths(&fresh, &existing);
+        assert_eq!(merged[MOVED_PATHS_KEY], stamped, "the stamp is carried over");
+        assert_eq!(merged["links"], json!(["fresh"]), "every other key is fresh");
+        assert_eq!(
+            merged.as_object().unwrap().len(),
+            fresh.as_object().unwrap().len() + 1
+        );
+
+        // Nothing to keep: the fresh value comes back untouched.
+        let plain = json!({"kind": "knowledge", "rel_path": "bug/x.md"});
+        assert_eq!(keep_moved_paths(&fresh, &plain), fresh);
+        // A non-object existing value carries no key at all.
+        assert_eq!(keep_moved_paths(&fresh, &serde_json::Value::Null), fresh);
+        assert_eq!(keep_moved_paths(&fresh, &json!("a string")), fresh);
+    }
+
     #[tokio::test]
     async fn a_project_without_a_coding_dir_is_not_an_error() {
         let project = Project::new();
@@ -1524,5 +1606,110 @@ mod tests {
         let report = run(store.as_ref(), project.root()).await.expect("never fails");
         assert!(!report.report_written);
         assert!(report.stale_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_keeps_the_stamp() {
+        let project = Project::new();
+        let store = make_store();
+        project.write("src/kept.rs", "fn kept() {}\n");
+        let stamped = project.record(
+            "bug/2026-11-08-moved.md",
+            "Moved fact",
+            "Fixed in `src/gone.rs`. See [[how/2026-11-08-other]].",
+        );
+        project.record("how/2026-11-08-other.md", "Other", "See `src/kept.rs`.");
+        index_corpus(&project, &store).await;
+        let links = knowledge_row(&store, &stamped).await.data["links"].clone();
+        assert!(
+            !links.as_array().unwrap().is_empty(),
+            "the file's links indexed: {links}"
+        );
+
+        let report = run(store.as_ref(), project.root()).await.expect("pass");
+        assert_eq!(report.rows_updated, 1, "{report:?}");
+        let expected = json!([{"from": "src/gone.rs", "to": null}]);
+        assert_eq!(
+            knowledge_row(&store, &stamped).await.data[MOVED_PATHS_KEY],
+            expected
+        );
+
+        // The corpus changed (a third record lands), so the open's reconcile
+        // re-asserts every knowledge row's metadata from its file.
+        project.record("spec/2026-11-08-third.md", "Third", "Unrelated.");
+        index_corpus(&project, &store).await;
+
+        let after = knowledge_row(&store, &stamped).await;
+        assert_eq!(after.data[MOVED_PATHS_KEY], expected, "{after:?}");
+        assert_eq!(after.data["links"], links, "links are still the file's");
+    }
+
+    #[tokio::test]
+    async fn a_targeted_reindex_keeps_the_stamp() {
+        let project = Project::new();
+        let store = make_store();
+        let rel = project.record(
+            "decision/2026-11-08-stamped.md",
+            "Stamped fact",
+            "Uses `src/ghost.rs`. See [[how/2026-11-08-helper]].",
+        );
+        project.record("how/2026-11-08-helper.md", "Helper", "A helper.");
+        index_corpus(&project, &store).await;
+        let links = knowledge_row(&store, &rel).await.data["links"].clone();
+
+        let report = run(store.as_ref(), project.root()).await.expect("pass");
+        assert_eq!(report.rows_updated, 1, "{report:?}");
+        let expected = json!([{"from": "src/ghost.rs", "to": null}]);
+
+        // Every knowledge write takes the targeted reindex path.
+        crate::memory::indexer::reindex_knowledge_files(
+            store.as_ref(),
+            &project.root().join(".coding").join("knowledge"),
+            std::slice::from_ref(&rel),
+        )
+        .await
+        .expect("targeted reindex");
+
+        let after = knowledge_row(&store, &rel).await;
+        assert_eq!(after.data[MOVED_PATHS_KEY], expected, "{after:?}");
+        assert_eq!(after.data["links"], links, "links are still the file's");
+    }
+
+    #[tokio::test]
+    async fn the_pass_still_clears_a_stamp_the_record_no_longer_earns() {
+        let project = Project::new();
+        let store = make_store();
+        let rel = project.record(
+            "bug/2026-11-08-restored.md",
+            "Restored fact",
+            "Fixed in `src/restored.rs`.",
+        );
+        index_corpus(&project, &store).await;
+        let first = run(store.as_ref(), project.root()).await.expect("pass");
+        assert_eq!(first.rows_updated, 1, "{first:?}");
+        assert!(knowledge_row(&store, &rel)
+            .await
+            .data
+            .get(MOVED_PATHS_KEY)
+            .is_some());
+
+        // The path comes back: the record no longer earns the stamp.
+        project.write("src/restored.rs", "fn restored() {}\n");
+        let second = run(store.as_ref(), project.root()).await.expect("pass");
+        assert_eq!(second.rows_updated, 1, "{second:?}");
+        assert!(knowledge_row(&store, &rel)
+            .await
+            .data
+            .get(MOVED_PATHS_KEY)
+            .is_none());
+
+        // A later reconcile does not resurrect it.
+        project.record("spec/2026-11-08-again.md", "Again", "Unrelated.");
+        index_corpus(&project, &store).await;
+        assert!(knowledge_row(&store, &rel)
+            .await
+            .data
+            .get(MOVED_PATHS_KEY)
+            .is_none());
     }
 }

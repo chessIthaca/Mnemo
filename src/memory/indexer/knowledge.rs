@@ -230,8 +230,11 @@ pub async fn reindex_knowledge_files(
             (_, Some(e)) => Some(e),
             (computed, None) => computed,
         };
+        // The check pass owns `moved_paths`: carry its stamp across this
+        // re-assert (plan 373dec00 step 13); the rest is the file's metadata.
+        let data = crate::memory::health::keep_moved_paths(&meta.data, &row.data);
         store
-            .set_derived_metadata(&memory_id, superseded_by, &meta.data)
+            .set_derived_metadata(&memory_id, superseded_by, &data)
             .await?;
     }
     Ok(report)

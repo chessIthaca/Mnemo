@@ -109,6 +109,9 @@ pub async fn index_derived(
     let knowledge_dir = plans_dir
         .parent()
         .map(|p| p.join(KNOWLEDGE_DIR_NAME));
+    // Keep a handle for the INDEX.md regeneration after the loop — the scan
+    // closure below takes ownership of the original.
+    let knowledge_dir_for_index = knowledge_dir.clone();
     let config = store.memory_search_config();
     let (sources, knowledge_records, scan_errors) = tokio::task::spawn_blocking(move || {
         scan_sources(&plans, &backlog, knowledge_dir.as_deref(), &config)
@@ -229,6 +232,12 @@ pub async fn index_derived(
                 .set_derived_metadata(&memory_id, meta.superseded_by.as_deref(), &data)
                 .await?;
         }
+    }
+    // The generated knowledge map follows the corpus (plan 373dec00 step 6).
+    // It is a convenience file: a failure is one stderr line, never an indexing
+    // error, and the regenerate pass is a no-op when nothing changed.
+    if let Some(dir) = knowledge_dir_for_index {
+        crate::memory::knowledge_index::regenerate_blocking(dir).await;
     }
     Ok(report)
 }

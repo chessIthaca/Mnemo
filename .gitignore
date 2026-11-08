@@ -71,6 +71,10 @@ Thumbs.db
 # churn on every commit and conflict between the parallel worker worktrees.
 .coding/knowledge/HEALTH.md
 .coding/knowledge/.health-state.json
+# The generated knowledge map and any leftover temp file (plan 373dec00 step
+# 6) — same story: derived from the record files by every knowledge write and
+# every project open.
+.coding/knowledge/INDEX.md*
 # Parallel run-all worktrees (plan ffd7a86f) — linked worktrees for
 # concurrently dispatched backlog items + the landing worktree. Disposable
 # working trees, never committed.

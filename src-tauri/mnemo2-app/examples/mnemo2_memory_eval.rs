@@ -35,7 +35,8 @@ use mnemo::memory::{EmbedderStatus, MemoryFilter, MemoryStore, MemoryStoreTrait}
 use mnemo::provider::client_factory::build_embedder;
 use mnemo_app::mnemo2::memory_eval::{
     control_cases, hit_from_memory, load_fixture, misses, save_record, score_run,
-    summarize_misses, EvalCase, EvalHit, EvalRecord, EvalScore, Miss, MissSummary, HIT_LIMIT,
+    summarize_misses, EvalCase, EvalHit, EvalRecord, EvalScore, Miss, MissSummary,
+    RecalledRecord, HIT_LIMIT,
 };
 use mnemo_app::mnemo2::route_eval::today_utc;
 
@@ -116,6 +117,15 @@ async fn main() -> Result<(), String> {
     let miss_list = misses(&cases, &results);
     print_misses(&miss_list, &summarize_misses(&miss_list));
 
+    // The auto-recall measurement (plan 373dec00 step 6): which records the
+    // peek path actually surfaced, highest count first. Empty until a session
+    // has run with the counter in place.
+    let top_recalled = store
+        .top_recalled(10)
+        .await
+        .map_err(|error| format!("cannot read the recall counts: {error}"))?;
+    print_top_recalled(&top_recalled);
+
     let project_root = options
         .coding
         .parent()
@@ -127,6 +137,13 @@ async fn main() -> Result<(), String> {
         score,
         control: control_score,
         misses: miss_list,
+        top_recalled: top_recalled
+            .iter()
+            .map(|(title, count)| RecalledRecord {
+                title: title.clone(),
+                count: *count,
+            })
+            .collect(),
     };
     save_record(&options.out, &record)?;
     println!("\nrecord: {}", options.out.display());
@@ -208,6 +225,19 @@ fn print_score(label: &str, score: &EvalScore) {
     );
     for (kind, (hit_at_5, mrr)) in &score.per_kind {
         println!("  {kind:<9} hit@5 {hit_at_5:.3}   MRR {mrr:.3}");
+    }
+}
+
+/// Print the auto-recall counters: which records a fresh recall injected, and
+/// how often (plan 373dec00 step 6 — `access_count` never saw these).
+fn print_top_recalled(top: &[(String, u64)]) {
+    println!("\ntop recalled (auto-recall hits)");
+    if top.is_empty() {
+        println!("  none yet — the counter fills as sessions run");
+        return;
+    }
+    for (rank, (title, count)) in top.iter().enumerate() {
+        println!("  {:>2}. {title} — {count}", rank + 1);
     }
 }
 

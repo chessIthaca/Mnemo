@@ -237,6 +237,9 @@ pub async fn reindex_knowledge_files(
             .set_derived_metadata(&memory_id, superseded_by, &data)
             .await?;
     }
+    // Every knowledge write keeps the generated map current (plan 373dec00
+    // step 6). Best effort, blocking pool, no-op when the bytes match.
+    crate::memory::knowledge_index::regenerate_blocking(knowledge_dir.to_path_buf()).await;
     Ok(report)
 }
 

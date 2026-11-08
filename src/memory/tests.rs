@@ -488,14 +488,10 @@ async fn access_log_caps_at_100_evicting_oldest() {
 #[tokio::test]
 async fn access_log_records_session_primer_reads() {
     let store = make_store();
-    store
-        .write(Memory::new(MemoryTier::Semantic, "f", "content", 1000))
-        .await
-        .unwrap();
-    store
-        .strongest(&[MemoryTier::Semantic, MemoryTier::Procedural], 8)
-        .await
-        .unwrap();
+    let mut memory = Memory::new(MemoryTier::Semantic, "HOW: f", "content", 1000);
+    memory.record_class = MemoryClass::Derived;
+    store.write(memory).await.unwrap();
+    store.primer_records(8).await.unwrap();
 
     let log = store.access_log();
     assert_eq!(log.len(), 2);
@@ -1675,58 +1671,51 @@ async fn recall_decays_strength_so_old_memories_sink() {
 }
 
 #[tokio::test]
-async fn strongest_returns_top_by_decayed_strength() {
-    // Two semantic memories written at different times. The more-recently-
-    // accessed one (smaller time-since-last-access) has higher decayed
-    // strength and must rank first. Uses a fixed clock so decay is
-    // deterministic.
-    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new());
-    let now_val = Arc::new(AtomicI64::new(1_000_000));
-    let now_clone = Arc::clone(&now_val);
-    let store =
-        MemoryStore::open_in_memory_with_clock(embedder, move || now_clone.load(Ordering::SeqCst))
-            .unwrap();
+async fn the_primer_prefers_searched_typed_records() {
+    // The primer ranks by `access_count` — how often an explicit search
+    // returned the row — then recency. Typed titles are required: untyped
+    // rows are never primer material (plan 373dec00 step 6).
+    let store = make_store();
+    let mut first = Memory::new(
+        MemoryTier::Semantic,
+        "HOW: postgres for storage",
+        "the project uses postgres for storage",
+        1000,
+    );
+    first.record_class = MemoryClass::Derived;
+    store.write(first).await.unwrap();
+    let mut second = Memory::new(
+        MemoryTier::Semantic,
+        "DECISION: sqlite for storage",
+        "we use sqlite for storage",
+        2000,
+    );
+    second.record_class = MemoryClass::Derived;
+    store.write(second).await.unwrap();
 
-    // "old" memory: written + last-accessed at t=1_000_000.
+    // One explicit search for the older record: only it gets counted.
     store
-        .write(Memory::new(
-            MemoryTier::Semantic,
-            "old fact",
-            "the project uses postgres for storage",
-            1_000_000,
-        ))
-        .await
-        .unwrap();
-    // Advance the clock by 30 days, then write the "fresh" memory.
-    let thirty_days: i64 = 30 * 24 * 60 * 60;
-    now_val.store(1_000_000 + thirty_days, Ordering::SeqCst);
-    store
-        .write(Memory::new(
-            MemoryTier::Semantic,
-            "fresh fact",
-            "the project uses postgres for storage",
-            1_000_000 + thirty_days,
-        ))
+        .recall("postgres", &MemoryFilter::new())
         .await
         .unwrap();
 
-    let results = store
-        .strongest(&[MemoryTier::Semantic, MemoryTier::Procedural], 8)
-        .await
-        .unwrap();
-    assert_eq!(results.len(), 2);
-    // Fresh (decayed strength ≈ 1.0) outranks old (≈ 0.06 after 30 days).
-    assert_eq!(results[0].title, "fresh fact");
-    assert_eq!(results[1].title, "old fact");
+    let primer = store.primer_records(8).await.unwrap();
+    assert_eq!(
+        primer
+            .iter()
+            .map(|memory| memory.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["HOW: postgres for storage", "DECISION: sqlite for storage"],
+        "the searched record leads despite being older"
+    );
 }
 
 #[tokio::test]
-async fn strongest_excludes_superseded_memories() {
-    // The session primer (strongest) is the standing context of every new
-    // session — a superseded record must never surface there at full
-    // strength (the same invariant recall/list_filtered honor; the primer
-    // path was the gap). Supersede the STRONGEST semantic memory and
-    // assert it leaves strongest() output entirely.
+async fn primer_records_excludes_superseded_memories() {
+    // The primer is the standing context of every new session — a superseded
+    // record must never surface there (the same invariant recall and
+    // list_filtered honor; the primer path was the gap before plan 373dec00
+    // step 6).
     let store = make_store();
     let mut old = Memory::new(
         MemoryTier::Semantic,
@@ -1734,41 +1723,40 @@ async fn strongest_excludes_superseded_memories() {
         "we use postgres for storage",
         1000,
     );
-    old.strength = 5.0; // the strongest memory in the store
+    old.record_class = MemoryClass::Derived;
     let old_id = store.write(old).await.unwrap();
 
     // Before superseding: the row surfaces.
-    let before = store.strongest(&[MemoryTier::Semantic], 8).await.unwrap();
+    let before = store.primer_records(8).await.unwrap();
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].id, old_id);
 
-    // Supersede the strongest row with its successor.
+    // Supersede the row with its successor.
+    let mut successor = Memory::new(
+        MemoryTier::Semantic,
+        "DECISION: storage engine",
+        "we use sqlite for storage",
+        1001,
+    );
+    successor.record_class = MemoryClass::Derived;
     store
-        .supersede_memory(
-            &old_id,
-            Memory::new(
-                MemoryTier::Semantic,
-                "DECISION: storage engine",
-                "we use sqlite for storage",
-                1001,
-            ),
-        )
+        .supersede_memory(&old_id, successor)
         .await
         .unwrap();
 
     // The superseded row leaves the primer entirely — only the live
     // successor remains.
-    let after = store.strongest(&[MemoryTier::Semantic], 8).await.unwrap();
+    let after = store.primer_records(8).await.unwrap();
     assert_eq!(after.len(), 1, "superseded excluded from the primer");
     assert_ne!(after[0].id, old_id);
     assert!(after.iter().all(|m| m.superseded_by.is_none()));
 }
 
 #[tokio::test]
-async fn strongest_respects_tier_filter_and_excludes_working() {
-    // A working + a semantic + a procedural memory. strongest over
-    // [Semantic, Procedural] must return only the distilled tiers (never
-    // working, even if passed). A procedural memory is included.
+async fn primer_records_excludes_working_and_untyped_rows() {
+    // A working row is never primer material, and neither is an untyped row
+    // (the primer wants typed knowledge, not free-text facts). The typed
+    // procedural record is the only one that surfaces.
     let store = make_store();
     store
         .write(Memory::new(
@@ -1783,45 +1771,202 @@ async fn strongest_respects_tier_filter_and_excludes_working() {
         .write(Memory::new(
             MemoryTier::Semantic,
             "semantic fact",
-            "a distilled project fact",
+            "a distilled but untyped fact",
             1000,
         ))
         .await
         .unwrap();
-    store
-        .write(Memory::new(
-            MemoryTier::Procedural,
-            "procedural workflow",
-            "a learned recurring workflow",
-            1000,
-        ))
-        .await
-        .unwrap();
+    let mut procedural = Memory::new(
+        MemoryTier::Procedural,
+        "HOW: release checklist",
+        "a learned recurring workflow",
+        1000,
+    );
+    procedural.record_class = MemoryClass::Derived;
+    store.write(procedural).await.unwrap();
 
-    // Even if Working is passed, it must be excluded.
-    let results = store
-        .strongest(
-            &[
-                MemoryTier::Semantic,
-                MemoryTier::Procedural,
-                MemoryTier::Working,
-            ],
-            8,
-        )
-        .await
-        .unwrap();
-    assert_eq!(results.len(), 2, "working must be excluded");
-    assert!(results
-        .iter()
-        .all(|m| m.tier == MemoryTier::Semantic || m.tier == MemoryTier::Procedural));
-
-    // An empty tier slice returns empty.
-    let empty = store.strongest(&[], 8).await.unwrap();
-    assert!(empty.is_empty());
+    let results = store.primer_records(8).await.unwrap();
+    assert_eq!(results.len(), 1, "only the typed procedural row");
+    assert_eq!(results[0].title, "HOW: release checklist");
 
     // A limit of 0 returns empty.
-    let zero = store.strongest(&[MemoryTier::Semantic], 0).await.unwrap();
+    let zero = store.primer_records(0).await.unwrap();
     assert!(zero.is_empty());
+}
+
+#[tokio::test]
+async fn the_primer_excludes_bug_plan_and_untyped_rows() {
+    // The primer is standing context: BUG and PLAN digests are history and
+    // bookkeeping, not durable knowledge (plan 373dec00 step 6). SPEC,
+    // DECISION and HOW survive.
+    let store = make_store();
+    for (title, tier) in [
+        ("SPEC: the contract", MemoryTier::Semantic),
+        ("DECISION: the choice", MemoryTier::Semantic),
+        ("HOW: the procedure", MemoryTier::Procedural),
+        ("BUG: an old defect", MemoryTier::Semantic),
+        ("PLAN: an old plan", MemoryTier::Semantic),
+        ("REVIEW: an old review", MemoryTier::Semantic),
+        ("untyped fact", MemoryTier::Semantic),
+    ] {
+        // The primer only takes file-backed (derived) rows, so the typed ones
+        // are marked derived here; the type filter is what this test probes.
+        let mut memory = Memory::new(tier, title, "content", 1000);
+        memory.record_class = MemoryClass::Derived;
+        store.write(memory).await.unwrap();
+    }
+
+    let mut primer: Vec<String> = store
+        .primer_records(8)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|memory| memory.title)
+        .collect();
+    // The rows share one timestamp here, so this test is about exclusion, not
+    // order (the ordering contract has its own test above).
+    primer.sort();
+    assert_eq!(
+        primer,
+        vec![
+            "DECISION: the choice",
+            "HOW: the procedure",
+            "SPEC: the contract"
+        ],
+        "only the typed knowledge rows survive"
+    );
+}
+
+#[tokio::test]
+async fn the_primer_skips_file_less_stale_and_status_first_rows() {
+    // Standing context must never lead a session with the wrong thing (plan
+    // 373dec00 step 6 review): a typed authored row with no knowledge file is
+    // hearsay, a row the check pass stamped `moved_paths` is stale, and a
+    // legacy git-state digest opens with landing status. Only the clean,
+    // file-backed row is primer material.
+    let store = make_store();
+
+    // Authored (no file behind it).
+    store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "DECISION: file-less",
+            "no path backs this row",
+            1000,
+        ))
+        .await
+        .unwrap();
+
+    // Derived, but the check pass found the cited path gone.
+    let mut stale = Memory::new(
+        MemoryTier::Semantic,
+        "SPEC: stale",
+        "cites src/gone.rs",
+        1001,
+    );
+    stale.record_class = MemoryClass::Derived;
+    stale.data = serde_json::json!({
+        "moved_paths": [{ "from": "src/gone.rs", "to": null }]
+    });
+    store.write(stale).await.unwrap();
+
+    // Derived, but a legacy landing-status digest.
+    let mut status_first = Memory::new(
+        MemoryTier::Semantic,
+        "HOW: landed",
+        "MERGED into main at e37d07a on 2027-01-24; branch wt/x deleted",
+        1002,
+    );
+    status_first.record_class = MemoryClass::Derived;
+    store.write(status_first).await.unwrap();
+
+    // The one that belongs.
+    let mut clean = Memory::new(
+        MemoryTier::Semantic,
+        "HOW: clean",
+        "a durable, file-backed procedure",
+        1003,
+    );
+    clean.record_class = MemoryClass::Derived;
+    store.write(clean).await.unwrap();
+
+    let primer: Vec<String> = store
+        .primer_records(8)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|memory| memory.title)
+        .collect();
+    assert_eq!(primer, vec!["HOW: clean"]);
+}
+
+#[tokio::test]
+async fn note_recalled_counts_without_touching_last_accessed() {
+    // The auto-recall counter (plan 373dec00 step 6) is a separate measure
+    // from the explicit-read counters: the peek path stays read-only, and the
+    // turn loop's `note_recalled` bumps only `recall_count`.
+    let store = make_store();
+    let id = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "SPEC: storage",
+            "we use sqlite",
+            1000,
+        ))
+        .await
+        .unwrap();
+    let other = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "SPEC: other",
+            "another fact",
+            1001,
+        ))
+        .await
+        .unwrap();
+    let before = store.get_memory(&id).await.unwrap().unwrap();
+    let other_before = store.get_memory(&other).await.unwrap().unwrap();
+
+    // One batch covers both ids (and tolerates an id that does not exist); a
+    // second recall counts only the first row again.
+    store
+        .note_recalled(&[id.clone(), other.clone(), "does-not-exist".to_string()])
+        .await
+        .unwrap();
+    store.note_recalled(&[id.clone()]).await.unwrap();
+    let after = store.get_memory(&id).await.unwrap().unwrap();
+    let other_after = store.get_memory(&other).await.unwrap().unwrap();
+    assert_eq!(
+        after.access_count, before.access_count,
+        "an explicit-read counter is not touched"
+    );
+    assert_eq!(
+        after.last_accessed_at, before.last_accessed_at,
+        "recency is not touched"
+    );
+    assert_eq!(
+        other_after.access_count, other_before.access_count,
+        "the other row's explicit-read counter is untouched"
+    );
+    assert_eq!(
+        store.top_recalled(10).await.unwrap(),
+        vec![("SPEC: storage".to_string(), 2), ("SPEC: other".to_string(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn note_recalled_does_not_bump_the_store_version() {
+    // The agent's per-turn recall cache keys on `version()`; a recall counter
+    // bump must not invalidate it (turn.rs's cache would re-recall every turn).
+    let store = make_store();
+    let id = store
+        .write(Memory::new(MemoryTier::Semantic, "HOW: v", "c", 1000))
+        .await
+        .unwrap();
+    let version = store.version();
+    store.note_recalled(&[id]).await.unwrap();
+    assert_eq!(store.version(), version);
+    assert_eq!(store.top_recalled(10).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

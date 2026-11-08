@@ -67,11 +67,11 @@ pub const REPORT_HEADER: &str =
 /// the project's source trees. URLs and `[[wiki-link]]` targets are blanked
 /// before the match, and `.coding/…` paths carry no listed prefix, so none of
 /// them count as citations.
-const CITATION_PATTERN: &str = r"\b((?:src|src-tauri|mnemo2|frontend|tests|scripts|docs)/[\w./-]+\.\w+)";
+pub(crate) const CITATION_PATTERN: &str = r"\b((?:src|src-tauri|mnemo2|frontend|tests|scripts|docs)/[\w./-]+\.\w+)";
 
 /// Scheme-qualified tokens (URLs) — blanked before citation matching so a path
 /// embedded in a link never reads as a citation of this repo.
-const URL_PATTERN: &str = r"\S*://\S*";
+pub(crate) const URL_PATTERN: &str = r"\S*://\S*";
 
 /// How many rename hops a moved path may take before it counts as gone.
 const MAX_RENAME_HOPS: usize = 5;
@@ -257,6 +257,12 @@ async fn run_with_git(
             rows_updated += 1;
         }
     }
+    // An open rebuilds a missing index file (plan 373dec00 step 6): the
+    // generation is cheap, deterministic and a no-op when the bytes match.
+    crate::memory::knowledge_index::regenerate_blocking(
+        workspace_root.join(".coding").join(knowledge::KNOWLEDGE_DIR_NAME),
+    )
+    .await;
     Ok(HealthReport {
         rows_updated,
         ..scanned.report
@@ -414,7 +420,10 @@ fn scan(root: &Path, rows: &[Memory], git: &dyn GitProbe) -> Scan {
 
 /// Every `.md` record in the corpus' four type dirs, as `(rel_path, record)`,
 /// sorted by rel path so every downstream list is deterministic.
-fn read_corpus(knowledge_dir: &Path) -> Vec<(String, KnowledgeRecord)> {
+///
+/// Shared with [`crate::memory::knowledge_index`], which renders the same
+/// corpus as `.coding/knowledge/INDEX.md`.
+pub(crate) fn read_corpus(knowledge_dir: &Path) -> Vec<(String, KnowledgeRecord)> {
     let mut records = Vec::new();
     for record_type in KNOWLEDGE_TYPES {
         let Some(dir_name) = knowledge::dir_for_record_type(record_type) else {
@@ -444,7 +453,10 @@ fn read_corpus(knowledge_dir: &Path) -> Vec<(String, KnowledgeRecord)> {
 }
 
 /// The repo paths one record body cites, sorted and deduped.
-fn extract_citations(citation_re: &Regex, url_re: &Regex, body: &str) -> Vec<String> {
+///
+/// Shared with [`crate::memory::knowledge_index`]: the generated INDEX.md's
+/// area rule is the same citation rule this pass checks against the repo.
+pub(crate) fn extract_citations(citation_re: &Regex, url_re: &Regex, body: &str) -> Vec<String> {
     let without_urls = url_re.replace_all(body, " ");
     let text = strip_links(&without_urls);
     let mut paths: BTreeSet<String> = BTreeSet::new();

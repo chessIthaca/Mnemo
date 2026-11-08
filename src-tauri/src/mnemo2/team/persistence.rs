@@ -5,11 +5,13 @@
 //! The `team.json` ledger: the persisted shape, its backup-recoverable
 //! store, and the legacy tier-id conversion.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use mnemo::config::endpoints::TierLadder;
+use mnemo::headless::Transcript;
 use serde::{Deserialize, Serialize};
 
 use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
@@ -25,6 +27,13 @@ pub(super) const TEAM_PRE_TIERS_BACKUP: &str = "team.json.pre-tiers.bak";
 /// The longest a telemetry-only change (usage counters, context size) waits
 /// before it is written.
 pub(super) const LEDGER_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+/// The sub-directory (beside `team.json`) holding one transcript file per
+/// worker: `<worker_id>.json`.
+pub(super) const TRANSCRIPTS_DIR: &str = "transcripts";
+/// How old a transcript temp file must be before the sweep removes it: a save
+/// running in another [`TeamPersistence`] may be between its write and its
+/// rename right now (`cleanup_workspace` saves through its own instance).
+const TRANSCRIPT_TEMP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The persisted team ledger.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -55,6 +64,10 @@ pub(super) struct TeamPersistence {
     /// Set once the runtime shuts down, voiding a pending telemetry flush so
     /// the final persist stays the last ledger write.
     pub(super) closed: Arc<AtomicBool>,
+    /// Per worker id, the transcript `Arc` last written to (or read from) that
+    /// worker's file. Holding the `Arc` is what makes `Arc::ptr_eq` a sound
+    /// "unchanged" test: the comparing code always holds it too.
+    written: Arc<Mutex<HashMap<String, Arc<Transcript>>>>,
 }
 
 impl TeamPersistence {
@@ -64,7 +77,27 @@ impl TeamPersistence {
             slots: Arc::new(AtomicUsize::new(DEFAULT_SLOTS)),
             flush_scheduled: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
+            written: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The directory holding the per-worker transcript files.
+    fn transcripts_dir(&self) -> Option<PathBuf> {
+        Some(self.path.parent()?.join(TRANSCRIPTS_DIR))
+    }
+
+    /// The file holding one worker's transcript. A worker id that could not be
+    /// a file stem (not ASCII alphanumeric, or shorter than the validated
+    /// minimum) keeps its transcript embedded in `team.json` instead.
+    fn transcript_file(&self, worker_id: &str) -> Option<PathBuf> {
+        let usable = worker_id.len() >= 8
+            && worker_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric());
+        if !usable {
+            return None;
+        }
+        Some(self.transcripts_dir()?.join(format!("{worker_id}.json")))
     }
 
     fn decode(path: &std::path::Path) -> Result<Option<PersistedTeam>, String> {
@@ -101,6 +134,36 @@ impl TeamPersistence {
         }
     }
 
+    /// Load each worker's transcript from its own file. The file wins over the
+    /// embedded copy. A missing file is a ledger written before transcripts
+    /// moved out: the embedded transcript stays, and is not recorded, so the
+    /// next save writes the file and strips `team.json`.
+    fn attach_transcripts(&self, team: &mut PersistedTeam) {
+        for worker in &mut team.workers {
+            let Some(file) = self.transcript_file(&worker.id) else {
+                continue;
+            };
+            if !file.exists() {
+                continue;
+            }
+            match read_transcript(&file) {
+                Ok(transcript) => {
+                    worker.transcript = Arc::new(transcript);
+                    self.written_guard()
+                        .insert(worker.id.clone(), worker.transcript.clone());
+                }
+                Err(error) => {
+                    // The embedded copy stands, and the next save rewrites the
+                    // file from it (the id is deliberately not recorded).
+                    eprintln!(
+                        "team: transcript for {} could not be read: {error}",
+                        worker.id
+                    );
+                }
+            }
+        }
+    }
+
     pub(super) fn load(&self) -> Result<Option<PersistedTeam>, String> {
         self.sweep_stale_temps();
         let backup = self.path.with_extension("json.bak");
@@ -120,6 +183,9 @@ impl TeamPersistence {
         let Some((mut team, source)) = loaded else {
             return Ok(None);
         };
+        // Before the conversion save below: writing first would overwrite the
+        // newer transcript files of a legacy ledger with empty placeholders.
+        self.attach_transcripts(&mut team);
         if convert_legacy_team_tiers(&mut team) {
             let pre_tiers = self.path.with_file_name(TEAM_PRE_TIERS_BACKUP);
             if !pre_tiers.exists() {
@@ -136,11 +202,19 @@ impl TeamPersistence {
     }
 
     pub(super) fn save(&self, team: &PersistedTeam) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("could not create the team state dir: {err}"))?;
-        }
-        let bytes = serde_json::to_vec(team)
+        let Some(state_dir) = self.path.parent() else {
+            return Err("the team ledger path has no state directory".to_string());
+        };
+        std::fs::create_dir_all(state_dir)
+            .map_err(|err| format!("could not create the team state dir: {err}"))?;
+        std::fs::create_dir_all(state_dir.join(TRANSCRIPTS_DIR))
+            .map_err(|err| format!("could not create the transcript dir: {err}"))?;
+        // The transcript files land first: a failure here leaves the ledger
+        // itself untouched, and a crash between the two leaves a transcript
+        // file that a load prefers over the (older) embedded placeholder.
+        self.write_transcripts(team)?;
+        let ledger = self.ledger_without_transcripts(team);
+        let bytes = serde_json::to_vec(&ledger)
             .map_err(|err| format!("could not encode the team ledger: {err}"))?;
         let temp = self.path.with_extension(format!(
             "json.{}.{}.tmp",
@@ -179,7 +253,7 @@ impl TeamPersistence {
                 Err(err) => return Err(format!("could not back up the team ledger: {err}")),
             }
         }
-        match retry_io(|| std::fs::rename(&temp, &self.path)) {
+        let result = match retry_io(|| std::fs::rename(&temp, &self.path)) {
             Ok(()) => {
                 let _ = std::fs::remove_file(backup);
                 Ok(())
@@ -190,8 +264,142 @@ impl TeamPersistence {
                 }
                 Err(format!("could not replace the team ledger: {err}"))
             }
+        };
+        if result.is_ok() {
+            // Only once team.json names the removed workers are their files
+            // unreachable: until then the backup ledger still needs them.
+            self.sweep_orphan_transcripts(team);
+        }
+        result
+    }
+
+    /// Write the transcript files of the workers whose transcript `Arc` changed
+    /// since the last write (or read) of that worker's file. A worker with no
+    /// transcript file keeps its transcript in `team.json` and is skipped.
+    fn write_transcripts(&self, team: &PersistedTeam) -> Result<(), String> {
+        let mut pending: Vec<(String, PathBuf, Arc<Transcript>)> = Vec::new();
+        {
+            let written = self.written_guard();
+            for worker in &team.workers {
+                let Some(file) = self.transcript_file(&worker.id) else {
+                    continue;
+                };
+                let unchanged = written
+                    .get(&worker.id)
+                    .is_some_and(|known| Arc::ptr_eq(known, &worker.transcript));
+                if !unchanged {
+                    pending.push((worker.id.clone(), file, worker.transcript.clone()));
+                }
+            }
+        }
+        for (id, file, transcript) in pending {
+            let bytes = serde_json::to_vec(&*transcript)
+                .map_err(|err| format!("could not encode the transcript for {id}: {err}"))?;
+            // A temp name unique per write, as for `team.json`: two savers
+            // over one state dir need not share `save_lock` (a cleanup builds
+            // its own `TeamPersistence`), and a shared temp name lets one
+            // saver consume the other's temp and fail its rename.
+            let temp = file.with_extension(format!(
+                "json.{}.{}.tmp",
+                std::process::id(),
+                SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            retry_io(|| std::fs::write(&temp, &bytes))
+                .map_err(|err| format!("could not write the transcript for {id}: {err}"))?;
+            retry_io(|| std::fs::rename(&temp, &file))
+                .map_err(|err| format!("could not replace the transcript for {id}: {err}"))?;
+            self.written_guard().insert(id, transcript);
+        }
+        Ok(())
+    }
+
+    /// The ledger as stored in `team.json`: a worker with its own transcript
+    /// file carries an empty transcript placeholder there.
+    fn ledger_without_transcripts(&self, team: &PersistedTeam) -> PersistedTeam {
+        PersistedTeam {
+            workers: team
+                .workers
+                .iter()
+                .map(|worker| {
+                    if self.transcript_file(&worker.id).is_some() {
+                        WorkerRecord {
+                            transcript: Arc::default(),
+                            ..worker.clone()
+                        }
+                    } else {
+                        worker.clone()
+                    }
+                })
+                .collect(),
+            slots: team.slots,
+            usage: team.usage.clone(),
         }
     }
+
+    /// Delete the transcript files of workers the ledger no longer holds, plus
+    /// the temp files a crashed transcript write left behind.
+    fn sweep_orphan_transcripts(&self, team: &PersistedTeam) {
+        let Some(dir) = self.transcripts_dir() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let known: HashSet<String> = team
+            .workers
+            .iter()
+            .map(|worker| worker.id.clone())
+            .collect();
+        let mut orphans = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.ends_with(".tmp") {
+                // A leftover temp of a crashed write. A young one may belong to
+                // a save running right now, so it is left alone.
+                let young = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .map(|modified| modified.elapsed().unwrap_or_default() < TRANSCRIPT_TEMP_GRACE)
+                    .unwrap_or(true);
+                if !young {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                continue;
+            }
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if known.contains(stem) {
+                continue;
+            }
+            let _ = std::fs::remove_file(entry.path());
+            orphans.push(stem.to_string());
+        }
+        if orphans.is_empty() {
+            return;
+        }
+        let mut written = self.written_guard();
+        for id in orphans {
+            written.remove(&id);
+        }
+    }
+
+    /// The transcripts already on disk, recovering the lock from a panicked
+    /// writer instead of failing every later save.
+    fn written_guard(&self) -> MutexGuard<'_, HashMap<String, Arc<Transcript>>> {
+        self.written
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// Read and decode one worker's transcript file.
+fn read_transcript(path: &std::path::Path) -> Result<Transcript, String> {
+    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|err| err.to_string())
 }
 
 /// Windows can transiently deny a rename or remove while an indexer, an

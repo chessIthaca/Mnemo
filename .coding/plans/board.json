@@ -1892,10 +1892,10 @@
     },
     {
       "id": "373dec00",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794127622605,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1794155643660,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-373dec00-20261108-163403.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},

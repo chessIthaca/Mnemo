@@ -1,0 +1,8 @@
++++
+title = "team_dispatch's MCP schema omitted review_risk, so the high-risk audit gate was unreachable from a schema-following lead (fixed)"
+supersedes = "2026-11-08-team-dispatch-s-mcp-schema-omits-review-risk-so"
+created = "2026-11-08"
+evidence = "Tests team_dispatch_schema_offers_review_risk, team_dispatch_schema_declares_every_argument_its_handler_reads and external_lead_high_risk_dispatch_over_mcp_records_the_risk: all three failed on the unfixed schema and pass with the fix (run 2026-11-08)."
++++
+
+Symptom: a persistence-format dispatch meant as high-risk came back `review_risk: "standard"`, because the tool offered no such parameter, so the merge gate that requires a fresh independent audit never armed for an external lead. Root cause: the `team_dispatch` schema in `lead_host_tools` (src-tauri/src/mnemo2/team/lead_tools.rs) did not declare `review_risk`, although `handle_lead_host_tool_from` reads it, team/dispatch.rs validates it, and the tool description and the mnemo-lead skill tell the lead to pass it. mcp_server.rs `tool_list` publishes the schema unchanged as `inputSchema`, and `tools/call` forwards arguments unfiltered, so only the schema was wrong. Fix: declare optional `review_risk` (enum standard, high) in the schema; omitting it stays standard. No other lead tool read an undeclared argument when this was checked. Regression test: `team_dispatch_schema_offers_review_risk` in team/tests.rs. `team_dispatch_schema_declares_every_argument_its_handler_reads` scans the handler source for undeclared reads, for `team_dispatch` only, and `external_lead_high_risk_dispatch_over_mcp_records_the_risk` in mcp_server.rs proves the path over MCP.

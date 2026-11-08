@@ -60,7 +60,7 @@ use merge::{
     merge_record_from_git,
 };
 use persistence::TeamPersistence;
-use pump::{close_worker_session, save_workers};
+use pump::{close_worker_session, save_workers_now, save_workers_soon};
 
 pub use deletion::{
     CleanupReport, DeletionPhase, DeletionProgress, TeamDeleteOutcome, WorkerDeletion,
@@ -747,7 +747,8 @@ impl TeamRuntime {
     }
 
     /// Fold one live usage report (lead or worker session) into the durable
-    /// per-project accumulator and persist the ledger.
+    /// per-project accumulator and schedule a ledger save (see
+    /// `save_workers_soon`).
     ///
     /// The observed model id (already keyed through [`usage_model_key`])
     /// attributes the row; a report with no observed model lands on the
@@ -770,7 +771,8 @@ impl TeamRuntime {
             let mut usage = self.usage.lock().await;
             usage.record(&key, prompt_tokens, cached_tokens, completion_tokens);
         }
-        save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await
+        save_workers_soon(&self.records, &self.usage, &self.save_lock, &self.persistence);
+        Ok(())
     }
 
     /// One worker by id.
@@ -800,7 +802,9 @@ impl TeamRuntime {
     }
 
     async fn persist(&self) -> Result<(), String> {
-        save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await
+        // The final write of a closing runtime, so it bypasses the shutdown
+        // check that voids detached saves.
+        save_workers_now(&self.records, &self.usage, &self.save_lock, &self.persistence).await
     }
 
     /// Stop every live worker while preserving merged audit records.
@@ -816,6 +820,8 @@ impl TeamRuntime {
     /// Stop every live worker. The shared engine is owned by the lead and is
     /// not shut down here.
     pub async fn shutdown(&self) {
+        // Void a pending telemetry flush: the final persist is the last write.
+        self.persistence.closed.store(true, Ordering::SeqCst);
         *self.lead_session.lock().await = None;
         let live = {
             let mut map = self.live.lock().await;

@@ -383,6 +383,148 @@ fn legacy_ledger_without_usage_decodes_with_an_empty_accumulator() {
     assert_eq!(restored.usage, usage);
 }
 
+#[test]
+fn ledger_saves_are_compact_json() {
+    // Regression (PERF-1): the ledger is rewritten on every state change, so
+    // it must not pay for pretty-printed indentation on top of every record.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![worker(root.path(), "00000004000000000004")],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("compact save");
+    let bytes = std::fs::read(dir.path().join(TEAM_STATE_FILE)).expect("read team.json");
+    assert!(
+        !bytes.contains(&b'\n'),
+        "team.json must be one compact JSON document"
+    );
+    let loaded = persistence.load().expect("reload").expect("some ledger");
+    assert_eq!(loaded.workers.len(), 1);
+    assert_eq!(loaded.workers[0].id, "00000004000000000004");
+}
+
+#[test]
+fn a_crash_leftover_temp_is_swept_on_load() {
+    // A crash mid-save leaves a uniquely-named temp (`team.json.<pid>.<seq>.tmp`)
+    // that no later save overwrites; load sweeps it before decoding.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![worker(root.path(), "00000005000000000005")],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("compact save");
+    let stale = dir.path().join("team.json.123.0.tmp");
+    std::fs::write(&stale, b"{\"workers\":[]}").expect("stale temp");
+    let loaded = persistence.load().expect("load").expect("some ledger");
+    assert!(!stale.exists(), "the crash-leftover temp is swept on load");
+    assert_eq!(loaded.workers.len(), 1);
+    assert_eq!(loaded.workers[0].id, "00000005000000000005");
+}
+
+#[tokio::test]
+async fn usage_reports_reach_the_ledger_within_the_flush_delay() {
+    // Regression (PERF-2): every usage report used to rewrite the whole
+    // ledger. Reports now coalesce into one flush, which must still reach
+    // team.json within the flush delay.
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    for _ in 0..3 {
+        team.record_usage(Some("perf-model"), 10, 0, 5)
+            .await
+            .expect("record usage");
+    }
+    let persistence = TeamPersistence::new(state.path());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let prompt_tokens = loop {
+        // A concurrent save renames team.json while it writes, so a miss is
+        // just "not yet", not an error.
+        let prompt_tokens = persistence
+            .load()
+            .expect("load the ledger")
+            .and_then(|loaded| {
+                loaded
+                    .usage
+                    .models
+                    .get("perf-model")
+                    .map(|row| row.prompt_tokens)
+            });
+        if prompt_tokens == Some(30) {
+            break prompt_tokens;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the coalesced usage save never reached the ledger: {prompt_tokens:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(prompt_tokens, Some(30));
+    assert!(
+        !team.persistence.flush_scheduled.load(Ordering::SeqCst),
+        "the pending flag clears before the ledger write"
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn telemetry_saves_coalesce_into_one_pending_flush() {
+    // Regression (PERF-2): usage and context-size updates arrive with every
+    // LLM request. Twenty reports in a row must leave exactly one flush
+    // pending, and that flush must still write the current state.
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    {
+        let mut usage = team.usage.lock().await;
+        usage.record("coalesced-model", 7, 0, 0);
+    }
+    for _ in 0..20 {
+        super::pump::save_workers_soon(
+            &team.records,
+            &team.usage,
+            &team.save_lock,
+            &team.persistence,
+        );
+    }
+    assert!(
+        team.persistence.flush_scheduled.load(Ordering::SeqCst),
+        "the first call schedules the flush, the rest ride along"
+    );
+    let persistence = TeamPersistence::new(state.path());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let saved = persistence
+            .load()
+            .expect("load the ledger")
+            .and_then(|loaded| {
+                loaded
+                    .usage
+                    .models
+                    .get("coalesced-model")
+                    .map(|row| row.prompt_tokens)
+            });
+        if saved == Some(7) && !team.persistence.flush_scheduled.load(Ordering::SeqCst) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the coalesced flush never wrote the ledger"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    team.shutdown().await;
+}
+
 fn lifecycle_git(root: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .args(args)
@@ -3038,12 +3180,9 @@ async fn finished_audit_releases_its_slot() {
             .any(|message| message.worker_id == audit_id),
         "the audit's report is recorded for the lead"
     );
-    // The finished audit no longer counts against the slots.
-    assert_eq!(
-        team.live.lock().await.len(),
-        0,
-        "the finished audit released its slot"
-    );
+    // The finished audit no longer counts against the slots. The release runs
+    // after the finish is persisted, so poll instead of racing it.
+    eventually(|| async { (team.live.lock().await.is_empty()).then_some(()) }).await;
     // The freed slot dispatches a fresh audit with no manual stop
     // (a different id prefix: the finished audit's branch stays).
     team.audit_dispatch(&target.id, "audittwo001", None, None, None)
@@ -4005,7 +4144,11 @@ async fn three_failing_tool_calls_nudge_once() {
     // stronger tier can still take the nudge. The dispatch's Route row
     // lands in the background (plan c74b1987), so the three rows are
     // asserted as a set, not an order.
-    let rows = fixture.rows();
+    let rows = eventually(|| async {
+        let rows = fixture.rows();
+        (rows.len() >= 3).then_some(rows)
+    })
+    .await;
     assert_eq!(rows.len(), 3, "the route, the nudge, and the outcome rows: {rows:?}");
     assert!(
         rows.iter().any(|row| matches!(row, DispatchRoutingRow::Route { .. })),
@@ -7164,23 +7307,33 @@ async fn auto_mode_switches_an_idle_nudged_worker_and_notifies_the_lead() {
         })
         .await;
     fixture.team.persist().await.expect("save pending nudge");
-    assert!(
-        fixture
-            .team
-            .auto_escalate_worker("routingworker")
-            .await
-            .expect("auto escalation")
-    );
-    let switched = fixture.team.worker("routingworker").await.expect("switched");
+    // Auto mode applies a pending nudge on the first idle event, so the pump
+    // may claim it while the ledger save yields; either pass performs the same
+    // switch, so assert the outcome rather than which caller ran it.
+    let _ = fixture
+        .team
+        .auto_escalate_worker("routingworker")
+        .await
+        .expect("auto escalation");
+    let switched = eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        (worker.model.as_deref() == Some("test/scripted-difficult")).then_some(worker)
+    })
+    .await;
     assert_eq!(switched.model.as_deref(), Some("test/scripted-difficult"));
     assert_eq!(switched.tier.as_deref(), Some("high"));
     assert!(switched.routing.expect("routing").nudged.is_none());
-    let raw = std::fs::read_to_string(fixture.log_path()).expect("routing log");
-    assert!(raw.lines().any(|line| {
-        serde_json::from_str::<Value>(line).is_ok_and(|row| {
-            row["event"] == "lead_reroute" && row["source"] == "escalation"
-        })
-    }), "{raw}");
+    let _ = eventually(|| async {
+        let raw = std::fs::read_to_string(fixture.log_path()).expect("routing log");
+        raw.lines()
+            .any(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                    row["event"] == "lead_reroute" && row["source"] == "escalation"
+                })
+            })
+            .then_some(raw)
+    })
+    .await;
     let mut notice = None;
     for _ in 0..800 {
         while let Ok(signal) = notices.try_recv() {

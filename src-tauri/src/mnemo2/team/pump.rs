@@ -30,7 +30,7 @@ use crate::mnemo2::usage::{ProjectUsage, event_session};
 use super::{BoardSignal, LiveWorker, TeamEvent, TeamMessage};
 use super::escalation::{AutoEscalation, auto_escalate_idle};
 use super::nudge::{StrikeNudges, note_tool_outcome, try_strike_nudge};
-use super::persistence::{PersistedTeam, TeamPersistence};
+use super::persistence::{LEDGER_FLUSH_DELAY, PersistedTeam, TeamPersistence};
 use super::record::{WorkerRecord, WorkerStatus, kickoff_message};
 use super::review::clear_review_for_a_newer_tip;
 use super::routing::{logs_label, outcome_row};
@@ -175,6 +175,23 @@ pub(super) fn cost_notice_due(cost: u64, notified: u64, threshold: u64) -> Optio
         level = doubled;
     }
     (level > notified).then_some(level)
+}
+
+/// Whether this worker's record (this generation, or a generation-0 record)
+/// has no observed model id yet.
+async fn worker_lacks_model_id(
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    worker_id: &str,
+    generation: u64,
+) -> bool {
+    records
+        .lock()
+        .await
+        .iter()
+        .find(|worker| {
+            worker.id == worker_id && (worker.generation == 0 || worker.generation == generation)
+        })
+        .is_some_and(|worker| worker.model_id.is_none())
 }
 
 /// Forward one worker session's events, update its durable record, and refresh
@@ -398,7 +415,9 @@ pub(super) async fn pump_worker(
             }
             _ => {}
         }
-        let usage_model = if matches!(&event.event, SerializableAgentEvent::Usage { .. }) {
+        let usage_model = if matches!(&event.event, SerializableAgentEvent::Usage { .. })
+            && worker_lacks_model_id(&records, &worker_id, generation).await
+        {
             match engine.session(&session_id).await {
                 Some(session) => session
                     .snapshot()
@@ -413,6 +432,7 @@ pub(super) async fn pump_worker(
         let mut terminal = false;
         let mut refresh = false;
         let mut changed = false;
+        let mut telemetry = false;
         // Whether this event ended a reported audit's turn (plan 5779641):
         // its live session is released below, once the save persists the
         // report and the `Completed` status.
@@ -552,12 +572,12 @@ pub(super) async fn pump_worker(
                                 completion,
                             );
                         }
-                        changed = true;
+                        telemetry = true;
                     }
                     SerializableAgentEvent::ContextUsage { used, max, .. } => {
                         worker.used_tokens = *used;
                         worker.max_tokens = *max;
-                        changed = true;
+                        telemetry = true;
                     }
                     SerializableAgentEvent::ApprovalRequest { tool_call_id, .. } => {
                         worker.pending = Some(PendingInteraction::Approval {
@@ -819,6 +839,8 @@ pub(super) async fn pump_worker(
         });
         if terminal || changed {
             let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+        } else if telemetry {
+            save_workers_soon(&records, &usage, &save_lock, &persistence);
         }
         if let Some(held) = settled_parked_finish.take() {
             // The held turn end, now that the record reads Completed: this
@@ -1053,8 +1075,27 @@ async fn release_finished_audit(
 /// `save_lock` serializes every `team.json` write (pump saves, the lead's
 /// usage recording, cleanup) so a usage report folded into the accumulator
 /// can never be lost to a stale interleaving of concurrent saves: each save
-/// clones the latest committed state while holding the lock.
+/// clones the latest committed state while holding the lock. The encode and
+/// the file writes run on the blocking pool, never on a runtime worker.
+///
+/// A runtime that has shut down skips the write: its final persist is already
+/// the last ledger write, so a detached task (the post-turn refresh) cannot
+/// resurrect state pruned afterwards.
 pub(super) async fn save_workers(
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    usage: &Arc<Mutex<ProjectUsage>>,
+    save_lock: &Arc<Mutex<()>>,
+    persistence: &TeamPersistence,
+) -> Result<(), String> {
+    if persistence.closed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    save_workers_now(records, usage, save_lock, persistence).await
+}
+
+/// [`save_workers`] without the shutdown check: the closing runtime's final
+/// persist.
+pub(super) async fn save_workers_now(
     records: &Arc<Mutex<Vec<WorkerRecord>>>,
     usage: &Arc<Mutex<ProjectUsage>>,
     save_lock: &Arc<Mutex<()>>,
@@ -1063,11 +1104,50 @@ pub(super) async fn save_workers(
     let _serialized = save_lock.lock().await;
     let workers = records.lock().await.clone();
     let usage = usage.lock().await.clone();
-    persistence.save(&PersistedTeam {
+    let persistence = persistence.clone();
+    let team = PersistedTeam {
         workers,
         slots: Some(persistence.slots.load(Ordering::SeqCst)),
         usage,
-    })
+    };
+    tokio::task::spawn_blocking(move || persistence.save(&team))
+        .await
+        .map_err(|err| format!("the team ledger save task failed: {err}"))?
+}
+
+/// Persist the ledger within [`LEDGER_FLUSH_DELAY`] instead of now: for
+/// telemetry-only changes (usage counters, context size) that arrive with
+/// every LLM request. At most one flush is pending; changes that land while
+/// it waits ride along. The in-memory state stays authoritative, so a crash
+/// loses at most the last delay's counters.
+pub(super) fn save_workers_soon(
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    usage: &Arc<Mutex<ProjectUsage>>,
+    save_lock: &Arc<Mutex<()>>,
+    persistence: &TeamPersistence,
+) {
+    if persistence.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    if persistence.flush_scheduled.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (records, usage, save_lock, persistence) = (
+        records.clone(),
+        usage.clone(),
+        save_lock.clone(),
+        persistence.clone(),
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(LEDGER_FLUSH_DELAY).await;
+        // Clear first: a change landing during the save schedules the next flush.
+        persistence.flush_scheduled.store(false, Ordering::SeqCst);
+        // A shutdown voids the pending flush: its persist is the last write.
+        if persistence.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+    });
 }
 
 /// A human label for the session limit a worker hit.

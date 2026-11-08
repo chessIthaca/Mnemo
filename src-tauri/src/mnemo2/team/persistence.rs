@@ -6,7 +6,7 @@
 //! store, and the legacy tier-id conversion.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use mnemo::config::endpoints::TierLadder;
@@ -22,6 +22,9 @@ use super::DEFAULT_SLOTS;
 pub(super) const TEAM_STATE_FILE: &str = "team.json";
 /// Original bytes preserved before the one-time legacy tier-id conversion.
 pub(super) const TEAM_PRE_TIERS_BACKUP: &str = "team.json.pre-tiers.bak";
+/// The longest a telemetry-only change (usage counters, context size) waits
+/// before it is written.
+pub(super) const LEDGER_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// The persisted team ledger.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -36,11 +39,22 @@ pub(super) struct PersistedTeam {
     pub(super) usage: ProjectUsage,
 }
 
+/// Distinguishes the temp files of concurrent savers (two runtimes on one
+/// state dir, or a cleanup racing a pump save): a shared temp name lets one
+/// saver consume the other's temp file and fail its rename.
+static SAVE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 /// The backup-recoverable `team.json` store.
 #[derive(Clone, Debug)]
 pub(super) struct TeamPersistence {
     pub(super) path: PathBuf,
     pub(super) slots: Arc<AtomicUsize>,
+    /// Set while a coalesced telemetry flush is pending (see
+    /// [`save_workers_soon`](super::pump::save_workers_soon)).
+    pub(super) flush_scheduled: Arc<AtomicBool>,
+    /// Set once the runtime shuts down, voiding a pending telemetry flush so
+    /// the final persist stays the last ledger write.
+    pub(super) closed: Arc<AtomicBool>,
 }
 
 impl TeamPersistence {
@@ -48,6 +62,8 @@ impl TeamPersistence {
         Self {
             path: state_dir.join(TEAM_STATE_FILE),
             slots: Arc::new(AtomicUsize::new(DEFAULT_SLOTS)),
+            flush_scheduled: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -64,7 +80,29 @@ impl TeamPersistence {
             .map_err(|err| format!("could not decode {}: {err}", path.display()))
     }
 
+    /// Remove temp files a crashed save left behind (`team.json.<pid>.<seq>.tmp`).
+    /// The name is unique per save, so only a crash leaves one; every `load`
+    /// caller holds `save_lock`, so no save of this process is in flight.
+    fn sweep_stale_temps(&self) {
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with("team.json.") && name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     pub(super) fn load(&self) -> Result<Option<PersistedTeam>, String> {
+        self.sweep_stale_temps();
         let backup = self.path.with_extension("json.bak");
         let loaded = match Self::decode(&self.path) {
             Ok(Some(team)) => Some((team, self.path.clone())),
@@ -102,37 +140,76 @@ impl TeamPersistence {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("could not create the team state dir: {err}"))?;
         }
-        let bytes = serde_json::to_vec_pretty(team)
+        let bytes = serde_json::to_vec(team)
             .map_err(|err| format!("could not encode the team ledger: {err}"))?;
-        let temp = self.path.with_extension("json.tmp");
-        std::fs::write(&temp, bytes)
+        let temp = self.path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        retry_io(|| std::fs::write(&temp, &bytes))
             .map_err(|err| format!("could not write the team ledger: {err}"))?;
         let backup = self.path.with_extension("json.bak");
         if !self.path.exists() && backup.exists() {
-            std::fs::rename(&backup, &self.path)
-                .map_err(|err| format!("could not restore the team ledger backup: {err}"))?;
+            match retry_io(|| std::fs::rename(&backup, &self.path)) {
+                Ok(()) => {}
+                // Another writer restored the ledger first: its snapshot stands.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!("could not restore the team ledger backup: {err}"));
+                }
+            }
         }
         if backup.exists() {
-            std::fs::remove_file(&backup)
-                .map_err(|err| format!("could not clear the old team ledger backup: {err}"))?;
+            match retry_io(|| std::fs::remove_file(&backup)) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!("could not clear the old team ledger backup: {err}"));
+                }
+            }
         }
         if self.path.exists() {
-            std::fs::rename(&self.path, &backup)
-                .map_err(|err| format!("could not back up the team ledger: {err}"))?;
+            match retry_io(|| std::fs::rename(&self.path, &backup)) {
+                Ok(()) => {}
+                // Another writer moved the ledger between the check and the
+                // rename; every writer persists a consistent snapshot, so the
+                // newest temp still replaces it below.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("could not back up the team ledger: {err}")),
+            }
         }
-        match std::fs::rename(&temp, &self.path) {
+        match retry_io(|| std::fs::rename(&temp, &self.path)) {
             Ok(()) => {
                 let _ = std::fs::remove_file(backup);
                 Ok(())
             }
             Err(err) => {
                 if backup.exists() {
-                    let _ = std::fs::rename(&backup, &self.path);
+                    let _ = retry_io(|| std::fs::rename(&backup, &self.path));
                 }
                 Err(format!("could not replace the team ledger: {err}"))
             }
         }
     }
+}
+
+/// Windows can transiently deny a rename or remove while an indexer, an
+/// antivirus scan, or a second ledger writer still holds the file: retry a
+/// few times before reporting a failure.
+fn retry_io<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut last = None;
+    for _ in 0..5 {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                last = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.expect("a retried IO attempt"))
 }
 
 /// Convert one stored tier id, returning whether it changed.

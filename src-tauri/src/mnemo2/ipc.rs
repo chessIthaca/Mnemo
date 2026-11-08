@@ -42,6 +42,7 @@ use crate::mnemo2::mcp_server::{McpServer, OpenFailure};
 use crate::mnemo2::phase3::{Finding, ReviewEvidence};
 use crate::mnemo2::project::{self, ProjectPreferences, ProjectRecord};
 use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
+use crate::mnemo2::laya_learnings::{self, LearningsOffer, LearningsSource};
 use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
@@ -54,6 +55,10 @@ use crate::mnemo2::workbench::{self, DiffSnapshot};
 /// The Tauri event emitted (no payload) whenever the plan board may have changed.
 pub const BOARD_CHANGED_CHANNEL: &str = "mnemo2://board-changed";
 
+/// The Tauri event carrying the copies of Laya's learnings waiting for an
+/// answer: the full list, which may be empty when a stale question closes.
+pub const LAYA_LEARNINGS_CHANNEL: &str = "mnemo2://laya-learnings";
+
 /// The shared Mnemo2 app state: one live lead and its event forwarder.
 #[derive(Default)]
 pub struct Mnemo2State {
@@ -65,6 +70,9 @@ pub struct Mnemo2State {
     marker_root: Mutex<Option<PathBuf>>,
     preferences: Mutex<Option<(PathBuf, ProjectPreferences)>>,
     notified: Mutex<HashSet<String>>,
+    /// The conflicting copies of Laya's learnings the window is asking about,
+    /// each with the source its answer applies to.
+    learnings_offers: Mutex<Vec<(LearningsSource, LearningsOffer)>>,
     /// The canonical `--project` from the command line, until the frontend
     /// takes it.
     startup_project: std::sync::Mutex<Option<String>>,
@@ -693,7 +701,119 @@ pub async fn lead_open(
     *state.board_forwarder.lock().await = Some(board_forwarder);
     *state.indexing_forwarder.lock().await = Some(indexing_forwarder);
     state.sync_run_file(Some(&root));
+    // The Laya learnings check rides along with the open: it runs off the open
+    // path and its offers arrive on [`LAYA_LEARNINGS_CHANNEL`]. A failed check
+    // never fails an open.
+    spawn_learnings_check(app.clone(), root.clone());
     Ok(snapshot)
+}
+
+/// The offers still relevant to `sources`: an offer from a project that is no
+/// longer open goes stale, while the installer's copy survives a project
+/// switch.
+fn offers_for_the_current_sources(
+    existing: Vec<(LearningsSource, LearningsOffer)>,
+    sources: &[LearningsSource],
+) -> Vec<(LearningsSource, LearningsOffer)> {
+    existing
+        .into_iter()
+        .filter(|(source, _)| sources.iter().any(|fresh| fresh.key == source.key))
+        .collect()
+}
+
+/// Check the shipped copies of Laya's learnings in the background: a copy this
+/// computer has no conflicting decisions for imports silently, a conflicting
+/// one becomes an offer the window asks about. Never blocks and never fails a
+/// project open.
+fn spawn_learnings_check(app: AppHandle, root: PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        let resource_dir = app.path().resource_dir().ok();
+        let sources = laya_learnings::learnings_sources(resource_dir.as_deref(), &root);
+        let log = crate::mnemo2::dispatch_routing::dispatch_routing_log_path();
+        let record = mnemo::training_log_dir().join(laya_learnings::IMPORT_RECORD_FILE);
+        let checked = sources.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            let mut found = Vec::new();
+            for source in checked {
+                match laya_learnings::check_source(&source, &log, &record) {
+                    Ok(laya_learnings::CheckResult::Nothing) => {}
+                    Ok(laya_learnings::CheckResult::Imported { rows }) => {
+                        eprintln!(
+                            "mnemo2: imported {rows} Laya learning rows from {}",
+                            source.label
+                        );
+                    }
+                    Ok(laya_learnings::CheckResult::Offer(offer)) => found.push((source, offer)),
+                    Err(error) => eprintln!(
+                        "mnemo2: could not check {} for Laya learnings: {error}",
+                        source.path.display()
+                    ),
+                }
+            }
+            found
+        })
+        .await;
+        let offers = match found {
+            Ok(offers) => offers,
+            Err(error) => {
+                eprintln!("mnemo2: the Laya learnings check could not finish: {error}");
+                return;
+            }
+        };
+        let state = app.state::<Mnemo2State>();
+        let mut held = state.learnings_offers.lock().await;
+        let previous: Vec<LearningsOffer> = held.iter().map(|(_, offer)| offer.clone()).collect();
+        let mut current = offers_for_the_current_sources(std::mem::take(&mut *held), &sources);
+        for (source, offer) in offers {
+            current.retain(|(kept, _)| kept.key != source.key);
+            current.push((source, offer));
+        }
+        let now: Vec<LearningsOffer> = current.iter().map(|(_, offer)| offer.clone()).collect();
+        *held = current;
+        drop(held);
+        if now != previous {
+            // An empty list is a valid payload: it closes a stale question.
+            let _ = app.emit(LAYA_LEARNINGS_CHANNEL, &now);
+        }
+    });
+}
+
+/// The copies of Laya's learnings waiting for the user's answer.
+#[tauri::command]
+pub async fn laya_learnings_offers(
+    state: State<'_, Mnemo2State>,
+) -> Result<Vec<LearningsOffer>, String> {
+    let offers = state.learnings_offers.lock().await;
+    Ok(offers.iter().map(|(_, offer)| offer.clone()).collect())
+}
+
+/// Apply the user's answer about one copy: accepting appends the rows it
+/// holds, declining records that version as declined. Either way the offer
+/// leaves the list and the remaining offers are returned.
+#[tauri::command]
+pub async fn laya_learnings_decide(
+    state: State<'_, Mnemo2State>,
+    source_key: String,
+    sha256: String,
+    accept: bool,
+) -> Result<Vec<LearningsOffer>, String> {
+    let (source, _) = {
+        let mut offers = state.learnings_offers.lock().await;
+        let index = offers
+            .iter()
+            .position(|(source, _)| source.key == source_key)
+            .ok_or_else(|| "that update is no longer pending".to_string())?;
+        offers.remove(index)
+    };
+    let log = crate::mnemo2::dispatch_routing::dispatch_routing_log_path();
+    let record = mnemo::training_log_dir().join(laya_learnings::IMPORT_RECORD_FILE);
+    tokio::task::spawn_blocking(move || {
+        laya_learnings::decide_offer(&source, &sha256, accept, &log, &record)
+    })
+    .await
+    .map_err(|error| format!("the answer could not be applied: {error}"))??;
+    let offers = state.learnings_offers.lock().await;
+    Ok(offers.iter().map(|(_, offer)| offer.clone()).collect())
 }
 
 /// The project named by `--project` on the command line (its canonical root),
@@ -1601,5 +1721,40 @@ mod tests {
         worker.error = None;
         let (_, body) = notification_for(&worker).expect("a needs-you notification");
         assert!(!body.contains("waiting for input"), "{body}");
+    }
+
+    /// The retain rule: a project's offer must not outlive the project (an
+    /// answer would write a log nobody is looking at), while the installer's
+    /// offer survives a project switch.
+    #[test]
+    fn offers_follow_the_current_sources_after_an_open() {
+        let source = |key: &str| LearningsSource {
+            key: key.to_string(),
+            label: key.to_string(),
+            path: PathBuf::from(format!("{key}.jsonl")),
+            plans_dir: None,
+        };
+        let offer = |key: &str| LearningsOffer {
+            source_key: key.to_string(),
+            source_label: key.to_string(),
+            sha256: "0".repeat(64),
+            new_rows: 1,
+            local_only_rows: 2,
+        };
+        let existing = vec![
+            (source("installer"), offer("installer")),
+            (source("project:one"), offer("project:one")),
+        ];
+        let kept = offers_for_the_current_sources(
+            existing,
+            &[source("installer"), source("project:two")],
+        );
+        assert_eq!(
+            kept.iter()
+                .map(|(source, _)| source.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["installer"],
+            "only the copies still in play keep their offers"
+        );
     }
 }

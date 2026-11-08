@@ -328,4 +328,24 @@ describe("WorkerThread", () => {
       expect(container.querySelector(".thread-composer")).not.toBeNull();
     }
   });
+
+  it("a long thread shows its newest 200 messages", async () => {
+    const messages = Array.from({ length: 250 }, (_, index) => message(`long-${index}`));
+    const long = worker({ id: "window-1", status: "working", error: null, messages });
+    const { container, rerender } = render(WorkerThread, { worker: long });
+
+    expect(container.querySelectorAll(".thread-message")).toHaveLength(200);
+    expect(screen.getByText("Line long-50 while the thread grows.")).toBeTruthy();
+    expect(screen.queryByText("Line long-49 while the thread grows.")).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Show earlier messages (50 hidden)" }));
+
+    expect(container.querySelectorAll(".thread-message")).toHaveLength(250);
+    expect(screen.getByText("Line long-0 while the thread grows.")).toBeTruthy();
+
+    // Switching workers starts the new thread with a fresh window.
+    await rerender({ worker: worker({ id: "window-2", status: "working", error: null, messages }) });
+    expect(container.querySelectorAll(".thread-message")).toHaveLength(200);
+    expect(screen.getByRole("button", { name: "Show earlier messages (50 hidden)" })).toBeTruthy();
+  });
 });

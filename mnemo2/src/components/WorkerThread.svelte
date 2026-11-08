@@ -10,6 +10,7 @@
   import { onMount } from "svelte";
   import { actions } from "../lib/store";
   import { turnStartTimes } from "../lib/elapsed";
+  import { earlierEntriesLabel, ENTRY_WINDOW, windowEntries } from "../lib/entryWindow";
   import { createStickToBottom } from "../lib/stickToBottom";
   import { workerBox } from "../lib/workerComposer";
   import { workerPhaseLabel } from "../lib/workerActivity";
@@ -33,6 +34,11 @@
   /** Each tool call's turn start: its card shows how long the turn has run. */
   const turnStarts = $derived(turnStartTimes(worker.messages));
 
+  // A long thread keeps every message in state but only its newest window in
+  // the DOM; the button above the list grows the window on demand.
+  let entryLimit = $state(ENTRY_WINDOW);
+  const windowed = $derived(windowEntries(worker.messages, entryLimit));
+
   /** What this worker's box offers now: steer it, message it, or why it can't. */
   const box = $derived(workerBox(worker));
 
@@ -48,6 +54,7 @@
     if (id === lastWorkerId) return;
     lastWorkerId = id;
     reply = drafts.get(id) ?? "";
+    entryLimit = ENTRY_WINDOW;
     follow.reset();
   });
 
@@ -93,7 +100,10 @@
 </script>
 
 {#snippet threadMessages()}
-  {#each worker.messages as entry (entry.id)}
+  {#if windowed.hidden > 0}
+    <button type="button" class="earlier-entries" onclick={() => (entryLimit += ENTRY_WINDOW)}>{earlierEntriesLabel(windowed.hidden)}</button>
+  {/if}
+  {#each windowed.visible as entry (entry.id)}
     {#if entry.kind === "tool"}
       <div class="thread-tool"><ToolActivity {entry} turnStartedAtMs={turnStarts[entry.id]} /></div>
     {:else if entry.kind === "error"}
@@ -176,6 +186,8 @@
 </section>
 
 <style>
+  .earlier-entries { display: block; margin: 0 auto 12px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: var(--text-meta); }
+  .earlier-entries:hover { border-color: var(--line-strong); color: var(--ink-soft); }
   .thread-message > span { color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.07em; }
   .thread-message-body { margin: 5px 0 0; padding: 10px 12px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--ink-soft); }
   .thread-message-body :global(.markdown) { font-size: var(--text-body); line-height: 1.5; }

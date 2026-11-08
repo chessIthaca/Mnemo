@@ -4,6 +4,7 @@
   import { actions, app } from "../lib/store";
   import { createStickToBottom } from "../lib/stickToBottom";
   import { turnStartTimes } from "../lib/elapsed";
+  import { earlierEntriesLabel, ENTRY_WINDOW, windowEntries } from "../lib/entryWindow";
   import { workerStatusText } from "../lib/types";
   import { selectNeedsYouWorkers, selectRunningWorkers } from "../lib/workerSelection";
   import Composer from "./Composer.svelte";
@@ -36,6 +37,10 @@
   );
   /** Each tool call's turn start: its card shows how long the turn has run. */
   const turnStarts = $derived(turnStartTimes(entries));
+  // A long session keeps every entry in state but only its newest window in the
+  // DOM; the button above the list grows the window on demand.
+  let entryLimit = $state(ENTRY_WINDOW);
+  const windowed = $derived(windowEntries(entries, entryLimit));
 
   // The lead ends its turn while workers run; TeamManager wakes it when one
   // finishes. Say so, so an idle lead does not read as a stalled one.
@@ -97,11 +102,14 @@
     <div class="lead-content">
       <div class="lead-stream" bind:this={content}>
       <div class="lead-entries">
-        {#each entries as entry, index (entry.id)}
+        {#if windowed.hidden > 0}
+          <button type="button" class="earlier-entries" onclick={() => (entryLimit += ENTRY_WINDOW)}>{earlierEntriesLabel(windowed.hidden)}</button>
+        {/if}
+        {#each windowed.visible as entry, index (entry.id)}
           {#if entry.kind === "message"}
             <article
               class:user-entry={entry.author === "user"}
-              class:before-tool={entries[index + 1]?.kind === "tool"}
+              class:before-tool={windowed.visible[index + 1]?.kind === "tool"}
               class="chat-entry"
             >
               {#if entry.author === "lead"}
@@ -121,8 +129,8 @@
           {:else if entry.kind === "tool"}
             <div
               class="tool-activity-row"
-              class:tool-connected={entries[index + 1]?.kind === "tool"}
-              class:before-message={entries[index + 1]?.kind === "message"}
+              class:tool-connected={windowed.visible[index + 1]?.kind === "tool"}
+              class:before-message={windowed.visible[index + 1]?.kind === "message"}
             >
               <ToolActivity {entry} turnStartedAtMs={turnStarts[entry.id]} />
             </div>
@@ -231,6 +239,8 @@
   .lead-content { width: 100%; min-width: 0; margin: 0; padding: 22px 32px 18px; }
   .lead-stream { display: flow-root; min-width: 0; }
   .chat-entry { margin: 0 0 16px; }
+  .earlier-entries { display: block; margin: 0 auto 14px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: var(--text-meta); }
+  .earlier-entries:hover { border-color: var(--line-strong); color: var(--ink-soft); }
   /* A tool run reads as part of the message that started it: keep it close,
      then give the next message room to start fresh. */
   .chat-entry.before-tool:not(.user-entry) { margin-bottom: 6px; }

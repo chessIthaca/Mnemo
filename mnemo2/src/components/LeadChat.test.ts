@@ -846,4 +846,27 @@ describe("LeadChat", () => {
       expect(screen.queryByRole("textbox", { name: "Message the lead" })).toBeNull();
     });
   });
+
+  it("long conversations show the newest 200 entries", async () => {
+    await act(); // drain the project open from beforeEach: it resets the team
+    const entries: LeadEntry[] = Array.from({ length: 250 }, (_, index) => ({
+      id: `long-${index}`,
+      kind: "message",
+      author: "lead",
+      time: "now",
+      body: `Message ${index}`,
+    }));
+    setLeadEntries(entries);
+    const { container } = render(LeadChat);
+
+    expect(container.querySelectorAll(".chat-entry")).toHaveLength(200);
+    expect(screen.getByText("Message 50")).toBeTruthy();
+    expect(screen.queryByText("Message 49")).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Show earlier messages (50 hidden)" }));
+
+    expect(container.querySelectorAll(".chat-entry")).toHaveLength(250);
+    expect(screen.getByText("Message 0")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /earlier messages/ })).toBeNull();
+  });
 });

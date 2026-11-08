@@ -818,6 +818,22 @@ pub(crate) fn wire_brain(
                 ),
                 Err(e) => eprintln!("warning: git-state fact sweep failed: {e}"),
             }
+            // An old authored plan or review digest beside the same digest
+            // derived from its file makes the twin compete with the truth
+            // (plan 373dec00 step 12). Retired on the same recoverable terms
+            // and with its own one-line notifier, like the git-state sweep:
+            // the first run finds around 140 on this store, which is
+            // housekeeping, not a malformed-store alarm.
+            match crate::memory::integrity::quarantine_duplicate_digests(store_for_index.as_ref())
+                .await
+            {
+                Ok(ids) if ids.is_empty() => {}
+                Ok(ids) => eprintln!(
+                    "memory integrity: quarantined {} duplicate plan/review digest(s) beside their file",
+                    ids.len()
+                ),
+                Err(e) => eprintln!("warning: duplicate-digest sweep failed: {e}"),
+            }
             // The staleness pre-check decides whether the reconcile runs at
             // all. A failure here (store error, scan failure) degrades to
             // "run the index anyway" — the reconcile is the recovery path

@@ -1563,6 +1563,18 @@ impl MemoryStoreTrait for MemoryStore {
         // The live [memory] knobs (Phase 2): decay half-life, per-query cap,
         // and the derived per-class backstop — read per recall so a Settings
         // save takes effect without a restart.
+        //
+        // Timeless knowledge (plan 373dec00 step 11): a SPEC, DECISION, BUG or
+        // HOW record states something true until it is superseded, so age says
+        // nothing about it — it skips BOTH the strength decay and the
+        // staleness penalty. Without that exemption age is worth up to 0.55
+        // (0.3 decayed strength + 0.25 staleness) against a perfect semantic
+        // match's 0.35, so a durable record nobody happened to search for
+        // loses to an unrelated row touched today; the recall eval's title
+        // control (a record asked by its own title) reached the top 5 only 65%
+        // of the time before this. Session digests, plan and review digests and
+        // untyped facts still age — they are snapshots of a moment, and the
+        // staleness de-rank exists to sink exactly those.
         let search_config = self.memory_search_config();
         let decay_tau_secs = search_config.decay_half_life_days * 86_400.0;
         let q_lower = query.to_ascii_lowercase();
@@ -1620,8 +1632,24 @@ impl MemoryStoreTrait for MemoryStore {
                 } else {
                     0.0
                 };
-                let decayed_strength =
-                    strength::decay_with_tau(m.strength, now - m.last_accessed_at, decay_tau_secs);
+                // Durable knowledge does not age (the timeless note above):
+                // its write-time strength is the ranking signal, undecayed.
+                let timeless = matches!(
+                    m.record_type,
+                    MemoryRecordType::Spec
+                        | MemoryRecordType::Decision
+                        | MemoryRecordType::Bug
+                        | MemoryRecordType::How
+                );
+                let decayed_strength = if timeless {
+                    m.strength
+                } else {
+                    strength::decay_with_tau(
+                        m.strength,
+                        now - m.last_accessed_at,
+                        decay_tau_secs,
+                    )
+                };
                 // Tier weight: distilled tiers (semantic/procedural/episodic)
                 // outrank raw working-tier snapshots. Working is weighted 0 so
                 // it never outscores a distilled fact when both are present
@@ -1634,7 +1662,7 @@ impl MemoryStoreTrait for MemoryStore {
                 // mechanism; penalizing too would double-punish history.
                 let cw = Self::class_weight(m.record_class);
                 let age_days = (now - m.last_accessed_at).max(0) as f64 / 86_400.0;
-                let staleness_penalty = if age_days <= stale_grace_days {
+                let staleness_penalty = if timeless || age_days <= stale_grace_days {
                     0.0
                 } else {
                     STALE_PENALTY_MAX

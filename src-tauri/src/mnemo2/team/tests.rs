@@ -3171,6 +3171,10 @@ struct StubDispatchClassifier {
     answer: Option<mnemo::memory::Answer>,
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     delay: std::time::Duration,
+    /// `Some((first_gated_call, open))`: calls numbered `first_gated_call`
+    /// (1-based) and later wait until `open` reads true; earlier calls
+    /// answer at once. `None`: no call ever waits.
+    gate: Option<(usize, tokio::sync::watch::Receiver<bool>)>,
 }
 
 impl StubDispatchClassifier {
@@ -3179,11 +3183,25 @@ impl StubDispatchClassifier {
             answer,
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             delay: std::time::Duration::ZERO,
+            gate: None,
         }
     }
 
     fn slow(answer: Option<mnemo::memory::Answer>, delay: std::time::Duration) -> Self {
         Self { delay, ..Self::new(answer) }
+    }
+
+    /// A classifier whose calls from `first_gated_call` (1-based) on block
+    /// until the returned sender sends `true`; earlier calls answer at once.
+    fn gated(
+        answer: Option<mnemo::memory::Answer>,
+        first_gated_call: usize,
+    ) -> (Self, tokio::sync::watch::Sender<bool>) {
+        let (open, gate) = tokio::sync::watch::channel(false);
+        (
+            Self { gate: Some((first_gated_call, gate)), ..Self::new(answer) },
+            open,
+        )
     }
 
     fn calls(&self) -> usize {
@@ -3198,7 +3216,17 @@ impl mnemo::memory::Classifier for StubDispatchClassifier {
         _state: &str,
         _question: &mnemo::memory::Question,
     ) -> Option<mnemo::memory::Answer> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if let Some((first_gated_call, gate)) = &self.gate {
+            if call >= *first_gated_call {
+                let mut gate = gate.clone();
+                // A dropped sender also ends the wait: the test is over.
+                let _ = gate.wait_for(|open| *open).await;
+            }
+        }
         tokio::time::sleep(self.delay).await;
         self.answer.clone()
     }
@@ -3460,16 +3488,32 @@ fn tool_call_batch(call_id: &str, name: &str, args: &str) -> Vec<mnemo::provider
     ]
 }
 
+/// The nudge fixture with a stub classifier that answers `answer` after
+/// `delay`.
+async fn nudge_fixture_with(
+    settings: crate::mnemo2::dispatch_routing::RoutingSettings,
+    answer: Option<mnemo::memory::Answer>,
+    delay: std::time::Duration,
+    responses: Vec<Vec<mnemo::provider::LlmEvent>>,
+) -> (RoutingFixture, broadcast::Receiver<BoardSignal>) {
+    nudge_fixture_with_classifier(
+        settings,
+        StubDispatchClassifier::slow(answer, delay),
+        responses,
+    )
+    .await
+}
+
 /// The nudge tests' live team (design §4.6): the routing settings come
 /// from the config dir, all three tiers are in the catalog, and the
 /// worker sessions run real turns served by the scripted LLM — so the
 /// pump observes real tool results and the strike counter counts real
 /// failures. Returns the usual routing fixture plus a board-signal
 /// subscription taken before any dispatch, to catch nudge notices.
-async fn nudge_fixture_with(
+/// The caller builds the classifier (a gated one, say).
+async fn nudge_fixture_with_classifier(
     settings: crate::mnemo2::dispatch_routing::RoutingSettings,
-    answer: Option<mnemo::memory::Answer>,
-    delay: std::time::Duration,
+    classifier: StubDispatchClassifier,
     responses: Vec<Vec<mnemo::provider::LlmEvent>>,
 ) -> (RoutingFixture, broadcast::Receiver<BoardSignal>) {
     use crate::mnemo2::dispatch_routing::save_routing_settings;
@@ -3536,7 +3580,7 @@ async fn nudge_fixture_with(
         },
         Vec::new(),
     );
-    let classifier = std::sync::Arc::new(StubDispatchClassifier::slow(answer, delay));
+    let classifier = std::sync::Arc::new(classifier);
     let slot: mnemo::memory::classifier::ClassifierSlot =
         std::sync::Arc::new(std::sync::RwLock::new(Some(classifier.clone())));
     team.classifier = Some(slot);
@@ -4474,17 +4518,24 @@ async fn drift_message_nudges_when_laya_reads_it_harder() {
     fixture.team.shutdown().await;
 }
 
-/// Drift classification is detached: a slow Laya never delays the
-/// message, and the nudge still lands (design §4.6).
+/// Drift classification is detached: the message returns while Laya's
+/// drift answer is still held back, and the nudge lands once Laya answers
+/// (design §4.6). A gate, not a clock, holds Laya back, so machine load
+/// cannot fail the test.
 #[tokio::test]
 async fn drift_never_blocks_the_message() {
-    let (fixture, _notices) = nudge_fixture_with(
+    // Call 1 is the dispatch's deferred classification and answers at
+    // once; call 2 is the drift check and waits for the gate.
+    let (classifier, open_gate) = StubDispatchClassifier::gated(
+        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
+        2,
+    );
+    let (fixture, _notices) = nudge_fixture_with_classifier(
         crate::mnemo2::dispatch_routing::RoutingSettings {
             mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
             ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
         },
-        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.91),
-        std::time::Duration::from_secs(1),
+        classifier,
         vec![vec![
             mnemo::provider::LlmEvent::TextDelta { text: "done".to_string() },
             mnemo::provider::LlmEvent::Finish { reason: mnemo::provider::FinishReason::Stop },
@@ -4493,26 +4544,38 @@ async fn drift_never_blocks_the_message() {
     .await;
     let result = fixture.dispatch(Some("routine"), None).await;
     assert!(result.success, "{}", result.output);
-    // The dispatch's deferred classification holds the permit for the
-    // stub's delay; the drift classification below waits for it and
-    // still fits its own 3-second budget (1 s permit wait + 1 s ask).
     wait_worker_settled(&fixture.team, "routingworker").await;
-    let started = std::time::Instant::now();
-    fixture
-        .team
-        .message("routingworker", drift_message(), MessageSender::Lead)
-        .await
-        .expect("the message returns without waiting on Laya");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_millis(1_000),
-        "the message waited {elapsed:?} on drift classification"
-    );
+    // The dispatch's own classification has answered (its Route row is
+    // written after Laya replies), so the next classifier call is the
+    // drift check.
+    wait_route_row(&fixture).await;
     assert_eq!(
         fixture.classifier.calls(),
         1,
         "only the dispatch classified before the message"
     );
+    // While the gate is closed Laya cannot answer. A message that waited
+    // on drift classification would hang here, or let the drift check
+    // time out behind the closed gate so that no nudge lands below.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        fixture
+            .team
+            .message("routingworker", drift_message(), MessageSender::Lead),
+    )
+    .await
+    .expect("the message returned while Laya's drift answer was held back")
+    .expect("the message is delivered");
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| matches!(row, DispatchRoutingRow::Nudge { .. })),
+        "no nudge can land before Laya answers"
+    );
+    open_gate
+        .send(true)
+        .expect("the stub classifier still holds the gate");
     let row = eventually(|| async {
         fixture
             .rows()
@@ -4522,7 +4585,12 @@ async fn drift_never_blocks_the_message() {
     .await;
     assert!(
         matches!(&row, DispatchRoutingRow::Nudge { reason, .. } if reason == "drift"),
-        "the slow drift nudge still landed: {row:?}"
+        "the held-back drift nudge still landed: {row:?}"
+    );
+    assert_eq!(
+        fixture.classifier.calls(),
+        2,
+        "the dispatch and the drift check each asked Laya once"
     );
     fixture.team.shutdown().await;
 }

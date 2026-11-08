@@ -8,16 +8,13 @@ core-operations approval gate, bookkeeping tools never prompt, never resend a
 failed tool call, preserve line endings, final-summary length, the full
 test→review→fix→commit→finish closing sequence) are built into the app's
 compiled system prompt and apply to every project — they are NOT repeated here.
-This file holds only this project's policy: environment, language, and test
-command.
+This file holds this project's policy.
 
 ## Environment
 
-- This is a **Windows 11** machine. Use Windows paths
-  (`C:\AgenticCoder\AgenticCoder\src\...`) and PowerShell syntax for shell
-  commands — never Linux paths (`/c/AgenticCoder`) or bash syntax in the
-  `shell` tool.
-- The project root is `C:\AgenticCoder\AgenticCoder`.
+- This is a **Windows 11** machine. Use Windows paths and PowerShell syntax for
+  shell commands, never Linux paths or bash syntax in the `shell` tool. The
+  project root is the folder the session opened.
 - Never commit to `main` — commit to the current feature branch.
 <!-- mnemo:classic -->
 - `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase` — on `shell`, the `git` tool having no fetch/pull subcommand), then merges the branch — on repos WITHOUT a main-protection ruleset. Since 2026-09-21 this repo's `main` is protected by ruleset 23755694 (pull_request, required_approving_review_count: 1): the skill detects it up-front (`gh api .../rulesets`), pushes the working branch, opens a PR against `main`, reports the URL, and STOPS — the human approves and merges (the author cannot self-approve); never bypass (no force-push/admin/ruleset edits). The **Mnemo1 agent workflow** keeps the hard gate: `git` core operations (`merge`/`push`) performed by the agent MUST go through the approval-gated `git` tool, and a shell-invoked `git merge`/`push` is gated identically (`GitTool::never_auto_for` covers the tool path; since 2027-01-11 `ShellTool::never_auto_for` matches a `git` executable in a command position) — no unprompted run in Autonomous mode either way. **Mnemo2** is an application-level integration queue, not an Mnemo1 agent workflow; its scoped merge policy is in **Mnemo2 team merge policy** under Branch policy. The skill also writes its landing records BEFORE the final commit — never after the push (see the record-phrasing rule in Branch policy).
@@ -130,7 +127,6 @@ command.
 <!-- /mnemo:classic -->
 - `.coding/` is the mergeable side-car: knowledge files (`.coding/knowledge/`), plans, reviews, and `backlog.jsonl` (git union merge driver) travel with git and merge across instances; `memory.db`/`codegraph.db` (rebuildable caches) and `plans/stack.json` + `instance.json` (per-instance local state) are gitignored — never committed.
 - After a git merge, the memory index converges automatically at the next project open (startup reconciliation re-derives on content-hash drift); in-session, Settings → Memory → "Rebuild index from files".
-- Never commit to main — commit to the current feature branch.
 <!-- mnemo:classic -->
 - Parallel run-all (plan ffd7a86f) adds per-item worktree branches
   (`wt/runall-<item8>`, forked from main into `.worktrees/runall-<item8>`)
@@ -214,18 +210,7 @@ project-specific checks.
   (`Set-Content`/`Out-File`/`Add-Content`/`>>`/`sed -i`/`tee`/python scripts)
   in non-test, non-generated code where `file_edit`/`file_write` would work —
   and missing justification where a fallback was genuinely needed.
-- **Re-review rounds are delta-scoped (backlog 85313a7e).** Every reviewer
-  spawn carries a harness-rendered preamble: the verdict contract, the checks
-  above as one line each, and the `.coding/**` rule (an accuracy check in one
-  line — never a line review; generated/lockfile noise is out of scope). The
-  app stamps each round's base revision on the plan frame (`## Reviews` in
-  `.coding/plans/<id>.md`) and, from round 2 on, the preamble names that base,
-  the delta scope and the mechanically-derived changed file set —
-  so a re-review verifies the DELTA, not the whole tree. It narrows only when
-  verified work is committed: **commit code at step boundaries on `wt/*`** (the
-  closing sequence still commits last, with the report) so `git diff <base>` is
-  exactly the fix. Never hand-write the preamble or the scope — the spawn path
-  renders it, and re-writing it by hand only bloats the prompt.
+- **Reviewer mechanics** (delta-scoped re-reviews, read-only tool surface, a failed reviewer asks the user) are enforced by the app; details in docs/REVIEW-POLICY.md.
 - **Pre-flight self-check before ANY reviewer spawn.** Run this section's
   checklist against the diff yourself first — documentation sync, no
   `cfg(windows)`-only additions outside the sanctioned gate, file-tools-first,
@@ -234,19 +219,4 @@ project-specific checks.
   (plan febcd6f5 spent three rounds, ~33 min, on a 1-3 file fix). Keep the
   reviewer's `task` to scope + acceptance criteria + risk focus; the preamble
   already carries the boilerplate, and the reviewer can read the plan file.
-- **Reviewer tool surface + failed-reviewer protocol.** A `role:"reviewer"`
-  subagent is read-only by construction: reads + `git_read` (op `diff`/`log`/
-  `show`/`status`), `web_fetch`, the graph tools, memory/backlog **query** tools
-  + `write_review_report`. It cannot ask questions (`ask_user`), mutate memory
-  or backlog, run plan tools, or `finish`. **Reviewer-only authorship:** a
-  review report can only ever be authored by a spawned `role:"reviewer"`
-  agent — `write_review_report` is visible under no other filter, and
-  `.coding/reviews/` is protected from the file tools (the one residual is an
-  approval-gated `shell` call — the standing residual, as with
-  `.coding/plans/`), so the main agent can never write a review itself. If a reviewer fails **without writing a
-  report**, it is NOT done: never respawn it blindly — `ask_user` and let
-  the user choose (retry on another model / abandon the review).
-  `spawn_agent` refuses a blind reviewer respawn while a reviewer failure is
-  pending. An un-completable review is escaped via `abandon_plan` (returns
-  to Planning) — the main agent is never stuck in Reviewing.
 <!-- /mnemo:classic -->

@@ -80,7 +80,29 @@ impl TeamPersistence {
             .map_err(|err| format!("could not decode {}: {err}", path.display()))
     }
 
+    /// Remove temp files a crashed save left behind (`team.json.<pid>.<seq>.tmp`).
+    /// The name is unique per save, so only a crash leaves one; every `load`
+    /// caller holds `save_lock`, so no save of this process is in flight.
+    fn sweep_stale_temps(&self) {
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with("team.json.") && name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     pub(super) fn load(&self) -> Result<Option<PersistedTeam>, String> {
+        self.sweep_stale_temps();
         let backup = self.path.with_extension("json.bak");
         let loaded = match Self::decode(&self.path) {
             Ok(Some(team)) => Some((team, self.path.clone())),
@@ -166,13 +188,7 @@ impl TeamPersistence {
                 if backup.exists() {
                     let _ = retry_io(|| std::fs::rename(&backup, &self.path));
                 }
-                // A vanished temp means another writer already replaced the
-                // ledger with a consistent snapshot.
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(format!("could not replace the team ledger: {err}"))
-                }
+                Err(format!("could not replace the team ledger: {err}"))
             }
         }
     }

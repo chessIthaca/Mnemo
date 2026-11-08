@@ -357,6 +357,28 @@ fn ledger_saves_are_compact_json() {
     assert_eq!(loaded.workers[0].id, "00000004000000000004");
 }
 
+#[test]
+fn a_crash_leftover_temp_is_swept_on_load() {
+    // A crash mid-save leaves a uniquely-named temp (`team.json.<pid>.<seq>.tmp`)
+    // that no later save overwrites; load sweeps it before decoding.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![worker(root.path(), "00000005000000000005")],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("compact save");
+    let stale = dir.path().join("team.json.123.0.tmp");
+    std::fs::write(&stale, b"{\"workers\":[]}").expect("stale temp");
+    let loaded = persistence.load().expect("load").expect("some ledger");
+    assert!(!stale.exists(), "the crash-leftover temp is swept on load");
+    assert_eq!(loaded.workers.len(), 1);
+    assert_eq!(loaded.workers[0].id, "00000005000000000005");
+}
+
 #[tokio::test]
 async fn usage_reports_reach_the_ledger_within_the_flush_delay() {
     // Regression (PERF-2): every usage report used to rewrite the whole

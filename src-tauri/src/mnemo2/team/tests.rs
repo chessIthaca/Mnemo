@@ -4142,6 +4142,28 @@ async fn legacy_completed_audit_counts_as_finished() {
     team.shutdown().await;
 }
 
+/// A finished audit waits on nobody, so the session-start summary must not count it. An implementation worker awaiting review and an audit that failed before reporting still wait on the lead.
+#[tokio::test]
+async fn external_summary_does_not_count_finished_audits() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let mut finished = worker(root.path(), "auditworker1");
+    finished.kind = "audit".to_string();
+    finished.status = WorkerStatus::Completed;
+    finished.report_delivered = true;
+    let mut reviewing = worker(root.path(), "implworker01");
+    reviewing.status = WorkerStatus::Completed;
+    let mut failed_audit = worker(root.path(), "auditworker2");
+    failed_audit.kind = "audit".to_string();
+    failed_audit.status = WorkerStatus::Failed;
+    let team = open_test_team(root.path(), state.path(), vec![finished, reviewing, failed_audit]).await;
+    let summary = team.external_summary().await;
+    assert!(summary.contains("2 waiting on you"), "{summary}");
+    assert!(summary.contains("3 total"), "{summary}");
+    team.shutdown().await;
+}
+
 /// A model switch appends the new spec once: `models_used` is the order the
 /// worker ran in, without consecutive duplicates (plan 40eef714 step 4).
 #[tokio::test]

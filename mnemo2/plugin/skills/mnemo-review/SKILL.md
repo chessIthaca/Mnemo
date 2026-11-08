@@ -72,8 +72,8 @@ Finish with a short report to the user: what merged, what the checks showed, wha
 
 ## 8. Record what the work established
 
-After each merge, write what the work taught the project to Mnemo's memory, not only to the user — the `team_merge` result ends with a reminder line:
+After each merge, write what the work taught the project to Mnemo's memory, not only to the user — the `team_merge` result ends with one memory line (the nudge, or a reminder):
 
-- `memory_write` the durable facts with a typed title: `SPEC:` how the feature now works, `DECISION:` a choice and its rationale, `HOW:` a recurring workflow. Keep each record compact and pointer-first, and leave out plan IDs, branch names and commit hashes — a record carrying them is a plan-scoped note, retired at plan close, and does not satisfy the close gate.
-- While you are the attached lead, an `implementation` or `research` plan cannot close until such a record was written, amended or superseded after the plan was created, so record with the merge instead of waiting for the "cannot close yet" notice. A `bug_fixing` plan captures its `BUG:` record automatically at close; check that the captured record tells the truth (symptom, root cause, fix, regression test) and `memory_update` it if it does not.
+- `memory_write` the durable facts with a typed title: `SPEC:` how the feature now works, `DECISION:` a choice and its rationale, `HOW:` a recurring workflow. Keep each record compact and pointer-first, and leave out plan IDs, branch names and commit hashes — a record carrying them is a plan-scoped note, retired at plan close, and does not count as durable knowledge.
+- While you are the attached lead, an `implementation` or `research` plan closes with or without a new durable record, and its close result nudges you when none was written, amended or superseded since the plan was created — so record what the repository cannot show with the merge, and skip the write if the work taught nothing durable. A `bug_fixing` plan captures its `BUG:` record automatically at close; check that the captured record tells the truth (symptom, root cause, fix, regression test) and `memory_update` it if it does not.
 - A merge that makes a stored fact wrong calls for `memory_supersede`, never a second live record. `memory_update` refines a still-current record; `memory_amend` appends a dated amendment.

@@ -269,14 +269,16 @@ pub async fn require_clean(root: &Path, label: &str) -> Result<(), String> {
 
 /// The bookkeeping the lead keeps in the project, shared with Mnemo1: plan
 /// files (`.coding/plans/`), the closing team review reports
-/// (`.coding/reviews/`), memory knowledge records (`.coding/knowledge/`), and
-/// OpenSpec current-state specs and archives (`.coding/openspec/`), all
-/// committed with the lead's own work.
-const LEAD_BOOKKEEPING_PREFIXES: [&str; 4] = [
+/// (`.coding/reviews/`), memory knowledge records (`.coding/knowledge/`),
+/// OpenSpec current-state specs and archives (`.coding/openspec/`), and Laya's
+/// dispatch routing learnings bundle (`.coding/laya/`), all committed with the
+/// lead's own work.
+const LEAD_BOOKKEEPING_PREFIXES: [&str; 5] = [
     ".coding/plans/",
     ".coding/reviews/",
     ".coding/knowledge/",
     ".coding/openspec/",
+    ".coding/laya/",
 ];
 
 fn is_lead_bookkeeping(path: &str) -> bool {
@@ -805,5 +807,10 @@ mod tests {
         validate_review_evidence(&linked, true).expect("audited evidence passes");
         // The base contract never demands the audit fields.
         validate_review_evidence(&evidence(), false).expect("standard evidence passes");
+    }
+
+    #[test]
+    fn the_learnings_bundle_is_lead_bookkeeping() {
+        assert!(is_lead_bookkeeping(".coding/laya/dispatch_routing.jsonl"));
     }
 }

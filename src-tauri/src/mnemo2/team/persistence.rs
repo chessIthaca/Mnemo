@@ -31,9 +31,10 @@ pub(super) const LEDGER_FLUSH_DELAY: std::time::Duration = std::time::Duration::
 /// worker: `<worker_id>.json`.
 pub(super) const TRANSCRIPTS_DIR: &str = "transcripts";
 /// How old a save temp file must be before a sweep removes it: two
-/// [`TeamPersistence`] instances can share one state dir (a test runs a second
-/// runtime on the same one), so a young temp may belong to a save that is
-/// between its write and its rename right now.
+/// [`TeamPersistence`] instances can share one state dir - "Open anyway"
+/// attaches a second instance to the same project, and a test can run a second
+/// runtime on it - so a young temp may belong to a save that is between its
+/// write and its rename right now.
 const TEMP_SWEEP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The persisted team ledger.
@@ -117,7 +118,8 @@ impl TeamPersistence {
     /// Remove temp files a crashed save left behind (`team.json.<pid>.<seq>.tmp`).
     /// The name is unique per save, so only a crash leaves one; a young one may
     /// belong to a save running right now in another [`TeamPersistence`] over
-    /// the same state dir, so it is left alone.
+    /// the same state dir ("Open anyway" lets two instances share a project),
+    /// so it is left alone.
     fn sweep_stale_temps(&self) {
         let Some(parent) = self.path.parent() else {
             return;
@@ -140,7 +142,13 @@ impl TeamPersistence {
     /// embedded copy. A missing file is a ledger written before transcripts
     /// moved out: the embedded transcript stays, and is not recorded, so the
     /// next save writes the file and strips `team.json`.
-    fn attach_transcripts(&self, team: &mut PersistedTeam) {
+    ///
+    /// A file that cannot be read fails the load: `team.json` keeps only a
+    /// placeholder, so the save that follows a load would erase the worker's
+    /// conversation with it. A file that reads but does not decode is kept
+    /// aside as `<id>.json.corrupt` - its bytes are never destroyed - logged,
+    /// and rewritten by the next save.
+    fn attach_transcripts(&self, team: &mut PersistedTeam) -> Result<(), String> {
         for worker in &mut team.workers {
             let Some(file) = self.transcript_file(&worker.id) else {
                 continue;
@@ -148,22 +156,29 @@ impl TeamPersistence {
             if !file.exists() {
                 continue;
             }
-            match read_transcript(&file) {
+            let bytes = retry_io(|| std::fs::read(&file)).map_err(|err| {
+                format!("could not read the transcript for {}: {err}", worker.id)
+            })?;
+            match serde_json::from_slice(&bytes) {
                 Ok(transcript) => {
                     worker.transcript = Arc::new(transcript);
                     self.written_guard()
                         .insert(worker.id.clone(), worker.transcript.clone());
                 }
                 Err(error) => {
-                    // The embedded copy stands, and the next save rewrites the
-                    // file from it (the id is deliberately not recorded).
+                    let kept = corrupt_path(&file);
                     eprintln!(
-                        "team: transcript for {} could not be read: {error}",
-                        worker.id
+                        "team: transcript for {} could not be decoded ({error}); kept as {}",
+                        worker.id,
+                        kept.display()
                     );
+                    let _ = retry_io(|| std::fs::rename(&file, &kept));
+                    // The embedded copy stands, unrecorded, so the next save
+                    // writes a valid file.
                 }
             }
         }
+        Ok(())
     }
 
     pub(super) fn load(&self) -> Result<Option<PersistedTeam>, String> {
@@ -187,7 +202,7 @@ impl TeamPersistence {
         };
         // Before the conversion save below: writing first would overwrite the
         // newer transcript files of a legacy ledger with empty placeholders.
-        self.attach_transcripts(&mut team);
+        self.attach_transcripts(&mut team)?;
         if convert_legacy_team_tiers(&mut team) {
             let pre_tiers = self.path.with_file_name(TEAM_PRE_TIERS_BACKUP);
             if !pre_tiers.exists() {
@@ -258,28 +273,37 @@ impl TeamPersistence {
     /// conversation. A worker with no transcript file keeps its transcript in
     /// `team.json` and is skipped.
     fn write_transcripts(&self, team: &PersistedTeam) -> Result<(), String> {
-        let mut pending: Vec<(String, PathBuf, Arc<Transcript>)> = Vec::new();
-        {
+        // Under the lock, only compare the `Arc`s; the per-worker stat and the
+        // writes happen with it released.
+        let same_arc: HashSet<String> = {
             let written = self.written_guard();
-            for worker in &team.workers {
-                let Some(file) = self.transcript_file(&worker.id) else {
-                    continue;
-                };
-                let recorded = written
-                    .get(&worker.id)
-                    .is_some_and(|known| Arc::ptr_eq(known, &worker.transcript));
-                if recorded && file.exists() {
-                    continue;
-                }
-                pending.push((worker.id.clone(), file, worker.transcript.clone()));
+            team.workers
+                .iter()
+                .filter(|worker| {
+                    written
+                        .get(&worker.id)
+                        .is_some_and(|known| Arc::ptr_eq(known, &worker.transcript))
+                })
+                .map(|worker| worker.id.clone())
+                .collect()
+        };
+        let mut pending: Vec<(String, PathBuf, Arc<Transcript>)> = Vec::new();
+        for worker in &team.workers {
+            let Some(file) = self.transcript_file(&worker.id) else {
+                continue;
+            };
+            if same_arc.contains(&worker.id) && file.exists() {
+                continue;
             }
+            pending.push((worker.id.clone(), file, worker.transcript.clone()));
         }
         for (id, file, transcript) in pending {
             let bytes = serde_json::to_vec(&*transcript)
                 .map_err(|err| format!("could not encode the transcript for {id}: {err}"))?;
             // A temp name unique per write, as for `team.json`: two
-            // `TeamPersistence` instances can share one state dir (a test runs
-            // a second runtime on the same one), so a shared temp name would
+            // `TeamPersistence` instances can share one state dir ("Open
+            // anyway" attaches a second instance to one project), and between
+            // them `team.json` stays last-writer-wins; a shared temp name would
             // let one saver consume the other's temp and fail its rename.
             let temp = file.with_extension(format!(
                 "json.{}.{}.tmp",
@@ -318,49 +342,51 @@ impl TeamPersistence {
         }
     }
 
-    /// Delete the transcript files of workers the ledger no longer holds, plus
-    /// the temp files a crashed transcript write left behind.
+    /// Delete the transcript files of the workers this instance removed from the
+    /// ledger, plus the aged temp files a crashed write left behind.
+    ///
+    /// Only files this instance wrote are candidates: another instance can share
+    /// the state dir ("Open anyway" attaches a second instance to one project),
+    /// so an unknown `<id>.json` belongs to that instance's worker and is never
+    /// touched. A crash can leave such a file behind, which is harmless - a
+    /// later dispatch of that id rewrites it.
     fn sweep_orphan_transcripts(&self, team: &PersistedTeam) {
+        let known: HashSet<&str> = team
+            .workers
+            .iter()
+            .map(|worker| worker.id.as_str())
+            .collect();
+        let removed: Vec<String> = {
+            let mut written = self.written_guard();
+            let gone: Vec<String> = written
+                .keys()
+                .filter(|id| !known.contains(id.as_str()))
+                .cloned()
+                .collect();
+            for id in &gone {
+                written.remove(id);
+            }
+            gone
+        };
+        for id in removed {
+            if let Some(file) = self.transcript_file(&id) {
+                let _ = std::fs::remove_file(&file);
+            }
+        }
         let Some(dir) = self.transcripts_dir() else {
             return;
         };
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };
-        let known: HashSet<String> = team
-            .workers
-            .iter()
-            .map(|worker| worker.id.clone())
-            .collect();
-        let mut orphans = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if name.ends_with(".tmp") {
-                // A leftover temp of a crashed write. A young one may belong to
-                // a save running right now, so it is left alone.
-                if !is_young(&entry) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-                continue;
+            if name.ends_with(".tmp") && !is_young(&entry) {
+                let _ = std::fs::remove_file(entry.path());
             }
-            let Some(stem) = name.strip_suffix(".json") else {
-                continue;
-            };
-            if known.contains(stem) {
-                continue;
-            }
-            let _ = std::fs::remove_file(entry.path());
-            orphans.push(stem.to_string());
-        }
-        if orphans.is_empty() {
-            return;
-        }
-        let mut written = self.written_guard();
-        for id in orphans {
-            written.remove(&id);
         }
     }
 
@@ -374,7 +400,8 @@ impl TeamPersistence {
 }
 
 /// Whether a directory entry is too fresh to sweep: a save running in another
-/// [`TeamPersistence`] over the same state dir may own it right now.
+/// [`TeamPersistence`] over the same state dir - "Open anyway" attaches a
+/// second instance to one project - may own it right now.
 fn is_young(entry: &std::fs::DirEntry) -> bool {
     entry
         .metadata()
@@ -383,10 +410,10 @@ fn is_young(entry: &std::fs::DirEntry) -> bool {
         .unwrap_or(true)
 }
 
-/// Read and decode one worker's transcript file.
-fn read_transcript(path: &std::path::Path) -> Result<Transcript, String> {
-    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
-    serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+/// Where a transcript that failed to decode is kept: its bytes are never
+/// destroyed, and an earlier copy is replaced.
+fn corrupt_path(file: &std::path::Path) -> PathBuf {
+    file.with_extension("json.corrupt")
 }
 
 /// Windows can transiently deny a rename or remove while an indexer, an

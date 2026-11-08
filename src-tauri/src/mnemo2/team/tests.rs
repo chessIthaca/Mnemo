@@ -828,7 +828,45 @@ fn a_removed_worker_loses_its_transcript_file() {
 }
 
 #[test]
-fn an_unreadable_transcript_file_keeps_the_embedded_one() {
+fn a_transcript_this_instance_never_knew_survives_a_save() {
+    // Two instances can share a state dir ("Open anyway"), so an unknown
+    // `<id>.json` belongs to the other instance's worker, not to an orphan this
+    // instance may delete.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    let mut mine = worker(root.path(), "keepmine01");
+    mine.transcript = transcript_of(&["mine"]);
+    let team = PersistedTeam {
+        workers: vec![mine],
+        slots: Some(4),
+        usage: ProjectUsage::default(),
+    };
+    persistence.save(&team).expect("first save");
+    let transcripts = dir.path().join(TRANSCRIPTS_DIR);
+    let theirs = transcripts.join("otherinst1.json");
+    let bytes = serde_json::to_vec(&Transcript {
+        messages: vec![mnemo::provider::Message::text(
+            mnemo::provider::Role::User,
+            "theirs",
+        )],
+    })
+    .expect("their transcript JSON");
+    std::fs::write(&theirs, &bytes).expect("another instance's transcript");
+
+    persistence.save(&team).expect("second save");
+    assert_eq!(
+        std::fs::read(&theirs).expect("their transcript survives"),
+        bytes,
+        "a transcript this instance never wrote is left alone"
+    );
+    assert!(transcripts.join("keepmine01.json").exists());
+}
+
+#[test]
+fn a_corrupt_transcript_file_keeps_the_embedded_one() {
+    // Decode failure only: the bytes are damaged, so the file is kept aside as
+    // `.corrupt` and the embedded transcript stands until the next save.
     let dir = tempfile::tempdir().expect("ledger dir");
     let root = tempfile::tempdir().expect("workspace");
     let mut record = worker(root.path(), "broken0001");
@@ -853,13 +891,90 @@ fn an_unreadable_transcript_file_keeps_the_embedded_one() {
     assert_eq!(
         loaded.workers[0].transcript.messages.len(),
         1,
-        "an unreadable file keeps the embedded transcript"
+        "a corrupt file keeps the embedded transcript"
+    );
+    assert_eq!(
+        std::fs::read(transcripts.join("broken0001.json.corrupt")).expect("the kept bytes"),
+        b"not json".to_vec(),
+        "the damaged bytes are kept aside, not destroyed"
     );
 
     persistence.save(&loaded).expect("repairing save");
     let stored: Transcript = serde_json::from_slice(&std::fs::read(&file).expect("repaired file"))
         .expect("valid transcript file");
     assert_eq!(stored.messages.len(), 1);
+}
+
+#[test]
+fn a_corrupt_transcript_is_kept_aside() {
+    // A current-format ledger holds only a placeholder, so a damaged file must
+    // not be dropped: it is renamed aside and the next save writes valid JSON.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let ledger = PersistedTeam {
+        workers: vec![worker(root.path(), "damaged001")],
+        slots: Some(4),
+        usage: ProjectUsage::default(),
+    };
+    std::fs::write(
+        dir.path().join(TEAM_STATE_FILE),
+        serde_json::to_vec(&ledger).expect("ledger JSON"),
+    )
+    .expect("write the ledger");
+    let transcripts = dir.path().join(TRANSCRIPTS_DIR);
+    std::fs::create_dir_all(&transcripts).expect("transcripts dir");
+    let file = transcripts.join("damaged001.json");
+    std::fs::write(&file, "not json").expect("corrupt transcript file");
+
+    let persistence = TeamPersistence::new(dir.path());
+    let loaded = persistence.load().expect("load").expect("some ledger");
+    assert_eq!(
+        loaded.workers[0].transcript.messages.len(),
+        0,
+        "the placeholder stands"
+    );
+    let kept = transcripts.join("damaged001.json.corrupt");
+    assert_eq!(
+        std::fs::read(&kept).expect("the kept bytes"),
+        b"not json".to_vec()
+    );
+    assert!(!file.exists(), "the damaged file is moved aside");
+
+    persistence.save(&loaded).expect("repairing save");
+    let stored: Transcript = serde_json::from_slice(&std::fs::read(&file).expect("rewritten file"))
+        .expect("valid transcript file");
+    assert_eq!(stored.messages.len(), 0);
+}
+
+#[test]
+fn a_transcript_read_failure_refuses_to_load() {
+    // A read that does not succeed must fail the load: the ledger holds only a
+    // placeholder, so the save that follows an open would erase the
+    // conversation with it.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    let mut record = worker(root.path(), "denied0001");
+    record.transcript = transcript_of(&["first"]);
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![record],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("first save");
+    let file = dir.path().join(TRANSCRIPTS_DIR).join("denied0001.json");
+    std::fs::remove_file(&file).expect("remove the transcript file");
+    std::fs::create_dir(&file).expect("make the transcript path unreadable");
+
+    let error = TeamPersistence::new(dir.path())
+        .load()
+        .expect_err("the load refuses to continue");
+    assert!(
+        error.contains("denied0001"),
+        "the failure names the worker: {error}"
+    );
+    assert!(file.is_dir(), "the unreadable path is left untouched");
 }
 
 #[test]
@@ -926,13 +1041,16 @@ fn a_failed_transcript_write_leaves_the_ledger_untouched() {
         before,
         "team.json is not replaced when a transcript write fails"
     );
+    // Unblock the path first: an unreadable transcript correctly refuses a load.
+    std::fs::remove_dir(&file).expect("unblock the transcript path");
     assert_eq!(
         TeamPersistence::new(dir.path())
             .load()
             .expect("load")
             .expect("some ledger")
             .slots,
-        Some(4)
+        Some(4),
+        "the previous ledger still stands"
     );
 }
 

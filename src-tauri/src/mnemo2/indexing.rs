@@ -274,6 +274,9 @@ impl IndexingTracker {
                 return;
             };
             let root = engine.workspace_root().to_path_buf();
+            // The UI only shows a pass it saw running, so the check enters as
+            // Running and leaves as Done: the counts ride the finished line.
+            tracker.update(health_running);
             let counts = match mnemo::memory::health::run(store.as_ref(), &root).await {
                 Ok(report) => report.summary(),
                 Err(e) => {
@@ -282,24 +285,7 @@ impl IndexingTracker {
                 }
             };
             let detail = format!("{HEALTH_PREFIX}{counts}");
-            tracker.update(|snapshot| match snapshot.memory.as_mut() {
-                Some(pass) => {
-                    pass.detail = Some(match pass.detail.take() {
-                        Some(existing) if !existing.is_empty() => format!("{existing} · {detail}"),
-                        _ => detail,
-                    });
-                }
-                // An in-sync reconcile stays silent; the check's counts are
-                // still worth the line.
-                None => {
-                    snapshot.memory = Some(IndexPass {
-                        state: PassState::Done,
-                        done: 0,
-                        total: 0,
-                        detail: Some(detail),
-                    });
-                }
-            });
+            tracker.update(|snapshot| health_done(snapshot, detail));
         })
     }
 
@@ -378,6 +364,53 @@ impl IndexingTracker {
             .drain(..)
         {
             task.abort();
+        }
+    }
+}
+
+/// Flip the Memory status line to Running while the memory check runs.
+///
+/// The UI only shows a pass it saw running (`IndexingStatus.svelte`), so a
+/// check that only ever wrote `Done` would be invisible on an in-sync open.
+/// An existing pass keeps its own detail; [`health_done`] appends to it.
+fn health_running(snapshot: &mut IndexingSnapshot) {
+    match snapshot.memory.as_mut() {
+        Some(pass) => {
+            pass.state = PassState::Running;
+            pass.done = 0;
+            pass.total = 0;
+        }
+        None => {
+            snapshot.memory = Some(IndexPass {
+                state: PassState::Running,
+                done: 0,
+                total: 0,
+                detail: None,
+            });
+        }
+    }
+}
+
+/// Close the Memory status line with the check's counts joined onto the pass's
+/// own detail (` · `), so the finished item's title carries them. A failed
+/// check still ends `Done` with `health: failed — …`: it is advisory, and must
+/// not read "Memory update failed".
+fn health_done(snapshot: &mut IndexingSnapshot, detail: String) {
+    match snapshot.memory.as_mut() {
+        Some(pass) => {
+            pass.state = PassState::Done;
+            pass.detail = Some(match pass.detail.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing} · {detail}"),
+                _ => detail,
+            });
+        }
+        None => {
+            snapshot.memory = Some(IndexPass {
+                state: PassState::Done,
+                done: 0,
+                total: 0,
+                detail: Some(detail),
+            });
         }
     }
 }
@@ -490,5 +523,45 @@ mod tests {
         assert_eq!(after.laya.map(|pass| pass.state), Some(PassState::Running));
         tracker.clear_laya();
         assert_eq!(tracker.snapshot().laya, None);
+    }
+
+    #[test]
+    fn the_health_pass_shows_running_then_done_with_its_counts() {
+        // An in-sync reconcile leaves no Memory pass at all: the check's line
+        // must still appear, running first and then done with the counts.
+        let mut snapshot = IndexingSnapshot::default();
+        health_running(&mut snapshot);
+        let pass = snapshot.memory.clone().expect("running memory pass");
+        assert_eq!(pass.state, PassState::Running);
+        assert_eq!((pass.done, pass.total), (0, 0));
+        health_done(&mut snapshot, "health: 3 records cite missing paths".into());
+        let pass = snapshot.memory.clone().expect("done memory pass");
+        assert_eq!(pass.state, PassState::Done);
+        assert_eq!(
+            pass.detail.as_deref(),
+            Some("health: 3 records cite missing paths")
+        );
+
+        // After a reconcile the pass's own summary survives, joined with ` · `.
+        let mut snapshot = IndexingSnapshot {
+            memory: Some(IndexPass {
+                state: PassState::Done,
+                done: 7,
+                total: 7,
+                detail: Some("derived index in sync".into()),
+            }),
+            ..IndexingSnapshot::default()
+        };
+        health_running(&mut snapshot);
+        let pass = snapshot.memory.clone().expect("running");
+        assert_eq!(pass.state, PassState::Running);
+        assert_eq!(pass.detail.as_deref(), Some("derived index in sync"));
+        health_done(&mut snapshot, "health: 0 records cite missing paths".into());
+        let pass = snapshot.memory.expect("done");
+        assert_eq!(pass.state, PassState::Done);
+        assert_eq!(
+            pass.detail.as_deref(),
+            Some("derived index in sync · health: 0 records cite missing paths")
+        );
     }
 }

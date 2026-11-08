@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::memory::indexer::knowledge_id;
-use crate::memory::knowledge::{self, KnowledgeLink, KnowledgeLinkKind, KnowledgeRecord};
+use crate::memory::knowledge::{self, KnowledgeLink, KnowledgeLinkKind, KnowledgeRecord, KnowledgeStatus};
 use crate::memory::types::{Memory, MemoryFilter, MemoryRecordType, MemoryTier};
 use crate::memory::MemoryStoreTrait;
 use crate::project::agent_md::{Constitution, ConstitutionScope};
@@ -280,11 +280,26 @@ fn scan(root: &Path, rows: &[Memory], git: &dyn GitProbe) -> Scan {
     let citation_re = Regex::new(CITATION_PATTERN).expect("the citation pattern is a fixed regex");
     let url_re = Regex::new(URL_PATTERN).expect("the URL pattern is a fixed regex");
 
-    // Every record's citations, sorted and deduped (an empty body costs one
-    // regex scan and yields nothing).
-    let cited: Vec<(String, Vec<String>)> = records
+    // Superseded files are history: never reported, never stamped — but they
+    // still resolve a `[[link]]` (see `link_names`).
+    let live: Vec<usize> = records
         .iter()
-        .map(|(rel, record)| (rel.clone(), extract_citations(&citation_re, &url_re, &record.body)))
+        .enumerate()
+        .filter(|(_, (_, record))| record.status != KnowledgeStatus::Superseded)
+        .map(|(index, _)| index)
+        .collect();
+
+    // Every live record's citations, sorted and deduped (an empty body costs
+    // one regex scan and yields nothing).
+    let cited: Vec<(String, Vec<String>)> = live
+        .iter()
+        .map(|&index| {
+            let (rel, record) = &records[index];
+            (
+                rel.clone(),
+                extract_citations(&citation_re, &url_re, &record.body),
+            )
+        })
         .collect();
 
     // The distinct missing paths, resolved once per pass.
@@ -320,13 +335,19 @@ fn scan(root: &Path, rows: &[Memory], git: &dyn GitProbe) -> Scan {
             moved,
         });
     }
-    // A record that no longer cites a missing path loses its stale stamp.
+    // A record that no longer cites a missing path loses its stale stamp. A
+    // superseded record is history: it is left exactly as it is.
     let affected: BTreeSet<&str> = stale_paths.iter().map(|s| s.rel_path.as_str()).collect();
+    let superseded: BTreeSet<&str> = records
+        .iter()
+        .filter(|(_, record)| record.status == KnowledgeStatus::Superseded)
+        .map(|(rel, _)| rel.as_str())
+        .collect();
     for row in rows {
         let Some(rel) = row.data.get("rel_path").and_then(|value| value.as_str()) else {
             continue;
         };
-        if affected.contains(rel) {
+        if affected.contains(rel) || superseded.contains(rel) {
             continue;
         }
         if row.data.get(MOVED_PATHS_KEY).is_some() {
@@ -334,11 +355,17 @@ fn scan(root: &Path, rows: &[Memory], git: &dyn GitProbe) -> Scan {
         }
     }
 
-    // Wiki-links that resolve to nothing.
+    // Wiki-links that resolve to nothing. Only real link shapes count here:
+    // TOML array headers (`[[bin]]`, `[[patch.unused]]`) and word mentions
+    // (`[[links]]`) look like links to `extract_links` but never name a record.
     let names = link_names(&records, rows);
     let mut unresolved: BTreeSet<(String, String)> = BTreeSet::new();
-    for (rel, record) in &records {
+    for &index in &live {
+        let (rel, record) = &records[index];
         for link in &record.links {
+            if !looks_like_link_target(&link.target) {
+                continue;
+            }
             if !link_resolves(root, &knowledge_dir, &names, link) {
                 unresolved.insert((rel.clone(), link.target.clone()));
             }
@@ -369,14 +396,6 @@ fn scan(root: &Path, rows: &[Memory], git: &dyn GitProbe) -> Scan {
     } else {
         false
     };
-    // The report and the cache are generated per checkout: keep them out of
-    // `git status` through the repository's local `info/exclude` (the same
-    // best-effort mechanism the app uses for its other caches), so a
-    // clean-tree merge gate never trips on them.
-    if report_written || cache_written {
-        ensure_excluded(root, git);
-    }
-
 
     Scan {
         report: HealthReport {
@@ -471,6 +490,10 @@ fn resolve_missing_paths(
     let mut state = load_state(state_path);
     let mut changed = false;
     let mut resolved = BTreeMap::new();
+    // One git failure ends the lookups for this pass: a non-git project must
+    // not spawn once per path on every open, and a transient failure must not
+    // be cached as "gone".
+    let mut git_failed = false;
     for path in missing {
         match state.resolved.get(path) {
             // A cached new home holds while it still exists on disk.
@@ -486,52 +509,81 @@ fn resolve_missing_paths(
             // Uncached, or the cached home has vanished: resolve again.
             _ => {}
         }
-        let to = resolve_missing(root, git, path);
-        if state.resolved.get(path) != Some(&to) {
-            state.resolved.insert(path.clone(), to.clone());
-            changed = true;
+        if git_failed {
+            // Unknown for this pass — reported gone, never cached: the next
+            // pass tries again.
+            resolved.insert(path.clone(), None);
+            continue;
         }
-        resolved.insert(path.clone(), to);
+        match resolve_missing(root, git, path) {
+            Resolved::Answered(to) => {
+                if state.resolved.get(path) != Some(&to) {
+                    state.resolved.insert(path.clone(), to.clone());
+                    changed = true;
+                }
+                resolved.insert(path.clone(), to);
+            }
+            Resolved::Failed => {
+                git_failed = true;
+                resolved.insert(path.clone(), None);
+            }
+        }
     }
     let written = changed && write_state(state_path, &state);
     (resolved, written)
 }
 
+/// One rename lookup's answer. A git failure is [`Resolved::Failed`], never
+/// "gone": an unknown path must not be cached as a dead end for every later
+/// pass.
+enum Resolved {
+    /// The path's new home, or `None` when it was deleted outright.
+    Answered(Option<String>),
+    /// Git could not answer (binary missing, a lock, a timeout, not a repo).
+    Failed,
+}
+
 /// Follow one missing path to its new home: the commit that deleted it, then
 /// that commit's rename entry. A chain (`a → b → c`) is followed up to
-/// [`MAX_RENAME_HOPS`]. `None` means gone.
-fn resolve_missing(root: &Path, git: &dyn GitProbe, path: &str) -> Option<String> {
+/// [`MAX_RENAME_HOPS`]. `Answered(None)` means gone; [`Resolved::Failed`] means
+/// git could not answer.
+fn resolve_missing(root: &Path, git: &dyn GitProbe, path: &str) -> Resolved {
     let mut current = path.to_string();
     for _ in 0..MAX_RENAME_HOPS {
         if root.join(&current).exists() {
-            return Some(current);
+            return Resolved::Answered(Some(current));
         }
-        let deleted = git
-            .run(
-                root,
-                &["log", "-1", "--diff-filter=D", "--format=%H", "--", &current],
-            )
-            .ok()?;
+        let deleted = match git.run(
+            root,
+            &["log", "-1", "--diff-filter=D", "--format=%H", "--", &current],
+        ) {
+            Ok(output) => output,
+            Err(_) => return Resolved::Failed,
+        };
         let commit = deleted.trim();
         if commit.is_empty() {
-            return None;
+            return Resolved::Answered(None);
         }
-        let diff = git
-            .run(
-                root,
-                &[
-                    "diff-tree",
-                    "-r",
-                    "-M",
-                    "--name-status",
-                    "--no-commit-id",
-                    commit,
-                ],
-            )
-            .ok()?;
-        current = rename_target(&diff, &current)?;
+        let diff = match git.run(
+            root,
+            &[
+                "diff-tree",
+                "-r",
+                "-M",
+                "--name-status",
+                "--no-commit-id",
+                commit,
+            ],
+        ) {
+            Ok(output) => output,
+            Err(_) => return Resolved::Failed,
+        };
+        match rename_target(&diff, &current) {
+            Some(next) => current = next,
+            None => return Resolved::Answered(None),
+        }
     }
-    root.join(&current).exists().then_some(current)
+    Resolved::Answered(root.join(&current).exists().then_some(current))
 }
 
 /// The `to` side of the rename entry for `from` in a `--name-status` diff.
@@ -601,42 +653,28 @@ fn write_if_changed(path: &Path, text: &str) -> bool {
     std::fs::write(path, text).is_ok()
 }
 
-/// Keep the generated report and the rename cache out of `git status` without
-/// touching a tracked file: append them to the repository's local
-/// `.git/info/exclude` — the same best-effort mechanism the app already uses
-/// for `memory.db`, `codegraph.db` and its other caches, so a clean-tree merge
-/// gate never trips on generated files. A project that is not a git checkout,
-/// or an unwritable exclude file, is left alone; the pass still reports.
-fn ensure_excluded(root: &Path, git: &dyn GitProbe) {
-    let Ok(reported) = git.run(root, &["rev-parse", "--git-path", "info/exclude"]) else {
-        return;
-    };
-    let reported = reported.trim();
-    if reported.is_empty() {
-        return;
-    }
-    let exclude = root.join(reported);
-    let current = std::fs::read_to_string(&exclude).unwrap_or_default();
-    let missing: Vec<&str> = [REPORT_REL_PATH, STATE_REL_PATH]
-        .into_iter()
-        .filter(|entry| !current.lines().any(|line| line.trim() == *entry))
-        .collect();
-    if missing.is_empty() {
-        return;
-    }
-    let mut next = current;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str("# Mnemo's generated memory check report (plan 373dec00 step 5)\n");
-    for entry in missing {
-        next.push_str(entry);
-        next.push('\n');
-    }
-    if let Some(parent) = exclude.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&exclude, next);
+
+/// Whether a `[[target]]` is a real link shape for the health check: a path
+/// (`decision/…`, `src/…`) or a bare knowledge slug (`2026-08-23-…`). TOML
+/// array headers (`[[bin]]`, `[[patch.unused]]`) and word mentions
+/// (`[[links]]`) are not links — `extract_links` cannot tell them apart, so
+/// the check filters here. `extract_links` itself is left alone: its output
+/// feeds the row data the wiki-link surface resolves.
+fn looks_like_link_target(target: &str) -> bool {
+    let target = target.trim();
+    target.contains('/') || starts_with_date(target)
+}
+
+/// `YYYY-MM-DD-…` — a bare knowledge slug.
+fn starts_with_date(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    bytes.len() >= 11
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'-'
 }
 
 /// The names a `[[link]]` may match by name alone: every knowledge file stem
@@ -671,7 +709,8 @@ fn link_resolves(
     if target.is_empty() {
         return true;
     }
-    let named = |name: &str| names.contains(&normalize_title(name));
+    let named =
+        |name: &str| names.contains(&name.to_lowercase()) || names.contains(&normalize_title(name));
     match link.kind {
         KnowledgeLinkKind::Knowledge => {
             knowledge_dir.join(format!("{target}.md")).is_file()
@@ -696,10 +735,23 @@ fn link_resolves(
 }
 
 /// Live typed semantic records grouped by record type and normalized title.
+///
+/// Only the authored knowledge classes (SPEC / DECISION / BUG / HOW) are
+/// listed: plan and review digests are generated from files nobody can
+/// supersede, and on the live store they made 141 of 143 groups — enough to
+/// hide the one real collision.
 fn duplicate_titles(rows: &[Memory]) -> Vec<DuplicateTitle> {
     let mut groups: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
     for row in rows {
-        if row.tier != MemoryTier::Semantic || row.record_type == MemoryRecordType::None {
+        if row.tier != MemoryTier::Semantic
+            || !matches!(
+                row.record_type,
+                MemoryRecordType::Spec
+                    | MemoryRecordType::Decision
+                    | MemoryRecordType::Bug
+                    | MemoryRecordType::How
+            )
+        {
             continue;
         }
         if row.superseded_by.is_some() || row.quarantined.is_some() {
@@ -1142,21 +1194,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_superseded_record_is_not_reported() {
+        let project = Project::new();
+        let store = make_store();
+        project.write("src/gone.rs", "fn gone() {}\n");
+        project.commit_all("add gone");
+        project.git(&["rm", "--quiet", "src/gone.rs"]);
+        project.commit_all("delete gone");
+
+        // History: a superseded record is never listed, stamped or reported.
+        let superseded = "decision/2026-01-01-old.md";
+        project.write(
+            &format!(".coding/knowledge/{superseded}"),
+            "+++\ntitle = \"old\"\nstatus = \"superseded\"\n+++\n\nSee `src/gone.rs`.",
+        );
+        project.seed_row(&store, superseded, "DECISION: old").await;
+        // ...but its slug still resolves a link.
+        project.record(
+            "how/2026-11-08-linking.md",
+            "linking",
+            "See [[2026-01-01-old]].",
+        );
+
+        let report = run(store.as_ref(), project.root()).await.expect("health pass");
+        assert!(report.stale_paths.is_empty(), "{report:?}");
+        assert!(report.unresolved_links.is_empty(), "{report:?}");
+        let row = store
+            .get_memory(&knowledge_id(superseded))
+            .await
+            .unwrap()
+            .expect("row");
+        assert!(row.data.get(MOVED_PATHS_KEY).is_none(), "{:?}", row.data);
+    }
+
+    #[tokio::test]
     async fn an_unresolved_link_is_listed() {
         let project = Project::new();
         let store = make_store();
         project.record("decision/2026-11-08-known.md", "known record", "no citations");
-        // Resolves by file path, and by bare title.
+        // A path-shaped link that resolves to a file.
         project.record(
             "how/2026-11-08-linking.md",
             "linking",
-            "See [[decision/2026-11-08-known]] and [[known record]].",
+            "See [[decision/2026-11-08-known]].",
         );
-        // One target matches nothing: a file that does not exist.
+        // One path-shaped target matches nothing: a record that does not exist.
         project.record(
             "how/2026-11-08-broken.md",
             "broken",
-            "See [[decision/2026-11-08-absent]].",
+            "See [[spec/no-such-record]].",
         );
 
         let report = run(store.as_ref(), project.root()).await.expect("health pass");
@@ -1164,9 +1250,24 @@ mod tests {
             report.unresolved_links,
             vec![UnresolvedLink {
                 rel_path: "how/2026-11-08-broken.md".into(),
-                target: "decision/2026-11-08-absent".into(),
+                target: "spec/no-such-record".into(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn toml_headers_are_not_links() {
+        let project = Project::new();
+        let store = make_store();
+        // Shapes taken from this repo's Cargo.toml: `extract_links` reads each
+        // of them as a wiki-link target, but none names a knowledge record.
+        project.record(
+            "how/2026-11-08-toml.md",
+            "toml shapes",
+            "Cargo sections: [[bin]], [[patch.unused]] and [[tier]].",
+        );
+        let report = run(store.as_ref(), project.root()).await.expect("health pass");
+        assert!(report.unresolved_links.is_empty(), "{report:?}");
     }
 
     #[tokio::test]
@@ -1193,6 +1294,21 @@ mod tests {
             )
             .await
             .unwrap();
+        // Plan digests are not listed: nobody can supersede a generated row.
+        project
+            .seed_row(
+                &store,
+                ".coding/plans/373dec00.md",
+                "PLAN: Memory that earns its place",
+            )
+            .await;
+        project
+            .seed_row(
+                &store,
+                ".coding/plans/99999999.md",
+                "PLAN: Memory that earns its place",
+            )
+            .await;
 
         let report = run(store.as_ref(), project.root()).await.expect("health pass");
         assert_eq!(report.duplicate_titles.len(), 1, "{report:?}");
@@ -1320,6 +1436,48 @@ mod tests {
             .expect("row");
         assert_eq!(row_after.data, row_before.data);
         assert_eq!(store.version(), version_before);
+    }
+
+    /// A probe that always fails: a machine without git, or a transient error.
+    struct FailingGit;
+
+    impl GitProbe for FailingGit {
+        fn run(&self, _root: &Path, _args: &[&str]) -> std::result::Result<String, String> {
+            Err("git is unavailable".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_git_failure_is_not_cached_as_gone() {
+        let project = Project::new();
+        let store = make_store();
+        project.write("src/old.rs", "fn old() {}\n");
+        project.commit_all("add old");
+        project.git(&["mv", "src/old.rs", "src/new.rs"]);
+        project.commit_all("rename");
+        let rel = project.record(
+            "decision/2026-11-08-retry.md",
+            "retry",
+            "See `src/old.rs`.",
+        );
+        project.seed_row(&store, &rel, "DECISION: retry").await;
+
+        let failed = run_with_git(store.as_ref(), project.root(), Arc::new(FailingGit))
+            .await
+            .expect("first pass");
+        assert_eq!(failed.stale_paths.len(), 1, "{failed:?}");
+        assert_eq!(
+            failed.stale_paths[0].moved[0].to, None,
+            "an unknown path reads as gone for this pass"
+        );
+        assert!(!failed.cache_written, "a git failure is never cached");
+        let state =
+            std::fs::read_to_string(project.root().join(STATE_REL_PATH)).unwrap_or_default();
+        assert!(!state.contains("src/old.rs"), "not cached as gone: {state}");
+
+        // Git is back: the next pass finds the new home.
+        let ok = run(store.as_ref(), project.root()).await.expect("second pass");
+        assert_eq!(ok.stale_paths[0].moved[0].to, Some("src/new.rs".into()));
     }
 
     #[test]

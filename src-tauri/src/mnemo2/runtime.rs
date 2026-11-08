@@ -1758,11 +1758,17 @@ fn ignore_project_caches(root: &Path) {
     }
     let exclude = root.join(reported);
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
-    // The one-time knowledge migration marker is also per-machine state.
+    // The one-time knowledge migration marker is also per-machine state; so
+    // are the memory check pass's report and its rename cache (plan 373dec00
+    // step 5) — generated per checkout, never committed.
     let missing: Vec<&str> = mnemo::project::scaffold::MANAGED_GITIGNORE_ENTRIES
         .iter()
         .copied()
-        .chain([".coding/knowledge/.migration-*"])
+        .chain([
+            ".coding/knowledge/.migration-*",
+            ".coding/knowledge/HEALTH.md",
+            ".coding/knowledge/.health-state.json",
+        ])
         .filter(|entry| !current.lines().any(|line| line.trim() == *entry))
         .collect();
     if missing.is_empty() {

@@ -1741,6 +1741,50 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Merge-time checkout and branch cleanup is not specified by any capability under .coding/openspec/specs (dispatch-routing, external-lead, tier-ladder and worker-brief govern routing, the external lead, tiers and briefs; a search of all specs finds no mention of checkout, worktree or cleanup). The plan only adds a retry of an existing best-effort cleanup in src-tauri/src/mnemo2/team.rs."
+    },
+    {
+      "id": "2b1e9c1b",
+      "status": "closed",
+      "created_at_ms": 1794083796586,
+      "closed_at_ms": 1794084958076,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-2b1e9c1b-20261107-205558.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only and documentation changes: tests/boundary.rs, a test in mnemo2/mod.rs and two spec Purpose lines. No specified behavior changes."
+    },
+    {
+      "id": "e7a6d30a",
+      "status": "closed",
+      "created_at_ms": 1794084015718,
+      "closed_at_ms": 1794085522060,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e7a6d30a-20261107-210522.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Pure test-code move within one file group; no specified behavior, governed file or spec changes."
+    },
+    {
+      "id": "42953435",
+      "status": "closed",
+      "created_at_ms": 1794084269311,
+      "closed_at_ms": 1794096156466,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-42953435-20261108-000236.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Pure code move: team.rs is split into child modules with identical behavior; no requirement of dispatch-routing, external-lead, tier-ladder or worker-brief changes. Step 8 updates the governed-files map so the same gate keeps covering the moved code."
+    },
+    {
+      "id": "fe45dea4",
+      "status": "closed",
+      "created_at_ms": 1794084782172,
+      "closed_at_ms": 1794091216232,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-fe45dea4-20261107-224016.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Frontend-only refactor of an ungoverned module (mnemo2/src/lib/store.ts is not in any capability's governed_files); no specified behavior changes."
     }
   ]
 }

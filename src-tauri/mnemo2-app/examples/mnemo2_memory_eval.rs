@@ -10,8 +10,10 @@
 //! `-shm` sidecars) into a temp directory, opens the COPY with the app's
 //! configured embedder, and asks every question of the shipped hand set
 //! (`mnemo_app::mnemo2::memory_eval::EVAL_CASES_JSONL`) through the app's own
-//! non-bumping recall path (`recall_peek`, default filter, limit 12). It prints
-//! the score and writes `<coding>/analysis/memory_eval.json`.
+//! non-bumping recall path (`recall_peek`, default filter, limit 12). Two
+//! passes run: the paraphrased questions, and a title control that asks each
+//! one as the record's own title. It prints both scores and the miss list, and
+//! writes `<coding>/tmp/memory_eval.json`.
 //!
 //! The live store is never opened for writing — it is only read for the copy.
 //! This is deliberately NOT part of CI: it needs the local store.
@@ -23,7 +25,7 @@
 //! ```
 //!
 //! `--coding` defaults to the repository root's `.coding` side-car; `--out`
-//! defaults to `<coding>/analysis/memory_eval.json`.
+//! defaults to `<coding>/tmp/memory_eval.json` (under the gitignored tmp dir).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -32,8 +34,8 @@ use mnemo::config::{self, Config};
 use mnemo::memory::{EmbedderStatus, MemoryFilter, MemoryStore, MemoryStoreTrait};
 use mnemo::provider::client_factory::build_embedder;
 use mnemo_app::mnemo2::memory_eval::{
-    hit_from_memory, knowledge_stem, load_fixture, matching_rank, save_record, score_run,
-    EvalCase, EvalHit, EvalRecord, HIT_LIMIT,
+    control_cases, hit_from_memory, load_fixture, misses, save_record, score_run,
+    summarize_misses, EvalCase, EvalHit, EvalRecord, EvalScore, Miss, MissSummary, HIT_LIMIT,
 };
 use mnemo_app::mnemo2::route_eval::today_utc;
 
@@ -41,14 +43,15 @@ const USAGE: &str = "\
 mnemo2_memory_eval — the memory recall eval (plan 373dec00, step 1)
 
 Copies a project's memory store into a temp dir, opens the copy with the app's
-configured embedder, and scores the shipped question set through recall_peek.
+configured embedder, and scores the shipped question set through recall_peek —
+once as written (paraphrased) and once with each record's own title (control).
 
 Usage:
   cargo run --example mnemo2_memory_eval -- [--coding <dir>] [--out <file>]
 
   --coding <dir>   the project's .coding side-car (default: <repo>/.coding)
   --out <file>     where to write the eval record
-                   (default: <coding>/analysis/memory_eval.json)
+                   (default: <coding>/tmp/memory_eval.json)
   -h, --help       show this text";
 
 #[tokio::main]
@@ -95,28 +98,23 @@ async fn main() -> Result<(), String> {
     // per-query caps, derived backstop) are part of the retrieval result.
     store.set_memory_search_config(config.general.memory.clone());
 
-    let mut results: Vec<Vec<EvalHit>> = Vec::with_capacity(cases.len());
-    for case in &cases {
-        let hits = store
-            .recall_peek(&case.query, &MemoryFilter::new().limit(HIT_LIMIT))
-            .await
-            .map_err(|error| format!("recall failed for {:?}: {error}", case.query))?;
-        results.push(hits.iter().map(|scored| hit_from_memory(&scored.memory)).collect());
-    }
-
+    // Pass 1 — the paraphrased questions, as a user would ask them.
+    let results = run_pass(&store, &cases).await?;
     let score = score_run(&cases, &results);
-    println!(
-        "\n{} questions — hit@1 {:.3}   hit@5 {:.3}   MRR {:.3}   noise@5 {:.3}",
-        cases.len(),
-        score.hit_at_1,
-        score.hit_at_5,
-        score.mrr,
-        score.noise_at_5
-    );
-    for (kind, (hit_at_5, mrr)) in &score.per_kind {
-        println!("  {kind:<9} hit@5 {hit_at_5:.3}   MRR {mrr:.3}");
-    }
-    print_misses(&cases, &results);
+
+    // Pass 2 — the title control: the same expectations asked with each
+    // record's own title. A working harness and store score this near 1.0;
+    // only then does a low paraphrased score mean weak recall.
+    let control = control_cases(&cases, &options.coding.join("knowledge"))?;
+    let control_results = run_pass(&store, &control).await?;
+    let control_score = score_run(&control, &control_results);
+
+    println!("\n{} questions", cases.len());
+    print_score("paraphrased", &score);
+    print_score("title_control", &control_score);
+
+    let miss_list = misses(&cases, &results);
+    print_misses(&miss_list, &summarize_misses(&miss_list));
 
     let project_root = options
         .coding
@@ -127,6 +125,8 @@ async fn main() -> Result<(), String> {
         date: today_utc(),
         commit: git_head(&project_root),
         score,
+        control: control_score,
+        misses: miss_list,
     };
     save_record(&options.out, &record)?;
     println!("\nrecord: {}", options.out.display());
@@ -161,7 +161,7 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>, String> {
     let coding = coding.unwrap_or_else(|| {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(".coding")
     });
-    let out = out.unwrap_or_else(|| coding.join("analysis").join("memory_eval.json"));
+    let out = out.unwrap_or_else(|| coding.join("tmp").join("memory_eval.json"));
     Ok(Some(Options { coding, out }))
 }
 
@@ -187,28 +187,60 @@ fn copy_store(coding: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Print every question whose expected record missed the top five, with the
-/// hit that did come first — the review aid for the next memory step.
-fn print_misses(cases: &[EvalCase], results: &[Vec<EvalHit>]) {
-    let mut misses = 0usize;
-    for (index, case) in cases.iter().enumerate() {
-        let hits = results.get(index).map(Vec::as_slice).unwrap_or(&[]);
-        if matching_rank(case, hits).is_some_and(|rank| rank <= 5) {
-            continue;
-        }
-        misses += 1;
-        let top = hits
+/// Run one pass (a case set) through the app's non-bumping recall path.
+async fn run_pass(store: &MemoryStore, cases: &[EvalCase]) -> Result<Vec<Vec<EvalHit>>, String> {
+    let mut results = Vec::with_capacity(cases.len());
+    for case in cases {
+        let hits = store
+            .recall_peek(&case.query, &MemoryFilter::new().limit(HIT_LIMIT))
+            .await
+            .map_err(|error| format!("recall failed for {:?}: {error}", case.query))?;
+        results.push(hits.iter().map(|scored| hit_from_memory(&scored.memory)).collect());
+    }
+    Ok(results)
+}
+
+/// Print one pass's overall score and its per-kind `(hit@5, MRR)` rows.
+fn print_score(label: &str, score: &EvalScore) {
+    println!(
+        "{label:<13} hit@1 {:.3}   hit@5 {:.3}   MRR {:.3}   noise@5 {:.3}",
+        score.hit_at_1, score.hit_at_5, score.mrr, score.noise_at_5
+    );
+    for (kind, (hit_at_5, mrr)) in &score.per_kind {
+        println!("  {kind:<9} hit@5 {hit_at_5:.3}   MRR {mrr:.3}");
+    }
+}
+
+/// Print the miss list and its one-line summary — the review aid for the next
+/// memory step.
+fn print_misses(misses: &[Miss], summary: &MissSummary) {
+    for miss in misses {
+        let top = miss
+            .top
             .first()
             .map(|hit| {
-                let stem = hit.path.as_deref().and_then(knowledge_stem).unwrap_or("<no file>");
-                format!("{stem} — {}", hit.title)
+                format!(
+                    "{} [{}, {}{}]",
+                    hit.title,
+                    hit.tier,
+                    hit.class,
+                    if hit.noise { ", noise" } else { "" }
+                )
             })
             .unwrap_or_else(|| "<no hits>".to_string());
-        println!("  miss [{}] {} -> {}", case.kind, case.query, top);
+        let rank = match miss.rank {
+            Some(rank) => format!("expected at rank {rank}"),
+            None => "expected absent from all 12".to_string(),
+        };
+        println!("  miss {} -> {top} ({rank})", miss.query);
     }
-    if misses == 0 {
+    if misses.is_empty() {
         println!("  no misses in the top five");
     }
+    println!(
+        "  misses: {} — absent from all 12: {} — noise in their top-5 slots: {}/{}",
+        summary.misses, summary.absent_from_all, summary.noise_slots, summary.top_slots
+    );
 }
 
 /// The measured project's HEAD, so the record names the tree it describes.

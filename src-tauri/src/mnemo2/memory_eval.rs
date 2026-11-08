@@ -12,6 +12,14 @@
 //! part of CI: it needs the local store (`.coding/memory.db`, gitignored).
 //! The CLI lives in `src-tauri/mnemo2-app/examples/mnemo2_memory_eval.rs`.
 //!
+//! Two passes run in one process: the **paraphrased** set, and a **title
+//! control** that asks each question as the record's own title
+//! ([`control_cases`]). A working harness and store should score the control
+//! near 1.0; only then does a low paraphrased score mean weak recall instead
+//! of a broken harness. The record keeps both ([`EvalRecord::score`] /
+//! [`EvalRecord::control`]) and lists what recall returned on every
+//! paraphrased miss ([`EvalRecord::misses`]).
+//!
 //! Metric definitions (all ratios over the question set):
 //! - `hit_at_1` — the first hit is one of the question's expected records.
 //! - `hit_at_5` — one of the first five hits is. This is the metric later
@@ -31,6 +39,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use mnemo::memory::knowledge::parse_file;
 use mnemo::memory::{Memory, MemoryRecordType};
 
 /// The shipped question set. The fixture format (one JSON object per line,
@@ -69,6 +78,8 @@ pub struct EvalHit {
     /// relative to `.coding/knowledge/`), when the hit is a knowledge-row
     /// digest.
     pub path: Option<String>,
+    /// The memory tier (`semantic`, `episodic`, `working`, …).
+    pub tier: String,
     /// The memory title (carries the typed-record prefix on typed rows).
     pub title: String,
     /// The head of the memory body — enough to spot a synthetic session row.
@@ -93,16 +104,65 @@ pub struct EvalScore {
     pub per_kind: BTreeMap<String, (f64, f64)>,
 }
 
-/// The record the CLI writes to `.coding/analysis/memory_eval.json`: which tree
-/// was measured, when, and what the run scored.
+/// The record the CLI writes (by default to `<coding>/tmp/memory_eval.json`,
+/// gitignored): which tree was measured, when, the paraphrased score, the
+/// title-control score, and what recall returned on every paraphrased miss.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvalRecord {
     /// The run's UTC date (`YYYY-MM-DD`).
     pub date: String,
     /// The git commit checked out in the measured project (HEAD at run time).
     pub commit: String,
-    /// The score the run produced.
+    /// The paraphrased question set's score — unchanged shape.
     pub score: EvalScore,
+    /// The title-control pass's score: each question asked as the record's own
+    /// title. A working harness and store should score near 1.0.
+    pub control: EvalScore,
+    /// Every paraphrased question without an expected record in its top five,
+    /// with what recall did return.
+    pub misses: Vec<Miss>,
+}
+
+/// One hit of a miss report, reduced for the record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissHit {
+    /// The memory title.
+    pub title: String,
+    /// The memory tier.
+    pub tier: String,
+    /// The memory's provenance class (`authored` / `derived`).
+    pub class: String,
+    /// Whether the hit counts as noise (see [`is_noise`]).
+    pub noise: bool,
+}
+
+/// Why a paraphrased question missed: the first hits recall returned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Miss {
+    /// The paraphrased question.
+    #[serde(rename = "q")]
+    pub query: String,
+    /// The knowledge stems the question was written from.
+    pub expect: Vec<String>,
+    /// Up to five hits that came first.
+    pub top: Vec<MissHit>,
+    /// 1-based rank of the first expected record anywhere in the returned
+    /// list, when it was returned at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<usize>,
+}
+
+/// The miss list's one-line summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissSummary {
+    /// How many questions missed the top five.
+    pub misses: usize,
+    /// How many of those never returned their expected record at all.
+    pub absent_from_all: usize,
+    /// How many of the misses' top-five slots were noise.
+    pub noise_slots: usize,
+    /// How many top-five slots the misses produced in total.
+    pub top_slots: usize,
 }
 
 /// Score one eval run. `results[i]` is the ranked hit list for `cases[i]`;
@@ -213,6 +273,7 @@ pub fn is_noise(hit: &EvalHit) -> bool {
 pub fn hit_from_memory(memory: &Memory) -> EvalHit {
     EvalHit {
         path: knowledge_rel(memory),
+        tier: memory.tier.as_str().to_string(),
         title: memory.title.clone(),
         content_head: content_head(&memory.content),
         class: memory.record_class.as_str().to_string(),
@@ -232,6 +293,89 @@ fn knowledge_rel(memory: &Memory) -> Option<String> {
 /// The first [`CONTENT_HEAD_CHARS`] characters of a memory body.
 fn content_head(content: &str) -> String {
     content.chars().take(CONTENT_HEAD_CHARS).collect()
+}
+
+/// Build the title-control cases: for each fixture case, the same expected
+/// stem, asked with the record's own title instead of the paraphrase.
+///
+/// The title is read through the app's knowledge parser (`parse_file`), so it
+/// is exactly the digest's source title — the `title` front-matter line, with
+/// the same fallbacks the indexer uses. A missing record or unreadable title
+/// is an error: the control must cover every question, never silently shrink.
+pub fn control_cases(cases: &[EvalCase], knowledge_root: &Path) -> Result<Vec<EvalCase>, String> {
+    let mut control = Vec::with_capacity(cases.len());
+    for case in cases {
+        let mut built = None;
+        for stem in &case.expect {
+            let rel_path = format!("{}/{stem}.md", case.kind);
+            let path = knowledge_root.join(&case.kind).join(format!("{stem}.md"));
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let record = parse_file(&rel_path, &contents)
+                .ok_or_else(|| format!("{} is not a knowledge record", path.display()))?;
+            if !record.title.trim().is_empty() {
+                built = Some(EvalCase {
+                    query: record.title,
+                    expect: vec![stem.clone()],
+                    kind: case.kind.clone(),
+                });
+                break;
+            }
+        }
+        control.push(
+            built.ok_or_else(|| format!("no readable record title for question {:?}", case.query))?,
+        );
+    }
+    Ok(control)
+}
+
+/// Every paraphrased case without an expected record in its top five, with
+/// what recall did return. Pure — the review aid for the next memory step.
+pub fn misses(cases: &[EvalCase], results: &[Vec<EvalHit>]) -> Vec<Miss> {
+    let mut misses = Vec::new();
+    for (index, case) in cases.iter().enumerate() {
+        let hits = results.get(index).map(Vec::as_slice).unwrap_or(&[]);
+        let rank = matching_rank(case, hits);
+        if rank.is_some_and(|rank| rank <= 5) {
+            continue;
+        }
+        let top = hits
+            .iter()
+            .take(5)
+            .map(|hit| MissHit {
+                title: hit.title.clone(),
+                tier: hit.tier.clone(),
+                class: hit.class.clone(),
+                noise: is_noise(hit),
+            })
+            .collect();
+        misses.push(Miss {
+            query: case.query.clone(),
+            expect: case.expect.clone(),
+            top,
+            rank,
+        });
+    }
+    misses
+}
+
+/// Summarize a miss list: how many expected records never appeared in the
+/// returned list at all, and how noisy the misses' own top-five slots were.
+pub fn summarize_misses(misses: &[Miss]) -> MissSummary {
+    let mut summary = MissSummary {
+        misses: misses.len(),
+        absent_from_all: 0,
+        noise_slots: 0,
+        top_slots: 0,
+    };
+    for miss in misses {
+        if miss.rank.is_none() {
+            summary.absent_from_all += 1;
+        }
+        summary.top_slots += miss.top.len();
+        summary.noise_slots += miss.top.iter().filter(|hit| hit.noise).count();
+    }
+    summary
 }
 
 /// Parse a fixture file: one JSON object per line; blank lines and `#`
@@ -270,7 +414,7 @@ pub fn load_fixture() -> Result<Vec<EvalCase>, String> {
     parse_fixture(EVAL_CASES_JSONL)
 }
 
-/// Write the eval record, creating the analysis directory.
+/// Write the eval record, creating the parent directory.
 pub fn save_record(path: &Path, record: &EvalRecord) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -298,6 +442,7 @@ mod tests {
     fn hit(title: &str, path: Option<&str>, content_head: &str) -> EvalHit {
         EvalHit {
             path: path.map(str::to_string),
+            tier: "semantic".to_string(),
             title: title.to_string(),
             content_head: content_head.to_string(),
             class: "derived".to_string(),
@@ -422,5 +567,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn control_questions_use_the_record_title() {
+        let dir = tempfile::tempdir().expect("a temp knowledge root");
+        std::fs::create_dir_all(dir.path().join("bug")).expect("bug dir");
+        std::fs::create_dir_all(dir.path().join("how")).expect("how dir");
+        std::fs::write(
+            dir.path().join("bug/trace-locks.md"),
+            "+++\ntitle = \"trace locks are taken in the wrong order\"\ncreated = \"2026-08-22\"\n+++\n\nBody text that must not become the query.\n",
+        )
+        .expect("the bug record writes");
+        std::fs::write(
+            dir.path().join("how/retry-the-fix.md"),
+            "+++\ntitle = \"retry the fix commit, not the working tree\"\n+++\n\nBody text.\n",
+        )
+        .expect("the how record writes");
+
+        let cases = vec![
+            case("why does the window freeze?", &["trace-locks"], "bug"),
+            case("what should the second pass review?", &["retry-the-fix"], "how"),
+        ];
+        let control = control_cases(&cases, dir.path()).expect("the control builds");
+
+        assert_eq!(control.len(), cases.len());
+        assert_eq!(control[0].query, "trace locks are taken in the wrong order");
+        assert_eq!(control[0].expect, vec!["trace-locks".to_string()]);
+        assert_eq!(control[0].kind, "bug");
+        assert_eq!(control[1].query, "retry the fix commit, not the working tree");
+        assert_eq!(control[1].kind, "how");
+        // A missing record must fail loudly, not silently shrink the control.
+        let missing = vec![case("q", &["does-not-exist"], "bug")];
+        assert!(control_cases(&missing, dir.path()).is_err());
+    }
+
+    #[test]
+    fn misses_list_what_was_returned() {
+        let cases = vec![
+            case("hit", &["alpha"], "bug"),
+            case("late", &["beta"], "bug"),
+            case("absent", &["gamma"], "spec"),
+        ];
+        let results = vec![
+            vec![hit("BUG: alpha", Some("bug/alpha.md"), "")],
+            // No expected record in the top five; beta appears at rank 7.
+            vec![
+                hit("a plain fact", None, ""),
+                hit("BUG: wrapped", None, "Session involved 2 tool calls."),
+                hit("BUG: other", Some("bug/other.md"), ""),
+                hit("HOW: something", Some("how/x.md"), ""),
+                hit("REVIEW: r", Some("review/x.md"), ""),
+                hit("BUG: b6", Some("bug/b6.md"), ""),
+                hit("BUG: beta", Some("bug/beta.md"), ""),
+            ],
+            // The expected record never appears at all.
+            vec![
+                hit("BUG: x", Some("bug/x.md"), ""),
+                hit("a plain fact", None, ""),
+            ],
+        ];
+
+        let misses = misses(&cases, &results);
+        assert_eq!(misses.len(), 2);
+        assert_eq!(misses[0].query, "late");
+        assert_eq!(misses[0].expect, vec!["beta".to_string()]);
+        assert_eq!(misses[0].top.len(), 5);
+        assert_eq!(misses[0].top[0].title, "a plain fact");
+        assert!(misses[0].top[0].noise);
+        assert!(misses[0].top[1].noise);
+        assert!(!misses[0].top[2].noise);
+        assert_eq!(misses[0].top[2].tier, "semantic");
+        assert_eq!(misses[0].top[2].class, "derived");
+        assert_eq!(misses[0].rank, Some(7));
+        assert_eq!(misses[1].query, "absent");
+        assert_eq!(misses[1].top.len(), 2);
+        assert_eq!(misses[1].rank, None);
+
+        let summary = summarize_misses(&misses);
+        assert_eq!(summary.misses, 2);
+        assert_eq!(summary.absent_from_all, 1);
+        assert_eq!(summary.top_slots, 7);
+        assert_eq!(summary.noise_slots, 3);
     }
 }

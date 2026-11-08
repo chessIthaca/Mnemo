@@ -372,9 +372,12 @@ impl IndexingTracker {
 ///
 /// The UI only shows a pass it saw running (`IndexingStatus.svelte`), so a
 /// check that only ever wrote `Done` would be invisible on an in-sync open.
-/// An existing pass keeps its own detail; [`health_done`] appends to it.
+/// An existing pass keeps its own detail; [`health_done`] appends to it. A
+/// FAILED reconcile is left untouched: the window shows its detail as the
+/// error's title, and an advisory check must never hide it.
 fn health_running(snapshot: &mut IndexingSnapshot) {
     match snapshot.memory.as_mut() {
+        Some(pass) if pass.state == PassState::Failed => {}
         Some(pass) => {
             pass.state = PassState::Running;
             pass.done = 0;
@@ -393,10 +396,12 @@ fn health_running(snapshot: &mut IndexingSnapshot) {
 
 /// Close the Memory status line with the check's counts joined onto the pass's
 /// own detail (` · `), so the finished item's title carries them. A failed
-/// check still ends `Done` with `health: failed — …`: it is advisory, and must
-/// not read "Memory update failed".
+/// CHECK still ends `Done` with `health: failed — …` (advisory, never "Memory
+/// update failed"); a failed RECONCILE keeps its `Failed` state and its own
+/// detail, which the window renders as the error's title.
 fn health_done(snapshot: &mut IndexingSnapshot, detail: String) {
     match snapshot.memory.as_mut() {
+        Some(pass) if pass.state == PassState::Failed => {}
         Some(pass) => {
             pass.state = PassState::Done;
             pass.detail = Some(match pass.detail.take() {
@@ -563,5 +568,29 @@ mod tests {
             pass.detail.as_deref(),
             Some("derived index in sync · health: 0 records cite missing paths")
         );
+    }
+
+    #[test]
+    fn the_health_pass_never_hides_a_failed_reconcile() {
+        let mut snapshot = IndexingSnapshot {
+            memory: Some(IndexPass {
+                state: PassState::Failed,
+                done: 3,
+                total: 7,
+                detail: Some("boom".into()),
+            }),
+            ..IndexingSnapshot::default()
+        };
+        // The window renders the Failed pass's detail as the error's title, so
+        // the advisory check must not touch either field.
+        health_running(&mut snapshot);
+        let pass = snapshot.memory.clone().expect("failed memory pass");
+        assert_eq!(pass.state, PassState::Failed);
+        assert_eq!(pass.detail.as_deref(), Some("boom"));
+        health_done(&mut snapshot, "health: 0 records cite missing paths".into());
+        let pass = snapshot.memory.expect("failed memory pass");
+        assert_eq!(pass.state, PassState::Failed);
+        assert_eq!(pass.detail.as_deref(), Some("boom"));
+        assert_eq!((pass.done, pass.total), (3, 7));
     }
 }

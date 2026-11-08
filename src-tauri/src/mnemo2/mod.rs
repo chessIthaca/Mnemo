@@ -58,6 +58,11 @@ pub(crate) mod ledger;
 /// Host-side batching of streamed deltas before they cross into the window.
 pub(crate) mod delta_batch;
 
+/// Laya's dispatch routing decisions travelling with the project's git
+/// checkout and the installer: the bundle's export, the import check, and
+/// the answer to a conflicting copy.
+pub(crate) mod laya_learnings;
+
 /// The typed Tauri command surface for the lead conversation.
 pub mod ipc;
 

@@ -1785,6 +1785,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Frontend-only refactor of an ungoverned module (mnemo2/src/lib/store.ts is not in any capability's governed_files); no specified behavior changes."
+    },
+    {
+      "id": "3bc2457b",
+      "status": "closed",
+      "created_at_ms": 1794119881586,
+      "closed_at_ms": 1794120484973,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3bc2457b-20261108-064804.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only change in src-tauri/src/mnemo2/team/tests.rs; no specified behaviour changes."
     }
   ]
 }

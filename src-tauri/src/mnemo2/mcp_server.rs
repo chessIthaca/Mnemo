@@ -907,7 +907,21 @@ impl Shared {
         };
         let active_workers = team.live_worker_turns().await;
         let waiter_alive = team.external_waiter_alive();
-        let summary = team.external_summary().await;
+        // The knowledge map rides only a real SessionStart (plan 373dec00 step
+        // 6): a PostToolUse drain sends the same "drain" mode without the
+        // flag, so it never pays for the file read. A missing INDEX.md (a
+        // project without a corpus, or before the first pass) adds nothing.
+        let session_start = body
+            .get("session_start")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut summary = team.external_summary().await;
+        if session_start {
+            if let Some(map) = mnemo::memory::knowledge_index::knowledge_map_at(&target.root) {
+                summary.push_str("\n\n");
+                summary.push_str(&map);
+            }
+        }
         let notices = if peek {
             team.current_notices(team.peek_external_notices()).await
         } else {
@@ -2569,7 +2583,8 @@ mod tests {
         })
     }
 
-    /// Every `.md` file under `dir`.
+    /// Every record `.md` file under `dir` — the generated `INDEX.md` map
+    /// (plan 373dec00 step 6) is not a record and is skipped.
     fn markdown_files(dir: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let mut pending = vec![dir.to_path_buf()];
@@ -2578,7 +2593,9 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     pending.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "md") {
+                } else if path.extension().is_some_and(|ext| ext == "md")
+                    && path.file_name() != Some(std::ffi::OsStr::new("INDEX.md"))
+                {
                     found.push(path);
                 }
             }
@@ -3467,6 +3484,52 @@ mod tests {
         assert_eq!(other["attached"], false);
         let (status, _) = fixture.post("/lead/notices", Some("tok-123"), &[], "{}").await;
         assert_eq!(status, 400, "a root is required");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_knowledge_map_rides_only_a_session_start_drain() {
+        // The map is appended to the summary only when the hook says it is a
+        // real SessionStart (plan 373dec00 step 6): a PostToolUse drain uses
+        // the same "drain" mode without the flag and must never pay for the
+        // read. A project without an INDEX.md adds nothing either.
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+
+        let plain = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "drain" }))
+            .await;
+        let summary = plain["summary"].as_str().expect("summary");
+        assert!(!summary.contains("Project knowledge"), "{summary}");
+
+        let index = fixture.root.join(".coding/knowledge/INDEX.md");
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        std::fs::write(
+            &index,
+            "# Project knowledge index\n\n## src/agent (3)\n- SPEC: a - spec/a.md\n\n## general (4)\n- HOW: b - how/b.md\n",
+        )
+        .unwrap();
+
+        let drain = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "drain" }))
+            .await;
+        let summary = drain["summary"].as_str().expect("summary");
+        assert!(
+            !summary.contains("Project knowledge"),
+            "a drain without the flag gets no map: {summary}"
+        );
+
+        let start = fixture
+            .lead_post(
+                "/lead/notices",
+                json!({ "root": root, "mode": "drain", "session_start": true }),
+            )
+            .await;
+        let summary = start["summary"].as_str().expect("summary");
+        assert!(
+            summary.contains("Project knowledge (7 records): src/agent 3, general 4."),
+            "a SessionStart carries the map: {summary}"
+        );
         fixture.shutdown().await;
     }
 

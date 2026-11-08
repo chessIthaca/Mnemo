@@ -322,6 +322,52 @@ async fn reindex_knowledge_files_updates_just_the_given_files() {
 }
 
 #[tokio::test]
+async fn the_index_regenerates_after_a_knowledge_write() {
+    // Every knowledge write regenerates `.coding/knowledge/INDEX.md` (plan
+    // 373dec00 step 6): the map lists the new record's typed title and path,
+    // and a later write replaces the file's bytes.
+    let dir = tempdir().unwrap();
+    write_knowledge(
+        dir.path(),
+        "spec/2026-08-23-branch-strategy.md",
+        "+++\ntitle = \"Branch strategy\"\ncreated = \"2026-08-23\"\n+++\n\nTrunk based. Cites src/agent/turn.rs.\n",
+    );
+    let store = make_store();
+    let knowledge_dir = dir.path().join(".coding/knowledge");
+    let index_path = knowledge_dir.join("INDEX.md");
+    reindex_knowledge_files(
+        store.as_ref(),
+        &knowledge_dir,
+        &["spec/2026-08-23-branch-strategy.md".to_string()],
+    )
+    .await
+    .unwrap();
+    let first = std::fs::read_to_string(&index_path).unwrap();
+    assert!(first.contains("## src/agent (1)"), "{first}");
+    assert!(
+        first.contains("- SPEC: Branch strategy - spec/2026-08-23-branch-strategy.md"),
+        "{first}"
+    );
+
+    // A second record in a new area: the next pass re-renders the file.
+    write_knowledge(
+        dir.path(),
+        "how/2026-08-23-release.md",
+        "+++\ntitle = \"Release checklist\"\ncreated = \"2026-08-23\"\n+++\n\nRun scripts/release.ps1.\n",
+    );
+    reindex_knowledge_files(
+        store.as_ref(),
+        &knowledge_dir,
+        &["how/2026-08-23-release.md".to_string()],
+    )
+    .await
+    .unwrap();
+    let second = std::fs::read_to_string(&index_path).unwrap();
+    assert_ne!(first, second, "a write re-renders the index");
+    assert!(second.contains("## scripts (1)"), "{second}");
+}
+
+#[tokio::test]
 async fn reindex_knowledge_files_resolves_supersedes_against_the_corpus() {
     // F1 regression: memory_update on a SUCCESSOR knowledge file
     // reindexes just the touched rel. `supersedes` must resolve against

@@ -121,6 +121,20 @@ pub struct EvalRecord {
     /// Every paraphrased question without an expected record in its top five,
     /// with what recall did return.
     pub misses: Vec<Miss>,
+    /// The records auto-recall has surfaced most often (plan 373dec00 step 6),
+    /// highest `recall_count` first. Empty on a store that predates the
+    /// counter; `#[serde(default)]` keeps older records readable.
+    #[serde(default)]
+    pub top_recalled: Vec<RecalledRecord>,
+}
+
+/// One row of [`EvalRecord::top_recalled`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecalledRecord {
+    /// The memory title.
+    pub title: String,
+    /// How many fresh auto-recalls injected this record.
+    pub count: u64,
 }
 
 /// One hit of a miss report, reduced for the record.

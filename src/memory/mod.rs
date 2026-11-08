@@ -18,6 +18,7 @@ pub mod health;
 pub mod integrity;
 pub mod indexer;
 pub mod knowledge;
+pub mod knowledge_index;
 pub mod maintenance;
 pub mod plan_format;
 pub mod plan_scope;
@@ -144,6 +145,22 @@ fn cap_json_strings(value: serde_json::Value, max_chars: usize) -> serde_json::V
         }
         other => other,
     }
+}
+
+/// Whether a row belongs in the session primer (plan 373dec00 step 6): typed
+/// knowledge a new session should start with. BUG / PLAN / REVIEW digests and
+/// untyped rows are excluded, and a superseded or quarantined row never
+/// surfaces there (the same invariant every ranking path honors).
+fn is_primer_record(memory: &Memory) -> bool {
+    matches!(
+        memory.record_type,
+        MemoryRecordType::Spec | MemoryRecordType::Decision | MemoryRecordType::How
+    ) && memory.superseded_by.is_none()
+        && memory.quarantined.is_none()
+        && matches!(
+            memory.tier,
+            MemoryTier::Semantic | MemoryTier::Procedural
+        )
 }
 
 /// The trait for the memory store (so we can mock it in agent-loop tests).
@@ -319,36 +336,49 @@ pub trait MemoryStoreTrait: Send + Sync {
     /// listing a large store should always set one.
     async fn list_filtered(&self, filter: &MemoryFilter) -> Result<Vec<Memory>>;
 
-    /// The top-`limit` strongest memories across the given tiers, ranked by
-    /// decayed strength (the same Ebbinghaus decay used by `recall`'s scoring,
-    /// so recently-accessed distilled facts surface first). Used to build a
-    /// standing "project memory" primer injected once at session start — the
-    /// agent begins with project knowledge instead of re-discovering it.
+    /// The top-`limit` records for the standing "project memory" primer
+    /// injected once at session start (plan 373dec00 step 6).
     ///
-    /// Unlike `recall`, this is NOT query-driven: it returns the globally
-    /// strongest distilled facts regardless of the user's prompt. Working-tier
-    /// memories are never included (they are consolidation input, not primer
-    /// material); callers should pass only distilled tiers.
-    async fn strongest(&self, tiers: &[MemoryTier], limit: usize) -> Result<Vec<Memory>> {
-        // Default: union across per-tier list_by_tier, then rank. The SQLite
-        // impl overrides this with a single query; this default keeps trait
-        // objects (mocks) compiling without a bespoke implementation.
-        // Working-tier is filtered out to match the override + the doc
-        // contract (working is consolidation input, not primer material).
+    /// Typed knowledge only — SPEC / DECISION / HOW rows in the semantic or
+    /// procedural tiers, live and unquarantined — ranked by how often a
+    /// search returned them (`access_count`), then recency, then id. The old
+    /// `strongest` ranked by decayed strength, which with every stored
+    /// strength at 1.0 was effectively recency; searched records now lead.
+    /// BUG / PLAN / REVIEW digests and untyped rows are excluded: old fixed
+    /// bugs and session bookkeeping are poor standing context.
+    async fn primer_records(&self, limit: usize) -> Result<Vec<Memory>> {
+        // Default: union across the two distilled tiers, filter, rank. The
+        // SQLite impl overrides this with a single query; this default keeps
+        // trait objects (mocks) compiling without a bespoke implementation.
         let mut all = Vec::new();
-        for tier in tiers.iter().copied().filter(|t| *t != MemoryTier::Working) {
+        for tier in [MemoryTier::Semantic, MemoryTier::Procedural] {
             all.extend(self.list_by_tier(tier).await?);
         }
-        // Without a clock, mocks can't decay — rank by stored strength desc
-        // with a title tiebreaker (deterministic across restarts).
+        all.retain(is_primer_record);
         all.sort_by(|a, b| {
-            b.strength
-                .partial_cmp(&a.strength)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.title.cmp(&b.title))
+            b.access_count
+                .cmp(&a.access_count)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
         });
         all.truncate(limit);
         Ok(all)
+    }
+
+    /// Count these memories as recalled by the auto-recall path (plan
+    /// 373dec00 step 6) — the measurement `access_count` was never able to
+    /// give, because recall and the primer are peek paths that do not bump it.
+    ///
+    /// The peek path itself stays read-only; the caller that actually
+    /// injects the rows calls this. Default: nothing to count.
+    async fn note_recalled(&self, _ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+
+    /// The most-recalled records as `(title, count)`, highest first. Default:
+    /// empty (a store without the measurement).
+    async fn top_recalled(&self, _limit: usize) -> Result<Vec<(String, u64)>> {
+        Ok(Vec::new())
     }
 
     /// Delete all working-tier memories belonging to a session.
@@ -2095,45 +2125,30 @@ impl MemoryStoreTrait for MemoryStore {
         .map_err(|e| Error::Memory(format!("list_filtered task failed: {e}")))?
     }
 
-    /// Override the default `strongest` with a single-query implementation
-    /// that ranks by decayed strength (time-since-last-access, same Ebbinghaus
-    /// decay as `recall`'s scoring). Loads all rows matching the requested
-    /// tiers (a project store is small — hundreds to low-thousands), scores
-    /// in Rust, and truncates to `limit`. Working-tier is never included even
-    /// if passed (it is consolidation input, not primer material).
-    async fn strongest(&self, tiers: &[MemoryTier], limit: usize) -> Result<Vec<Memory>> {
-        if tiers.is_empty() || limit == 0 {
-            return Ok(Vec::new());
-        }
-        // Filter out working-tier (never primer material). Duplicates in the
-        // IN clause are harmless, so no dedup needed (and MemoryTier is not Ord).
-        let wanted: Vec<MemoryTier> = tiers
-            .iter()
-            .copied()
-            .filter(|t| *t != MemoryTier::Working)
-            .collect();
-        if wanted.is_empty() {
+    /// Override the default `primer_records` with a single indexed query
+    /// (plan 373dec00 step 6): typed semantic/procedural rows, ranked by
+    /// `access_count` (how often a search returned them), then recency, then
+    /// id — all pushed into SQLite so a large store never loads whole tiers.
+    async fn primer_records(&self, limit: usize) -> Result<Vec<Memory>> {
+        if limit == 0 {
             return Ok(Vec::new());
         }
         let read_conn = self.read_conn().clone();
-        let mut memories: Vec<Memory> = tokio::task::spawn_blocking(move || -> Result<Vec<Memory>> {
+        let memories: Vec<Memory> = tokio::task::spawn_blocking(move || -> Result<Vec<Memory>> {
             let conn = read_conn.lock().expect("read conn lock poisoned");
-            // Build `WHERE tier IN (?, ?, ...)` with one placeholder per tier.
-            // Superseded rows are excluded at SQL level — the primer is the
-            // standing context of every new session, and a superseded record
-            // must never surface there at full strength (the same invariant
-            // recall/list_filtered honor; the primer path was the gap).
-            let placeholders: Vec<&str> = (0..wanted.len()).map(|_| "?").collect();
-            let sql = format!(
+            // Typed knowledge only (SPEC / DECISION / HOW). BUG, PLAN and
+            // REVIEW digests and untyped rows are not standing context; the
+            // superseded/quarantined predicates are the same invariant every
+            // ranking path honors.
+            let mut stmt = conn.prepare(
                 "SELECT id, tier, title, content, data, strength, access_count, created_at, \
                  last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by, quarantined FROM memories \
-                 WHERE tier IN ({}) AND superseded_by IS NULL AND quarantined IS NULL",
-                placeholders.join(", ")
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let params_vec: Vec<Box<dyn rusqlite::ToSql>> =
-                wanted.iter().map(|t| Box::new(t.as_str().to_string()) as Box<dyn rusqlite::ToSql>).collect();
-            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
+                 WHERE tier IN ('semantic', 'procedural') \
+                 AND record_type IN ('spec', 'decision', 'how') \
+                 AND superseded_by IS NULL AND quarantined IS NULL \
+                 ORDER BY access_count DESC, created_at DESC, id LIMIT ?1",
+            )?;
+            let mut rows = stmt.query(params![limit as i64])?;
             let mut memories = Vec::new();
             while let Some(row) = rows.next()? {
                 memories.push(Self::parse_memory_row(row)?);
@@ -2141,26 +2156,60 @@ impl MemoryStoreTrait for MemoryStore {
             Ok(memories)
         })
         .await
-        .map_err(|e| Error::Memory(format!("strongest load task failed: {e}")))??;
-        // The read connection is released above before scoring (no further DB
-        // access) — the sort + truncate below is pure Rust.
-
-        let now = self.now();
-        // The same configurable decay tau as recall (the live [memory]
-        // knobs) so the primer ranks consistently with query-driven recall.
-        let decay_tau_secs = self.memory_search_config().decay_half_life_days * 86_400.0;
-        // Rank by decayed strength desc, with a deterministic title tiebreaker
-        // (stable across restarts — DB row order is not guaranteed).
-        memories.sort_by(|a, b| {
-            let da = strength::decay_with_tau(a.strength, now - a.last_accessed_at, decay_tau_secs);
-            let db = strength::decay_with_tau(b.strength, now - b.last_accessed_at, decay_tau_secs);
-            db.partial_cmp(&da)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.title.cmp(&b.title))
-        });
-        memories.truncate(limit);
+        .map_err(|e| Error::Memory(format!("primer load task failed: {e}")))??;
         self.log_access("read", None, "session primer", Some(memories.len()));
         Ok(memories)
+    }
+
+    /// One `UPDATE` for the whole batch. Deliberately does not touch
+    /// `access_count` or `last_accessed_at` (those belong to explicit reads,
+    /// and `recall_peek` must stay read-only) and does not bump `version()` —
+    /// the agent's recall cache keys on it.
+    async fn note_recalled(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        let ids = ids.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("conn lock poisoned");
+            let mut stmt = conn.prepare(
+                "UPDATE memories SET recall_count = COALESCE(recall_count, 0) + 1 WHERE id = ?1",
+            )?;
+            for id in &ids {
+                stmt.execute(params![id])?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("note_recalled task failed: {e}")))?
+    }
+
+    /// The biggest `recall_count` values, highest first, with the row's title
+    /// so a report reads like a list of records rather than a list of ids.
+    async fn top_recalled(&self, limit: usize) -> Result<Vec<(String, u64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read_conn = self.read_conn().clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(String, u64)>> {
+            let conn = read_conn.lock().expect("read conn lock poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT title, recall_count FROM memories \
+                 WHERE recall_count IS NOT NULL AND recall_count > 0 \
+                 ORDER BY recall_count DESC, title, id LIMIT ?1",
+            )?;
+            let mut rows = stmt.query(params![limit as i64])?;
+            let mut top = Vec::new();
+            while let Some(row) = rows.next()? {
+                let title: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                top.push((title, count.max(0) as u64));
+            }
+            Ok(top)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("top_recalled task failed: {e}")))?
     }
 
     async fn delete_working_for_session(&self, session_id: &str) -> Result<usize> {

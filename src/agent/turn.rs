@@ -3961,6 +3961,18 @@ impl AgentLoop {
                                 },
                             ))
                             .await;
+                        // Count the recall itself (plan 373dec00 step 6): the
+                        // peek path stays read-only, so the measurement is the
+                        // caller's job. Detached and error-ignoring — a counter
+                        // must never fail a turn (and cache reuse never reaches
+                        // this block).
+                        if let Some(store) = self.memory.clone() {
+                            let ids: Vec<String> =
+                                results.iter().map(|sm| sm.memory.id.clone()).collect();
+                            tokio::spawn(async move {
+                                let _ = store.note_recalled(&ids).await;
+                            });
+                        }
                     }
                     Some(self.recall_block(&results, session_id))
                 } else {
@@ -4237,10 +4249,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             }
             None if self.memory.is_some() => {
                 let store = self.memory.as_ref().unwrap();
-                match store
-                    .strongest(&[MemoryTier::Semantic, MemoryTier::Procedural], 8)
-                    .await
-                {
+                match store.primer_records(8).await {
                     Ok(memories) if !memories.is_empty() => {
                         let primer = prompt::format_primer(&memories);
                         if !primer.trim().is_empty() {

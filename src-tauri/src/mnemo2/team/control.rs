@@ -443,8 +443,12 @@ impl TeamRuntime {
                     worker.pending = None;
                 })
                 .await;
+                // Snapshot the resumed record before the save: a `Finished`
+                // event still draining from the failed turn can otherwise
+                // turn this resume's result back into `NeedsYou`.
+                let resumed = self.worker(worker_id).await?;
                 self.persist().await?;
-                return self.worker(worker_id).await;
+                return Ok(resumed);
             }
             return Err(format!(
                 "worker '{worker_id}' is already running; team_message it to continue"

@@ -3840,6 +3840,9 @@ async fn usage_above_former_budget_never_pauses_and_survives_restart() {
     let stopped = team.snapshot().await;
     assert_eq!(stopped.active, 0);
     assert_eq!(stopped.workers[0].status, WorkerStatus::Stopped);
+    // A restart must not race the old runtime's pending ledger flush: shut it
+    // down (which persists) before reopening the same state dir.
+    team.shutdown().await;
 
     let reopened = TeamRuntime::open(TeamRuntimeOptions {
         engine: lead.engine_handle().await.expect("engine"),
@@ -3860,7 +3863,6 @@ async fn usage_above_former_budget_never_pauses_and_survives_restart() {
     assert_eq!(restored.cost_micros, Some(750_000));
     assert!(restored.brief_sent);
 
-    team.shutdown().await;
     reopened.shutdown().await;
     lead.shutdown().await;
 }
@@ -7210,10 +7212,17 @@ async fn worker_reasoning_effort_is_validated_and_recorded() {
         .await
         .expect("dispatch with an explicit effort");
     assert_eq!(worker.reasoning_effort.as_deref(), Some("minimal"));
-    let ledger = std::fs::read_to_string(state.path().join("team.json")).expect("ledger");
-    assert!(
-        ledger.contains("\"reasoning_effort\": \"minimal\""),
-        "{ledger}"
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(state.path().join("team.json")).expect("ledger"),
+    )
+    .expect("the ledger JSON");
+    let persisted = ledger["workers"]
+        .as_array()
+        .and_then(|workers| workers.iter().find(|worker| worker["id"] == "effort0001"))
+        .expect("the worker record");
+    assert_eq!(
+        persisted["reasoning_effort"], "minimal",
+        "the ledger persists the effort"
     );
     let changed = team
         .dispatch_task(
@@ -8197,9 +8206,9 @@ async fn change_model_keeps_the_already_observed_model_id() {
     lead.shutdown().await;
 }
 
-/// An audit worker's model is not user-switchable: the busy-path switch
-/// refuses an audit worker outright, and the refusal leaves its record
-/// and its session untouched.
+/// An unreported audit switches live while its request is in flight: the
+/// in-flight request finishes on the old model, the next request serves on
+/// the new one, and the session is not stopped or restarted.
 #[tokio::test]
 async fn change_model_switches_a_busy_unreported_audit() {
     let root = tempfile::tempdir().expect("root");
@@ -8241,6 +8250,11 @@ async fn change_model_switches_a_busy_unreported_audit() {
     // stop the worker and move its tip so there is something to audit.
     wait_for_worker_status(&team, "worker0001", crate::mnemo2::team::WorkerStatus::Completed)
         .await;
+    // The implementation turn's request is the first arrival: consume it so
+    // the wait after the audit dispatch is genuinely about the audit request.
+    tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+        .await
+        .expect("the implementation request arrives");
     team.stop("worker0001").await.expect("stop the worker");
     std::fs::write(worker.worktree.join("feature.rs"), "pub fn feature() {}\n")
         .expect("worker source");
@@ -8261,6 +8275,9 @@ async fn change_model_switches_a_busy_unreported_audit() {
     tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
         .await
         .expect("the audit worker's first request arrives");
+    // The pump has folded TurnStarted by now, so the switch takes the live
+    // busy path instead of the stop-and-restart one.
+    wait_for_worker_status(&team, "auditor1", crate::mnemo2::team::WorkerStatus::Working).await;
     let audit = team.worker("auditor1").await.expect("the audit record");
     assert_eq!(audit.kind, "audit");
     let generation = audit.generation;
@@ -8287,7 +8304,11 @@ async fn change_model_switches_a_busy_unreported_audit() {
             .await;
     assert_eq!(settled.model, Some("test/model-b".into()));
     assert_eq!(settled.generation, generation);
-    assert_eq!(stub.models(), ["model-a", "model-b"]);
+    // The switch only affects the NEXT request: the request already in
+    // flight finished on the old model and this script's audit turn ends
+    // there (the next-request coverage lives in
+    // `change_model_switches_a_working_worker_live`).
+    assert_eq!(stub.models(), ["model-a", "model-a"]);
     team.shutdown().await;
     lead.shutdown().await;
 }
@@ -8406,9 +8427,16 @@ async fn read_back_dispatch_sends_the_read_back_kickoff() {
         .expect("the first user message");
     assert_eq!(first_user, READ_BACK_KICKOFF);
 
-    let ledger = std::fs::read_to_string(state.path().join("team.json")).expect("the ledger");
-    assert!(
-        ledger.contains("\"read_back\": true"),
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(state.path().join("team.json")).expect("the ledger"),
+    )
+    .expect("the ledger JSON");
+    let persisted = ledger["workers"]
+        .as_array()
+        .and_then(|workers| workers.iter().find(|worker| worker["id"] == "worker0001"))
+        .expect("the worker record");
+    assert_eq!(
+        persisted["read_back"], true,
         "the read-back flag persisted: {ledger}"
     );
     team.shutdown().await;

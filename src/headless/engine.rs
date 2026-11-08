@@ -619,6 +619,14 @@ impl Engine {
         self.brain.factory.reviews_dir()
     }
 
+    /// The workspace root this engine was opened on — the project directory
+    /// every record's relative paths are resolved against. The memory check
+    /// pass reads the knowledge corpus, `agent.md` and the git history here
+    /// (plan 373dec00 step 5).
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.brain.workspace.root
+    }
+
     /// §5.6's memory data API — the debug/read + maintenance surface,
     /// ONE implementation shared with the app's IPC commands. Errors
     /// code `memory_disabled` when `EngineOptions.memory` was

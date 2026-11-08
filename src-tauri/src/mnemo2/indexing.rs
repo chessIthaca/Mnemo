@@ -29,6 +29,15 @@ pub const INDEXING_CHANNEL: &str = "mnemo2://indexing";
 const WATCHDOG_EVERY: Duration = Duration::from_millis(750);
 /// Consecutive idle polls before the watchdog calls a silent pass finished.
 const WATCHDOG_IDLE_POLLS: u32 = 3;
+/// How often the memory check watches the reconcile for a quiet window.
+const HEALTH_POLL_EVERY: Duration = Duration::from_millis(250);
+/// Consecutive quiet polls before the memory check treats the reconcile as
+/// settled (1.5 s). A reconcile over an unchanged corpus stays silent — the
+/// engine's `return` before `Started` — so "after the reconcile" is a quiet
+/// window, not an event.
+const HEALTH_QUIET_POLLS: u32 = 6;
+/// The Memory status line's prefix for the memory check's counts.
+const HEALTH_PREFIX: &str = "health: ";
 
 /// Where one pass stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -229,6 +238,57 @@ impl IndexingTracker {
         )
     }
 
+    fn memory_running(&self) -> bool {
+        matches!(
+            self.snapshot().memory,
+            Some(IndexPass {
+                state: PassState::Running,
+                ..
+            })
+        )
+    }
+
+    /// Run the memory check pass once the reconcile has settled and fold its
+    /// counts into the Memory status line (plan 373dec00 step 5).
+    ///
+    /// The engine spawns the reconcile detached and an in-sync corpus emits no
+    /// event at all, so "after the reconcile" is a quiet window, not an event.
+    /// Never blocks the open: the scan runs on the blocking pool, and a failure
+    /// is reported in the pass's detail (plus one warning), never as a failed
+    /// open.
+    fn spawn_memory_health(self: &Arc<Self>, engine: Arc<Engine>) -> JoinHandle<()> {
+        let tracker = self.clone();
+        tokio::spawn(async move {
+            let mut quiet = 0;
+            while quiet < HEALTH_QUIET_POLLS {
+                quiet = if tracker.memory_running() {
+                    0
+                } else {
+                    quiet + 1
+                };
+                if quiet < HEALTH_QUIET_POLLS {
+                    tokio::time::sleep(HEALTH_POLL_EVERY).await;
+                }
+            }
+            let Some(store) = engine.memory_store_handle() else {
+                return;
+            };
+            let root = engine.workspace_root().to_path_buf();
+            // The UI only shows a pass it saw running, so the check enters as
+            // Running and leaves as Done: the counts ride the finished line.
+            tracker.update(health_running);
+            let counts = match mnemo::memory::health::run(store.as_ref(), &root).await {
+                Ok(report) => report.summary(),
+                Err(e) => {
+                    eprintln!("warning: memory health pass failed: {e}");
+                    format!("failed — {e}")
+                }
+            };
+            let detail = format!("{HEALTH_PREFIX}{counts}");
+            tracker.update(|snapshot| health_done(snapshot, detail));
+        })
+    }
+
     /// Follow the engine's startup passes until the engine stops.
     pub fn watch(self: &Arc<Self>, engine: Arc<Engine>) {
         let mut host_events = engine.host_events();
@@ -253,8 +313,9 @@ impl IndexingTracker {
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.push(forward);
         if self.code_running() {
-            tasks.push(self.spawn_watchdog(engine));
+            tasks.push(self.spawn_watchdog(engine.clone()));
         }
+        tasks.push(self.spawn_memory_health(engine));
     }
 
     /// A pass that ends without an event (a fast pass whose terminal event
@@ -303,6 +364,58 @@ impl IndexingTracker {
             .drain(..)
         {
             task.abort();
+        }
+    }
+}
+
+/// Flip the Memory status line to Running while the memory check runs.
+///
+/// The UI only shows a pass it saw running (`IndexingStatus.svelte`), so a
+/// check that only ever wrote `Done` would be invisible on an in-sync open.
+/// An existing pass keeps its own detail; [`health_done`] appends to it. A
+/// FAILED reconcile is left untouched: the window shows its detail as the
+/// error's title, and an advisory check must never hide it.
+fn health_running(snapshot: &mut IndexingSnapshot) {
+    match snapshot.memory.as_mut() {
+        Some(pass) if pass.state == PassState::Failed => {}
+        Some(pass) => {
+            pass.state = PassState::Running;
+            pass.done = 0;
+            pass.total = 0;
+        }
+        None => {
+            snapshot.memory = Some(IndexPass {
+                state: PassState::Running,
+                done: 0,
+                total: 0,
+                detail: None,
+            });
+        }
+    }
+}
+
+/// Close the Memory status line with the check's counts joined onto the pass's
+/// own detail (` · `), so the finished item's title carries them. A failed
+/// CHECK still ends `Done` with `health: failed — …` (advisory, never "Memory
+/// update failed"); a failed RECONCILE keeps its `Failed` state and its own
+/// detail, which the window renders as the error's title.
+fn health_done(snapshot: &mut IndexingSnapshot, detail: String) {
+    match snapshot.memory.as_mut() {
+        Some(pass) if pass.state == PassState::Failed => {}
+        Some(pass) => {
+            pass.state = PassState::Done;
+            pass.detail = Some(match pass.detail.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing} · {detail}"),
+                _ => detail,
+            });
+        }
+        None => {
+            snapshot.memory = Some(IndexPass {
+                state: PassState::Done,
+                done: 0,
+                total: 0,
+                detail: Some(detail),
+            });
         }
     }
 }
@@ -415,5 +528,69 @@ mod tests {
         assert_eq!(after.laya.map(|pass| pass.state), Some(PassState::Running));
         tracker.clear_laya();
         assert_eq!(tracker.snapshot().laya, None);
+    }
+
+    #[test]
+    fn the_health_pass_shows_running_then_done_with_its_counts() {
+        // An in-sync reconcile leaves no Memory pass at all: the check's line
+        // must still appear, running first and then done with the counts.
+        let mut snapshot = IndexingSnapshot::default();
+        health_running(&mut snapshot);
+        let pass = snapshot.memory.clone().expect("running memory pass");
+        assert_eq!(pass.state, PassState::Running);
+        assert_eq!((pass.done, pass.total), (0, 0));
+        health_done(&mut snapshot, "health: 3 records cite missing paths".into());
+        let pass = snapshot.memory.clone().expect("done memory pass");
+        assert_eq!(pass.state, PassState::Done);
+        assert_eq!(
+            pass.detail.as_deref(),
+            Some("health: 3 records cite missing paths")
+        );
+
+        // After a reconcile the pass's own summary survives, joined with ` · `.
+        let mut snapshot = IndexingSnapshot {
+            memory: Some(IndexPass {
+                state: PassState::Done,
+                done: 7,
+                total: 7,
+                detail: Some("derived index in sync".into()),
+            }),
+            ..IndexingSnapshot::default()
+        };
+        health_running(&mut snapshot);
+        let pass = snapshot.memory.clone().expect("running");
+        assert_eq!(pass.state, PassState::Running);
+        assert_eq!(pass.detail.as_deref(), Some("derived index in sync"));
+        health_done(&mut snapshot, "health: 0 records cite missing paths".into());
+        let pass = snapshot.memory.expect("done");
+        assert_eq!(pass.state, PassState::Done);
+        assert_eq!(
+            pass.detail.as_deref(),
+            Some("derived index in sync · health: 0 records cite missing paths")
+        );
+    }
+
+    #[test]
+    fn the_health_pass_never_hides_a_failed_reconcile() {
+        let mut snapshot = IndexingSnapshot {
+            memory: Some(IndexPass {
+                state: PassState::Failed,
+                done: 3,
+                total: 7,
+                detail: Some("boom".into()),
+            }),
+            ..IndexingSnapshot::default()
+        };
+        // The window renders the Failed pass's detail as the error's title, so
+        // the advisory check must not touch either field.
+        health_running(&mut snapshot);
+        let pass = snapshot.memory.clone().expect("failed memory pass");
+        assert_eq!(pass.state, PassState::Failed);
+        assert_eq!(pass.detail.as_deref(), Some("boom"));
+        health_done(&mut snapshot, "health: 0 records cite missing paths".into());
+        let pass = snapshot.memory.expect("failed memory pass");
+        assert_eq!(pass.state, PassState::Failed);
+        assert_eq!(pass.detail.as_deref(), Some("boom"));
+        assert_eq!((pass.done, pass.total), (3, 7));
     }
 }

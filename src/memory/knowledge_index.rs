@@ -284,6 +284,7 @@ mod tests {
             status: KnowledgeStatus::Live,
             supersedes: None,
             created: Some("2026-01-01".to_string()),
+            evidence: None,
             body: body.to_string(),
             links: Vec::new(),
         }

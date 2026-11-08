@@ -1933,7 +1933,7 @@ async fn note_recalled_counts_without_touching_last_accessed() {
         .note_recalled(&[id.clone(), other.clone(), "does-not-exist".to_string()])
         .await
         .unwrap();
-    store.note_recalled(&[id.clone()]).await.unwrap();
+    store.note_recalled(std::slice::from_ref(&id)).await.unwrap();
     let after = store.get_memory(&id).await.unwrap().unwrap();
     let other_after = store.get_memory(&other).await.unwrap().unwrap();
     assert_eq!(

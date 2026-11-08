@@ -7236,6 +7236,63 @@ async fn tier_is_optional_only_in_auto_mode() {
 }
 
 
+/// `team_dispatch` offers `review_risk`: a lead that follows the schema can
+/// only request the high-risk audit gate if the parameter is declared.
+#[tokio::test]
+async fn team_dispatch_schema_offers_review_risk() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let tools = team.lead_host_tools();
+    let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+    let review_risk = &dispatch.parameters["properties"]["review_risk"];
+    assert_eq!(review_risk["type"], json!("string"), "{review_risk}");
+    assert_eq!(review_risk["enum"], json!(["standard", "high"]), "{review_risk}");
+    assert!(
+        review_risk["description"].as_str().is_some_and(|text| !text.is_empty()),
+        "{review_risk}"
+    );
+    let required = dispatch.parameters["required"].as_array().expect("required fields");
+    assert!(!required.contains(&json!("review_risk")), "review_risk stays optional");
+    team.shutdown().await;
+}
+
+/// Every argument the `team_dispatch` handler reads must be declared in its
+/// schema, or a lead that follows the schema can never send it.
+#[tokio::test]
+async fn team_dispatch_schema_declares_every_argument_its_handler_reads() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let tools = team.lead_host_tools();
+    let dispatch = tools.iter().find(|tool| tool.name == "team_dispatch").expect("dispatch");
+    let declared = dispatch.parameters["properties"].as_object().expect("properties");
+    let source = include_str!("lead_tools.rs");
+    let start = source
+        .find("if name == \"team_dispatch\" {")
+        .expect("the team_dispatch handler");
+    let end = source
+        .find("if name == \"team_audit_dispatch\" {")
+        .expect("the handler after team_dispatch");
+    let read: Vec<&str> = source[start..end]
+        .split(".get(\"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().expect("an argument name"))
+        .collect();
+    // A renamed accessor must not turn this into a scan that finds nothing.
+    assert!(read.contains(&"review_risk"), "the scan sees the handler's reads: {read:?}");
+    assert!(read.contains(&"worker_id"), "the scan sees the handler's reads: {read:?}");
+    let undeclared: Vec<&str> = read
+        .iter()
+        .copied()
+        .filter(|arg| !declared.contains_key(*arg))
+        .collect();
+    assert!(undeclared.is_empty(), "read but not declared: {undeclared:?}");
+    team.shutdown().await;
+}
+
 #[tokio::test]
 async fn suggest_auto_refuses_when_laya_returns_no_answer() {
     let fixture = routing_fixture(

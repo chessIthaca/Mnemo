@@ -2038,6 +2038,8 @@ function sampleMemoryTransport(): MemoryTransport {
         access_count: record.row.access_count,
         strength: record.row.strength,
         links: record.links,
+        evidence: null,
+        unconfirmed: false,
         backlinks: rowsFor(record.backlinks),
       };
     },

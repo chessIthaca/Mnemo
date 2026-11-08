@@ -262,6 +262,59 @@ impl Memory {
             embedding: Vec::new(),
         }
     }
+
+    /// True when the record asserts something the repo or a test can check —
+    /// a SPEC / DECISION / BUG / HOW claim of the semantic or procedural
+    /// tier. PLAN and REVIEW digests are pointers at a file rather than
+    /// claims of their own, so they are never marked (plan 373dec00 step 4).
+    pub fn is_claim(&self) -> bool {
+        matches!(self.tier, MemoryTier::Semantic | MemoryTier::Procedural)
+            && !matches!(
+                self.record_type,
+                MemoryRecordType::Plan | MemoryRecordType::Review
+            )
+    }
+
+    /// True when the record says how it is known: a non-blank `evidence`
+    /// note, a non-blank `how_known` note (the extractor's field), or a BUG
+    /// that names its regression test — in `data.regression_test` (the
+    /// indexer's finding) or in the record's own text.
+    ///
+    /// Confirmation is a bonus, never a penalty: a row that cannot state its
+    /// evidence still ranks, it just does not gain the bonus (see
+    /// `recall_peek`'s scoring).
+    pub fn is_confirmed(&self) -> bool {
+        fn non_blank(value: &serde_json::Value, key: &str) -> bool {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        }
+        if non_blank(&self.data, "evidence") || non_blank(&self.data, "how_known") {
+            return true;
+        }
+        if self.record_type == MemoryRecordType::Bug {
+            if self
+                .data
+                .get("regression_test")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                return true;
+            }
+            if self.content.to_lowercase().contains("regression") {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True when the record is a claim that does not say how it is known —
+    /// `memory_search` tags the line `[unconfirmed]`. Digests, episodic rows
+    /// and working rows are never marked.
+    pub fn is_unconfirmed(&self) -> bool {
+        self.is_claim() && !self.is_confirmed()
+    }
 }
 
 /// One entry of the rolling memory-access log — surfaced in the Graph tab's

@@ -233,7 +233,9 @@ the cheapest tool that can answer the question.
 
 - memory_write: the moment you learn something durable (decision, root cause, \
 convention, user correction) — semantic for facts, procedural for workflows. \
-Deferred = lost; auto-capture is not enough.
+Deferred = lost; auto-capture is not enough. Say how it is known with evidence \
+(a test name, a file and line, a run, the user said so) — optional, but a record \
+without it is marked unconfirmed.
 - memory_search: the ONE read path — search with a query, browse without one, \
 narrow with record_type/tier. MANDATORY before planning non-trivial work (no \
 record_type — a pointer-first bundle across plans/reviews/bugs/decisions). \
@@ -1069,8 +1071,11 @@ mod tests {
         // a deliberate, documented head change. Re-pinned on the wt/mnemo
         // merge for the intentional WORKFLOW_LIFECYCLE REVIEWING addition
         // (finish ticks any step appended during review — plan 33a7341e).
+        // Bumped 2026-11-08 (plan 373dec00 step 4): the memory_write habit
+        // gained one sentence on `evidence` — the prompt side of the
+        // confirmation bonus.
         const GOLDEN_HEAD: &str =
-            "len=12555|sha256=99de55ccaba5345c242dbcb8f2aec2eb43800adc8185f4d95a9a2153bf668f06";
+            "len=12706|sha256=e50d693bbb4d772ef7b1504d5608721077c211b375cbc0955ff28634978dd121";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",

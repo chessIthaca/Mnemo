@@ -42,6 +42,9 @@ struct MemoryWriteArgs {
     tier: String,
     title: String,
     content: String,
+    /// What shows this is true — optional; nothing is refused without it.
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 /// Arguments for `memory_recall`.
@@ -189,7 +192,8 @@ impl Tool for MemoryWriteTool {
                 "properties": {
                     "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "Memory tier: working (raw events), episodic (session summaries), semantic (facts), procedural (workflows)."},
                     "title": {"type": "string", "description": "Short label, used in recall listings; carries the typed prefix."},
-                    "content": {"type": "string", "description": "The memory body — the full text to persist and recall later."}
+                    "content": {"type": "string", "description": "The memory body — the full text to persist and recall later."},
+                    "evidence": {"type": "string", "description": "What shows this is true: a test name, a file and line, a run, the user said so."}
                 },
                 "required": ["tier", "title", "content"]
             }),
@@ -283,7 +287,10 @@ impl Tool for MemoryWriteTool {
         // to the historical DB-only row.
         if let Some(support) = self.knowledge.as_ref().filter(|_| is_knowledge_type) {
             let body = args.content.clone();
-            match support.knowledge.write(record_type, &title, &body) {
+            match support
+                .knowledge
+                .write_with_evidence(record_type, &title, &body, args.evidence.as_deref())
+            {
                 Ok(rel) => match support.reindex(std::slice::from_ref(&rel)).await {
                     Ok(()) => {
                         // Count the knowledge-file write (the run-all
@@ -342,6 +349,19 @@ impl Tool for MemoryWriteTool {
             let now = (self.now)();
             let mut memory = Memory::new(tier, title.clone(), args.content, now);
             memory.data = scope.data();
+            // A row with no knowledge file keeps its evidence in `data`,
+            // merged into whatever the scope put there (plan 373dec00).
+            if let Some(evidence) = args
+                .evidence
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+            {
+                if !memory.data.is_object() {
+                    memory.data = json!({});
+                }
+                memory.data["evidence"] = json!(evidence);
+            }
             match self.store.write(memory).await {
                 Ok(id) => {
                     // Human-readable confirmation (backlog 2026-08-20: "wrote
@@ -841,6 +861,10 @@ struct MemoryUpdateArgs {
     title: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// What shows the record is true — confirms an old record on its own,
+    /// with no title/content change needed (plan 373dec00).
+    #[serde(default)]
+    evidence: Option<String>,
     /// Targeted-repair mode (backlog 488248ce): the exact text to replace. It
     /// must occur exactly once in the record body.
     #[serde(default)]
@@ -1005,7 +1029,8 @@ impl Tool for MemoryUpdateTool {
                      matched). Pass with replace_with, and nothing else."},
                     "replace_with": {"type": "string", "description": "Targeted repair: what find is \
                      replaced with; an empty string deletes it. The result must not leave the body \
-                     empty."}
+                     empty."},
+                    "evidence": {"type": "string", "description": "What shows this is true: a test name, a file and line, a run, the user said so."}
                 },
                 "required": ["id"]
             }),
@@ -1033,20 +1058,26 @@ impl Tool for MemoryUpdateTool {
                 )
             }
         };
-        if repair.is_some() && (args.title.is_some() || args.content.is_some()) {
+        if repair.is_some() && (args.title.is_some() || args.content.is_some() || args.evidence.is_some())
+        {
             return ToolResult::error(
-                "find/replace_with is a targeted repair — pass it alone, with no title or \
-                 content: one call, one intent",
+                "find/replace_with is a targeted repair — pass it alone, with no title, \
+                 content or evidence: one call, one intent",
             );
         }
-        if repair.is_none() && args.title.is_none() && args.content.is_none() {
+        if repair.is_none()
+            && args.title.is_none()
+            && args.content.is_none()
+            && args.evidence.is_none()
+        {
             return ToolResult::error(
-                "nothing to update: pass title and/or content, or find + replace_with",
+                "nothing to update: pass title, content and/or evidence, or find + replace_with",
             );
         }
         let changed: Vec<&str> = [
             args.title.as_ref().map(|_| "title"),
             args.content.as_ref().map(|_| "content"),
+            args.evidence.as_ref().map(|_| "evidence"),
             repair.map(|_| "find + replace_with"),
         ]
         .into_iter()
@@ -1070,10 +1101,12 @@ impl Tool for MemoryUpdateTool {
                     "knowledge record {id} exists but the file backing is not wired"
                 ));
             };
-            match support
-                .knowledge
-                .update(&rel, args.title.as_deref(), args.content.as_deref())
-            {
+            match support.knowledge.update(
+                &rel,
+                args.title.as_deref(),
+                args.content.as_deref(),
+                args.evidence.as_deref(),
+            ) {
                 Ok(_) => match support.reindex(std::slice::from_ref(&rel)).await {
                     Ok(()) => ToolResult::success(format!(
                         "Updated knowledge record {} ({} changed) — file .coding/knowledge/{rel} \
@@ -1100,6 +1133,21 @@ impl Tool for MemoryUpdateTool {
                 }
                 Ok(_) => {}
                 Err(e) => return ToolResult::error(format!("failed to read memory: {e}")),
+            }
+            // Evidence lands in a knowledge file's front matter. A
+            // database-only row keeps it in its `data` JSON, which
+            // `update_memory` does not rewrite — say so instead of dropping it.
+            if args
+                .evidence
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|e| !e.is_empty())
+            {
+                return ToolResult::error(format!(
+                    "memory {id} has no knowledge file, so its evidence would live in the row's \
+                     data and memory_update cannot rewrite that — pass evidence to memory_write \
+                     instead (title and/or content here still work)"
+                ));
             }
             match self
                 .store
@@ -1256,6 +1304,10 @@ struct MemorySupersedeArgs {
     tier: String,
     title: String,
     content: String,
+    /// What shows the SUCCESSOR is true — a successor is a new claim and does
+    /// not inherit the old record's evidence (plan 373dec00).
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 /// The `memory_supersede` tool — replace a memory with its successor,
@@ -1364,7 +1416,8 @@ impl Tool for MemorySupersedeTool {
                     "id": {"type": "string", "description": "The id of the memory being superseded (from recall/list output)."},
                     "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "The successor's tier (same tiers as memory_write). A file-backed knowledge record's successor is always stored as semantic — a working/episodic/procedural request is stored as semantic instead of refused."},
                     "title": {"type": "string", "description": "The successor's title — keep the same typed prefix when the topic is unchanged."},
-                    "content": {"type": "string", "description": "The successor's content."}
+                    "content": {"type": "string", "description": "The successor's content."},
+                    "evidence": {"type": "string", "description": "What shows this is true: a test name, a file and line, a run, the user said so."}
                 },
                 "required": ["id", "tier", "title", "content"]
             }),
@@ -1416,7 +1469,12 @@ impl Tool for MemorySupersedeTool {
                     "knowledge record {old_id} exists but the file backing is not wired"
                 ));
             };
-            match support.knowledge.supersede(&old_rel, &title, &args.content) {
+            match support.knowledge.supersede_with_evidence(
+                &old_rel,
+                &title,
+                &args.content,
+                args.evidence.as_deref(),
+            ) {
                 Ok(new_rel) => {
                     // F12: rewrite hand-written `File:` pointer lines that
                     // assumed a different successor filename than the tool
@@ -1424,7 +1482,11 @@ impl Tool for MemorySupersedeTool {
                     // self-reference never dangles.
                     let (body, stale_pointers) = reconcile_file_pointers(&args.content, &new_rel);
                     if !stale_pointers.is_empty() {
-                        if let Err(e) = support.knowledge.update(&new_rel, None, Some(&body)) {
+                        if let Err(e) =
+                            support
+                                .knowledge
+                                .update(&new_rel, None, Some(&body), None)
+                        {
                             return ToolResult::error(format!(
                                 "superseded knowledge record {old_id}, but rewriting its \
                                  {} stale File: pointer line(s) failed: {e} — the canonical \
@@ -1462,7 +1524,15 @@ impl Tool for MemorySupersedeTool {
                 Err(e) => ToolResult::error(format!("failed to supersede knowledge record: {e}")),
             }
         } else {
-            let memory = Memory::new(tier, title.clone(), args.content, (self.now)());
+            let mut memory = Memory::new(tier, title.clone(), args.content, (self.now)());
+            if let Some(evidence) = args
+                .evidence
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+            {
+                memory.data = json!({ "evidence": evidence });
+            }
             match self.store.supersede_memory(&old_id, memory).await {
                 Ok(new_id) => {
                     let msg = format!(
@@ -2475,6 +2545,84 @@ mod tests {
             row.data.get("rel_path").and_then(|v| v.as_str()),
             Some(rel.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn update_can_confirm_an_old_record() {
+        // Plan 373dec00 step 4: `memory_update` exists in the evidence loop
+        // so a record written before the field existed can be confirmed
+        // later — evidence alone, no title/content rewrite needed.
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, write, update, _supersede, _delete) =
+            make_knowledge_tools(&dir, store.clone());
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: storage",
+                "content": "the store is sqlite\n\nfull detail: .coding/knowledge/spec/2026-02-01-spec-storage.md",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.expect("structured data");
+        let id = data["id"].as_str().unwrap().to_string();
+        let rel = data["knowledge"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches(".coding/knowledge/")
+            .to_string();
+        let file = dir.path().join(".coding/knowledge").join(&rel);
+        assert!(
+            !std::fs::read_to_string(&file).unwrap().contains("evidence ="),
+            "the record starts unconfirmed"
+        );
+
+        let result = update
+            .execute(json!({
+                "id": id,
+                "evidence": "tests/storage.rs::opens_and_closes",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("evidence = \"tests/storage.rs::opens_and_closes\""),
+            "the file (the truth) gained the evidence: {text}"
+        );
+        assert!(text.contains("the store is sqlite"), "body untouched: {text}");
+        // The row the store serves is confirmed too, after the reindex.
+        let row = store.get_memory(&id).await.unwrap().expect("row exists");
+        assert!(row.is_confirmed(), "row data carries it: {:?}", row.data);
+        assert!(!row.is_unconfirmed());
+    }
+
+    #[tokio::test]
+    async fn update_evidence_needs_a_knowledge_file() {
+        // A database-only row keeps its evidence in `data`, which
+        // update_memory does not rewrite: say so rather than drop it.
+        let store = make_store();
+        let id = store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "untyped storage fact",
+                "sqlite keeps the rows",
+                1000,
+            ))
+            .await
+            .unwrap();
+        let tool = MemoryUpdateTool::new(store.clone());
+        let result = tool
+            .execute(json!({"id": id, "evidence": "a run"}))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("memory_write"),
+            "the error names the tool that can store it: {}",
+            result.output
+        );
+        // The row is untouched, and still unconfirmed.
+        let row = store.get_memory(&id).await.unwrap().unwrap();
+        assert!(!row.is_confirmed());
     }
 
     #[tokio::test]

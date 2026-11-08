@@ -1692,8 +1692,21 @@ impl MemoryStoreTrait for MemoryStore {
                         * ((age_days - stale_grace_days) / STALE_PENALTY_RAMP_DAYS)
                             .min(1.0)
                 };
+                // Confirmation bonus (plan 373dec00 step 4): a claim that
+                // states how it is known outranks an equal unconfirmed one.
+                // TIEBREAKER-SIZED on purpose: the eval showed a 0.05 bonus
+                // reordered non-ties and cost hit@5 (0.400 -> 0.325), because
+                // most BUG digests and extracted facts count as confirmed at
+                // once. At 0.005 it still decides an exact tie and never
+                // outranks a genuinely better match.
+                let confirmed_bonus = if m.is_claim() && m.is_confirmed() {
+                    0.005
+                } else {
+                    0.0
+                };
                 let score = sim * sim_weight + decayed_strength * 0.3 + keyword_boost + tw + cw
-                    - staleness_penalty;
+                    - staleness_penalty
+                    + confirmed_bonus;
                 ScoredMemory { memory: m, score }
             })
             .collect();

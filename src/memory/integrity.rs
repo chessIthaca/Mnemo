@@ -19,7 +19,10 @@
 //! and a false positive costs one `include_quarantined` lookup, not a lost
 //! record.
 
+use std::collections::BTreeMap;
+
 use crate::error::Result;
+use crate::memory::health::{bare_title, normalize_title};
 use crate::memory::{
     Memory, MemoryClass, MemoryFilter, MemoryRecordType, MemoryStoreTrait, MemoryTier, SemanticData,
 };
@@ -377,6 +380,91 @@ pub async fn quarantine_git_state_facts(store: &dyn MemoryStoreTrait) -> Result<
                 )
                 .await?;
             quarantined.push(row.id);
+        }
+    }
+    Ok(quarantined)
+}
+
+/// Why [`quarantine_duplicate_digests`] retires a row: the same plan or review,
+/// spelled out where `include_quarantined` shows it.
+const DUPLICATE_DIGEST_REASON: &str = "duplicate digest of the same plan or review";
+
+/// Retire the authored plan and review digests that duplicate a file-derived
+/// twin (plan 373dec00 step 12).
+///
+/// A plan (`.coding/plans/*.md`) or a review (`.coding/reviews/*.md`) lives on
+/// disk and the indexer re-derives its digest from that file — the file is the
+/// truth. An older AUTHORED row with the same record type and the same
+/// normalized title restates that file and competes with it in recall (on the
+/// live store: 141 PLAN and 1 REVIEW title pairs, almost all an old authored
+/// row beside its derived twin), so it is retired.
+///
+/// QUARANTINE — never delete: `include_quarantined` keeps every row and its
+/// reason, exactly like the other startup sweeps. Groups are
+/// (record type, [`normalize_title`] of the prefix-stripped title), so only a
+/// genuine twin matches — a SPEC and a PLAN sharing a title never group, and
+/// knowledge-record rows are out of scope entirely (they have their own
+/// duplicate report in `health.rs`).
+///
+/// Within a group of two or more:
+///
+/// * a `Derived` row always stays, because it is the file's own digest;
+/// * a group holding a derived row retires every authored twin;
+/// * a group with no derived row keeps the newest authored row (largest
+///   `created_at`, ties by largest id) and retires the rest.
+///
+/// `access_count` protects nothing here: a twin carries the same plan or
+/// review, so whatever the user asked for is still answered by the row that
+/// stays. Idempotent — quarantined rows drop out of the default filter, so a
+/// re-run finds nothing new. Returns the ids newly quarantined this run.
+pub async fn quarantine_duplicate_digests(store: &dyn MemoryStoreTrait) -> Result<Vec<String>> {
+    let rows = store
+        .list_filtered(&MemoryFilter::new().tier(MemoryTier::Semantic))
+        .await?;
+    let mut groups: BTreeMap<(&'static str, String), Vec<&Memory>> = BTreeMap::new();
+    for row in &rows {
+        if !matches!(
+            row.record_type,
+            MemoryRecordType::Plan | MemoryRecordType::Review
+        ) {
+            continue;
+        }
+        let key = normalize_title(&bare_title(&row.title));
+        if key.is_empty() {
+            continue;
+        }
+        groups
+            .entry((row.record_type.as_str(), key))
+            .or_default()
+            .push(row);
+    }
+
+    let mut quarantined = Vec::new();
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        // The newest authored twin only survives when there is no file-derived
+        // row in the group; a derived row is never retired.
+        let newest_authored = members
+            .iter()
+            .filter(|row| row.record_class == MemoryClass::Authored)
+            .max_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)))
+            .map(|row| row.id.as_str());
+        let has_derived = members
+            .iter()
+            .any(|row| row.record_class == MemoryClass::Derived);
+        for row in members {
+            if row.record_class == MemoryClass::Derived {
+                continue;
+            }
+            if !has_derived && Some(row.id.as_str()) == newest_authored {
+                continue;
+            }
+            store
+                .quarantine_memory(&row.id, DUPLICATE_DIGEST_REASON)
+                .await?;
+            quarantined.push(row.id.clone());
         }
     }
     Ok(quarantined)
@@ -828,5 +916,257 @@ mod tests {
         assert!(!restates_repo_state(
             "Root cause: the draft state was cleared before the reply landed."
         ));
+    }
+
+    /// One plan/review digest shaped like the store's: a typed title, the
+    /// given provenance class, and the timestamp that orders a group.
+    fn digest(
+        record_type: MemoryRecordType,
+        bare: &str,
+        class: MemoryClass,
+        created_at: i64,
+    ) -> Memory {
+        let prefix = match record_type {
+            MemoryRecordType::Plan => "PLAN",
+            MemoryRecordType::Review => "REVIEW",
+            MemoryRecordType::Spec => "SPEC",
+            other => panic!("unexpected record type {other:?}"),
+        };
+        let mut row = Memory::new(
+            MemoryTier::Semantic,
+            format!("{prefix}: {bare}"),
+            format!("digest of {bare}"),
+            created_at,
+        );
+        row.record_class = class;
+        row
+    }
+
+    #[tokio::test]
+    async fn a_digest_with_a_file_twin_is_quarantined() {
+        // Plan 373dec00 step 12: the plan file is the truth and its digest is
+        // re-derived; an old authored row beside that derived twin competes
+        // with it in recall, so it is retired.
+        let store = store();
+        let derived = store
+            .write(digest(
+                MemoryRecordType::Plan,
+                "the memory map",
+                MemoryClass::Derived,
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+        let mut authored_row = digest(
+            MemoryRecordType::Plan,
+            "the memory map",
+            MemoryClass::Authored,
+            1_700_000_000,
+        );
+        // A searched row is still a duplicate: the twin holds the same plan.
+        authored_row.access_count = 42;
+        let authored = store.write(authored_row).await.unwrap();
+
+        let quarantined = quarantine_duplicate_digests(store.as_ref()).await.unwrap();
+        assert_eq!(
+            quarantined,
+            vec![authored.clone()],
+            "only the authored twin goes"
+        );
+
+        // The derived row is the file's own digest and always stays.
+        let kept = store.get_memory(&derived).await.unwrap().unwrap();
+        assert!(
+            kept.quarantined.is_none(),
+            "the file's digest is never retired: {kept:?}"
+        );
+
+        // Quarantine never deletes — the row and its reason are still there.
+        let flagged = store.get_memory(&authored).await.unwrap().unwrap();
+        assert_eq!(
+            flagged.quarantined.as_deref(),
+            Some(DUPLICATE_DIGEST_REASON),
+            "the reason names the duplicate"
+        );
+
+        // Recall and the default listing stop returning it.
+        let default_list = store.list_filtered(&MemoryFilter::new()).await.unwrap();
+        assert!(
+            default_list.iter().all(|m| m.id != authored),
+            "a quarantined duplicate never injects"
+        );
+
+        // `include_quarantined` still finds it: recoverable history, never a
+        // delete.
+        let full = store
+            .list_filtered(&MemoryFilter::new().include_quarantined())
+            .await
+            .unwrap();
+        assert!(full.iter().any(|m| m.id == authored), "recoverable");
+
+        // Idempotent: the next startup finds nothing left.
+        let again = quarantine_duplicate_digests(store.as_ref()).await.unwrap();
+        assert!(again.is_empty(), "idempotent: {again:?}");
+    }
+
+    #[tokio::test]
+    async fn the_newest_of_authored_twins_stays() {
+        // No file twin: the newest authored digest wins and the older ones are
+        // retired. The titles differ only in case and spacing, so this also
+        // exercises the normalized-title grouping.
+        let store = store();
+        let older = store
+            .write(digest(
+                MemoryRecordType::Plan,
+                "same plan",
+                MemoryClass::Authored,
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+        let newer = store
+            .write(digest(
+                MemoryRecordType::Plan,
+                "Same  plan!",
+                MemoryClass::Authored,
+                1_700_000_100,
+            ))
+            .await
+            .unwrap();
+        let unrelated = store
+            .write(digest(
+                MemoryRecordType::Review,
+                "same plan",
+                MemoryClass::Authored,
+                1_700_000_200,
+            ))
+            .await
+            .unwrap();
+
+        let quarantined = quarantine_duplicate_digests(store.as_ref()).await.unwrap();
+        assert_eq!(quarantined, vec![older.clone()], "the older twin goes");
+        let kept = store.get_memory(&newer).await.unwrap().unwrap();
+        assert!(
+            kept.quarantined.is_none(),
+            "the newest authored twin stays: {kept:?}"
+        );
+        // A REVIEW with the same bare title is a different record type.
+        let review = store.get_memory(&unrelated).await.unwrap().unwrap();
+        assert!(
+            review.quarantined.is_none(),
+            "record types never group together: {review:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_twins_are_both_kept() {
+        // Two derived rows are both re-derived from files: retiring either
+        // would lose a file's digest, so neither is touched.
+        let store = store();
+        let first = store
+            .write(digest(
+                MemoryRecordType::Plan,
+                "same plan",
+                MemoryClass::Derived,
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+        let second = store
+            .write(digest(
+                MemoryRecordType::Plan,
+                "same plan",
+                MemoryClass::Derived,
+                1_700_000_100,
+            ))
+            .await
+            .unwrap();
+
+        let quarantined = quarantine_duplicate_digests(store.as_ref()).await.unwrap();
+        assert!(quarantined.is_empty(), "derived rows always stay: {quarantined:?}");
+        for id in [&first, &second] {
+            let row = store.get_memory(id).await.unwrap().unwrap();
+            assert!(row.quarantined.is_none(), "still live: {row:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_knowledge_record_pair_is_never_touched() {
+        // SPEC / DECISION / BUG / HOW rows are knowledge records, not plan or
+        // review digests; their duplicate handling belongs to the health
+        // report, so this sweep leaves them alone even with a twin.
+        let store = store();
+        let authored = store
+            .write(digest(
+                MemoryRecordType::Spec,
+                "tier ladder",
+                MemoryClass::Authored,
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+        let derived = store
+            .write(digest(
+                MemoryRecordType::Spec,
+                "tier ladder",
+                MemoryClass::Derived,
+                1_700_000_100,
+            ))
+            .await
+            .unwrap();
+
+        let quarantined = quarantine_duplicate_digests(store.as_ref()).await.unwrap();
+        assert!(
+            quarantined.is_empty(),
+            "knowledge records are out of scope: {quarantined:?}"
+        );
+        for id in [&authored, &derived] {
+            let row = store.get_memory(id).await.unwrap().unwrap();
+            assert!(row.quarantined.is_none(), "still live: {row:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn differently_titled_digests_are_kept() {
+        // Only the same plan or review is a duplicate: two different plans
+        // (each an authored/derived pair of its own) both stay live.
+        let store = store();
+        let authored_first = store
+            .write(digest(
+                MemoryRecordType::Plan,
+                "first plan",
+                MemoryClass::Authored,
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+        let derived_second = store
+            .write(digest(
+                MemoryRecordType::Plan,
+                "second plan",
+                MemoryClass::Derived,
+                1_700_000_100,
+            ))
+            .await
+            .unwrap();
+        let review = store
+            .write(digest(
+                MemoryRecordType::Review,
+                "first plan",
+                MemoryClass::Derived,
+                1_700_000_200,
+            ))
+            .await
+            .unwrap();
+
+        let quarantined = quarantine_duplicate_digests(store.as_ref()).await.unwrap();
+        assert!(
+            quarantined.is_empty(),
+            "different plans and record types are not duplicates: {quarantined:?}"
+        );
+        for id in [&authored_first, &derived_second, &review] {
+            let row = store.get_memory(id).await.unwrap().unwrap();
+            assert!(row.quarantined.is_none(), "still live: {row:?}");
+        }
     }
 }

@@ -792,7 +792,10 @@ fn duplicate_titles(rows: &[Memory]) -> Vec<DuplicateTitle> {
 }
 
 /// The title without its typed prefix (`"BUG: crash"` → `"crash"`).
-fn bare_title(title: &str) -> String {
+///
+/// `pub(crate)` for the digest sweep in `integrity.rs`, which groups plan and
+/// review digests by the same bare title the health report uses.
+pub(crate) fn bare_title(title: &str) -> String {
     for prefix in ["SPEC:", "DECISION:", "BUG:", "PLAN:", "HOW:", "REVIEW:"] {
         if let Some(rest) = title.strip_prefix(prefix) {
             return rest.trim().to_string();
@@ -803,7 +806,10 @@ fn bare_title(title: &str) -> String {
 
 /// Lowercase; every run of non-alphanumeric characters collapses to one space;
 /// trimmed. `"BUG:  Same  crash!"` and `"bug: same crash"` normalize alike.
-fn normalize_title(title: &str) -> String {
+///
+/// `pub(crate)` for the digest sweep in `integrity.rs`, so a twin is matched
+/// exactly as the health report matches duplicate titles.
+pub(crate) fn normalize_title(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
     let mut pending_space = false;
     for ch in title.chars() {

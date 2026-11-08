@@ -3346,6 +3346,49 @@ mod tests {
         assert!(dir.path().join("openspec/specs/importer/spec.md").is_file());
     }
 
+    /// A section body that opens with `# ` / `## ` lines must stay inside its
+    /// section (review L3 class, backlog 77ff8f45): board.json keeps the raw
+    /// text, the plan render escapes those lines, and the archive therefore
+    /// still carries the lead's words without a backslash.
+    #[tokio::test]
+    async fn a_section_heading_does_not_rename_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        research_schema(dir.path(), true);
+        let board = board(dir.path());
+        let plan = board
+            .create_with_sections(
+                PlanDraft {
+                    spec_deltas: vec![added_delta("importer", "Preserve source rows")],
+                    ..draft("Custom archive")
+                },
+                research_section("# Findings\n\nInspected src/import.rs."),
+            )
+            .unwrap();
+        board
+            .update_with_sections(
+                &plan.id,
+                PlanEdit::default(),
+                Some(research_section(
+                    "# Findings\n\nInspected src/import.rs again.",
+                )),
+            )
+            .unwrap();
+
+        let parsed =
+            PlanFile::read_from_file(&dir.path().join("plans").join(format!("{}.md", plan.id)))
+                .unwrap();
+        assert_eq!(parsed.title, "Custom archive");
+
+        complete_steps(&board, &plan.id);
+        assert!(matches!(
+            board.try_close(&plan.id, &FakeLedger::passing()).await,
+            CloseOutcome::Closed { .. }
+        ));
+        let archive = archive_dir(dir.path(), &plan.id, "custom-archive");
+        let research = std::fs::read_to_string(archive.join("research.md")).unwrap();
+        assert_eq!(research, "# Findings\n\nInspected src/import.rs again.\n");
+    }
+
     #[tokio::test]
     async fn a_close_retries_after_the_archive_succeeded_but_the_report_failed() {
         let dir = tempfile::tempdir().unwrap();

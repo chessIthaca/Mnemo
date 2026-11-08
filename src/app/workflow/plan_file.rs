@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::app::tool::workflow::plan::escape_section_markers;
 use crate::error::Result;
 use crate::openspec::{Delta, Requirement};
 
@@ -451,7 +452,7 @@ fn render_schema_sections(sections: &BTreeMap<String, String>) -> String {
     for (id, text) in sections {
         let text = text.trim();
         if !text.is_empty() {
-            out.push_str(&format!("\n## {id}\n\n{text}\n"));
+            out.push_str(&format!("\n## {id}\n\n{}\n", escape_section_markers(text)));
         }
     }
     out
@@ -568,6 +569,29 @@ mod tests {
         assert!(text.find("## decision-log").unwrap() < text.find("## research").unwrap());
         assert!(text.find("## research").unwrap() < text.find("## Steps").unwrap());
         assert!(text.contains("## research\n\nEvidence and findings.\n"));
+        let parsed = PlanFile::parse(&text).unwrap();
+        assert_eq!(parsed.title, "T");
+        assert_eq!(parsed.steps.len(), 1);
+        assert_eq!(parsed.steps[0].text, "step one");
+    }
+
+    #[test]
+    fn schema_section_headings_do_not_become_plan_structure() {
+        let dir = tempdir().unwrap();
+        let plan = PlanFile::new("T", "G", "C", vec!["step one".into()]);
+        let sections = BTreeMap::from([(
+            "research".to_string(),
+            "# Findings\n\n## Details\n\nSome text.".to_string(),
+        )]);
+        let path = plan
+            .write_to_dir_with_sections(dir.path(), "plan", &[], &sections)
+            .unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        // A section body quoting the plan's own structure is escaped at the
+        // render (review L3 class, backlog 77ff8f45): the raw section text is
+        // board-owned state and stays backslash-free.
+        assert!(text.contains("\\# Findings"), "{text}");
+        assert!(text.contains("\\## Details"), "{text}");
         let parsed = PlanFile::parse(&text).unwrap();
         assert_eq!(parsed.title, "T");
         assert_eq!(parsed.steps.len(), 1);

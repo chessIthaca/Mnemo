@@ -34,6 +34,8 @@
 
     // The host emits the full list whenever it changed, including an empty one
     // (which closes the question).
+    // A failed subscription or first fetch never opens a sheet: there is
+    // nothing for the user to decide, so it only goes to the console.
     void active
       .onOffers((next) => {
         if (!stopped) offers = next;
@@ -43,7 +45,7 @@
         else unlisten = stop;
       })
       .catch((cause: unknown) => {
-        if (!stopped) error = errorText(cause);
+        console.error("laya learnings: could not watch the offer channel", cause);
       });
     void active
       .offers()
@@ -51,7 +53,7 @@
         if (!stopped) offers = next;
       })
       .catch((cause: unknown) => {
-        if (!stopped) error = errorText(cause);
+        console.error("laya learnings: could not read the pending offers", cause);
       });
     return () => {
       stopped = true;
@@ -83,28 +85,44 @@
   }
 </script>
 
-{#if current !== null}
+{#if current !== null || error !== null}
   <Sheet
     open={true}
     title="Update Laya's learnings?"
     eyebrow="LAYA'S LEARNINGS"
-    onclose={() => void answer(false)}
+    onclose={() => {
+      // With an offer left, closing the sheet declines it. With nothing left to
+      // decide it only dismisses the failed answer, and must not decide again.
+      if (current !== null) void answer(false);
+      else error = null;
+    }}
   >
-    <p class="dialog-copy">{offerMessage(current)}</p>
+    {#if current !== null}
+      <p class="dialog-copy">{offerMessage(current)}</p>
+    {/if}
     {#if error !== null}
       <p class="learnings-error" role="alert">{error}</p>
     {/if}
     <div class="dialog-actions">
-      <button class="button button-quiet" disabled={busy} onclick={() => void answer(false)}>
-        Not now
-      </button>
-      <button class="button button-primary" disabled={busy} onclick={() => void answer(true)}>
-        {#if busy}
-          Updating…
-        {:else}
-          Update
-        {/if}
-      </button>
+      {#if current !== null}
+        <button class="button button-quiet" disabled={busy} onclick={() => void answer(false)}>
+          Not now
+        </button>
+        <button class="button button-primary" disabled={busy} onclick={() => void answer(true)}>
+          {#if busy}
+            Updating…
+          {:else}
+            Update
+          {/if}
+        </button>
+      {:else}
+        <button
+          class="button button-quiet"
+          onclick={() => {
+            error = null;
+          }}>Close</button
+        >
+      {/if}
     </div>
   </Sheet>
 {/if}

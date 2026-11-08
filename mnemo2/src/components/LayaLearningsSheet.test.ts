@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { describe, expect, it, vi } from "vitest";
 import type { LayaLearningsTransport, LearningsOffer } from "../lib/layaLearnings";
 import LayaLearningsSheet from "./LayaLearningsSheet.svelte";
@@ -137,6 +137,61 @@ describe("LayaLearningsSheet", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("that update is no longer pending");
     expect(await shownQuestion()).toContain("The Mnemo2 installer has");
+  });
+
+  it("a rejected only offer still shows the error", async () => {
+    const { transport, decide } = fakeTransport([offer()]);
+    decide.mockRejectedValueOnce("that update is no longer pending");
+    render(LayaLearningsSheet, { props: { transport } });
+    await shownQuestion();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("that update is no longer pending");
+    // Nothing is left to decide, so the sheet offers only a dismissal.
+    const dialog = screen.getByRole("dialog", { name: "Update Laya's learnings?" });
+    const footer = dialog.querySelector(".dialog-actions") as HTMLElement;
+    expect(within(footer).queryByRole("button", { name: "Update" })).toBeNull();
+
+    await fireEvent.click(within(footer).getByRole("button", { name: "Close" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(decide).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows nothing when the first fetch fails", async () => {
+    const { transport, offers } = fakeTransport([]);
+    offers.mockRejectedValueOnce("ipc is not ready");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(LayaLearningsSheet, { props: { transport } });
+
+    await waitFor(() => expect(offers).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(logged).toHaveBeenCalledWith(
+        "laya learnings: could not read the pending offers",
+        "ipc is not ready",
+      ),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    logged.mockRestore();
+  });
+
+  it("shows nothing when the subscription fails", async () => {
+    const { transport, onOffers } = fakeTransport([]);
+    onOffers.mockRejectedValueOnce("ipc is not ready");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(LayaLearningsSheet, { props: { transport } });
+
+    await waitFor(() => expect(onOffers).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(logged).toHaveBeenCalledWith(
+        "laya learnings: could not watch the offer channel",
+        "ipc is not ready",
+      ),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    logged.mockRestore();
   });
 
   it("opens when the host pushes a new offer", async () => {

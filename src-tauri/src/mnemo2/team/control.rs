@@ -24,7 +24,9 @@ use super::{
     LiveWorker, RECOVERED_WORKTREE_CLEANUP_ERROR, TeamRuntime, WorkerSessionSpec,
     cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key,
 };
-use super::nudge::{NUDGE_STRIKE_LIMIT, claim_nudge, deliver_nudge, nudge_ignored_row};
+use super::nudge::{
+    NUDGE_STRIKE_LIMIT, claim_nudge, deliver_nudge, message_can_show_drift, nudge_ignored_row,
+};
 use super::pump::{pump_worker, snapshot_model};
 use super::record::{
     ChangeSource, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox,
@@ -169,12 +171,16 @@ impl TeamRuntime {
         })
         .await;
         self.persist().await?;
-        self.spawn_drift_check(worker_id, &text).await;
+        // `record` was read before this message joined the inbox.
+        if message_can_show_drift(&record, sender) {
+            self.spawn_drift_check(worker_id, &text).await;
+        }
         self.worker(worker_id).await
     }
 
-    /// The drift nudge (design §4.6): a delivered lead message that Laya
-    /// reads a tier above the worker's own nudges the lead — in the
+    /// The drift nudge (design §4.6): a delivered lead or user message that
+    /// [`message_can_show_drift`] lets through and that Laya reads a tier above
+    /// the worker's own nudges the lead — in the
     /// background, so it never blocks or fails the message. Off in routing
     /// mode `off` (no classifier calls) and when nudges are disabled.
     async fn spawn_drift_check(&self, worker_id: &str, text: &str) {

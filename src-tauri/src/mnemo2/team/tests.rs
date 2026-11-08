@@ -21,7 +21,7 @@ use super::dispatch::{
 use super::guardrails::executor_guardrails;
 use super::lead_tools::worker_status_view;
 use super::merge::{delete_merged_branch, validate_merge, WORKTREE_CLEANUP_ERROR};
-use super::nudge::{note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
+use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
 use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
 };
@@ -5815,6 +5815,54 @@ async fn route_fix_prompt_draws_no_drift_nudge() {
         "the dispatch and the scope message each asked Laya once"
     );
     fixture.team.shutdown().await;
+}
+
+/// What reaches the drift check, including the order seen on real read-back
+/// workers: Mnemo2's plan-changed notices first, then the lead's answer.
+#[test]
+fn drift_check_skips_generated_messages_and_the_read_back_answer() {
+    let root = tempfile::tempdir().expect("workspace");
+    let entry = |sender, kind| InboxEntry {
+        sender,
+        kind,
+        text: "earlier".to_string(),
+        at_ms: 1,
+    };
+    let plain = worker(root.path(), "plainworker1");
+    assert!(message_can_show_drift(&plain, MessageSender::ExternalLead));
+    assert!(message_can_show_drift(&plain, MessageSender::Lead));
+    assert!(message_can_show_drift(&plain, MessageSender::User));
+    assert!(
+        !message_can_show_drift(&plain, MessageSender::Mnemo),
+        "Mnemo2's own text is never read"
+    );
+    let mut read_back = worker(root.path(), "readback0001");
+    read_back.read_back = true;
+    for sender in [
+        MessageSender::ExternalLead,
+        MessageSender::Lead,
+        MessageSender::User,
+    ] {
+        assert!(
+            !message_can_show_drift(&read_back, sender),
+            "the first reply is the read-back answer: {sender:?}"
+        );
+    }
+    read_back.inbox.push(entry(MessageSender::Mnemo, InboxKind::Steer));
+    read_back.inbox.push(entry(MessageSender::Mnemo, InboxKind::Prompt));
+    assert!(
+        !message_can_show_drift(&read_back, MessageSender::ExternalLead),
+        "plan-changed notices before the answer do not count as the answer"
+    );
+    read_back
+        .inbox
+        .push(entry(MessageSender::ExternalLead, InboxKind::Steer));
+    assert!(
+        message_can_show_drift(&read_back, MessageSender::ExternalLead),
+        "a lead reply delivered as a steer was the answer, so the next message is read"
+    );
+    assert!(message_can_show_drift(&read_back, MessageSender::User));
+    assert!(!message_can_show_drift(&read_back, MessageSender::Mnemo));
 }
 
 /// The deterministic review nudge: a second review round that still

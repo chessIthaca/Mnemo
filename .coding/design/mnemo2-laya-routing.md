@@ -306,7 +306,7 @@ behaviour on real Mnemo1 prompts is unmeasured.
 | Route only the first prompt | **Adapt** | Route once per worker at **dispatch**, on the step spec + brief, not on a chat message. |
 | Never auto-switch; nudge once | **Adopt** | A switch drops the cache and summarizes on smaller windows. The lead or the user decides. |
 | Strikes: 3 failed or identical tool calls → suggest tier up | **Adopt** | It is cheap and deterministic, from the worker's tool events in team.rs's pump. |
-| Drift: a later prompt reads harder | **Adapt** | Classify the lead's `team_message` / `team_route_fix` text and the review findings, not user chat. |
+| Drift: a later prompt reads harder | **Adapt** | Classify the lead's `team_message` text, not user chat. A read-back worker's first reply and Mnemo2's own fix briefs and plan notices are not read (§4.6). |
 | Manual `/model` wins and is logged | **Adopt** | An explicit lead tier at dispatch that disagrees with Laya, a `team_resume` onto another tier, and a user's mission-control `change_model` are all overrides, all logged. This delivers the deferred "manual changes feed Laya" request. |
 | Under-3-words skip | **Reject** | Specs are long; there is no short first prompt. Replaced by "classify only when the step text is at least 20 words". |
 | Skill text capped at 2000 chars | **Adapt** | Cap the classified text at 2000 chars, built **step header first**: step text, then brief, never the plan boilerplate. |
@@ -463,10 +463,21 @@ worker**, and are never automatic:
     nudge: X looks stuck (3 failing tool calls in a row); consider team_resume
     with tier difficult.`
   - Reason text: "going in circles" for the identical-call case.
-- **Drift.** When the lead sends `team_message` or `team_route_fix` text of
-  at least 20 words, classify it in the background (not awaited, best-effort).
-  If it clears on a tier above the current one, send the notice "this got
-  harder: <reason>".
+- **Drift.** When the lead sends `team_message` text of at least 20 words,
+  classify it in the background (not awaited, best-effort). If it clears on a
+  tier above the current one, send the notice "this got harder: <reason>".
+  Two kinds of message are never classified, so they cannot spend the
+  worker's one nudge:
+  - Text Mnemo2 wrote itself (sender `mnemo`): a `team_route_fix` brief or a
+    plan-changed notice. A fix brief restates findings, and failed fix rounds
+    have their own escalation.
+  - The first lead or user message a read-back worker receives. It answers
+    the worker's questions and releases a step the lead already rated.
+  Laya sees only the text, and these read like implementation specs whatever
+  they add, so the rule goes by what the message is
+  (`message_can_show_drift`, team/nudge.rs). In the log up to 2026-11-08, all
+  13 drift nudges that could be matched to their message were one of these
+  two kinds.
 - **Review.** When a `team_review` records at least one **high** finding and
   the worker's `review_rounds` reaches 2, send a nudge to the next tier up.
   This is deterministic, needs no classifier, and works in every mode except
@@ -1122,11 +1133,11 @@ runtime.rs.
      `routing.nudged` is None, queue the nudge notice (§4.6 text), set
      `routing.nudged = Some(tier)` and append a `Nudge` row;
    - a reroute calls `strikes.reset()`.
-4. Drift: in `team_message` and `team_route_fix`, when mode is not `off` and
-   the text has at least `min_words` words, spawn a detached task. It
-   classifies the text (same question, same 3 s timeout, same permit) and, if
-   it clears on a tier above the worker's, sends the nudge with reason
-   `drift`. It never blocks or fails the message.
+4. Drift: in `team_message`, when mode is not `off`, the text has at least
+   `min_words` words and `message_can_show_drift` allows it, spawn a detached
+   task. It classifies the text (same question, same 3 s timeout, same
+   permit) and, if it clears on a tier above the worker's, sends the nudge
+   with reason `drift`. It never blocks or fails the message.
 5. Review: in `review(…)`, after storing, when the new findings contain a
    `high` and `review_rounds >= 2`, send the nudge with reason `review`.
 6. On a terminal status with `routing.nudged.is_some()` and the tier

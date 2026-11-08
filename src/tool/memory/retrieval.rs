@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::memory::health;
 use crate::memory::{MemoryFilter, MemoryRecordType, MemoryStoreTrait};
 use crate::provider::ToolSchema;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
@@ -31,6 +32,41 @@ use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 /// output. (Successor of the old CONTEXT_PACK_CAP_CHARS 2048, which
 /// despite its name governed search output.)
 const SEARCH_CAP_CHARS: usize = 6144;
+
+/// The `[cites moved paths: a -> b; c gone]` suffix for a hit whose knowledge
+/// file cites paths the repo has moved past — the memory check pass stamps
+/// `data.moved_paths` (plan 373dec00 step 5). Empty for an unaffected row.
+///
+/// At most [`health::ANNOTATION_MAX_ENTRIES`] entries render, then `+N more`,
+/// so a record citing dozens of gone paths cannot blow `SEARCH_CAP_CHARS`.
+fn moved_paths_note(data: &serde_json::Value) -> String {
+    let Some(entries) = data
+        .get(health::MOVED_PATHS_KEY)
+        .and_then(|value| value.as_array())
+    else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for entry in entries.iter().take(health::ANNOTATION_MAX_ENTRIES) {
+        let Some(from) = entry.get("from").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        match entry.get("to").and_then(|value| value.as_str()) {
+            Some(to) => parts.push(format!("{from} -> {to}")),
+            None => parts.push(format!("{from} gone")),
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    if entries.len() > health::ANNOTATION_MAX_ENTRIES {
+        parts.push(format!(
+            "+{} more",
+            entries.len() - health::ANNOTATION_MAX_ENTRIES
+        ));
+    }
+    format!(" [cites moved paths: {}]", parts.join("; "))
+}
 
 /// Format one scored memory as a recall-style line — the same
 /// `[tier] title (id: …, score: …)` shape as `memory_recall` (the frontend
@@ -53,8 +89,12 @@ fn format_hit(sm: &crate::memory::ScoredMemory) -> String {
     } else {
         ""
     };
+    // A knowledge record whose cited source paths the repo has moved past:
+    // say so before the agent trusts the claim (the memory check pass stamps
+    // `data.moved_paths`; plan 373dec00 step 5).
+    let moved = moved_paths_note(&sm.memory.data);
     format!(
-        "[{}] {} (id: {}, score: {:.2}, strength: {:.2}){}{}\n  {}\n\n",
+        "[{}] {} (id: {}, score: {:.2}, strength: {:.2}){}{}{}\n  {}\n\n",
         sm.memory.tier,
         sm.memory.title,
         sm.memory.id,
@@ -62,6 +102,7 @@ fn format_hit(sm: &crate::memory::ScoredMemory) -> String {
         sm.memory.strength,
         superseded,
         quarantined,
+        moved,
         sm.memory.content.chars().take(200).collect::<String>(),
     )
 }

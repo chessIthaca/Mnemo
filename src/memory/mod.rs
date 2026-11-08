@@ -14,6 +14,7 @@ pub mod classifier;
 pub mod consolidation;
 pub mod embedder;
 pub mod finish_capture;
+pub mod health;
 pub mod integrity;
 pub mod indexer;
 pub mod knowledge;

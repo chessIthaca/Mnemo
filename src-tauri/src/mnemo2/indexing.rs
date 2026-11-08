@@ -29,6 +29,15 @@ pub const INDEXING_CHANNEL: &str = "mnemo2://indexing";
 const WATCHDOG_EVERY: Duration = Duration::from_millis(750);
 /// Consecutive idle polls before the watchdog calls a silent pass finished.
 const WATCHDOG_IDLE_POLLS: u32 = 3;
+/// How often the memory check watches the reconcile for a quiet window.
+const HEALTH_POLL_EVERY: Duration = Duration::from_millis(250);
+/// Consecutive quiet polls before the memory check treats the reconcile as
+/// settled (1.5 s). A reconcile over an unchanged corpus stays silent — the
+/// engine's `return` before `Started` — so "after the reconcile" is a quiet
+/// window, not an event.
+const HEALTH_QUIET_POLLS: u32 = 6;
+/// The Memory status line's prefix for the memory check's counts.
+const HEALTH_PREFIX: &str = "health: ";
 
 /// Where one pass stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -229,6 +238,71 @@ impl IndexingTracker {
         )
     }
 
+    fn memory_running(&self) -> bool {
+        matches!(
+            self.snapshot().memory,
+            Some(IndexPass {
+                state: PassState::Running,
+                ..
+            })
+        )
+    }
+
+    /// Run the memory check pass once the reconcile has settled and fold its
+    /// counts into the Memory status line (plan 373dec00 step 5).
+    ///
+    /// The engine spawns the reconcile detached and an in-sync corpus emits no
+    /// event at all, so "after the reconcile" is a quiet window, not an event.
+    /// Never blocks the open: the scan runs on the blocking pool, and a failure
+    /// is reported in the pass's detail (plus one warning), never as a failed
+    /// open.
+    fn spawn_memory_health(self: &Arc<Self>, engine: Arc<Engine>) -> JoinHandle<()> {
+        let tracker = self.clone();
+        tokio::spawn(async move {
+            let mut quiet = 0;
+            while quiet < HEALTH_QUIET_POLLS {
+                quiet = if tracker.memory_running() {
+                    0
+                } else {
+                    quiet + 1
+                };
+                if quiet < HEALTH_QUIET_POLLS {
+                    tokio::time::sleep(HEALTH_POLL_EVERY).await;
+                }
+            }
+            let Some(store) = engine.memory_store_handle() else {
+                return;
+            };
+            let root = engine.workspace_root().to_path_buf();
+            let counts = match mnemo::memory::health::run(store.as_ref(), &root).await {
+                Ok(report) => report.summary(),
+                Err(e) => {
+                    eprintln!("warning: memory health pass failed: {e}");
+                    format!("failed — {e}")
+                }
+            };
+            let detail = format!("{HEALTH_PREFIX}{counts}");
+            tracker.update(|snapshot| match snapshot.memory.as_mut() {
+                Some(pass) => {
+                    pass.detail = Some(match pass.detail.take() {
+                        Some(existing) if !existing.is_empty() => format!("{existing} · {detail}"),
+                        _ => detail,
+                    });
+                }
+                // An in-sync reconcile stays silent; the check's counts are
+                // still worth the line.
+                None => {
+                    snapshot.memory = Some(IndexPass {
+                        state: PassState::Done,
+                        done: 0,
+                        total: 0,
+                        detail: Some(detail),
+                    });
+                }
+            });
+        })
+    }
+
     /// Follow the engine's startup passes until the engine stops.
     pub fn watch(self: &Arc<Self>, engine: Arc<Engine>) {
         let mut host_events = engine.host_events();
@@ -253,8 +327,9 @@ impl IndexingTracker {
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.push(forward);
         if self.code_running() {
-            tasks.push(self.spawn_watchdog(engine));
+            tasks.push(self.spawn_watchdog(engine.clone()));
         }
+        tasks.push(self.spawn_memory_health(engine));
     }
 
     /// A pass that ends without an event (a fast pass whose terminal event

@@ -2,3 +2,4 @@ paths:
   - src/app/plan_board.rs
   - src/app/openspec/capability_spec.rs
   - src-tauri/src/mnemo2/team.rs
+  - src-tauri/src/mnemo2/team/*.rs

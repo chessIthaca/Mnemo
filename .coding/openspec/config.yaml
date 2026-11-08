@@ -9,6 +9,23 @@
 governed_files:
   dispatch-routing:
     - src-tauri/src/mnemo2/team.rs
+    - src-tauri/src/mnemo2/team/record.rs
+    - src-tauri/src/mnemo2/team/persistence.rs
+    - src-tauri/src/mnemo2/team/guardrails.rs
+    - src-tauri/src/mnemo2/team/routing.rs
+    - src-tauri/src/mnemo2/team/nudge.rs
+    - src-tauri/src/mnemo2/team/escalation.rs
+    - src-tauri/src/mnemo2/team/external_lead.rs
+    - src-tauri/src/mnemo2/team/lead_tools.rs
+    - src-tauri/src/mnemo2/team/dispatch.rs
+    - src-tauri/src/mnemo2/team/spawn.rs
+    - src-tauri/src/mnemo2/team/audit.rs
+    - src-tauri/src/mnemo2/team/control.rs
+    - src-tauri/src/mnemo2/team/review.rs
+    - src-tauri/src/mnemo2/team/pump.rs
+    - src-tauri/src/mnemo2/team/merge.rs
+    - src-tauri/src/mnemo2/team/deletion.rs
+    - src-tauri/src/mnemo2/team/tests.rs
     - src-tauri/src/mnemo2/dispatch_routing.rs
     - src-tauri/src/mnemo2/route_eval.rs
     - src-tauri/src/mnemo2/laya_settings.rs
@@ -24,13 +41,32 @@ governed_files:
   #   lead while another helper led" / "Idle external leads are released" —
   #   the attach, detach, remembered-helper and idle-sweep endpoints in
   #   src-tauri/src/mnemo2/mcp_server.rs drive the external-lead state
-  #   (TeamRuntime::ExternalLead) in src-tauri/src/mnemo2/team.rs.
+  #   (TeamRuntime::ExternalLead) in src-tauri/src/mnemo2/team.rs and
+  #   team/external_lead.rs.
   external-lead:
     - src-tauri/src/mnemo2/mcp_server.rs
     - src-tauri/src/mnemo2/team.rs
+    - src-tauri/src/mnemo2/team/record.rs
+    - src-tauri/src/mnemo2/team/persistence.rs
+    - src-tauri/src/mnemo2/team/guardrails.rs
+    - src-tauri/src/mnemo2/team/routing.rs
+    - src-tauri/src/mnemo2/team/nudge.rs
+    - src-tauri/src/mnemo2/team/escalation.rs
+    - src-tauri/src/mnemo2/team/external_lead.rs
+    - src-tauri/src/mnemo2/team/lead_tools.rs
+    - src-tauri/src/mnemo2/team/dispatch.rs
+    - src-tauri/src/mnemo2/team/spawn.rs
+    - src-tauri/src/mnemo2/team/audit.rs
+    - src-tauri/src/mnemo2/team/control.rs
+    - src-tauri/src/mnemo2/team/review.rs
+    - src-tauri/src/mnemo2/team/pump.rs
+    - src-tauri/src/mnemo2/team/merge.rs
+    - src-tauri/src/mnemo2/team/deletion.rs
+    - src-tauri/src/mnemo2/team/tests.rs
   # tier-ladder — .coding/openspec/specs/tier-ladder/spec.md:
   #   "Five fixed tiers" (escalate never offered to Laya/kNN; team_dispatch
-  #   refuses it for fresh work — src-tauri/src/mnemo2/team.rs),
+  #   refuses it for fresh work — src-tauri/src/mnemo2/team/dispatch.rs and
+  #   team/routing.rs),
   #   "Empty tiers fold down" and "Retired tier ids" (TIER_IDS, escalation,
   #   convert_old_id — src/config/endpoints.rs), "Serialized configuration
   #   writes" (the config.write.lock — src/config/mod.rs), "One Tiers page"
@@ -39,18 +75,52 @@ governed_files:
     - src/config/endpoints.rs
     - src/config/mod.rs
     - src-tauri/src/mnemo2/team.rs
+    - src-tauri/src/mnemo2/team/record.rs
+    - src-tauri/src/mnemo2/team/persistence.rs
+    - src-tauri/src/mnemo2/team/guardrails.rs
+    - src-tauri/src/mnemo2/team/routing.rs
+    - src-tauri/src/mnemo2/team/nudge.rs
+    - src-tauri/src/mnemo2/team/escalation.rs
+    - src-tauri/src/mnemo2/team/external_lead.rs
+    - src-tauri/src/mnemo2/team/lead_tools.rs
+    - src-tauri/src/mnemo2/team/dispatch.rs
+    - src-tauri/src/mnemo2/team/spawn.rs
+    - src-tauri/src/mnemo2/team/audit.rs
+    - src-tauri/src/mnemo2/team/control.rs
+    - src-tauri/src/mnemo2/team/review.rs
+    - src-tauri/src/mnemo2/team/pump.rs
+    - src-tauri/src/mnemo2/team/merge.rs
+    - src-tauri/src/mnemo2/team/deletion.rs
+    - src-tauri/src/mnemo2/team/tests.rs
     - mnemo2/src/components/TiersPage.svelte
   # worker-brief — .coding/openspec/specs/worker-brief/spec.md:
   #   "Workers get the whole plan at dispatch" — PlanBoard::brief_for in
   #   src/app/plan_board.rs, assembled into the dispatch header in
-  #   src-tauri/src/mnemo2/team.rs; "Workers can re-read their plan" — the
-  #   plan_read host tool in src-tauri/src/mnemo2/team.rs over
-  #   PlanBoard::worker_view; "Working workers hear about plan changes" —
-  #   the edit observer in src/app/plan_board.rs, delivered as worker
-  #   notices in src-tauri/src/mnemo2/team.rs.
+  #   src-tauri/src/mnemo2/team/dispatch.rs; "Workers can re-read their
+  #   plan" — the plan_read host tool in src-tauri/src/mnemo2/team/pump.rs
+  #   over PlanBoard::worker_view; "Working workers hear about plan
+  #   changes" — the edit observer in src/app/plan_board.rs, delivered as
+  #   worker notices in src-tauri/src/mnemo2/team.rs and team/control.rs.
   worker-brief:
     - src/app/plan_board.rs
     - src-tauri/src/mnemo2/team.rs
+    - src-tauri/src/mnemo2/team/record.rs
+    - src-tauri/src/mnemo2/team/persistence.rs
+    - src-tauri/src/mnemo2/team/guardrails.rs
+    - src-tauri/src/mnemo2/team/routing.rs
+    - src-tauri/src/mnemo2/team/nudge.rs
+    - src-tauri/src/mnemo2/team/escalation.rs
+    - src-tauri/src/mnemo2/team/external_lead.rs
+    - src-tauri/src/mnemo2/team/lead_tools.rs
+    - src-tauri/src/mnemo2/team/dispatch.rs
+    - src-tauri/src/mnemo2/team/spawn.rs
+    - src-tauri/src/mnemo2/team/audit.rs
+    - src-tauri/src/mnemo2/team/control.rs
+    - src-tauri/src/mnemo2/team/review.rs
+    - src-tauri/src/mnemo2/team/pump.rs
+    - src-tauri/src/mnemo2/team/merge.rs
+    - src-tauri/src/mnemo2/team/deletion.rs
+    - src-tauri/src/mnemo2/team/tests.rs
   # plan-board — born with plan a707e9fa's spec delta (the spec-impact gate
   # requirement): the plan board and its plan_create/plan_update tools,
   # plus the openspec machinery the gate itself reads (audit follow-up:

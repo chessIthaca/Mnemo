@@ -177,9 +177,7 @@ impl TeamPersistence {
                         let missing =
                             format!("this worker's saved conversation is missing ({path})");
                         eprintln!("team: {missing}");
-                        if worker.error.is_none() {
-                            worker.error = Some(missing);
-                        }
+                        note_loss(worker, missing);
                     }
                     continue;
                 }
@@ -212,6 +210,17 @@ impl TeamPersistence {
                         worker.id,
                         kept.display()
                     );
+                    // The conversation is gone as surely as a deleted file is:
+                    // flag it unless the worker never saved one.
+                    if worker.saved_messages > 0 || worker.transcript.messages.is_empty() {
+                        let path = format!("{TRANSCRIPTS_DIR}/{}.json.corrupt", worker.id);
+                        note_loss(
+                            worker,
+                            format!(
+                                "this worker's saved conversation was damaged and kept as {path}"
+                            ),
+                        );
+                    }
                     // The embedded copy stands, unrecorded, so the next save
                     // writes a valid file (or none, when it is empty).
                 }
@@ -474,6 +483,15 @@ fn is_young(entry: &std::fs::DirEntry) -> bool {
 /// destroyed, and an earlier copy is replaced.
 fn corrupt_path(file: &std::path::Path) -> PathBuf {
     file.with_extension("json.corrupt")
+}
+
+/// Record a lost or damaged conversation on the worker, keeping any earlier
+/// error beside it: an error the worker already carried must not hide the loss.
+fn note_loss(worker: &mut WorkerRecord, message: String) {
+    worker.error = Some(match worker.error.take() {
+        Some(previous) => format!("{message}; {previous}"),
+        None => message,
+    });
 }
 
 /// Windows can transiently deny a rename or remove while an indexer, an

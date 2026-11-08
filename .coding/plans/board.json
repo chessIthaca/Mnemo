@@ -1799,10 +1799,10 @@
     },
     {
       "id": "bc3e948a",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794120856085,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1794138629616,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-bc3e948a-20261108-115029.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -1832,10 +1832,10 @@
     },
     {
       "id": "cf3ce043",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794127152842,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1794138631724,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-cf3ce043-20261108-115031.md",
       "abandon_reason": null,
       "spec_deltas": [
         {

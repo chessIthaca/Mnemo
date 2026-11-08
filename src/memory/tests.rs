@@ -871,6 +871,193 @@ async fn staleness_grace_follows_the_configured_decay_tau() {
 }
 
 #[tokio::test]
+async fn old_typed_knowledge_beats_a_fresh_unrelated_fact() {
+    // Plan 373dec00 step 11 (the eval's title control): age was worth up to
+    // 0.55 in the score — 0.3 of decayed strength plus 0.25 of staleness —
+    // while a perfect semantic match was worth 0.35, so a durable record
+    // nobody had searched for lost to an unrelated row touched today.
+    // SPEC / DECISION / BUG / HOW are timeless: they keep their write-time
+    // strength and take no staleness penalty.
+    let embedder: Arc<dyn Embedder> = Arc::new(AnchorEmbedder { model_id: "anchor-real" });
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    const DAY: i64 = 86_400;
+
+    // The durable record: its title IS the query, last accessed 90 days ago
+    // (the peek paths never bump it). Strength pinned at 1.0 so the
+    // arithmetic is exact — unexempted, the decayed strength term is ~0 and
+    // the staleness ramp takes the full 0.25.
+    let mut spec = Memory::new(
+        MemoryTier::Semantic,
+        "SPEC: pipeline stages",
+        "pipeline pipeline",
+        1000,
+    );
+    spec.strength = 1.0;
+    store.write(spec).await.unwrap();
+
+    // 90 days later, a fresh untyped fact sharing the query's word: same
+    // keyword boost and tier weight, only partial similarity (sim ~0.707).
+    now_val.store(1000 + 90 * DAY, Ordering::SeqCst);
+    let mut fresh = Memory::new(
+        MemoryTier::Semantic,
+        "unrelated note",
+        "unrelated pipeline",
+        1000 + 90 * DAY,
+    );
+    fresh.strength = 1.0;
+    store.write(fresh).await.unwrap();
+
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "both records are recall candidates");
+    assert_eq!(
+        results[0].memory.title, "SPEC: pipeline stages",
+        "the 90-day-old SPEC record must outrank the fresh untyped fact"
+    );
+}
+
+#[tokio::test]
+async fn old_knowledge_keeps_its_relevance_order() {
+    // The timeless exemption changes what age is worth, not relevance: two
+    // 90-day-old DECISION records still rank by how well they answer the
+    // query, the aligned one first.
+    let embedder: Arc<dyn Embedder> = Arc::new(AnchorEmbedder { model_id: "anchor-real" });
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    const DAY: i64 = 86_400;
+
+    let mut matching = Memory::new(
+        MemoryTier::Semantic,
+        "DECISION: pipeline stages",
+        "pipeline pipeline",
+        1000,
+    );
+    matching.strength = 1.0;
+    store.write(matching).await.unwrap();
+
+    // The sibling answers less well: its content mixes axes (sim ~0.577).
+    let mut sibling = Memory::new(
+        MemoryTier::Semantic,
+        "DECISION: pipeline archive",
+        "pipeline unrelated unrelated",
+        1000,
+    );
+    sibling.strength = 1.0;
+    store.write(sibling).await.unwrap();
+
+    // Both are 90 days unaccessed when the recall runs.
+    now_val.store(1000 + 90 * DAY, Ordering::SeqCst);
+
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "both records are recall candidates");
+    assert_eq!(
+        results[0].memory.title, "DECISION: pipeline stages",
+        "among timeless records the better answer still ranks first"
+    );
+}
+
+#[tokio::test]
+async fn old_episodic_digests_still_age() {
+    // A session digest is a snapshot of a moment, not durable knowledge: the
+    // timeless exemption must not leak to the episodic tier, so an aged digest
+    // still sinks below a fresh one of equal relevance.
+    let embedder: Arc<dyn Embedder> = Arc::new(AnchorEmbedder { model_id: "anchor-real" });
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    const DAY: i64 = 86_400;
+
+    let mut old = Memory::new(
+        MemoryTier::Episodic,
+        "old session digest",
+        "pipeline pipeline",
+        1000,
+    );
+    old.strength = 1.0;
+    store.write(old).await.unwrap();
+
+    now_val.store(1000 + 90 * DAY, Ordering::SeqCst);
+    let mut fresh = Memory::new(
+        MemoryTier::Episodic,
+        "fresh session digest",
+        "pipeline pipeline",
+        1000 + 90 * DAY,
+    );
+    fresh.strength = 1.0;
+    store.write(fresh).await.unwrap();
+
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "both digests are recall candidates");
+    assert_eq!(
+        results[0].memory.title, "fresh session digest",
+        "an aged episodic digest still sinks below a fresh one of equal relevance"
+    );
+}
+
+#[tokio::test]
+async fn old_untyped_facts_still_age() {
+    // An untyped fact is a note about a moment, not a typed durable record: it
+    // keeps the old aging behaviour — no exemption for merely being factual.
+    let embedder: Arc<dyn Embedder> = Arc::new(AnchorEmbedder { model_id: "anchor-real" });
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    const DAY: i64 = 86_400;
+
+    let mut old = Memory::new(
+        MemoryTier::Semantic,
+        "old pipeline digest",
+        "pipeline pipeline",
+        1000,
+    );
+    old.strength = 1.0;
+    store.write(old).await.unwrap();
+
+    now_val.store(1000 + 90 * DAY, Ordering::SeqCst);
+    let mut fresh = Memory::new(
+        MemoryTier::Semantic,
+        "fresh pipeline digest",
+        "pipeline pipeline",
+        1000 + 90 * DAY,
+    );
+    fresh.strength = 1.0;
+    store.write(fresh).await.unwrap();
+
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "both facts are recall candidates");
+    assert_eq!(
+        results[0].memory.title, "fresh pipeline digest",
+        "an aged untyped fact still sinks below a fresh one of equal relevance"
+    );
+}
+
+#[tokio::test]
 async fn turn_boundary_auto_consolidates_previous_turns_working_rows() {
     // Backlog 4100f5e3 pillar C: a gap between a session's tool events
     // marks a turn boundary — the previous turn's working rows are

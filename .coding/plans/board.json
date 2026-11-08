@@ -1796,6 +1796,110 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Test-only change in src-tauri/src/mnemo2/team/tests.rs; no specified behaviour changes."
+    },
+    {
+      "id": "bc3e948a",
+      "status": "open",
+      "created_at_ms": 1794120856085,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Performance-only: no specified dispatch-routing, external-lead, tier-ladder or worker-brief behavior changes. The team.json layout is not part of any capability spec; tool outputs (team_status, MCP) stay byte-identical."
+    },
+    {
+      "id": "aa44321b",
+      "status": "closed",
+      "created_at_ms": 1794120925111,
+      "closed_at_ms": 1794124649339,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-aa44321b-20261108-075729.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Performance-only: event payloads merge adjacent same-kind deltas the window concatenates anyway, and the board/memory/open paths return identical results. No team.rs specified behavior (dispatch routing, external lead, tiers, worker briefs) changes."
+    },
+    {
+      "id": "01f40b19",
+      "status": "closed",
+      "created_at_ms": 1794120995334,
+      "closed_at_ms": 1794121948875,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-01f40b19-20261108-071228.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Window rendering performance only; no capability spec governs these components or the build."
+    },
+    {
+      "id": "cf3ce043",
+      "status": "open",
+      "created_at_ms": 1794127152842,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Routing decisions travel with the repository and the installer",
+              "text": "A project that keeps a `.coding/laya/` folder SHALL carry its own routing decisions in `.coding/laya/dispatch_routing.jsonl`, as verbatim rows of the routing log whose plan belongs to that project, and the Mnemo2 installer SHALL ship that file. When a project opens, the system SHALL import a shipped copy by appending only, SHALL import silently when this computer has no decisions the copy lacks, and SHALL ask the user before importing when it has.",
+              "scenarios": [
+                {
+                  "name": "A fresh computer imports silently",
+                  "when": [
+                    "a project opens on a computer whose routing log lacks the shipped rows and has none of its own"
+                  ],
+                  "then": [
+                    "the rows are appended to the routing log without a question"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "A conflicting copy asks",
+                  "when": [
+                    "a project opens and this computer has decisions the shipped copy lacks, and the copy has decisions this computer lacks"
+                  ],
+                  "then": [
+                    "the user is asked whether to update"
+                  ],
+                  "and": [
+                    "updating appends the missing rows and removes nothing",
+                    "declining leaves the log unchanged and the same copy does not ask again"
+                  ]
+                },
+                {
+                  "name": "Only opted-in projects export",
+                  "when": [
+                    "a worker merges in a project without a .coding/laya folder"
+                  ],
+                  "then": [
+                    "no decision rows are written into that project"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No external-lead, tier-ladder or worker-brief requirement changes: team/merge.rs only gains a best-effort learnings export after the outcome row, and team/tests.rs only gains tests for it. The new behavior is specified by this plan's dispatch-routing delta."
+    },
+    {
+      "id": "373dec00",
+      "status": "open",
+      "created_at_ms": 1794127622605,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Memory is not an OpenSpec capability today, and no dispatch-routing, external-lead, tier-ladder, worker-brief or plan-board requirement changes. The plan-close gate is explicitly left alone."
     }
   ]
 }

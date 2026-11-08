@@ -4,6 +4,7 @@
   import ControlRoom from "./components/ControlRoom.svelte";
   import CostView from "./components/CostView.svelte";
   import FirstIndexOverlay from "./components/FirstIndexOverlay.svelte";
+  import LayaLearningsSheet from "./components/LayaLearningsSheet.svelte";
   import LeadChat from "./components/LeadChat.svelte";
   import MemoryView from "./components/MemoryView.svelte";
   import PlansView from "./components/PlansView.svelte";
@@ -63,6 +64,7 @@
     </div>
     {#if $app.teamPeekOpen && $app.route === "lead"}<TeamPeek />{/if}
     <WorkerDeleteSheet />
+    <LayaLearningsSheet />
     <FirstIndexOverlay />
   </div>
 {/if}

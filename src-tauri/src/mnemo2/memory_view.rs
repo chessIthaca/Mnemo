@@ -600,7 +600,12 @@ async fn read_record(
         // The file is the truth for a knowledge record; a file that moved or
         // is on another branch degrades to the row's digest instead of
         // failing the read.
-        if let Ok(text) = std::fs::read_to_string(dir.join(rel)) {
+        let path = dir.join(rel);
+        let text = tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if let Some(text) = text {
             if let Some(record) = parse_file(rel, &text) {
                 markdown = record.body;
                 created = record.created;

@@ -943,7 +943,10 @@ impl LeadRuntime {
         // Mnemo1 uses: memory.db, knowledge/, codegraph.db, plans/ and reviews/
         // are one shared set of project stores. (Mnemo2's own state stays in
         // `.coding/mnemo2/`.)
-        ignore_project_caches(&self.workspace_root);
+        // Best effort, as before: this only keeps the shared caches out of
+        // `git status`, so a failed or cancelled task is ignored.
+        let root = self.workspace_root.clone();
+        let _ = tokio::task::spawn_blocking(move || ignore_project_caches(&root)).await;
         std::fs::create_dir_all(self.workspace_root.join(".coding"))
             .map_err(|err| format!("could not create the project's .coding directory: {err}"))?;
         let workspace = Workspace::new(self.workspace_root.clone());

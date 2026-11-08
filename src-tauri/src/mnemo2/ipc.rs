@@ -23,7 +23,7 @@
 //! session and advances the generation; the frontend MUST ignore envelopes
 //! whose generation differs from its current snapshot.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -829,10 +829,20 @@ pub async fn lead_answer(
         .await
 }
 
-/// Read the real team snapshot.
+/// Read the real team snapshot, leaving out the transcripts the window holds.
+///
+/// `known_transcripts` maps each worker id to the transcript revision the
+/// caller already received; those workers come back with an empty transcript
+/// and are named in `omitted_transcripts`.
 #[tauri::command]
-pub async fn team_snapshot(state: State<'_, Mnemo2State>) -> Result<TeamSnapshot, String> {
-    Ok(current_team(&state).await?.snapshot().await)
+pub async fn team_snapshot(
+    state: State<'_, Mnemo2State>,
+    known_transcripts: Option<HashMap<String, u64>>,
+) -> Result<TeamSnapshot, String> {
+    let team = current_team(&state).await?;
+    Ok(team
+        .snapshot_known(&known_transcripts.unwrap_or_default())
+        .await)
 }
 
 /// Read the plan board: every plan with the workers on each step.

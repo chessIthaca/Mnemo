@@ -164,6 +164,56 @@ fn inbox_keeps_only_the_latest_200_entries() {
     );
 }
 
+#[tokio::test]
+async fn team_snapshots_leave_out_transcripts_the_caller_holds() {
+    let root = tempfile::tempdir().expect("root");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let mut record = worker(root.path(), "transcriptrevs");
+    record.transcript = Arc::new(Transcript {
+        messages: vec![mnemo::provider::Message::text(
+            mnemo::provider::Role::User,
+            "hello",
+        )],
+    });
+    let team = open_test_team(root.path(), state.path(), vec![record]).await;
+    let id = "transcriptrevs".to_string();
+
+    // A caller that holds nothing receives the whole thread and its revision.
+    let first = team.snapshot_known(&HashMap::new()).await;
+    assert_eq!(first.workers.len(), 1);
+    assert_eq!(first.workers[0].transcript.messages.len(), 1);
+    let rev = first.transcript_revs[&id];
+    assert!(first.omitted_transcripts.is_empty());
+
+    // A caller that already holds that revision receives no transcript.
+    let known = HashMap::from([(id.clone(), rev)]);
+    let second = team.snapshot_known(&known).await;
+    assert!(second.workers[0].transcript.messages.is_empty());
+    assert_eq!(second.omitted_transcripts, vec![id.clone()]);
+    assert_eq!(second.transcript_revs[&id], rev);
+
+    // A replaced transcript is a new revision, so it travels in full again.
+    {
+        let mut records = team.records.lock().await;
+        records[0].transcript = Arc::new(Transcript {
+            messages: vec![
+                mnemo::provider::Message::text(mnemo::provider::Role::User, "hello"),
+                mnemo::provider::Message::text(mnemo::provider::Role::Assistant, "hi"),
+            ],
+        });
+    }
+    let third = team.snapshot_known(&known).await;
+    assert_eq!(third.workers[0].transcript.messages.len(), 2);
+    assert_ne!(third.transcript_revs[&id], rev);
+    assert!(third.omitted_transcripts.is_empty());
+
+    // The plain snapshot every other caller uses always carries the thread.
+    let full = team.snapshot().await;
+    assert_eq!(full.workers[0].transcript.messages.len(), 2);
+    assert!(full.omitted_transcripts.is_empty());
+}
+
 /// Workers do the bulk of the work and run without any session limit.
 /// The old 64-request cap and 30-minute wall clock (counted from spawn,
 /// idle review time included) parked real implementation workers

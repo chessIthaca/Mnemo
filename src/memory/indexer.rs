@@ -218,11 +218,16 @@ pub async fn index_derived(
     if knowledge_touched {
         for (key, meta) in &metas {
             let memory_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string();
-            if store.get_memory(&memory_id).await?.is_some() {
-                store
-                    .set_derived_metadata(&memory_id, meta.superseded_by.as_deref(), &meta.data)
-                    .await?;
-            }
+            let Some(row) = store.get_memory(&memory_id).await? else {
+                continue;
+            };
+            // The check pass owns `moved_paths` — a reconcile re-asserts the
+            // FILE's metadata and would otherwise drop the stamp it wrote
+            // (plan 373dec00 step 13). Everything else comes from the file.
+            let data = crate::memory::health::keep_moved_paths(&meta.data, &row.data);
+            store
+                .set_derived_metadata(&memory_id, meta.superseded_by.as_deref(), &data)
+                .await?;
         }
     }
     Ok(report)

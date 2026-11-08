@@ -20,7 +20,9 @@
 //! record.
 
 use crate::error::Result;
-use crate::memory::{MemoryFilter, MemoryStoreTrait, MemoryTier};
+use crate::memory::{
+    Memory, MemoryClass, MemoryFilter, MemoryRecordType, MemoryStoreTrait, MemoryTier, SemanticData,
+};
 
 /// Heuristic for the observed corruption class (the ".c"-truncated
 /// digests): a gist cut MID-TOKEN at the byte budget, leaving a
@@ -129,6 +131,250 @@ pub async fn quarantine_old_synthetic(store: &dyn MemoryStoreTrait) -> Result<Ve
         {
             store
                 .quarantine_memory(&row.id, "synthetic turn-boundary summary older than 30 days")
+                .await?;
+            quarantined.push(row.id);
+        }
+    }
+    Ok(quarantined)
+}
+
+/// The literal phrases that restate git or plan state (plan 373dec00 step 3),
+/// all observed in the live store's auto-extracted facts. Lowercase: the
+/// matcher lowercases the body once (see [`restates_repo_state`]).
+const STATE_PHRASES: &[&str] = &["was committed", "committed as", "merged into", "was completed"];
+
+/// Does `haystack` contain `phrase` ending on a word boundary — so
+/// "on branches" and "was completedness" never match?
+fn contains_phrase(haystack: &str, phrase: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(phrase) {
+        let end = from + offset + phrase.len();
+        let boundary = match haystack[end..].chars().next() {
+            Some(c) => !c.is_ascii_alphanumeric(),
+            None => true,
+        };
+        if boundary {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// `on branch <name>` — the branch a commit landed on. The name must be
+/// backticked ("on branch `wt/agent-storeUi0`") or branch-shaped itself —
+/// `main` / `master` / `develop` / `trunk`, or any name containing a `/` — so
+/// an ordinary sentence ("tests focus on branch coverage") never matches.
+fn has_on_branch(text: &str) -> bool {
+    const KNOWN_BRANCHES: &[&str] = &["main", "master", "develop", "trunk"];
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("on branch") {
+        let rest = text[from + offset + "on branch".len()..].trim_start();
+        let token_end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | ';' | ':' | ')' | ']'))
+            .unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        let name = token.trim_matches('`');
+        if !name.is_empty()
+            && (token.starts_with('`')
+                || name.contains('/')
+                || KNOWN_BRANCHES.contains(&name))
+        {
+            return true;
+        }
+        from += offset + "on branch".len();
+    }
+    false
+}
+
+/// Is `token` a nonempty run of ASCII hex digits (the commit/plan-id shape)?
+fn is_hex_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A bare 7-to-40-char hex hash between backticks — a commit id
+/// ("committed as `890e3a57`"). Six or forty-one hex chars are not a hash.
+fn has_backticked_hash(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else {
+            return false;
+        };
+        let token = &after[..close];
+        if (7..=40).contains(&token.len()) && is_hex_token(token) {
+            return true;
+        }
+        rest = &after[close + 1..];
+    }
+    false
+}
+
+/// `plan <8 hex>` — a plan id exactly 8 hex chars long, backticked
+/// ("plan `fe45dea4`") or bare ("plan fe45dea4"). The word must stand alone
+/// (not "planner") and be followed by a single space.
+fn has_plan_id(text: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("plan") {
+        let start = from + offset;
+        let before_ok = match text[..start].chars().next_back() {
+            Some(c) => !c.is_ascii_alphanumeric(),
+            None => true,
+        };
+        if before_ok {
+            if let Some(after_space) = text[start + 4..].strip_prefix(' ') {
+                let token = if let Some(quoted) = after_space.strip_prefix('`') {
+                    quoted.find('`').map(|end| &quoted[..end])
+                } else {
+                    let end = after_space
+                        .find(|c: char| !c.is_ascii_hexdigit())
+                        .unwrap_or(after_space.len());
+                    Some(&after_space[..end])
+                };
+                if let Some(token) = token {
+                    if token.len() == 8 && is_hex_token(token) {
+                        return true;
+                    }
+                }
+            }
+        }
+        from = start + 4;
+    }
+    false
+}
+
+/// `step N of` / `step N was` — plan-step progress ("Step 2 of plan
+/// `fe45dea4` was completed", "step 11 was implemented"). A plural "steps",
+/// or a following word that continues ("step 2 offering"), never matches.
+fn has_step_marker(text: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("step") {
+        let start = from + offset;
+        let before_ok = match text[..start].chars().next_back() {
+            Some(c) => !c.is_ascii_alphanumeric(),
+            None => true,
+        };
+        if before_ok {
+            if let Some(after_space) = text[start + 4..].strip_prefix(' ') {
+                let digits = after_space
+                    .bytes()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                if digits > 0 {
+                    let tail = &after_space[digits..];
+                    for marker in [" of", " was"] {
+                        if let Some(rest) = tail.strip_prefix(marker) {
+                            let boundary = match rest.chars().next() {
+                                Some(c) => !c.is_ascii_alphanumeric(),
+                                None => true,
+                            };
+                            if boundary {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        from = start + 4;
+    }
+    false
+}
+
+/// Does `text` restate repository state that git, the plan board, or the
+/// knowledge files already show? (plan 373dec00 step 3)
+///
+/// The shapes, all observed in the live store's auto-extracted facts
+/// (case-insensitive):
+///
+/// - `was committed` / `committed as` — a commit restated;
+/// - a bare 7-to-40-char hex hash in backticks — a commit id;
+/// - `on branch <name>` — the branch a commit landed on (the name must be
+///   backticked or branch-shaped: `main`/`master`/`develop`/`trunk`, or any
+///   name containing a `/`);
+/// - `wt/agent-` — a worker branch name;
+/// - `plan <8 hex>` — a plan id;
+/// - `step N of` / `step N was` — plan-step progress;
+/// - `merged into` — a merge result;
+/// - `was completed` — plan-step completion.
+///
+/// Deliberately narrow: the literal phrases end on a word boundary, the hash
+/// shape needs backticks and a hash-length token, and a plan id is exactly 8
+/// hex chars after the standalone word `plan` — so an untyped root cause in
+/// ordinary prose ("the draft was cleared before the reply landed") is left
+/// alone. A root cause that *quotes* a commit id in backticks is still
+/// caught by the hash shape; that is the one trade-off the step's sample
+/// check audits (a wrong call costs one `include_quarantined` lookup, never
+/// a lost record).
+pub fn restates_repo_state(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    STATE_PHRASES
+        .iter()
+        .any(|phrase| contains_phrase(&lower, phrase))
+        || lower.contains("wt/agent-")
+        || has_on_branch(&lower)
+        || has_backticked_hash(&lower)
+        || has_plan_id(&lower)
+        || has_step_marker(&lower)
+}
+
+/// Does the row's semantic payload already record how the fact is known
+/// ([`SemanticData::how_known`])? A fact whose evidence is stated — a test, a
+/// file, a run — is knowledge, never a bare state restatement.
+fn has_how_known(row: &Memory) -> bool {
+    serde_json::from_value::<SemanticData>(row.data.clone())
+        .ok()
+        .and_then(|data| data.how_known)
+        .is_some_and(|how| !how.trim().is_empty())
+}
+
+/// The full step-3 predicate: ALL of
+///
+/// * `tier` semantic — only distilled facts are in scope;
+/// * class authored — knowledge-file rows are DERIVED and never match (they
+///   are re-derived from their file, so the file stays the truth);
+/// * no typed title prefix — `SPEC:`/`DECISION:`/`BUG:`/`PLAN:`/`HOW:`/
+///   `REVIEW:` records are pointers to on-disk truth, whatever their body
+///   restates (the stored column and the title are checked together);
+/// * `access_count == 0` — an explicit memory_search never returned it (the
+///   auto-recall and primer peek paths deliberately do not bump it), so
+///   nobody has actually asked for this row;
+/// * no `how_known` — stated evidence makes it knowledge;
+/// * the body matches [`restates_repo_state`].
+fn is_git_state_fact(row: &Memory) -> bool {
+    row.tier == MemoryTier::Semantic
+        && row.record_class == MemoryClass::Authored
+        && row.record_type == MemoryRecordType::None
+        && MemoryRecordType::from_title(&row.title) == MemoryRecordType::None
+        && row.access_count == 0
+        && !has_how_known(row)
+        && restates_repo_state(&row.content)
+}
+
+/// Retire the existing facts that only restate git or plan state (plan
+/// 373dec00 step 3): the extractor used to record what a commit or the plan
+/// board already shows ("Step 2 of plan `fe45dea4` was completed on branch
+/// `wt/agent-storeUi0` and committed as `890e3a57`"), which is re-derivable
+/// from the repository and never was knowledge.
+///
+/// QUARANTINE — never delete — under the same recoverable terms as the other
+/// startup sweeps: `include_quarantined` keeps every row and its reason.
+/// Typed records, derived (knowledge-file) rows, searched rows and rows with
+/// stated evidence are untouched (see [`is_git_state_fact`]). Idempotent:
+/// quarantined rows drop out of the scan's default filter, so a re-run finds
+/// nothing new. Returns the ids newly quarantined this run.
+pub async fn quarantine_git_state_facts(store: &dyn MemoryStoreTrait) -> Result<Vec<String>> {
+    let rows = store
+        .list_filtered(&MemoryFilter::new().tier(MemoryTier::Semantic))
+        .await?;
+    let mut quarantined = Vec::new();
+    for row in rows {
+        if is_git_state_fact(&row) {
+            store
+                .quarantine_memory(
+                    &row.id,
+                    "fact restates git or plan state the repository already shows",
+                )
                 .await?;
             quarantined.push(row.id);
         }
@@ -372,5 +618,215 @@ mod tests {
         // Idempotent: the next startup finds nothing left.
         let again = quarantine_old_synthetic(store.as_ref()).await.unwrap();
         assert!(again.is_empty(), "idempotent: {again:?}");
+    }
+
+    /// The content shape the live extractor produced for a finished plan
+    /// step (observed 2026-11-08) — the row step 3 retires.
+    const GIT_STATE_BODY: &str = "Step 2 of plan `fe45dea4` was completed on branch \
+                                  `wt/agent-storeUi0` and committed as `890e3a57`.";
+
+    #[tokio::test]
+    async fn a_git_state_fact_is_quarantined() {
+        // Plan 373dec00 step 3: a fact that only restates what git or the
+        // plan board already shows is retired — recoverably, like every
+        // other quarantine.
+        let store = store();
+        let state = store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "Step 2 of plan `fe45dea4` was completed on branch `wt/agent-storeUi0`",
+                GIT_STATE_BODY,
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+
+        let quarantined = quarantine_git_state_facts(store.as_ref()).await.unwrap();
+        assert_eq!(quarantined, vec![state.clone()], "exactly the state row");
+
+        // Quarantine never deletes — the row and its reason are still there.
+        let flagged = store.get_memory(&state).await.unwrap().unwrap();
+        let reason = flagged.quarantined.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("git or plan state"),
+            "the reason says what happened: {reason:?}"
+        );
+
+        // Recall and the default listing stop returning it.
+        let hits = store
+            .recall_peek("Step 2 of plan fe45dea4", &MemoryFilter::new().limit(10))
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().all(|sm| sm.memory.id != state),
+            "a quarantined row never injects: {hits:?}"
+        );
+        let default_list = store.list_filtered(&MemoryFilter::new()).await.unwrap();
+        assert!(default_list.iter().all(|m| m.id != state));
+
+        // `include_quarantined` still finds it: recoverable history, never a
+        // delete.
+        let full = store
+            .list_filtered(&MemoryFilter::new().include_quarantined())
+            .await
+            .unwrap();
+        assert!(
+            full.iter().any(|m| m.id == state),
+            "recoverable, never deleted"
+        );
+
+        // Idempotent: a re-run finds nothing new.
+        let again = quarantine_git_state_facts(store.as_ref()).await.unwrap();
+        assert!(again.is_empty(), "idempotent: {again:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fact_that_was_searched_is_kept() {
+        // `access_count > 0` means an explicit memory_search returned the
+        // row: the agent asked for it, so it is not inert state noise. (The
+        // auto-recall and primer peek paths deliberately do not bump the
+        // count, so this stays a real "someone searched this" signal.)
+        let store = store();
+        let searched = store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "Step 2 of plan `fe45dea4` was completed on branch `wt/agent-storeUi0`",
+                GIT_STATE_BODY,
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+        store.access(&searched).await.unwrap();
+
+        let quarantined = quarantine_git_state_facts(store.as_ref()).await.unwrap();
+        assert!(quarantined.is_empty(), "searched rows stay: {quarantined:?}");
+        let row = store.get_memory(&searched).await.unwrap().unwrap();
+        assert!(row.quarantined.is_none(), "kept: {row:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fact_with_how_known_is_kept() {
+        // A fact that states its evidence (plan 373dec00 step 4's field) is
+        // knowledge, even when its wording also mentions a commit: the
+        // `how_known` field means someone established it.
+        let store = store();
+        let mut memory = Memory::new(
+            MemoryTier::Semantic,
+            "Step 2 of plan `fe45dea4` was completed",
+            GIT_STATE_BODY,
+            1_700_000_000,
+        );
+        memory.data = serde_json::to_value(SemanticData {
+            fact: GIT_STATE_BODY.to_string(),
+            confidence: 0.9,
+            how_known: Some("checked: git log --oneline shows the step-2 commit".to_string()),
+        })
+        .unwrap();
+        let id = store.write(memory).await.unwrap();
+
+        let quarantined = quarantine_git_state_facts(store.as_ref()).await.unwrap();
+        assert!(quarantined.is_empty(), "evidence stays: {quarantined:?}");
+        let row = store.get_memory(&id).await.unwrap().unwrap();
+        assert!(row.quarantined.is_none(), "kept: {row:?}");
+    }
+
+    #[tokio::test]
+    async fn a_typed_record_is_never_touched() {
+        // Typed records are pointers to on-disk truth whatever their body
+        // restates — the prefix wins. Derived knowledge-file rows are the
+        // other half: the file is the truth and the row is re-derived, so a
+        // derived row never matches even with no prefix.
+        let store = store();
+        let bug = store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "BUG: routing gate used the margin score",
+                "The routing gate keyed on the margin instead of the top probability; \
+                 fixed and committed as `9cb3eac5` on branch `wt/agent-layaConf`.",
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+        let mut derived = Memory::new(
+            MemoryTier::Semantic,
+            "knowledge digest without a typed prefix",
+            GIT_STATE_BODY,
+            1_700_000_100,
+        );
+        derived.record_class = MemoryClass::Derived;
+        let derived_id = store.write(derived).await.unwrap();
+
+        let quarantined = quarantine_git_state_facts(store.as_ref()).await.unwrap();
+        assert!(
+            quarantined.is_empty(),
+            "typed and derived rows are untouched: {quarantined:?}"
+        );
+        for id in [&bug, &derived_id] {
+            let row = store.get_memory(id).await.unwrap().unwrap();
+            assert!(row.quarantined.is_none(), "kept: {row:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_root_cause_without_state_words_is_kept() {
+        // The failure mode the matcher must never hit: an untyped root cause
+        // in ordinary prose. The cause is not in git; quarantine must leave
+        // it live.
+        let store = store();
+        let id = store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "sheet errors vanish when the answer lands",
+                "Root cause: answering cleared the sheet's draft state before the reply \
+                 landed, so the edit form re-rendered empty. The fix keeps the draft \
+                 until the reply is applied.",
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+
+        let quarantined = quarantine_git_state_facts(store.as_ref()).await.unwrap();
+        assert!(quarantined.is_empty(), "the cause stays live: {quarantined:?}");
+        let row = store.get_memory(&id).await.unwrap().unwrap();
+        assert!(row.quarantined.is_none(), "kept: {row:?}");
+    }
+
+    #[test]
+    fn restates_repo_state_matches_the_listed_shapes() {
+        // Every shape the step lists, in the wording the live store uses.
+        assert!(restates_repo_state(
+            "Step 2 of plan `fe45dea4` was completed on branch `wt/agent-storeUi0` \
+             and committed as `890e3a57`."
+        ));
+        // The shapes one at a time.
+        assert!(restates_repo_state("The routing fix was committed yesterday."));
+        assert!(restates_repo_state("It landed, committed as a pure move."));
+        assert!(restates_repo_state("The change is `890e3a57`.")); // 8-hex commit id
+        assert!(restates_repo_state(&format!("The tree is `{}`.", "a".repeat(40))));
+        assert!(restates_repo_state("It landed on branch main."));
+        assert!(restates_repo_state("Pushed to wt/agent-storeUi0."));
+        assert!(restates_repo_state("Step 2 of plan `fe45dea4` was completed."));
+        assert!(restates_repo_state("plan fe45dea4")); // bare 8-hex plan id
+        assert!(restates_repo_state("step 11 was implemented"));
+        assert!(restates_repo_state("The worker was merged into the lead branch."));
+        assert!(restates_repo_state("The migration was completed."));
+        // Case-insensitive, like the store's extractor output.
+        assert!(restates_repo_state("STEP 2 OF PLAN `FE45DEA4` WAS COMPLETED"));
+
+        // Near-misses stay out: a word boundary, a non-hash token, a
+        // too-short or too-long hex token, a plural, and a plan id that is
+        // not exactly 8 hex chars.
+        assert!(!restates_repo_state(""));
+        assert!(!restates_repo_state("Tests focus on branch coverage."));
+        assert!(!restates_repo_state("The rule fires on branch selection."));
+        assert!(!restates_repo_state("The suite was completedness-adjacent."));
+        assert!(!restates_repo_state("Run `cargo test` before landing."));
+        assert!(!restates_repo_state("The id is `abcdef`.")); // 6 hex chars
+        assert!(!restates_repo_state(&format!("The id is `{}`.", "a".repeat(41))));
+        assert!(!restates_repo_state("steps 2 of the migration"));
+        assert!(!restates_repo_state("The planner 20260101 ran."));
+        assert!(!restates_repo_state(
+            "Root cause: the draft state was cleared before the reply landed."
+        ));
     }
 }

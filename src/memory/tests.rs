@@ -488,10 +488,9 @@ async fn access_log_caps_at_100_evicting_oldest() {
 #[tokio::test]
 async fn access_log_records_session_primer_reads() {
     let store = make_store();
-    store
-        .write(Memory::new(MemoryTier::Semantic, "HOW: f", "content", 1000))
-        .await
-        .unwrap();
+    let mut memory = Memory::new(MemoryTier::Semantic, "HOW: f", "content", 1000);
+    memory.record_class = MemoryClass::Derived;
+    store.write(memory).await.unwrap();
     store.primer_records(8).await.unwrap();
 
     let log = store.access_log();
@@ -1569,24 +1568,22 @@ async fn the_primer_prefers_searched_typed_records() {
     // returned the row — then recency. Typed titles are required: untyped
     // rows are never primer material (plan 373dec00 step 6).
     let store = make_store();
-    store
-        .write(Memory::new(
-            MemoryTier::Semantic,
-            "HOW: postgres for storage",
-            "the project uses postgres for storage",
-            1000,
-        ))
-        .await
-        .unwrap();
-    store
-        .write(Memory::new(
-            MemoryTier::Semantic,
-            "DECISION: sqlite for storage",
-            "we use sqlite for storage",
-            2000,
-        ))
-        .await
-        .unwrap();
+    let mut first = Memory::new(
+        MemoryTier::Semantic,
+        "HOW: postgres for storage",
+        "the project uses postgres for storage",
+        1000,
+    );
+    first.record_class = MemoryClass::Derived;
+    store.write(first).await.unwrap();
+    let mut second = Memory::new(
+        MemoryTier::Semantic,
+        "DECISION: sqlite for storage",
+        "we use sqlite for storage",
+        2000,
+    );
+    second.record_class = MemoryClass::Derived;
+    store.write(second).await.unwrap();
 
     // One explicit search for the older record: only it gets counted.
     store
@@ -1612,12 +1609,13 @@ async fn primer_records_excludes_superseded_memories() {
     // list_filtered honor; the primer path was the gap before plan 373dec00
     // step 6).
     let store = make_store();
-    let old = Memory::new(
+    let mut old = Memory::new(
         MemoryTier::Semantic,
         "DECISION: storage engine",
         "we use postgres for storage",
         1000,
     );
+    old.record_class = MemoryClass::Derived;
     let old_id = store.write(old).await.unwrap();
 
     // Before superseding: the row surfaces.
@@ -1626,16 +1624,15 @@ async fn primer_records_excludes_superseded_memories() {
     assert_eq!(before[0].id, old_id);
 
     // Supersede the row with its successor.
+    let mut successor = Memory::new(
+        MemoryTier::Semantic,
+        "DECISION: storage engine",
+        "we use sqlite for storage",
+        1001,
+    );
+    successor.record_class = MemoryClass::Derived;
     store
-        .supersede_memory(
-            &old_id,
-            Memory::new(
-                MemoryTier::Semantic,
-                "DECISION: storage engine",
-                "we use sqlite for storage",
-                1001,
-            ),
-        )
+        .supersede_memory(&old_id, successor)
         .await
         .unwrap();
 
@@ -1671,15 +1668,14 @@ async fn primer_records_excludes_working_and_untyped_rows() {
         ))
         .await
         .unwrap();
-    store
-        .write(Memory::new(
-            MemoryTier::Procedural,
-            "HOW: release checklist",
-            "a learned recurring workflow",
-            1000,
-        ))
-        .await
-        .unwrap();
+    let mut procedural = Memory::new(
+        MemoryTier::Procedural,
+        "HOW: release checklist",
+        "a learned recurring workflow",
+        1000,
+    );
+    procedural.record_class = MemoryClass::Derived;
+    store.write(procedural).await.unwrap();
 
     let results = store.primer_records(8).await.unwrap();
     assert_eq!(results.len(), 1, "only the typed procedural row");
@@ -1705,10 +1701,11 @@ async fn the_primer_excludes_bug_plan_and_untyped_rows() {
         ("REVIEW: an old review", MemoryTier::Semantic),
         ("untyped fact", MemoryTier::Semantic),
     ] {
-        store
-            .write(Memory::new(tier, title, "content", 1000))
-            .await
-            .unwrap();
+        // The primer only takes file-backed (derived) rows, so the typed ones
+        // are marked derived here; the type filter is what this test probes.
+        let mut memory = Memory::new(tier, title, "content", 1000);
+        memory.record_class = MemoryClass::Derived;
+        store.write(memory).await.unwrap();
     }
 
     let mut primer: Vec<String> = store
@@ -1733,6 +1730,69 @@ async fn the_primer_excludes_bug_plan_and_untyped_rows() {
 }
 
 #[tokio::test]
+async fn the_primer_skips_file_less_stale_and_status_first_rows() {
+    // Standing context must never lead a session with the wrong thing (plan
+    // 373dec00 step 6 review): a typed authored row with no knowledge file is
+    // hearsay, a row the check pass stamped `moved_paths` is stale, and a
+    // legacy git-state digest opens with landing status. Only the clean,
+    // file-backed row is primer material.
+    let store = make_store();
+
+    // Authored (no file behind it).
+    store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "DECISION: file-less",
+            "no path backs this row",
+            1000,
+        ))
+        .await
+        .unwrap();
+
+    // Derived, but the check pass found the cited path gone.
+    let mut stale = Memory::new(
+        MemoryTier::Semantic,
+        "SPEC: stale",
+        "cites src/gone.rs",
+        1001,
+    );
+    stale.record_class = MemoryClass::Derived;
+    stale.data = serde_json::json!({
+        "moved_paths": [{ "from": "src/gone.rs", "to": null }]
+    });
+    store.write(stale).await.unwrap();
+
+    // Derived, but a legacy landing-status digest.
+    let mut status_first = Memory::new(
+        MemoryTier::Semantic,
+        "HOW: landed",
+        "MERGED into main at e37d07a on 2027-01-24; branch wt/x deleted",
+        1002,
+    );
+    status_first.record_class = MemoryClass::Derived;
+    store.write(status_first).await.unwrap();
+
+    // The one that belongs.
+    let mut clean = Memory::new(
+        MemoryTier::Semantic,
+        "HOW: clean",
+        "a durable, file-backed procedure",
+        1003,
+    );
+    clean.record_class = MemoryClass::Derived;
+    store.write(clean).await.unwrap();
+
+    let primer: Vec<String> = store
+        .primer_records(8)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|memory| memory.title)
+        .collect();
+    assert_eq!(primer, vec!["HOW: clean"]);
+}
+
+#[tokio::test]
 async fn note_recalled_counts_without_touching_last_accessed() {
     // The auto-recall counter (plan 373dec00 step 6) is a separate measure
     // from the explicit-read counters: the peek path stays read-only, and the
@@ -1747,10 +1807,27 @@ async fn note_recalled_counts_without_touching_last_accessed() {
         ))
         .await
         .unwrap();
+    let other = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "SPEC: other",
+            "another fact",
+            1001,
+        ))
+        .await
+        .unwrap();
     let before = store.get_memory(&id).await.unwrap().unwrap();
-    store.note_recalled(&[id.clone()]).await.unwrap();
+    let other_before = store.get_memory(&other).await.unwrap().unwrap();
+
+    // One batch covers both ids (and tolerates an id that does not exist); a
+    // second recall counts only the first row again.
+    store
+        .note_recalled(&[id.clone(), other.clone(), "does-not-exist".to_string()])
+        .await
+        .unwrap();
     store.note_recalled(&[id.clone()]).await.unwrap();
     let after = store.get_memory(&id).await.unwrap().unwrap();
+    let other_after = store.get_memory(&other).await.unwrap().unwrap();
     assert_eq!(
         after.access_count, before.access_count,
         "an explicit-read counter is not touched"
@@ -1760,8 +1837,12 @@ async fn note_recalled_counts_without_touching_last_accessed() {
         "recency is not touched"
     );
     assert_eq!(
+        other_after.access_count, other_before.access_count,
+        "the other row's explicit-read counter is untouched"
+    );
+    assert_eq!(
         store.top_recalled(10).await.unwrap(),
-        vec![("SPEC: storage".to_string(), 2)]
+        vec![("SPEC: storage".to_string(), 2), ("SPEC: other".to_string(), 1)]
     );
 }
 

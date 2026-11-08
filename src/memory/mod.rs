@@ -147,15 +147,33 @@ fn cap_json_strings(value: serde_json::Value, max_chars: usize) -> serde_json::V
     }
 }
 
-/// Whether a row belongs in the session primer (plan 373dec00 step 6): typed
-/// knowledge a new session should start with. BUG / PLAN / REVIEW digests and
-/// untyped rows are excluded, and a superseded or quarantined row never
-/// surfaces there (the same invariant every ranking path honors).
+/// Whether a row belongs in the session primer (plan 373dec00 step 6): typed,
+/// file-backed knowledge a new session should start with.
+///
+/// Beyond the type filter (BUG / PLAN / REVIEW digests and untyped rows are
+/// not standing context), the primer must never lead a session with something
+/// wrong or stale, because bad standing memory is worse than none:
+///
+/// - `record_class = derived` — a file backs the row, and the file is the
+///   truth; an authored row with no knowledge file is hearsay;
+/// - no `moved_paths` stamp — the check pass found a cited path gone or
+///   renamed, so the record's claims no longer match the repo;
+/// - content not starting with `MERGED into main` — the legacy git-state
+///   digests lead with landing status, which is history, not knowledge.
+///
+/// Superseded and quarantined rows never surface either (the invariant every
+/// ranking path honors).
 fn is_primer_record(memory: &Memory) -> bool {
     matches!(
         memory.record_type,
         MemoryRecordType::Spec | MemoryRecordType::Decision | MemoryRecordType::How
-    ) && memory.superseded_by.is_none()
+    ) && memory.record_class == MemoryClass::Derived
+        && memory
+            .data
+            .get(crate::memory::health::MOVED_PATHS_KEY)
+            .is_none()
+        && !memory.content.starts_with("MERGED into main")
+        && memory.superseded_by.is_none()
         && memory.quarantined.is_none()
         && matches!(
             memory.tier,
@@ -2136,15 +2154,22 @@ impl MemoryStoreTrait for MemoryStore {
         let read_conn = self.read_conn().clone();
         let memories: Vec<Memory> = tokio::task::spawn_blocking(move || -> Result<Vec<Memory>> {
             let conn = read_conn.lock().expect("read conn lock poisoned");
-            // Typed knowledge only (SPEC / DECISION / HOW). BUG, PLAN and
-            // REVIEW digests and untyped rows are not standing context; the
-            // superseded/quarantined predicates are the same invariant every
-            // ranking path honors.
+            // Typed knowledge only (SPEC / DECISION / HOW), and only rows a
+            // file backs: `record_class = 'derived'` keeps file-less authored
+            // rows out, `json_extract(...) IS NULL` skips rows the check pass
+            // found stale, and `content NOT LIKE 'MERGED into main%'` drops
+            // the legacy git-state digests that lead with landing status.
+            // BUG, PLAN and REVIEW digests and untyped rows are not standing
+            // context; the superseded/quarantined predicates are the same
+            // invariant every ranking path honors.
             let mut stmt = conn.prepare(
                 "SELECT id, tier, title, content, data, strength, access_count, created_at, \
                  last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by, quarantined FROM memories \
                  WHERE tier IN ('semantic', 'procedural') \
                  AND record_type IN ('spec', 'decision', 'how') \
+                 AND record_class = 'derived' \
+                 AND json_extract(data, '$.moved_paths') IS NULL \
+                 AND content NOT LIKE 'MERGED into main%' \
                  AND superseded_by IS NULL AND quarantined IS NULL \
                  ORDER BY access_count DESC, created_at DESC, id LIMIT ?1",
             )?;
@@ -2173,12 +2198,17 @@ impl MemoryStoreTrait for MemoryStore {
         let ids = ids.to_vec();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = conn.lock().expect("conn lock poisoned");
-            let mut stmt = conn.prepare(
-                "UPDATE memories SET recall_count = COALESCE(recall_count, 0) + 1 WHERE id = ?1",
-            )?;
-            for id in &ids {
-                stmt.execute(params![id])?;
-            }
+            let placeholders: Vec<&str> = (0..ids.len()).map(|_| "?").collect();
+            let sql = format!(
+                "UPDATE memories SET recall_count = COALESCE(recall_count, 0) + 1 \
+                 WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+            let params_vec: Vec<Box<dyn rusqlite::ToSql>> = ids
+                .iter()
+                .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            conn.execute(&sql, rusqlite::params_from_iter(params_vec))?;
             Ok(())
         })
         .await

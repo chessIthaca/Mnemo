@@ -517,8 +517,31 @@ impl TeamRuntime {
         let board = self
             .board()
             .ok_or_else(|| "the plan board is not available".to_string())?;
-        let plans = board.list()?;
-        let workers = self.records.lock().await.clone();
+        let plans = tokio::task::spawn_blocking({
+            let board = board.clone();
+            move || board.list()
+        })
+        .await
+        .map_err(|err| format!("the plan board read failed: {err}"))??;
+        // Only what the Plan tab stamps on a step is taken under the records
+        // lock: a full worker record is large and nothing else here needs it.
+        let workers: Vec<(Option<String> /*plan_id*/, Option<usize> /*plan_step*/, BoardWorker)> = {
+            let records = self.records.lock().await;
+            records
+                .iter()
+                .map(|w| {
+                    (
+                        w.plan_id.clone(),
+                        w.plan_step,
+                        BoardWorker {
+                            id: w.id.clone(),
+                            name: w.name.clone(),
+                            status: w.status,
+                        },
+                    )
+                })
+                .collect()
+        };
         let plans = plans
             .into_iter()
             .map(|plan: BoardPlan| BoardPlanView {
@@ -532,15 +555,12 @@ impl TeamRuntime {
                     .map(|step| {
                         let on_step = workers
                             .iter()
-                            .filter(|w| {
-                                w.plan_id.as_deref() == Some(plan.id.as_str())
-                                    && w.plan_step == step.number.checked_sub(1)
+                            .filter(|(plan_id, plan_step, _)| {
+                                plan_id.as_deref() == Some(plan.id.as_str())
+                                    && *plan_step == step.number.checked_sub(1)
                             })
-                            .map(|w| BoardWorker {
-                                id: w.id.clone(),
-                                name: w.name.clone(),
-                                status: w.status,
-                            })
+                            .map(|(_, _, worker)| worker)
+                            .cloned()
                             .collect();
                         BoardStepView {
                             step,

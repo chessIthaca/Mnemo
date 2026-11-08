@@ -507,8 +507,8 @@ fn folder_summary(origin: &str, folder: &Path) -> SchemaSummary {
 
 /// Make `name` the project's default schema: it must resolve (so a pick
 /// can never leave the board stranded), then `config.yaml`'s `schema` key
-/// is rewritten with context, rules, and unknown keys kept. Returns the
-/// refreshed list.
+/// is rewritten in place; comments, `governed_files`, and every other key
+/// keep their bytes. Returns the refreshed list.
 pub fn activate_schema(openspec_dir: &Path, name: &str) -> Result<SchemaList, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -523,46 +523,118 @@ pub fn activate_schema(openspec_dir: &Path, name: &str) -> Result<SchemaList, St
 
 // ── config.yaml read/write ───────────────────────────────────────────────────
 
-/// The serialization shape of `config.yaml`: like `OpenSpecConfig`, but a
-/// missing schema and empty context and rules are omitted rather than
-/// written as `null`/empty keys. Unknown keys ride along through
-/// `extra`.
-#[derive(Serialize)]
-struct ConfigFile<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    schema: Option<&'a str>,
-    #[serde(skip_serializing_if = "str::is_empty")]
-    context: &'a str,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    rules: &'a BTreeMap<String, Vec<String>>,
-    #[serde(flatten)]
-    extra: &'a BTreeMap<String, Value>,
+/// One key rendered as block YAML with its trailing newline.
+fn rendered_key<T: Serialize>(key: &str, value: &T) -> Result<String, String> {
+    serde_norway::to_string(&BTreeMap::from([(key, value)]))
+        .map_err(|error| format!("could not serialize '{key}': {error}"))
 }
 
-impl<'a> ConfigFile<'a> {
-    /// The write shape of a loaded config.
-    fn of(config: &'a OpenSpecConfig) -> Self {
-        Self {
-            schema: config.schema.as_deref(),
-            context: &config.context,
-            rules: &config.rules,
-            extra: &config.extra,
+/// Replace one top-level key's lines in YAML text, remove them when
+/// `rendered` is `None`, or append when the key is absent. A key's lines are
+/// its `key:` line at column 0 plus every following indented line or
+/// column-0 `- ` list item. Blank lines count only when more of the block
+/// follows, so blank lines and column-0 comments before the next key stay
+/// where they are.
+fn set_top_level_key(text: &str, key: &str, rendered: Option<&str>) -> String {
+    let prefix = format!("{key}:");
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let Some(start) = lines.iter().position(|line| line.starts_with(&prefix)) else {
+        let mut out = text.to_string();
+        if let Some(rendered) = rendered {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(rendered);
+        }
+        return out;
+    };
+    let mut end = start + 1;
+    let mut scan = end;
+    while scan < lines.len() {
+        let line = lines[scan];
+        if line.trim().is_empty() {
+            scan += 1;
+        } else if line.starts_with(' ') || line.starts_with('\t') || line.starts_with("- ") {
+            scan += 1;
+            end = scan;
+        } else {
+            break;
         }
     }
+    format!(
+        "{}{}{}",
+        lines[..start].concat(),
+        rendered.unwrap_or(""),
+        lines[end..].concat()
+    )
 }
 
-/// Write `config.yaml` beneath the OpenSpec directory, creating parent
-/// folders as needed. The file is re-serialized, so YAML comments inside
-/// it are lost; `schema`, `context`, `rules`, and every unknown key keep
-/// their values.
+/// Edit `config.yaml` in place, one top-level key at a time, creating parent
+/// folders as needed. Comments and every key this write does not touch keep
+/// their bytes; an edit that would not read back as exactly the intended
+/// config is refused and the file is left untouched.
 fn write_config(openspec_dir: &Path, config: &OpenSpecConfig) -> Result<(), String> {
     let path = openspec_dir.join("config.yaml");
-    let text = serde_norway::to_string(&ConfigFile::of(config))
-        .map_err(|error| format!("could not serialize '{}': {error}", path.display()))?;
+    let original = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!("could not read '{}': {error}", path.display()));
+        }
+    };
+    let current = OpenSpecConfig::parse(&original)
+        .map_err(|error| format!("could not parse '{}': {error}", path.display()))?;
+    // The pre-in-place writer stored an empty config as `{}`; start such a
+    // file from nothing so the edit is not appended to a flow mapping.
+    let mut text = if original.trim() == "{}" {
+        String::new()
+    } else {
+        original.clone()
+    };
+    if current.schema != config.schema {
+        let rendered = match &config.schema {
+            Some(schema) => Some(rendered_key("schema", schema)?),
+            None => None,
+        };
+        text = set_top_level_key(&text, "schema", rendered.as_deref());
+    }
+    if current.context != config.context {
+        let rendered = if config.context.is_empty() {
+            None
+        } else {
+            Some(rendered_key("context", &config.context)?)
+        };
+        text = set_top_level_key(&text, "context", rendered.as_deref());
+    }
+    if current.rules != config.rules {
+        let rendered = if config.rules.is_empty() {
+            None
+        } else {
+            Some(rendered_key("rules", &config.rules)?)
+        };
+        text = set_top_level_key(&text, "rules", rendered.as_deref());
+    }
+    if text == original {
+        return Ok(());
+    }
+    let refused = || {
+        format!(
+            "could not update '{}' without changing anything else; edit it by hand",
+            path.display()
+        )
+    };
+    let parsed = OpenSpecConfig::parse(&text).map_err(|_| refused())?;
+    if parsed.schema != config.schema
+        || parsed.context != config.context
+        || parsed.rules != config.rules
+        || parsed.governed_files != config.governed_files
+        || parsed.extra != config.extra
+    {
+        return Err(refused());
+    }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!("could not create '{}': {error}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create '{}': {error}", parent.display()))?;
     }
     std::fs::write(&path, text)
         .map_err(|error| format!("could not write '{}': {error}", path.display()))
@@ -580,9 +652,9 @@ pub fn config(openspec_dir: &Path) -> Result<SpecsConfig, String> {
     })
 }
 
-/// Save the worker context and the artifact rules. The active schema and
-/// unknown keys keep their values; the file is re-serialized, so YAML
-/// comments inside it are lost. Returns the persisted state.
+/// Save the worker context and the artifact rules. The active schema,
+/// `governed_files`, unknown keys, and comments keep their bytes. Returns
+/// the persisted state.
 pub fn store_config(
     openspec_dir: &Path,
     context: &str,
@@ -1932,5 +2004,134 @@ mod tests {
         );
         assert!(preview.worker_context.contains("The project's rules."));
         assert!(preview.worker_context.contains("### Artifact: proposal"));
+    }
+
+    /// A `config.yaml` the Specs page must be able to edit without losing
+    /// anything: comments, governed files, and an unknown key.
+    const GOVERNED_CONFIG: &str = "\
+# Why these files are governed: they carry auth's specified behaviour.
+governed_files:
+  # auth is the session layer.
+  auth:
+    - src/auth.rs
+    - src/session.rs
+
+# Hand-written, not known to the Specs page.
+custom_key: kept
+";
+
+    #[test]
+    fn make_active_keeps_governed_files_and_comments() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        fs::write(dir.join("config.yaml"), GOVERNED_CONFIG).expect("config.yaml");
+        activate_schema(&dir, "spec-driven").expect("activate");
+        let raw = fs::read_to_string(dir.join("config.yaml")).expect("config.yaml");
+        assert_eq!(raw, format!("{GOVERNED_CONFIG}schema: spec-driven\n"));
+        let loaded = OpenSpecConfig::load(&dir).expect("load");
+        let governed = loaded.governed_files.get("auth").expect("auth governed");
+        assert_eq!(governed.as_slice(), ["src/auth.rs", "src/session.rs"]);
+    }
+
+    #[test]
+    fn make_active_replaces_only_the_schema_line() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        let before =
+            GOVERNED_CONFIG.replace("governed_files:\n", "schema: old-name\ngoverned_files:\n");
+        fs::write(dir.join("config.yaml"), &before).expect("config.yaml");
+        activate_schema(&dir, "spec-driven").expect("activate");
+        let raw = fs::read_to_string(dir.join("config.yaml")).expect("config.yaml");
+        assert_eq!(
+            raw,
+            before.replace("schema: old-name", "schema: spec-driven")
+        );
+        assert_eq!(raw.matches("schema:").count(), 1, "{raw}");
+    }
+
+    #[test]
+    fn save_config_keeps_governed_files_and_comments() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        fs::write(dir.join("config.yaml"), GOVERNED_CONFIG).expect("config.yaml");
+        let first = BTreeMap::from([("research".to_string(), vec!["Cite sources.".to_string()])]);
+        store_config(&dir, "First line.\n\nSecond line.", &first).expect("first save");
+        let second = BTreeMap::from([
+            ("proposal".to_string(), vec!["Name the risk.".to_string()]),
+            (
+                "research".to_string(),
+                vec!["Cite every claim.".to_string()],
+            ),
+        ]);
+        store_config(&dir, "Rewritten context.
+
+Still two lines.", &second).expect("second save");
+
+        let raw = fs::read_to_string(dir.join("config.yaml")).expect("config.yaml");
+        let mut cursor = 0;
+        for line in GOVERNED_CONFIG
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            let found = raw[cursor..]
+                .find(line)
+                .unwrap_or_else(|| panic!("config.yaml lost {line:?}:\n{raw}"));
+            cursor += found + line.len();
+        }
+        assert!(raw.contains("src/session.rs\n\n# Hand-written"), "{raw}");
+        assert_eq!(raw.matches("context:").count(), 1, "{raw}");
+        assert_eq!(raw.matches("rules:").count(), 1, "{raw}");
+        let reloaded = config(&dir).expect("reload");
+        assert_eq!(reloaded.context, "Rewritten context.\n\nStill two lines.");
+        assert_eq!(reloaded.rules, second);
+    }
+
+    #[test]
+    fn clearing_context_and_rules_removes_only_their_keys() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        let start = format!(
+            "context: Old context.\nrules:\n  research:\n    - Cite sources.\n{GOVERNED_CONFIG}"
+        );
+        fs::write(dir.join("config.yaml"), &start).expect("config.yaml");
+        store_config(&dir, "", &BTreeMap::new()).expect("clear");
+        let raw = fs::read_to_string(dir.join("config.yaml")).expect("config.yaml");
+        assert_eq!(raw, GOVERNED_CONFIG);
+    }
+
+    #[test]
+    fn clearing_the_only_key_leaves_a_readable_file() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        fs::write(dir.join("config.yaml"), "context: old\n").expect("config.yaml");
+        store_config(&dir, "", &BTreeMap::new()).expect("clear");
+        let cleared = config(&dir).expect("reload");
+        assert_eq!(cleared.context, "");
+        assert!(cleared.rules.is_empty());
+        assert!(cleared.schema.is_none());
+        // A key can still be appended to the now-empty file.
+        activate_schema(&dir, "spec-driven").expect("activate");
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_edited_safely_is_refused_and_left_alone() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        let before = "{context: old}\n";
+        fs::write(dir.join("config.yaml"), before).expect("config.yaml");
+        let error = activate_schema(&dir, "spec-driven").unwrap_err();
+        assert!(error.contains("edit it by hand"), "{error}");
+        let after = fs::read_to_string(dir.join("config.yaml")).expect("config.yaml");
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn an_old_empty_config_can_be_edited() {
+        let project = project();
+        let dir = openspec_dir(project.path());
+        fs::write(dir.join("config.yaml"), "{}\n").expect("config.yaml");
+        activate_schema(&dir, "spec-driven").expect("activate");
+        let raw = fs::read_to_string(dir.join("config.yaml")).expect("config.yaml");
+        assert_eq!(raw, "schema: spec-driven\n");
     }
 }

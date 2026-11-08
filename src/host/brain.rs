@@ -802,6 +802,22 @@ pub(crate) fn wire_brain(
                 ),
                 Err(e) => eprintln!("warning: synthetic-summary sweep failed: {e}"),
             }
+            // Facts that only restate git or plan state are not knowledge
+            // (plan 373dec00 step 3): the extractor used to record what a
+            // commit or the plan board already shows. Retired on the same
+            // recoverable terms, with its own one-line notifier — a few
+            // hundred rows on the first run is housekeeping, not a
+            // malformed-store alarm.
+            match crate::memory::integrity::quarantine_git_state_facts(store_for_index.as_ref())
+                .await
+            {
+                Ok(ids) if ids.is_empty() => {}
+                Ok(ids) => eprintln!(
+                    "memory integrity: quarantined {} git/plan-state fact(s) the repository already shows",
+                    ids.len()
+                ),
+                Err(e) => eprintln!("warning: git-state fact sweep failed: {e}"),
+            }
             // The staleness pre-check decides whether the reconcile runs at
             // all. A failure here (store error, scan failure) degrades to
             // "run the index anyway" — the reconcile is the recovery path

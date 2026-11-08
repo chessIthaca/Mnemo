@@ -578,10 +578,6 @@ pub struct TiersTopControlWire {
     /// The saved choice — the key of [`tiers_top_control_writes`]:
     /// `off`, `shadow`, `suggest` or `auto`.
     pub choice: String,
-    /// Mnemo1's `[general.routing] enforce` half of the choice, reported so
-    /// a hand-edited config can show a mismatch warning instead of pretending
-    /// the three halves agree.
-    pub mnemo1_enforce: bool,
     /// Mnemo1's `[general.laya] routing` half of the choice.
     pub laya_routing: bool,
     /// Laya's coarse readiness word: `not_installed`, `disabled`,
@@ -597,25 +593,27 @@ pub struct TiersTopControlWire {
 }
 
 /// The choice's exact writes (design §7.1): the mnemo2.toml `[routing]`
-/// mode, Mnemo1's `[general.routing] enforce` gate and the
-/// `[general.laya] routing` master flag. Pure, so the tests can pin every
+/// mode and the `[general.laya] routing` master flag. Mnemo1's
+/// `[general.routing] enforce` gate is not one of them — it belongs to
+/// Mnemo1's own settings. Pure, so the tests can pin every
 /// row of the table and the command stays a thin caller.
 pub fn tiers_top_control_writes(
     choice: &str,
-) -> Result<(dispatch_routing::RoutingMode, bool, bool), String> {
+) -> Result<(dispatch_routing::RoutingMode, bool), String> {
     match choice {
-        "off" => Ok((dispatch_routing::RoutingMode::Off, false, false)),
-        "shadow" => Ok((dispatch_routing::RoutingMode::Shadow, false, true)),
-        "suggest" => Ok((dispatch_routing::RoutingMode::Suggest, false, true)),
-        "auto" => Ok((dispatch_routing::RoutingMode::Auto, true, true)),
+        "off" => Ok((dispatch_routing::RoutingMode::Off, false)),
+        "shadow" => Ok((dispatch_routing::RoutingMode::Shadow, true)),
+        "suggest" => Ok((dispatch_routing::RoutingMode::Suggest, true)),
+        "auto" => Ok((dispatch_routing::RoutingMode::Auto, true)),
         other => Err(format!(
             "unknown tier choice `{other}` — pick one of: off, shadow, suggest, auto"
         )),
     }
 }
 
-/// Assemble the control's wire: the saved choice, Mnemo1's two halves and
-/// Laya's readiness, read from the same files the save path writes.
+/// Assemble the control's wire: the saved choice, Mnemo1's `laya` routing
+/// flag and Laya's readiness, read from the same files the save path
+/// writes.
 async fn tiers_top_control_read(
     setup: &Setup,
     runtime: Option<Arc<LeadRuntime>>,
@@ -634,7 +632,6 @@ async fn tiers_top_control_read(
     };
     Ok(TiersTopControlWire {
         choice: mode_key(routing.mode).to_string(),
-        mnemo1_enforce: config.general.general.routing.enforce,
         laya_routing: config.general.general.laya.routing,
         laya_status: status.status,
         checkpoint: status.installed.then(|| english_checkpoint().name.to_string()),
@@ -654,10 +651,11 @@ pub async fn tiers_top_control_status(
 }
 
 /// Save the top control's choice in one call (design §7.1): the mnemo2.toml
-/// `[routing]` mode, Mnemo1's `enforce` gate and the `[general.laya]`
-/// routing master flag, through the sanctioned write paths, then reload the
-/// open team and the engine's config. A choice other than `off` also starts
-/// the Laya check (plan 8106337a) — an error there never fails the save.
+/// `[routing]` mode and the `[general.laya]` routing master flag, through
+/// the sanctioned write paths, then reload the open team and the engine's
+/// config. Mnemo1's `enforce` gate is not written — it stays under Mnemo1's
+/// own settings. A choice other than `off` also starts the Laya check
+/// (plan 8106337a) — an error there never fails the save.
 /// Returns the fresh wire.
 #[tauri::command]
 pub async fn save_tiers_top_control(
@@ -684,17 +682,18 @@ pub async fn save_tiers_top_control(
     tiers_top_control_read(&setup, runtime).await
 }
 
-/// The `save_tiers_top_control` core — the three writes without the Tauri
+/// The `save_tiers_top_control` core — the two writes without the Tauri
 /// state, so the tests can pin them against a temp config dir: the
 /// mnemo2.toml mode (plus a live team's reload, when one is handed in),
-/// then Mnemo1's enforce gate and `laya` routing master flag through the
-/// sanctioned settings patch (which holds the OS config lock).
+/// then the `laya` routing master flag through the sanctioned settings
+/// patch (which holds the OS config lock). Mnemo1's `[general.routing]`
+/// block is not written — `enforce` stays under Mnemo1's own settings.
 pub(crate) async fn save_tiers_top_control_core(
     setup: &Setup,
     choice: &str,
     team: Option<&TeamRuntime>,
 ) -> Result<(), String> {
-    let (mode, enforce, laya_routing) = tiers_top_control_writes(choice)?;
+    let (mode, laya_routing) = tiers_top_control_writes(choice)?;
     update_routing_settings(setup.config_dir(), team, |settings| settings.mode = mode)?;
     save_laya_settings_core(
         setup,
@@ -702,10 +701,7 @@ pub(crate) async fn save_tiers_top_control_core(
             routing: Some(laya_routing),
             ..LayaFlagsPatch::default()
         }),
-        Some(RoutingConfigDto {
-            enforce: Some(enforce),
-            ..RoutingConfigDto::default()
-        }),
+        None,
     )
     .await
 }
@@ -1141,33 +1137,13 @@ simple = ["ep1/exec-model"]
     }
 
     #[tokio::test]
-    async fn the_top_control_writes_all_three_settings() {
+    async fn the_top_control_writes_the_mode_and_the_routing_flag() {
         let (dir, setup) = fixture();
-        for (choice, mode, enforce, laya_routing) in [
-            (
-                "off",
-                dispatch_routing::RoutingMode::Off,
-                false,
-                false,
-            ),
-            (
-                "shadow",
-                dispatch_routing::RoutingMode::Shadow,
-                false,
-                true,
-            ),
-            (
-                "suggest",
-                dispatch_routing::RoutingMode::Suggest,
-                false,
-                true,
-            ),
-            (
-                "auto",
-                dispatch_routing::RoutingMode::Auto,
-                true,
-                true,
-            ),
+        for (choice, mode, laya_routing) in [
+            ("off", dispatch_routing::RoutingMode::Off, false),
+            ("shadow", dispatch_routing::RoutingMode::Shadow, true),
+            ("suggest", dispatch_routing::RoutingMode::Suggest, true),
+            ("auto", dispatch_routing::RoutingMode::Auto, true),
         ] {
             save_tiers_top_control_core(&setup, choice, None)
                 .await
@@ -1176,23 +1152,65 @@ simple = ["ep1/exec-model"]
             assert_eq!(settings.mode, mode, "{choice}: the mnemo2.toml mode");
             let config = Config::load(dir.path()).expect("reload");
             assert_eq!(
-                config.general.general.routing.enforce,
-                enforce,
-                "{choice}: Mnemo1's enforce gate"
-            );
-            assert_eq!(
                 config.general.general.laya.routing,
                 laya_routing,
                 "{choice}: the laya routing master flag"
             );
-            // The read derives the same choice back, with its two Mnemo1
-            // halves for the mismatch warning.
+            // The read derives the same choice back, with its Mnemo1
+            // routing flag for the mismatch warning.
             let wire = tiers_top_control_read(&setup, None)
                 .await
                 .expect("read");
             assert_eq!(wire.choice, choice);
-            assert_eq!(wire.mnemo1_enforce, enforce);
             assert_eq!(wire.laya_routing, laya_routing);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_on_the_top_control_leaves_mnemo1_enforce_alone() {
+        let (dir, setup) = fixture();
+        // The fixture stores enforce = true; park it off through the
+        // sanctioned patch, as Mnemo1's own Classifier settings would.
+        save_laya_settings_core(
+            &setup,
+            None,
+            Some(RoutingConfigDto {
+                enforce: Some(false),
+                ..RoutingConfigDto::default()
+            }),
+        )
+        .await
+        .expect("enforce off");
+        // Picking Auto must not reach Mnemo1's gate: the bug turned it on.
+        save_tiers_top_control_core(&setup, "auto", None)
+            .await
+            .expect("save auto");
+        let config = Config::load(dir.path()).expect("reload");
+        assert!(
+            !config.general.general.routing.enforce,
+            "auto left Mnemo1's enforce gate off"
+        );
+        // The other direction: once enforcement is on, no choice turns it
+        // off.
+        save_laya_settings_core(
+            &setup,
+            None,
+            Some(RoutingConfigDto {
+                enforce: Some(true),
+                ..RoutingConfigDto::default()
+            }),
+        )
+        .await
+        .expect("enforce on");
+        for choice in ["auto", "shadow", "suggest", "off"] {
+            save_tiers_top_control_core(&setup, choice, None)
+                .await
+                .expect("save choice");
+            let config = Config::load(dir.path()).expect("reload");
+            assert!(
+                config.general.general.routing.enforce,
+                "{choice}: the choice leaves Mnemo1's enforce gate alone"
+            );
         }
     }
 

@@ -142,7 +142,6 @@ function makeMcpTransport() {
 function makeLayaTransport() {
   const control = {
     choice: "suggest",
-    mnemo1_enforce: false,
     laya_routing: true,
     laya_status: "ready",
     checkpoint: "Laya (English)",

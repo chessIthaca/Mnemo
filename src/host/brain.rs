@@ -787,6 +787,21 @@ pub(crate) fn wire_brain(
                 ),
                 Err(e) => eprintln!("warning: digest-integrity sweep failed: {e}"),
             }
+            // Synthetic turn-boundary summaries are not knowledge (plan
+            // 373dec00 step 2): the compressor writes them to bound the
+            // working tier, and after 30 days they are retired. A separate
+            // notifier on purpose — ~1,300 rows on the first run is routine
+            // housekeeping, not a malformed-store alarm.
+            match crate::memory::integrity::quarantine_old_synthetic(store_for_index.as_ref())
+                .await
+            {
+                Ok(ids) if ids.is_empty() => {}
+                Ok(ids) => eprintln!(
+                    "memory integrity: quarantined {} synthetic turn-boundary summary/summaries older than 30 days",
+                    ids.len()
+                ),
+                Err(e) => eprintln!("warning: synthetic-summary sweep failed: {e}"),
+            }
             // The staleness pre-check decides whether the reconcile runs at
             // all. A failure here (store error, scan failure) degrades to
             // "run the index anyway" — the reconcile is the recovery path

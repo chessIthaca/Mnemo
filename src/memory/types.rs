@@ -323,6 +323,13 @@ pub struct SemanticData {
     pub fact: String,
     /// 0.0–1.0; rises with reinforcement across sessions.
     pub confidence: f64,
+    /// What shows the fact is true — a test, a file, a run, or that the user
+    /// said so (plan 373dec00). Optional: extraction output that omits it and
+    /// rows written before the field existed deserialize as `None`, and a
+    /// `None` is serialized away so those rows keep their old shape byte for
+    /// byte (no schema migration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how_known: Option<String>,
 }
 
 /// Procedural-memory payload — a learned workflow.
@@ -935,6 +942,7 @@ mod tests {
         let d = MemoryData::Semantic(SemanticData {
             fact: "uses jose for JWT".into(),
             confidence: 0.8,
+            how_known: None,
         });
         let json = serde_json::to_string(&d).unwrap();
         let back: MemoryData = serde_json::from_str(&json).unwrap();

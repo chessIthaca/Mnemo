@@ -368,6 +368,33 @@ async fn synthesize_with_llm(
     Ok((narrative, key_decisions, files_modified, concepts))
 }
 
+/// The semantic-extraction prompt (plan 373dec00 step 2).
+///
+/// Guidance says what memory is FOR — what a future session cannot get by
+/// reading the repository or git — instead of imposing fixed salience rules
+/// or banned words: the article's evidence is that fixed write rules cost
+/// more memory gain than they save. `how_known` is optional; output that
+/// omits it must keep parsing.
+pub(crate) fn semantic_extraction_prompt(
+    narrative: &str,
+    corpus_section: &str,
+    existing_section: &str,
+) -> String {
+    format!(
+        "Extract what a future session on this project could not get by reading the repository or \
+         git. Return a JSON array of objects with a 'fact' field, a 'confidence' field (0-1), an \
+         optional 'how_known' field (what shows the fact is true: a test, a file, a run, or that \
+         the user said so), and an optional 'id' field — the id of the existing fact this entry \
+         refines or corrects. Omit 'id' for genuinely new facts.\n\n\
+         What earns a place: why a choice was made, what was tried and failed, a trap, a user \
+         preference, a rule and how it was verified. Git and the plan board already record what \
+         was committed, merged or finished, and the code shows what it does — do not restate \
+         those. If a fact restates what the repository or git already makes plain, leave it \
+         out.\n\n\
+         Summary:\n{narrative}{corpus_section}{existing_section}"
+    )
+}
+
 /// Extract cross-session semantic facts from an episodic narrative.
 ///
 /// `corpus` (the plans/reviews digest) is appended to the prompt when
@@ -418,9 +445,7 @@ async fn extract_semantic_facts(
             "\n\nExisting facts (id: text) — set 'id' when an entry refines or corrects one of these:\n{lines}"
         )
     };
-    let prompt = format!(
-        "Extract distinct, reusable facts about this project from the session summary. Return a JSON array of objects with a 'fact' field, a 'confidence' field (0-1), and optionally an 'id' field — the id of the existing fact this entry refines or corrects. Omit 'id' for genuinely new facts.\n\nSummary:\n{narrative}{corpus_section}{existing_section}"
-    );
+    let prompt = semantic_extraction_prompt(narrative, &corpus_section, &existing_section);
     let messages = vec![Message::user_text(prompt)];
     let stream = llm
         .complete_with_context(&messages, &[], None, llm_context)
@@ -443,10 +468,15 @@ async fn extract_semantic_facts(
                 .get("confidence")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.5);
-            let data = crate::memory::types::SemanticData {
-                fact: fact_str.to_string(),
-                confidence,
-            };
+            // Provenance is optional in the output and old rows lack it; a
+            // refinement that omits it KEEPS the prior row's answer instead
+            // of forgetting how the fact is known (plan 373dec00 step 2).
+            let how_known = fact
+                .get("how_known")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             // When the LLM names the fact this entry refines, rewrite that
             // memory in place (same id, bumped strength, preserved history)
             // so reinforcement compounds instead of duplicating near-misses.
@@ -456,6 +486,17 @@ async fn extract_semantic_facts(
                     .iter()
                     .find(|m| m.id == id && m.tier == MemoryTier::Semantic)
             });
+            let prior_how_known = existing_hit
+                .and_then(|prior| {
+                    serde_json::from_value::<crate::memory::types::SemanticData>(prior.data.clone())
+                        .ok()
+                })
+                .and_then(|d| d.how_known);
+            let data = crate::memory::types::SemanticData {
+                fact: fact_str.to_string(),
+                confidence,
+                how_known: how_known.or(prior_how_known),
+            };
             let mut mem = match existing_hit {
                 Some(prior) => {
                     let mut m = prior.clone();
@@ -1164,6 +1205,7 @@ mod tests {
         seed.data = serde_json::to_value(crate::memory::types::SemanticData {
             fact: "The build uses cargo workspaces.".to_string(),
             confidence: 0.6,
+            how_known: None,
         })
         .unwrap();
         store.write(seed).await.unwrap();
@@ -1234,6 +1276,206 @@ mod tests {
             .find(|m| m.id != "fact-known")
             .expect("new fact written");
         assert!(fresh.content.contains("cargo test unpiped"));
+    }
+
+    #[tokio::test]
+    async fn extracted_facts_keep_how_known_and_tolerate_its_absence() {
+        // Plan 373dec00 step 2: the extractor may say HOW a fact is known
+        // (a test, a file, a run, the user said so). It round-trips through
+        // the row's existing `data` JSON — the old shape keeps parsing, and a
+        // refinement that omits it keeps what the row already knew.
+        let embedder: Arc<dyn crate::memory::embedder::Embedder> = Arc::new(HashEmbedder::new());
+        let store = MemoryStore::open_in_memory(embedder).unwrap();
+        store
+            .record_tool_event(
+                Some("sess-hk"),
+                "file_read",
+                serde_json::json!({"path": "Cargo.toml"}),
+                "contents",
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "agent inspected Cargo.toml",
+                "key_decisions": [],
+                "files_modified": ["Cargo.toml"],
+                "concepts": []
+            })
+            .to_string(),
+            serde_json::json!([
+                {
+                    "fact": "The build uses cargo workspaces.",
+                    "confidence": 0.9,
+                    "how_known": "Cargo.toml lists two workspace members; cargo test passes."
+                },
+                {"fact": "Tests run via cargo test unpiped.", "confidence": 0.7}
+            ])
+            .to_string(),
+            "[]".to_string(),
+        ]);
+        consolidate_session(
+            &store,
+            "sess-hk",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
+
+        let semantic = store.list_by_tier(MemoryTier::Semantic).await.unwrap();
+        let with_evidence = semantic
+            .iter()
+            .find(|m| m.content.contains("cargo workspaces"))
+            .expect("the evidenced fact was written");
+        let data: crate::memory::types::SemanticData =
+            serde_json::from_value(with_evidence.data.clone()).unwrap();
+        assert_eq!(
+            data.how_known.as_deref(),
+            Some("Cargo.toml lists two workspace members; cargo test passes.")
+        );
+        let without = semantic
+            .iter()
+            .find(|m| m.content.contains("cargo test unpiped"))
+            .expect("the bare fact was written");
+        let data: crate::memory::types::SemanticData =
+            serde_json::from_value(without.data.clone()).unwrap();
+        assert!(
+            data.how_known.is_none(),
+            "output without how_known still parses: {data:?}"
+        );
+        assert!(
+            without.data.get("how_known").is_none(),
+            "the old row shape stays byte-identical when how_known is absent"
+        );
+        // A pre-field `data` payload (the shape already in the store) keeps
+        // deserializing — no schema migration.
+        assert!(
+            serde_json::from_value::<crate::memory::types::SemanticData>(
+                serde_json::json!({"fact": "old row shape", "confidence": 0.5})
+            )
+            .is_ok()
+        );
+
+        // A refinement that omits how_known KEEPS the prior answer.
+        let evidenced_id = with_evidence.id.clone();
+        store
+            .record_tool_event(
+                Some("sess-hk2"),
+                "file_read",
+                serde_json::json!({"path": "Cargo.toml"}),
+                "contents",
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "agent re-read Cargo.toml",
+                "key_decisions": [],
+                "files_modified": ["Cargo.toml"],
+                "concepts": []
+            })
+            .to_string(),
+            serde_json::json!([
+                {
+                    "id": evidenced_id.clone(),
+                    "fact": "The build uses a cargo workspace with two members.",
+                    "confidence": 0.95
+                }
+            ])
+            .to_string(),
+            "[]".to_string(),
+        ]);
+        consolidate_session(
+            &store,
+            "sess-hk2",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
+        let refined = store.list_by_tier(MemoryTier::Semantic).await.unwrap();
+        let refined = refined
+            .iter()
+            .find(|m| m.id == evidenced_id)
+            .expect("refined row keeps its id");
+        let data: crate::memory::types::SemanticData =
+            serde_json::from_value(refined.data.clone()).unwrap();
+        assert_eq!(
+            data.how_known.as_deref(),
+            Some("Cargo.toml lists two workspace members; cargo test passes."),
+            "a refinement without how_known keeps the prior provenance"
+        );
+        assert!(refined.content.contains("two members"));
+    }
+
+    #[tokio::test]
+    async fn extraction_prompt_says_what_memory_is_for() {
+        // Plan 373dec00 step 2: the prompt says what memory is FOR — what a
+        // future session cannot get from the repository or git — instead of
+        // fixed salience rules, and it asks for optional provenance.
+        let embedder: Arc<dyn crate::memory::embedder::Embedder> = Arc::new(HashEmbedder::new());
+        let store = MemoryStore::open_in_memory(embedder).unwrap();
+        store
+            .record_tool_event(
+                Some("sess-prompt"),
+                "file_read",
+                serde_json::json!({"path": "src/main.rs"}),
+                "contents",
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = MockLlm::sequence(vec![
+            serde_json::json!({
+                "narrative": "agent read src/main.rs",
+                "key_decisions": [],
+                "files_modified": ["src/main.rs"],
+                "concepts": []
+            })
+            .to_string(),
+            "[]".to_string(),
+            "[]".to_string(),
+        ]);
+        consolidate_session(
+            &store,
+            "sess-prompt",
+            Some(&llm),
+            "",
+            &LlmRequestContext::unattributed(),
+        )
+        .await
+        .unwrap();
+
+        let prompts = llm.prompts().await;
+        assert_eq!(prompts.len(), 3, "synthesis + semantic + procedural");
+        let prompt = &prompts[1];
+        for needle in [
+            "could not get by reading the repository or git",
+            "why a choice was made",
+            "what was tried and failed",
+            "a trap",
+            "a user preference",
+            "a rule and how it was verified",
+            "Git and the plan board already record",
+            "how_known",
+            "a test, a file, a run, or that the user said so",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "the extraction prompt must say {needle:?}: {prompt}"
+            );
+        }
+        assert!(
+            prompt.contains("agent read src/main.rs"),
+            "the session narrative still reaches the extractor: {prompt}"
+        );
+        // The old one-line guidance said nothing about what memory is for.
+        assert!(!prompt.contains("distinct, reusable facts"));
     }
 
     #[tokio::test]

@@ -50,6 +50,13 @@ pub struct ScoredMemory {
     pub score: f64,
 }
 
+/// The synthetic turn-boundary compressor's content prefix
+/// ([`consolidation::synthesize_synthetic`]) — a tool-call count line, not
+/// knowledge. Rows carrying it keep their job (they bound the working tier)
+/// but never compete in ranked recall or a default browse; only an explicit
+/// `tier = episodic` browse lists them (plan 373dec00 step 2).
+pub const SYNTHETIC_SUMMARY_PREFIX: &str = "Session involved ";
+
 /// If the stored model fingerprints don't exactly match the embedder's
 /// (model_id, dim), re-embed all rows. No-op (returns without re-embedding)
 /// when the fingerprint set already matches.
@@ -1181,6 +1188,15 @@ impl MemoryStore {
         } else if filter.exclude_working {
             sql.push_str(" AND tier != 'working'");
         }
+        // Ranked recall never ranks a synthetic turn-boundary summary (plan
+        // 373dec00 step 2): those rows are the compressor's "Session involved
+        // N tool calls" working-tier exhaust, not knowledge, and they crowded
+        // real records out of the top 5. Applies even when the filter names
+        // the episodic tier — a query is a search, not a browse;
+        // `list_filtered` keeps the explicit episodic browse that shows them.
+        sql.push_str(" AND NOT (tier = 'episodic' AND substr(content, 1, ?) = ?)");
+        params_vec.push(Box::new(SYNTHETIC_SUMMARY_PREFIX.chars().count() as i64));
+        params_vec.push(Box::new(SYNTHETIC_SUMMARY_PREFIX.to_string()));
         if filter.exclude_superseded {
             sql.push_str(" AND superseded_by IS NULL");
         }
@@ -1296,6 +1312,11 @@ impl MemoryStore {
         } else if filter.exclude_working {
             sql.push_str(" AND m.tier != 'working'");
         }
+        // Same rule as `load_recent_locked`: a ranked query never ranks a
+        // synthetic turn-boundary summary, even with an explicit tier.
+        sql.push_str(" AND NOT (m.tier = 'episodic' AND substr(m.content, 1, ?) = ?)");
+        params_vec.push(Box::new(SYNTHETIC_SUMMARY_PREFIX.chars().count() as i64));
+        params_vec.push(Box::new(SYNTHETIC_SUMMARY_PREFIX.to_string()));
         if filter.exclude_superseded {
             sql.push_str(" AND m.superseded_by IS NULL");
         }
@@ -2027,6 +2048,15 @@ impl MemoryStoreTrait for MemoryStore {
                 params_vec.push(Box::new(t.as_str().to_string()));
             } else if filter.exclude_working {
                 sql.push_str(" AND tier != 'working'");
+            }
+            // Synthetic turn-boundary summaries (plan 373dec00 step 2) are
+            // hidden from the default browse too, but an explicit
+            // `tier = episodic` browse lists them — the one deliberate way to
+            // read them back (the old-synthetic sweep uses it).
+            if filter.tier != Some(MemoryTier::Episodic) {
+                sql.push_str(" AND NOT (tier = 'episodic' AND substr(content, 1, ?) = ?)");
+                params_vec.push(Box::new(SYNTHETIC_SUMMARY_PREFIX.chars().count() as i64));
+                params_vec.push(Box::new(SYNTHETIC_SUMMARY_PREFIX.to_string()));
             }
             if filter.exclude_superseded {
                 sql.push_str(" AND superseded_by IS NULL");

@@ -1121,6 +1121,99 @@ async fn turn_boundary_auto_consolidates_previous_turns_working_rows() {
 }
 
 #[tokio::test]
+async fn synthetic_summaries_do_not_compete_in_recall() {
+    // Plan 373dec00 step 2: the turn-boundary compressor's synthetic rows
+    // keep their job (bounding the working tier) but stop competing in
+    // ranked recall — they used to crowd real records out of the top 5.
+    let store = make_store();
+    let synthetic_id = store
+        .write(Memory::new(
+            MemoryTier::Episodic,
+            "session sess-t summary",
+            "Session involved 2 tool calls across tools: file_read, file_write. \
+             Files modified: routes.rs. The login route lives in routes.rs.",
+            1000,
+        ))
+        .await
+        .unwrap();
+    let real_id = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "login route location",
+            "The login route lives in routes.rs; the trap is its middleware ordering.",
+            1000,
+        ))
+        .await
+        .unwrap();
+
+    let hits = store
+        .recall_peek("login route routes.rs", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.memory.id == real_id),
+        "the real record still ranks: {hits:?}"
+    );
+    assert!(
+        hits.iter().all(|h| h.memory.id != synthetic_id),
+        "the synthetic summary must not compete in recall: {hits:?}"
+    );
+
+    // A query that names the episodic tier is still a search, not a browse:
+    // the tier filter narrows the candidates, it does not resurrect noise.
+    let hits = store
+        .recall_peek(
+            "login route routes.rs",
+            &MemoryFilter::new().tier(MemoryTier::Episodic),
+        )
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().all(|h| h.memory.id != synthetic_id),
+        "an explicit tier on a query does not resurrect synthetic summaries: {hits:?}"
+    );
+
+    // The bumping recall path shares the same SQL: same result.
+    let hits = store
+        .recall("login route routes.rs", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert!(hits.iter().all(|h| h.memory.id != synthetic_id));
+}
+
+#[tokio::test]
+async fn an_explicit_episodic_browse_still_lists_them() {
+    // Plan 373dec00 step 2: an explicit episodic-tier browse with no query is
+    // the one deliberate way back to a synthetic summary (the startup sweep
+    // reads them through it). The default browse hides them.
+    let store = make_store();
+    let synthetic_id = store
+        .write(Memory::new(
+            MemoryTier::Episodic,
+            "session sess-t summary",
+            "Session involved 2 tool calls across tools: file_read.",
+            1000,
+        ))
+        .await
+        .unwrap();
+
+    let browse = store
+        .list_filtered(&MemoryFilter::new().tier(MemoryTier::Episodic))
+        .await
+        .unwrap();
+    assert!(
+        browse.iter().any(|m| m.id == synthetic_id),
+        "an explicit episodic browse lists synthetic summaries: {browse:?}"
+    );
+
+    let default_browse = store.list_filtered(&MemoryFilter::new()).await.unwrap();
+    assert!(
+        default_browse.iter().all(|m| m.id != synthetic_id),
+        "the default browse hides them: {default_browse:?}"
+    );
+}
+
+#[tokio::test]
 async fn recall_bumps_access_via_batch() {
     // End-to-end: recall should still bump access counts (now via the
     // batched path). After recalling 3 memories, each should have

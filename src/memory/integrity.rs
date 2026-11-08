@@ -20,7 +20,7 @@
 //! record.
 
 use crate::error::Result;
-use crate::memory::{MemoryFilter, MemoryStoreTrait};
+use crate::memory::{MemoryFilter, MemoryStoreTrait, MemoryTier};
 
 /// Heuristic for the observed corruption class (the ".c"-truncated
 /// digests): a gist cut MID-TOKEN at the byte budget, leaving a
@@ -91,6 +91,47 @@ pub async fn quarantine_malformed(store: &dyn MemoryStoreTrait) -> Result<Vec<St
         };
         store.quarantine_memory(&row.id, reason).await?;
         quarantined.push(row.id);
+    }
+    Ok(quarantined)
+}
+
+/// How old a synthetic turn-boundary summary must be before the startup
+/// sweep retires it (plan 373dec00 step 2). Thirty days is long past any
+/// resume window, so the row has done its bounded-working-tier job.
+pub const SYNTHETIC_SUMMARY_MAX_AGE_SECS: i64 = 30 * 86_400;
+
+/// Retire the synthetic turn-boundary summaries older than
+/// [`SYNTHETIC_SUMMARY_MAX_AGE_SECS`]: QUARANTINE — never delete — the
+/// `"Session involved N tool calls"` episodic rows the compressor writes to
+/// bound the working tier (plan 373dec00 step 2). They are not knowledge; at
+/// a month old they rank nothing, and `include_quarantined` keeps them
+/// recoverable like every other quarantine.
+///
+/// Fetched through the explicit episodic-tier browse: the default listing now
+/// hides synthetic rows, and that browse is the one deliberate way back to
+/// them. It carries no limit (`MemoryFilter::new()` sets none), so the sweep
+/// sees every episodic row. Idempotent — quarantined rows drop out of the
+/// browse's default filter.
+pub async fn quarantine_old_synthetic(store: &dyn MemoryStoreTrait) -> Result<Vec<String>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - SYNTHETIC_SUMMARY_MAX_AGE_SECS;
+    let rows = store
+        .list_filtered(&MemoryFilter::new().tier(MemoryTier::Episodic))
+        .await?;
+    let mut quarantined = Vec::new();
+    for row in rows {
+        if row.tier == MemoryTier::Episodic
+            && row.content.starts_with(crate::memory::SYNTHETIC_SUMMARY_PREFIX)
+            && row.created_at < cutoff
+        {
+            store
+                .quarantine_memory(&row.id, "synthetic turn-boundary summary older than 30 days")
+                .await?;
+            quarantined.push(row.id);
+        }
     }
     Ok(quarantined)
 }
@@ -238,6 +279,98 @@ mod tests {
         // Idempotent: a re-run finds nothing new (quarantined rows are
         // excluded from the scan by the default filter).
         let again = quarantine_malformed(store.as_ref()).await.unwrap();
+        assert!(again.is_empty(), "idempotent: {again:?}");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_quarantines_old_synthetic_rows_only() {
+        // Plan 373dec00 step 2: the startup sweep retires synthetic
+        // turn-boundary summaries after 30 days — only rows carrying the
+        // compressor's content prefix, only on the episodic tier, only when
+        // old, and always as a recoverable quarantine.
+        let store = store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap();
+        let old = now - SYNTHETIC_SUMMARY_MAX_AGE_SECS - 86_400;
+        let synthetic_old = store
+            .write(Memory::new(
+                MemoryTier::Episodic,
+                "session old summary",
+                "Session involved 2 tool calls across tools: file_read.",
+                old,
+            ))
+            .await
+            .unwrap();
+        let synthetic_fresh = store
+            .write(Memory::new(
+                MemoryTier::Episodic,
+                "session fresh summary",
+                "Session involved 1 tool call across tools: file_write.",
+                now - 86_400,
+            ))
+            .await
+            .unwrap();
+        let episodic_old = store
+            .write(Memory::new(
+                MemoryTier::Episodic,
+                "session decision",
+                "We decided the login route moves into the router module.",
+                old,
+            ))
+            .await
+            .unwrap();
+        let semantic_old = store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "DECISION: quoted call line",
+                "Session involved 2 tool calls — a quote inside a real decision record.",
+                old,
+            ))
+            .await
+            .unwrap();
+
+        let quarantined = quarantine_old_synthetic(store.as_ref()).await.unwrap();
+        assert_eq!(
+            quarantined,
+            vec![synthetic_old.clone()],
+            "exactly the old synthetic row"
+        );
+        let flagged = store.get_memory(&synthetic_old).await.unwrap().unwrap();
+        let reason = flagged.quarantined.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("synthetic") && reason.contains("30 days"),
+            "the reason says what happened: {reason:?}"
+        );
+
+        // Quarantine is recoverable, never a delete.
+        let full = store
+            .list_filtered(
+                &MemoryFilter::new()
+                    .include_quarantined()
+                    .tier(MemoryTier::Episodic),
+            )
+            .await
+            .unwrap();
+        assert!(full.iter().any(|m| m.id == synthetic_old), "recoverable");
+        let default_list = store.list_filtered(&MemoryFilter::new()).await.unwrap();
+        assert!(
+            default_list.iter().all(|m| m.id != synthetic_old),
+            "quarantined rows leave the default listing"
+        );
+
+        // The other rows are untouched.
+        for id in [&synthetic_fresh, &episodic_old, &semantic_old] {
+            let row = store.get_memory(id).await.unwrap().unwrap();
+            assert!(
+                row.quarantined.is_none(),
+                "a fresh, non-synthetic, or non-episodic row is never swept: {row:?}"
+            );
+        }
+
+        // Idempotent: the next startup finds nothing left.
+        let again = quarantine_old_synthetic(store.as_ref()).await.unwrap();
         assert!(again.is_empty(), "idempotent: {again:?}");
     }
 }

@@ -3126,6 +3126,76 @@ mod tests {
         fixture.shutdown().await;
     }
 
+    /// A lead that follows the schema can request a high-risk dispatch: the
+    /// listed team_dispatch schema offers review_risk, and the value reaches
+    /// the worker's record through tools/call.
+    #[tokio::test]
+    async fn external_lead_high_risk_dispatch_over_mcp_records_the_risk() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        fixture.rpc(initialize()).await;
+        let (_, listed) = fixture
+            .rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            }))
+            .await;
+        let tools = listed["result"]["tools"].as_array().expect("tools");
+        let dispatch = tools
+            .iter()
+            .find(|tool| tool["name"] == "team_dispatch")
+            .expect("team_dispatch");
+        assert_eq!(
+            dispatch["inputSchema"]["properties"]["review_risk"]["enum"],
+            json!(["standard", "high"]),
+            "{dispatch}"
+        );
+        let required = dispatch["inputSchema"]["required"].as_array().expect("required");
+        assert!(!required.contains(&json!("review_risk")), "{dispatch}");
+        ok_text(&fixture.call("memory_search", json!({"query": "high-risk dispatch"})).await);
+        let created = ok_text(
+            &fixture
+                .call(
+                    "plan_create",
+                    json!({
+                        "title": "High-risk plan",
+                        "goal": "Prove a schema-following lead can request a high-risk dispatch",
+                        "context": "The external lead creates this plan over MCP; src/lib.rs is the anchor file for the change.",
+                        "steps": ["**One** - edit src/lib.rs"],
+                        "acceptance_scenarios": ["A high-risk worker cannot merge without an independent audit."]
+                    }),
+                )
+                .await,
+        );
+        let plan_id = created
+            .strip_prefix("Created plan ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("a plan id")
+            .to_string();
+        ok_text(
+            &fixture
+                .call(
+                    "team_dispatch",
+                    json!({
+                        "worker_id": "extrisk001",
+                        "plan_id": plan_id,
+                        "step": 1,
+                        "brief": "write src/lib.rs",
+                        "review_risk": "high"
+                    }),
+                )
+                .await,
+        );
+        let worker = fixture
+            .team()
+            .await
+            .worker("extrisk001")
+            .await
+            .expect("the dispatched worker");
+        assert_eq!(worker.review_risk, "high");
+        fixture.shutdown().await;
+    }
+
     /// The whole external-lead loop: plan on the board over MCP, dispatch a
     /// worker, and the worker's "finished" notice reaches the external lead
     /// (not the in-app one) through the waiter and the next tool result.

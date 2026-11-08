@@ -30,10 +30,11 @@ pub(super) const LEDGER_FLUSH_DELAY: std::time::Duration = std::time::Duration::
 /// The sub-directory (beside `team.json`) holding one transcript file per
 /// worker: `<worker_id>.json`.
 pub(super) const TRANSCRIPTS_DIR: &str = "transcripts";
-/// How old a transcript temp file must be before the sweep removes it: a save
-/// running in another [`TeamPersistence`] may be between its write and its
-/// rename right now (`cleanup_workspace` saves through its own instance).
-const TRANSCRIPT_TEMP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+/// How old a save temp file must be before a sweep removes it: two
+/// [`TeamPersistence`] instances can share one state dir (a test runs a second
+/// runtime on the same one), so a young temp may belong to a save that is
+/// between its write and its rename right now.
+const TEMP_SWEEP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The persisted team ledger.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -114,8 +115,9 @@ impl TeamPersistence {
     }
 
     /// Remove temp files a crashed save left behind (`team.json.<pid>.<seq>.tmp`).
-    /// The name is unique per save, so only a crash leaves one; every `load`
-    /// caller holds `save_lock`, so no save of this process is in flight.
+    /// The name is unique per save, so only a crash leaves one; a young one may
+    /// belong to a save running right now in another [`TeamPersistence`] over
+    /// the same state dir, so it is left alone.
     fn sweep_stale_temps(&self) {
         let Some(parent) = self.path.parent() else {
             return;
@@ -128,7 +130,7 @@ impl TeamPersistence {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if name.starts_with("team.json.") && name.ends_with(".tmp") {
+            if name.starts_with("team.json.") && name.ends_with(".tmp") && !is_young(&entry) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -274,8 +276,11 @@ impl TeamPersistence {
     }
 
     /// Write the transcript files of the workers whose transcript `Arc` changed
-    /// since the last write (or read) of that worker's file. A worker with no
-    /// transcript file keeps its transcript in `team.json` and is skipped.
+    /// since the last write (or read) of that worker's file, and of those whose
+    /// file has since disappeared. `written` is not the sole authority: the
+    /// ledger keeps only a placeholder, so a missing file means a lost worker
+    /// conversation. A worker with no transcript file keeps its transcript in
+    /// `team.json` and is skipped.
     fn write_transcripts(&self, team: &PersistedTeam) -> Result<(), String> {
         let mut pending: Vec<(String, PathBuf, Arc<Transcript>)> = Vec::new();
         {
@@ -284,21 +289,22 @@ impl TeamPersistence {
                 let Some(file) = self.transcript_file(&worker.id) else {
                     continue;
                 };
-                let unchanged = written
+                let recorded = written
                     .get(&worker.id)
                     .is_some_and(|known| Arc::ptr_eq(known, &worker.transcript));
-                if !unchanged {
-                    pending.push((worker.id.clone(), file, worker.transcript.clone()));
+                if recorded && file.exists() {
+                    continue;
                 }
+                pending.push((worker.id.clone(), file, worker.transcript.clone()));
             }
         }
         for (id, file, transcript) in pending {
             let bytes = serde_json::to_vec(&*transcript)
                 .map_err(|err| format!("could not encode the transcript for {id}: {err}"))?;
-            // A temp name unique per write, as for `team.json`: two savers
-            // over one state dir need not share `save_lock` (a cleanup builds
-            // its own `TeamPersistence`), and a shared temp name lets one
-            // saver consume the other's temp and fail its rename.
+            // A temp name unique per write, as for `team.json`: two
+            // `TeamPersistence` instances can share one state dir (a test runs
+            // a second runtime on the same one), so a shared temp name would
+            // let one saver consume the other's temp and fail its rename.
             let temp = file.with_extension(format!(
                 "json.{}.{}.tmp",
                 std::process::id(),
@@ -359,12 +365,7 @@ impl TeamPersistence {
             if name.ends_with(".tmp") {
                 // A leftover temp of a crashed write. A young one may belong to
                 // a save running right now, so it is left alone.
-                let young = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .map(|modified| modified.elapsed().unwrap_or_default() < TRANSCRIPT_TEMP_GRACE)
-                    .unwrap_or(true);
-                if !young {
+                if !is_young(&entry) {
                     let _ = std::fs::remove_file(entry.path());
                 }
                 continue;
@@ -394,6 +395,16 @@ impl TeamPersistence {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
+}
+
+/// Whether a directory entry is too fresh to sweep: a save running in another
+/// [`TeamPersistence`] over the same state dir may own it right now.
+fn is_young(entry: &std::fs::DirEntry) -> bool {
+    entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .map(|modified| modified.elapsed().unwrap_or_default() < TEMP_SWEEP_GRACE)
+        .unwrap_or(true)
 }
 
 /// Read and decode one worker's transcript file.

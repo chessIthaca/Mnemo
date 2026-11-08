@@ -409,10 +409,22 @@ fn ledger_saves_are_compact_json() {
     assert_eq!(loaded.workers[0].id, "00000004000000000004");
 }
 
+/// Backdate a file so the temp-file grace treats it as a crash leftover.
+fn age_file(path: &Path, by: std::time::Duration) {
+    let old = std::time::SystemTime::now() - by;
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open the aged file")
+        .set_modified(old)
+        .expect("age the file");
+}
+
 #[test]
 fn a_crash_leftover_temp_is_swept_on_load() {
     // A crash mid-save leaves a uniquely-named temp (`team.json.<pid>.<seq>.tmp`)
-    // that no later save overwrites; load sweeps it before decoding.
+    // that no later save overwrites; load sweeps it once it is old enough that
+    // no save running right now can own it.
     let dir = tempfile::tempdir().expect("ledger dir");
     let root = tempfile::tempdir().expect("workspace");
     let persistence = TeamPersistence::new(dir.path());
@@ -425,10 +437,33 @@ fn a_crash_leftover_temp_is_swept_on_load() {
         .expect("compact save");
     let stale = dir.path().join("team.json.123.0.tmp");
     std::fs::write(&stale, b"{\"workers\":[]}").expect("stale temp");
+    age_file(&stale, std::time::Duration::from_secs(120));
     let loaded = persistence.load().expect("load").expect("some ledger");
     assert!(!stale.exists(), "the crash-leftover temp is swept on load");
     assert_eq!(loaded.workers.len(), 1);
     assert_eq!(loaded.workers[0].id, "00000005000000000005");
+}
+
+#[test]
+fn a_young_ledger_temp_survives_a_load() {
+    // Regression: a load through a fresh TeamPersistence must not delete the
+    // temp file of a save running right now, or that save's rename fails and
+    // its coalesced flush is lost.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![worker(root.path(), "00000006000000000006")],
+            slots: Some(4),
+            usage: ProjectUsage::default(),
+        })
+        .expect("compact save");
+    let live = dir.path().join("team.json.456.1.tmp");
+    std::fs::write(&live, b"{\"workers\":[]}").expect("live temp");
+    let loaded = persistence.load().expect("load").expect("some ledger");
+    assert!(live.exists(), "a young ledger temp is not swept");
+    assert_eq!(loaded.workers.len(), 1);
 }
 
 #[tokio::test]
@@ -577,8 +612,8 @@ fn transcripts_are_saved_beside_the_ledger() {
 #[test]
 fn an_unchanged_transcript_is_not_rewritten() {
     // Regression (PERF-7): the ledger is saved on every state change, so a
-    // transcript that did not change must not be rewritten; a new `Arc` with
-    // the same content must be.
+    // transcript that did not change must not be rewritten. The sentinel proves
+    // it: an unchanged save leaves the file's bytes alone.
     let dir = tempfile::tempdir().expect("ledger dir");
     let root = tempfile::tempdir().expect("workspace");
     let persistence = TeamPersistence::new(dir.path());
@@ -593,14 +628,55 @@ fn an_unchanged_transcript_is_not_rewritten() {
     let file = dir.path().join(TRANSCRIPTS_DIR).join("steady001.json");
     assert!(file.exists());
 
-    std::fs::remove_file(&file).expect("remove the transcript file");
+    std::fs::write(&file, b"sentinel").expect("overwrite with sentinel bytes");
     persistence.save(&team).expect("unchanged save");
-    assert!(!file.exists(), "an unchanged transcript is not rewritten");
+    assert_eq!(
+        std::fs::read(&file).expect("read the transcript file"),
+        b"sentinel",
+        "an unchanged transcript is not rewritten"
+    );
 
     let mut changed = team.clone();
     changed.workers[0].transcript = transcript_of(&["hello"]);
     persistence.save(&changed).expect("changed save");
-    assert!(file.exists(), "a new transcript Arc is written again");
+    let stored: Transcript = serde_json::from_slice(&std::fs::read(&file).expect("transcript file"))
+        .expect("valid transcript file");
+    assert_eq!(stored.messages.len(), 1, "a new transcript Arc is written");
+}
+
+#[test]
+fn a_deleted_transcript_file_is_written_again() {
+    // Regression: `written` is not the sole authority. team.json keeps only a
+    // placeholder, so a transcript file deleted out of band must come back on
+    // the next save even though the worker's transcript `Arc` never changed.
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let root = tempfile::tempdir().expect("workspace");
+    let persistence = TeamPersistence::new(dir.path());
+    let mut record = worker(root.path(), "vanish001");
+    record.transcript = transcript_of(&["hello"]);
+    let team = PersistedTeam {
+        workers: vec![record],
+        slots: Some(4),
+        usage: ProjectUsage::default(),
+    };
+    persistence.save(&team).expect("first save");
+    let file = dir.path().join(TRANSCRIPTS_DIR).join("vanish001.json");
+    assert!(file.exists());
+
+    std::fs::remove_file(&file).expect("delete the transcript file");
+    persistence.save(&team).expect("restoring save");
+    let stored: Transcript = serde_json::from_slice(&std::fs::read(&file).expect("restored file"))
+        .expect("valid restored transcript");
+    assert_eq!(stored.messages.len(), 1, "the deleted file is written again");
+    let reloaded = TeamPersistence::new(dir.path())
+        .load()
+        .expect("load")
+        .expect("some ledger");
+    assert_eq!(
+        reloaded.workers[0].transcript.messages.len(),
+        1,
+        "a restart still sees the conversation"
+    );
 }
 
 #[test]

@@ -94,6 +94,36 @@ async fn phase_two_ledgers_load_with_phase_three_defaults() {
 }
 
 #[test]
+fn worker_record_clones_share_the_transcript() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut record = worker(dir.path(), "arcshare01");
+    record.transcript = Arc::new(Transcript {
+        messages: vec![mnemo::provider::Message::text(
+            mnemo::provider::Role::User,
+            "hello",
+        )],
+    });
+    let copy = record.clone();
+    assert!(Arc::ptr_eq(&record.transcript, &copy.transcript));
+}
+
+#[test]
+fn worker_record_transcript_json_shape_is_unchanged() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut record = worker(dir.path(), "arcshare02");
+    record.transcript = Arc::new(Transcript {
+        messages: vec![mnemo::provider::Message::text(
+            mnemo::provider::Role::User,
+            "hello",
+        )],
+    });
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["transcript"]["messages"].as_array().unwrap().len(), 1);
+    let back: WorkerRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(back.transcript.messages.len(), 1);
+}
+
+#[test]
 fn inbox_entries_use_the_stable_snapshot_shape() {
     let entry = InboxEntry {
         sender: MessageSender::ExternalLead,
@@ -533,7 +563,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         worktree: worker_checkout(root, id),
         status: WorkerStatus::Completed,
         generation: 0,
-        transcript: Transcript::default(),
+        transcript: Arc::default(),
         pending: None,
         used_tokens: 0,
         max_tokens: 0,

@@ -6,10 +6,10 @@
 //! brief and linkage helpers that path needs.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use mnemo::app::worktrees::{agent_branch, agent_short_id, provision_agent_worktree};
-use mnemo::headless::Transcript;
 
 use crate::mnemo2::phase3;
 use crate::mnemo2::phase3::ReviewEvidence;
@@ -360,7 +360,7 @@ impl TeamRuntime {
             worktree,
             status: WorkerStatus::Dispatching,
             generation: 0,
-            transcript: Transcript::default(),
+            transcript: Arc::default(),
             pending: None,
             used_tokens: 0,
             max_tokens: 0,

@@ -941,7 +941,7 @@ pub(super) async fn pump_worker(
                         if worker.model_id.is_none() {
                             worker.model_id = snapshot_model(&snapshot);
                         }
-                        worker.transcript = snapshot.transcript;
+                        worker.transcript = Arc::new(snapshot.transcript);
                         worker.used_tokens = snapshot.used_tokens;
                         worker.max_tokens = snapshot.max_tokens;
                         worker.pending = snapshot.pending;
@@ -1012,18 +1012,18 @@ async fn release_finished_audit(
         }) {
             if let Some(snapshot) = &snapshot {
                 if !snapshot.transcript.messages.is_empty() {
-                    worker.transcript = snapshot.transcript.clone();
+                    worker.transcript = Arc::new(snapshot.transcript.clone());
                     worker.used_tokens = snapshot.used_tokens;
                     worker.max_tokens = snapshot.max_tokens;
                     if worker.model_id.is_none() {
                         worker.model_id = snapshot_model(snapshot);
                     }
                 } else if worker.transcript.messages.is_empty() && worker.brief_sent {
-                    worker.transcript = Transcript {
+                    worker.transcript = Arc::new(Transcript {
                         messages: vec![mnemo::provider::Message::user_text(
                             kickoff_message(worker).to_string(),
                         )],
-                    };
+                    });
                 }
             }
         }

@@ -158,7 +158,7 @@ impl TeamRuntime {
             worktree,
             status: WorkerStatus::Dispatching,
             generation: 0,
-            transcript: Transcript::default(),
+            transcript: Arc::default(),
             pending: None,
             used_tokens: 0,
             max_tokens: 0,
@@ -252,7 +252,7 @@ impl TeamRuntime {
                 model: record.model.clone(),
                 reasoning_effort: record.reasoning_effort.clone(),
                 worktree: record.worktree.clone(),
-                resume: Some(record.transcript.clone()),
+                resume: Some((*record.transcript).clone()),
                 kind: record.kind.clone(),
                 trace_identity: Self::worker_trace_identity(&record),
                 pinned_task: Some(

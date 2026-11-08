@@ -41,7 +41,6 @@ const READY: LayaStatus = {
 /** The top control the scene opens on: Suggest, Laya ready, kNN warm. */
 const CONTROL: TiersTopControl = {
   choice: "suggest",
-  mnemo1_enforce: false,
   laya_routing: true,
   laya_status: "ready",
   checkpoint: "Laya (English)",
@@ -96,12 +95,10 @@ function createPreviewLayaTransport(): LayaTransport {
     routingStatus: async () => structuredClone(routingStatus),
     topControl: async () => structuredClone(control),
     saveTopControl: async (choice: TierChoice) => {
-      const enforce = choice === "auto";
       const layaRouting = choice !== "off";
       control = {
         ...control,
         choice,
-        mnemo1_enforce: enforce,
         laya_routing: layaRouting,
       };
       routingStatus = {
@@ -110,7 +107,6 @@ function createPreviewLayaTransport(): LayaTransport {
       };
       status = {
         ...status,
-        routing: { ...status.routing, enforce },
         flags: { ...status.flags, routing: layaRouting },
       };
       return structuredClone(control);

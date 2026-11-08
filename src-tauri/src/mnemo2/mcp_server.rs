@@ -2387,6 +2387,7 @@ mod tests {
         for expected in [
             "team_dispatch",
             "team_status",
+            "session_search",
             "team_merge",
             "plan_create",
             "plan_list",

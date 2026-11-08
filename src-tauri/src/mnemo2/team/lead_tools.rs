@@ -7,6 +7,9 @@
 //! (`team_status`, worker answers) they return.
 
 use mnemo::headless::HostToolSpec;
+use mnemo::memory::transcript_index::{
+    SyncReport, TranscriptHit, TranscriptIndex, TranscriptSource,
+};
 use mnemo::tool::{SafetyLevel, ToolResult};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -225,6 +228,18 @@ impl TeamRuntime {
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(120_000),
             },
+            HostToolSpec {
+                name: "session_search".to_string(),
+                description: "Search what actually happened in past worker and lead conversations: the ground truth behind a memory record, a plan or a merge. Use memory_search first for decisions and root causes; use this to check a claim or see what was tried. With query it returns matching messages; with worker and seq and no query it returns that one message.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "query":{"type":"string","description":"Words to find in past messages. Optional when worker and seq name one message."},
+                    "worker":{"type":"string","description":"A worker id, or 'lead', to narrow the search or to read one message from that transcript."},
+                    "seq":{"type":"integer","description":"The message's zero-based index in the transcript, with worker and no query."},
+                    "limit":{"type":"integer","description":"Maximum matches (1-30, default 10)."}
+                }}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(60_000),
+            },
         ]
     }
 
@@ -406,6 +421,9 @@ impl TeamRuntime {
             });
             return team_status_result(result, self.lead_status());
         }
+        if name == "session_search" {
+            return self.session_search(args).await;
+        }
         let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
             return ToolResult::error(format!("{name} requires a 'worker_id' string"));
         };
@@ -530,6 +548,150 @@ impl TeamRuntime {
         };
         worker_result(result, name)
     }
+
+    /// `session_search`: search the past worker and lead transcripts, or read
+    /// one message by its source and zero-based sequence number.
+    async fn session_search(&self, args: Value) -> ToolResult {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_string);
+        let worker = args
+            .get("worker")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|worker| !worker.is_empty())
+            .map(str::to_string);
+        let seq = args
+            .get("seq")
+            .and_then(Value::as_u64)
+            .and_then(|seq| usize::try_from(seq).ok());
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(10);
+        let Some(state_dir) = self.persistence.path.parent().map(std::path::Path::to_path_buf)
+        else {
+            return ToolResult::error("session_search cannot find the team's state directory");
+        };
+        let index_path = state_dir.join("transcript_index.db");
+        let sources = transcript_sources(&state_dir);
+        let task = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let mut index = TranscriptIndex::open(&index_path)?;
+            let report = index.sync(&sources);
+            if let Some(query) = query {
+                // A worker with a query narrows the search; seq is ignored.
+                let hits = index.search(&query, worker.as_deref(), limit)?;
+                Ok(format_search_hits(&hits, &report))
+            } else if let (Some(worker), Some(seq)) = (worker, seq) {
+                match index.message(&worker, seq)? {
+                    Some(hit) => Ok(format_one_message(&index, &hit)),
+                    None => Ok(format!("No message #{seq} in {worker}.")),
+                }
+            } else {
+                Err(session_search_usage())
+            }
+        })
+        .await;
+        match task {
+            Ok(Ok(output)) => ToolResult::success(output),
+            Ok(Err(error)) => ToolResult::error(error),
+            Err(error) => ToolResult::error(format!("session_search task failed: {error}")),
+        }
+    }
+}
+
+/// How many characters of hit lines one `session_search` answer carries; the
+/// header and the cut notice always show.
+const SESSION_SEARCH_OUTPUT_CHARS: usize = 6_144;
+
+/// The transcript files a team's state directory holds: every
+/// `transcripts/<worker id>.json`, plus `lead.json` as the `lead` source.
+fn transcript_sources(state_dir: &std::path::Path) -> Vec<TranscriptSource> {
+    let mut sources = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(state_dir.join("transcripts")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            sources.push(TranscriptSource {
+                name: name.to_string(),
+                path,
+            });
+        }
+    }
+    sources.sort_by(|left, right| left.name.cmp(&right.name));
+    let lead = state_dir.join("lead.json");
+    if lead.is_file() {
+        sources.push(TranscriptSource {
+            name: "lead".to_string(),
+            path: lead,
+        });
+    }
+    sources
+}
+
+/// The `session_search` answer for a query: one line per hit under a match
+/// count, with the unreadable-source notice on the first line.
+fn format_search_hits(hits: &[TranscriptHit], report: &SyncReport) -> String {
+    let mut out = format!("{} matches", hits.len());
+    if !report.unreadable.is_empty() {
+        out.push_str(&format!(
+            " ({} transcripts unreadable: {})",
+            report.unreadable.len(),
+            report.unreadable.join(", ")
+        ));
+    }
+    let mut used = 0;
+    let mut cut = false;
+    for hit in hits {
+        let line = format!("\n{} #{} {}: {}", hit.source, hit.seq, hit.role, hit.text);
+        let chars = line.chars().count();
+        if used + chars > SESSION_SEARCH_OUTPUT_CHARS {
+            cut = true;
+            break;
+        }
+        used += chars;
+        out.push_str(&line);
+    }
+    if cut {
+        out.push_str("\n[cut: output reached 6144 characters; narrow the query or pass a worker and seq]");
+    }
+    out
+}
+
+/// The `session_search` answer for one message: its address and stored text,
+/// then the sequence numbers that exist next to it.
+fn format_one_message(index: &TranscriptIndex, hit: &TranscriptHit) -> String {
+    let mut out = format!("{} #{} {}\n{}", hit.source, hit.seq, hit.role, hit.text);
+    let mut neighbours = Vec::new();
+    if hit.seq > 0 && matches!(index.message(&hit.source, hit.seq - 1), Ok(Some(_))) {
+        neighbours.push(hit.seq - 1);
+    }
+    if matches!(index.message(&hit.source, hit.seq + 1), Ok(Some(_))) {
+        neighbours.push(hit.seq + 1);
+    }
+    if !neighbours.is_empty() {
+        let numbers: Vec<String> = neighbours.iter().map(|seq| format!("#{seq}")).collect();
+        out.push_str(&format!("\nNeighbouring messages: {}.", numbers.join(", ")));
+    }
+    out
+}
+
+/// How to call `session_search` when the arguments name neither a search nor
+/// one message.
+fn session_search_usage() -> String {
+    "session_search needs a query to search, or both worker and seq to read one message. \
+     Example: {\"query\": \"flaky test\", \"worker\": \"agent-abc\"} or \
+     {\"worker\": \"lead\", \"seq\": 42}."
+        .to_string()
 }
 
 /// Strip every transcript, plus the transcript-revision bookkeeping only the

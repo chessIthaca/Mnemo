@@ -23,6 +23,7 @@ pub mod plan_format;
 pub mod plan_scope;
 pub mod schema;
 pub mod strength;
+pub mod transcript_index;
 pub mod types;
 
 use std::collections::VecDeque;

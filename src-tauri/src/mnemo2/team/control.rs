@@ -380,18 +380,18 @@ impl TeamRuntime {
             if let Some(snapshot) = snapshot {
                 self.update_worker(worker_id, |worker| {
                     if !snapshot.transcript.messages.is_empty() {
-                        worker.transcript = snapshot.transcript.clone();
+                        worker.transcript = Arc::new(snapshot.transcript.clone());
                         worker.used_tokens = snapshot.used_tokens;
                         worker.max_tokens = snapshot.max_tokens;
                         if worker.model_id.is_none() {
                             worker.model_id = snapshot_model(&snapshot);
                         }
                     } else if worker.transcript.messages.is_empty() && worker.brief_sent {
-                        worker.transcript = Transcript {
+                        worker.transcript = Arc::new(Transcript {
                             messages: vec![mnemo::provider::Message::user_text(
                                 kickoff_message(worker).to_string(),
                             )],
-                        };
+                        });
                     }
                 })
                 .await;
@@ -479,7 +479,7 @@ impl TeamRuntime {
                 model: record.model.clone(),
                 reasoning_effort: record.reasoning_effort.clone(),
                 worktree: record.worktree.clone(),
-                resume: Some(record.transcript.clone()),
+                resume: Some((*record.transcript).clone()),
                 kind: record.kind.clone(),
                 trace_identity: Self::worker_trace_identity(&record),
                 pinned_task: Some(

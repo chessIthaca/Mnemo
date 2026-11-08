@@ -6,6 +6,7 @@
 //! the inbox, routing and status types, and the kickoff text.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mnemo::headless::{PendingInteraction, Transcript};
 use serde::{Deserialize, Serialize};
@@ -210,8 +211,11 @@ pub struct WorkerRecord {
     pub status: WorkerStatus,
     /// The session generation within this worker (resume advances it).
     pub generation: u64,
-    /// The conversation so far.
-    pub transcript: Transcript,
+    /// The conversation so far. Shared: cloning a record never copies the
+    /// conversation. Assign a new `Arc` whenever the transcript changes and
+    /// never mutate through it: the ledger compares transcripts with
+    /// `Arc::ptr_eq`.
+    pub transcript: Arc<Transcript>,
     /// The interaction the worker is blocked on, if any.
     pub pending: Option<PendingInteraction>,
     /// Latest context-window usage reported by the session.

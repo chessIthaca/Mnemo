@@ -17,7 +17,7 @@ use crate::mnemo2::dispatch_routing::{
 use crate::mnemo2::phase3::Finding;
 use crate::mnemo2::runtime::LeadModel;
 
-use super::record::{ChangeSource, ToolErrorNote, WorkerRecord};
+use super::record::{ChangeSource, MessageSender, ToolErrorNote, WorkerRecord};
 use super::routing::{
     direct_tiers_over, final_tier, logs_routing, next_tier_above, tier_is_above,
     NUDGE_LADDER,
@@ -175,6 +175,35 @@ pub(super) fn deliver_nudge(
             },
         );
     }
+}
+
+/// Whether a delivered message can show that a worker's task got harder, and
+/// so reaches the drift check (design §4.6). `record` is the worker as it was
+/// before this message joined its inbox.
+///
+/// Two kinds of message are never read. Text Mnemo2 wrote itself
+/// ([`MessageSender::Mnemo`]: a route-fix brief, a plan-changed notice) is not
+/// new guidance from anyone, and a failed fix round has its own escalation. A
+/// read-back worker's first lead or user message answers the worker's questions
+/// and releases a step the lead already rated. Plan-changed notices do not count
+/// as that message: they often arrive first, because the lead records its
+/// answers as plan decisions before replying. The reply counts whatever its
+/// delivery form, since one that lands before the read-back turn has ended is a
+/// steer.
+///
+/// Laya sees only the text, and both kinds read like implementation specs
+/// whatever they add, so this goes by what the message is. Nothing in the text
+/// separates new requirements from restated ones.
+pub(super) fn message_can_show_drift(record: &WorkerRecord, sender: MessageSender) -> bool {
+    if sender == MessageSender::Mnemo {
+        return false;
+    }
+    let read_back_unanswered = record.read_back
+        && record
+            .inbox
+            .iter()
+            .all(|entry| entry.sender == MessageSender::Mnemo);
+    !read_back_unanswered
 }
 
 /// The `nudge_ignored` row (design §4.7): a nudged worker reached a

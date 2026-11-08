@@ -1,4 +1,5 @@
 import { fireEvent, render, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RepoPathRef } from "../lib/repoPaths";
 import Markdown from "./Markdown.svelte";
@@ -19,6 +20,7 @@ describe("Markdown", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it("renders the current source immediately and replaces it on updates", async () => {
@@ -104,5 +106,62 @@ describe("Markdown", () => {
     expect(opened).toEqual([
       { path: ".coding/design/unified-tiers.md", line: null, kind: "file", planId: null },
     ]);
+  });
+
+  it("renders the first source synchronously", () => {
+    vi.useFakeTimers();
+    markdown.renderMarkdown.mockReturnValue("<p><strong>Hello</strong></p>");
+
+    const { container } = render(Markdown, { source: "**Hello**" });
+
+    expect(container.querySelector("strong")?.textContent).toBe("Hello");
+    expect(markdown.renderMarkdown).toHaveBeenCalledWith("**Hello**");
+  });
+
+  it("re-renders appended text at most every 150 ms", async () => {
+    vi.useFakeTimers();
+    const { container, rerender } = render(Markdown, { source: "Hello" });
+
+    // The first change after a render is not throttled.
+    await rerender({ source: "Hello world" });
+    expect(container.textContent).toContain("Hello world");
+
+    // A second append within the window waits out the remaining time.
+    await rerender({ source: "Hello world again" });
+    expect(container.textContent).toContain("Hello world");
+    expect(container.textContent).not.toContain("Hello world again");
+
+    await vi.advanceTimersByTimeAsync(150);
+    await tick();
+
+    expect(container.textContent).toContain("Hello world again");
+    expect(markdown.renderMarkdown).toHaveBeenLastCalledWith("Hello world again");
+  });
+
+  it("renders a non-append change at once", async () => {
+    vi.useFakeTimers();
+    const { container, rerender } = render(Markdown, { source: "Hello" });
+
+    await rerender({ source: "Hello world" });
+    await rerender({ source: "Different text" });
+
+    expect(container.textContent).toContain("Different text");
+    expect(container.textContent).not.toContain("Hello world");
+    expect(markdown.renderMarkdown).toHaveBeenLastCalledWith("Different text");
+  });
+
+  it("drops a pending render on unmount", async () => {
+    vi.useFakeTimers();
+    const { rerender, unmount } = render(Markdown, { source: "Hello" });
+
+    await rerender({ source: "Hello world" });
+    await rerender({ source: "Hello world again" });
+    expect(vi.getTimerCount()).toBe(1);
+
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(200);
+    expect(markdown.renderMarkdown).not.toHaveBeenCalledWith("Hello world again");
   });
 });

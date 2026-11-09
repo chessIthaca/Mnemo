@@ -113,6 +113,10 @@
           <h2>Savings</h2>
           <p class="card-total">{view.savingsTokensLabel} tokens saved · {view.savingsCostLabel}</p>
         </div>
+        {#if view.savingsBasisLabel !== ""}
+          <p class="savings-note">{view.savingsBasisLabel}</p>
+        {/if}
+        <p class="savings-note">{view.savingsMethodLabel}</p>
         {#if view.levers.length === 0}
           <p class="quiet">No savings recorded yet.</p>
         {:else}
@@ -273,6 +277,7 @@
   .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
   .card-head h2 { margin: 0; }
   .card-total { margin: 0; color: var(--ink-soft); font-size: var(--text-body); font-variant-numeric: tabular-nums; }
+.savings-note { margin: 2px 0 0; color: var(--muted); font-size: var(--text-meta); line-height: 1.45; }
 
   .lever-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
   .lever-row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: start; }

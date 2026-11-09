@@ -3562,3 +3562,318 @@ async fn compaction_checkpoint_round_trips_through_the_archive() {
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0].id, id);
 }
+
+#[tokio::test]
+async fn savings_stats_clamps_archive_and_compression_to_the_result_cap() {
+    // A tool result was already capped at TOOL_RESULT_MAX_CHARS (100,000 chars
+    // = 25,000 tokens) before any lever ran, so no row may claim more. The
+    // clamp also telescopes a compressed-then-archived result into ONE saving
+    // instead of crediting both steps.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let day = 1_700_000_000_i64;
+    let record = |kind: &str, before: i64, after: i64, at: i64| SavingsEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        kind: kind.into(),
+        detail: None,
+        tokens_before: before,
+        tokens_after: after,
+        tokens_saved: before - after,
+        measured: false,
+        created_at: at,
+    };
+    store
+        .record_savings_event(&record("compression", 130_000, 9_000, day))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("archive", 9_000, 500, day + 60))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("archive", 100_000, 500, day + 120))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("skeleton", 12_000, 900, day + 180))
+        .await
+        .unwrap();
+
+    let stats = store.savings_stats().await.unwrap();
+
+    // compression: 25,000 - 9,000. archive: (9,000 - 500) + (25,000 - 500).
+    // skeleton is not an archive kind, so its raw saving stands.
+    assert_eq!(stats.saved_tokens_total, 16_000 + 33_000 + 11_100);
+    assert_eq!(stats.per_kind.len(), 3);
+    assert_eq!(stats.per_kind[0].kind, "archive");
+    assert_eq!(stats.per_kind[0].saved_tokens, 33_000);
+    assert_eq!(stats.per_kind[1].kind, "compression");
+    assert_eq!(stats.per_kind[1].saved_tokens, 16_000);
+    assert_eq!(stats.per_kind[2].kind, "skeleton");
+    assert_eq!(stats.per_kind[2].saved_tokens, 11_100);
+    // The per-day series sums to the same honest total.
+    let per_day: i64 = stats.per_day.iter().map(|day| day.saved_tokens).sum();
+    assert_eq!(per_day, stats.saved_tokens_total);
+    // `recent` keeps the raw rows: the audit view shows what was recorded.
+    let compression = stats
+        .recent
+        .iter()
+        .find(|event| event.kind == "compression")
+        .expect("the compression row is recent");
+    assert_eq!(compression.tokens_saved, 121_000);
+}
+
+#[tokio::test]
+async fn savings_valuation_counts_later_requests_up_to_the_lifetime() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let base = 1_700_000_000_i64;
+    let event = |kind: &str, session: Option<&str>, before: i64, after: i64, at: i64| {
+        SavingsEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session.map(str::to_string),
+            kind: kind.into(),
+            detail: None,
+            tokens_before: before,
+            tokens_after: after,
+            tokens_saved: before - after,
+            measured: false,
+            created_at: at,
+        }
+    };
+    // An early event with 20 requests after it: the credit stops at the
+    // 15-request lifetime.
+    store
+        .record_savings_event(&event("archive", Some("s1"), 25_000, 0, base))
+        .await
+        .unwrap();
+    // A late event with only two requests after it.
+    store
+        .record_savings_event(&event("skeleton", Some("s1"), 12_000, 900, base + 180))
+        .await
+        .unwrap();
+    // A row with no session cannot be timed against any request.
+    store
+        .record_savings_event(&event("compression", None, 8_000, 1_200, base))
+        .await
+        .unwrap();
+    // A compaction checkpoint is bookkeeping, not a lever.
+    store
+        .record_savings_event(&event("compaction_checkpoint", Some("s1"), 0, 0, base))
+        .await
+        .unwrap();
+    let request = |at: i64| RequestStats {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        model: "m".into(),
+        endpoint: None,
+        prompt_tokens: 10,
+        completion_tokens: 1,
+        reasoning_tokens: 0,
+        cached_tokens: None,
+        ttft_ms: None,
+        generation_ms: None,
+        created_at: at,
+        outcome: None,
+        purpose: None,
+    };
+    for i in 0..20 {
+        store
+            .record_request_stats(&request(base + 10 * (i + 1)))
+            .await
+            .unwrap();
+    }
+
+    let valuation = store.savings_valuation().await.unwrap();
+
+    assert_eq!(valuation.rows.len(), 3, "{:?}", valuation.rows);
+    assert!(
+        valuation
+            .rows
+            .iter()
+            .all(|row| row.kind != "compaction_checkpoint"),
+        "the compaction checkpoint is not a lever row"
+    );
+    let archive = valuation
+        .rows
+        .iter()
+        .find(|row| row.kind == "archive")
+        .expect("the archive row is valued");
+    assert_eq!(archive.later_requests, SAVED_TOKEN_LIFETIME_REQUESTS);
+    assert_eq!(archive.events, 1);
+    assert_eq!(archive.saved_tokens, 25_000);
+    let skeleton = valuation
+        .rows
+        .iter()
+        .find(|row| row.kind == "skeleton")
+        .expect("the skeleton row is valued");
+    assert_eq!(skeleton.later_requests, 2);
+    let untimed = valuation
+        .rows
+        .iter()
+        .find(|row| row.kind == "compression")
+        .expect("the compression row is valued");
+    assert_eq!(untimed.later_requests, 0);
+    assert_eq!(untimed.session_id, None);
+}
+
+#[tokio::test]
+async fn savings_valuation_lists_session_model_usage() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let request = |model: &str, prompt: u32, cached: Option<u32>| RequestStats {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        model: model.into(),
+        endpoint: None,
+        prompt_tokens: prompt,
+        completion_tokens: 10,
+        reasoning_tokens: 0,
+        cached_tokens: cached,
+        ttft_ms: None,
+        generation_ms: None,
+        created_at: 1_700_000_000,
+        outcome: None,
+        purpose: None,
+    };
+    store
+        .record_request_stats(&request("alpha", 1_000, Some(400)))
+        .await
+        .unwrap();
+    store
+        .record_request_stats(&request("alpha", 1_000, Some(100)))
+        .await
+        .unwrap();
+    // A provider that never reports caching: NULL counts as zero.
+    store
+        .record_request_stats(&request("beta", 500, None))
+        .await
+        .unwrap();
+
+    let valuation = store.savings_valuation().await.unwrap();
+
+    assert_eq!(valuation.sessions.len(), 2, "{:?}", valuation.sessions);
+    let alpha = valuation
+        .sessions
+        .iter()
+        .find(|row| row.model == "alpha")
+        .expect("alpha is listed");
+    assert_eq!(alpha.session_id.as_deref(), Some("s1"));
+    assert_eq!(alpha.prompt_tokens, 2_000);
+    assert_eq!(alpha.cached_tokens, 500);
+    assert_eq!(alpha.requests, 2);
+    let beta = valuation
+        .sessions
+        .iter()
+        .find(|row| row.model == "beta")
+        .expect("beta is listed");
+    assert_eq!(beta.prompt_tokens, 500);
+    assert_eq!(beta.cached_tokens, 0);
+    assert_eq!(beta.requests, 1);
+}
+
+#[tokio::test]
+async fn prune_tool_result_archive_removes_old_rows_and_their_search_entries() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let old = store
+        .archive_tool_result(Some("s1"), "shell", None, "OLDROW distinctive marker")
+        .await
+        .unwrap();
+    let fresh = store
+        .archive_tool_result(Some("s1"), "shell", None, "NEWROW distinctive marker")
+        .await
+        .unwrap();
+    // Archive rows are stamped "now" on write, so the test back-dates the old
+    // one directly to put it past the retention window.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs() as i64;
+    let cutoff = now - maintenance::ARCHIVE_RETENTION_SECS;
+    {
+        let conn = store.conn.lock().expect("conn lock poisoned");
+        conn.execute(
+            "UPDATE tool_result_archive SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![cutoff - 1, old],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        store.prune_tool_result_archive(cutoff, 100).await.unwrap(),
+        1
+    );
+    assert!(store.expand_tool_result(&old).await.unwrap().is_none());
+    let hits = store.search_archive("distinctive", 10).await.unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].id, fresh);
+    // Nothing left to prune.
+    assert_eq!(
+        store.prune_tool_result_archive(cutoff, 100).await.unwrap(),
+        0
+    );
+
+    // A batch of one deletes one row per call, oldest first.
+    let mut old_ids = Vec::new();
+    for index in 0..3 {
+        let id = store
+            .archive_tool_result(Some("s1"), "shell", None, &format!("OLD {index}"))
+            .await
+            .unwrap();
+        old_ids.push(id);
+    }
+    {
+        let conn = store.conn.lock().expect("conn lock poisoned");
+        for (index, id) in old_ids.iter().enumerate() {
+            conn.execute(
+                "UPDATE tool_result_archive SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![cutoff - 100 + index as i64, id],
+            )
+            .unwrap();
+        }
+    }
+    for id in &old_ids {
+        assert_eq!(store.prune_tool_result_archive(cutoff, 1).await.unwrap(), 1);
+        assert!(store.expand_tool_result(id).await.unwrap().is_none());
+    }
+    assert_eq!(
+        store.prune_tool_result_archive(cutoff, 1).await.unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn prune_old_archive_rows_clears_every_old_row() {
+    let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+    // More than one prune batch, so the loop has to go round twice.
+    for index in 0..150 {
+        store
+            .archive_tool_result(Some("s1"), "shell", None, &format!("OLD {index}"))
+            .await
+            .unwrap();
+    }
+    let fresh = store
+        .archive_tool_result(Some("s1"), "shell", None, "FRESH")
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs() as i64;
+    {
+        let conn = store.conn.lock().expect("conn lock poisoned");
+        conn.execute(
+            "UPDATE tool_result_archive SET created_at = ?1 WHERE id <> ?2",
+            rusqlite::params![now - maintenance::ARCHIVE_RETENTION_SECS - 1, fresh],
+        )
+        .unwrap();
+    }
+
+    maintenance::prune_old_archive_rows(store.clone()).await;
+
+    let conn = store.conn.lock().expect("conn lock poisoned");
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tool_result_archive", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(remaining, 1, "only the row inside the window survives");
+}

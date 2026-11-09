@@ -22,6 +22,7 @@ use crate::headless::error::EngineError;
 use crate::headless::host_tools::HostTool;
 use crate::headless::session::{pump_task, AgentSession, EngineInner};
 use crate::headless::stats::{EngineStats, TraceApi};
+use crate::memory::{maintenance, SavingsValuation};
 use crate::headless::types::{
     EngineOptions, EventReceiver, HostEvent, SessionEvent, SessionId, SpawnOptions,
 };
@@ -734,6 +735,21 @@ impl Engine {
         })
     }
 
+    /// The Cost tab's valuation read: the savings ledger grouped by re-send
+    /// count, plus per-(session, model) prompt volume, so saved tokens can be
+    /// priced at the rates each session actually paid. Deliberately not folded
+    /// into [`EngineStats`] — the Dashboard's wire shape stays unchanged.
+    pub async fn savings_valuation(&self) -> Result<SavingsValuation, EngineError> {
+        let store = self
+            .brain
+            .factory
+            .memory_handle()
+            .ok_or_else(EngineError::memory_disabled)?;
+        store.savings_valuation().await.map_err(|e| {
+            EngineError::stats_failed(format!("savings valuation read failed: {e}"))
+        })
+    }
+
     /// §5.7's trace pull — list/get/clear over the shared LLM request
     /// log (the same log the app's Trace tab reads).
     pub fn trace(&self) -> TraceApi {
@@ -949,6 +965,14 @@ async fn start_inner(
     // served by that existing stream (the §5.1 sketch's
     // CodegraphProgress/Ready names predate job 1's IndexProgress
     // landing — see notifier.rs's doc note).
+
+    // Archive retention (plan 0c16bd18): trim tool-result rows older than
+    // `ARCHIVE_RETENTION_SECS` in the background. Spawned and never awaited —
+    // `start` must not wait on a large archive sweep — and it runs for an
+    // injected brain too, since the archive belongs to the store either way.
+    if let Some(store) = brain.factory.memory_handle() {
+        tokio::spawn(maintenance::prune_old_archive_rows(store));
+    }
 
     Ok(Engine {
         brain,

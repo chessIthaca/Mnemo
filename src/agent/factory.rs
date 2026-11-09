@@ -2717,7 +2717,11 @@ mod tests {
             // the delta over the 19_659 figure pinned at the 2027-01-25 pass
             // is schema drift from plans landed since. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Planning, 21_800),
+            // 21_800 → 17_800 (2026-11-08): the tool descriptions were reviewed and
+            // shortened (internal ids, stale tool names, repeated syntax,
+            // implementation detail); measures Planning at 17_568 chars. Ceiling =
+            // measured + headroom, lowered on purpose so the saving holds.
+            (ToolFilter::Planning, 17_800),
             // 23_600 → 24_200 (2026-12-08): measured with the `browser`
             // feature enabled — Executing carries the browser tool family
             // (offscreen_browser_* + browser_*, incl. the file:// navigation
@@ -2842,7 +2846,11 @@ mod tests {
             // figure pinned at the 2026-09-27 pass; measures Executing at
             // 39_150 chars (workspace-unified, 26 tools on the final tree).
             // Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Executing, 39_600),
+            // 39_600 → 31_700 (2026-11-08): the tool descriptions were reviewed and
+            // shortened (internal ids, stale tool names, repeated syntax,
+            // implementation detail); measures Executing at 31_562 chars. Ceiling =
+            // measured + headroom, lowered on purpose so the saving holds.
+            (ToolFilter::Executing, 31_700),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -2907,7 +2915,11 @@ mod tests {
             // pass; measures PlanFrozen at 40_436 chars (workspace-unified,
             // 27 tools on the final tree). Ceiling = measured + headroom,
             // deliberate raise.
-            (ToolFilter::PlanFrozen, 40_900),
+            // 40_900 → 32_600 (2026-11-08): the tool descriptions were reviewed and
+            // shortened (internal ids, stale tool names, repeated syntax,
+            // implementation detail); measures PlanFrozen at 32_455 chars. Ceiling =
+            // measured + headroom, lowered on purpose so the saving holds.
+            (ToolFilter::PlanFrozen, 32_600),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -2975,7 +2987,11 @@ mod tests {
             // ExecutingResearch at 30_481 chars (workspace-unified, 22 tools
             // on the final tree). Ceiling = measured + headroom, deliberate
             // raise.
-            (ToolFilter::ExecutingResearch, 30_900),
+            // 30_900 → 23_300 (2026-11-08): the tool descriptions were reviewed and
+            // shortened (internal ids, stale tool names, repeated syntax,
+            // implementation detail); measures ExecutingResearch at 23_079 chars. Ceiling =
+            // measured + headroom, lowered on purpose so the saving holds.
+            (ToolFilter::ExecutingResearch, 23_300),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -3061,7 +3077,11 @@ mod tests {
             // since the 32_864 figure pinned at the 2026-09-27 pass; measures
             // Reviewing at 33_434 chars (workspace-unified, 25 tools on the
             // final tree). Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Reviewing, 33_900),
+            // 33_900 → 25_700 (2026-11-08): the tool descriptions were reviewed and
+            // shortened (internal ids, stale tool names, repeated syntax,
+            // implementation detail); measures Reviewing at 25_579 chars. Ceiling =
+            // measured + headroom, lowered on purpose so the saving holds.
+            (ToolFilter::Reviewing, 25_700),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -3106,7 +3126,11 @@ mod tests {
             // set as Planning, so it measures Complete at 21_402 chars, plus
             // the same drift since the 19_659 figure pinned at the 2027-02-05
             // pass. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Complete, 21_800),
+            // 21_800 → 17_800 (2026-11-08): the tool descriptions were reviewed and
+            // shortened (internal ids, stale tool names, repeated syntax,
+            // implementation detail); measures Complete at 17_568 chars. Ceiling =
+            // measured + headroom, lowered on purpose so the saving holds.
+            (ToolFilter::Complete, 17_800),
         ] {
             let (n, chars) = tools_array_chars(&registry, &filter);
             println!(

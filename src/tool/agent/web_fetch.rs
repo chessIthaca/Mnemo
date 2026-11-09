@@ -109,12 +109,10 @@ impl Tool for WebFetchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "web_fetch",
-            "Fetch an http/https URL and return the response body as readable text. \
-             HTML is stripped to plain text (scripts/styles removed, tags replaced with \
-             spaces); non-HTML bodies are returned verbatim. Only http and https URLs are \
-             allowed (file://, javascript:, data:, and other schemes are rejected). \
-             Read-only GET — usable in any workflow state for research (reading docs, \
-             checking a library site). Output is capped to keep the conversation lean.",
+            "Fetch an http/https URL and return the body as readable text: \
+             HTML is stripped to plain text, other bodies are returned \
+             verbatim. Other URL schemes are rejected. Read-only GET, usable \
+             in any workflow state. Output is capped.",
             json!({
                 "type": "object",
                 "properties": {

@@ -3735,4 +3735,27 @@ mod tests {
             holder.stable_head(&crate::agent::policy::NoPolicy::with_coding_default());
         assert_ne!(head3, head1, "head must rebuild when constitution changes");
     }
+
+    /// One session crossing its wall-clock budget: admitted before, refused
+    /// after, and still refused on the next call. The epoch is back-dated, so
+    /// no real time passes and machine load cannot change the outcome.
+    #[test]
+    fn wall_clock_budget_admits_requests_until_it_elapses() {
+        let mut limiter = SessionLimiter::unlimited();
+        limiter.apply(crate::runtime::channels::SessionLimits {
+            wall_clock_ms: Some(60_000),
+            ..Default::default()
+        });
+        assert_eq!(limiter.begin_request(), None);
+        assert_eq!(limiter.requests_served, 1);
+
+        limiter.started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        let spent = Some(crate::provider::LimitKind::WallClock);
+        assert_eq!(limiter.begin_request(), spent);
+        assert_eq!(limiter.begin_request(), spent);
+        assert_eq!(
+            limiter.requests_served, 1,
+            "a refused request is not served"
+        );
+    }
 }

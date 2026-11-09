@@ -40,8 +40,9 @@ use crate::tool::agent::line_endings::{
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EditItem {
     /// The exact text to find (EOL-agnostic matching, as in single mode).
-    /// Empty in the read-reference form (`from_read` set).
-    #[serde(default)]
+    /// Empty in the read-reference form (`from_read` set). An explicit null
+    /// means absent: the advertised schema makes models send every field.
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub old_string: String,
     /// The replacement text.
     pub new_string: String,

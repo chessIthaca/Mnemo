@@ -68,10 +68,9 @@ impl Tool for ConvertLineEndingsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "convert_line_endings",
-            "Convert a file's line endings to LF or CRLF in place. Use this instead of a shell \
-             command to fix line-ending style (e.g. before committing, or to satisfy a repo's \
-             .gitattributes). Mixed endings (including lone CR) are normalized to the target. \
-             No-op when the file already uses the target style. UTF-8 text files only.",
+            "Convert a file's line endings to LF or CRLF in place; use this \
+             instead of a shell command. Mixed endings are normalized. No-op \
+             when already in the target style. UTF-8 text files only.",
             json!({
                 "type": "object",
                 "properties": {

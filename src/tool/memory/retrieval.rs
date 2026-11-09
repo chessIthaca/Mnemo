@@ -181,11 +181,11 @@ impl Tool for MemorySearchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "memory_search",
-            "Read the memory store — the ONE way to look anything up. With a `query` it \
-             ranks matches semantically; without one it browses newest-first. Narrow with \
-             `record_type` (plan/review/bug/decision/spec/how), `tier`, or `prefix`. \
-             Pointer-first: a typed record carries the gist plus a path/commit pointer — \
-             read the file for detail.",
+            "Read the memory store — the ONE way to look anything up. With a \
+             `query` it ranks matches semantically; without one it browses \
+             newest-first. Narrow with `record_type`, `tier` or `prefix`. A \
+             typed record carries the gist plus a path/commit pointer: read \
+             the file for detail.",
             json!({
                 "type": "object",
                 "properties": {
@@ -194,8 +194,8 @@ impl Tool for MemorySearchTool {
                     "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "Optional: restrict to one tier."},
                     "prefix": {"type": "string", "description": "Optional: title starts-with filter (case-sensitive), e.g. \"BUG: login\"."},
                     "limit": {"type": "integer", "description": "Max rows (default 12 searching, 50 browsing)."},
-                    "include_superseded": {"type": "boolean", "description": "Include superseded records (history), annotated [superseded]. Default false — they are excluded, not downranked."},
-                    "include_quarantined": {"type": "boolean", "description": "Include quarantined records (the startup digest-integrity sweep's finds — recoverable history), annotated [quarantined]. Default false — they are excluded, not downranked."}
+                    "include_superseded": {"type": "boolean", "description": "Include superseded records (history), annotated [superseded]. Default false."},
+                    "include_quarantined": {"type": "boolean", "description": "Include quarantined records (recoverable history), annotated [quarantined]. Default false."}
                 }
             }),
         )

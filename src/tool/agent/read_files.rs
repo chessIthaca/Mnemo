@@ -308,19 +308,16 @@ impl Tool for ReadFilesTool {
         ToolSchema::new(
             "read_files",
             format!(
-                "{} An array of up to 10 file strings, each \"path\", \
-                 \"path:start+count\" (count lines from start) or \"path:start-end\" \
-                 (inclusive), 1-indexed. Read files — one or many, in one call instead \
-                 of N round-trips. Each file comes back under a header with line \
-                 numbers; a range reads only the relevant slice (default: the first \
-                 500 lines). A directory path returns a sorted listing. Per-file errors \
-                 are reported inline, never fatal. \
-                 Every real serve mints a short read-receipt id in its section \
-                 trailer — cite it in file_edit/multi_edit as \
-                 {{\"from_read\": \"<id>\", \"lines\": [s, e], \"new_string\": …}} to \
-                 anchor an edit without carrying the verbatim bytes (validated \
-                 server-side against the current file; drift hard-fails with a \
-                 fresh-read steer).",
+                "{} Up to 10 file strings, each \"path\", \"path:start+count\" \
+                 (count lines from start) or \"path:start-end\" (inclusive), \
+                 1-indexed. Each file comes back under a header with line \
+                 numbers (default: the first 500 lines). A directory path \
+                 returns a sorted listing. Per-file errors are reported \
+                 inline, never fatal. Each read mints a read-receipt id in its \
+                 trailer: cite it in file_edit/multi_edit as {{\"from_read\": \
+                 \"<id>\", \"lines\": [s, e], \"new_string\": …}} to anchor an \
+                 edit without carrying the verbatim bytes; if the file \
+                 drifted, the edit fails and asks for a fresh read.",
                 tool_contract::contract(
                     "`files`",
                     "{\"files\":[\"src/main.rs\",\"src/lib.rs:120+40\"]}"
@@ -332,7 +329,7 @@ impl Tool for ReadFilesTool {
                     "files": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "Files to read (max 10): \"path\", \"path:start+count\" or \"path:start-end\", paths relative to the project root.",
+                        "description": "Files to read (max 10), paths relative to the project root.",
                         "items": {"type": "string"}
                     }
                 },
@@ -1211,6 +1208,12 @@ three").unwrap();
         assert!(
             !schema.description.contains("If you catch yourself"),
             "the content-first clause lives once in TOOL_CALL_DISCIPLINE, not per tool: {}",
+            schema.description
+        );
+        // A model wrote "big.rs:115-20" for 20 lines from 115 once this was cut.
+        assert!(
+            schema.description.contains("\"path:start+count\" (count lines from start)"),
+            "the start+count form must say what count means: {}",
             schema.description
         );
         assert_eq!(

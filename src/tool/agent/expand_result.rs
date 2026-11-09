@@ -96,11 +96,10 @@ impl Tool for ExpandResultTool {
         ToolSchema::new(
             "expand_result",
             format!(
-                "{} Retrieve the FULL original of a tool result that was archived to save \
-                 context: an oversized or truncated result carries a preview naming its \
-                 archive `id`. Pass `id` to serve that original, or `query` to search the \
-                 archive by keyword when you do not have the id. Use `start_line`/`max_lines` \
-                 to page a very large result. Read-only.",
+                "{} Retrieve the FULL original of a tool result archived to \
+                 save context: a truncated result's preview names its archive \
+                 `id`. Pass `id`, or `query` to search the archive by keyword. \
+                 `start_line`/`max_lines` page a large result. Read-only.",
                 tool_contract::contract(
                     "`id` (or `query` to search the archive)",
                     r#"{"id":"<archive-id>"}"#

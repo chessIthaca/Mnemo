@@ -67,11 +67,11 @@ impl Tool for AskUserTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "ask_user",
-            "Ask the user a question, shown as one button per option plus a freeform text \
-             input. ONLY for a choice between at least two concrete options — do NOT guess. \
-             Frame it as a choice (\"Which approach?\", \"A or B?\"), never open-ended \
-             (\"What do you think?\") — post those as text in your response instead. You \
-             pause until they answer, and can ask only ONE question at a time. The answer \
+            "Ask the user a question, shown as one button per option plus a \
+             freeform input. ONLY for a choice between at least two concrete \
+             options; do NOT guess. Frame it as a choice (\"A or B?\"); post \
+             open-ended questions as text in your response instead. You pause \
+             until they answer, and can ask ONE question at a time. The answer \
              comes back as the chosen label or the freeform text.",
             json!({
                 "type": "object",

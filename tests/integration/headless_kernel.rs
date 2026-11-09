@@ -483,14 +483,16 @@ async fn limits_max_turns_parks_the_session() {
     engine.shutdown().await.expect("engine shuts down");
 }
 
-/// §5.9.7 :718-723: the wall-clock budget (from the limits epoch = the
-/// spawn) ends a turn with Finished{LimitReached{wall_clock}} once
-/// elapsed.
+/// §5.9.7 :718-723: a spent wall-clock budget (from the limits epoch = the
+/// spawn) ends the turn with Finished{LimitReached{wall_clock}} before any
+/// provider request, and parks the session. The budget is spent before the
+/// first prompt, so machine load cannot change the outcome: spawn starts the
+/// epoch before it returns, and the sleep outlasts the budget.
 #[tokio::test]
 async fn limits_wall_clock_parks_the_session() {
     let root = tempfile::tempdir().unwrap();
     let cfg = tempfile::tempdir().unwrap();
-    let llm = RecordingLlm::new(vec![g5_text_turn(&["one"])]);
+    let llm = RecordingLlm::new(vec![g5_text_turn(&["never sent"])]);
     let engine = Engine::builder(opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf())))
         .provider(llm.clone())
         .start()
@@ -499,37 +501,75 @@ async fn limits_wall_clock_parks_the_session() {
     let session = engine
         .spawn(SpawnOptions {
             limits: Some(SessionLimits {
-                wall_clock_ms: Some(200),
+                wall_clock_ms: Some(1),
                 ..SessionLimits::default()
             }),
             ..SpawnOptions::default()
         })
         .await
         .expect("spawn");
-    let first = session.run_to_completion("a").await.expect("turn 1");
-    assert_eq!(first.final_text, "one");
 
-    // Burn past the budget; the next turn's pre-request check hits.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let second = session
-        .run_to_completion("b")
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let limited = session
+        .run_to_completion("a")
         .await
         .expect("the limited turn still completes (with an empty outcome)");
     assert!(
         matches!(
-            second.finish_reason,
+            limited.finish_reason,
             Some(FinishReason::LimitReached {
                 which: LimitKind::WallClock
             })
         ),
-        "turn 2 reports LimitReached::WallClock, got {:?}",
-        second.finish_reason
+        "the turn reports LimitReached::WallClock, got {:?}",
+        limited.finish_reason
     );
-    assert_eq!(
-        llm.requests().len(),
-        1,
+    assert_eq!(limited.final_text, "");
+    assert!(
+        llm.requests().is_empty(),
         "the wall-clock turn never reached the provider"
     );
+
+    // Parked: a further prompt errors session_parked.
+    let err = session
+        .run_to_completion("b")
+        .await
+        .expect_err("a parked session rejects the prompt");
+    assert_eq!(err.code(), "session_parked");
+    engine.shutdown().await.expect("engine shuts down");
+}
+
+/// The other side of that budget: while it has not elapsed, turns reach the
+/// provider as usual. The budget is far longer than any test run, so this
+/// does not race the clock either. The switch from admitted to refused within
+/// one session is `wall_clock_budget_admits_requests_until_it_elapses` in
+/// `src/agent/loop_impl.rs`, which back-dates the epoch instead of waiting.
+#[tokio::test]
+async fn limits_wall_clock_leaves_a_session_under_budget_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![g5_text_turn(&["one"]), g5_text_turn(&["two"])]);
+    let engine = Engine::builder(opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf())))
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("engine starts");
+    let session = engine
+        .spawn(SpawnOptions {
+            limits: Some(SessionLimits {
+                wall_clock_ms: Some(3_600_000),
+                ..SessionLimits::default()
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn");
+
+    let first = session.run_to_completion("a").await.expect("turn 1");
+    assert_eq!(first.final_text, "one");
+    let second = session.run_to_completion("b").await.expect("turn 2");
+    assert_eq!(second.final_text, "two");
+    assert_eq!(llm.requests().len(), 2, "both turns reached the provider");
     engine.shutdown().await.expect("engine shuts down");
 }
 

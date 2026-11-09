@@ -574,6 +574,7 @@ pub trait Tool: Send + Sync {
     fn host_tool_timeout_ms(&self) -> Option<u64> {
         None
     }
+
     /// Execute the tool with parsed arguments.
     async fn execute(&self, args: Value) -> ToolResult;
 

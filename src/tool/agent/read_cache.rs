@@ -84,7 +84,6 @@ impl ReadCache {
         *remaining -= charged;
         Some(charged)
     }
-
 }
 
 /// A skeleton render result: the numbered signature lines, how many were

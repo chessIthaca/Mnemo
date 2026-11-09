@@ -14,10 +14,10 @@
 //! language: .rs/.ts/.tsx/.js/.py/…)
 //! prepends one SYMBOL NUDGE line pointing at `graph_context(id=...)`, so
 //! the agent takes targeted edges instead of another whole-file dump. With
-//! the `delta_reads` lever on, the first whole read of a big source file
-//! serves its signature outline (see `read_one_outlined`). Lines are numbered
-//! `{n}: {line}` — no padding, no
-//! trailing whitespace ([`numbered_line`]). Auto-run (read-only).
+//! the `delta_reads` lever on, a whole read of a source file over 500 lines
+//! serves its signature outline (see `read_one_outlined`); smaller files are
+//! served whole. Lines are numbered `{n}: {line}` — no padding, no trailing
+//! whitespace ([`numbered_line`]). Auto-run (read-only).
 
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -470,9 +470,8 @@ impl Tool for ReadFilesTool {
             // graphs all stay quiet.
             let mut nudge: Vec<String> = Vec::new();
             // Token-optimizer lever 1 (backlog e4a50d22): with the flag
-            // on, the first whole read of a big source file serves its
-            // signature outline; every other whole read serves the full
-            // content.
+            // on, a whole read of a source file over 500 lines serves its
+            // signature outline; smaller files are served whole.
             let delta_reads = optimizer
                 .as_ref()
                 .map(|c| c.read().map(|c| c.delta_reads).unwrap_or(false))

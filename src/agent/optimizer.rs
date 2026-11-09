@@ -370,11 +370,11 @@ fn fill_penalty(fill_pct: u8) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// The session's running optimizer counters (token-optimizer lever 6, backlog
-/// e4a50d22), fed by `AgentLoop::note_decisions` and the request clock.
+/// e4a50d22), fed by [`note_decisions`](Self::note_decisions) (compaction
+/// survival) and [`tick_request`](Self::tick_request) (the request clock).
 ///
-/// Atomics rather than a lock: `note_decisions` and `tick_request` run on
-/// `&self` from the turn loop and the tool-ingestion path, and the counters are
-/// a cheap monotone summary of what the levers already did.
+/// Atomics rather than a lock: both run on `&self` from the turn loop and the
+/// runtime, and the counters are a cheap monotone summary.
 #[derive(Debug)]
 pub struct OptimizerState {
     /// Decisions the compaction-survival lever has preserved.
@@ -812,7 +812,7 @@ mod tests {
         let a_grade = report(50);
         assert_eq!(a_grade.grade, QualityGrade::A, "{a_grade:?}");
         assert_eq!(nudge_note(&a_grade, Some(QualityGrade::S), false, 75), None);
-        // A two-band drop from the same baseline does fire.
+        // A three-band drop from the same baseline does fire.
         let c_grade = report(80);
         assert_eq!(c_grade.grade, QualityGrade::C, "{c_grade:?}");
         assert!(nudge_note(&c_grade, Some(QualityGrade::S), false, 75).is_some());

@@ -14,9 +14,9 @@
 //! language: .rs/.ts/.tsx/.js/.py/…)
 //! prepends one SYMBOL NUDGE line pointing at `graph_context(id=...)`, so
 //! the agent takes targeted edges instead of another whole-file dump. With
-//! the `delta_reads` lever on, a whole read of a big source file serves its
-//! signature outline first, and a re-read serves a skeleton or a diff (see
-//! `read_one_delta`). Lines are numbered `{n}: {line}` — no padding, no
+//! the `delta_reads` lever on, the first whole read of a big source file
+//! serves its signature outline (see `read_one_outlined`). Lines are numbered
+//! `{n}: {line}` — no padding, no
 //! trailing whitespace ([`numbered_line`]). Auto-run (read-only).
 
 use std::path::Path;
@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::optimizer::{estimate_tokens, savings_event};
-use super::read_cache::{diff_if_small, skeleton_for, ReadCache, Skeleton, SKELETON_MAX_LINES};
+use super::read_cache::{skeleton_for, ReadCache, Skeleton, SKELETON_MAX_LINES};
 use crate::codegraph::walk::Lang;
 use crate::provider::ToolSchema;
 use crate::tool::agent::sandbox::Sandbox;
@@ -254,10 +254,11 @@ pub struct ReadFilesTool {
     /// pinning pre-lever behavior) keeps the lever off — full content
     /// every time, byte-identical to the pre-lever build.
     optimizer: Option<Arc<RwLock<crate::config::OptimizerConfig>>>,
-    /// This agent's read cache (the delta baseline). Built fresh by
+    /// This agent's outline debt (what a served outline saved, charged to
+    /// later ranged reads). Built fresh by
     /// [`with_optimizer`](Self::with_optimizer) — per-agent, never shared
-    /// across subagents (a subagent's first read must not inherit a
-    /// false "already in context" state).
+    /// across subagents (a subagent's first read must not inherit another
+    /// agent's read state).
     read_cache: Option<Arc<ReadCache>>,
 }
 
@@ -281,12 +282,11 @@ impl ReadFilesTool {
         self
     }
 
-    /// Enable the delta/skeleton re-read lever (backlog e4a50d22): attach
-    /// the live `[general.optimizer]` config and a fresh per-agent read
-    /// cache. While `delta_reads` is off the tool serves the full content
-    /// exactly as before and the cache stays untouched (byte-identical
-    /// default); the flag is re-read per call, so a config save lands on
-    /// the next read without a rebuild.
+    /// Enable the outline lever (backlog e4a50d22): attach the live
+    /// `[general.optimizer]` config and a fresh per-agent read cache. While
+    /// `delta_reads` is off the tool serves the full content exactly as
+    /// before; the flag is re-read per call, so a config save lands on the
+    /// next read without a rebuild.
     pub fn with_optimizer(mut self, cfg: Arc<RwLock<crate::config::OptimizerConfig>>) -> Self {
         self.optimizer = Some(cfg);
         if self.read_cache.is_none() {
@@ -342,12 +342,6 @@ impl Tool for ReadFilesTool {
 
     fn safety(&self) -> SafetyLevel {
         SafetyLevel::AutoRun
-    }
-
-    fn on_context_reduced(&self) {
-        if let Some(cache) = &self.read_cache {
-            cache.forget_served();
-        }
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
@@ -476,10 +470,9 @@ impl Tool for ReadFilesTool {
             // graphs all stay quiet.
             let mut nudge: Vec<String> = Vec::new();
             // Token-optimizer lever 1 (backlog e4a50d22): with the flag
-            // on, a whole-file RE-read serves a signature skeleton
-            // (unchanged file) or a unified diff (changed file) against
-            // the last-served content. A first read serves the outline of a
-            // big file, else the full content (the delta baseline).
+            // on, the first whole read of a big source file serves its
+            // signature outline; every other whole read serves the full
+            // content.
             let delta_reads = optimizer
                 .as_ref()
                 .map(|c| c.read().map(|c| c.delta_reads).unwrap_or(false))
@@ -488,7 +481,7 @@ impl Tool for ReadFilesTool {
             for spec in &args.files {
                 if is_whole_file_source_read(spec) {
                     let (section, content, _) = match (delta_reads, read_cache.as_ref()) {
-                        (true, Some(cache)) => read_one_delta(&sandbox, spec, cache, &mut savings),
+                        (true, Some(cache)) => read_one_outlined(&sandbox, spec, cache, &mut savings),
                         _ => read_one_with_count(&sandbox, spec),
                     };
                     if let Some(content) = content {
@@ -734,7 +727,7 @@ fn charge_outline_followup(
 /// plan 5a21fc8f): every real serve mints a receipt for the lines it
 /// showed and appends the cite-form trailer to the section — `None`
 /// when nothing was minted (per-spec errors, directories, empty
-/// ranges). `read_one_delta` revokes it on its reduced serves (the
+/// ranges). `read_one_outlined` revokes it on an outline serve (the
 /// model never saw those lines verbatim).
 pub(crate) fn read_one_with_count(
     sandbox: &Sandbox,
@@ -839,29 +832,24 @@ pub(crate) fn read_one_with_count(
     (format!("{header}\n{body}"), Some(content), receipt)
 }
 
-/// Whole-file read with the delta/skeleton lever applied (backlog
-/// e4a50d22, `delta_reads`). Returns the section, the raw content (for the
-/// SYMBOL NUDGE probe), and appends any savings events to `savings`.
-/// Semantics:
-/// - first read of a source file over [`OUTLINE_MIN_LINES`] lines →
-///   numbered signature outline + a note pointing at ranged reads; no
-///   baseline is recorded (the agent has not seen the content);
-/// - first read of any other path → full content, and the content becomes
-///   the delta baseline;
-/// - re-read, file UNCHANGED → numbered signature skeleton + a note
-///   pointing at the ranged-read escape hatch;
-/// - re-read, file CHANGED → unified diff against the baseline (full
-///   re-serve once the diff would exceed ~40% of the file);
-/// - ranged reads never reach here (`is_whole_file_source_read` filters
-///   them) — they always serve exact lines.
-fn read_one_delta(
+/// Whole-file read with the outline lever applied (backlog e4a50d22,
+/// `delta_reads`). Returns the section, the raw content (for the SYMBOL
+/// NUDGE probe), and appends any savings events to `savings`. A whole read
+/// of a source file over [`OUTLINE_MIN_LINES`] lines that has signature
+/// lines serves the numbered signature outline plus a note pointing at
+/// ranged reads, records an `outline` savings event and the outline debt,
+/// and revokes the full-serve receipt (an outline is a signature list, not
+/// the lines). Any other whole read serves the full content. Ranged reads
+/// never reach here (`is_whole_file_source_read` filters them) — they
+/// always serve exact lines.
+fn read_one_outlined(
     sandbox: &Sandbox,
     spec: &ReadSpec,
     cache: &ReadCache,
     savings: &mut Vec<serde_json::Value>,
 ) -> (String, Option<String>, Option<String>) {
-    // Today's full serve — the baseline path and the fallback on every
-    // reduced-path miss (per-spec errors, directories, degenerate input).
+    // Today's full serve — the fallback on every outline-path miss
+    // (per-spec errors, directories, degenerate input).
     let (full_section, content, receipt) = read_one_with_count(sandbox, spec);
     let Some(content) = content else {
         return (full_section, None, receipt);
@@ -878,152 +866,60 @@ fn read_one_delta(
     let Ok(key) = sandbox.validate(Path::new(&spec.path)) else {
         return (full_section, Some(content), receipt);
     };
-    let before_tokens = estimate_tokens(&full_section);
-    match cache.snapshot(&key) {
-        None => {
-            // A big file's FIRST whole read serves its outline: the agent
-            // reads the region it needs next instead of swallowing up to
-            // DEFAULT_MAX_LINES lines it mostly won't use. The baseline is
-            // NOT recorded — the agent never saw the content, so a later
-            // whole read must not be answered with a diff against it.
-            let total = content.lines().count();
-            if total > OUTLINE_MIN_LINES && lang != Lang::Html {
-                let sk = skeleton_for(&content, lang);
-                // No signature lines: an empty outline maps nothing.
-                if sk.kept > 0 {
-                    let header = format!(
-                        "=== {} (outline: {} signature lines of {total}) ===",
-                        spec.path, sk.kept
-                    );
-                    let section = skeleton_section(
-                        &header,
-                        sk,
-                        &format!(
-                            "[outline read: a {total}-line file, signature lines only. Read \
-                             the region you need as a \"path:start+count\" range — ranges \
-                             always serve exact lines.]"
-                        ),
-                    );
-                    let after_tokens = estimate_tokens(&section);
-                    if after_tokens < before_tokens {
-                        savings.push(savings_event(
-                            "outline",
-                            &spec.path,
-                            before_tokens,
-                            after_tokens,
-                        ));
-                        // Charge any later ranged read of this file against
-                        // what this outline really saved (outline_followup).
-                        cache.note_outline(key, before_tokens - after_tokens);
-                        // An outline is a signature skeleton, not the lines:
-                        // the full-serve receipt must not stay anchorable
-                        // (backlog 3fdc605f), like the unchanged-file skeleton.
-                        if let Some(id) = receipt.as_deref() {
-                            crate::tool::agent::read_registry::revoke(id);
-                        }
-                        return (section, Some(content), None);
-                    }
-                }
-            }
-            cache.record(key, content.clone());
-            (full_section, Some(content), receipt)
-        }
-        Some(old) if old == content => {
-            if lang == Lang::Html {
-                // No line-level signatures in HTML — a skeleton would be
-                // noise. Serve the full content; the baseline stays cached
-                // so future DIFF serves work.
-                return (full_section, Some(content), receipt);
-            }
-            let sk = skeleton_for(&content, lang);
-            let total = content.lines().count();
+    let total = content.lines().count();
+    if total > OUTLINE_MIN_LINES && lang != Lang::Html {
+        // A big file's whole read serves its outline: the agent reads the
+        // region it needs next instead of swallowing up to DEFAULT_MAX_LINES
+        // lines it mostly won't use.
+        let before_tokens = estimate_tokens(&full_section);
+        let sk = skeleton_for(&content, lang);
+        // No signature lines: an empty outline maps nothing.
+        if sk.kept > 0 {
             let header = format!(
-                "=== {} (unchanged since your last read — signature skeleton: {} of {total} lines) ===",
-                spec.path,
-                sk.kept
+                "=== {} (outline: {} signature lines of {total}) ===",
+                spec.path, sk.kept
             );
-            let section = skeleton_section(
+            let section = outline_section(
                 &header,
                 sk,
-                "[delta read: file is UNCHANGED since your last full read — signature lines \
-                 only. Re-read a \"path:start+count\" range for exact lines.]",
+                &format!(
+                    "[outline read: a {total}-line file, signature lines only. Read \
+                     the region you need as a \"path:start+count\" range — ranges \
+                     always serve exact lines.]"
+                ),
             );
             let after_tokens = estimate_tokens(&section);
-            if after_tokens >= before_tokens {
-                // Tiny file: the header + note boilerplate costs more than
-                // the full serve. A reduced serve must never cost MORE
-                // than the full one — serve the full content (the cached
-                // baseline is already current; no savings row).
-                return (full_section, Some(content), receipt);
-            }
-            savings.push(savings_event(
-                "skeleton",
-                &spec.path,
-                before_tokens,
-                after_tokens,
-            ));
-            // The model saw a SIGNATURE SKELETON, not the lines — the
-            // full-serve receipt minted inside read_one_with_count must
-            // not stay anchorable (backlog 3fdc605f).
-            if let Some(id) = receipt.as_deref() {
-                crate::tool::agent::read_registry::revoke(id);
-            }
-            (section, Some(content), None)
-        }
-        Some(old) => match diff_if_small(&old, &content) {
-            Some(diff) => {
-                let header = format!(
-                    "=== {} (changed since your last read — unified diff vs your last full read) ===",
-                    spec.path
-                );
-                let body = format!(
-                    "{diff}\n[delta read: unified diff vs your last full read. Re-read a \
-                     \"path:start+count\" range for the exact current content.]"
-                );
-                let section = format!("{header}\n{body}");
-                let after_tokens = estimate_tokens(&section);
-                if after_tokens >= before_tokens {
-                    // The ratio gate compares the raw diff to the file; the
-                    // served section still adds the header + note, so a
-                    // small file can tip over. A reduced serve must never
-                    // cost MORE than the full one — fall back to the full
-                    // re-serve and refresh the baseline.
-                    cache.record(key, content.clone());
-                    return (full_section, Some(content), receipt);
-                }
+            if after_tokens < before_tokens {
                 savings.push(savings_event(
-                    "delta_read",
+                    "outline",
                     &spec.path,
                     before_tokens,
                     after_tokens,
                 ));
-                cache.record(key, content.clone());
-                // A unified DIFF is not the lines — revoke like the
-                // skeleton path (backlog 3fdc605f).
+                // Charge any later ranged read of this file against what
+                // this outline really saved (outline_followup).
+                cache.note_outline(key, before_tokens - after_tokens);
+                // The outline is a signature list, not the lines: the
+                // full-serve receipt must not stay anchorable (backlog
+                // 3fdc605f).
                 if let Some(id) = receipt.as_deref() {
                     crate::tool::agent::read_registry::revoke(id);
                 }
-                (section, Some(content), None)
+                return (section, Some(content), None);
             }
-            None => {
-                // Mostly-rewritten file: a diff would cost more than a
-                // full re-serve. Keep today's full section; refresh the
-                // baseline.
-                cache.record(key, content.clone());
-                (full_section, Some(content), receipt)
-            }
-        },
+        }
     }
+    (full_section, Some(content), receipt)
 }
 
-/// A skeleton serve's section: the header, the numbered signature lines
+/// An outline serve's section: the header, the numbered signature lines
 /// (plus the cap note when [`SKELETON_MAX_LINES`] cut them short), then
 /// `note` on how to reach exact lines.
-fn skeleton_section(header: &str, sk: Skeleton, note: &str) -> String {
+fn outline_section(header: &str, sk: Skeleton, note: &str) -> String {
     let mut body = sk.body;
     if sk.capped {
         body.push_str(&format!(
-            "... (skeleton capped at {SKELETON_MAX_LINES} signature lines)\n"
+            "... (outline capped at {SKELETON_MAX_LINES} signature lines)\n"
         ));
     }
     format!("{header}\n{body}{note}")
@@ -1913,9 +1809,9 @@ three
         assert!(!result.output.contains("SYMBOL NUDGE"), "{}", result.output);
     }
 
-    /// A delta-lever tool: the flag on, everything else default. Mirrors
+    /// An outline-lever tool: the flag on, everything else default. Mirrors
     /// the factory wiring (`with_optimizer` on a sandbox-bound tool).
-    fn make_delta_tool(dir: &Path) -> ReadFilesTool {
+    fn make_outline_tool(dir: &Path) -> ReadFilesTool {
         let cfg = crate::config::OptimizerConfig {
             delta_reads: true,
             ..Default::default()
@@ -1936,12 +1832,12 @@ three
     }
 
     #[tokio::test]
-    async fn delta_lever_off_serves_full_content_identically() {
+    async fn lever_off_serves_full_content_identically() {
         // No optimizer attached (CLI contract builds, pre-lever tests):
         // re-reads serve the full content again, byte-identical to the
         // pre-lever build, and no savings data rides the result — the
         // regression pin for the ABSENT-optimizer path (an explicit
-        // `delta_reads = false` is pinned by the test below). The
+        // `delta_reads = false` is pinned by the next test). The
         // per-read receipt trailer (backlog 3fdc605f) is the one new
         // line — its id differs per read, so the comparison normalizes
         // it away (content identity is the pin).
@@ -1961,13 +1857,10 @@ three
     }
 
     #[tokio::test]
-    async fn flag_off_then_flipped_on_populates_cache_only_under_the_flag() {
-        // "Cache populated only when flag on": with the optimizer
-        // ATTACHED but `delta_reads` off, re-reads stay byte-identical and
-        // the cache stays untouched — proven by flipping the flag on
-        // mid-session (a config save; the flag is re-read per call): the
-        // first flag-on read must serve the FULL content (no baseline was
-        // recorded while off), and only the one after serves the skeleton.
+    async fn flag_off_serves_big_files_whole_until_flipped_on() {
+        // With the optimizer ATTACHED but `delta_reads` off, a big file is
+        // served whole; flipping the flag on mid-session (a config save; the
+        // flag is re-read per call) makes the NEXT whole read its outline.
         let dir = tempdir().unwrap();
         // Explicit opt-out: the levers default ON (2027-01-25), so the
         // flag-off half of this test has to say so.
@@ -1977,6 +1870,25 @@ three
         }));
         let tool = ReadFilesTool::new(Sandbox::new(dir.path()).unwrap())
             .with_optimizer(Arc::clone(&cfg));
+        // 50 functions = 600 lines, over the 500-line outline threshold.
+        write_big_rust_file(dir.path(), "big.rs", 50);
+        let whole = json!({"files":[{"path":"big.rs"}]});
+        let r1 = tool.execute(whole.clone()).await;
+        assert!(r1.success, "{}", r1.output);
+        assert!(r1.output.contains("let a = x + 0;"), "{}", r1.output);
+        assert!(r1.data.is_none(), "the lever is off: no outline event");
+        // Flip the flag on mid-session: the next whole read is the outline.
+        cfg.write().unwrap().delta_reads = true;
+        let r2 = tool.execute(whole).await;
+        assert!(r2.success, "{}", r2.output);
+        assert!(r2.output.contains("(outline:"), "{}", r2.output);
+        assert_eq!(r2.data.as_ref().unwrap()["savings"][0]["kind"], "outline");
+    }
+
+    #[tokio::test]
+    async fn unchanged_whole_reread_serves_the_full_file() {
+        let dir = tempdir().unwrap();
+        let tool = make_outline_tool(dir.path());
         let src: String = (0..60)
             .map(|i| {
                 format!(
@@ -1986,86 +1898,27 @@ three
             })
             .collect();
         std::fs::write(dir.path().join("a.rs"), &src).unwrap();
-        let r1 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        let r2 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        assert!(r1.success && r2.success);
+        // Both whole reads serve the full file: no signature skeleton for an
+        // unchanged re-read, and no savings row either time.
+        let whole = json!({"files":[{"path":"a.rs"}]});
+        let r1 = tool.execute(whole.clone()).await;
+        let r2 = tool.execute(whole).await;
+        assert!(r1.success, "{}", r1.output);
+        assert!(r2.success, "{}", r2.output);
+        assert!(r1.output.contains("let z = x + y;"));
+        assert!(r2.output.contains("let z = x + y;"), "{}", r2.output);
+        assert!(r1.data.is_none() && r2.data.is_none());
         assert_eq!(
             without_receipt_trailer(&r1.output),
             without_receipt_trailer(&r2.output),
-            "flag off: byte-identical re-reads"
+            "an unchanged re-read serves the full file again"
         );
-        assert!(r1.data.is_none() && r2.data.is_none());
-        // Flip the flag on mid-session: no cache entry may exist yet.
-        cfg.write().unwrap().delta_reads = true;
-        let r3 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        assert!(r3.success, "{}", r3.output);
-        assert!(r3.data.is_none(), "no baseline was recorded while off");
-        assert!(r3.output.contains("let z = x + y;"), "{}", r3.output);
-        assert!(!r3.output.contains("unchanged since your last read"), "{}", r3.output);
-        // Only now does a re-read serve the skeleton.
-        let r4 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        assert!(r4.output.contains("unchanged since your last read"), "{}", r4.output);
-    }
-
-    #[tokio::test]
-    async fn tiny_file_reread_serves_full_even_with_the_flag_on() {
-        // The reduced-never-costs-more invariant: on a tiny file the
-        // note + numbering boilerplate exceeds the content itself, so
-        // even with the flag on an unchanged re-read serves the FULL
-        // content — no skeleton, no savings row.
-        let dir = tempdir().unwrap();
-        let tool = make_delta_tool(dir.path());
-        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
-        tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        let r2 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        assert!(r2.success, "{}", r2.output);
-        assert!(r2.output.contains("fn b() {}"), "{}", r2.output);
         assert!(!r2.output.contains("unchanged since your last read"), "{}", r2.output);
-        assert!(r2.data.is_none());
     }
-
     #[tokio::test]
-    async fn unchanged_reread_serves_skeleton() {
+    async fn changed_whole_reread_serves_the_new_full_file() {
         let dir = tempdir().unwrap();
-        let tool = make_delta_tool(dir.path());
-        // A file with real bodies — the skeleton only pays off from this
-        // size up; a tiny file's note boilerplate exceeds the content and
-        // serves in full (pinned by tiny_file_reread below).
-        let src: String = (0..60)
-            .map(|i| {
-                format!(
-                    "fn f_{i}() {{\n    let x = {i} + 1;\n    let y = {i} * 2;\n    \
-                     let z = x + y;\n}}\n"
-                )
-            })
-            .collect();
-        std::fs::write(dir.path().join("a.rs"), &src).unwrap();
-        // First read: full content, no savings, baseline established.
-        let r1 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        assert!(r1.success, "{}", r1.output);
-        assert!(r1.data.is_none());
-        assert!(r1.output.contains("let z = x + y;"));
-        // Second read, file unchanged: signature skeleton.
-        let r2 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        assert!(r2.success, "{}", r2.output);
-        assert!(r2.output.contains("unchanged since your last read"), "{}", r2.output);
-        assert!(r2.output.contains("fn f_59() {"), "{}", r2.output);
-        assert!(!r2.output.contains("let z = x + y;"), "{}", r2.output);
-        assert!(r2.output.contains("Re-read a \"path:start+count\" range"), "{}", r2.output);
-        let savings = r2.data.as_ref().unwrap()["savings"].as_array().unwrap();
-        assert_eq!(savings.len(), 1);
-        assert_eq!(savings[0]["kind"], "skeleton");
-        assert_eq!(savings[0]["detail"], "a.rs");
-        let before = savings[0]["tokens_before"].as_i64().unwrap();
-        let after = savings[0]["tokens_after"].as_i64().unwrap();
-        assert!(after < before, "skeleton must be smaller: {before} -> {after}");
-        assert_eq!(savings[0]["measured"], false);
-    }
-
-    #[tokio::test]
-    async fn changed_reread_serves_diff() {
-        let dir = tempdir().unwrap();
-        let tool = make_delta_tool(dir.path());
+        let tool = make_outline_tool(dir.path());
         let src: String = (0..60)
             .map(|i| format!("fn f_{i}() {{\n    let x = {i} + 1;\n    let y = {i} * 2;\n}}\n"))
             .collect();
@@ -2074,38 +1927,12 @@ three
         assert!(r1.data.is_none());
         let changed = src.replace("let x = 30 + 1;", "let x = 30 + 999;");
         std::fs::write(dir.path().join("a.rs"), &changed).unwrap();
+        // A changed file's whole re-read serves the new full content — not
+        // a unified diff against what the agent last saw.
         let r2 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
         assert!(r2.success, "{}", r2.output);
-        assert!(r2.output.contains("changed since your last read"), "{}", r2.output);
-        assert!(r2.output.contains("-    let x = 30 + 1;"), "{}", r2.output);
-        assert!(r2.output.contains("+    let x = 30 + 999;"), "{}", r2.output);
-        let savings = r2.data.as_ref().unwrap()["savings"].as_array().unwrap();
-        assert_eq!(savings.len(), 1);
-        assert_eq!(savings[0]["kind"], "delta_read");
-        assert_eq!(savings[0]["detail"], "a.rs");
-        assert!(
-            savings[0]["tokens_after"].as_i64().unwrap()
-                < savings[0]["tokens_before"].as_i64().unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn mostly_rewritten_reread_serves_full() {
-        // A file rewritten end-to-end serves the full content — a huge
-        // diff costs more than re-reading. No savings row (nothing was
-        // served in a reduced form).
-        let dir = tempdir().unwrap();
-        let tool = make_delta_tool(dir.path());
-        // Under the 500-line default serve cap so the whole file is in
-        // the output (300 lines).
-        let old: String = (0..100).map(|i| format!("fn o_{i}() {{\n    body_{i}\n}}\n")).collect();
-        std::fs::write(dir.path().join("a.rs"), &old).unwrap();
-        tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        let new: String = (0..100).map(|i| format!("fn n_{i}() {{\n    other_{i}\n}}\n")).collect();
-        std::fs::write(dir.path().join("a.rs"), &new).unwrap();
-        let r2 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
-        assert!(r2.success, "{}", r2.output);
-        assert!(r2.output.contains("fn n_99()"), "{}", r2.output);
+        assert!(r2.output.contains("let x = 30 + 999;"), "{}", r2.output);
+        assert!(!r2.output.contains(" let x = 30 + 1;"), "{}", r2.output);
         assert!(!r2.output.contains("changed since your last read"), "{}", r2.output);
         assert!(r2.data.is_none());
     }
@@ -2115,7 +1942,7 @@ three
         // The escape hatch: ranged reads always serve exact lines, even on
         // an unchanged file the agent just read whole.
         let dir = tempdir().unwrap();
-        let tool = make_delta_tool(dir.path());
+        let tool = make_outline_tool(dir.path());
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
         tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
         let r2 = tool
@@ -2167,7 +1994,7 @@ three
             .lines()
             .count();
         assert!(total > OUTLINE_MIN_LINES, "{total}");
-        let tool = make_delta_tool(dir.path());
+        let tool = make_outline_tool(dir.path());
         let whole = json!({"files":[{"path":"big.rs"}]});
 
         let r1 = tool.execute(whole.clone()).await;
@@ -2191,8 +2018,7 @@ three
             ranged.output
         );
 
-        // No baseline was recorded: a whole re-read is the outline again,
-        // never a skeleton of, or a diff against, content the agent never saw.
+        // A whole re-read is the outline again, even after the file changed.
         let r2 = tool.execute(whole.clone()).await;
         assert_eq!(r2.output, r1.output);
         let src = std::fs::read_to_string(dir.path().join("big.rs")).unwrap();
@@ -2211,12 +2037,12 @@ three
     async fn a_big_file_without_signatures_is_not_outlined() {
         // 600 lines is over OUTLINE_MIN_LINES, but there are no signatures to
         // extract: the outline fallback serves the ordinary whole read — no
-        // skeleton, no `outline` savings event. (The 500-line read cap is a
+        // outline section, no `outline` savings event. (The 500-line read cap is a
         // separate rule: a whole read is capped at DEFAULT_MAX_LINES.)
         let dir = tempdir().unwrap();
         let rows: String = (0..600).map(|i| format!("    {i},\n")).collect();
         std::fs::write(dir.path().join("table.rs"), &rows).unwrap();
-        let result = make_delta_tool(dir.path())
+        let result = make_outline_tool(dir.path())
             .execute(json!({"files":[{"path":"table.rs"}]}))
             .await;
         assert!(result.success, "{}", result.output);
@@ -2226,11 +2052,10 @@ three
     }
 
     #[tokio::test]
-    async fn a_file_at_or_under_the_cap_is_served_whole_on_first_read() {
+    async fn a_file_at_or_under_the_cap_is_always_served_whole() {
         // 40 functions = 480 lines, at or under OUTLINE_MIN_LINES: a whole
-        // read serves the whole file, because an outline at this size would
-        // only force a follow-up ranged read. The baseline is still
-        // recorded, so a second whole read serves the skeleton.
+        // read serves the whole file — first read and re-read alike — because
+        // an outline at this size would only force a follow-up ranged read.
         let dir = tempdir().unwrap();
         write_big_rust_file(dir.path(), "mid.rs", 40);
         let total = std::fs::read_to_string(dir.path().join("mid.rs"))
@@ -2238,7 +2063,7 @@ three
             .lines()
             .count();
         assert!(total <= OUTLINE_MIN_LINES, "{total}");
-        let tool = make_delta_tool(dir.path());
+        let tool = make_outline_tool(dir.path());
         let whole = json!({"files":[{"path":"mid.rs"}]});
         let r1 = tool.execute(whole.clone()).await;
         assert!(r1.success, "{}", r1.output);
@@ -2246,18 +2071,15 @@ three
         assert!(!r1.output.contains("signature lines of"), "{}", r1.output);
         assert!(r1.data.is_none(), "no outline event for a whole-served file");
         let r2 = tool.execute(whole).await;
-        assert!(
-            r2.output.contains("unchanged since your last read"),
-            "{}",
-            r2.output
-        );
+        assert!(r2.output.contains("let a = x + 0;"), "{}", r2.output);
+        assert!(r2.data.is_none());
     }
 
     #[tokio::test]
     async fn a_ranged_read_after_an_outline_records_a_followup() {
         let dir = tempdir().unwrap();
         write_big_rust_file(dir.path(), "big.rs", 50);
-        let tool = make_delta_tool(dir.path());
+        let tool = make_outline_tool(dir.path());
         let whole = tool.execute(json!({"files":[{"path":"big.rs"}]})).await;
         assert!(whole.success, "{}", whole.output);
         assert_eq!(whole.data.as_ref().unwrap()["savings"][0]["kind"], "outline");
@@ -2277,7 +2099,7 @@ three
     async fn followups_stop_at_what_the_outline_saved() {
         let dir = tempdir().unwrap();
         write_big_rust_file(dir.path(), "big.rs", 50);
-        let tool = make_delta_tool(dir.path());
+        let tool = make_outline_tool(dir.path());
         let whole = tool.execute(json!({"files":[{"path":"big.rs"}]})).await;
         let outline = &whole.data.as_ref().unwrap()["savings"][0];
         let saved = outline["tokens_before"].as_i64().unwrap()
@@ -2313,7 +2135,7 @@ three
     async fn a_range_beyond_the_whole_read_cap_is_not_charged() {
         let dir = tempdir().unwrap();
         write_big_rust_file(dir.path(), "big.rs", 50);
-        let tool = make_delta_tool(dir.path());
+        let tool = make_outline_tool(dir.path());
         let _ = tool.execute(json!({"files":[{"path":"big.rs"}]})).await;
         let r = tool
             .execute(json!({"files":[{"path":"big.rs","start_line":501,"max_lines":3}]}))
@@ -2329,7 +2151,7 @@ three
     async fn a_range_of_a_file_never_outlined_is_not_charged() {
         let dir = tempdir().unwrap();
         write_big_rust_file(dir.path(), "big.rs", 50);
-        let tool = make_delta_tool(dir.path());
+        let tool = make_outline_tool(dir.path());
         let r = tool
             .execute(json!({"files":[{"path":"big.rs","start_line":2,"max_lines":3}]}))
             .await;
@@ -2350,23 +2172,4 @@ three
         assert!(r.data.is_none());
     }
 
-    #[tokio::test]
-    async fn on_context_reduced_serves_the_full_file_again() {
-        let dir = tempdir().unwrap();
-        write_big_rust_file(dir.path(), "a.rs", 40);
-        let tool = make_delta_tool(dir.path());
-        let whole = json!({"files":[{"path":"a.rs"}]});
-        let r1 = tool.execute(whole.clone()).await;
-        assert!(r1.output.contains("let a = x + 0;"), "{}", r1.output);
-        let r2 = tool.execute(whole.clone()).await;
-        assert!(
-            r2.output.contains("unchanged since your last read"),
-            "{}",
-            r2.output
-        );
-        tool.on_context_reduced();
-        let r3 = tool.execute(whole).await;
-        assert!(r3.output.contains("let a = x + 0;"), "{}", r3.output);
-        assert!(!r3.output.contains("unchanged since your last read"));
-    }
 }

@@ -115,7 +115,7 @@ export interface OptimizerKnobs {
 
 /** The levers the Savings page switches, in display order. */
 export const OPTIMIZER_LEVERS: readonly OptimizerLever[] = [
-  { key: "delta_reads", label: "Delta reads", explanation: "Re-read file signatures and diffs instead of full file contents." },
+  { key: "delta_reads", label: "Outline reads", explanation: "Open a long source file with its outline; ranged reads load the exact lines." },
   { key: "compress_output", label: "Compress shell output", explanation: "Squeeze long command output down before it enters the context." },
   { key: "archive", label: "Archive big results", explanation: "Fold oversized tool results into archives and expand them on demand." },
   { key: "compaction_survival", label: "Compaction survival", explanation: "Keep the checkpoint, decisions and digest through compaction." },

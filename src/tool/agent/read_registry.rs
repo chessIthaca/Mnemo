@@ -96,10 +96,9 @@ pub fn mint(path: PathBuf, first_line: usize, lines: &[&str]) -> String {
     id
 }
 
-/// Revoke a receipt. The delta-mode reduced serves (skeleton/diff
-/// re-renders) call this with the just-minted id: the model never saw
-/// those lines verbatim, so the full-serve receipt must not stay
-/// anchorable. Revoking an unknown or empty id is a no-op.
+/// Revoke a receipt. The outline serve calls this with the just-minted id:
+/// the model never saw those lines verbatim, so the full-serve receipt must
+/// not stay anchorable. Revoking an unknown or empty id is a no-op.
 pub fn revoke(id: &str) {
     if id.is_empty() {
         return;

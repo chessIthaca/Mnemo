@@ -337,9 +337,8 @@ pub struct SettingsSaveDto {
     /// current value, so a dialog that never touched a lever leaves the section
     /// exactly as it was.
     ///
-    /// **Lever 1 — delta + skeleton re-reads**: `read_files` serves a
-    /// signature/import skeleton (or a diff) instead of the full file on a
-    /// re-read. On by default.
+    /// **Lever 1 — outline reads**: a whole read of a source file over 500
+    /// lines serves its signature outline. On by default.
     #[serde(default)]
     pub optimizer_delta_reads: Option<bool>,
     /// **Lever 2 — semantic command-output compression**: large shell output

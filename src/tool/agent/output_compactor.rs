@@ -248,6 +248,23 @@ fn classify_npm_test(line: &str) -> LineKind {
     LineKind::Keep
 }
 
+/// Is this a zero-problem summary — `0 error(s)` with no non-zero error
+/// count on the same line? svelte-check's clean summary
+/// (`COMPLETED 4822 FILES 0 ERRORS 0 WARNINGS …` and the human form
+/// `svelte-check found 0 errors and 0 warnings`) contains "error" and is
+/// a pass, not a diagnostic.
+fn is_zero_problem_summary(t: &str) -> bool {
+    static ZERO: OnceLock<Regex> = OnceLock::new();
+    static NONZERO: OnceLock<Regex> = OnceLock::new();
+    let zero = ZERO.get_or_init(|| {
+        Regex::new(r"(?i)\b0 errors?\b").expect("static zero-problem regex must compile")
+    });
+    let nonzero = NONZERO.get_or_init(|| {
+        Regex::new(r"(?i)\b[1-9]\d* errors?\b").expect("static non-zero-problem regex must compile")
+    });
+    zero.is_match(t) && !nonzero.is_match(t)
+}
+
 /// npm/yarn/pnpm build (vite/tsc/svelte-check) line classifier.
 fn classify_npm_build(line: &str) -> LineKind {
     if is_blank(line) {
@@ -264,6 +281,12 @@ fn classify_npm_build(line: &str) -> LineKind {
         || t.contains("kB │ gzip")
     {
         return LineKind::Noise;
+    }
+    // A clean check summary is recognized BEFORE the error substring check:
+    // svelte-check's `0 ERRORS` / `found 0 errors and 0 warnings` contains
+    // "error" and reports a clean build.
+    if is_zero_problem_summary(t) {
+        return LineKind::Keep;
     }
     if super::shell_filter::is_error_line(line) {
         return LineKind::Error;
@@ -538,9 +561,13 @@ fn compact_rustfmt(stdout: &str, stderr: &str, exit_code: i32) -> Option<Compact
     if files.is_empty() && kept.distinct() == 0 {
         return None;
     }
+    let files_phrase = if files.len() == 1 {
+        "1 file needs formatting".to_string()
+    } else {
+        format!("{} files need formatting", files.len())
+    };
     let mut out = format!(
-        "compressed rustfmt output — exit {exit_code}: {} files need formatting, {diffs} {}, {collapsed} diff lines collapsed\n",
-        files.len(),
+        "compressed rustfmt output — exit {exit_code}: {files_phrase}, {diffs} {}, {collapsed} diff lines collapsed\n",
         if diffs == 1 { "diff" } else { "diffs" },
     );
     for path in files.iter().take(200) {
@@ -1185,5 +1212,43 @@ mod tests {
         assert!(detect_family("npx").is_none());
         assert!(detect_family("npx --yes").is_none());
         assert!(detect_family("pnpm exec").is_none());
+    }
+
+    #[test]
+    fn a_clean_svelte_check_summary_is_not_an_error() {
+        let mut stdout = String::new();
+        stdout.push_str("Loading svelte-check in workspace: C:/x/mnemo2\n");
+        for i in 0..30 {
+            stdout.push_str(&format!("dist/assets/chunk-{i}.js   {i}.34 kB │ gzip: 4.56 kB\n"));
+        }
+        stdout.push_str("COMPLETED 4822 FILES 0 ERRORS 0 WARNINGS 0 FILES_WITH_PROBLEMS\n");
+        stdout.push_str("svelte-check found 0 errors and 0 warnings\n");
+        let out = compress("npm run build", &stdout, "", 0, &cfg()).expect("must compact");
+        assert!(out.text.contains("0 error / 0 warning"), "{}", out.text);
+        assert!(out.text.contains("COMPLETED 4822 FILES 0 ERRORS"), "{}", out.text);
+        assert!(
+            out.text.contains("svelte-check found 0 errors and 0 warnings"),
+            "{}",
+            out.text
+        );
+        // A non-zero count is a real diagnostic and stays an error.
+        let mut failing = stdout.clone();
+        failing.push_str("svelte-check found 2 errors and 0 warnings\n");
+        let out = compress("npm run build", &failing, "", 1, &cfg()).expect("must compact");
+        assert!(out.text.contains("1 error"), "{}", out.text);
+        assert!(
+            out.text.contains("svelte-check found 2 errors and 0 warnings"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn rustfmt_single_file_header_is_singular() {
+        let stdout = rustfmt_fixture(&[("src/a.rs", 1)]);
+        let out = compress("cargo fmt --check", &stdout, "", 1, &cfg()).expect("must compact");
+        assert!(out.text.contains("1 file needs formatting"), "{}", out.text);
+        assert!(out.text.contains("(1 diff)"), "{}", out.text);
+        assert!(!out.text.contains("1 files"), "{}", out.text);
     }
 }

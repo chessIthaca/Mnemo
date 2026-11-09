@@ -279,7 +279,7 @@
   .card-total { margin: 0; color: var(--ink-soft); font-size: var(--text-body); font-variant-numeric: tabular-nums; }
 .savings-note { margin: 2px 0 0; color: var(--muted); font-size: var(--text-meta); line-height: 1.45; }
 
-  .lever-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+  .lever-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 10px; }
   .lever-row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: start; }
   .lever-text p { margin: 0; }
   .lever-name { font-size: var(--text-body); font-weight: 620; }

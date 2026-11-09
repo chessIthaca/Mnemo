@@ -700,7 +700,7 @@ pub struct OptimizerConfig {
     /// `read_files` serves a signature/import skeleton for re-reads of
     /// unchanged files and a unified diff for changed ones, instead of the
     /// full content every time, and a first whole read of a source file over
-    /// 300 lines serves its signature outline (the agent then reads the
+    /// 500 lines serves its signature outline (the agent then reads the
     /// region it needs). Other first reads and ranged reads still serve full
     /// content. On by default.
     pub delta_reads: bool,

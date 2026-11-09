@@ -46,8 +46,10 @@ pub(crate) const READ_NUDGE_MIN_LINES: usize = 300;
 /// A FIRST whole-file read of a source file longer than this serves its
 /// signature outline instead of the content (the `delta_reads` lever) —
 /// the agent then reads the region it needs with `start_line`/`max_lines`.
-/// The same "big file" bar as the SYMBOL NUDGE.
-pub(crate) const OUTLINE_MIN_LINES: usize = READ_NUDGE_MIN_LINES;
+/// At or below this line count a whole read serves the whole file, so an
+/// outline would only force follow-up reads; above it a whole read would be
+/// cut at [`DEFAULT_MAX_LINES`] anyway, so the outline costs nothing extra.
+pub(crate) const OUTLINE_MIN_LINES: usize = DEFAULT_MAX_LINES;
 
 /// Default maximum output size in bytes per file (~100 KB).
 pub(crate) const DEFAULT_MAX_BYTES: usize = 102_400;
@@ -342,6 +344,12 @@ impl Tool for ReadFilesTool {
         SafetyLevel::AutoRun
     }
 
+    fn on_context_reduced(&self) {
+        if let Some(cache) = &self.read_cache {
+            cache.forget_served();
+        }
+    }
+
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         // Single-file shorthand: a top-level `path` (with the optional
         // start_line/max_lines that go with it) is lifted into a one-element
@@ -501,7 +509,11 @@ impl Tool for ReadFilesTool {
                     }
                     sections.push(section);
                 } else {
-                    sections.push(read_one(&sandbox, spec));
+                    let section = read_one(&sandbox, spec);
+                    if let (true, Some(cache)) = (delta_reads, read_cache.as_ref()) {
+                        charge_outline_followup(&sandbox, spec, &section, cache, &mut savings);
+                    }
+                    sections.push(section);
                 }
             }
             let mut output = sections.join("\n\n");
@@ -686,6 +698,31 @@ fn directory_listing(dir: &Path, display: &str) -> String {
 /// caller — one bad path must not blank out the other reads.
 pub(crate) fn read_one(sandbox: &Sandbox, spec: &ReadSpec) -> String {
     read_one_with_count(sandbox, spec).0
+}
+
+/// Charge a follow-up ranged read against what a prior outline of the same
+/// file saved: a ledger `outline_followup` event (tokens_before 0,
+/// tokens_after = the tokens charged), so the outline is credited only with
+/// what it really saved — never more. A range starting beyond
+/// [`DEFAULT_MAX_LINES`] is not charged: a whole read could not have served
+/// those lines either, so the range would have been needed anyway.
+fn charge_outline_followup(
+    sandbox: &Sandbox,
+    spec: &ReadSpec,
+    section: &str,
+    cache: &ReadCache,
+    savings: &mut Vec<serde_json::Value>,
+) {
+    if spec.start_line.unwrap_or(1) > DEFAULT_MAX_LINES {
+        return;
+    }
+    let Ok(key) = sandbox.validate(Path::new(&spec.path)) else {
+        return;
+    };
+    let tokens = estimate_tokens(section);
+    if let Some(charged) = cache.charge_outline(&key, tokens) {
+        savings.push(savings_event("outline_followup", &spec.path, 0, charged));
+    }
 }
 
 /// [`read_one`] plus the raw file content (`None` for per-spec errors) —
@@ -875,6 +912,9 @@ fn read_one_delta(
                             before_tokens,
                             after_tokens,
                         ));
+                        // Charge any later ranged read of this file against
+                        // what this outline really saved (outline_followup).
+                        cache.note_outline(key, before_tokens - after_tokens);
                         // An outline is a signature skeleton, not the lines:
                         // the full-serve receipt must not stay anchorable
                         // (backlog 3fdc605f), like the unchanged-file skeleton.
@@ -1024,8 +1064,9 @@ mod tests {
         ReadFilesTool::new(Sandbox::new(dir).unwrap()).with_codegraph(Some(Arc::new(graph)))
     }
 
-    /// Write a Rust file with `n` ~10-line free functions (`n = 40` clears
-    /// the 300-line whole-file nudge threshold).
+    /// Write a Rust file with `n` 12-line free functions: `n = 40` (480 lines)
+    /// clears the 300-line whole-file nudge threshold but stays at or under
+    /// the 500-line outline threshold; `n = 50` (600 lines) is outlined.
     fn write_big_rust_file(dir: &Path, name: &str, n: usize) {
         let mut src = String::new();
         for i in 0..n {
@@ -2119,8 +2160,12 @@ three
     #[tokio::test]
     async fn first_whole_read_of_a_big_file_serves_its_outline() {
         let dir = tempdir().unwrap();
-        write_big_rust_file(dir.path(), "big.rs", 40);
-        let total = std::fs::read_to_string(dir.path().join("big.rs")).unwrap().lines().count();
+        // 50 functions = 600 lines, over the 500-line outline threshold.
+        write_big_rust_file(dir.path(), "big.rs", 50);
+        let total = std::fs::read_to_string(dir.path().join("big.rs"))
+            .unwrap()
+            .lines()
+            .count();
         assert!(total > OUTLINE_MIN_LINES, "{total}");
         let tool = make_delta_tool(dir.path());
         let whole = json!({"files":[{"path":"big.rs"}]});
@@ -2163,15 +2208,165 @@ three
     }
 
     #[tokio::test]
-    async fn a_big_file_without_signatures_serves_in_full() {
+    async fn a_big_file_without_signatures_is_not_outlined() {
+        // 600 lines is over OUTLINE_MIN_LINES, but there are no signatures to
+        // extract: the outline fallback serves the ordinary whole read — no
+        // skeleton, no `outline` savings event. (The 500-line read cap is a
+        // separate rule: a whole read is capped at DEFAULT_MAX_LINES.)
         let dir = tempdir().unwrap();
-        let rows: String = (0..400).map(|i| format!("    {i},\n")).collect();
+        let rows: String = (0..600).map(|i| format!("    {i},\n")).collect();
         std::fs::write(dir.path().join("table.rs"), &rows).unwrap();
         let result = make_delta_tool(dir.path())
             .execute(json!({"files":[{"path":"table.rs"}]}))
             .await;
         assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("\n400:     399,"), "{}", result.output);
-        assert!(result.data.is_none());
+        assert!(result.output.contains("\n500:     499,"), "{}", result.output);
+        assert!(!result.output.contains("signature"), "{}", result.output);
+        assert!(result.data.is_none(), "no outline event without signatures");
+    }
+
+    #[tokio::test]
+    async fn a_file_at_or_under_the_cap_is_served_whole_on_first_read() {
+        // 40 functions = 480 lines, at or under OUTLINE_MIN_LINES: a whole
+        // read serves the whole file, because an outline at this size would
+        // only force a follow-up ranged read. The baseline is still
+        // recorded, so a second whole read serves the skeleton.
+        let dir = tempdir().unwrap();
+        write_big_rust_file(dir.path(), "mid.rs", 40);
+        let total = std::fs::read_to_string(dir.path().join("mid.rs"))
+            .unwrap()
+            .lines()
+            .count();
+        assert!(total <= OUTLINE_MIN_LINES, "{total}");
+        let tool = make_delta_tool(dir.path());
+        let whole = json!({"files":[{"path":"mid.rs"}]});
+        let r1 = tool.execute(whole.clone()).await;
+        assert!(r1.success, "{}", r1.output);
+        assert!(r1.output.contains("let a = x + 0;"), "{}", r1.output);
+        assert!(!r1.output.contains("signature lines of"), "{}", r1.output);
+        assert!(r1.data.is_none(), "no outline event for a whole-served file");
+        let r2 = tool.execute(whole).await;
+        assert!(
+            r2.output.contains("unchanged since your last read"),
+            "{}",
+            r2.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ranged_read_after_an_outline_records_a_followup() {
+        let dir = tempdir().unwrap();
+        write_big_rust_file(dir.path(), "big.rs", 50);
+        let tool = make_delta_tool(dir.path());
+        let whole = tool.execute(json!({"files":[{"path":"big.rs"}]})).await;
+        assert!(whole.success, "{}", whole.output);
+        assert_eq!(whole.data.as_ref().unwrap()["savings"][0]["kind"], "outline");
+        let ranged = tool
+            .execute(json!({"files":[{"path":"big.rs","start_line":2,"max_lines":3}]}))
+            .await;
+        assert!(ranged.success, "{}", ranged.output);
+        let savings = ranged.data.as_ref().unwrap()["savings"].as_array().unwrap();
+        assert_eq!(savings.len(), 1, "{savings:?}");
+        assert_eq!(savings[0]["kind"], "outline_followup");
+        assert_eq!(savings[0]["detail"], "big.rs");
+        assert_eq!(savings[0]["tokens_before"], 0);
+        assert!(savings[0]["tokens_after"].as_i64().unwrap() > 0, "{savings:?}");
+    }
+
+    #[tokio::test]
+    async fn followups_stop_at_what_the_outline_saved() {
+        let dir = tempdir().unwrap();
+        write_big_rust_file(dir.path(), "big.rs", 50);
+        let tool = make_delta_tool(dir.path());
+        let whole = tool.execute(json!({"files":[{"path":"big.rs"}]})).await;
+        let outline = &whole.data.as_ref().unwrap()["savings"][0];
+        let saved = outline["tokens_before"].as_i64().unwrap()
+            - outline["tokens_after"].as_i64().unwrap();
+        assert!(saved > 0, "{outline}");
+        let range = json!({"files":[{"path":"big.rs","start_line":2,"max_lines":400}]});
+        let mut charged = 0i64;
+        for _ in 0..40 {
+            if charged >= saved {
+                break;
+            }
+            let r = tool.execute(range.clone()).await;
+            let sum: i64 = r
+                .data
+                .as_ref()
+                .and_then(|d| d["savings"].as_array())
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter(|e| e["kind"] == "outline_followup")
+                        .map(|e| e["tokens_after"].as_i64().unwrap())
+                        .sum()
+                })
+                .unwrap_or(0);
+            charged += sum;
+        }
+        assert_eq!(charged, saved, "charged exactly what the outline saved");
+        let after = tool.execute(range).await;
+        assert!(after.data.is_none(), "no charge once the debt is paid");
+    }
+
+    #[tokio::test]
+    async fn a_range_beyond_the_whole_read_cap_is_not_charged() {
+        let dir = tempdir().unwrap();
+        write_big_rust_file(dir.path(), "big.rs", 50);
+        let tool = make_delta_tool(dir.path());
+        let _ = tool.execute(json!({"files":[{"path":"big.rs"}]})).await;
+        let r = tool
+            .execute(json!({"files":[{"path":"big.rs","start_line":501,"max_lines":3}]}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(
+            r.data.is_none(),
+            "a range a whole read could not have served is not charged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_of_a_file_never_outlined_is_not_charged() {
+        let dir = tempdir().unwrap();
+        write_big_rust_file(dir.path(), "big.rs", 50);
+        let tool = make_delta_tool(dir.path());
+        let r = tool
+            .execute(json!({"files":[{"path":"big.rs","start_line":2,"max_lines":3}]}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.data.is_none(), "no outline, nothing to charge");
+    }
+
+    #[tokio::test]
+    async fn no_followup_with_the_lever_off() {
+        let dir = tempdir().unwrap();
+        write_big_rust_file(dir.path(), "big.rs", 50);
+        let tool = make_tool(dir.path());
+        let _ = tool.execute(json!({"files":[{"path":"big.rs"}]})).await;
+        let r = tool
+            .execute(json!({"files":[{"path":"big.rs","start_line":2,"max_lines":3}]}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.data.is_none());
+    }
+
+    #[tokio::test]
+    async fn on_context_reduced_serves_the_full_file_again() {
+        let dir = tempdir().unwrap();
+        write_big_rust_file(dir.path(), "a.rs", 40);
+        let tool = make_delta_tool(dir.path());
+        let whole = json!({"files":[{"path":"a.rs"}]});
+        let r1 = tool.execute(whole.clone()).await;
+        assert!(r1.output.contains("let a = x + 0;"), "{}", r1.output);
+        let r2 = tool.execute(whole.clone()).await;
+        assert!(
+            r2.output.contains("unchanged since your last read"),
+            "{}",
+            r2.output
+        );
+        tool.on_context_reduced();
+        let r3 = tool.execute(whole).await;
+        assert!(r3.output.contains("let a = x + 0;"), "{}", r3.output);
+        assert!(!r3.output.contains("unchanged since your last read"));
     }
 }

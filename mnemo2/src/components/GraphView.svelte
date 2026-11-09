@@ -1188,6 +1188,7 @@
     .graph-side { grid-column: 1; grid-row: 1; }
     .graph-detail { grid-column: 1; grid-row: 2; border-top: 1px solid var(--line); border-right: 1px solid var(--line); border-left: 0; }
     .graph-canvas-wrap { grid-column: 2; grid-row: 1 / span 2; }
+    .canvas-note { right: auto; bottom: 30px; left: 12px; }
   }
   @container graph-view (max-width: 520px) {
     .graph-body { display: flex; flex-direction: column; overflow-y: auto; }

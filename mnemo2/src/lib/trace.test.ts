@@ -243,7 +243,7 @@ describe("prettyJson", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The Trace route's contract mirror and helpers.
+// The Trace tab's contract mirror and helpers.
 // ---------------------------------------------------------------------------
 
 
@@ -663,7 +663,7 @@ describe("trace page contract helpers", () => {
       const patch = traceEntryFilters({ agent: "design-trace", turn_id: "t-9", from_ms: 5 });
       expect(patch).toEqual({ agent: "design-trace", turn_id: "t-9", time: "custom", from_ms: 5, to_ms: null });
       expect(traceEntryFilters({ search: "read_file", search_scope: "response" })).toEqual({ search: "read_file", scope: "response" });
-      // The compact tab hands its open call over so the route opens the same one.
+      // An entry point hands its open call over so the tab opens the same one.
       expect(traceEntryFilters({ selected: "run-1:7" })).toEqual({ selected: "run-1:7" });
     });
   });

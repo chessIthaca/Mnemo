@@ -358,6 +358,22 @@ describe("WorkerPanel", () => {
     expect(container.querySelector(".worker-panel")).toBeTruthy();
   });
 
+  it("hands Model calls to the panel's Trace tab and gives way", async () => {
+    await openAppWith([nativeWorker(), kaiWorker()]);
+    const kai = state().workers.find((worker) => worker.id === "kai")!;
+    actions.openWorkerPanel("kai");
+    const { container } = render(App);
+
+    await fireEvent.click(screen.getByRole("button", { name: `Model calls ${kai.name}` }));
+
+    expect(state().workerPanelId).toBeNull();
+    expect(state().workbenchOpen).toBe(true);
+    expect(state().workbenchTab).toBe("trace");
+    expect(state().traceEntry).toEqual({ agent: "kai" });
+    expect(state().route).toBe("lead");
+    expect(container.querySelector(".worker-panel")).toBeNull();
+  });
+
   it("resets on project switch and when the worker vanishes from a sync", async () => {
     const transport = await openAppWith([nativeWorker(), kaiWorker()]);
     actions.openWorkerPanel("kai");

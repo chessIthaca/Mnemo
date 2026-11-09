@@ -182,7 +182,7 @@
 <section class="plan-tab" aria-label="Plan" bind:this={tabSection}>
   {#if scope === "open"}
     <p class="scope-header">
-      <button class="all-plans" type="button" onclick={actions.openPlans}>All plans <ArrowUpRight size={11} /></button>
+      <button class="all-plans" type="button" onclick={() => { actions.closeWorkbench(); actions.openPlans(); }}>All plans <ArrowUpRight size={11} /></button>
     </p>
   {/if}
 

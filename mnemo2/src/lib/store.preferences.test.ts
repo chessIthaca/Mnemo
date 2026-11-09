@@ -29,7 +29,9 @@ const saved: ProjectPreferences = {
   browser_url: "http://localhost:3000/",
   diff_worker_id: "ana",
   board_width: null,
+  workbench_wide_width: null,
 };
+
 
 describe("per-project workbench persistence", () => {
   beforeEach(() => {
@@ -74,6 +76,25 @@ describe("per-project workbench persistence", () => {
         ...saved,
         board_width: 860,
       });
+    } finally {
+      if (originalInnerWidth) Object.defineProperty(window, "innerWidth", originalInnerWidth);
+    }
+  });
+
+  it("restores the wide panel width and treats an absent one as null", async () => {
+    const originalInnerWidth = Object.getOwnPropertyDescriptor(window, "innerWidth");
+    Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1600 });
+    try {
+      transport.preferences.mockResolvedValue({ ...saved, workbench_wide_width: 1100 });
+      const project = get(app).projects[0];
+      await actions.openProject(project.id);
+      await vi.waitFor(() => expect(get(app).workbenchWideWidth).toBe(1100));
+
+      // A preferences file written before the wide tabs existed has no field.
+      transport.preferences.mockResolvedValue({ ...saved });
+      await actions.closeProject();
+      await actions.openProject(project.id);
+      await vi.waitFor(() => expect(get(app).workbenchWideWidth).toBeNull());
     } finally {
       if (originalInnerWidth) Object.defineProperty(window, "innerWidth", originalInnerWidth);
     }

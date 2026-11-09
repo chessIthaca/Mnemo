@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Activity, Brain, ChartColumn, ChevronDown, ListChecks, MessageSquare, Network, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
+  import { ChartColumn, ChevronDown, ListChecks, MessageSquare, PanelsTopLeft, Settings, UsersRound, Wallet } from "@lucide/svelte";
   import { actions, app, currentProject, needsYouCount } from "../lib/store";
   import { formatTokenCount, formatUsageCost, usageIsPartial, usageTotalTokens } from "../lib/usage";
   import AvatarStack from "./AvatarStack.svelte";
@@ -42,10 +42,7 @@
       {#if $needsYouCount > 0}<span class="nav-badge">{$needsYouCount}</span>{/if}
     </button>
     <button class:active={$app.route === "cost"} aria-pressed={$app.route === "cost"} onclick={actions.openCost}><ChartColumn size={14} /> Cost</button>
-    <button class:active={$app.route === "trace"} aria-pressed={$app.route === "trace"} onclick={() => actions.openTrace()}><Activity size={14} /> Trace</button>
-    <button class:active={$app.route === "graph"} aria-pressed={$app.route === "graph"} onclick={actions.openGraph}><Network size={14} /> Graph</button>
     <button class:active={$app.route === "plans"} aria-pressed={$app.route === "plans"} onclick={actions.openPlans}><ListChecks size={14} /> Plans</button>
-    <button class:active={$app.route === "memory"} aria-pressed={$app.route === "memory"} onclick={actions.openMemory}><Brain size={14} /> Memory</button>
   </nav>
 
   <div class="topbar-right">
@@ -53,14 +50,13 @@
       <AvatarStack workers={visibleWorkers} max={4} />
       <span>{activeCount} active</span>
     </button>
-    {#if $app.route === "lead"}
-      <button
-        class="icon-button"
-        aria-label={$app.workbenchOpen ? "Close workbench" : "Open workbench"}
-        aria-pressed={$app.workbenchOpen}
-        onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench("browser"))}
-      ><PanelsTopLeft size={15} /></button>
-    {/if}
+    <button
+      class="icon-button"
+      aria-label={$app.workbenchOpen ? "Close workbench" : "Open workbench"}
+      aria-pressed={$app.workbenchOpen}
+      title="Side panel: browser, diff, plan, files, git, trace, graph and memory"
+      onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench($app.workbenchTab))}
+    ><PanelsTopLeft size={15} /></button>
     <button class="icon-button" aria-label="Settings" title="Project and install settings" onclick={() => (appSettingsOpen = true)}><Settings size={15} /></button>
     <ExternalLeadBadge />
     <ContextRing />
@@ -135,5 +131,12 @@
   .usage-note { margin: 8px 0 0; color: var(--warning); font-size: var(--text-meta); line-height: 1.45; }
   .settings-copy { margin: 0 0 16px; color: var(--muted); font-size: var(--text-body); line-height: 1.55; }
   .settings-actions { display: flex; justify-content: space-between; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
-  @media (max-width: 760px) { .topbar { grid-template-columns: 1fr auto; padding: 0 14px; } .primary-nav { position: fixed; right: 14px; bottom: 14px; left: 14px; z-index: 40; justify-content: center; box-shadow: var(--shadow); } .primary-nav button { flex: 1; justify-content: center; } .team-stack { display: none; } }
+  /* The filter would make the bar the containing block of the fixed bottom nav,
+     parking the nav over the top bar instead of at the window's bottom edge. */
+  @media (max-width: 760px) {
+    .topbar { grid-template-columns: 1fr auto; padding: 0 14px; backdrop-filter: none; }
+    .primary-nav { position: fixed; right: 14px; bottom: 14px; left: 14px; z-index: 40; justify-content: center; box-shadow: var(--shadow); }
+    .primary-nav button { flex: 1; justify-content: center; }
+    .team-stack { display: none; }
+  }
 </style>

@@ -145,7 +145,7 @@ describe("Workbench", () => {
 
     const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
     const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
-    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Trace", "Git"]);
+    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Git", "Trace", "Graph", "Memory"]);
     expect(within(strip).getByRole("button", { name: "Files" }).getAttribute("aria-pressed")).toBe("true");
 
     // The body switch renders the tree, which lists only the project root.
@@ -153,7 +153,7 @@ describe("Workbench", () => {
     expect(screen.getByRole("heading", { name: "Files" })).toBeTruthy();
   });
 
-  it("appends the Trace tab to the strip and lists the shared request log", async () => {
+  it("opens the Trace tab in the strip and lists the shared request log", async () => {
     const row: TraceRow = {
       id: 7,
       ts_ms: 0,
@@ -203,15 +203,14 @@ describe("Workbench", () => {
 
     const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
     const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
-    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Trace", "Git"]);
+    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Git", "Trace", "Graph", "Memory"]);
     expect(within(strip).getByRole("button", { name: "Trace" }).getAttribute("aria-pressed")).toBe("true");
 
-    // The body switch renders the log: one row for the refused worker request.
-    // Workers share the lead's engine, so the tab names the actor per call.
-    expect(screen.getByRole("heading", { name: "Trace" })).toBeTruthy();
-    expect(screen.getByText(/The latest 20 model calls from the lead and every worker/)).toBeTruthy();
-    const request = await screen.findByRole("button", { name: "Open call 7: Unattributed, Failed" });
-    expect(request.textContent).toContain("worker-model");
+    // The panel hosts the full Trace view now, not the old compact summary.
+    // A first dynamic import can outlast the default wait under full-suite load.
+    expect(await screen.findByRole("region", { name: "Trace" }, { timeout: 15000 })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /worker-model/ }, { timeout: 15000 })).toBeTruthy();
+    expect(state().workbenchTab).toBe("trace");
   });
   it("appends the Git tab to the strip and fast-forwards main after confirmation", async () => {
     const moved: string[] = [];
@@ -262,6 +261,104 @@ describe("Workbench", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Move main" }));
     await vi.waitFor(() => expect(moved).toEqual(["work"]));
     expect(await screen.findByText(/main now points at work/)).toBeTruthy();
+  });
+
+  it("opens the wide tabs wider and remembers each width apart", async () => {
+    const original = Object.getOwnPropertyDescriptor(window, "innerWidth");
+    Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1600 });
+    try {
+      actions.setWorkbenchWidth(480);
+      actions.openWorkbench("diff");
+      const { container } = render(Workbench);
+      const aside = container.querySelector<HTMLElement>(".workbench")!;
+      expect(aside.style.width).toBe("480px");
+
+      await fireEvent.click(screen.getByRole("button", { name: "Graph" }));
+      expect(aside.style.width).toBe("960px");
+
+      await fireEvent.keyDown(screen.getByRole("button", { name: "Resize workbench" }), { key: "ArrowLeft" });
+      expect(state().workbenchWideWidth).toBe(984);
+      expect(aside.style.width).toBe("984px");
+
+      await fireEvent.click(screen.getByRole("button", { name: "Diff" }));
+      expect(aside.style.width).toBe("480px");
+      expect(state().workbenchWidth).toBe(480);
+
+      await fireEvent.click(screen.getByRole("button", { name: "Memory" }));
+      expect(aside.style.width).toBe("984px");
+
+      await fireEvent.doubleClick(screen.getByRole("button", { name: "Resize workbench" }));
+      expect(state().workbenchWideWidth).toBeNull();
+      expect(aside.style.width).toBe("960px");
+    } finally {
+      if (original) Object.defineProperty(window, "innerWidth", original);
+    }
+  });
+
+  it("hands openTrace filters to the panel's Trace tab", async () => {
+    const row: TraceRow = {
+      id: 7,
+      ts_ms: 0,
+      model: "worker-model",
+      base_url: "https://api.example.invalid/v1",
+      provider: "primary",
+      http_status: 200,
+      usage: null,
+      finish_reason: null,
+      is_complete: true,
+      version: 2,
+      ttft_ms: 120,
+      generation_ms: 120,
+      reasoning_ms: null,
+      connect_ms: null,
+      upload_ms: null,
+      server_ms: null,
+      tools_ms: null,
+      prep_ms: null,
+      compact_ms: null,
+      backoff_ms: null,
+      stall_ms: null,
+      chunks: null,
+      error: null,
+      cancelled: false,
+      response_truncated: false,
+      response_evicted: false,
+      guard_cut: null,
+      run_id: "run-1",
+      attribution: {
+        actor_kind: "worker",
+        agent_id: "design-trace",
+        session_id: "session-1",
+        agent_name: "Design trace",
+        worker_id: null,
+        plan_id: null,
+        plan_step: null,
+        turn_id: null,
+        purpose: "turn",
+      },
+      cost_micros: null,
+      priced: false,
+      retained: false,
+    };
+    seedTracePagePreview({
+      list: async () => ({ rows: [row], total: 1, unpriced: 0, has_more: false, next_cursor: null, capped: false }),
+      detail: async () => null,
+      settings: async () => ({ log_bodies: false, ring_capacity: 128, journal_bytes: 0, history_bytes: 0 }),
+      setLogBodies: async () => ({ log_bodies: false, ring_capacity: 128, journal_bytes: 0, history_bytes: 0 }),
+      clearLive: async () => undefined,
+      deleteHistory: async () => ({ deleted_files: 0, bytes: 0 }),
+      exportCalls: async () => ({ path: "", count: 0, includes_bodies: false }),
+      revealExport: async () => undefined,
+    });
+    actions.openTrace({ agent: "design-trace" });
+    render(Workbench);
+
+    await vi.waitFor(
+      () => expect((screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement).value).toBe("design-trace"),
+      { timeout: 15000 },
+    );
+    expect(state().traceEntry).toBeNull();
+    expect(state().workbenchTab).toBe("trace");
   });
 });
 

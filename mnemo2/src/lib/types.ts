@@ -4,9 +4,9 @@ import type { BoardPlan } from "./boardState";
 import type { WorkerDeletionPreview } from "./teamState";
 import type { TraceEntry } from "./trace";
 
-export type Route = "start" | "lead" | "team" | "cost" | "trace" | "graph" | "plans" | "memory";
+export type Route = "start" | "lead" | "team" | "cost" | "plans";
 
-export type WorkbenchTab = "browser" | "diff" | "plan" | "files" | "trace" | "git";
+export type WorkbenchTab = "browser" | "diff" | "plan" | "files" | "git" | "trace" | "graph" | "memory";
 
 /** One "open this file" request handed from another view to the Files tab. */
 export interface WorkbenchFileRequest {
@@ -685,6 +685,8 @@ export interface AppState {
   workbenchOpen: boolean;
   workbenchTab: WorkbenchTab;
   workbenchWidth: number;
+  /** The dragged width of the wide panel tabs (Trace, Graph, Memory); null follows the window. */
+  workbenchWideWidth: number | null;
   /** Worker whose output streams in the lead-side panel; null when closed. */
   workerPanelId: string | null;
   browserUrl: string;
@@ -717,7 +719,7 @@ export interface AppState {
   toast: ToastMessage | null;
   /** Saved mission-control worker-list width; null keeps the default split. */
   boardWidth: number | null;
-  /** Filter hand-over planted by openTrace for the Trace route to consume. */
+  /** Filter hand-over planted by openTrace for the panel's Trace tab to consume. */
   traceEntry: TraceEntry | null;
   /** Plan hand-over planted by openPlanDocument for the Plans tab to consume. */
   planDocumentId: string | null;

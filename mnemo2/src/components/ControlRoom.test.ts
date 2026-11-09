@@ -53,7 +53,7 @@ describe("Mission Control", () => {
     it("resizes the list with the arrow keys and clamps at both bounds", async () => {
       app.update((state) => ({ ...state, boardWidth: 600 }));
       render(ControlRoom);
-      expect(columns()).toContain("--board-columns: 600px 9px minmax(420px, 1fr)");
+      expect(columns()).toContain("--board-columns: minmax(300px, 600px) 9px minmax(420px, 1fr)");
 
       await fireEvent.keyDown(divider(), { key: "ArrowRight" });
       expect(get(app).boardWidth).toBe(624);
@@ -181,6 +181,6 @@ describe("Mission Control", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Diff" }));
     expect(get(app).workbenchTab).toBe("diff");
     expect(get(app).diffWorkerId).toBe("theo");
-    expect(get(app).route).toBe("lead");
+    expect(get(app).route).toBe("team");
   });
 });

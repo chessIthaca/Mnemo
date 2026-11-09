@@ -282,3 +282,23 @@ describe("WorkerDetail plan tab", () => {
     expect(within(tabs).queryByRole("button", { name: "Plan" })).toBeNull();
   });
 });
+
+describe("WorkerDetail hand-overs stay on the team tab", () => {
+  beforeEach(() => app.set({ ...fixtureState(), route: "team" }));
+
+  it("opens Model calls and Diff in the panel beside Mission Control", async () => {
+    const target = worker();
+    render(WorkerDetail, { worker: target, measureBriefOverflow: () => false });
+
+    await fireEvent.click(screen.getByRole("button", { name: `Model calls ${target.name}` }));
+    expect(get(app).route).toBe("team");
+    expect(get(app).workbenchOpen).toBe(true);
+    expect(get(app).workbenchTab).toBe("trace");
+    expect(get(app).traceEntry).toEqual({ agent: target.id });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Diff" }));
+    expect(get(app).route).toBe("team");
+    expect(get(app).workbenchOpen).toBe(true);
+    expect(get(app).workbenchTab).toBe("diff");
+  });
+});

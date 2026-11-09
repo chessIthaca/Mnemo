@@ -165,15 +165,13 @@ describe("TopBar workspace tabs", () => {
     app.set(fixtureState());
   });
 
-  it("switches between Lead, Team, Cost, Graph and Plans from the nav", async () => {
+  it("switches between Lead, Team, Cost and Plans from the nav", async () => {
     render(TopBar);
 
     await fireEvent.click(screen.getByRole("button", { name: /^Team/ }));
     expect(get(app).route).toBe("team");
     await fireEvent.click(screen.getByRole("button", { name: /^Cost/ }));
     expect(get(app).route).toBe("cost");
-    await fireEvent.click(screen.getByRole("button", { name: /^Graph/ }));
-    expect(get(app).route).toBe("graph");
     await fireEvent.click(screen.getByRole("button", { name: /^Plans/ }));
     expect(get(app).route).toBe("plans");
     await fireEvent.click(screen.getByRole("button", { name: /^Lead/ }));

@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { actions, app, createInitialState } from "./store";
 import { fixtureState } from "../test/fixtures";
 
@@ -68,7 +68,7 @@ describe("Mnemo2 store production state", () => {
     actions.openWorkbench("diff");
     actions.openTeam();
     expect(state().route).toBe("team");
-    expect(state().workbenchOpen).toBe(false);
+    expect(state().workbenchOpen).toBe(true);
     expect(state().leadEntries).toEqual([]);
   });
 
@@ -121,5 +121,66 @@ describe("Mnemo2 store production state", () => {
     actions.addLeadDraftImage("data:image/png;base64,one");
     actions.clearLeadDraft();
     expect(state().leadDraft).toEqual({ text: "", images: [] });
+  });
+});
+
+describe("the side panel is independent of the main tab", () => {
+  const originalWidth = window.innerWidth;
+
+  /** jsdom reads its viewport from `window.innerWidth`, so tests pin it explicitly. */
+  function pinWidth(width: number) {
+    Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+  }
+
+  beforeEach(() => {
+    pinWidth(1600);
+    app.set(fixtureState());
+  });
+
+  afterEach(() => {
+    pinWidth(originalWidth);
+  });
+
+  it("opens the panel without leaving the main tab", () => {
+    app.update((current) => ({ ...current, route: "team" }));
+
+    actions.openWorkbench("diff");
+
+    expect(state().route).toBe("team");
+    expect(state().workbenchOpen).toBe(true);
+    expect(state().workbenchTab).toBe("diff");
+  });
+
+  it("opens the browser tab from any main tab", () => {
+    app.update((current) => ({ ...current, route: "cost" }));
+
+    actions.openBrowser("https://example.com");
+
+    expect(state().route).toBe("cost");
+    expect(state().workbenchOpen).toBe(true);
+    expect(state().workbenchTab).toBe("browser");
+  });
+
+  it("opens the Trace tab with an entry point's filters from any main tab", () => {
+    app.update((current) => ({ ...current, route: "team" }));
+
+    actions.openTrace({ agent: "ana" });
+
+    expect(state().route).toBe("team");
+    expect(state().workbenchTab).toBe("trace");
+    expect(state().traceEntry).toEqual({ agent: "ana" });
+  });
+
+  it("keeps the panel beside Mission Control on a wide window and closes it on a narrow one", () => {
+    app.update((current) => ({ ...current, route: "lead", workbenchOpen: true }));
+    actions.selectWorker("ana");
+    expect(state().route).toBe("team");
+    expect(state().workbenchOpen).toBe(true);
+
+    pinWidth(900);
+    app.update((current) => ({ ...current, route: "lead", workbenchOpen: true }));
+    actions.selectWorker("ana");
+    expect(state().route).toBe("team");
+    expect(state().workbenchOpen).toBe(false);
   });
 });

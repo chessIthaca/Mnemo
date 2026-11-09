@@ -32,6 +32,7 @@ export async function restoreWorkbench(project: Project): Promise<void> {
       workbenchOpen: preferences.workbench_open,
       workbenchTab: preferences.workbench_tab,
       workbenchWidth: preferences.workbench_width,
+      workbenchWideWidth: preferences.workbench_wide_width ?? null,
       browserUrl: preferences.browser_url,
       browserImage: null,
       diffWorkerId: preferences.diff_worker_id,
@@ -153,7 +154,6 @@ export function openWorkerDiff(workerId: string): void {
 export function openWorkbench(workbenchTab: WorkbenchTab = "browser") {
   app.update((state) => ({
     ...state,
-    route: state.projectId ? "lead" : state.route,
     teamPeekOpen: false,
     workbenchOpen: true,
     workerPanelId: null,
@@ -182,17 +182,29 @@ export function setWorkbenchWidth(workbenchWidth: number) {
   schedulePreferenceSave();
 }
 
+/** Drag a wide panel tab; `null` goes back to following the window. */
+export function setWideWorkbenchWidth(width: number | null) {
+  app.update((state) => ({
+    ...state,
+    workbenchWideWidth: width === null ? null : clampWorkbenchWidth(width, viewportWidth()),
+  }));
+  schedulePreferenceSave();
+}
+
 /**
  * Re-clamp a saved or dragged width after the window shrank, so a wide panel
- * never squeezes the lead below its minimum. No-op while the width still fits.
+ * never squeezes the main tab below its minimum. No-op while the widths still
+ * fit. A wide tab that follows the window stays null.
  */
 export function reclampWorkbenchWidth(windowWidth: number = viewportWidth()) {
   let changed = false;
   app.update((state) => {
     const workbenchWidth = clampWorkbenchWidth(state.workbenchWidth, windowWidth);
-    if (workbenchWidth === state.workbenchWidth) return state;
+    const workbenchWideWidth =
+      state.workbenchWideWidth === null ? null : clampWorkbenchWidth(state.workbenchWideWidth, windowWidth);
+    if (workbenchWidth === state.workbenchWidth && workbenchWideWidth === state.workbenchWideWidth) return state;
     changed = true;
-    return { ...state, workbenchWidth };
+    return { ...state, workbenchWidth, workbenchWideWidth };
   });
   if (changed) schedulePreferenceSave();
 }
@@ -231,7 +243,6 @@ export async function openScreenshot(workerId: string, path: string): Promise<vo
   workbenchTransport = transport;
   app.update((state) => ({
     ...state,
-    route: state.projectId ? "lead" : state.route,
     workbenchOpen: true,
     workbenchTab: "browser",
     browserImage: { dataUrl: "", label: path.split("/").pop() ?? "Worker screenshot" },

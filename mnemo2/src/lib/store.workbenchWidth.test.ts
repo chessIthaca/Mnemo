@@ -8,8 +8,11 @@ import {
   app,
   clampBoardWidth,
   clampWorkbenchWidth,
+  defaultWideWorkbenchWidth,
   maxWorkbenchWidth,
+  workbenchPanelWidth,
 } from "./store";
+
 import { fixtureState } from "../test/fixtures";
 
 const { transport } = vi.hoisted(() => ({
@@ -105,5 +108,66 @@ describe("window-relative workbench width", () => {
     const rescued = transport.savePreferences.mock.lastCall?.[1] as ProjectPreferences;
     expect(rescued.workbench_width).toBe(697);
     expect(rescued.board_width).toBe(641);
+  });
+});
+
+describe("wide panel tabs", () => {
+  const originalInnerWidth = Object.getOwnPropertyDescriptor(window, "innerWidth");
+
+  beforeEach(() => {
+    transport.savePreferences.mockReset();
+    app.set(fixtureState());
+    setWindowWidth(1600);
+  });
+
+  afterEach(() => {
+    if (originalInnerWidth) Object.defineProperty(window, "innerWidth", originalInnerWidth);
+  });
+
+  it("opens at 62% of the window until dragged", () => {
+    expect(defaultWideWorkbenchWidth(1600)).toBe(960);
+    // The main tab keeps its floor, so the share yields to the panel bounds.
+    expect(defaultWideWorkbenchWidth(1000)).toBe(580);
+    expect(defaultWideWorkbenchWidth(600)).toBe(MIN_WORKBENCH_WIDTH);
+  });
+
+  it("keeps a drag on one kind of tab out of the other's width", () => {
+    expect(workbenchPanelWidth("diff", 480, 1000, 1600)).toBe(480);
+    expect(workbenchPanelWidth("trace", 480, null, 1600)).toBe(960);
+    expect(workbenchPanelWidth("graph", 480, 1000, 1280)).toBe(860);
+  });
+
+  it("stores the dragged wide width as whole pixels inside the panel bounds", () => {
+    actions.setWideWorkbenchWidth(697.3);
+    expect(get(app).workbenchWideWidth).toBe(697);
+
+    actions.setWideWorkbenchWidth(5000);
+    expect(get(app).workbenchWideWidth).toBe(1180);
+
+    actions.setWideWorkbenchWidth(null);
+    expect(get(app).workbenchWideWidth).toBeNull();
+  });
+
+  it("re-clamps a saved wide width on a shrunk window and leaves a following one null", () => {
+    actions.setWideWorkbenchWidth(1100);
+    actions.reclampWorkbenchWidth(1280);
+    expect(get(app).workbenchWideWidth).toBe(860);
+
+    actions.setWideWorkbenchWidth(null);
+    actions.reclampWorkbenchWidth(1280);
+    expect(get(app).workbenchWideWidth).toBeNull();
+  });
+
+  it("saves the wide width rounded, and null when it follows the window", async () => {
+    actions.setWideWorkbenchWidth(697.4);
+    await vi.waitFor(() => expect(transport.savePreferences).toHaveBeenCalled());
+    const dragged = transport.savePreferences.mock.lastCall?.[1] as ProjectPreferences;
+    expect(dragged.workbench_wide_width).toBe(697);
+
+    transport.savePreferences.mockClear();
+    actions.setWideWorkbenchWidth(null);
+    await vi.waitFor(() => expect(transport.savePreferences).toHaveBeenCalled());
+    const reset = transport.savePreferences.mock.lastCall?.[1] as ProjectPreferences;
+    expect(reset.workbench_wide_width).toBeNull();
   });
 });

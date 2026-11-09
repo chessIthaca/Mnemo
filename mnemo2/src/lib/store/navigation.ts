@@ -1,14 +1,24 @@
 import type { RepoPathRef } from "../repoPaths";
 import type { TraceEntry } from "../trace";
-import type { TeamFilter } from "../types";
+import type { AppState, TeamFilter } from "../types";
 import { app } from "./core";
+import { panelCoversMain, viewportWidth } from "./layout";
 import { openWorkbench } from "./workbench";
+
+/**
+ * The side panel outlives a main-tab change, except where it covers the main
+ * tab: in a narrow window it would hide the very tab just asked for.
+ */
+function panelAfterNavigation(state: AppState): boolean {
+  return state.workbenchOpen && !panelCoversMain(viewportWidth());
+}
 
 export function openLead() {
   app.update((state) => ({
     ...state,
     route: state.projectId ? "lead" : state.route,
     teamPeekOpen: false,
+    workbenchOpen: panelAfterNavigation(state),
   }));
 }
 
@@ -17,7 +27,7 @@ export function openTeam() {
     ...state,
     route: state.projectId ? "team" : state.route,
     teamPeekOpen: false,
-    workbenchOpen: false,
+    workbenchOpen: panelAfterNavigation(state),
   }));
 }
 
@@ -27,17 +37,7 @@ export function openCost() {
     ...state,
     route: state.projectId ? "cost" : state.route,
     teamPeekOpen: false,
-    workbenchOpen: false,
-  }));
-}
-
-/** Show the project's code graph; needs an open project. */
-export function openGraph() {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "graph" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
+    workbenchOpen: panelAfterNavigation(state),
   }));
 }
 
@@ -47,44 +47,29 @@ export function openPlans() {
     ...state,
     route: state.projectId ? "plans" : state.route,
     teamPeekOpen: false,
-    workbenchOpen: false,
-  }));
-}
-
-/** Show the project's knowledge records and memories; needs an open project. */
-export function openMemory() {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "memory" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
+    workbenchOpen: panelAfterNavigation(state),
   }));
 }
 
 /**
- * Open the Trace route — every model call, in detail. Optional filters carry
- * an entry point's hand-over (a worker from mission control, a lead turn
+ * Open the panel's Trace tab — every model call, in detail. Optional filters
+ * carry an entry point's hand-over (a worker from mission control, a lead turn
  * from the chat); the view consumes them once and they never enter a URL.
  */
 export function openTrace(filters?: TraceEntry) {
-  app.update((state) => ({
-    ...state,
-    route: state.projectId ? "trace" : state.route,
-    teamPeekOpen: false,
-    workbenchOpen: false,
-    traceEntry: filters ?? null,
-  }));
+  app.update((state) => ({ ...state, traceEntry: filters ?? null }));
+  openWorkbench("trace");
 }
 
-/** Clear a consumed Trace hand-over so returning to the route starts unfiltered. */
+/** Clear a consumed Trace hand-over so returning to the tab starts unfiltered. */
 export function clearTraceEntry() {
   app.update((state) => (state.traceEntry === null ? state : { ...state, traceEntry: null }));
 }
 
 /**
- * Open a plan document: the Memory tab's link to `.coding/plans/<id>.md`. The
- * Plans route expands the plan, reads its document and scrolls it into view;
- * an id the board does not hold shows a short not-found note.
+ * Open a plan document: the panel Memory tab's link to `.coding/plans/<id>.md`.
+ * The Plans route expands the plan, reads its document and scrolls it into
+ * view; an id the board does not hold shows a short not-found note.
  */
 export function openPlanDocument(planId: string) {
   const id = planId.trim();
@@ -93,7 +78,7 @@ export function openPlanDocument(planId: string) {
     ...state,
     route: state.projectId ? "plans" : state.route,
     teamPeekOpen: false,
-    workbenchOpen: false,
+    workbenchOpen: panelAfterNavigation(state),
     planDocumentId: id,
   }));
 }
@@ -104,7 +89,7 @@ export function clearPlanDocument() {
 }
 
 /**
- * Open a project file in the Workbench: the Memory tab's link to a path a
+ * Open a project file in the Workbench: the panel Memory tab's link to a path a
  * record names. The Files tab reads it through its own `openPath` and reveals
  * `line` when the reference carries one.
  */
@@ -143,7 +128,7 @@ export function selectWorker(workerId: string) {
       route: "team",
       selectedWorkerId: workerId,
       teamPeekOpen: false,
-      workbenchOpen: false,
+      workbenchOpen: panelAfterNavigation(state),
     };
   });
 }

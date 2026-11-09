@@ -43,6 +43,7 @@ export function schedulePreferenceSave(): void {
       browser_url: state.browserUrl,
       diff_worker_id: state.diffWorkerId,
       board_width: state.boardWidth === null ? null : Math.round(state.boardWidth),
+      workbench_wide_width: state.workbenchWideWidth === null ? null : Math.round(state.workbenchWideWidth),
     },
   };
   if (preferenceTimer) clearTimeout(preferenceTimer);

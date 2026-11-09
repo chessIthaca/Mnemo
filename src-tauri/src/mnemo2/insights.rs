@@ -461,7 +461,7 @@ pub fn savings_report(
         .per_kind
         .iter()
         // `compaction_checkpoint` is a bookkeeping marker, not a lever: it
-        // costs a compaction and buys nothing, so it is not a row.
+        // records the size of what a compaction dropped, so it is not a row.
         .filter(|lever| lever.kind != "compaction_checkpoint")
         .map(|lever| {
             let value = kinds.get(&lever.kind).copied().unwrap_or_default();

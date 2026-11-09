@@ -256,10 +256,10 @@ describe("InflightBar ctx popup quality badge", () => {
     expect(source).toContain("default:");
   });
 
-  it("shows the fill, waste, stale-read and decision components", () => {
+  it("shows the fill and decision components", () => {
     expect(source).toContain("contextUsage.quality.fill_pct");
-    expect(source).toContain("contextUsage.quality.waste_tokens");
-    expect(source).toContain("contextUsage.quality.stale_read_rate");
+    expect(source).not.toContain("contextUsage.quality.waste_tokens");
+    expect(source).not.toContain("contextUsage.quality.stale_read_rate");
     expect(source).toContain("contextUsage.quality.decision_density");
   });
 });

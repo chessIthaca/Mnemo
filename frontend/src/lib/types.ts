@@ -193,19 +193,14 @@ export interface AgentEventPayload {
 
 /**
  * The S–F context-quality grade (token-optimizer lever 6, backlog e4a50d22),
- * computed by the backend from the current window fill plus the session's
- * optimizer counters. Rides `context_usage` only while the backend's
- * `[general.optimizer] quality_score` flag is on.
+ * computed by the backend from how full the window is. Rides `context_usage`
+ * only while the backend's `[general.optimizer] quality_score` flag is on.
  */
 export interface ContextQuality {
   /** The letter grade, `"S"` (best) through `"F"` (worst). */
   grade: string;
   /** Window fill at the time of the report (0–100). */
   fill_pct: number;
-  /** Cumulative tokens spent on redundant serves (skeletons). */
-  waste_tokens: number;
-  /** Share of lever-served reads that were stale re-reads (0–100). */
-  stale_read_rate: number;
   /** Decisions seen per 100 messages (0–100). */
   decision_density: number;
 }

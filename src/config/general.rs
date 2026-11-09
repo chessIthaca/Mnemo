@@ -135,8 +135,8 @@ pub struct GeneralSection {
     #[serde(default, skip_serializing_if = "BudgetConfig::is_default")]
     pub budget: BudgetConfig,
     /// **Token-optimizer levers (on by default; backlog e4a50d22).** The
-    /// context levers that cut re-reads and command-output waste at the tool
-    /// dispatch layer: delta/skeleton re-reads, semantic command-output
+    /// context levers that cut big-file reads and command-output waste at the
+    /// dispatch layer: outline reads of big files, semantic command-output
     /// compression, archive/expand progressive disclosure, compaction
     /// survival, the S-F quality score, and the lean-output nudge. An absent
     /// section means every lever holds its default (ON) — an explicit
@@ -696,13 +696,11 @@ fn budget_retries_is_default(count: &u32) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OptimizerConfig {
-    /// **Lever 1 — delta, skeleton + outline reads.** When `true`,
-    /// `read_files` serves a signature/import skeleton for re-reads of
-    /// unchanged files and a unified diff for changed ones, instead of the
-    /// full content every time, and a first whole read of a source file over
-    /// 500 lines serves its signature outline (the agent then reads the
-    /// region it needs). Other first reads and ranged reads still serve full
-    /// content. On by default.
+    /// **Lever 1 — outline reads.** When `true`, a whole `read_files` read of
+    /// a source file over 500 lines serves its signature outline (the agent
+    /// then reads the region it needs with a ranged read). Other whole reads
+    /// and every ranged read serve full content. The key keeps its historical
+    /// name so existing configs load. On by default.
     pub delta_reads: bool,
     /// **Lever 2 — semantic command-output compression.** When `true`,
     /// large shell-tool output from known command families (cargo, npm,

@@ -2442,16 +2442,14 @@ mod tests {
             quality: Some(crate::agent::optimizer::QualityReport {
                 grade: crate::agent::optimizer::QualityGrade::A,
                 fill_pct: 12,
-                waste_tokens: 34,
-                stale_read_rate: 5,
                 decision_density: 50,
             }),
         };
         let json = serde_json::to_value(&graded).unwrap();
         assert_eq!(json["quality"]["grade"], serde_json::json!("A"), "{json}");
         assert_eq!(json["quality"]["fill_pct"], serde_json::json!(12));
-        assert_eq!(json["quality"]["waste_tokens"], serde_json::json!(34));
-        assert_eq!(json["quality"]["stale_read_rate"], serde_json::json!(5));
+        assert!(json["quality"].get("waste_tokens").is_none(), "{json}");
+        assert!(json["quality"].get("stale_read_rate").is_none(), "{json}");
         assert_eq!(json["quality"]["decision_density"], serde_json::json!(50));
         // The app deserializes what the core serializes.
         let back: SerializableAgentEvent = serde_json::from_value(json).unwrap();

@@ -2,20 +2,18 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Per-agent read cache for `read_files` delta + skeleton re-reads
-//! (token-optimizer lever 1, backlog e4a50d22).
+//! Per-agent read state for `read_files`'s outline lever (token-optimizer
+//! lever 1, backlog e4a50d22).
 //!
-//! Most whole-file reads are RE-reads of files already in context: the
-//! agent re-opens a file after an edit, or reads again what it read a few
-//! turns ago. Serving the full content again burns the same context twice.
-//! The cache keeps the last-served full content per path, so a re-read can
-//! serve a signature skeleton (unchanged file) or a unified diff (changed
-//! file) instead — with a clear note pointing back at the full-read escape
-//! hatch (`start_line`/`max_lines` always serve exact lines).
+//! A whole read of a big source file serves its signature outline instead of
+//! the content: [`skeleton_for`] renders the file's signature lines, and the
+//! model then reads the region it needs with `start_line`/`max_lines`.
+//! [`ReadCache`] keeps, per file, the tokens that outline saved and that have
+//! not yet been charged to follow-up ranged reads (`outline_followup`).
 //!
 //! The cache is per-agent: the factory builds a fresh one per tool
 //! registry, never shared across subagents — a subagent's first read must
-//! not inherit a false "already in context" state.
+//! not inherit another agent's read state.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,25 +30,13 @@ pub(crate) const MAX_CACHED_FILES: usize = 64;
 /// A skeleton serves at most this many numbered lines.
 pub(crate) const SKELETON_MAX_LINES: usize = 120;
 
-/// Serve the full file (not a diff) once the diff would exceed this
-/// fraction of the new content — a mostly-rewritten file is cheaper to
-/// re-serve in full than to make the model decode a huge diff.
-const DIFF_FULL_SERVE_RATIO: f64 = 0.4;
-
-/// The last-served full content of one file.
-struct FileSnapshot {
-    content: String,
-}
-
-/// Per-agent cache of last-served file contents (the delta baseline for
-/// `read_files` re-reads). Interior-mutable; the tool clones the `Arc`
-/// into its `spawn_blocking` closure.
+/// Per-agent cache of the outline debt owed to `read_files` ranged reads.
+/// Interior-mutable; the tool clones the `Arc` into its `spawn_blocking`
+/// closure.
 pub struct ReadCache {
-    inner: RwLock<HashMap<PathBuf, FileSnapshot>>,
     /// Per-file tokens a served outline saved and that have not yet been
     /// charged to a follow-up ranged read (the `outline_followup` ledger
-    /// row). Kept apart from `inner` so a skeleton serve and the debt can
-    /// never disagree.
+    /// row).
     outlined: RwLock<HashMap<PathBuf, i64>>,
 }
 
@@ -64,36 +50,14 @@ impl ReadCache {
     /// An empty cache.
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
             outlined: RwLock::new(HashMap::new()),
         }
     }
 
-    /// The last-served full content for `path`, when this agent already
-    /// read the file whole.
-    pub(crate) fn snapshot(&self, path: &Path) -> Option<String> {
-        self.inner
-            .read()
-            .expect("read cache lock poisoned")
-            .get(path)
-            .map(|s| s.content.clone())
-    }
-
-    /// Record the full content served for `path` (the delta baseline for
-    /// the next re-read). Resets the whole cache once the entry cap is
-    /// reached.
-    pub(crate) fn record(&self, path: PathBuf, content: String) {
-        let mut inner = self.inner.write().expect("read cache lock poisoned");
-        if !inner.contains_key(&path) && inner.len() >= MAX_CACHED_FILES {
-            inner.clear();
-        }
-        inner.insert(path, FileSnapshot { content });
-    }
-
     /// Note the tokens a served outline saved for `path`, to be charged to
     /// follow-up ranged reads (the `outline_followup` ledger row). Saturating,
-    /// and resets the whole debt map once the entry cap is reached — the same
-    /// fresh-epoch rule as [`Self::record`].
+    /// and resets the whole debt map once the entry cap is reached — a fresh
+    /// epoch is simpler and safer than partial eviction.
     pub(crate) fn note_outline(&self, path: PathBuf, saved_tokens: i64) {
         let mut outlined = self.outlined.write().expect("read cache lock poisoned");
         if !outlined.contains_key(&path) && outlined.len() >= MAX_CACHED_FILES {
@@ -119,18 +83,6 @@ impl ReadCache {
         let charged = tokens.min(*remaining);
         *remaining -= charged;
         Some(charged)
-    }
-
-    /// Forget what the model has seen (a compaction or an old-result trim
-    /// removed earlier content): the next whole read serves the file again
-    /// instead of a skeleton claiming "unchanged since your last read".
-    /// The `outlined` debt is deliberately kept — the outline saving was
-    /// already recorded in the ledger and stays owed.
-    pub(crate) fn forget_served(&self) {
-        self.inner
-            .write()
-            .expect("read cache lock poisoned")
-            .clear();
     }
 }
 
@@ -209,30 +161,9 @@ fn is_signature_line(lang: Lang, line: &str) -> bool {
         Lang::Php => starts(&[
             "function ", "class ", "interface ", "trait ", "enum ", "use ", "namespace ",
         ]),
-        // HTML has no line-level signatures — a skeleton would be noise.
-        // Whole-file HTML re-reads serve the full content (the baseline is
-        // still cached, so DIFF serves work).
+        // HTML has no line-level signatures, so it is never outlined.
         Lang::Html => false,
     }
-}
-
-/// A unified diff of `old` → `new` (the `similar` crate), or `None` when
-/// the diff is empty or too large to be worth serving — the caller then
-/// serves the full new content (a mostly-rewritten file is cheaper to
-/// re-read than to decode through a huge diff).
-pub(crate) fn diff_if_small(old: &str, new: &str) -> Option<String> {
-    let diff = similar::TextDiff::from_lines(old, new)
-        .unified_diff()
-        .context_radius(3)
-        .header("last read", "current")
-        .to_string();
-    if diff.is_empty() {
-        return None;
-    }
-    if diff.chars().count() as f64 > DIFF_FULL_SERVE_RATIO * (new.chars().count().max(1)) as f64 {
-        return None;
-    }
-    Some(diff)
 }
 
 #[cfg(test)]
@@ -280,41 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_small_change_is_served() {
-        // A one-line change inside a file large enough that the diff
-        // (headers + hunk + context included) is well under the 40%
-        // full-serve ratio — a TINY file's diff overhead exceeds the file
-        // itself, and that case must fall back to a full serve.
-        let old: String = (0..30)
-            .map(|i| format!("line {i} unchanged content\n"))
-            .collect();
-        let new = old.replace("line 15 unchanged content", "line 15 CHANGED");
-        let diff = diff_if_small(&old, &new).unwrap();
-        assert!(diff.contains("-line 15 unchanged content"), "{diff}");
-        assert!(diff.contains("+line 15 CHANGED"));
-    }
-
-    #[test]
-    fn diff_mostly_rewritten_returns_none() {
-        let old = "a\n".repeat(200);
-        let new = "b\n".repeat(200);
-        assert!(diff_if_small(&old, &new).is_none());
-    }
-
-    #[test]
-    fn cache_round_trips_and_resets_at_cap() {
-        let cache = ReadCache::new();
-        assert!(cache.snapshot(Path::new("/x")).is_none());
-        cache.record(PathBuf::from("/x"), "content".into());
-        assert_eq!(cache.snapshot(Path::new("/x")).as_deref(), Some("content"));
-        for i in 0..MAX_CACHED_FILES {
-            cache.record(PathBuf::from(format!("/p{i}")), "c".into());
-        }
-        // The cap reset cleared the whole cache, /x included.
-        assert!(cache.snapshot(Path::new("/x")).is_none());
-    }
-
-    #[test]
     fn charge_outline_charges_up_to_what_the_outline_saved() {
         let cache = ReadCache::new();
         cache.note_outline(PathBuf::from("/x"), 100);
@@ -328,14 +224,18 @@ mod tests {
     }
 
     #[test]
-    fn forget_served_keeps_the_outline_debt() {
+    fn outline_debt_resets_at_cap() {
         let cache = ReadCache::new();
-        cache.record(PathBuf::from("/x"), "content".into());
         cache.note_outline(PathBuf::from("/x"), 100);
-        cache.forget_served();
-        // The served-content baseline is gone: the next read serves the file.
-        assert!(cache.snapshot(Path::new("/x")).is_none());
-        // The ledger debt already recorded against the outline is still owed.
-        assert_eq!(cache.charge_outline(Path::new("/x"), 60), Some(60));
+        for i in 0..MAX_CACHED_FILES {
+            cache.note_outline(PathBuf::from(format!("/p{i}")), 1);
+        }
+        // The cap reset cleared the whole debt map, /x included.
+        assert_eq!(cache.charge_outline(Path::new("/x"), 10), None);
+        // The entry that triggered the reset survives.
+        assert_eq!(
+            cache.charge_outline(Path::new(&format!("/p{}", MAX_CACHED_FILES - 1)), 10),
+            Some(1)
+        );
     }
 }

@@ -52,9 +52,9 @@ function page(overrides: Partial<ModelSettingsTransport> = {}) {
 describe("SavingsPage", () => {
   it("renders every lever with its switch state and explanation, and the knobs", async () => {
     page();
-    expect((await screen.findByRole("checkbox", { name: /Delta reads/ }) as HTMLInputElement).checked).toBe(true);
+    expect((await screen.findByRole("checkbox", { name: /Outline reads/ }) as HTMLInputElement).checked).toBe(true);
     expect((screen.getByRole("checkbox", { name: /Recall deltas/ }) as HTMLInputElement).checked).toBe(false);
-    expect(screen.getByText("Re-read file signatures and diffs instead of full file contents.")).toBeTruthy();
+    expect(screen.getByText("Open a long source file with its outline; ranged reads load the exact lines.")).toBeTruthy();
     expect((screen.getByLabelText("Archive after") as HTMLInputElement).value).toBe("2400");
     expect((screen.getByLabelText("Nudge at fill %") as HTMLInputElement).value).toBe("80");
     expect((screen.getByLabelText("Extra commands") as HTMLInputElement).value).toBe("cargo test, npm run build");
@@ -105,7 +105,7 @@ describe("SavingsPage", () => {
 
   it("has no pricing table and points to the Endpoints page", async () => {
     page();
-    await screen.findByRole("checkbox", { name: /Delta reads/ });
+    await screen.findByRole("checkbox", { name: /Outline reads/ });
     expect(screen.queryByRole("region", { name: "Per-model pricing" })).toBeNull();
     expect(screen.queryByLabelText("Model for row 1")).toBeNull();
     expect(screen.queryByRole("button", { name: "Save prices" })).toBeNull();

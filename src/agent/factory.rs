@@ -427,7 +427,7 @@ pub struct AgentLoopFactory {
     browser_inspection: Arc<std::sync::atomic::AtomicBool>,
     /// Live mirror of `[general.optimizer]` (token-optimizer levers,
     /// backlog e4a50d22), shared with every lever-bearing tool built from
-    /// this factory (read_files delta/skeleton re-reads, shell output
+    /// this factory (read_files outline reads, shell output
     /// compression, …). Defaults to all-off; the IPC layer overrides via
     /// [`with_optimizer_config`](Self::with_optimizer_config) from the
     /// loaded config at startup (mirrors `shell_filter`).

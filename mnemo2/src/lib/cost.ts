@@ -174,11 +174,11 @@ export function costPreviewInsights(): CostInsights | null {
 const LEVERS: Record<string, { label: string; explanation: string }> = {
   delta_read: {
     label: "Delta reads",
-    explanation: "A file that changed since its last read is served as a diff, not as the whole file.",
+    explanation: "Retired. A changed file's re-read was served as a diff; these are past savings.",
   },
   skeleton: {
     label: "Signature skeletons",
-    explanation: "An unchanged re-read serves the file's symbol signatures instead of its full text.",
+    explanation: "Retired. An unchanged re-read was served as symbol signatures; these are past savings.",
   },
   outline: {
     label: "Outlines",

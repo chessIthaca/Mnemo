@@ -574,10 +574,6 @@ pub trait Tool: Send + Sync {
     fn host_tool_timeout_ms(&self) -> Option<u64> {
         None
     }
-    /// The context just lost earlier content (compaction or old-result
-    /// trimming). A tool holding a view of what the model has seen should
-    /// forget it. Default: no-op — only `read_files` caches a view.
-    fn on_context_reduced(&self) {}
 
     /// Execute the tool with parsed arguments.
     async fn execute(&self, args: Value) -> ToolResult;

@@ -2797,8 +2797,8 @@ impl AgentLoop {
             }
 
             // Token-optimizer savings ledger (backlog e4a50d22): a tool
-            // that served an optimized form (delta/skeleton re-read,
-            // compressed command output, archive preview, archive expand)
+            // that served an optimized form (outline read, compressed
+            // command output, archive preview, archive expand)
             // reports its before/after token counts in the result's
             // `data.savings` object — record the ledger row
             // fire-and-forget. `measured` defaults false (the tools
@@ -3192,15 +3192,13 @@ impl AgentLoop {
         if cut.truncated > 0 {
             state.token_accounting.reset();
             // Record what the reclaim really removed (not gated on the
-            // archive flag), and tell the read cache the model no longer
-            // holds what it last served.
+            // archive flag).
             self.record_trim_savings(
                 session_id,
                 cut.truncated,
                 cut.chars_before,
                 cut.chars_after,
             );
-            self.note_context_reduced();
         }
         // Fire-and-forget: the context is already bounded, so the archive is a
         // recovery path, never a blocking dependency (a failure is logged).
@@ -3824,7 +3822,6 @@ impl AgentLoop {
                 used as i64,
                 false,
             );
-            self.note_context_reduced();
         }
         // Invalidate per-turn recall cache on summarize (messages prefix changed).
         state.last_recalled_user_query = None;
@@ -4545,11 +4542,6 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         tokens_after: i64,
         measured: bool,
     ) {
-        // Lever 6 counters (backlog e4a50d22): mirror the ledger row into the
-        // session's running counters so the S–F score is graded from exactly
-        // what the levers logged. In-memory, so this happens even when no
-        // store is attached (the spawn below is the durable half).
-        self.optimizer_state.record(kind, tokens_after);
         let now_epoch = {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
@@ -4569,9 +4561,8 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             created_at: now_epoch,
         };
         // Live event (§5.7, job 3b.4): fan the `Savings` at the point the
-        // ledger row persists — un-gated by the store, mirroring the
-        // in-memory counters above (the durable row is the store's half
-        // alone).
+        // ledger row persists — un-gated by the store (the durable row is
+        // the store's half alone).
         self.emit_live_event(AgentEvent::Savings {
             kind: kind.to_string(),
             tokens_before,
@@ -4586,16 +4577,6 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                     eprintln!("mnemo: failed to record savings event: {e}");
                 }
             });
-        }
-    }
-
-    /// The context just lost earlier content (a compaction or an old-result
-    /// trim): tell the read tool to forget what it last served, so the next
-    /// whole read serves the file again instead of a skeleton claiming
-    /// "unchanged since your last read" about content the model no longer has.
-    pub(crate) fn note_context_reduced(&self) {
-        if let Some(tool) = self.tools.get("read_files") {
-            tool.on_context_reduced();
         }
     }
 
@@ -4623,9 +4604,8 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// Token-optimizer lever 6 (backlog e4a50d22): grade the context for a
     /// `ContextUsage` event, or `None` when the quality lever is off — the
     /// event then serializes byte-identically to its pre-lever form.
-    /// `used`/`max` are the values the event itself carries; the rest of the
-    /// signals come from the session counters, which
-    /// [`record_savings_event`](Self::record_savings_event) keeps current.
+    /// `used`/`max` are the values the event itself carries; the grade is
+    /// computed from the window fill plus the decisions counter.
     pub(crate) fn quality_report(
         &self,
         used: u32,

@@ -21,9 +21,12 @@
 //! (fail-open).
 //!
 //! Families: cargo build/check/clippy, cargo test, npm/yarn/pnpm test,
-//! npm/yarn/pnpm build (vitest/jest/tsc/vite), pytest (incl.
-//! `python -m pytest`), go test, go build — plus the user-extensible
-//! `compress_extra_commands` regexes (a generic dedup compressor).
+//! npm/yarn/pnpm build (vitest/jest/tsc/vite/svelte-check), pytest (incl.
+//! `python -m pytest`), go test, go build, and `cargo fmt`/`rustfmt` — plus
+//! the user-extensible `compress_extra_commands` regexes (a generic dedup
+//! compressor). Runner prefixes (`npx`/`pnpx`/`bunx`, `pnpm`/`yarn exec`,
+//! `bun x`) are resolved before family detection, so `npx vitest run`
+//! reaches the npm-test compressor.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -92,8 +95,8 @@ static NPM_TEST: FamilySpec = FamilySpec {
     classify: classify_npm_test,
 };
 
-/// npm/yarn/pnpm build (vite/tsc): drop asset tables and bundler progress,
-/// keep errors, warnings, and the `built in` summary.
+/// npm/yarn/pnpm build (vite/tsc/svelte-check): drop asset tables and
+/// bundler progress, keep errors, warnings, and the `built in` summary.
 static NPM_BUILD: FamilySpec = FamilySpec {
     label: "npm-build",
     noise_label: "build-progress",
@@ -143,20 +146,32 @@ fn classify_cargo_build(line: &str) -> LineKind {
     if is_blank(line) {
         return LineKind::Noise;
     }
+    // Compile progress is recognized BEFORE the error substring check:
+    // `Compiling thiserror v1.0` and `Checking error-chain v0.12` name
+    // crates containing "error" and are not errors. `Finished` stays kept —
+    // it is the build's own summary line.
+    let t = line.trim_start();
+    for prefix in [
+        "Compiling ",
+        "Checking ",
+        "Downloading",
+        "Downloaded ",
+        "Locking ",
+        "Updating ",
+        "Adding ",
+        "Blocking ",
+        "Fresh ",
+        "Collecting ",
+    ] {
+        if t.starts_with(prefix) {
+            return LineKind::Noise;
+        }
+    }
     if super::shell_filter::is_error_line(line) {
         return LineKind::Error;
     }
     if super::shell_filter::is_warning_line(line) {
         return LineKind::Warning;
-    }
-    let t = line.trim_start();
-    for prefix in [
-        "Compiling ", "Checking ", "Downloading", "Downloaded ", "Locking ", "Updating ",
-        "Adding ", "Blocking ", "Fresh ", "Collecting ",
-    ] {
-        if t.starts_with(prefix) {
-            return LineKind::Noise;
-        }
     }
     LineKind::Keep
 }
@@ -166,23 +181,43 @@ fn classify_cargo_test(line: &str) -> LineKind {
     if is_blank(line) {
         return LineKind::Noise;
     }
-    if super::shell_filter::is_error_line(line) {
-        return LineKind::Error;
-    }
-    if super::shell_filter::is_warning_line(line) {
-        return LineKind::Warning;
-    }
     let t = line.trim();
-    if t.starts_with("test ") && t.ends_with(" ok") {
-        return LineKind::Passing;
+    // Passing and ignored test lines are recognized BEFORE the error
+    // substring check: a passing test named `parse_errors_0` or
+    // `failure_triage::case_3` is a pass, not an error. A `... FAILED`
+    // line falls through to the error check below.
+    if t.starts_with("test ") {
+        if t.ends_with(" ok") {
+            return LineKind::Passing;
+        }
+        if t.contains(" ... ignored") {
+            return LineKind::Noise;
+        }
     }
     for prefix in [
-        "Compiling ", "Finished ", "Running ", "Doc-tests", "Collecting ", "Downloading",
+        "Compiling ",
+        "Finished ",
+        "Running ",
+        "Doc-tests",
+        "Collecting ",
+        "Downloading",
         "Fresh ",
     ] {
         if line.trim_start().starts_with(prefix) {
             return LineKind::Noise;
         }
+    }
+    // The run summary is kept — `test result: ok. 45 passed; 0 failed`
+    // contains "failed" but is the command's own verdict, not an error;
+    // only a FAILED summary is one.
+    if t.starts_with("test result:") {
+        return if t.contains("FAILED") { LineKind::Error } else { LineKind::Keep };
+    }
+    if super::shell_filter::is_error_line(line) {
+        return LineKind::Error;
+    }
+    if super::shell_filter::is_warning_line(line) {
+        return LineKind::Warning;
     }
     LineKind::Keep
 }
@@ -192,34 +227,36 @@ fn classify_npm_test(line: &str) -> LineKind {
     if is_blank(line) {
         return LineKind::Noise;
     }
+    let t = line.trim_start();
+    // Passing lines are recognized BEFORE the error substring check: a
+    // passing test whose NAME mentions an error (`✓ … > reports an error`)
+    // is a pass, not an error.
+    if t.starts_with('✓') || t.starts_with('√') || t.starts_with("PASS ") {
+        return LineKind::Passing;
+    }
     if super::shell_filter::is_error_line(line) {
         return LineKind::Error;
     }
     if super::shell_filter::is_warning_line(line) {
         return LineKind::Warning;
     }
-    let t = line.trim_start();
-    if t.starts_with('✓') || t.starts_with('√') || t.starts_with("PASS ") {
-        return LineKind::Passing;
-    }
+    // After the error check on purpose: vitest's
+    // `❯ src/a.test.ts (3 tests | 1 failed)` carries the failure.
     if t.starts_with('❯') || t.starts_with('→') || t.starts_with('·') {
         return LineKind::Noise;
     }
     LineKind::Keep
 }
 
-/// npm/yarn/pnpm build (vite/tsc) line classifier.
+/// npm/yarn/pnpm build (vite/tsc/svelte-check) line classifier.
 fn classify_npm_build(line: &str) -> LineKind {
     if is_blank(line) {
         return LineKind::Noise;
     }
-    if super::shell_filter::is_error_line(line) {
-        return LineKind::Error;
-    }
-    if super::shell_filter::is_warning_line(line) {
-        return LineKind::Warning;
-    }
     let t = line.trim_start();
+    // Asset-table and bundler-progress noise is recognized BEFORE the error
+    // substring check: a chunk filename may contain "error" and the
+    // asset table is never a diagnostic.
     if t.starts_with("dist/")
         || t.starts_with("transforming (")
         || t.starts_with("rendering chunks (")
@@ -227,6 +264,12 @@ fn classify_npm_build(line: &str) -> LineKind {
         || t.contains("kB │ gzip")
     {
         return LineKind::Noise;
+    }
+    if super::shell_filter::is_error_line(line) {
+        return LineKind::Error;
+    }
+    if super::shell_filter::is_warning_line(line) {
+        return LineKind::Warning;
     }
     LineKind::Keep
 }
@@ -242,16 +285,20 @@ fn is_pytest_progress(t: &str) -> bool {
     re.is_match(t)
 }
 
+/// Is this a pytest `PASSED` line — `… PASSED`, optionally followed by a
+/// `[ 50%]` progress trailer? A test named `test_errors_1` passes.
+fn is_pytest_passed(t: &str) -> bool {
+    static TRAILER: OnceLock<Regex> = OnceLock::new();
+    let re = TRAILER.get_or_init(|| {
+        Regex::new(r"\s*\[\s*\d+%\s*\]$").expect("static pytest trailer regex must compile")
+    });
+    re.replace(t, "").ends_with(" PASSED")
+}
+
 /// pytest line classifier.
 fn classify_pytest(line: &str) -> LineKind {
     if is_blank(line) {
         return LineKind::Noise;
-    }
-    if super::shell_filter::is_error_line(line) {
-        return LineKind::Error;
-    }
-    if super::shell_filter::is_warning_line(line) {
-        return LineKind::Warning;
     }
     let t = line.trim();
     // The session banner is `===== test session starts =====` — the label
@@ -259,10 +306,27 @@ fn classify_pytest(line: &str) -> LineKind {
     if t.contains("test session starts") {
         return LineKind::Noise;
     }
-    for prefix in ["platform ", "rootdir:", "configfile:", "plugins:", "collected "] {
+    for prefix in [
+        "platform ",
+        "rootdir:",
+        "configfile:",
+        "plugins:",
+        "collected ",
+    ] {
         if t.starts_with(prefix) {
             return LineKind::Noise;
         }
+    }
+    // A passing test is recognized BEFORE the error substring check: a test
+    // named `test_errors_1` prints `… tests/test_errors.py::test_1 PASSED`.
+    if is_pytest_passed(t) {
+        return LineKind::Passing;
+    }
+    if super::shell_filter::is_error_line(line) {
+        return LineKind::Error;
+    }
+    if super::shell_filter::is_warning_line(line) {
+        return LineKind::Warning;
     }
     if is_pytest_progress(t) {
         return LineKind::Passing;
@@ -275,13 +339,9 @@ fn classify_go_test(line: &str) -> LineKind {
     if is_blank(line) {
         return LineKind::Noise;
     }
-    if super::shell_filter::is_error_line(line) {
-        return LineKind::Error;
-    }
-    if super::shell_filter::is_warning_line(line) {
-        return LineKind::Warning;
-    }
     let t = line.trim();
+    // Passing tests and run noise are recognized BEFORE the error substring
+    // check: `--- PASS: TestErrorPath0` names an error path but is a pass.
     if t.starts_with("--- PASS:") {
         return LineKind::Passing;
     }
@@ -291,6 +351,17 @@ fn classify_go_test(line: &str) -> LineKind {
         || t.starts_with("--- SKIP:")
     {
         return LineKind::Noise;
+    }
+    // A package summary line is kept — `ok  example.com/errors  0.1s` names
+    // a package containing "error" but is not an error.
+    if t.starts_with("ok ") || t.starts_with("ok\t") {
+        return LineKind::Keep;
+    }
+    if super::shell_filter::is_error_line(line) {
+        return LineKind::Error;
+    }
+    if super::shell_filter::is_warning_line(line) {
+        return LineKind::Warning;
     }
     LineKind::Keep
 }
@@ -407,24 +478,147 @@ fn compact(spec: &FamilySpec, stdout: &str, stderr: &str, exit_code: i32) -> Opt
     (out.chars().count() * 10 <= orig_chars * 7).then_some(CompactedOutput { text: out })
 }
 
-/// Detect the command family from the leading words. Path prefixes
-/// (`./cargo`), `.exe` suffixes, and trailing punctuation
+/// Is this a rustfmt check — `cargo fmt …` or `rustfmt …`?
+fn is_rustfmt_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    let program = program_name(first);
+    if program == "rustfmt" {
+        return true;
+    }
+    program == "cargo" && words.next().is_some_and(|w| normalize_word(w) == "fmt")
+}
+
+/// Compact `cargo fmt --check` / `rustfmt` output: one line per file that
+/// needs formatting with its diff count (first-seen order), the kept
+/// `error`/`warning` lines verbatim, and a census of the collapsed diff
+/// bodies. `None` when there is nothing to describe — or when the compact
+/// form is not meaningfully smaller (≤70% of the original characters).
+fn compact_rustfmt(stdout: &str, stderr: &str, exit_code: i32) -> Option<CompactedOutput> {
+    static DIFF_IN: OnceLock<Regex> = OnceLock::new();
+    let diff_in = DIFF_IN.get_or_init(|| {
+        Regex::new(r"^Diff in (.+?)(?::\d+:| at line \d+:)\s*$")
+            .expect("static rustfmt diff-marker regex must compile")
+    });
+    let orig_chars = stdout.chars().count() + stderr.chars().count();
+    if orig_chars == 0 {
+        return None;
+    }
+    let mut files: Vec<String> = Vec::new();
+    let mut per_file: HashMap<String, usize> = HashMap::new();
+    let mut diffs = 0usize;
+    let mut collapsed = 0usize;
+    let mut kept = Bucket::new();
+    for text in [stdout, stderr] {
+        for line in text.lines() {
+            if let Some(caps) = diff_in.captures(line) {
+                let raw = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+                // rustfmt may print the Windows verbatim path prefix.
+                let path = raw.strip_prefix("\\\\?\\").unwrap_or(raw).to_string();
+                diffs += 1;
+                match per_file.get_mut(&path) {
+                    Some(n) => *n += 1,
+                    None => {
+                        per_file.insert(path.clone(), 1);
+                        files.push(path);
+                    }
+                }
+                continue;
+            }
+            let t = line.trim_start();
+            if t.starts_with("error") || t.starts_with("warning") {
+                kept.bump(redact_secrets(line));
+            } else {
+                collapsed += 1;
+            }
+        }
+    }
+    if files.is_empty() && kept.distinct() == 0 {
+        return None;
+    }
+    let mut out = format!(
+        "compressed rustfmt output — exit {exit_code}: {} files need formatting, {diffs} {}, {collapsed} diff lines collapsed\n",
+        files.len(),
+        if diffs == 1 { "diff" } else { "diffs" },
+    );
+    for path in files.iter().take(200) {
+        let n = per_file.get(path).copied().unwrap_or(0);
+        let word = if n == 1 { "diff" } else { "diffs" };
+        out.push_str(&format!("{path} ({n} {word})\n"));
+    }
+    if files.len() > 200 {
+        out.push_str(&format!("... and {} more files\n", files.len() - 200));
+    }
+    out.push_str(&kept.render());
+    (out.chars().count() * 10 <= orig_chars * 7).then_some(CompactedOutput { text: out })
+}
+
+/// Normalize the first word of a command to a bare program name: a path
+/// prefix (`./cargo`), a `.exe` suffix, and case are normalized away.
+fn program_name(word: &str) -> String {
+    word.rsplit(['/', '\\', ':'])
+        .next()
+        .unwrap_or(word)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase()
+}
+
+/// Normalize one command word: surrounding punctuation (`build;`) and case
+/// are normalized away.
+fn normalize_word(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_ascii_lowercase()
+}
+
+/// Resolve a runner prefix to the program it runs: `npx`/`pnpx`/`bunx`
+/// (with their leading flags), `pnpm`/`yarn exec`, and `bun x`. Every other
+/// command is left untouched.
+fn strip_runner_prefix(words: &mut Vec<&str>) {
+    let Some(first) = words.first().copied() else {
+        return;
+    };
+    match program_name(first).as_str() {
+        "npx" | "pnpx" | "bunx" => {
+            words.remove(0);
+        }
+        "pnpm" | "yarn" => {
+            if !words.get(1).is_some_and(|w| w.eq_ignore_ascii_case("exec")) {
+                return;
+            }
+            words.drain(0..2);
+        }
+        "bun" => {
+            if !words.get(1).is_some_and(|w| w.eq_ignore_ascii_case("x")) {
+                return;
+            }
+            words.drain(0..2);
+        }
+        _ => return,
+    }
+    while let Some(word) = words.first().copied() {
+        if !word.starts_with('-') {
+            return;
+        }
+        words.remove(0);
+        // These runner flags take a value as the following word.
+        if matches!(word, "--prefix" | "-p" | "--package") && !words.is_empty() {
+            words.remove(0);
+        }
+    }
+}
+
+/// Detect the command family from the leading words, after resolving a
+/// runner prefix (`npx vitest run` reaches the npm-test family). Path
+/// prefixes (`./cargo`), `.exe` suffixes, and trailing punctuation
 /// (`build;`) are normalized away.
 fn detect_family(command: &str) -> Option<&'static FamilySpec> {
-    let mut words = command.split_whitespace();
-    let first = words.next()?;
-    let first = first
-        .rsplit(['/', '\\', ':'])
-        .next()
-        .unwrap_or(first)
-        .trim_end_matches(".exe")
-        .to_ascii_lowercase();
-    let norm = |w: &str| {
-        w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
-            .to_ascii_lowercase()
-    };
-    let word = words.next().map(&norm);
-    let word2 = words.next().map(&norm);
+    let mut words: Vec<&str> = command.split_whitespace().collect();
+    strip_runner_prefix(&mut words);
+    let first = program_name(words.first()?);
+    let word = words.get(1).map(|w| normalize_word(w));
+    let word2 = words.get(2).map(|w| normalize_word(w));
     match (first.as_str(), word.as_deref(), word2.as_deref()) {
         ("cargo", Some("build" | "check" | "clippy"), _) => Some(&CARGO_BUILD),
         ("cargo", Some("test"), _) => Some(&CARGO_TEST),
@@ -437,11 +631,11 @@ fn detect_family(command: &str) -> Option<&'static FamilySpec> {
             Some(&NPM_TEST)
         }
         ("npm" | "yarn" | "pnpm" | "bun", Some("build"), _) => Some(&NPM_BUILD),
-        ("npm" | "yarn" | "pnpm" | "bun", Some("run"), Some("build" | "vite" | "tsc")) => {
+        ("npm" | "yarn" | "pnpm" | "bun", Some("run"), Some("build" | "vite" | "tsc" | "check")) => {
             Some(&NPM_BUILD)
         }
         ("vitest" | "jest", _, _) => Some(&NPM_TEST),
-        ("tsc" | "vite", _, _) => Some(&NPM_BUILD),
+        ("tsc" | "vite" | "svelte-check", _, _) => Some(&NPM_BUILD),
         ("go", Some("test"), _) => Some(&GO_TEST),
         ("go", Some("build"), _) => Some(&GO_BUILD),
         _ => None,
@@ -465,6 +659,9 @@ fn matches_extra(command: &str, patterns: &[String]) -> bool {
 /// `None` when the command matches no known family and no
 /// `compress_extra_commands` pattern — or when the compact form is not
 /// meaningfully smaller (fail-open: the caller keeps the original).
+/// `cargo fmt`/`rustfmt` output has its own compressor
+/// ([`compact_rustfmt`]): its diff bodies collapse to one line per file
+/// that needs formatting.
 ///
 /// Called by the `shell` tool AFTER
 /// [`shell_filter`](super::shell_filter) shaping, and only when
@@ -478,6 +675,9 @@ pub(crate) fn compress(
     exit_code: i32,
     cfg: &OptimizerConfig,
 ) -> Option<CompactedOutput> {
+    if is_rustfmt_command(command) {
+        return compact_rustfmt(stdout, stderr, exit_code);
+    }
     let spec = detect_family(command).or_else(|| {
         matches_extra(command, &cfg.compress_extra_commands).then_some(&GENERIC)
     })?;
@@ -625,6 +825,16 @@ mod tests {
             ("npm run build", "npm-build"),
             ("tsc --noEmit", "npm-build"),
             ("vite build", "npm-build"),
+            ("svelte-check --tsconfig x", "npm-build"),
+            ("npm run check", "npm-build"),
+            // Runner prefixes resolve to the program they run.
+            ("npx vitest run", "npm-test"),
+            ("npx --yes vitest", "npm-test"),
+            ("npx --prefix mnemo2 vitest run", "npm-test"),
+            ("pnpm exec vitest", "npm-test"),
+            ("bun x jest", "npm-test"),
+            ("npx tsc --noEmit", "npm-build"),
+            ("npx svelte-check", "npm-build"),
             ("go test ./...", "go-test"),
             ("go build ./...", "go-build"),
             // Path/extension/punctuation normalization.
@@ -795,5 +1005,185 @@ mod tests {
         let out = compress("cargo build", &stdout, "", 101, &cfg()).expect("must compact");
         assert!(out.text.contains("bob:[REDACTED]@git.example.com"), "{}", out.text);
         assert!(!out.text.contains("s3cret"), "{}", out.text);
+    }
+
+    /// The passing half of the cargo-test fixture the false-error
+    /// regressions share: build chatter, 45 passing tests whose names
+    /// contain "error"/"failure", and one ignored test.
+    fn passing_cargo_test_fixture() -> String {
+        let mut stdout = String::new();
+        stdout.push_str("   Compiling thiserror v1.0.0\n");
+        stdout.push_str("     Running unittests src/error.rs (target/debug/deps/error-abc)\n");
+        stdout.push_str("running 46 tests\n");
+        for i in 0..40 {
+            stdout.push_str(&format!("test failure_triage::case_{i} ... ok\n"));
+        }
+        for i in 0..5 {
+            stdout.push_str(&format!("test parse_errors_{i} ... ok\n"));
+        }
+        stdout.push_str("test memory::y ... ignored, integration: spawns real git\n");
+        stdout.push_str("test result: ok. 45 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.2s\n");
+        stdout
+    }
+
+    /// Read the compact header's leading error count (`… : 3 error / …`).
+    fn header_error_count(text: &str) -> usize {
+        text.lines()
+            .next()
+            .and_then(|header| header.split(": ").nth(1))
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("the compact header carries an error count")
+    }
+
+    #[test]
+    fn a_passing_cargo_test_with_error_words_in_names_is_a_clean_summary() {
+        let out = compress("cargo test --lib", &passing_cargo_test_fixture(), "", 0, &cfg())
+            .expect("a passing cargo test output must compact");
+        assert!(out.text.contains("0 error / 0 warning / 45 passing"), "{}", out.text);
+        assert!(!out.text.contains("parse_errors_0"), "{}", out.text);
+        assert!(!out.text.contains("failure_triage"), "{}", out.text);
+        assert!(!out.text.contains("ignored, integration"), "{}", out.text);
+        assert!(out.text.contains("test result: ok. 45 passed"), "{}", out.text);
+        assert!(out.text.contains("passing-test lines collapsed"), "{}", out.text);
+        assert!(out.text.chars().count() < 400, "{} chars: {}", out.text.chars().count(), out.text);
+    }
+
+    #[test]
+    fn a_failing_test_stays_visible_among_error_named_passes() {
+        let mut stdout = passing_cargo_test_fixture();
+        stdout.push_str("test suite::broken ... FAILED\n");
+        stdout.push_str("thread 'suite::broken' panicked at src/b.rs:12:5:\n");
+        stdout.push_str("test result: FAILED. 45 passed; 1 failed; 1 ignored\n");
+        let out = compress("cargo test", &stdout, "", 101, &cfg()).expect("must compact");
+        assert!(out.text.contains("test suite::broken ... FAILED"), "{}", out.text);
+        assert!(out.text.contains("thread 'suite::broken' panicked at src/b.rs:12:5:"), "{}", out.text);
+        assert!(out.text.contains("test result: FAILED. 45 passed; 1 failed"), "{}", out.text);
+        assert!(header_error_count(&out.text) >= 3, "{}", out.text);
+    }
+
+    #[test]
+    fn cargo_build_does_not_count_crate_names_as_errors() {
+        let mut stdout = String::new();
+        stdout.push_str("   Compiling thiserror v1.0\n");
+        stdout.push_str("   Compiling quick-error v2.0\n");
+        stdout.push_str("   Checking error-chain v0.12\n");
+        stdout.push_str("warning: unused variable: `y`\n");
+        for i in 0..20 {
+            stdout.push_str(&format!("   Compiling dep{i} v1.0.{i} (/x)\n"));
+        }
+        let out = compress("cargo build", &stdout, "", 0, &cfg()).expect("must compact");
+        assert!(out.text.contains("0 error / 1 warning"), "{}", out.text);
+        assert!(!out.text.contains("quick-error"), "{}", out.text);
+        assert!(out.text.contains("warning: unused variable: `y`"), "{}", out.text);
+    }
+
+    #[test]
+    fn npm_test_passing_lines_naming_an_error_are_passing() {
+        let mut stdout = String::new();
+        for i in 0..30 {
+            stdout.push_str(&format!("✓ src/a.test.ts > reports an error {i}\n"));
+        }
+        stdout.push_str(" Tests  30 passed (30)\n");
+        let out = compress("npm test", &stdout, "", 0, &cfg()).expect("must compact");
+        assert!(out.text.contains("0 error / 0 warning / 30 passing"), "{}", out.text);
+        assert!(out.text.contains("30 passing-test lines collapsed"), "{}", out.text);
+        assert!(!out.text.contains("reports an error 0"), "{}", out.text);
+        // A vitest failure marker stays an error, and the `❯`/`→`/`·` noise
+        // check stays below the error check on purpose.
+        let mut failing = stdout.clone();
+        failing.push_str("× src/b.test.ts > breaks\n");
+        let out = compress("npm test", &failing, "", 1, &cfg()).expect("must compact");
+        assert!(out.text.contains("1 error"), "{}", out.text);
+        assert!(out.text.contains("× src/b.test.ts > breaks"), "{}", out.text);
+    }
+
+    #[test]
+    fn pytest_passed_lines_naming_an_error_are_passing() {
+        let mut stdout = String::new();
+        for i in 0..30 {
+            let trailer = if i % 2 == 0 { "" } else { " [ 50%]" };
+            stdout.push_str(&format!("tests/test_errors.py::test_{i} PASSED{trailer}\n"));
+        }
+        let out = compress("pytest -q", &stdout, "", 0, &cfg()).expect("must compact");
+        assert!(out.text.contains("0 error / 0 warning / 30 passing"), "{}", out.text);
+        assert!(out.text.contains("30 passing-test lines collapsed"), "{}", out.text);
+    }
+
+    #[test]
+    fn go_pass_lines_naming_an_error_are_passing() {
+        let mut stdout = String::new();
+        for i in 0..30 {
+            stdout.push_str(&format!("--- PASS: TestErrorPath{i} (0.00s)\n"));
+        }
+        stdout.push_str("ok  \texample.com/errors\t0.1s\n");
+        stdout.push_str("ok\texample.com/other\t0.2s\n");
+        let out = compress("go test ./...", &stdout, "", 0, &cfg()).expect("must compact");
+        assert!(out.text.contains("0 error / 0 warning / 30 passing"), "{}", out.text);
+        assert!(out.text.contains("ok  \texample.com/errors"), "{}", out.text);
+        assert!(out.text.contains("30 passing-test lines collapsed"), "{}", out.text);
+    }
+
+    /// A rustfmt `--check` fixture: one `Diff in` marker per diff, each
+    /// followed by ten diff-body lines.
+    fn rustfmt_fixture(files: &[(&str, usize)]) -> String {
+        let mut s = String::new();
+        for (path, diffs) in files {
+            for d in 0..*diffs {
+                s.push_str(&format!("Diff in {path} at line {}:\n", 3 + d));
+                s.push_str(" use std::time::Duration;\n");
+                s.push_str("-use foo;\n");
+                for i in 0..8 {
+                    s.push_str(&format!("     let value{i} = compute({i});\n"));
+                }
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn rustfmt_check_lists_files_not_diff_bodies() {
+        let stdout = rustfmt_fixture(&[
+            (r"\\?\C:\repo\src\a.rs", 2),
+            ("src/b.rs", 1),
+            ("src/c.rs", 5),
+        ]);
+        let out = compress("cargo fmt --check", &stdout, "", 1, &cfg()).expect("must compact");
+        assert!(out.text.contains("compressed rustfmt output — exit 1"), "{}", out.text);
+        assert!(out.text.contains("3 files need formatting"), "{}", out.text);
+        assert!(out.text.contains("8 diffs"), "{}", out.text);
+        assert!(out.text.contains("80 diff lines collapsed"), "{}", out.text);
+        assert!(out.text.contains(r"C:\repo\src\a.rs (2 diffs)"), "{}", out.text);
+        assert!(out.text.contains("src/b.rs (1 diff)"), "{}", out.text);
+        assert!(!out.text.contains("\\\\?\\"), "{}", out.text);
+        assert!(!out.text.contains("-use foo;"), "{}", out.text);
+        assert!(!out.text.contains("use std::time::Duration"), "{}", out.text);
+    }
+
+    #[test]
+    fn rustfmt_without_diffs_passes_through() {
+        assert!(compress("cargo fmt --check", "", "", 0, &cfg()).is_none());
+        let plain = "plain output, no diff markers here\n";
+        assert!(compress("rustfmt --check src/a.rs", plain, "", 0, &cfg()).is_none());
+        assert!(compress("cargo fmt", "plain line\nplain line\n", "", 0, &cfg()).is_none());
+    }
+
+    #[test]
+    fn rustfmt_keeps_its_parse_errors() {
+        let mut stdout = rustfmt_fixture(&[("src/a.rs", 3)]);
+        stdout.push_str("error: expected item, found `;`\n");
+        let out = compress("rustfmt --check --edition 2021 src/a.rs", &stdout, "", 1, &cfg())
+            .expect("must compact");
+        assert!(out.text.contains("error: expected item, found `;`"), "{}", out.text);
+        assert!(out.text.contains("src/a.rs (3 diffs)"), "{}", out.text);
+        assert!(out.text.contains("30 diff lines collapsed"), "{}", out.text);
+    }
+
+    #[test]
+    fn runner_prefixes_do_not_invent_families() {
+        assert!(detect_family("npx cowsay hi").is_none());
+        assert!(detect_family("npx").is_none());
+        assert!(detect_family("npx --yes").is_none());
+        assert!(detect_family("pnpm exec").is_none());
     }
 }

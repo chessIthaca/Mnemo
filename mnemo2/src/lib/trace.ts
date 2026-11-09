@@ -309,7 +309,7 @@ export function responseText(detail: TraceDetail): string {
 // snake_case serde, this file mirrors it exactly, and the commands below are
 // what the tab uses since step E switched it over (`trace_list` takes the
 // query, `trace_detail` a durable key, and
-// and `trace_settings`/`trace_export`/`trace_clear_live`/
+// `trace_settings`/`trace_export`/`trace_clear_live`/
 // `trace_delete_history` back the data controls).
 // ---------------------------------------------------------------------------
 

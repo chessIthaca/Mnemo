@@ -799,6 +799,61 @@ pub struct CacheEfficiency {
     pub request_count: u64,
 }
 
+/// One lever kind's savings at a given re-send count — the input the Cost tab
+/// needs to value the ledger without a correlated subquery per row.
+///
+/// A saved token is only worth something if it would have been re-sent, so the
+/// ledger rows of one kind are grouped by how many requests followed them
+/// (capped at [`crate::memory::SAVED_TOKEN_LIFETIME_REQUESTS`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavingsValuationRow {
+    /// The memory session the rows belong to, when known. `None` rows fall back
+    /// to the project's realized rates.
+    pub session_id: Option<String>,
+    /// The ledger kind (`archive`, `compression`, `archive_expand`, …).
+    pub kind: String,
+    /// How many requests followed the events, capped at the saved-token
+    /// lifetime; a re-send count of `later - 1`.
+    pub later_requests: u32,
+    /// Number of ledger rows in this group.
+    pub events: u64,
+    /// Summed saving of the group, already clamped to the result baseline
+    /// (`archive` / `compression`) and signed (`archive_expand` /
+    /// `outline_followup` subtract).
+    pub saved_tokens: i64,
+}
+
+/// One (session, model) pair's prompt volume — the denominator the Cost tab
+/// needs to price that session's saved tokens at the rates it actually paid.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelUsage {
+    /// The memory session, when known (`NULL` for pre-session rows).
+    pub session_id: Option<String>,
+    /// The model that served the session's requests.
+    pub model: String,
+    /// Prompt tokens billed across the pair's requests.
+    pub prompt_tokens: u64,
+    /// Of those, the tokens served from the provider's prompt cache.
+    pub cached_tokens: u64,
+    /// Completion tokens billed across the pair's requests.
+    pub completion_tokens: u64,
+    /// Number of requests in the pair.
+    pub requests: u64,
+}
+
+/// The two reads the Cost tab needs to value the savings ledger: per-(kind,
+/// re-send count) savings groups plus per-(session, model) prompt volume.
+///
+/// Both are read in one pass so the tab never issues a correlated subquery per
+/// ledger row — it refreshes every 30 seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavingsValuation {
+    /// The ledger's savings, grouped by (session, kind, later requests).
+    pub rows: Vec<SavingsValuationRow>,
+    /// Per-(session, model) prompt volume, so per-session rates are possible.
+    pub sessions: Vec<SessionModelUsage>,
+}
+
 /// One archived tool result (one row in `tool_result_archive`) — the full
 /// original of a tool result too large to keep in context (backlog
 /// e4a50d22 lever 3), retrievable by id through the `expand_result` tool.

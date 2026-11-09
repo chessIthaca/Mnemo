@@ -248,6 +248,8 @@ describe("preview scenes", () => {
     expect(insights?.cost.unpriced_models).toEqual(["ollama/qwen3:32b"]);
     expect(insights?.cost.per_day).toHaveLength(14);
     expect(insights?.savings.levers.some((lever) => lever.kind === "delta_read")).toBe(true);
+    // The label table dropped `truncation` — nothing emits it any more.
+    expect(insights?.savings.levers.some((lever) => lever.kind === "truncation")).toBe(false);
   });
 
   it("mission-control shows one running worker in every live phase", () => {

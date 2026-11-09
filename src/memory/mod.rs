@@ -27,7 +27,7 @@ pub mod strength;
 pub mod transcript_index;
 pub mod types;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -42,8 +42,9 @@ pub use types::{
     ArchiveSearchHit, ArchivedToolResult, CacheEfficiency, DayBreakdown, EpisodicData, Memory,
     MemoryAccessEntry, MemoryClass, MemoryData, MemoryFilter, MemoryRecordType, MemorySearchConfig,
     MemoryTier, ModelBreakdown, ProceduralData, ProjectStats, RequestStats, SavingsDayBreakdown,
-    SavingsEvent, SavingsKindBreakdown, SavingsStats, SemanticData, Session, SessionStats,
-    SessionSummary, SpendEvent, WorkingData,
+    SavingsEvent, SavingsKindBreakdown, SavingsStats, SavingsValuation, SavingsValuationRow,
+    SemanticData, Session, SessionModelUsage, SessionStats, SessionSummary, SpendEvent,
+    WorkingData,
 };
 
 /// A scored memory result.
@@ -180,6 +181,42 @@ fn is_primer_record(memory: &Memory) -> bool {
             memory.tier,
             MemoryTier::Semantic | MemoryTier::Procedural
         )
+}
+
+/// The token baseline a savings row may never be credited above.
+///
+/// Tool results were already capped at `TOOL_RESULT_MAX_CHARS` (100,000
+/// characters, 25,000 tokens) before any optimizer lever ran, so a lever that
+/// "saves" more than that saved nothing the agent would not have avoided
+/// anyway. The clamp telescopes a compressed-then-archived result into ONE
+/// saving instead of crediting both steps, and applying it at read time (not
+/// at write time) also corrects rows recorded before the rule existed — no
+/// migration.
+pub const LEDGER_BASELINE_CAP_TOKENS: i64 = 25_000;
+
+/// How many later requests a saved token is credited for.
+///
+/// A saved token would have been re-sent once per following request until
+/// old-result trimming removes the result it belonged to: results are cut once
+/// more than 20 newer ones exist, back to 10, so about 15 requests is a fair
+/// lifetime — and it keeps one lever from claiming an unbounded stream of
+/// cached re-sends.
+pub const SAVED_TOKEN_LIFETIME_REQUESTS: u32 = 15;
+
+/// The SQL expression for one ledger row's honest saving.
+///
+/// `archive` and `compression` rows are credited
+/// `MAX(MIN(tokens_before, LEDGER_BASELINE_CAP_TOKENS) - tokens_after, 0)`;
+/// every other kind keeps its recorded `tokens_saved` (signed, because an
+/// `archive_expand` or `outline_followup` row re-adds tokens). See
+/// [`LEDGER_BASELINE_CAP_TOKENS`] for why the clamp exists.
+fn saved_tokens_sql() -> String {
+    format!(
+        "CASE WHEN kind IN ('archive','compression') \
+         THEN MAX(MIN(tokens_before, {cap}) - tokens_after, 0) \
+         ELSE tokens_saved END",
+        cap = LEDGER_BASELINE_CAP_TOKENS
+    )
 }
 
 /// The trait for the memory store (so we can mock it in agent-loop tests).
@@ -465,6 +502,13 @@ pub trait MemoryStoreTrait: Send + Sync {
     /// ledger yields zeroed/empty fields, never an error.
     async fn savings_stats(&self) -> Result<SavingsStats>;
 
+    /// The two reads that let the Cost tab value the ledger honestly: the
+    /// savings grouped by (session, kind, later requests), and per-(session,
+    /// model) prompt volume so each session's saved tokens can be priced at
+    /// the rates it actually paid. `compaction_checkpoint` rows are bookkeeping
+    /// markers, not levers, and are excluded.
+    async fn savings_valuation(&self) -> Result<SavingsValuation>;
+
     /// Record one per-decision spend row (the budget layer's ledger, backlog
     /// a25a5323): the plan, step, lane, model and token cost of one request,
     /// with the reason that model ran. Written for every main plan request
@@ -495,6 +539,13 @@ pub trait MemoryStoreTrait: Send + Sync {
     /// return ids + snippets, newest first. Degrades to a LIKE scan when FTS5
     /// is unavailable on this build.
     async fn search_archive(&self, query: &str, limit: usize) -> Result<Vec<ArchiveSearchHit>>;
+
+    /// Delete up to `batch` archived tool results older than `older_than_secs`
+    /// (a Unix-seconds cutoff) and return how many rows went. Oldest first, so
+    /// a caller looping short batches makes steady progress; the archive's FTS
+    /// delete trigger keeps keyword search in step. Never VACUUMs — freed pages
+    /// are reused, so the file stops growing rather than shrinking.
+    async fn prune_tool_result_archive(&self, older_than_secs: i64, batch: usize) -> Result<usize>;
 
     /// List a session's raw `request_stats` rows (ordered by creation time)
     /// — the row-level view the aggregates are built from, including the
@@ -2613,8 +2664,9 @@ impl MemoryStoreTrait for MemoryStore {
             let mut stats = SavingsStats::default();
             // Totals. The ledger is empty on a fresh project, and the Dashboard
             // must render an honest empty state rather than an error.
+            let saved = saved_tokens_sql();
             let (total, count) = conn.query_row(
-                "SELECT COALESCE(SUM(tokens_saved), 0), COUNT(*) FROM savings_events",
+                &format!("SELECT COALESCE(SUM({saved}), 0), COUNT(*) FROM savings_events"),
                 [],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )?;
@@ -2622,9 +2674,9 @@ impl MemoryStoreTrait for MemoryStore {
             stats.event_count = count as u64;
             // Per-kind breakdown, biggest saver first. Ties break on the kind
             // name so the ordering is deterministic across runs.
-            let mut stmt = conn.prepare(
-                "SELECT kind, COUNT(*), COALESCE(SUM(tokens_saved), 0) FROM savings_events GROUP BY kind ORDER BY SUM(tokens_saved) DESC, kind",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT kind, COUNT(*), COALESCE(SUM({saved}), 0) FROM savings_events GROUP BY kind ORDER BY SUM({saved}) DESC, kind"
+            ))?;
             let kind_rows = stmt.query_map([], |row| {
                 Ok(SavingsKindBreakdown {
                     kind: row.get(0)?,
@@ -2641,9 +2693,9 @@ impl MemoryStoreTrait for MemoryStore {
             // (86400s) like `project_stats`. NOTE: the STORED unit differs from
             // project_stats — this holds the epoch DAY, not day-start seconds —
             // so the frontend multiplies by 86_400_000 ms, not 1000.
-            let mut stmt2 = conn.prepare(
-                "SELECT created_at / 86400 AS day, COUNT(*), COALESCE(SUM(tokens_saved), 0) FROM savings_events GROUP BY day ORDER BY day",
-            )?;
+            let mut stmt2 = conn.prepare(&format!(
+                "SELECT created_at / 86400 AS day, COUNT(*), COALESCE(SUM({saved}), 0) FROM savings_events GROUP BY day ORDER BY day"
+            ))?;
             let day_rows = stmt2.query_map([], |row| {
                 Ok(SavingsDayBreakdown {
                     day: row.get(0)?,
@@ -2706,6 +2758,132 @@ impl MemoryStoreTrait for MemoryStore {
         })
         .await
         .map_err(|e| Error::Memory(format!("savings_stats task failed: {e}")))?
+    }
+
+    async fn savings_valuation(&self) -> Result<SavingsValuation> {
+        let read_conn = self.read_conn().clone();
+        tokio::task::spawn_blocking(move || -> Result<SavingsValuation> {
+            let conn = read_conn.lock().expect("read conn lock poisoned");
+            let mut valuation = SavingsValuation::default();
+            // (1) Every request instant, grouped by session. One pass over
+            // `request_stats` and a binary search per ledger row keeps the whole
+            // read well under a second on 100,000 rows — a correlated subquery
+            // per row would not, and this refreshes every 30 seconds.
+            let mut request_times: HashMap<String, Vec<i64>> = HashMap::new();
+            let mut stmt = conn.prepare(
+                "SELECT session_id, created_at FROM request_stats \
+                 WHERE session_id IS NOT NULL ORDER BY session_id, created_at",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (session_id, created_at) = row.map_err(|e| {
+                    Error::Memory(format!("savings_valuation request read failed: {e}"))
+                })?;
+                request_times
+                    .entry(session_id)
+                    .or_default()
+                    .push(created_at);
+            }
+            // (2) The ledger, clamped exactly the way `savings_stats` reads it,
+            // so the tab's dollars and its token totals never disagree. A saved
+            // token is only worth what it avoided re-sending, so the rows are
+            // grouped by (session, kind, how many requests followed) — the
+            // re-send count the valuation prices at the cached rate.
+            let saved = saved_tokens_sql();
+            let mut groups: BTreeMap<(Option<String>, String, u32), (u64, i64)> = BTreeMap::new();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT session_id, kind, created_at, {saved} FROM savings_events \
+                 WHERE kind <> 'compaction_checkpoint'"
+            ))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (session_id, kind, created_at, saved_tokens) = row
+                    .map_err(|e| Error::Memory(format!("savings_valuation ledger read failed: {e}")))?;
+                // Requests strictly after the event; a NULL session (rows
+                // recorded before sessions were known) gets no re-sends, since
+                // their timeline is unknown.
+                let later = session_id
+                    .as_ref()
+                    .and_then(|id| request_times.get(id))
+                    .map(|times| {
+                        let after = times.partition_point(|&t| t <= created_at);
+                        (times.len() - after).min(SAVED_TOKEN_LIFETIME_REQUESTS as usize) as u32
+                    })
+                    .unwrap_or(0);
+                let group = groups.entry((session_id, kind, later)).or_insert((0, 0));
+                group.0 += 1;
+                group.1 += saved_tokens;
+            }
+            valuation.rows = groups
+                .into_iter()
+                .map(
+                    |((session_id, kind, later_requests), (events, saved_tokens))| {
+                        SavingsValuationRow {
+                            session_id,
+                            kind,
+                            later_requests,
+                            events,
+                            saved_tokens,
+                        }
+                    },
+                )
+                .collect();
+            // (3) Per-(session, model) prompt volume, so each session's saved
+            // tokens can be priced at the rates that session actually paid.
+            // A NULL `cached_tokens` (a provider that never reported caching)
+            // counts as zero rather than poisoning the sum.
+            let mut stmt = conn.prepare(
+                "SELECT session_id, model, SUM(prompt_tokens), \
+                 SUM(COALESCE(cached_tokens, 0)), SUM(completion_tokens), COUNT(*) \
+                 FROM request_stats GROUP BY session_id, model \
+                 ORDER BY session_id, model",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SessionModelUsage {
+                    session_id: row.get(0)?,
+                    model: row.get(1)?,
+                    prompt_tokens: row.get::<_, i64>(2)? as u64,
+                    cached_tokens: row.get::<_, i64>(3)? as u64,
+                    completion_tokens: row.get::<_, i64>(4)? as u64,
+                    requests: row.get::<_, i64>(5)? as u64,
+                })
+            })?;
+            for row in rows {
+                valuation.sessions.push(row.map_err(|e| {
+                    Error::Memory(format!("savings_valuation session read failed: {e}"))
+                })?);
+            }
+            Ok(valuation)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("savings_valuation task failed: {e}")))?
+    }
+
+    async fn prune_tool_result_archive(&self, older_than_secs: i64, batch: usize) -> Result<usize> {
+        // The WRITE connection: this is a delete, and it must serialize with the
+        // other writers rather than racing them on the read connection.
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = conn.lock().expect("conn lock poisoned");
+            let deleted = conn.execute(
+                "DELETE FROM tool_result_archive WHERE id IN (\
+                 SELECT id FROM tool_result_archive WHERE created_at < ?1 \
+                 ORDER BY created_at LIMIT ?2)",
+                params![older_than_secs, batch as i64],
+            )?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("prune_tool_result_archive task failed: {e}")))?
     }
 
     async fn archive_tool_result(

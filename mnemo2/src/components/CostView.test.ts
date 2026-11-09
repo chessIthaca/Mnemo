@@ -50,11 +50,13 @@ const savings = (overrides: Partial<SavingsReport> = {}): SavingsReport => ({
   tokens_saved: 1_080_000,
   estimated_saved_micros: 180_000,
   levers: [
-    { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000 },
-    { kind: "archive_expand", events: 6, tokens_saved: -120_000, estimated_saved_micros: 0 },
+    { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000, estimated_cost_micros: null },
+    { kind: "archive_expand", events: 6, tokens_saved: -120_000, estimated_saved_micros: 0, estimated_cost_micros: 20_000 },
   ],
   cache: { prompt_tokens: 2_000_000, cached_tokens: 1_540_000, hit_rate: 0.77, estimated_saved_micros: 120_000 },
   per_day: [{ day: 100 * DAY, tokens_saved: 1_000_000 }],
+  traffic_micros: 12_500_000,
+  traffic_since: 100 * DAY,
   ...overrides,
 });
 
@@ -102,10 +104,14 @@ describe("CostView", () => {
     expect(screen.getByText("Delta reads")).toBeTruthy();
     expect(screen.getByText("77%")).toBeTruthy();
 
-    // The expansion is a cost row: re-added tokens, never a dollar figure.
+    // The expansion is a cost row: re-added tokens and what they cost.
     const expansions = screen.getByText("Archive expansions").closest(".lever-row") as HTMLElement;
     expect(within(expansions).getByText("+120,000 tokens re-added · 6 events")).toBeTruthy();
-    expect(expansions.querySelector(".lever-cost")).toBeNull();
+    expect(within(expansions).getByText("costs ≈ $0.02")).toBeTruthy();
+
+    // The savings card says how the estimate is made, and against what.
+    expect(screen.getByText(/credited against the 100,000-character result cap/)).toBeTruthy();
+    expect(screen.getByText(/On ≈ \$12\.50 of model traffic since Apr 11\./)).toBeTruthy();
 
     // The day charts carry month-aware labels.
     expect(screen.getAllByText("Apr 11").length).toBeGreaterThan(0);

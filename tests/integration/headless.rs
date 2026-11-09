@@ -989,7 +989,8 @@ impl LoggingStore {
 use mnemo::error::Result as MemResult;
 use mnemo::memory::types::{
     ArchiveSearchHit, ArchivedToolResult, Memory, MemoryFilter, MemoryTier, ProjectStats,
-    RequestStats, SavingsEvent, SavingsStats, Session, SessionStats, SessionSummary, SpendEvent,
+    RequestStats, SavingsEvent, SavingsStats, SavingsValuation, Session, SessionStats,
+    SessionSummary, SpendEvent,
 };
 use mnemo::memory::{MemoryStoreTrait, ScoredMemory};
 
@@ -1116,6 +1117,9 @@ impl MemoryStoreTrait for LoggingStore {
     async fn savings_stats(&self) -> MemResult<SavingsStats> {
         self.inner.savings_stats().await
     }
+    async fn savings_valuation(&self) -> MemResult<SavingsValuation> {
+        self.inner.savings_valuation().await
+    }
     async fn record_spend_event(&self, event: &SpendEvent) -> MemResult<()> {
         self.inner.record_spend_event(event).await
     }
@@ -1138,6 +1142,15 @@ impl MemoryStoreTrait for LoggingStore {
     }
     async fn search_archive(&self, query: &str, limit: usize) -> MemResult<Vec<ArchiveSearchHit>> {
         self.inner.search_archive(query, limit).await
+    }
+    async fn prune_tool_result_archive(
+        &self,
+        older_than_secs: i64,
+        batch: usize,
+    ) -> MemResult<usize> {
+        self.inner
+            .prune_tool_result_archive(older_than_secs, batch)
+            .await
     }
     async fn request_stats_rows(&self, session_id: &str) -> MemResult<Vec<RequestStats>> {
         self.inner.request_stats_rows(session_id).await

@@ -17,12 +17,22 @@ export interface ProjectRecord {
 
 export interface ProjectPreferences {
   workbench_open: boolean;
-  workbench_tab: "browser" | "diff" | "plan" | "files" | "trace" | "git";
+  workbench_tab:
+    | "browser"
+    | "diff"
+    | "plan"
+    | "files"
+    | "git"
+    | "trace"
+    | "graph"
+    | "memory";
   workbench_width: number;
   browser_url: string;
   diff_worker_id: string | null;
   /** Saved mission-control list width; null (or absent) keeps the default split. */
   board_width: number | null;
+  /** Saved width of the wide panel tabs; null (or absent) follows the window. */
+  workbench_wide_width?: number | null;
 }
 
 export interface ProjectTransportBindings {

@@ -48,9 +48,11 @@ describe("preview scenes", () => {
     }
   });
 
-  it("graph routes to the explorer and seeds its preview transport", async () => {
+  it("graph opens in the panel and seeds its preview transport", async () => {
     const state = build("graph");
-    expect(state.route).toBe("graph");
+    expect(state.workbenchOpen).toBe(true);
+    expect(state.workbenchTab).toBe("graph");
+    expect(state.projectId).not.toBeNull();
     expect(state.projectId).not.toBeNull();
     const transport = createGraphTransport();
     expect(transport).not.toBeNull();
@@ -94,8 +96,10 @@ describe("preview scenes", () => {
       "memory",
       "trace",
       "trace-empty",
-      "trace-tab",
-      "trace-tab-empty",
+      "panel-team-diff",
+      "panel-team-graph",
+      "panel-cost-trace",
+      "panel-plans-memory",
       "lead-tool-rows",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
@@ -113,7 +117,8 @@ describe("preview scenes", () => {
 
   it("memory seeds the store with 20 records and opens the newest one", async () => {
     const state = build("memory");
-    expect(state.route).toBe("memory");
+    expect(state.workbenchOpen).toBe(true);
+    expect(state.workbenchTab).toBe("memory");
     expect(state.projectId).not.toBeNull();
 
     const transport = createMemoryTransport();

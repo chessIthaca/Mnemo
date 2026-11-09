@@ -76,9 +76,19 @@ impl ProjectRecord {
 
 /// The Workbench tabs a project may persist, in strip order.
 ///
-/// The Files, Trace and Git steps appended theirs here, next to these, so the
-/// stored tab and the frontend's `WorkbenchTab` union stay one decision.
-pub const WORKBENCH_TABS: [&str; 6] = ["browser", "diff", "plan", "files", "trace", "git"];
+/// The Files, Git, Trace, Graph and Memory steps appended theirs here, next to
+/// these, so the stored tab and the frontend's `WorkbenchTab` union stay one
+/// decision. Trace, Graph and Memory are the panel's wide tabs.
+pub const WORKBENCH_TABS: [&str; 8] = [
+    "browser",
+    "diff",
+    "plan",
+    "files",
+    "git",
+    "trace",
+    "graph",
+    "memory",
+];
 
 /// The narrowest workbench width that may be persisted, in CSS pixels.
 const MIN_WORKBENCH_WIDTH: u32 = 320;
@@ -104,8 +114,8 @@ const MAX_BOARD_WIDTH: u32 = 8_192;
 pub struct ProjectPreferences {
     /// Whether the workbench was open.
     pub workbench_open: bool,
-    /// `browser`, `diff`, `plan`, `files`, or a tab a later step adds to
-    /// [`WORKBENCH_TABS`].
+    /// `browser`, `diff`, `plan`, `files`, `git`, `trace`, `graph` or `memory`,
+    /// one of [`WORKBENCH_TABS`].
     pub workbench_tab: String,
     /// Saved desktop width in CSS pixels.
     pub workbench_width: u32,
@@ -116,6 +126,9 @@ pub struct ProjectPreferences {
     /// Saved mission-control worker-list width in CSS pixels; `None` keeps
     /// the default proportion between the list and the worker output.
     pub board_width: Option<u32>,
+    /// Saved width of the wide panel tabs (Trace, Graph, Memory) in CSS pixels;
+    /// `None` follows the window.
+    pub workbench_wide_width: Option<u32>,
 }
 
 impl Default for ProjectPreferences {
@@ -127,6 +140,7 @@ impl Default for ProjectPreferences {
             browser_url: "about:blank".to_string(),
             diff_worker_id: None,
             board_width: None,
+            workbench_wide_width: None,
         }
     }
 }
@@ -157,6 +171,13 @@ impl ProjectPreferences {
             if !(MIN_BOARD_WIDTH..=MAX_BOARD_WIDTH).contains(&board_width) {
                 return Err(format!(
                     "board width must be between {MIN_BOARD_WIDTH} and {MAX_BOARD_WIDTH} pixels"
+                ));
+            }
+        }
+        if let Some(wide) = self.workbench_wide_width {
+            if !(MIN_WORKBENCH_WIDTH..=MAX_WORKBENCH_WIDTH).contains(&wide) {
+                return Err(format!(
+                    "wide workbench width must be between {MIN_WORKBENCH_WIDTH} and {MAX_WORKBENCH_WIDTH} pixels"
                 ));
             }
         }
@@ -717,6 +738,14 @@ mod tests {
             WORKBENCH_TABS.contains(&"git"),
             "the Git tab is part of the persisted set"
         );
+        assert!(
+            WORKBENCH_TABS.contains(&"graph"),
+            "the Graph tab is part of the persisted set"
+        );
+        assert!(
+            WORKBENCH_TABS.contains(&"memory"),
+            "the Memory tab is part of the persisted set"
+        );
         let unknown = ProjectPreferences {
             workbench_tab: "console".to_string(),
             ..ProjectPreferences::default()
@@ -813,6 +842,7 @@ mod tests {
             browser_url: "http://localhost:3000/".to_string(),
             diff_worker_id: Some("worker1".to_string()),
             board_width: Some(720),
+            workbench_wide_width: Some(900),
         };
         save_preferences(one.path(), OWNER, &preferences).expect("save");
         let mut newer = preferences.clone();
@@ -824,6 +854,46 @@ mod tests {
         let mut invalid = preferences;
         invalid.browser_url = "file:///etc/passwd".to_string();
         assert!(save_preferences(one.path(), OWNER, &invalid).is_err());
+    }
+
+    #[test]
+    fn preferences_validate_the_wide_panel_width() {
+        for wide in [
+            Some(MIN_WORKBENCH_WIDTH),
+            Some(1_200),
+            Some(MAX_WORKBENCH_WIDTH),
+            None,
+        ] {
+            let preferences = ProjectPreferences {
+                workbench_wide_width: wide,
+                ..ProjectPreferences::default()
+            };
+            assert!(
+                preferences.validate().is_ok(),
+                "a wide panel width of {wide:?} must be accepted"
+            );
+        }
+        for wide in [Some(MIN_WORKBENCH_WIDTH - 1), Some(MAX_WORKBENCH_WIDTH + 1)] {
+            let preferences = ProjectPreferences {
+                workbench_wide_width: wide,
+                ..ProjectPreferences::default()
+            };
+            assert!(
+                preferences.validate().is_err(),
+                "a wide panel width of {wide:?} must be refused"
+            );
+        }
+    }
+
+    /// Regression: a preferences file written before the panel's wide tabs
+    /// existed carries no `workbench_wide_width`, and must keep loading (on the
+    /// window-relative default) instead of failing the whole restore.
+    #[test]
+    fn preferences_without_a_wide_width_load_as_none() {
+        let restored: ProjectPreferences =
+            serde_json::from_value(serde_json::json!({ "workbench_tab": "diff" }))
+                .expect("legacy preferences load");
+        assert_eq!(restored.workbench_wide_width, None);
     }
 
     #[test]

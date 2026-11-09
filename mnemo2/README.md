@@ -66,6 +66,9 @@ Pick a screen with `?scene=<name>`; a missing parameter renders
 - `lead-chat` — the lead conversation: plan, dispatch, review, merge, tool row.
 - `lead-idle` — the top bar with an idle Claude Code lead badge.
 - `delete-sheet` — the delete-old sheet with one superseded worker.
+- `panel-team-diff`, `panel-team-graph`, `panel-cost-trace`,
+  `panel-plans-memory` — the side panel open beside Mission Control, the Cost
+  tab and the Plans tab.
 - `mission-control-dark`, `lead-chat-dark`, `graph-dark` — the mission-control,
   lead-chat and Graph scenes in the dark palette (`[ui] theme = "dark"`).
 
@@ -277,9 +280,9 @@ only the app.
    non-`main` lead branch. **Revert** is available before landing. **Stop all**
    closes live worker sessions while retaining their work. Token and cost
    figures are telemetry; there is no agent token or cost budget.
-8. Open the workbench from the top bar, then switch to **Diff**. Use **Browser /
-   Diff / Plan**; the pane is resizable on desktop and full-screen on narrow
-   layouts.
+8. Open the side panel from the top bar on any main tab, then switch between
+   **Browser / Diff / Plan / Files / Git / Trace / Graph / Memory**; the panel is
+   resizable on desktop and full-screen on narrow layouts.
 
 ## Review and merge policy
 

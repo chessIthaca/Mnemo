@@ -116,7 +116,7 @@
           class="handoff-button"
           type="button"
           aria-label={`Model calls ${worker.name}`}
-          title="Every model call this worker made, in the Trace page"
+          title="Every model call this worker made, in the panel's Trace tab"
           onclick={() => actions.openTrace({ agent: worker.id })}
         >
           <Activity size={13} /> Model calls

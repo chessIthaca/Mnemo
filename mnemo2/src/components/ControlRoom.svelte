@@ -39,15 +39,14 @@
   const boardColumns = $derived(
     $app.boardWidth === null
       ? `minmax(${MIN_BOARD_WIDTH}px, 0.88fr) ${BOARD_DIVIDER_WIDTH}px minmax(${MIN_BOARD_OUTPUT_WIDTH}px, 1.12fr)`
-      : `${$app.boardWidth}px ${BOARD_DIVIDER_WIDTH}px minmax(${MIN_BOARD_OUTPUT_WIDTH}px, 1fr)`,
+      : `minmax(${MIN_BOARD_WIDTH}px, ${$app.boardWidth}px) ${BOARD_DIVIDER_WIDTH}px minmax(${MIN_BOARD_OUTPUT_WIDTH}px, 1fr)`,
   );
 
   /** The list's real on-screen width: the base a drag or an arrow key starts from. */
   function listWidth(): number {
-    // A saved width is also the column the grid lays out, so it is the honest
-    // base; the measured column only matters for the default proportion.
-    if ($app.boardWidth !== null) return $app.boardWidth;
-    return boardEl?.clientWidth || defaultBoardWidth(window.innerWidth);
+    // The column as laid out, since the side panel can hold it below the saved
+    // width; jsdom measures 0 and the saved or default width stands in.
+    return boardEl?.clientWidth || $app.boardWidth || defaultBoardWidth(window.innerWidth);
   }
 
   let boardEl = $state<HTMLElement | null>(null);
@@ -166,7 +165,7 @@
 </section>
 
 <style>
-  .control-room { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
+  .control-room { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; container: control-room / inline-size; }
   .control-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 24px 12px; }
   .control-header h1 { margin: 0; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; letter-spacing: -0.03em; }
   .team-settings { display: flex; align-items: center; gap: 18px; }
@@ -192,9 +191,10 @@
   .empty-board, .empty-detail { display: grid; place-items: center; padding: 50px 20px; color: var(--muted); text-align: center; }
   .empty-detail { height: 100%; align-content: center; }
   .empty-detail h2 { margin: 12px 0 0; color: var(--ink-soft); font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; }
-  @media (max-width: 760px) {
-    .control-header { padding: 16px; }
+  @container control-room (max-width: 760px) {
+    .control-header { flex-wrap: wrap; gap: 10px; padding: 16px; }
     .control-header h1 { font-size: var(--text-page); }
+    .team-settings { flex-wrap: wrap; gap: 8px; }
     .control-layout { grid-template-columns: 1fr; grid-template-rows: minmax(220px, 42%) minmax(0, 58%); }
     .worker-board { border-right: 0; border-bottom: 1px solid var(--line); }
     /* The list and the output stack, so there is nothing left to drag. */

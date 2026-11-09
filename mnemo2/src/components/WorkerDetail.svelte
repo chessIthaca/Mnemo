@@ -172,7 +172,7 @@
           class="toolbar-button"
           type="button"
           aria-label={`Model calls ${worker.name}`}
-          title="Every model call this worker made, in the Trace page"
+          title="Every model call this worker made, in the panel's Trace tab"
           onclick={() => actions.openTrace({ agent: worker.id })}
         >Model calls</button>
         {#if !auditFinished}<button class="toolbar-button" type="button" aria-label="Compact" title="Compact worker context" disabled={worker.compacting || !["completed", "idle", "needs_you", "paused", "stopped", "interrupted", "failed"].includes(worker.status)} onclick={() => actions.compactWorker(worker.id)}>Compact</button>{/if}

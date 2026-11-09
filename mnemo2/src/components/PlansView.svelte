@@ -125,7 +125,7 @@
 </section>
 
 <style>
-  .plans-view { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; background: var(--canvas); }
+  .plans-view { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; container: plans-view / inline-size; background: var(--canvas); }
   .plans-header { padding: 18px 24px 12px; }
   .plans-header h1 { margin: 0; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; letter-spacing: -0.03em; }
   .plans-header p { margin: 6px 0 0; color: var(--muted); font-size: var(--text-body); }
@@ -135,12 +135,12 @@
   .splitter { flex: 0 0 6px; padding: 0; border: 0; background: var(--line); cursor: col-resize; touch-action: none; }
   .splitter:hover, .splitter.resizing, .splitter:focus-visible { background: var(--accent-line); }
   .splitter:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: -2px; }
-  .backlog-column { flex: 0 0 auto; min-width: 0; overflow-y: auto; background: var(--surface); }
+  .backlog-column { flex: 0 0 auto; min-width: 0; max-width: 60%; overflow-y: auto; background: var(--surface); }
   .backlog-column :global(.backlog) { padding: 16px 18px 24px; }
   :global(body.resizing) { user-select: none; }
-  @media (max-width: 760px) {
+  @container plans-view (max-width: 640px) {
     .plans-body { flex-direction: column-reverse; overflow-y: auto; }
-    .plans-column, .backlog-column { width: auto !important; overflow: visible; }
+    .plans-column, .backlog-column { width: auto !important; max-width: none; overflow: visible; }
     .splitter { display: none; }
   }
 </style>

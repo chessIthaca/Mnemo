@@ -261,7 +261,7 @@
     }
   }
 
-  // The tab mounts only while its route is active, so this first read is the
+  // The tab mounts only while the panel shows it, so this first read is the
   // tab-open load; no poll — knowledge changes when the agent or the user
   // writes a record, not on a clock.
   $effect(() => {
@@ -565,7 +565,7 @@
 </section>
 
 <style>
-  .memory-view { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; background: var(--canvas); }
+  .memory-view { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; container: memory-view / inline-size; background: var(--canvas); }
   .memory-header { padding: 18px 24px 12px; }
   .memory-header h1 { margin: 0; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; letter-spacing: -0.03em; }
   .memory-header p { margin: 6px 0 0; color: var(--muted); font-size: var(--text-body); }
@@ -651,6 +651,13 @@
   .path-link code { color: var(--accent-strong); }
   .path-link:hover code { text-decoration: underline; }
   .path-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 5px; }
-  .backlink { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-body); text-align: left; cursor: pointer; }
   .backlink:hover { text-decoration: underline; }
+  @container memory-view (max-width: 820px) {
+    .memory-body { grid-template-columns: 270px minmax(0, 1fr); }
+    .record { padding: 18px 20px 32px; }
+  }
+  @container memory-view (max-width: 580px) {
+    .memory-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(200px, 42%) minmax(0, 1fr); }
+    .memory-side { border-right: 0; border-bottom: 1px solid var(--line); }
+  }
 </style>

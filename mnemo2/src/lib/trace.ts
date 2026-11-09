@@ -303,11 +303,11 @@ export function responseText(detail: TraceDetail): string {
 }
 
 // ---------------------------------------------------------------------------
-// The Trace route's contract — the full-page view of every model call.
+// The Trace tab's contract — the full view of every model call.
 //
 // The wire shape is frozen in the plan's Interfaces section: Rust keeps
 // snake_case serde, this file mirrors it exactly, and the commands below are
-// what the route and the compact Workbench tab both use since step E switched
+// what the tab uses since step E switched it over (`trace_list` takes the
 // the tab over (`trace_list` takes the query, `trace_detail` a durable key,
 // and `trace_settings`/`trace_export`/`trace_clear_live`/
 // `trace_delete_history` back the data controls).
@@ -1446,10 +1446,10 @@ export function saveTracePrefs(projectId: string | null, prefs: TraceViewPrefs):
 }
 
 // ---------------------------------------------------------------------------
-// Route entry — the filter hand-over `openTrace` plants.
+// Tab entry — the filter hand-over `openTrace` plants.
 // ---------------------------------------------------------------------------
 
-/** The filter hand-over an entry point can carry into the Trace route. */
+/** The filter hand-over an entry point can carry into the panel's Trace tab. */
 export interface TraceEntry {
   agent?: string;
   model?: string;
@@ -1460,7 +1460,7 @@ export interface TraceEntry {
   turn_id?: string;
   search?: string;
   search_scope?: TraceSearchScope;
-  /** The call to open on arrival ("run_id:id"), for the compact tab's hand-over. */
+  /** The call to open on arrival ("run_id:id"), for an entry point's hand-over. */
   selected?: string;
 }
 

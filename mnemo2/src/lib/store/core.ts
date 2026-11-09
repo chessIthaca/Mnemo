@@ -38,9 +38,11 @@ export function createInitialState(): AppState {
     workbenchOpen: false,
     workbenchTab: "browser",
     workbenchWidth: 480,
+    /** Wide panel tabs follow the window until the user drags one. */
+    workbenchWideWidth: null,
     /** No saved mission-control split until the user drags or the project restores one. */
     boardWidth: null,
-    /** No Trace-route filter hand-over until an entry point plants one. */
+    /** No trace filter hand-over until an entry point plants one for the panel. */
     traceEntry: null,
     /** No plan hand-over until the Memory tab plants one. */
     planDocumentId: null,

@@ -42,19 +42,6 @@ vi.mock("../lib/trace", async (importOriginal) => {
   return { ...original, createTracePageTransport: () => mocks.transport };
 });
 
-// jsdom ships no matchMedia; the page listens for the narrow layout switch.
-function stubMatchMedia(): void {
-  window.matchMedia = ((query: string) => ({
-    matches: false,
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  })) as unknown as typeof window.matchMedia;
-}
 
 function attribution(overrides: Partial<TraceAttribution> = {}): TraceAttribution {
   return {
@@ -212,7 +199,6 @@ async function flush(ms: number): Promise<void> {
 describe("TraceView", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    stubMatchMedia();
     window.localStorage.clear();
     mocks.transport = null;
     mocks.rows = [];
@@ -227,7 +213,7 @@ describe("TraceView", () => {
     mocks.agentFilters = false;
     mocks.cleared = 0;
     mocks.deletes = 0;
-    app.set({ ...fixtureState(), route: "trace", traceEntry: null });
+    app.set({ ...fixtureState(), route: "lead", traceEntry: null });
   });
 
   afterEach(() => {
@@ -516,7 +502,7 @@ describe("TraceView", () => {
   it("consumes an entry hand-over with its filters and clears it afterwards", async () => {
     installTransport();
     mocks.rows = [callRow({ id: 1 })];
-    app.set({ ...fixtureState(), route: "trace", traceEntry: { agent: "design-trace" } });
+    app.set({ ...fixtureState(), route: "lead", traceEntry: { agent: "design-trace" } });
     render(TraceView);
 
     await vi.waitFor(() => {
@@ -825,11 +811,44 @@ describe("TraceView", () => {
     installTransport();
     const row = callRow({ id: 61, run_id: "run-9" });
     mocks.details.set("run-9:61", callDetail(row));
-    app.set({ ...fixtureState(), route: "trace", traceEntry: { agent: "design-trace", selected: "run-9:61" } });
+    app.set({ ...fixtureState(), route: "lead", traceEntry: { agent: "design-trace", selected: "run-9:61" } });
     render(TraceView);
 
     await vi.waitFor(() => expect(mocks.detailKeys).toContain("run-9:61"));
-    // The hand-over is one-shot: the route consumes it.
+    // The hand-over is one-shot: the tab consumes it.
     expect(get(app).traceEntry).toBeNull();
+  });
+
+  it("shows one column in a narrow panel and two in a wide one", async () => {
+    installTransport();
+    mocks.rows = [callRow({ id: 1 })];
+    const callbacks: ResizeObserverCallback[] = [];
+    class StubResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        callbacks.push(callback);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    const originalObserver = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = StubResizeObserver as unknown as typeof ResizeObserver;
+    let width = 600;
+    const widthGetter = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => width });
+    try {
+      const { container } = render(TraceView);
+      await vi.waitFor(() => expect(callbacks.length).toBeGreaterThan(0));
+      expect(container.querySelector(".trace-columns")).toBeNull();
+
+      width = 1200;
+      for (const callback of callbacks) callback([], {} as ResizeObserver);
+      await vi.waitFor(() => expect(container.querySelector(".trace-columns")).toBeTruthy());
+    } finally {
+      if (originalObserver) globalThis.ResizeObserver = originalObserver;
+      else delete (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
+      if (widthGetter) Object.defineProperty(HTMLElement.prototype, "clientWidth", widthGetter);
+      else delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth;
+    }
   });
 });

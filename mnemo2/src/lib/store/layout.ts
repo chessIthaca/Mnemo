@@ -1,4 +1,6 @@
-/** The narrowest the lead's conversation may get; the side panel yields the rest of the window. */
+import type { WorkbenchTab } from "../types";
+
+/** The narrowest the main tab beside the side panel may get; the panel yields the rest of the window. */
 export const MIN_LEAD_WIDTH = 420;
 /** The narrowest the workbench or the worker panel may be dragged to. */
 export const MIN_WORKBENCH_WIDTH = 320;
@@ -23,6 +25,45 @@ export function maxWorkbenchWidth(windowWidth: number): number {
  */
 export function clampWorkbenchWidth(workbenchWidth: number, windowWidth: number): number {
   return Math.round(Math.min(maxWorkbenchWidth(windowWidth), Math.max(MIN_WORKBENCH_WIDTH, workbenchWidth)));
+}
+
+/**
+ * At or below this window width the side panel covers the main tab instead of
+ * sitting beside it. Matches the max-width breakpoint in Workbench.svelte and
+ * WorkerPanel.svelte.
+ */
+export const PANEL_OVERLAY_MAX_WIDTH = 980;
+
+/** Whether the side panel covers the main tab in a window this wide. */
+export function panelCoversMain(windowWidth: number): boolean {
+  return windowWidth <= PANEL_OVERLAY_MAX_WIDTH;
+}
+
+/** The panel tabs with several columns of their own: they need more room than a diff. */
+const WIDE_WORKBENCH_TABS: readonly WorkbenchTab[] = ["trace", "graph", "memory"];
+
+/** Whether this panel tab is one of the wide ones. */
+export function isWideWorkbenchTab(tab: WorkbenchTab): boolean {
+  return WIDE_WORKBENCH_TABS.includes(tab);
+}
+
+/** Share of the window a wide tab takes until the user drags it. */
+const DEFAULT_WIDE_WORKBENCH_SHARE = 0.62;
+
+/** The width a wide tab opens at in a window this wide when nothing is saved. */
+export function defaultWideWorkbenchWidth(windowWidth: number): number {
+  return clampWorkbenchWidth(Math.round(windowWidth * DEFAULT_WIDE_WORKBENCH_SHARE), windowWidth);
+}
+
+/** The width the panel shows this tab at. */
+export function workbenchPanelWidth(
+  tab: WorkbenchTab,
+  workbenchWidth: number,
+  wideWidth: number | null,
+  windowWidth: number,
+): number {
+  if (!isWideWorkbenchTab(tab)) return workbenchWidth;
+  return wideWidth === null ? defaultWideWorkbenchWidth(windowWidth) : clampWorkbenchWidth(wideWidth, windowWidth);
 }
 
 /**

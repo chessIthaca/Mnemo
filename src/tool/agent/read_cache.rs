@@ -47,6 +47,11 @@ struct FileSnapshot {
 /// into its `spawn_blocking` closure.
 pub struct ReadCache {
     inner: RwLock<HashMap<PathBuf, FileSnapshot>>,
+    /// Per-file tokens a served outline saved and that have not yet been
+    /// charged to a follow-up ranged read (the `outline_followup` ledger
+    /// row). Kept apart from `inner` so a skeleton serve and the debt can
+    /// never disagree.
+    outlined: RwLock<HashMap<PathBuf, i64>>,
 }
 
 impl Default for ReadCache {
@@ -60,6 +65,7 @@ impl ReadCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            outlined: RwLock::new(HashMap::new()),
         }
     }
 
@@ -82,6 +88,49 @@ impl ReadCache {
             inner.clear();
         }
         inner.insert(path, FileSnapshot { content });
+    }
+
+    /// Note the tokens a served outline saved for `path`, to be charged to
+    /// follow-up ranged reads (the `outline_followup` ledger row). Saturating,
+    /// and resets the whole debt map once the entry cap is reached — the same
+    /// fresh-epoch rule as [`Self::record`].
+    pub(crate) fn note_outline(&self, path: PathBuf, saved_tokens: i64) {
+        let mut outlined = self.outlined.write().expect("read cache lock poisoned");
+        if !outlined.contains_key(&path) && outlined.len() >= MAX_CACHED_FILES {
+            outlined.clear();
+        }
+        let entry = outlined.entry(path).or_insert(0);
+        *entry = entry.saturating_add(saved_tokens);
+    }
+
+    /// Charge `tokens` of follow-up ranged-read cost against what the outline
+    /// for `path` saved. Returns the charge — `min(tokens, remaining)` — and
+    /// reduces the remainder, or `None` when the path has no remainder left or
+    /// `tokens` is non-positive (nothing to charge).
+    pub(crate) fn charge_outline(&self, path: &Path, tokens: i64) -> Option<i64> {
+        if tokens <= 0 {
+            return None;
+        }
+        let mut outlined = self.outlined.write().expect("read cache lock poisoned");
+        let remaining = outlined.get_mut(path)?;
+        if *remaining <= 0 {
+            return None;
+        }
+        let charged = tokens.min(*remaining);
+        *remaining -= charged;
+        Some(charged)
+    }
+
+    /// Forget what the model has seen (a compaction or an old-result trim
+    /// removed earlier content): the next whole read serves the file again
+    /// instead of a skeleton claiming "unchanged since your last read".
+    /// The `outlined` debt is deliberately kept — the outline saving was
+    /// already recorded in the ledger and stays owed.
+    pub(crate) fn forget_served(&self) {
+        self.inner
+            .write()
+            .expect("read cache lock poisoned")
+            .clear();
     }
 }
 
@@ -263,5 +312,30 @@ mod tests {
         }
         // The cap reset cleared the whole cache, /x included.
         assert!(cache.snapshot(Path::new("/x")).is_none());
+    }
+
+    #[test]
+    fn charge_outline_charges_up_to_what_the_outline_saved() {
+        let cache = ReadCache::new();
+        cache.note_outline(PathBuf::from("/x"), 100);
+        assert_eq!(cache.charge_outline(Path::new("/x"), 60), Some(60));
+        assert_eq!(cache.charge_outline(Path::new("/x"), 60), Some(40));
+        // The debt is paid: nothing more is charged.
+        assert_eq!(cache.charge_outline(Path::new("/x"), 60), None);
+        // Non-positive charges and unknown paths are no-ops.
+        assert_eq!(cache.charge_outline(Path::new("/x"), 0), None);
+        assert_eq!(cache.charge_outline(Path::new("/never"), 10), None);
+    }
+
+    #[test]
+    fn forget_served_keeps_the_outline_debt() {
+        let cache = ReadCache::new();
+        cache.record(PathBuf::from("/x"), "content".into());
+        cache.note_outline(PathBuf::from("/x"), 100);
+        cache.forget_served();
+        // The served-content baseline is gone: the next read serves the file.
+        assert!(cache.snapshot(Path::new("/x")).is_none());
+        // The ledger debt already recorded against the outline is still owed.
+        assert_eq!(cache.charge_outline(Path::new("/x"), 60), Some(60));
     }
 }

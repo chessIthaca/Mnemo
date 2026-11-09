@@ -465,6 +465,17 @@ impl OptimizerState {
     /// alongside it. `kind` is the ledger kind; `after` the tokens the model
     /// was actually handed.
     pub fn record(&self, kind: &str, after: i64) {
+        // These rows do not describe tokens a lever served: an old-result
+        // trim and a compaction REMOVE tokens the model already had, and an
+        // `outline_followup` is an ordinary ranged read charged back against
+        // an outline — its `after` is a cost, not a serve. The quality score
+        // must not count any of them.
+        if matches!(
+            kind,
+            "old_result_trim" | "compaction" | "outline_followup"
+        ) {
+            return;
+        }
         let after = after.max(0) as u64;
         self.served_tokens.fetch_add(after, Ordering::Relaxed);
         match kind {
@@ -880,6 +891,22 @@ mod tests {
         // A negative `after` (a re-expansion row) never underflows a counter.
         state.record("archive_expand", -100);
         assert_eq!(state.snapshot().served_tokens, 580);
+    }
+
+    #[test]
+    fn record_ignores_tokens_a_reclaim_removed() {
+        // Old-result trims and compactions REMOVE tokens the model already
+        // had, and an outline follow-up is a ranged read charged back against
+        // an outline: none of them is something a lever served, so none may
+        // reach the quality score's served-token counter.
+        let state = OptimizerState::default();
+        state.record("old_result_trim", 500);
+        state.record("compaction", 500);
+        state.record("outline_followup", 500);
+        assert_eq!(state.snapshot().served_tokens, 0);
+        // Reads a lever really served still count.
+        state.record("outline", 30);
+        assert_eq!(state.snapshot().served_tokens, 30);
     }
 
     /// A report built from the given fill / served / waste signals.

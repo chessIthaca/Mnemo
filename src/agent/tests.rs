@@ -3779,6 +3779,176 @@ async fn savings_and_spend_emitted_where_persisted() {
     assert!(measured);
 }
 
+/// An `AgentLoop` over a given memory store and a fresh temp project — for
+/// tests that drive the ledger-recording methods or `ingest_tool_output`
+/// directly.
+fn agent_over_store(
+    dir: &std::path::Path,
+    store: &Arc<dyn crate::memory::MemoryStoreTrait>,
+) -> AgentLoop {
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    AgentLoop::new(
+        AgentLoopConfig {
+            provider: Arc::new(MockProvider::sequence(vec![vec![
+                LlmEvent::TextDelta { text: "hi".into() },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]])),
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store.clone()),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    )
+}
+
+#[tokio::test]
+async fn record_trim_savings_writes_a_row() {
+    // An old-result trim records what it really removed: chars/4 as the
+    // token estimate, the count in the detail, and no archive-flag gate.
+    let dir = tempdir().unwrap();
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    let agent = agent_over_store(dir.path(), &store);
+
+    agent.record_trim_savings(None, 3, 40_000, 2_000);
+
+    let rows = wait_for_savings_row(&store, |r| r.kind == "old_result_trim", std::time::Duration::from_secs(5)).await;
+    let row = rows
+        .iter()
+        .find(|r| r.kind == "old_result_trim")
+        .expect("the trim row");
+    assert_eq!(row.tokens_before, 10_000);
+    assert_eq!(row.tokens_after, 500);
+    assert_eq!(row.tokens_saved, 9_500);
+    assert_eq!(row.detail.as_deref(), Some("3 results"));
+    assert!(!row.measured);
+}
+
+#[tokio::test]
+async fn exempt_tools_are_capped_not_archived() {
+    // `expand_result` was asked for exactly that content: archiving it again
+    // only turns the expansion into another preview (250 of 580 expansions in
+    // the 2026-11-09 ledger). `plan_read`/`web_fetch` are expanded most of the
+    // time for the same reason.
+    let dir = tempdir().unwrap();
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    let agent = agent_over_store(dir.path(), &store);
+
+    let big = "x".repeat(30_000);
+    for tool in ["expand_result", "plan_read", "web_fetch"] {
+        let out = agent.ingest_tool_output(None, tool, None, &big).await;
+        assert_eq!(out, big, "{tool} must be served unchanged, not previewed");
+    }
+    // Rows are written from a spawned task; give any stray write time to land.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let rows = store.savings_events_rows(None).await.unwrap();
+    assert!(
+        rows.iter().all(|r| r.kind != "archive"),
+        "no exempt tool may be archived: {rows:?}"
+    );
+
+    // The ingestion cap still applies to every result, exempt or not.
+    let huge = "y".repeat(150_000);
+    let capped = agent.ingest_tool_output(None, "expand_result", None, &huge).await;
+    assert!(capped.chars().count() > context::TOOL_RESULT_MAX_CHARS);
+    assert!(capped.starts_with("yyyy"));
+    assert!(capped.contains("tool output truncated at 100000 chars:"));
+    assert!(capped.contains("50000 of 150000 chars dropped"));
+}
+
+#[tokio::test]
+async fn other_tools_are_still_archived() {
+    let dir = tempdir().unwrap();
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    let agent = agent_over_store(dir.path(), &store);
+
+    let out = agent
+        .ingest_tool_output(None, "shell", None, &"x".repeat(30_000))
+        .await;
+    assert!(out.contains("expand_result id="), "{out}");
+    let rows = wait_for_savings_row(&store, |r| r.kind == "archive", std::time::Duration::from_secs(5)).await;
+    assert_eq!(rows.iter().filter(|r| r.kind == "archive").count(), 1);
+}
+
+#[tokio::test]
+async fn note_context_reduced_tells_the_read_tool() {
+    // A compaction or an old-result trim removed content the model held: the
+    // read cache's "unchanged since your last read" skeleton would then be a
+    // lie, so the next whole read must serve the file again.
+    let dir = tempdir().unwrap();
+    let mut src = String::new();
+    for i in 0..40 {
+        src.push_str(&format!("pub fn sym_{i}(x: u32) -> u32 {{\n"));
+        for j in 0..9 {
+            src.push_str(&format!("    let v{j} = x + {i} + {j};\n"));
+        }
+        src.push_str("}\n\n");
+    }
+    std::fs::write(dir.path().join("a.rs"), &src).unwrap();
+
+    let cfg = crate::config::OptimizerConfig {
+        delta_reads: true,
+        ..Default::default()
+    };
+    let files =
+        crate::tool::agent::read_files::ReadFilesTool::new(Sandbox::new(dir.path()).unwrap())
+            .with_optimizer(Arc::new(std::sync::RwLock::new(cfg)));
+    let mut registry = crate::tool::ToolRegistry::new();
+    registry.register(Box::new(files));
+    let registry = Arc::new(registry);
+
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: Arc::new(MockProvider::sequence(vec![vec![
+                LlmEvent::TextDelta { text: "hi".into() },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]])),
+            tools: registry.clone(),
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+
+    let tool = registry.get("read_files").expect("read_files registered");
+    let whole = serde_json::json!({"files":[{"path":"a.rs"}]});
+    let r1 = tool.execute(whole.clone()).await;
+    assert!(r1.output.contains("let v0 = x + 0 + 0;"), "{}", r1.output);
+    let r2 = tool.execute(whole.clone()).await;
+    assert!(
+        r2.output.contains("unchanged since your last read"),
+        "{}",
+        r2.output
+    );
+
+    agent.note_context_reduced();
+
+    let r3 = tool.execute(whole).await;
+    assert!(r3.output.contains("let v0 = x + 0 + 0;"), "{}", r3.output);
+    assert!(!r3.output.contains("unchanged since your last read"));
+}
+
 #[tokio::test]
 async fn cache_heuristic_skipped_after_summarization() {
     // Regression for the over-reporting finding: after a context

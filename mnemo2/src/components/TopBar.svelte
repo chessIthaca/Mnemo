@@ -131,5 +131,12 @@
   .usage-note { margin: 8px 0 0; color: var(--warning); font-size: var(--text-meta); line-height: 1.45; }
   .settings-copy { margin: 0 0 16px; color: var(--muted); font-size: var(--text-body); line-height: 1.55; }
   .settings-actions { display: flex; justify-content: space-between; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
-  @media (max-width: 760px) { .topbar { grid-template-columns: 1fr auto; padding: 0 14px; } .primary-nav { position: fixed; right: 14px; bottom: 14px; left: 14px; z-index: 40; justify-content: center; box-shadow: var(--shadow); } .primary-nav button { flex: 1; justify-content: center; } .team-stack { display: none; } }
+  /* The filter would make the bar the containing block of the fixed bottom nav,
+     parking the nav over the top bar instead of at the window's bottom edge. */
+  @media (max-width: 760px) {
+    .topbar { grid-template-columns: 1fr auto; padding: 0 14px; backdrop-filter: none; }
+    .primary-nav { position: fixed; right: 14px; bottom: 14px; left: 14px; z-index: 40; justify-content: center; box-shadow: var(--shadow); }
+    .primary-nav button { flex: 1; justify-content: center; }
+    .team-stack { display: none; }
+  }
 </style>

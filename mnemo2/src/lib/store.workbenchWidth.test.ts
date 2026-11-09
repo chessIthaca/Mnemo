@@ -125,7 +125,7 @@ describe("wide panel tabs", () => {
   });
 
   it("opens at 62% of the window until dragged", () => {
-    expect(defaultWideWorkbenchWidth(1600)).toBe(992);
+    expect(defaultWideWorkbenchWidth(1600)).toBe(960);
     // The main tab keeps its floor, so the share yields to the panel bounds.
     expect(defaultWideWorkbenchWidth(1000)).toBe(580);
     expect(defaultWideWorkbenchWidth(600)).toBe(MIN_WORKBENCH_WIDTH);
@@ -133,7 +133,7 @@ describe("wide panel tabs", () => {
 
   it("keeps a drag on one kind of tab out of the other's width", () => {
     expect(workbenchPanelWidth("diff", 480, 1000, 1600)).toBe(480);
-    expect(workbenchPanelWidth("trace", 480, null, 1600)).toBe(992);
+    expect(workbenchPanelWidth("trace", 480, null, 1600)).toBe(960);
     expect(workbenchPanelWidth("graph", 480, 1000, 1280)).toBe(860);
   });
 

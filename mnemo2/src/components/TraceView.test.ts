@@ -42,7 +42,6 @@ vi.mock("../lib/trace", async (importOriginal) => {
   return { ...original, createTracePageTransport: () => mocks.transport };
 });
 
-
 function attribution(overrides: Partial<TraceAttribution> = {}): TraceAttribution {
   return {
     actor_kind: "worker",

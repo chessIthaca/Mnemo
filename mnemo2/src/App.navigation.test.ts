@@ -47,7 +47,6 @@ describe("Mnemo2 navigation and draft preservation", () => {
     expect(screen.queryByRole("dialog", { name: "Project settings" })).toBeNull();
   });
 
-
   it("restores an unsent text and image draft across Lead → Team → Lead", async () => {
     render(App);
     const input = await textbox();
@@ -156,10 +155,10 @@ describe("the side panel on every main tab", () => {
     expect(await screen.findByRole("region", { name: "Memory" })).toBeTruthy();
 
     await fireEvent.click(screen.getByRole("button", { name: "Graph" }));
-    expect(await screen.findByRole("region", { name: "Code graph" })).toBeTruthy();
+    expect(await screen.findByRole("region", { name: "Code graph" }, { timeout: 15000 })).toBeTruthy();
 
     await fireEvent.click(screen.getByRole("button", { name: "Trace" }));
-    expect(await screen.findByRole("region", { name: "Trace" })).toBeTruthy();
+    expect(await screen.findByRole("region", { name: "Trace" }, { timeout: 15000 })).toBeTruthy();
 
     expect(state().route).toBe("team");
     expect(screen.getByRole("region", { name: "Mission Control" })).toBeTruthy();

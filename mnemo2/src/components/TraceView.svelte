@@ -1190,7 +1190,7 @@
     {/if}
   {/if}
 </section><style>
-  .trace-view { display: flex; min-height: 0; flex: 1; flex-direction: column; }
+  .trace-view { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; overflow-y: auto; }
   .trace-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; padding: 22px 26px 10px; }
   .trace-head h1 { margin: 0; color: var(--ink); font-size: var(--text-page); font-weight: 700; }
   .head-line { margin: 3px 0 0; color: var(--muted); font-size: var(--text-body); }
@@ -1210,14 +1210,14 @@
   .search-box select { padding: 5px 6px 5px 0; border: 0; background: transparent; color: var(--muted); font-size: var(--text-meta); cursor: pointer; }
   .follow-toggle { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--muted); font-size: var(--text-meta); font-weight: 600; cursor: pointer; }
   .follow-toggle input { accent-color: var(--accent-strong); }
-  .trace-columns { display: grid; min-height: 0; flex: 1; align-items: stretch; }
+  .trace-columns { display: grid; flex: 1 0 420px; min-height: 0; align-items: stretch; }
   .divider { display: block; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; background: transparent; cursor: col-resize; touch-action: none; }
   .divider::after { display: block; margin: 0 3px; height: 100%; border-left: 1px solid transparent; content: ""; }
   .divider:hover::after, .divider:focus-visible::after { border-left-color: var(--accent); }
   .divider:focus { outline: none; }
   .divider:focus-visible { outline: none; }
-  .list-column { display: flex; min-width: 0; overflow: auto; flex-direction: column; padding: 0 0 14px; }
-  .detail-column { display: flex; min-width: 0; overflow: hidden; flex-direction: column; }
+  .list-column { display: flex; flex: 1 0 420px; min-width: 0; overflow: auto; flex-direction: column; padding: 0 0 14px; }
+  .detail-column { display: flex; flex: 1 0 420px; min-width: 0; overflow: hidden; flex-direction: column; }
   .chip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 12px 0; }
   .chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 4px 3px 9px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink-soft); font-size: var(--text-meta); }
   .chip-x { display: inline-flex; padding: 2px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); cursor: pointer; }

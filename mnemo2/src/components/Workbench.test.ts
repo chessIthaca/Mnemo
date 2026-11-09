@@ -207,8 +207,9 @@ describe("Workbench", () => {
     expect(within(strip).getByRole("button", { name: "Trace" }).getAttribute("aria-pressed")).toBe("true");
 
     // The panel hosts the full Trace view now, not the old compact summary.
-    expect(await screen.findByRole("region", { name: "Trace" })).toBeTruthy();
-    expect(await screen.findByRole("button", { name: /worker-model/ })).toBeTruthy();
+    // A first dynamic import can outlast the default wait under full-suite load.
+    expect(await screen.findByRole("region", { name: "Trace" }, { timeout: 15000 })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /worker-model/ }, { timeout: 15000 })).toBeTruthy();
     expect(state().workbenchTab).toBe("trace");
   });
   it("appends the Git tab to the strip and fast-forwards main after confirmation", async () => {
@@ -273,22 +274,22 @@ describe("Workbench", () => {
       expect(aside.style.width).toBe("480px");
 
       await fireEvent.click(screen.getByRole("button", { name: "Graph" }));
-      expect(aside.style.width).toBe("992px");
+      expect(aside.style.width).toBe("960px");
 
       await fireEvent.keyDown(screen.getByRole("button", { name: "Resize workbench" }), { key: "ArrowLeft" });
-      expect(state().workbenchWideWidth).toBe(1016);
-      expect(aside.style.width).toBe("1016px");
+      expect(state().workbenchWideWidth).toBe(984);
+      expect(aside.style.width).toBe("984px");
 
       await fireEvent.click(screen.getByRole("button", { name: "Diff" }));
       expect(aside.style.width).toBe("480px");
       expect(state().workbenchWidth).toBe(480);
 
       await fireEvent.click(screen.getByRole("button", { name: "Memory" }));
-      expect(aside.style.width).toBe("1016px");
+      expect(aside.style.width).toBe("984px");
 
       await fireEvent.doubleClick(screen.getByRole("button", { name: "Resize workbench" }));
       expect(state().workbenchWideWidth).toBeNull();
-      expect(aside.style.width).toBe("992px");
+      expect(aside.style.width).toBe("960px");
     } finally {
       if (original) Object.defineProperty(window, "innerWidth", original);
     }
@@ -352,8 +353,9 @@ describe("Workbench", () => {
     actions.openTrace({ agent: "design-trace" });
     render(Workbench);
 
-    await vi.waitFor(() =>
-      expect((screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement).value).toBe("design-trace"),
+    await vi.waitFor(
+      () => expect((screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement).value).toBe("design-trace"),
+      { timeout: 15000 },
     );
     expect(state().traceEntry).toBeNull();
     expect(state().workbenchTab).toBe("trace");

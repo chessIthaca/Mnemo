@@ -2456,7 +2456,7 @@ export const previewScenes: PreviewScene[] = [
     name: "memory",
     title: "Memory",
     description:
-      "The top-level Memory tab: the project's knowledge records newest first with the SPEC/DECISION/BUG/HOW chips, one record rendered as Markdown with its path, date and backlinks, and the Diagnostics card (embedder, per-tier counts, recall test).",
+      "The panel's Memory tab: the project's knowledge records newest first with the SPEC/DECISION/BUG/HOW chips, one record rendered as Markdown with its path, date and backlinks, and the Diagnostics card (embedder, per-tier counts, recall test).",
     build: memoryTab,
     // Diagnostics is collapsed by design, so the scene opens it and runs one
     // recall after mounting — otherwise the screenshot would show an empty

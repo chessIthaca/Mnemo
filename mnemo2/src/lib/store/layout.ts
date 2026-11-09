@@ -48,7 +48,7 @@ export function isWideWorkbenchTab(tab: WorkbenchTab): boolean {
 }
 
 /** Share of the window a wide tab takes until the user drags it. */
-const DEFAULT_WIDE_WORKBENCH_SHARE = 0.62;
+const DEFAULT_WIDE_WORKBENCH_SHARE = 0.6;
 
 /** The width a wide tab opens at in a window this wide when nothing is saved. */
 export function defaultWideWorkbenchWidth(windowWidth: number): number {

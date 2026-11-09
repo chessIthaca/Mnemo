@@ -651,6 +651,7 @@
   .path-link code { color: var(--accent-strong); }
   .path-link:hover code { text-decoration: underline; }
   .path-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 5px; }
+  .backlink { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); font-size: var(--text-body); text-align: left; cursor: pointer; }
   .backlink:hover { text-decoration: underline; }
   @container memory-view (max-width: 820px) {
     .memory-body { grid-template-columns: 270px minmax(0, 1fr); }

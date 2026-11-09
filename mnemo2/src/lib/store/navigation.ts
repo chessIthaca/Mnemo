@@ -52,7 +52,6 @@ export function openPlans() {
 }
 
 /**
-
  * Open the panel's Trace tab — every model call, in detail. Optional filters
  * carry an entry point's hand-over (a worker from mission control, a lead turn
  * from the chat); the view consumes them once and they never enter a URL.

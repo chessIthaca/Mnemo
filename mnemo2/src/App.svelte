@@ -7,7 +7,6 @@
   import LayaLearningsSheet from "./components/LayaLearningsSheet.svelte";
   import LeadChat from "./components/LeadChat.svelte";
   import PlansView from "./components/PlansView.svelte";
-
   import StartScreen from "./components/StartScreen.svelte";
   import TeamPeek from "./components/TeamPeek.svelte";
   import Toast from "./components/Toast.svelte";

@@ -1189,9 +1189,9 @@
     .graph-detail { grid-column: 1; grid-row: 2; border-top: 1px solid var(--line); border-right: 1px solid var(--line); border-left: 0; }
     .graph-canvas-wrap { grid-column: 2; grid-row: 1 / span 2; }
   }
-  @container graph-view (max-width: 620px) {
+  @container graph-view (max-width: 520px) {
     .graph-body { display: flex; flex-direction: column; overflow-y: auto; }
-    .graph-side, .graph-detail { border: 0; overflow: visible; }
+    .graph-side, .graph-detail { flex: 0 0 auto; border: 0; overflow: visible; }
     .graph-canvas-wrap { flex: 0 0 auto; height: 320px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); order: 2; }
     .graph-side { order: 1; }
     .graph-detail { order: 3; }

@@ -193,10 +193,6 @@ export function setWideWorkbenchWidth(width: number | null) {
 
 /**
  * Re-clamp a saved or dragged width after the window shrank, so a wide panel
- * never squeezes the lead below its minimum. No-op while the width still fits.
- */
-/**
- * Re-clamp a saved or dragged width after the window shrank, so a wide panel
  * never squeezes the main tab below its minimum. No-op while the widths still
  * fit. A wide tab that follows the window stays null.
  */

@@ -14,7 +14,7 @@ export function leadError(error: unknown): string {
 }
 
 /**
- * When this app instance booted, as the anchor for the Trace route's
+ * When this app instance booted, as the anchor for the Trace tab's
  * "This session" time filter — the engine starts with the app, so its ring
  * holds nothing older.
  */

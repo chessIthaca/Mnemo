@@ -440,8 +440,8 @@ pub fn savings_report(
             // following request would have re-sent those tokens at the cached
             // rate.
             LeverValue::Entry => entry.saved += saved * (session.input + session.cached * resends),
-            // A recall delta avoided one input charge; the prompt still carries
-            // the tokens, so nothing is re-sent.
+            // A recall delta avoided one input charge; the recall block sits in
+            // the volatile tail, rebuilt per request, so nothing is re-sent.
             LeverValue::Tail => entry.saved += saved * session.input,
             // A result cut from context would have been re-sent at the cached
             // rate on every later request until trimming removed it.

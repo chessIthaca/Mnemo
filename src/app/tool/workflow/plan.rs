@@ -1035,21 +1035,16 @@ impl Tool for UpdatePlanTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "update_plan",
-            "Edit the active plan in place WITHOUT abandoning it — use this to \
-             adjust a plan whose scope changed, and use it whenever the plan is \
-             still broadly correct (abandon_plan is a destructive last resort). Completed \
-             steps are preserved verbatim; only the remaining steps can be replaced or \
-             appended to. Omit a field to leave it unchanged. Executing and Reviewing \
-             (full field set in both for the main agent — the reviewer never sees this \
-             tool; complete_step stays hidden mid-review, so appended steps stay \
-             unchecked during the review — finish ticks them on the \
-             Reviewing → Complete transition, so a completed plan shows no open \
-             checkbox). bug_fixing \
-             plans have a LOCKED skeleton (steps cannot be replaced; appends are allowed \
-             only in the Reviewing state — follow-on fix work in the closing sequence) — record \
-             the verify step's test name via regression_test, and landed_design=true when \
-             the fix turned out feature-scale (the finish gate then requires a 'Landed \
-             design' context amendment).",
+            "Edit the active plan in place; use it whenever the plan is still \
+             broadly correct (abandon_plan is a destructive last resort). \
+             Completed steps are preserved verbatim; only remaining steps can \
+             be replaced or appended to. Omit a field to leave it unchanged. \
+             Works in Executing and Reviewing; steps appended during Reviewing \
+             stay unchecked until finish ticks them. bug_fixing plans have a \
+             LOCKED skeleton (steps cannot be replaced; appends only in \
+             Reviewing): record the verify step's test name via \
+             regression_test, and set landed_design=true when the fix turned \
+             out feature-scale.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1070,19 +1065,19 @@ impl Tool for UpdatePlanTool {
                                 {"type": "object", "properties": {"header": {"type": "string"}, "body": {"type": "string"}}, "required": ["header"]}
                             ]
                         },
-                        "description": "Replacement for the remaining (not-yet-completed) steps; \
-                            completed steps are prepended automatically. Same shape as \
-                            create_plan's steps. More entries than remain appends work, \
-                            fewer trims. Must be non-empty; omit to keep current steps. \
-                            With append=true the entries are ADDED AFTER the remaining \
-                            steps (they need not be resent) — the chunked protocol for \
-                            very long plans: create_plan with the first few steps, then \
-                            update_plan(append=true) per chunk. Resumability gate: every \
-                            step names file path(s) or a no-code marker."
+                        "description": "Replacement for the remaining (not-yet-completed) \
+                            steps; completed steps are kept. Same shape as \
+                            create_plan's steps. Non-empty; omit to keep \
+                            current steps. With append=true the entries are \
+                            ADDED AFTER the remaining steps: the way to write \
+                            very long plans in chunks (create_plan with the \
+                            first few steps, then update_plan(append=true) per \
+                            chunk). Resumability gate: every step names file \
+                            path(s) or a no-code marker."
                     },
                     "append": {
                         "type": "boolean",
-                        "description": "Default false. When true, steps are appended after the remaining ones (not replacing them) and context is appended (not replaced). For bug_fixing plans, appends are allowed only in the Reviewing state (follow-on fix work in the closing sequence); steps replacement is always refused (locked skeleton)."
+                        "description": "Default false. When true, steps and context are added after the current ones instead of replacing them. bug_fixing plans allow appends only in Reviewing."
                     }
                 }
             }),
@@ -1768,12 +1763,10 @@ impl Tool for AbandonPlanTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "abandon_plan",
-            "Abandon the active plan WITHOUT completing it: pop it off the plan stack and \
-             resume the parent plan (or return to Planning if none remains). DESTRUCTIVE LAST \
-             RESORT. Use update_plan whenever the plan is still broadly \
-             correct (it edits the active plan in place, preserving completed steps). Only use \
-             abandon_plan when the plan is fundamentally wrong or stale and can't be salvaged \
-             by editing. The plan file stays on disk for reference.",
+            "Abandon the active plan WITHOUT completing it and resume the \
+             parent plan (or return to Planning). DESTRUCTIVE LAST RESORT: use \
+             update_plan whenever the plan is still broadly correct. The plan \
+             file stays on disk.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -2252,26 +2245,25 @@ impl Tool for FinishTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "finish",
-            "The only path from Reviewing to Complete. Requires a non-empty review report \
-             under .coding/reviews/ opening with \"## Verdict: PASS\" — a FINDINGS or \
-             unparseable verdict blocks finish (fail closed). So: reviewer subagent writes \
-             its report, you fix every finding and commit, then call this with the report \
-             path. bug_fixing plans also need the regression test name recorded (either \
-             via update_plan regression_test, or pass it directly here), the symbol \
-             present in the code graph, and — when landed_design was recorded — a \
-             'Landed design' context amendment (agent.md 'Documentation expectations'). \
-             Auto-captures the PLAN:/BUG: digests and supersedes \
-             the plan's crash markers.",
+            "The only path from Reviewing to Complete. Requires a review \
+             report under .coding/reviews/ opening with \"## Verdict: PASS\"; \
+             a FINDINGS or unparseable verdict blocks finish. So: the reviewer \
+             subagent writes its report, you fix every finding and commit, \
+             then call this with the report path. bug_fixing plans also need \
+             the regression test name recorded (via update_plan or here), that \
+             symbol in the code graph, and, when landed_design was recorded, a \
+             'Landed design' context amendment. Auto-captures the PLAN:/BUG: \
+             digests.",
             json!({
                 "type": "object",
                 "properties": {
                     "review_report": {
                         "type": "string",
-                        "description": "Path to the review report file under .coding/reviews/ (written by the reviewer subagent; must open with \"## Verdict: PASS\")."
+                        "description": "Path to the review report under .coding/reviews/."
                     },
                     "regression_test": {
                         "type": "string",
-                        "description": "Optional: the regression test name for bug_fixing plans. Recorded on the plan frame right before the gate check — an alternative to calling update_plan separately (useful when the test name is only known after running tests at the end of the verify step)."
+                        "description": "Optional: the regression test name for bug_fixing plans, instead of recording it with update_plan."
                     }
                 },
                 "required": ["review_report"]
@@ -2553,11 +2545,10 @@ impl Tool for CurrentPlanTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "current_plan",
-            "Takes NO arguments — call it with {}. Read-only query of the active plan. Returns \
-             the active plan's id, title, total steps, completed count, and workflow state — use \
-             this when you're unsure which plan is active (e.g. after stacked sub-plans). \
-             Returns 'no active plan' when the workflow is in Planning with no plan. Available \
-             in every workflow state.",
+            "Takes NO arguments — call it with {}. Read-only: returns the \
+             active plan's id, title, total steps, completed count and \
+             workflow state, or 'no active plan'. Use it when unsure which \
+             plan is active.",
             json!({
                 "type": "object",
                 "properties": {}

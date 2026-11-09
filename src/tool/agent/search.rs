@@ -1666,34 +1666,28 @@ impl Tool for SearchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "search",
-            "Searches a pattern (regex by default, or literal) in files matching an optional \
-             glob. Literal queries use the full-text content index when populated \
-             (engine: index), walking otherwise; metachar-free regex walks carry a TIP \
-             pointing at literal:true. A regex alternation whose every branch is an \
-             escape-only literal (e.g. memory\\.db|codegraph\\.db) is served by per-branch \
-             index lookups, merged — any branch the index cannot serve falls back to the \
-             walk. A broken regex is matched literally with a note. \
-             Returns matching lines with paths and line numbers. Build output and \
-             dependencies (target/, node_modules/, .git/, dist/) are pruned from the walk. \
-              ESCAPE-HATCH: for text with regex metacharacters or backslashes \
-              prefer literal:true (it avoids escaping) — e.g. a search for the \
-              literal (?< is pattern (?< with literal true; if a call is \
-              rejected as malformed, do NOT resend it — reformulate. \
-               For symbol questions — where is X defined, who calls X, callers/callees/blast \
-               radius — call graph_search (then graph_context(id=...)) FIRST; this tool is for \
-               text occurrences (comments, string literals, config keys, log text). \
-               Symbol-shaped patterns (bare name, 'fn X', 'X(', 'a::b', 'who calls X') naming \
-               an indexed symbol, and memory hunts (.coding/knowledge|reviews globs, typed \
-                SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
-                above the plain file matches in the same response — nothing is skipped; \
-                re-issue the same search to drop the block. \
-                With the optional Laya tool-choice classifier on and confident, it picks that route itself (symbol / text / memory); otherwise the heuristics above stand.",
+            "Searches a pattern (regex by default, or literal) in files \
+             matching an optional glob; returns matching lines with paths and \
+             line numbers. target/, node_modules/, .git/ and dist/ are \
+             skipped. A broken regex is matched literally with a note. \
+             ESCAPE-HATCH: for text with regex metacharacters or backslashes \
+             prefer literal:true (it avoids escaping) — e.g. a search for the \
+             literal (?< is pattern (?< with literal true; if a call is \
+             rejected as malformed, do NOT resend it — reformulate. For symbol \
+             questions (where is X defined, who calls X, blast radius) call \
+             graph_search, then graph_context(id=...), FIRST; this tool is for \
+             text occurrences (comments, string literals, config keys, log \
+             text). A pattern naming an indexed symbol ('fn X', 'X(', 'a::b', \
+             'who calls X'), and memory hunts (.coding/knowledge|reviews \
+             globs, SPEC:/DECISION:/ prefixes), also get the graph or memory \
+             answer inline above the file matches; re-issue the same search to \
+             drop that block.",
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "The pattern to search for. Prefer literal:true for text with regex metacharacters or backslashes."},
+                    "pattern": {"type": "string", "description": "The pattern to search for. Prefer literal:true for regex metacharacters or backslashes."},
                     "glob": {"type": "string", "description": "Glob pattern to filter files (e.g. \"**/*.rs\")."},
-                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes — avoids escaping."}
+                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes."}
                 },
                 "required": ["pattern"]
             }),

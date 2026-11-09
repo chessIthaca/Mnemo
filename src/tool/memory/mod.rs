@@ -174,14 +174,13 @@ impl Tool for MemoryWriteTool {
         ToolSchema::new(
             "memory_write",
             format!(
-                "{} MANDATORY the moment you learn a \
-             durable fact, decision, convention, or bug root cause — do NOT \
-             defer to session end; write it immediately or it is lost. \
-             Memories persist across sessions and are auto-recalled into \
-             future prompts: this is how you learn. Typed title prefixes classify \
-             the record (SPEC:/DECISION:/BUG:/PLAN:/HOW:/REVIEW:) as a \
-             pointer to on-disk truth — keep it compact (gist + path/commit \
-                 pointer); the file carries the detail.",
+                "{} MANDATORY the moment you learn a durable fact, decision, \
+                 convention or bug root cause: write it immediately or it is \
+                 lost. Not for this task's results or what the code already \
+                 shows. Memories are auto-recalled into future prompts. Typed \
+                 title prefixes (SPEC:/DECISION:/BUG:/PLAN:/HOW:/REVIEW:) \
+                 classify the record; keep it compact (gist + path/commit \
+                 pointer), the file carries the detail.",
                 tool_contract::contract(
                     "`tier`, `title`, `content`",
                     "{\"tier\":\"semantic\",\"title\":\"DECISION: …\",\"content\":\"…\"}"
@@ -192,7 +191,7 @@ impl Tool for MemoryWriteTool {
                 "properties": {
                     "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "Memory tier: working (raw events), episodic (session summaries), semantic (facts), procedural (workflows)."},
                     "title": {"type": "string", "description": "Short label, used in recall listings; carries the typed prefix."},
-                    "content": {"type": "string", "description": "The memory body — the full text to persist and recall later."},
+                    "content": {"type": "string", "description": "The memory body."},
                     "evidence": {"type": "string", "description": "What shows this is true: a test name, a file and line, a run, the user said so."}
                 },
                 "required": ["tier", "title", "content"]
@@ -770,13 +769,13 @@ impl Tool for MemoryConsolidateTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "memory_consolidate",
-            "Run the consolidation pipeline for a session: compress working memory into an \
-             episodic summary, then extract semantic facts + procedural workflows. Requires \
-             an LLM for full extraction; without one, stops at episodic.",
+            "Compress a session's working memory into an episodic summary, \
+             then extract semantic facts and procedural workflows. Without an \
+             LLM it stops at episodic.",
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string", "description": "The session whose working-memory events to compress into an episodic summary."}
+                    "session_id": {"type": "string", "description": "The session to compress."}
                 },
                 "required": ["session_id"]
             }),
@@ -1006,30 +1005,27 @@ impl Tool for MemoryUpdateTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "memory_update",
-            "Refine an existing memory in place by id (new title and/or content). Use to \
-             correct or tighten a fact that is still CURRENT — when a memory is obsolete or \
-             contradicted, supersede it instead (memory_supersede); never edit history. A \
-             content change re-embeds; a title change re-classifies typed prefixes. Ids come \
-             from memory_recall / memory_list output. Targeted repair: pass find + \
-             replace_with instead (alone, no title/content) to replace ONE occurrence of \
-             stray text in the record body — find must match exactly once (widen it if it \
-             repeats). That is the in-tool repair for .coding/knowledge/** text, which the \
-             file tools refuse by design.",
+            "Refine a memory that is still CURRENT, by id (new title and/or \
+             content); when it is obsolete or contradicted use \
+             memory_supersede. Ids come from memory_search. Targeted repair: \
+             pass find + replace_with alone to replace ONE occurrence of text \
+             in the record body (find must match exactly once). That is the \
+             in-tool repair for .coding/knowledge/** text, which the file \
+             tools refuse.",
             json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "The memory id to update (from recall/list output)."},
-                    "title": {"type": "string", "description": "Optional new title — a typed prefix (SPEC:/DECISION:/BUG:/PLAN:/HOW:) re-classifies the record."},
-                    "content": {"type": "string", "description": "Optional new content — re-embeds the memory. For \
-                     knowledge-backed records this replaces the truth file's FULL body: pass the complete corrected \
-                     body (or full body + a dated amendment paragraph); digest-shaped content (shorter + a \
-                     knowledge-path pointer tail) is refused."},
-                    "find": {"type": "string", "description": "Targeted repair: the exact text to \
-                     replace — it must occur EXACTLY ONCE in the record body (front matter is never \
-                     matched). Pass with replace_with, and nothing else."},
-                    "replace_with": {"type": "string", "description": "Targeted repair: what find is \
-                     replaced with; an empty string deletes it. The result must not leave the body \
-                     empty."},
+                    "id": {"type": "string", "description": "The memory id (from memory_search)."},
+                    "title": {"type": "string", "description": "Optional new title; a typed prefix (SPEC:/DECISION:/BUG:/PLAN:/HOW:) re-classifies the record."},
+                    "content": {"type": "string", "description": "Optional new content. For knowledge-backed records \
+                        this replaces the file's FULL body: pass the complete \
+                        corrected body; digest-shaped content (shorter + a \
+                        knowledge-path pointer tail) is refused."},
+                    "find": {"type": "string", "description": "Targeted repair: the exact text to replace; it must \
+                        occur EXACTLY ONCE in the record body. Pass with \
+                        replace_with, and nothing else."},
+                    "replace_with": {"type": "string", "description": "What find is replaced with; empty deletes it. The \
+                        result must not leave the body empty."},
                     "evidence": {"type": "string", "description": "What shows this is true: a test name, a file and line, a run, the user said so."}
                 },
                 "required": ["id"]
@@ -1221,20 +1217,15 @@ impl Tool for MemoryAmendTool {
         ToolSchema::new(
             "memory_amend",
             "Append a dated amendment paragraph to a knowledge record's file \
-             (.coding/knowledge/**) by id — the sanctioned way to ADD information to a \
-             knowledge-backed memory without replacing it. Append-only: the existing body \
-             is preserved verbatim, so the digest guard can never fire. A leading \
-             'Amended …:' / 'Amendment (…):' heading inside the paragraph is stripped before \
-             the tool's own dated stamp — exactly one heading ever lands, dated by the tool \
-             (a date you supply is dropped). For corrections or contradictions use \
-             memory_update (full body, or its find/replace_with repair mode) or \
-             memory_supersede (successor) instead. Refuses unknown ids and superseded \
-             records.",
+             (.coding/knowledge/**) by id, preserving the existing body. The \
+             tool stamps the date; a leading 'Amended …:' heading you supply \
+             is dropped. For corrections use memory_update or \
+             memory_supersede. Refuses unknown ids and superseded records.",
             json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "The memory id to amend (from recall/list output)."},
-                    "paragraph": {"type": "string", "description": "The amendment paragraph — appended to the record's file body under the tool's own dated 'Amended <date>:' heading. A leading heading you supply is stripped; the tool's date is authoritative."}
+                    "id": {"type": "string", "description": "The memory id (from memory_search)."},
+                    "paragraph": {"type": "string", "description": "The amendment paragraph, appended under the tool's dated heading."}
                 },
                 "required": ["id", "paragraph"]
             }),
@@ -1406,15 +1397,16 @@ impl Tool for MemorySupersedeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "memory_supersede",
-            "MANDATORY when a new decision or fact contradicts or obsoletes a stored one — \
-             write the successor here and the old memory becomes history (excluded from \
-             recall by default, retrievable via include_superseded); NEVER leave both live. \
-             For edits to a still-current fact use memory_update.",
+            "MANDATORY when a new decision or fact contradicts or obsoletes a \
+             stored one: write the successor here and the old memory becomes \
+             history (recall excludes it unless include_superseded). NEVER \
+             leave both live. For edits to a still-current fact use \
+             memory_update.",
             json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "The id of the memory being superseded (from recall/list output)."},
-                    "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "The successor's tier (same tiers as memory_write). A file-backed knowledge record's successor is always stored as semantic — a working/episodic/procedural request is stored as semantic instead of refused."},
+                    "id": {"type": "string", "description": "The id of the memory being superseded (from memory_search)."},
+                    "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "The successor's tier. A file-backed record's successor is always stored as semantic."},
                     "title": {"type": "string", "description": "The successor's title — keep the same typed prefix when the topic is unchanged."},
                     "content": {"type": "string", "description": "The successor's content."},
                     "evidence": {"type": "string", "description": "What shows this is true: a test name, a file and line, a run, the user said so."}
@@ -1608,13 +1600,13 @@ impl Tool for MemoryDeleteTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "memory_delete",
-            "Hard-delete a memory by id — for JUNK or DUPLICATE rows only. Stale or \
-             contradicted knowledge is history: supersede it (memory_supersede), NEVER \
-             delete it — deletion destroys the audit trail. Errors when the id is unknown.",
+            "Hard-delete a memory by id, for JUNK or DUPLICATE rows only. \
+             Stale or contradicted knowledge is history: use memory_supersede, \
+             NEVER delete it.",
             json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "The memory id to delete (from memory_list / memory_recall output)."}
+                    "id": {"type": "string", "description": "The memory id (from memory_search)."}
                 },
                 "required": ["id"]
             }),
@@ -1816,6 +1808,13 @@ mod tests {
         assert!(
             !schema.description.contains("If you catch yourself"),
             "the content-first clause lives once in TOOL_CALL_DISCIPLINE, not per tool: {}",
+            schema.description
+        );
+        // Measured on DeepSeek: a shortened description without this line
+        // saved unrequested task results in 8 of 25 runs; with it, 0 of 25.
+        assert!(
+            schema.description.contains("Not for this task's results"),
+            "the line that stops task results being saved as memories: {}",
             schema.description
         );
     }

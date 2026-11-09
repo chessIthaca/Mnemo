@@ -869,47 +869,56 @@ impl Tool for FileEditTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "file_edit",
-            "Replace old_string with new_string in a file; generates a unified diff for \
-              approval. Read the file first (read_files) — old_string must match the file's \
-               exact content or the edit fails (escape/whitespace differences are \
-               auto-absorbed with a NOTE): JS-escaped apostrophes (\\'), backslashes \
-               (\\\\), and line endings are literal. If the anchor contains a quote, a \
-               backslash, or is >3 lines, prefer the ops array with a compact line op. Six modes: \
-              LITERAL (default, first \
-              occurrence), REGEX (use_regex), LINE-RANGE (lines: [start, end] — no \
-              old_string needed, so whitespace mismatches cannot bite; with \
-              from_read — the read-receipt id a read_files trailer minted — \
-              the range becomes a VALIDATED anchor: the current bytes at \
-              those lines must match the cited read, drift hard-fails with a \
-              fresh-read steer), FUZZY \
-             (fuzzy_whitespace, literal only), OPS (ops — an atomic ops array \
-             applied in order with ONE write; any failing op aborts the whole \
-             array with the file untouched on disk; an element is a compact \
-             line op like 'd202-205' or an anchor object), and APPEND (append — add \
-             new_string at EOF on a fresh line; no old_string needed; the file must \
-              exist — use file_write to create it). OPS and APPEND are mutually \
-              exclusive with every single-edit field (in ops mode, \
-              placeholder-filled single-edit fields are ignored with a NOTE). \
-              replace_all / count=N widen a \
-             literal or regex match. An invalid regex is rejected with an actionable \
-             error — match semantics never change silently before an edit.",
+            "Replace old_string with new_string in a file; returns a unified \
+             diff for approval. Read the file first (read_files): old_string \
+             must match exactly, though escape and whitespace differences are \
+             absorbed with a NOTE. JS-escaped apostrophes (\\'), backslashes \
+             (\\\\) and line endings are literal. If the anchor contains a \
+             quote or backslash, or spans more than 3 lines, prefer a compact \
+             line op in ops. Modes: LITERAL (default, first occurrence; \
+             replace_all or count=N widen a literal or regex match), REGEX \
+             (use_regex), LINE-RANGE (lines: [start, end], no old_string; add \
+             from_read to validate those lines against an earlier read), FUZZY \
+             (fuzzy_whitespace, literal only), OPS (ops: applied in order with \
+             one atomic write; a failing op leaves the file untouched) and \
+             APPEND (append: new_string at EOF; the file must exist, use \
+             file_write to create it). OPS and APPEND exclude every \
+             single-edit field. An invalid regex is rejected with an error.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file, relative to the project root."},
-                    "old_string": {"type": ["string", "null"], "description": "The exact text to find, or a regex when use_regex=true. Leave empty or null when using ops (placeholder filler is ignored with a NOTE)."},
-                    "new_string": {"type": ["string", "null"], "description": "The replacement text; supports $1/${name} capture refs when use_regex=true. Required in single mode (empty deletes old_string); leave empty or null in ops mode — the ops carry their own replacements (placeholder filler is ignored with a NOTE). A replacement of exactly 'null' is dropped by the transport's null-stringify defense (empty = deletion) — use batch mode or include surrounding context."},
+                    "old_string": {"type": ["string", "null"], "description": "The exact text to find, or a regex when use_regex=true. Empty or null with ops."},
+                    "new_string": {"type": ["string", "null"], "description": "The replacement text; $1/${name} capture refs work when use_regex=true. Required in single mode (empty deletes old_string); empty or null with ops. A replacement of exactly 'null' is read as empty, which deletes: use ops or include surrounding context."},
                     "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)."},
-                    "use_regex": {"type": "boolean", "description": "Treat old_string as a Rust regex (default: false). In the replacement (new_string), use real newlines — a literal backslash-n is inserted as-is, not converted to a newline."},
+                    "use_regex": {"type": "boolean", "description": "Treat old_string as a Rust regex (default: false). In new_string use real newlines: a literal backslash-n is inserted as-is."},
                     "count": {"type": "integer", "description": "Replace at most N matches (vi-style count); overrides replace_all."},
-                    "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line-range mode: exactly [start, end] — 1-indexed, inclusive; use the numbers shown by file_read. That range is replaced by new_string — old_string, replace_all, use_regex, count and fuzzy_whitespace are all ignored in this mode. One tuple, so the pair can never be half-filled."},
-                    "fuzzy_whitespace": {"type": "boolean", "description": "Literal mode only: locate old_string with whitespace normalized — runs of spaces/tabs collapse to one space, trailing whitespace ignored — catching tab-vs-space and off-by-one mismatches. The replacement is spliced in verbatim (default: false)."},
-                    "from_read": {"type": "string", "description": "Read-receipt cite (backlog 3fdc605f): the id from a prior read_files section trailer. With lines: [start, end] the range becomes a VALIDATED anchor — the current bytes at those lines must match what the cited read served (drift hard-fails with a fresh-read steer, never a fuzzy apply), so the edit needs no old_string and survives context compaction. Mutually exclusive with every other field; requires lines + new_string."},
-                    "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops — EXCEPT a read-receipt cite, whose [start, end] is in the CITED READ's line numbers (plan f302cc0e: it is translated through the earlier ops' line shifts, so it lands on exactly the lines it validated, and a cite whose lines an earlier op already changed is refused with a steer to split the edit and re-read). An anchor object {old_string, new_string, count?, fuzzy_whitespace?} — or the \
-                  read-receipt cite {from_read, lines, new_string} (backlog \
-                  3fdc605f: validated server-side against the cited read's bytes; \
-                  drift hard-fails with a fresh-read steer) — is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines — leave those empty or null (never placeholder) when using ops; placeholder filler is ignored with a NOTE. An empty array is treated as absent (falls back to single-edit/append/line-range mode).", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive in the CITED READ's numbering (not the running content's) — validated against the receipt."}}, "required": ["new_string"]}]}},
-                    "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. With an empty/omitted new_string it instead ENSURES the file ends with exactly one final newline (adds the detected line ending when missing; idempotent success + note when already terminated) — the affordance for restoring a lost trailing EOF newline. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."},
+                    "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line-range mode: exactly [start, end], 1-indexed inclusive, from read_files' line numbers. new_string replaces that range; old_string and the matching options are ignored."},
+                    "fuzzy_whitespace": {"type": "boolean", "description": "Literal mode only: match old_string with runs of spaces/tabs collapsed and trailing whitespace ignored. The replacement is spliced in verbatim (default: false)."},
+                    "from_read": {"type": "string", "description": "Read-receipt id from a read_files section trailer. With lines, those lines must still match what that read served, or the edit fails and asks for a fresh read. Needs no old_string and survives compaction. Requires lines + new_string; excludes every other field."},
+                    "ops": {"type": "array", "description": "The edits, applied IN ORDER with one write; any \
+                        failing op aborts the whole array and nothing is \
+                        written. A compact line op is a string \
+                        {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive: \
+                        'i101:text' inserts after line 101 ('i0:' top, 'i<line \
+                        count>:' EOF), 'b101:text' inserts before it, \
+                        'd202-205' deletes ('d202' one line, 'd100-' to EOF), \
+                        'r102:text' replaces a line ('r100-120:text' a range; \
+                        'r102:' leaves one empty line). To delete lines use a \
+                        'd' op: a cite or line range with empty new_string \
+                        leaves a blank line. Line numbers refer to the content \
+                        as left by the preceding ops, except a read-receipt \
+                        cite, whose lines use the cited read's numbering (a \
+                        cite whose lines an earlier op changed is refused: \
+                        split the edit and re-read). An element can also be an \
+                        anchor {old_string, new_string, count?, \
+                        fuzzy_whitespace?}, which must match exactly once \
+                        unless it sets count, or a read-receipt cite \
+                        {from_read, lines, new_string}. Excludes \
+                        old_string/new_string/use_regex/replace_all/count/lines: \
+                        leave those empty or null. An empty array counts as \
+                        absent.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Max occurrences to replace (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant match (default: the array-level value)."}, "from_read": {"type": "string", "description": "Read-receipt id from a read_files trailer."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's [start, end], 1-indexed inclusive, in the cited read's numbering."}}, "required": ["new_string"]}]}},
+                    "append": {"type": "boolean", "description": "Append mode: add new_string at EOF on a fresh line, no old_string needed. With an empty new_string it instead ensures the file ends with exactly one newline. Excludes ops, lines, old_string and the matching options. Errors when the file is missing: use file_write (default: false)."},
                     "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation (see the rejection message)."}
                 },
                 "required": ["path"]
@@ -1371,6 +1380,57 @@ mod tests {
             "exactly the cited lines replaced, nothing else"
         );
     }
+
+    #[tokio::test]
+    async fn from_read_cite_with_explicit_null_fields_applies() {
+        // The advertised schema lists every item field as required and
+        // nullable, so a schema-following model sends `"old_string": null`
+        // on a cite. Null means absent here, not a type error: the DeepSeek
+        // trial of the shortened tool text hit this on 3 of 9 cites in ops.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "ops": [{
+                    "old_string": null,
+                    "from_read": id,
+                    "lines": [2, 2],
+                    "new_string": "TWO",
+                    "count": null,
+                    "fuzzy_whitespace": null
+                }]
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_with_null_old_string_and_no_cite_is_refused() {
+        // Accepting null must not turn a nameless anchor into an edit: with
+        // no `from_read` there is nothing to locate, so the file stays as is.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "ops": [{"old_string": null, "new_string": "X"}]
+            }))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
     #[tokio::test]
     async fn from_read_two_disjoint_cites_with_a_deletion_between_them() {
         // Plan f302cc0e acceptance: several disjoint cites of ONE receipt in
@@ -3044,7 +3104,15 @@ mod tests {
             "the legacy edits key must not be advertised: {params}"
         );
         let text = ops.to_string();
-        for needle in ["i101:text", "d202-205", "r102", "inserts after line 101"] {
+        // The delete hint is measured: without it, models delete with an empty
+        // new_string, which leaves a blank line and costs a repair round.
+        for needle in [
+            "i101:text",
+            "d202-205",
+            "r102",
+            "inserts after line 101",
+            "To delete lines use a 'd' op",
+        ] {
             assert!(text.contains(needle), "{needle} missing from the ops schema");
         }
         assert!(

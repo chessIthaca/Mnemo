@@ -280,13 +280,11 @@ impl Tool for MultiEditTool {
         ToolSchema::new(
             "multi_edit",
             format!(
-                "{} Apply ops to SEVERAL files ATOMICALLY: nothing is written until \
-                 every file applies cleanly, so a failing op leaves ALL files untouched. \
-                 Entries are {{path, ops}} — the ops array is file_edit's (compact line \
-                  ops + anchor objects — verbatim old_string anchors or read-receipt \
-                  cites — applied IN ORDER, line numbers as left by the \
-                  preceding ops). One combined diff is returned. Use file_edit for a \
-                  single file.",
+                "{} Apply ops to SEVERAL files ATOMICALLY: nothing is written \
+                 until every file applies cleanly, so a failing op leaves ALL \
+                 files untouched. Entries are {{path, ops}}, using file_edit's \
+                 ops forms. Returns one combined diff. Use file_edit for a \
+                 single file.",
                 tool_contract::contract(
                     "`files`",
                     "{\"files\":[{\"path\":\"a.rs\",\"ops\":[\"d202-205\"]}]}"
@@ -295,11 +293,11 @@ impl Tool for MultiEditTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "files": {"type": "array", "description": "The files to edit, each with its own ops. Nothing is written until ALL files succeed — a failing op aborts the whole call with no write anywhere.", "items": {"type": "object", "properties": {
+                    "files": {"type": "array", "description": "The files to edit, each with its own ops.", "items": {"type": "object", "properties": {
                         "path": {"type": "string", "description": "Path to the file, relative to the project root."},
-                        "ops": {"type": "array", "description": "The ops to apply IN ORDER — the same forms as file_edit's ops array: compact line-op strings (e.g. 'i101:text' insert after line 101, 'b101:text' insert before, 'd202-205' delete, 'd100-' to EOF, 'r102:text' replace; {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed) or anchor objects {old_string, new_string, count?, fuzzy_whitespace?} (an anchor must match exactly once unless it sets count), or read-receipt cites {from_read, lines, new_string} (backlog 3fdc605f: the id a read_files trailer minted, validated server-side against the cited read's bytes — drift hard-fails with a fresh-read steer). Line numbers refer to the content as left by the preceding ops.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Max occurrences to replace (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant match (default false)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive — validated against the receipt."}}, "required": ["new_string"]}]}}
+                        "ops": {"type": "array", "description": "The ops to apply IN ORDER, in the same forms as file_edit's ops: compact line ops like 'd202-205' or 'r102:text', anchors {old_string, new_string, count?, fuzzy_whitespace?}, or read-receipt cites {from_read, lines, new_string}.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Max occurrences to replace (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant match (default false)."}, "from_read": {"type": "string", "description": "Read-receipt id from a read_files trailer."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's [start, end], 1-indexed inclusive."}}, "required": ["new_string"]}]}}
                     }, "required": ["path", "ops"]}},
-                    "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation for every file in this call (see the rejection message)."}
+                    "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation for every file (see the rejection message)."}
                 },
                 "required": ["files"]
             }),

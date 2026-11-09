@@ -74,16 +74,16 @@ impl Tool for FileWriteTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "file_write",
-            "Write a whole file. Default mode overwrites (creating parent directories as \
-             needed); mode=\"append\" adds to the end, creating the file if absent. To \
-             write a large file, overwrite the first section then append the rest in \
-             chunks of under ~4000 characters (large single calls risk truncation). For \
-             a targeted change to an existing file, use file_edit.",
+            "Write a whole file. Default mode overwrites (creating parent \
+             directories); mode=\"append\" adds to the end, creating the file \
+             if absent. For a large file, overwrite with the first section, \
+             then append chunks of under ~4000 characters (large single calls \
+             risk truncation). For a targeted change use file_edit.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file, relative to the project root."},
-                    "content": {"type": "string", "description": "The content. Overwrites the file, or is appended to it when mode=\"append\"."},
+                    "content": {"type": "string", "description": "The content."},
                     "mode": {"type": "string", "enum": ["overwrite", "append"], "description": "Default \"overwrite\"."}
                 },
                 "required": ["path", "content"]

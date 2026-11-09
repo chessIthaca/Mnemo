@@ -436,18 +436,15 @@ impl Tool for ShellTool {
             "shell",
             format!(
                 "{} If you just made a shell call, the next one needs its own \
-                 command. Execute a shell command — PowerShell 5.1 on Windows, sh \
-                 on Unix. Requires approval. \
-             On Windows chain with ; not && / || — PowerShell 5.1 rejects \
-             bash-style chaining; it is auto-translated to if ($?) gates with a \
-             note in the result, but prefer ; or separate calls. A result is \
-             'successful' when the command RAN: check the exit code to see \
-             whether it failed. Output streams live into the tool card while \
-             the command runs; the RESULT is capped (~100 KiB) with a truncation \
-             note, and well-known commands (cargo build/test, npm test/build, \
-             git status) are noise-filtered — errors, warnings, and summaries \
-             always survive, and the raw stdout/stderr ride the result's data \
-                 field. Commands exceeding the timeout are killed.",
+                 command. Execute a shell command: PowerShell 5.1 on Windows, \
+                 sh on Unix. Requires approval. On Windows chain with ; not && \
+                 / || (bash-style chaining is auto-translated with a note, but \
+                 prefer ; or separate calls). A result is 'successful' when \
+                 the command RAN: check the exit code. Output is capped (~100 \
+                 KiB) with a truncation note; well-known commands (cargo \
+                 build/test, npm test/build, git status) are noise-filtered, \
+                 keeping errors, warnings and summaries. Commands exceeding \
+                 the timeout are killed.",
                 tool_contract::contract(
                     "`command` + `purpose`",
                     "{\"command\":\"cargo test\",\"purpose\":\"running tests\"}"

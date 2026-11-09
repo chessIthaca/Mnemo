@@ -97,11 +97,10 @@ impl Tool for LoadToolsTool {
         let groups: Vec<&str> = self.table.iter().map(|(g, _)| g.as_str()).collect();
         ToolSchema::new(
             "load_tools",
-            "Reveal a tool group listed under AVAILABLE TOOL GROUPS. Its tools join your \
-             tool list from your next message on — call this first, then use them (the \
-             response lists each tool's required parameters). Loading is permanent for the \
-             session and safe to call once per group; calling it for a group you will not \
-             use just wastes context.",
+            "Reveal a tool group listed under AVAILABLE TOOL GROUPS. Its tools \
+             join your list from your next message on, and the response lists \
+             their required parameters. Loading lasts for the session: call it \
+             once per group, and only for a group you will use.",
             json!({
                 "type": "object",
                 "properties": {

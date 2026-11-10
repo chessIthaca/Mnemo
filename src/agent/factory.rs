@@ -478,6 +478,23 @@ impl AgentLoopFactory {
         &self.steering
     }
 
+    /// The client background memory upkeep summarises with: the
+    /// `[models.summarize]` model when one is configured and its endpoint
+    /// builds, else the factory's current default provider.
+    pub fn summarize_client(&self) -> Arc<dyn LlmClient> {
+        let default = self.provider.read().expect("provider lock poisoned").clone();
+        let Some(resolver) = self.model_resolver.as_ref() else {
+            return default;
+        };
+        let Some(model_ref) = resolver.resolve_summarize_model() else {
+            return default;
+        };
+        resolver
+            .build_turn_provider(&model_ref, self.fill_rate)
+            .map(|(provider, _)| provider)
+            .unwrap_or(default)
+    }
+
     /// Create a factory holding the shared, stateless deps.
     ///
     /// Every subsequent [`build`](Self::build) clones the shared deps and
@@ -2136,6 +2153,17 @@ mod tests {
             b.steering().snapshot(),
             crate::agent::steering_stats::SteeringStats::new().snapshot(),
         );
+    }
+
+    /// The memory upkeep's summariser falls back to the shared default
+    /// provider when no `[models]` resolver is wired (test factories, and
+    /// every project without a `[models.summarize]` entry).
+    #[test]
+    fn summarize_client_without_a_resolver_is_the_default_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = make_factory(dir.path());
+        let default = factory.provider.read().unwrap().model().to_string();
+        assert_eq!(factory.summarize_client().model(), default);
     }
 
     /// Build a factory with an optional vision model (to exercise the

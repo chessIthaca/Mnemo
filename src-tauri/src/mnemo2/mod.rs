@@ -154,6 +154,9 @@ pub mod model_settings;
 /// Diagnostics card (embedder status, per-tier counts, recall test).
 pub mod memory_view;
 
+/// The Memory tab's upkeep: clean up, rebuild search, rebuild index.
+pub mod memory_maintenance;
+
 /// The UI log: every popup and every uncaught frontend error, appended to
 /// `<project>/.coding/logs/mnemo2-ui.jsonl` (or the config dir's `logs/` when no
 /// project is open) so a popup that vanished before it could be read can still
@@ -697,6 +700,9 @@ pub fn run() {
             memory_view::memory_backlinks,
             memory_view::memory_overview,
             memory_view::memory_recall_test,
+            memory_maintenance::memory_cleanup,
+            memory_maintenance::memory_rebuild_search,
+            memory_maintenance::memory_rebuild_index,
             ui_log::ui_log,
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))

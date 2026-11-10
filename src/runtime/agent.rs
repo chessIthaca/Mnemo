@@ -36,6 +36,17 @@ const MAX_PROVIDER_TURN_ATTEMPTS: u32 = 3;
 /// bodies); capping keeps the note from bloating the next request's context.
 const MAX_PROVIDER_ERROR_NOTE_CHARS: usize = 2000;
 
+/// Why the command loop woke up: a command arrived, or an idle-compaction
+/// deadline elapsed. Split out so the `select!` only yields a value — the
+/// command handler itself is never run inside a `select!` arm (it borrows
+/// `cmd_rx` mutably).
+enum Wake {
+    /// A command arrived; `None` = the inbox closed (the agent must exit).
+    Command(Option<AgentCommand>),
+    /// The idle-compaction deadline elapsed.
+    Idle,
+}
+
 /// The agent task's state: its conversation history + the agent loop.
 pub struct AgentTask {
     pub id: AgentId,
@@ -79,12 +90,30 @@ pub struct AgentTask {
     /// consolidations. Cleared by the spawned task on completion (success
     /// or failure).
     consolidation_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// When the agent last finished handling a command (the start of the
+    /// current idle spell). `None` before the first command and right after
+    /// an idle compaction attempt, so one idle spell compacts at most once.
+    idle_since: Option<tokio::time::Instant>,
+    /// The last measured prompt-cache lifetime: model id, seconds, and when
+    /// it was measured.
+    cache_lifetime: Option<(String, u64, tokio::time::Instant)>,
 }
 
 /// Maximum consecutive auto-continue turns before the agent parks for user
 /// input. Prevents infinite loops when the model keeps finishing without
 /// completing the plan (a genuine deadlock the user must break).
 const MAX_AUTO_CONTINUE: u32 = 12;
+
+/// Idle compaction runs only on conversations at least this large: below it,
+/// resending the context costs too little to be worth a summary.
+const IDLE_COMPACT_MIN_TOKENS: usize = 50_000;
+
+/// The idle delay when the request log cannot tell a model's cache lifetime:
+/// every provider measured so far is cold after an hour.
+const IDLE_CACHE_LIFETIME_FALLBACK_SECS: u64 = 3_600;
+
+/// How long a measured cache lifetime is reused before it is measured again.
+const CACHE_LIFETIME_REFRESH: std::time::Duration = std::time::Duration::from_secs(3_600);
 
 #[cfg(test)]
 pub(crate) mod digest_test_gate {
@@ -173,8 +202,10 @@ enum AfterTurn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CompactOutcome {
     /// The summarization completed and the summary was applied (with or
-    /// without a token reduction).
-    Completed,
+    /// without a token reduction). `resumed_input` is `true` when a Prompt or
+    /// Suggestion that arrived during the summarization was re-injected as a
+    /// message — it still needs a turn.
+    Completed { resumed_input: bool },
     /// The summarization LLM call failed — an Error event was emitted and
     /// the conversation is unchanged.
     Failed,
@@ -211,6 +242,8 @@ impl AgentTask {
             auto_continue_streak: 0,
             unattended: false,
             consolidation_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idle_since: None,
+            cache_lifetime: None,
         }
     }
 
@@ -574,7 +607,7 @@ impl AgentTask {
                         });
                     }
                     match outcome {
-                        CompactOutcome::Completed => {
+                        CompactOutcome::Completed { .. } => {
                             if steers.is_empty() {
                                 // No queued commands — nudge the model to
                                 // resume the work the compacted turn was
@@ -897,7 +930,31 @@ impl AgentTask {
         // console, headless host, tests), so this one line covers them all;
         // every explicit send below keeps carrying `self.id` as before.
         self.agent_loop.set_event_fanin(fanin_tx.clone());
-        while let Some(cmd) = cmd_rx.recv().await {
+        loop {
+            // Between commands: wake on the next command, or on the
+            // idle-compaction deadline when this agent has an idle spell open
+            // and every idle-compaction condition still holds. The handler
+            // itself never runs inside the `select!` — it borrows `cmd_rx`.
+            let wake = match self.idle_compaction_deadline().await {
+                Some(deadline) => tokio::select! {
+                    cmd = cmd_rx.recv() => Wake::Command(cmd),
+                    () = tokio::time::sleep_until(deadline) => Wake::Idle,
+                },
+                None => Wake::Command(cmd_rx.recv().await),
+            };
+            let cmd = match wake {
+                Wake::Idle => {
+                    if self.run_idle_compaction(&fanin_tx, &mut cmd_rx).await {
+                        break;
+                    }
+                    continue;
+                }
+                Wake::Command(Some(cmd)) => cmd,
+                Wake::Command(None) => break,
+            };
+            // Every command but a history export opens a new idle spell once
+            // handled (an export is a pure read, not agent activity).
+            let opens_idle_spell = !matches!(cmd, AgentCommand::ExportHistory { .. });
             match cmd {
                 AgentCommand::ExportHistory { reply } => {
                     // G5 (3a.6): the layout-preserving export — a pure
@@ -1120,6 +1177,9 @@ impl AgentTask {
                         .await;
                     break;
                 }
+            }
+            if opens_idle_spell {
+                self.idle_since = Some(tokio::time::Instant::now());
             }
         }
 
@@ -1431,9 +1491,13 @@ impl AgentTask {
         // Drop any steers the user dismissed (the "x" on a pending steer)
         // before re-injecting buffered commands.
         crate::agent::drop_cancelled_steers(&mut buffered);
+        // Whether a buffered Prompt/Suggestion was re-injected: the caller
+        // must then run the turn that input still needs.
+        let mut resumed_input = false;
         for cmd in buffered {
             match cmd {
                 crate::runtime::AgentCommand::Suggestion(payload) => {
+                    resumed_input = true;
                     let crate::runtime::SteerPayload { text, images } = payload;
                     let _ = fanin_tx
                         .send((
@@ -1467,6 +1531,7 @@ impl AgentTask {
                     }
                 }
                 crate::runtime::AgentCommand::Prompt { text, images } => {
+                    resumed_input = true;
                     // Same image handling as the normal prompt path —
                     // previously the images were silently dropped here.
                     // A Prompt buffered during the summarization never
@@ -1578,7 +1643,104 @@ impl AgentTask {
         }
         match stop {
             Some(reason) => CompactOutcome::Stopped(reason),
-            None => CompactOutcome::Completed,
+            None => CompactOutcome::Completed { resumed_input },
+        }
+    }
+
+    /// When this agent may run an idle compaction, or `None` when it must not:
+    /// no idle spell is open, the switch is off, the conversation is under
+    /// [`IDLE_COMPACT_MIN_TOKENS`], or there is no dedicated compaction model.
+    /// The delay is the measured cache lifetime of the model the last turn ran
+    /// on, falling back to [`IDLE_CACHE_LIFETIME_FALLBACK_SECS`].
+    async fn idle_compaction_deadline(&mut self) -> Option<tokio::time::Instant> {
+        let idle_since = self.idle_since?;
+        if !self.agent_loop.optimizer_config().idle_compaction {
+            return None;
+        }
+        if crate::agent::context::ContextManager::count_tokens(&self.messages)
+            < IDLE_COMPACT_MIN_TOKENS
+        {
+            return None;
+        }
+        self.agent_loop.dedicated_summarizer_model()?;
+        let model = self.agent_loop.last_turn_model();
+        let cached = match &self.cache_lifetime {
+            Some((cached_model, secs, measured_at))
+                if *cached_model == model && measured_at.elapsed() < CACHE_LIFETIME_REFRESH =>
+            {
+                Some(*secs)
+            }
+            _ => None,
+        };
+        let secs = match cached {
+            Some(secs) => secs,
+            None => {
+                let measured = match self.agent_loop.memory_handle() {
+                    Some(store) => match store.cache_lifetime_secs(&model).await {
+                        Ok(Some(secs)) => secs,
+                        Ok(None) => IDLE_CACHE_LIFETIME_FALLBACK_SECS,
+                        Err(e) => {
+                            eprintln!("[idle-compact] cache lifetime for {model}: {e}");
+                            IDLE_CACHE_LIFETIME_FALLBACK_SECS
+                        }
+                    },
+                    None => IDLE_CACHE_LIFETIME_FALLBACK_SECS,
+                };
+                self.cache_lifetime =
+                    Some((model.clone(), measured, tokio::time::Instant::now()));
+                measured
+            }
+        };
+        Some(idle_since + std::time::Duration::from_secs(secs))
+    }
+
+    /// Run one idle compaction: summarize with the compaction model through
+    /// [`Self::compact_context`], record an `idle_compaction` savings row when
+    /// the context shrank, and close the idle spell. Returns `true` when the
+    /// agent must exit (a Cancel arrived during the summary or the resumed
+    /// turn).
+    async fn run_idle_compaction(
+        &mut self,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
+    ) -> bool {
+        // A switch turned off while the agent waited wins: re-check it here so
+        // a Settings save lands without a restart.
+        if !self.agent_loop.optimizer_config().idle_compaction {
+            self.idle_since = None;
+            return false;
+        }
+        let before = crate::agent::context::ContextManager::count_tokens(&self.messages);
+        let outcome = self.compact_context(fanin_tx, cmd_rx).await;
+        self.idle_since = None;
+        match outcome {
+            CompactOutcome::Stopped(crate::agent::StopReason::Cancel) => true,
+            CompactOutcome::Completed { resumed_input } => {
+                let after = crate::agent::context::ContextManager::count_tokens(&self.messages);
+                if before > after {
+                    self.agent_loop.record_savings_event(
+                        self.session_id.as_deref(),
+                        "idle_compaction",
+                        None,
+                        before as i64,
+                        after as i64,
+                        false,
+                    );
+                }
+                if resumed_input {
+                    // A prompt or steer that landed during the summary is a
+                    // new command: run the turn it still needs, then open a
+                    // fresh idle spell (it never passed through the run loop's
+                    // arming line).
+                    let exit = self.drive_turns(fanin_tx, cmd_rx).await;
+                    self.idle_since = Some(tokio::time::Instant::now());
+                    return exit;
+                }
+                false
+            }
+            // `Failed` or `Stopped(Interrupt)`: the Error / interrupted note
+            // was already emitted by `compact_context`.
+            _ => false,
         }
     }
 
@@ -6708,7 +6870,7 @@ mod tests {
         }
 
         let outcome = task.compact_context(&fanin_tx, &mut cmd_rx).await;
-        assert!(matches!(outcome, CompactOutcome::Completed));
+        assert!(matches!(outcome, CompactOutcome::Completed { .. }));
 
         // A Compacted event with a real reduction must have been emitted.
         let mut compacted: Option<(u32, u32)> = None;
@@ -6722,6 +6884,428 @@ mod tests {
         assert!(
             after < before,
             "compaction should reduce tokens: before={before} after={after}"
+        );
+    }
+
+    /// The compaction summarizer for the idle-compaction tests: streams one
+    /// short summary, optionally only after a gate opens (so a test can hold
+    /// the summarization open while a command arrives).
+    struct SummaryProvider {
+        model: &'static str,
+        gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for SummaryProvider {
+        fn capabilities(&self) -> &Capabilities {
+            const C: Capabilities = Capabilities {
+                supports_tool_choice: true,
+                supports_strict_schema: true,
+                supports_parallel_tools: true,
+                reliable_finish_reason: true,
+                max_context: 128_000,
+                max_output_tokens: 4096,
+                multimodal: false,
+            };
+            &C
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            self.model
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            use futures::StreamExt;
+
+            let gate = self.gate.clone();
+            let events = vec![
+                LlmEvent::TextDelta {
+                    text: "idle summary".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ];
+            Ok(Box::pin(
+                futures::stream::once(async move {
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    events
+                })
+                .flat_map(|events: Vec<LlmEvent>| futures::stream::iter(events)),
+            ))
+        }
+    }
+
+    /// Build the idle-compaction test task: `MockProvider` ("mock") as the
+    /// agent's provider, a context manager large enough that the fill-rate
+    /// compaction never fires, no memory store (so the cache lifetime falls
+    /// back to [`IDLE_CACHE_LIFETIME_FALLBACK_SECS`]), and a conversation of
+    /// either ~100k tokens (`big`) or three short messages. The idle spell is
+    /// open, as it is right after a command was handled.
+    fn idle_task(
+        summarizer: Option<Arc<dyn LlmClient>>,
+        big: bool,
+        optimizer: Option<Arc<std::sync::RwLock<crate::config::OptimizerConfig>>>,
+    ) -> AgentTask {
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let mut registry = ToolRegistry::new();
+        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
+        registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
+
+        let mut agent_loop = AgentLoop::new(
+            AgentLoopConfig {
+                provider: Arc::new(MockProvider {
+                    caps: Capabilities::openai(),
+                }),
+                tools: Arc::new(registry),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
+                sandbox,
+                safety_mode: SafetyMode::Autonomous,
+                context_manager: ContextManager::new(400_000, 0.9),
+                memory: None,
+                vision: None,
+            },
+            crate::project::Constitution::default(),
+        )
+        // The factory assigns the id at build time; it routes the live
+        // `Savings`/`Spend` fan-in events, so the fixture needs it too.
+        .with_agent_id(1);
+        if let Some(summarizer) = summarizer {
+            agent_loop = agent_loop.with_summarize_provider(summarizer);
+        }
+        if let Some(optimizer) = optimizer {
+            agent_loop = agent_loop.with_optimizer(optimizer);
+        }
+
+        let mut task = AgentTask::new(1, "test".into(), Arc::new(agent_loop));
+        task.messages.push(Message::system("system prompt"));
+        if big {
+            for _ in 0..40 {
+                task.messages.push(Message::user_text("word ".repeat(2_000)));
+            }
+            assert!(
+                ContextManager::count_tokens(&task.messages) >= IDLE_COMPACT_MIN_TOKENS,
+                "the big fixture must clear IDLE_COMPACT_MIN_TOKENS"
+            );
+        } else {
+            task.messages.push(Message::user_text("hello"));
+            task.messages.push(Message::assistant_text("hi"));
+            task.messages.push(Message::user_text("how are you?"));
+        }
+        task.idle_since = Some(tokio::time::Instant::now());
+        task
+    }
+
+    /// An idle conversation past the (fallback) cache lifetime compacts once
+    /// with the compaction model, and the transcript pairs `CompactStarted`
+    /// with `Compacted` before → after. The `Savings` event proves the
+    /// `idle_compaction` ledger row was recorded.
+    #[tokio::test(start_paused = true)]
+    async fn idle_compaction_summarizes_after_the_cache_lifetime() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = idle_task(
+            Some(Arc::new(SummaryProvider {
+                model: "cheap-summary",
+                gate: None,
+            })),
+            true,
+            None,
+        );
+        let start = tokio::time::Instant::now();
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        let deadline = start + std::time::Duration::from_secs(4 * 3600);
+        let mut compact_started = false;
+        let mut compacted: Option<(u32, u32)> = None;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::CompactStarted => compact_started = true,
+                AgentEvent::Compacted { before, after } => {
+                    compacted = Some((before, after));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (before, after) = compacted.expect("the idle spell must compact the conversation");
+        assert!(
+            compact_started,
+            "Compacting context… must precede Compacted"
+        );
+        assert!(after < before, "before={before} after={after}");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(IDLE_CACHE_LIFETIME_FALLBACK_SECS),
+            "the compaction must wait out the cache lifetime: {:?}",
+            start.elapsed()
+        );
+
+        // `record_savings_event` fans the live `Savings` event at the same
+        // moment it writes the ledger row.
+        let savings_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saw_savings = false;
+        while let Some(event) = next_event(&mut fanin_rx, savings_deadline).await {
+            if let AgentEvent::Savings { kind, .. } = event {
+                if kind == "idle_compaction" {
+                    saw_savings = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_savings,
+            "the idle compaction must record an idle_compaction savings row"
+        );
+
+        drop(cmd_tx);
+        let _ = handle.await;
+    }
+
+    /// One idle spell compacts at most once: after the attempt the agent needs
+    /// a new command before it can arm again.
+    #[tokio::test(start_paused = true)]
+    async fn idle_compaction_runs_once_per_idle_spell() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = idle_task(
+            Some(Arc::new(SummaryProvider {
+                model: "cheap-summary",
+                gate: None,
+            })),
+            true,
+            None,
+        );
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4 * 3600);
+        let mut saw_compacted = false;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            if matches!(event, AgentEvent::Compacted { .. }) {
+                saw_compacted = true;
+                break;
+            }
+        }
+        assert!(saw_compacted, "the first idle spell must compact");
+
+        // Hours pass with no command: the spell stays closed.
+        tokio::time::sleep(std::time::Duration::from_secs(3 * 3600)).await;
+        let mut second_start = false;
+        while let Ok((_id, event)) = fanin_rx.try_recv() {
+            if matches!(event, AgentEvent::CompactStarted) {
+                second_start = true;
+            }
+        }
+        assert!(
+            !second_start,
+            "a second idle compaction needs a new command, not more idle time"
+        );
+
+        drop(cmd_tx);
+        let _ = handle.await;
+    }
+
+    /// Without a dedicated compaction model the idle spell never compacts:
+    /// a summary on the agent's own model costs what the next message would
+    /// have paid anyway.
+    #[tokio::test(start_paused = true)]
+    async fn idle_compaction_needs_a_dedicated_summarizer() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = idle_task(None, true, None);
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        tokio::time::sleep(std::time::Duration::from_secs(2 * 3600)).await;
+        let mut compact_started = false;
+        while let Ok((_id, event)) = fanin_rx.try_recv() {
+            if matches!(event, AgentEvent::CompactStarted) {
+                compact_started = true;
+            }
+        }
+        assert!(
+            !compact_started,
+            "no dedicated summarizer → no idle compaction, however long it sits"
+        );
+
+        drop(cmd_tx);
+        let _ = handle.await;
+    }
+
+    /// Too small a conversation never compacts while idle: a 49k-token resend
+    /// is cheaper than a summary.
+    #[tokio::test(start_paused = true)]
+    async fn idle_compaction_skips_small_conversations() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = idle_task(
+            Some(Arc::new(SummaryProvider {
+                model: "cheap-summary",
+                gate: None,
+            })),
+            false,
+            None,
+        );
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        tokio::time::sleep(std::time::Duration::from_secs(2 * 3600)).await;
+        let mut compact_started = false;
+        while let Ok((_id, event)) = fanin_rx.try_recv() {
+            if matches!(event, AgentEvent::CompactStarted) {
+                compact_started = true;
+            }
+        }
+        assert!(
+            !compact_started,
+            "a conversation under IDLE_COMPACT_MIN_TOKENS must not compact while idle"
+        );
+
+        drop(cmd_tx);
+        let _ = handle.await;
+    }
+
+    /// The Settings → Savings switch turns idle compaction off without a
+    /// restart: the loop reads the live optimizer mirror at each deadline.
+    #[tokio::test(start_paused = true)]
+    async fn idle_compaction_respects_the_switch() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = idle_task(
+            Some(Arc::new(SummaryProvider {
+                model: "cheap-summary",
+                gate: None,
+            })),
+            true,
+            Some(Arc::new(std::sync::RwLock::new(crate::config::OptimizerConfig {
+                idle_compaction: false,
+                ..Default::default()
+            }))),
+        );
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        tokio::time::sleep(std::time::Duration::from_secs(2 * 3600)).await;
+        let mut compact_started = false;
+        while let Ok((_id, event)) = fanin_rx.try_recv() {
+            if matches!(event, AgentEvent::CompactStarted) {
+                compact_started = true;
+            }
+        }
+        assert!(
+            !compact_started,
+            "with the switch off the idle spell must never compact"
+        );
+
+        drop(cmd_tx);
+        let _ = handle.await;
+    }
+
+    /// A prompt sent while the idle summary is running is buffered, then
+    /// answered in a turn right after the summary lands.
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_during_idle_compaction_still_runs_a_turn() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = idle_task(
+            Some(Arc::new(SummaryProvider {
+                model: "cheap-summary",
+                gate: Some(gate.clone()),
+            })),
+            true,
+            None,
+        );
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        // Wait until the summarization is running (and held open by the gate).
+        // The deadline must sit past the agent's own 3600 s sleep: a `timeout`
+        // equal to it would fire first under paused time.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 3600);
+        let mut started = false;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            if matches!(event, AgentEvent::CompactStarted) {
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "the idle spell must start a summary");
+
+        cmd_tx
+            .send(AgentCommand::Prompt {
+                text: "hello".into(),
+                images: vec![],
+            })
+            .await
+            .expect("the prompt must reach the summarizer's buffer");
+        // Let the summarizer's interrupt loop buffer the prompt before the
+        // stream is released.
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        gate.notify_one();
+
+        // The summary lands, then the buffered prompt runs a turn.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let mut compacted = false;
+        let mut answered = false;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::Compacted { .. } => compacted = true,
+                AgentEvent::TextDelta(text) if text == "Done!" => {
+                    answered = true;
+                    break;
+                }
+                AgentEvent::Finished { .. } => {
+                    answered = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(compacted, "the summary must complete");
+        assert!(
+            answered,
+            "a prompt buffered during the summary must be answered in a turn"
+        );
+
+        drop(cmd_tx);
+        let _ = handle.await;
+    }
+
+    /// The manual `/compact` arm reports `resumed_input: false` when nothing
+    /// arrived during the summary — the idle path adds the resumed turn, the
+    /// manual path keeps today's behavior.
+    #[tokio::test(start_paused = true)]
+    async fn the_manual_compact_reports_resumed_input_false_without_input() {
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+        let mut task = idle_task(
+            Some(Arc::new(SummaryProvider {
+                model: "cheap-summary",
+                gate: None,
+            })),
+            true,
+            None,
+        );
+
+        let outcome = task.compact_context(&fanin_tx, &mut cmd_rx).await;
+        assert!(
+            matches!(
+                outcome,
+                CompactOutcome::Completed {
+                    resumed_input: false
+                }
+            ),
+            "nothing arrived during the summary → no resumed input"
         );
     }
 
@@ -7867,7 +8451,7 @@ mod tests {
         let _ = stream_gate_tx.send(());
         let (task, outcome) = handle.await.unwrap();
         assert!(
-            matches!(outcome, CompactOutcome::Completed),
+            matches!(outcome, CompactOutcome::Completed { .. }),
             "the mock summarization must complete"
         );
         // The buffered plain prompt MUST have applied the same
@@ -7944,7 +8528,7 @@ mod tests {
         let _ = stream_gate_tx.send(());
         let (task, outcome) = handle.await.unwrap();
         assert!(
-            matches!(outcome, CompactOutcome::Completed),
+            matches!(outcome, CompactOutcome::Completed { .. }),
             "the mock summarization must complete"
         );
         assert!(

@@ -10519,110 +10519,81 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
     );
 }
 
+/// Build an [`AgentLoop`] over `resolver` with `default-model` as the turn
+/// provider — the shared harness of the summarize-slot tests.
+fn summarize_loop(
+    resolver: Arc<dyn crate::model_resolver::ModelResolver>,
+) -> (AgentLoop, Arc<dyn LlmClient>) {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let turn_provider: Arc<dyn LlmClient> = Arc::new(FixedModelProvider {
+        model: "default-model",
+    });
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: turn_provider.clone(),
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    )
+    .with_model_resolver(resolver);
+    (agent, turn_provider)
+}
+
+/// Build a [`summarize_loop`] whose `[models.summarize]` slot is `summarize`,
+/// over a config whose one endpoint lists `gpt-4o`, `cheap-summary` and
+/// `default-model`.
+fn summarize_slot_loop(
+    summarize: Option<crate::config::ModelRef>,
+) -> (AgentLoop, Arc<dyn LlmClient>) {
+    use crate::config::{GeneralConfig, ModelsConfig};
+
+    let config = crate::config::Config {
+        general: GeneralConfig {
+            models: ModelsConfig {
+                summarize,
+                ..ModelsConfig::default()
+            },
+            ..GeneralConfig::default()
+        },
+        endpoints: vec![pin_test_endpoint(vec![
+            "gpt-4o",
+            "cheap-summary",
+            "default-model",
+        ])],
+        pricing: vec![],
+        tiers: Default::default(),
+        keys: Default::default(),
+        mcp: Vec::new(),
+        projects: Default::default(),
+    };
+    let resolver = Arc::new(crate::model_resolver::ConfigModelResolver::new(
+        Arc::new(std::sync::RwLock::new(config)),
+        Arc::new(crate::provider::trace::LlmRequestLog::new()),
+    ));
+    summarize_loop(resolver)
+}
+
 #[tokio::test]
 async fn summarize_provider_routes_through_the_summarize_slot() {
     // [models.summarize] routes compaction summaries to a dedicated (often
     // cheaper) model: with the slot set, summarize_provider returns a
     // provider for THAT model; unset, it returns the turn's provider
     // unchanged (today's behavior). The routing must not disturb the turn's
-    // display state (set_resolved_model et al.).
-    use crate::config::{Endpoint, GeneralConfig, ModelRef, ModelsConfig};
-    use crate::model_resolver::ConfigModelResolver;
-    use crate::provider::Capabilities;
-
-    /// A provider whose `model()` returns a fixed id — tells the test which
-    /// model resolved (and never completes; routing only inspects the id).
-    struct FixedModelProvider {
-        model: &'static str,
-    }
-    #[async_trait::async_trait]
-    impl crate::provider::LlmClient for FixedModelProvider {
-        fn capabilities(&self) -> &Capabilities {
-            const C: Capabilities = Capabilities {
-                supports_tool_choice: true,
-                supports_strict_schema: true,
-                supports_parallel_tools: true,
-                reliable_finish_reason: true,
-                max_context: 128_000,
-                max_output_tokens: 4096,
-                multimodal: false,
-            };
-            &C
-        }
-        fn kind(&self) -> crate::provider::ProviderKind {
-            crate::provider::ProviderKind::OpenAI
-        }
-        fn model(&self) -> &str {
-            self.model
-        }
-        async fn complete(
-            &self,
-            _messages: &[crate::provider::Message],
-            _tools: &[crate::provider::ToolSchema],
-            _tool_choice: Option<crate::provider::ToolChoice>,
-        ) -> crate::error::Result<futures::stream::BoxStream<'_, crate::provider::LlmEvent>>
-        {
-            unreachable!("summarize_provider must not call complete")
-        }
-    }
-
-    let make_loop = |summarize: Option<ModelRef>| -> (
-        AgentLoop,
-        Arc<dyn crate::provider::LlmClient>,
-    ) {
-        let config = crate::config::Config {
-            general: GeneralConfig {
-                models: ModelsConfig {
-                    summarize,
-                    ..ModelsConfig::default()
-                },
-                ..GeneralConfig::default()
-            },
-            endpoints: vec![Endpoint {
-                name: "openai".into(),
-                base_url: "https://api.openai.com/v1/".into(),
-                models: vec!["gpt-4o".into(), "cheap-summary".into()],
-                ..Endpoint::test_default()
-            }],
-            pricing: vec![],
-        tiers: Default::default(),
-            keys: Default::default(),
-            mcp: Vec::new(),
-            projects: Default::default(),
-        };
-        let resolver = Arc::new(ConfigModelResolver::new(
-            Arc::new(std::sync::RwLock::new(config)),
-            Arc::new(crate::provider::trace::LlmRequestLog::new()),
-        ));
-        let dir = tempdir().unwrap();
-        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
-            dir.path().join("plans"),
-        )));
-        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        let registry = make_registry((*sandbox).clone(), workflow.clone());
-        let turn_provider: Arc<dyn crate::provider::LlmClient> =
-            Arc::new(FixedModelProvider {
-                model: "default-model",
-            });
-        let agent = AgentLoop::new(
-            AgentLoopConfig {
-                provider: turn_provider.clone(),
-                tools: registry,
-                workflow: crate::app::workflow::as_handle(workflow),
-                sandbox,
-                safety_mode: SafetyMode::Autonomous,
-                context_manager: context::ContextManager::new(128_000, 0.5),
-                memory: None,
-                vision: None,
-            },
-            crate::project::Constitution::default(),
-        )
-        .with_model_resolver(resolver);
-        (agent, turn_provider)
-    };
+    // display state (set_resolved_model et al.). Only a summarizer whose
+    // model differs from the last turn's model is "dedicated".
+    use crate::config::ModelRef;
 
     // Slot set → the summary provider is the slot's model.
-    let (agent, turn) = make_loop(Some(ModelRef {
+    let (agent, turn) = summarize_slot_loop(Some(ModelRef {
         endpoint: "openai".into(),
         model: "cheap-summary".into(),
         reasoning_effort: None,
@@ -10633,14 +10604,109 @@ async fn summarize_provider_routes_through_the_summarize_slot() {
         "cheap-summary",
         "with [models.summarize] set, summaries ride the slot's model"
     );
+    assert_eq!(
+        agent.dedicated_summarizer_model().as_deref(),
+        Some("cheap-summary"),
+        "a slot naming another model is a dedicated summarizer"
+    );
 
     // Slot unset → the turn's provider, unchanged (today's behavior).
-    let (agent, turn) = make_loop(None);
+    let (agent, turn) = summarize_slot_loop(None);
     let summary = agent.summarize_provider(&turn);
     assert_eq!(
         summary.model(),
         "default-model",
         "unset slot → the turn's provider (no config, no change)"
+    );
+    assert_eq!(
+        agent.dedicated_summarizer_model(),
+        None,
+        "no slot → no dedicated summarizer (the summary rides the turn model)"
+    );
+
+    // Slot naming the turn's own model → resolved, but not "dedicated":
+    // re-reading the cold context on that model costs what the next message
+    // would have paid anyway.
+    let (agent, turn) = summarize_slot_loop(Some(ModelRef {
+        endpoint: "openai".into(),
+        model: "default-model".into(),
+        reasoning_effort: None,
+    }));
+    assert_eq!(agent.summarize_provider(&turn).model(), "default-model");
+    assert_eq!(
+        agent.dedicated_summarizer_model(),
+        None,
+        "a slot naming the last turn's model is not a dedicated summarizer"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_summarize_provider_wins() {
+    // `with_summarize_provider` pins the summary provider, bypassing
+    // [models.summarize] — the seam the idle-compaction tests use to stream a
+    // summary without a network.
+    use crate::config::ModelRef;
+
+    let (agent, turn) = summarize_slot_loop(Some(ModelRef {
+        endpoint: "openai".into(),
+        model: "cheap-summary".into(),
+        reasoning_effort: None,
+    }));
+    let agent = agent.with_summarize_provider(Arc::new(FixedModelProvider { model: "pinned" }));
+    assert_eq!(
+        agent.summarize_provider(&turn).model(),
+        "pinned",
+        "a pinned summarizer wins over the slot"
+    );
+    assert_eq!(
+        agent.dedicated_summarizer_model().as_deref(),
+        Some("pinned"),
+        "the pinned model differs from the turn's model → dedicated"
+    );
+}
+
+#[tokio::test]
+async fn a_slot_whose_provider_cannot_build_is_not_a_dedicated_summarizer() {
+    // A slot the resolver accepts can still fail to build (its endpoint or
+    // key vanishes between resolve and build): summarize_provider then falls
+    // back to the turn's provider, so a summary would ride the agent's own
+    // model — not a dedicated summarizer, and idle compaction must not run.
+    use crate::agent::context::ContextManager;
+    use crate::config::ModelRef;
+    use crate::model_resolver::ModelResolver;
+
+    struct UnbuildableResolver;
+
+    impl ModelResolver for UnbuildableResolver {
+        fn resolve(&self, _context: crate::model_resolver::ModelContext) -> Option<ModelRef> {
+            None
+        }
+        fn resolve_summarize_model(&self) -> Option<ModelRef> {
+            Some(ModelRef {
+                endpoint: "openai".into(),
+                model: "cheap-summary".into(),
+                reasoning_effort: None,
+            })
+        }
+        fn build_turn_provider(
+            &self,
+            _model: &ModelRef,
+            _fill_rate: f64,
+        ) -> Option<(Arc<dyn LlmClient>, ContextManager)> {
+            None
+        }
+    }
+
+    let (agent, turn) = summarize_loop(Arc::new(UnbuildableResolver));
+    assert_eq!(
+        agent.summarize_provider(&turn).model(),
+        "default-model",
+        "an unbuildable slot falls back to the turn's provider"
+    );
+    assert_eq!(
+        agent.dedicated_summarizer_model(),
+        None,
+        "a slot that cannot build must not count as a dedicated summarizer"
     );
 }
 

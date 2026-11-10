@@ -411,6 +411,10 @@ pub struct AgentLoop {
     /// the default provider. `None` in tests / when no `[models]` section is
     /// configured (the default provider is always used).
     pub(crate) model_resolver: Option<Arc<dyn crate::model_resolver::ModelResolver>>,
+    /// A pinned compaction-summary provider. When set it wins over
+    /// `[models.summarize]` in [`summarize_provider`](Self::summarize_provider),
+    /// so a test can stream a summary without a network.
+    pub(crate) summarize_override: Option<Arc<dyn LlmClient>>,
     /// Whether this agent is a subagent (spawned via `spawn_agent` or the UI
     /// spawn button with a parent). Drives the `[models.subagent]` override
     /// in the resolver. `false` for the main agent. Behind a mutex so it can
@@ -1207,6 +1211,7 @@ impl AgentLoop {
             event_fanin: std::sync::Mutex::new(None),
             plan_mutations_allowed: std::sync::Mutex::new(true),
             model_resolver: None,
+            summarize_override: None,
             is_subagent: std::sync::Mutex::new(false),
             family_root: std::sync::Mutex::new(None),
             reviewer_failure_pending: std::sync::Mutex::new(false),
@@ -2201,18 +2206,29 @@ impl AgentLoop {
         self
     }
 
+    /// Pin the compaction-summary provider, bypassing `[models.summarize]`.
+    /// Tests use it for a summarizer that streams without a network.
+    pub fn with_summarize_provider(mut self, provider: Arc<dyn LlmClient>) -> Self {
+        self.summarize_override = Some(provider);
+        self
+    }
+
     /// The provider a compaction summary call runs on.
     ///
     /// `[models.summarize]` routes summaries to a dedicated — often cheaper —
     /// model; unset (or a dangling reference / build failure) falls back to
-    /// the turn's provider, preserving the pre-slot behavior exactly. The
-    /// resolved model is NOT stamped into the turn's display state
+    /// the turn's provider, preserving the pre-slot behavior exactly. A
+    /// pinned provider ([`Self::with_summarize_provider`]) wins over the
+    /// slot. The resolved model is NOT stamped into the turn's display state
     /// ([`Self::set_resolved_model`] et al.) — a summary is a one-off
     /// internal call, not a turn model switch.
     pub(crate) fn summarize_provider(
         &self,
         turn_provider: &Arc<dyn LlmClient>,
     ) -> Arc<dyn LlmClient> {
+        if let Some(provider) = &self.summarize_override {
+            return provider.clone();
+        }
         let Some(resolver) = self.model_resolver.as_ref() else {
             return turn_provider.clone();
         };
@@ -2226,6 +2242,42 @@ impl AgentLoop {
             .build_turn_provider(&model_ref, self.fill_rate)
             .map(|(provider, _)| provider)
             .unwrap_or_else(|| turn_provider.clone())
+    }
+
+    /// The model id the most recent turn ran on: the per-context override
+    /// when one resolved, else the default provider's model.
+    pub(crate) fn last_turn_model(&self) -> String {
+        self.resolved_model()
+            .unwrap_or_else(|| self.provider().model().to_string())
+    }
+
+    /// The model id of the dedicated compaction summarizer, or `None` when a
+    /// summary would ride the agent's own model: no pinned summarizer and no
+    /// `[models.summarize]` slot, a slot whose provider could not be built
+    /// (a missing endpoint or key leaves [`Self::summarize_provider`] on the
+    /// turn's provider), or a summarizer naming the model the last turn ran
+    /// on. Idle compaction runs only with a dedicated summarizer — re-reading
+    /// a cold context on the agent's own model costs what the next message
+    /// would have paid anyway.
+    pub(crate) fn dedicated_summarizer_model(&self) -> Option<String> {
+        let model = match self.summarize_override.as_ref() {
+            Some(provider) => provider.model().to_string(),
+            None => {
+                let slot = self.model_resolver.as_ref()?.resolve_summarize_model()?;
+                let built = self.summarize_provider(&self.provider());
+                // A slot the resolver accepts can still fail to build (no
+                // endpoint / no key): `summarize_provider` then falls back to
+                // the turn's provider, which is NOT a dedicated summarizer.
+                if built.model() != slot.model {
+                    return None;
+                }
+                built.model().to_string()
+            }
+        };
+        if model == self.last_turn_model() {
+            return None;
+        }
+        Some(model)
     }
 
     /// Resolve the provider + context manager to use for a turn given the

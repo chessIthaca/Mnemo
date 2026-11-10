@@ -3784,6 +3784,109 @@ async fn savings_valuation_counts_later_requests_up_to_the_lifetime() {
     assert_eq!(untimed.session_id, None);
 }
 
+#[test]
+fn cache_lifetime_from_gaps_finds_the_first_cold_window() {
+    // Five warm samples in [300, 600) and five cold ones in [600, 1200): the
+    // first probe whose window averages below 0.5 is the lifetime.
+    let mut samples: Vec<(i64, f64)> = vec![(400, 0.9); 5];
+    samples.extend(vec![(700, 0.2); 5]);
+    assert_eq!(cache_lifetime_from_gaps(&samples), Some(600));
+}
+
+#[test]
+fn cache_lifetime_from_gaps_skips_thin_windows() {
+    // Probe 300's window holds only 2 cold samples (under the 3-sample
+    // minimum); 600 and 900 hold none; 1200's window [1200, 2400) holds the
+    // four cold ones.
+    let mut samples: Vec<(i64, f64)> = vec![(400, 0.0); 2];
+    samples.extend(vec![(2000, 0.1); 4]);
+    assert_eq!(cache_lifetime_from_gaps(&samples), Some(1200));
+}
+
+#[test]
+fn cache_lifetime_from_gaps_is_none_when_the_cache_stays_warm() {
+    // A cache that outlives an hour never decides; neither does no data.
+    assert_eq!(cache_lifetime_from_gaps(&vec![(4000, 0.95); 10]), None);
+    assert_eq!(cache_lifetime_from_gaps(&[]), None);
+}
+
+#[tokio::test]
+async fn cache_lifetime_secs_measures_one_model_from_the_request_log() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    // The store's clock is real time, so anchor the rows 20,000 s back: every
+    // one stays inside the 30-day measurement window.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let base = now_secs - 20_000;
+    let request =
+        |session: &str, model: &str, at: i64, prompt: u32, cached: u32, purpose: Option<&str>| {
+            RequestStats {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: Some(session.into()),
+                model: model.into(),
+                endpoint: None,
+                prompt_tokens: prompt,
+                completion_tokens: 1,
+                reasoning_tokens: 0,
+                cached_tokens: Some(cached),
+                ttft_ms: None,
+                generation_ms: None,
+                created_at: at,
+                outcome: None,
+                purpose: purpose.map(str::to_string),
+            }
+        };
+    // Rows 40 days back: outside the 30-day measurement window, and their
+    // only decisive gaps would be the 700 s ones if that window were dropped.
+    let old_base = now_secs - 40 * 86_400;
+    let rows = [
+        // Two requests 100 s apart: a gap under every probe.
+        request("s1", "m", base, 30_000, 27_000, None),
+        request("s1", "m", base + 100, 30_000, 27_000, None),
+        // Three gaps of 700 s, each a 10% cache hit — probe 600's window.
+        request("s1", "m", base + 800, 30_000, 3_000, None),
+        // Compaction's own call, between two "m" requests: filtered out.
+        request("s1", "m", base + 850, 30_000, 0, Some("summarize")),
+        // Under the 20,000-token minimum: filtered out.
+        request("s1", "m", base + 900, 5_000, 0, None),
+        request("s1", "m", base + 1_500, 30_000, 3_000, None),
+        request("s1", "m", base + 2_200, 30_000, 3_000, None),
+        // Four "other" rows 700 s apart, each 97% cached. Mixed into "m",
+        // their three warm gaps would lift probe 600's mean to 0.53 and flip
+        // the answer to None — so "m" proves the model filter.
+        request("s2", "other", base, 30_000, 29_000, None),
+        request("s2", "other", base + 700, 30_000, 29_000, None),
+        request("s2", "other", base + 1_400, 30_000, 29_000, None),
+        request("s2", "other", base + 2_100, 30_000, 29_000, None),
+        // One model per filter, each with FOUR cold rows 700 s apart and no
+        // other request: dropped, each would decide Some(600) on its own, so
+        // the None below proves that filter.
+        request("s3", "sum", base, 30_000, 0, Some("summarize")),
+        request("s3", "sum", base + 700, 30_000, 0, Some("summarize")),
+        request("s3", "sum", base + 1_400, 30_000, 0, Some("summarize")),
+        request("s3", "sum", base + 2_100, 30_000, 0, Some("summarize")),
+        request("s4", "small", base, 5_000, 0, None),
+        request("s4", "small", base + 700, 5_000, 0, None),
+        request("s4", "small", base + 1_400, 5_000, 0, None),
+        request("s4", "small", base + 2_100, 5_000, 0, None),
+        request("s5", "old", old_base, 30_000, 0, None),
+        request("s5", "old", old_base + 700, 30_000, 0, None),
+        request("s5", "old", old_base + 1_400, 30_000, 0, None),
+        request("s5", "old", old_base + 2_100, 30_000, 0, None),
+    ];
+    for row in rows {
+        store.record_request_stats(&row).await.unwrap();
+    }
+
+    assert_eq!(store.cache_lifetime_secs("m").await.unwrap(), Some(600));
+    assert_eq!(store.cache_lifetime_secs("unknown").await.unwrap(), None);
+    assert_eq!(store.cache_lifetime_secs("sum").await.unwrap(), None);
+    assert_eq!(store.cache_lifetime_secs("small").await.unwrap(), None);
+    assert_eq!(store.cache_lifetime_secs("old").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn savings_valuation_lists_session_model_usage() {
     let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();

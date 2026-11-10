@@ -74,6 +74,7 @@ describe("lever names", () => {
   it("maps every ledger kind to a friendly name and a one-line explanation", () => {
     expect(leverLabel("compression")).toBe("Output compression");
     expect(leverLabel("old_result_trim")).toBe("Old results trimmed");
+    expect(leverLabel("idle_compaction")).toBe("Idle compaction");
     // Dropped from the table: a checkpoint still prettifies through the
     // fallback rather than rendering as its raw id.
     expect(leverLabel("compaction_checkpoint")).toBe("Compaction checkpoint");

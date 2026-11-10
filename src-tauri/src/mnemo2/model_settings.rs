@@ -144,6 +144,8 @@ pub struct OptimizerWire {
     pub lean_output_nudge: bool,
     /// Lever: compact auto-recall re-injections of unchanged memories.
     pub recall_delta: bool,
+    /// Lever: summarize an idle conversation once its cache has gone cold.
+    pub idle_compaction: bool,
     /// Knob: minimum tool-result length (chars) lever 3 archives.
     pub archive_min_chars: usize,
     /// Knob: minimum filtered-output length (chars) lever 2 compresses.
@@ -196,6 +198,7 @@ pub(crate) fn model_settings_read(setup: &Setup) -> Result<ModelSettingsWire, St
             quality_score: general.optimizer.quality_score,
             lean_output_nudge: general.optimizer.lean_output_nudge,
             recall_delta: general.optimizer.recall_delta,
+            idle_compaction: general.optimizer.idle_compaction,
             archive_min_chars: general.optimizer.archive_min_chars,
             compress_min_chars: general.optimizer.compress_min_chars,
             lean_output_fill_pct: general.optimizer.lean_output_fill_pct,
@@ -420,6 +423,7 @@ struct OptimizerPatch {
     quality_score: Option<bool>,
     lean_output_nudge: Option<bool>,
     recall_delta: Option<bool>,
+    idle_compaction: Option<bool>,
     archive_min_chars: Option<usize>,
     compress_min_chars: Option<usize>,
     lean_output_fill_pct: Option<u8>,
@@ -440,6 +444,7 @@ async fn apply_optimizer(setup: &Setup, value: Value) -> Result<(), String> {
         optimizer_quality_score: patch.quality_score,
         optimizer_lean_output_nudge: patch.lean_output_nudge,
         optimizer_recall_delta: patch.recall_delta,
+        optimizer_idle_compaction: patch.idle_compaction,
         optimizer_archive_min_chars: patch.archive_min_chars,
         optimizer_compress_min_chars: patch.compress_min_chars,
         optimizer_lean_output_fill_pct: patch.lean_output_fill_pct,
@@ -671,6 +676,7 @@ simple = ["ep1/exec-model"]
         assert!(!wire.optimizer.archive, "the fixture opts lever 3 out");
         assert_eq!(wire.optimizer.archive_min_chars, 1234);
         assert!(wire.optimizer.delta_reads, "untouched levers stay default");
+        assert!(wire.optimizer.idle_compaction, "the idle lever defaults on");
         assert!(wire.budget.enabled);
         assert_eq!(wire.budget.max_tokens_per_plan, 5000);
         assert_eq!(wire.budget.max_escalations_per_plan, 1, "the default fills in");
@@ -859,20 +865,27 @@ simple = ["ep1/exec-model"]
 
     #[tokio::test]
     async fn save_optimizer_updates_only_present_fields() {
-        let (_dir, setup) = fixture();
+        let (dir, setup) = fixture();
         model_settings_apply(
             &setup,
             "optimizer",
-            json!({ "compress_output": false, "nudge_cooldown_requests": 20 }),
+            json!({
+                "compress_output": false,
+                "nudge_cooldown_requests": 20,
+                "idle_compaction": false,
+            }),
         )
         .await
         .expect("save");
         let wire = model_settings_read(&setup).expect("read");
         assert!(!wire.optimizer.compress_output, "the patch flipped the lever");
         assert_eq!(wire.optimizer.nudge_cooldown_requests, 20);
+        assert!(!wire.optimizer.idle_compaction, "the patch flipped the idle lever");
         assert!(!wire.optimizer.archive, "the fixture value survives");
         assert_eq!(wire.optimizer.archive_min_chars, 1234);
         assert!(wire.optimizer.delta_reads, "untouched levers stay default");
+        let config = Config::load(dir.path()).expect("reload");
+        assert!(!config.general.general.optimizer.idle_compaction, "the patch landed in the config");
     }
 
     #[tokio::test]

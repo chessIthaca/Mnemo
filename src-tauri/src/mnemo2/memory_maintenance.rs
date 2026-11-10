@@ -203,7 +203,7 @@ pub async fn memory_cleanup(app: AppHandle, state: State<'_, Mnemo2State>) -> Re
         match run.await {
             Ok(Ok(report)) => {
                 let summary = format!(
-                    "{} session(s) consolidated · {} working row(s) removed · database compacted",
+                    "{} session(s) consolidated · {} raw row(s) removed · database compacted",
                     report.sessions_consolidated, report.working_rows_removed
                 );
                 emit(

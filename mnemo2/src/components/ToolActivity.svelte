@@ -15,11 +15,13 @@
   import { app } from "../lib/store";
   import { prettyArguments } from "../lib/toolArguments";
   import { editDiffSections, writeDiffSections } from "../lib/toolDiff";
+  import { toolImagePaths } from "../lib/toolImages";
   import { toolHeadline } from "../lib/toolSummary";
   import type { LeadEntry } from "../lib/types";
   import ElapsedTime from "./ElapsedTime.svelte";
   import TerminalText from "./TerminalText.svelte";
   import ToolDiff from "./ToolDiff.svelte";
+  import ToolImages from "./ToolImages.svelte";
   import ToolShellOutput from "./ToolShellOutput.svelte";
 
   type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
@@ -28,8 +30,14 @@
    * One tool call's card. `turnStartedAtMs` is when the turn's first call
    * started: the card shows how long the turn has run, and keeps the call's own
    * duration in its tooltip. A card rendered on its own falls back to the call.
+   * `workerId` names the worker whose checkout a tool's images live in; null
+   * (the default) is the lead, whose images sit under the project root.
    */
-  let { entry, turnStartedAtMs }: { entry: ToolEntry; turnStartedAtMs?: number } = $props();
+  let {
+    entry,
+    turnStartedAtMs,
+    workerId = null,
+  }: { entry: ToolEntry; turnStartedAtMs?: number; workerId?: string | null } = $props();
   let expanded = $state(false);
   const status = $derived(
     entry.result === null ? "running" : entry.result.success ? "completed" : "failed",
@@ -65,6 +73,9 @@
     });
   });
   const argumentsPreview = $derived(prettyArguments(entry.arguments));
+  /** The images this call took or looked at, shown under the card whatever
+   *  the disclosure state: a thumbnail must not need an expanded card. */
+  const imagePaths = $derived(toolImagePaths(entry.toolName, entry.arguments, entry.result));
 
   // The expanded body, per tool kind — the Mnemo1 CallDetail port: a shell
   // shows its command and its split output, and edits, writes and reads show
@@ -266,6 +277,11 @@
   {#if !expanded && errorSummary}
     <p class="tool-error">{errorSummary}</p>
   {/if}
+  {#if imagePaths.length > 0}
+    <div class="tool-images">
+      <ToolImages paths={imagePaths} {workerId} />
+    </div>
+  {/if}
 </article>
 
 <style>
@@ -311,6 +327,7 @@
      arrives and never shrinks, so the conversation below does not jump. */
   .tool-live { box-sizing: content-box; height: calc(var(--live-rows, 1) * 1lh); margin: 4px 0 2px 26px; padding: 6px 10px; overflow: hidden; }
   .tool-error { margin: 4px 0 4px 26px; color: var(--danger); font-size: var(--text-body); line-height: 1.5; }
+  .tool-images { margin: 6px 0 4px 26px; }
   .tool-spinner { display: grid; place-items: center; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>

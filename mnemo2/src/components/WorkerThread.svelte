@@ -105,7 +105,7 @@
   {/if}
   {#each windowed.visible as entry (entry.id)}
     {#if entry.kind === "tool"}
-      <div class="thread-tool"><ToolActivity {entry} turnStartedAtMs={turnStarts[entry.id]} /></div>
+      <div class="thread-tool"><ToolActivity {entry} turnStartedAtMs={turnStarts[entry.id]} workerId={worker.id} /></div>
     {:else if entry.kind === "error"}
       {#if entry.retrying}
         <div class="thread-error-note" role="status">Provider error, retrying: {entry.body}</div>

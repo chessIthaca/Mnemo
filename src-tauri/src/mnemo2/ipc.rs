@@ -1331,6 +1331,26 @@ pub async fn workbench_screenshot(
     workbench::worker_screenshot(runtime.workspace_root(), &worker, &path).await
 }
 
+/// Read an image a lead or worker tool call took or looked at, for the tool
+/// card's thumbnail. `worker_id` None means the lead (the project root).
+#[tauri::command]
+pub async fn workbench_tool_image(
+    state: State<'_, Mnemo2State>,
+    worker_id: Option<String>,
+    path: String,
+) -> Result<String, String> {
+    let runtime = current(&state).await?;
+    let checkout = match worker_id {
+        Some(id) => {
+            let worker = current_team(&state).await?.worker(&id).await?;
+            workbench::worker_checkout(runtime.workspace_root(), &worker)?
+        }
+        None => dunce::canonicalize(runtime.workspace_root())
+            .map_err(|err| format!("could not resolve the project root: {err}"))?,
+    };
+    workbench::read_tool_image(checkout, &path).await
+}
+
 /// Read worker-to-lead messages.
 #[tauri::command]
 pub async fn team_messages(state: State<'_, Mnemo2State>) -> Result<Vec<TeamMessage>, String> {

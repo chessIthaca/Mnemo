@@ -22,6 +22,16 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 const MAX_UNTRACKED_BYTES: u64 = 1024 * 1024;
 const MAX_SCREENSHOT_BYTES: u64 = 20 * 1024 * 1024;
 
+/// The image formats a tool card can show, by lower-cased extension.
+const TOOL_IMAGE_TYPES: [(&str, &str); 6] = [
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("bmp", "image/bmp"),
+];
+
 /// One rendered unified-diff line with its original line numbers.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DiffLine {
@@ -634,6 +644,79 @@ pub async fn worker_screenshot(
     ))
 }
 
+/// The MIME type an image file's extension names, or None for anything the
+/// tool card cannot render inline.
+pub fn tool_image_mime(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    TOOL_IMAGE_TYPES
+        .iter()
+        .find(|(known, _)| *known == extension.as_str())
+        .map(|(_, mime)| *mime)
+}
+
+/// The checkout a worker's tool images live in (its registered worktree).
+pub fn worker_checkout(root: &Path, worker: &WorkerRecord) -> Result<PathBuf, String> {
+    checkout_path(root, worker)
+}
+
+/// Read an image a tool call took or looked at, as a `data:` URL for the tool
+/// card. `checkout` is the project root for the lead or the worker's worktree;
+/// `requested` is the path the call reported, relative to it or absolute.
+pub async fn read_tool_image(checkout: PathBuf, requested: &str) -> Result<String, String> {
+    let root = dunce::canonicalize(&checkout)
+        .map_err(|err| format!("could not resolve the project root: {err}"))?;
+    // A tool may report a Windows path; every component check below reads the
+    // forward-slash form so both spellings take the same route.
+    let requested = requested.replace('\\', "/");
+    let requested = Path::new(&requested);
+    let path = if requested.is_absolute() {
+        let absolute = dunce::canonicalize(requested)
+            .map_err(|err| format!("could not resolve the image: {err}"))?;
+        if !absolute.starts_with(&root) {
+            return Err("the image is outside the project".to_string());
+        }
+        absolute
+    } else {
+        if requested
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err("not a project image path".to_string());
+        }
+        if matches!(requested.components().next(), Some(Component::Normal(name)) if name == std::ffi::OsStr::new(".git")) {
+            return Err("not a project image path".to_string());
+        }
+        checkout.join(requested)
+    };
+    if sensitive_path(&path) {
+        return Err("not a project image path".to_string());
+    }
+    let mime = tool_image_mime(&path).ok_or_else(|| "not an image file".to_string())?;
+    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let canonical = dunce::canonicalize(&path)
+            .map_err(|err| format!("could not resolve the image: {err}"))?;
+        if !canonical.starts_with(&root) {
+            return Err("the image is outside the project".to_string());
+        }
+        let metadata = std::fs::symlink_metadata(&canonical)
+            .map_err(|err| format!("could not inspect the image: {err}"))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("the image is not a regular file".to_string());
+        }
+        if metadata.len() > MAX_SCREENSHOT_BYTES {
+            return Err("the image exceeds the 20 MiB preview limit".to_string());
+        }
+        read_regular_file(&canonical, MAX_SCREENSHOT_BYTES)
+            .map_err(|err| format!("could not read the image: {err}"))
+    })
+    .await
+    .map_err(|err| format!("image task failed: {err}"))??;
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,5 +942,75 @@ mod tests {
         assert_eq!(merged.files[0].path, "file.txt");
         assert_eq!(merged.total_additions, 1);
         assert!(!checkout.exists());
+    }
+
+    #[test]
+    fn tool_image_mime_by_extension() {
+        assert_eq!(tool_image_mime(Path::new("a/b.PNG")), Some("image/png"));
+        assert_eq!(tool_image_mime(Path::new("x.jpeg")), Some("image/jpeg"));
+        assert_eq!(tool_image_mime(Path::new("x.txt")), None);
+    }
+
+    /// A canonical tempdir standing in for a project root.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("checkout");
+        let root = dunce::canonicalize(dir.path()).expect("canonical checkout");
+        (dir, root)
+    }
+
+    #[tokio::test]
+    async fn read_tool_image_returns_a_data_url() {
+        let (_dir, root) = canonical_tempdir();
+        std::fs::create_dir_all(root.join("shots")).expect("shots");
+        std::fs::write(root.join("shots/a.png"), b"\x89PNG\r\n\x1a\nimage").expect("png");
+        let data = read_tool_image(root, "shots/a.png")
+            .await
+            .expect("data url");
+        assert!(data.starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn read_tool_image_accepts_an_absolute_path_inside() {
+        let (_dir, root) = canonical_tempdir();
+        let image = root.join("shot.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nimage").expect("png");
+        let data = read_tool_image(root, image.to_str().expect("absolute path"))
+            .await
+            .expect("data url");
+        assert!(data.starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn read_tool_image_refuses_parent_paths() {
+        let (_dir, root) = canonical_tempdir();
+        assert!(read_tool_image(root, "../x.png").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_tool_image_refuses_git_and_secrets() {
+        let (_dir, root) = canonical_tempdir();
+        std::fs::create_dir_all(root.join(".git")).expect(".git");
+        std::fs::write(root.join(".git/x.png"), b"\x89PNG\r\n\x1a\nimage").expect("git png");
+        std::fs::write(root.join(".env.png"), b"\x89PNG\r\n\x1a\nimage").expect("secret png");
+        assert!(read_tool_image(root.clone(), ".git/x.png").await.is_err());
+        assert!(read_tool_image(root, ".env.png").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_tool_image_refuses_outside_absolute() {
+        let (_dir, root) = canonical_tempdir();
+        let (_outside_dir, outside) = canonical_tempdir();
+        let image = outside.join("x.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nimage").expect("png");
+        assert!(read_tool_image(root, image.to_str().expect("absolute path"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn read_tool_image_refuses_non_images() {
+        let (_dir, root) = canonical_tempdir();
+        std::fs::write(root.join("notes.txt"), b"text").expect("notes");
+        assert!(read_tool_image(root, "notes.txt").await.is_err());
     }
 }

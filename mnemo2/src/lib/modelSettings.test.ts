@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   EMBEDDER_EVENT_CHANNEL,
+  OPTIMIZER_LEVERS,
   budgetDraft,
   budgetWire,
   createModelSettingsTransport,
@@ -124,6 +125,7 @@ describe("modelSettings", () => {
       quality_score: true,
       lean_output_nudge: true,
       recall_delta: false,
+      idle_compaction: true,
       archive_min_chars: 2400,
       compress_min_chars: 3000,
       lean_output_fill_pct: 80,
@@ -131,6 +133,12 @@ describe("modelSettings", () => {
       compress_extra_commands: ["cargo test"],
     };
     const draft = optimizerDraft(settings);
+    // The idle-compaction lever rides the lever list and its switch rides the payload.
+    expect(OPTIMIZER_LEVERS.find((lever) => lever.key === "idle_compaction")).toMatchObject({
+      key: "idle_compaction",
+      label: "Idle compaction",
+    });
+    expect(optimizerWire(optimizerDraft({ ...settings, idle_compaction: false })).value?.idle_compaction).toBe(false);
     draft.lean_output_fill_pct = "75";
     draft.compress_extra_commands = "cargo clippy,  npm test ";
     const parsed = optimizerWire(draft);

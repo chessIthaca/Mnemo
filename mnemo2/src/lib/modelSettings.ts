@@ -59,6 +59,7 @@ export interface OptimizerSettings {
   quality_score: boolean;
   lean_output_nudge: boolean;
   recall_delta: boolean;
+  idle_compaction: boolean;
   archive_min_chars: number;
   compress_min_chars: number;
   lean_output_fill_pct: number;
@@ -122,6 +123,7 @@ export const OPTIMIZER_LEVERS: readonly OptimizerLever[] = [
   { key: "quality_score", label: "Context quality score", explanation: "Track the S-F context-quality score on usage events." },
   { key: "lean_output_nudge", label: "Lean-output nudge", explanation: "Nudge for shorter answers while the context is nearly full." },
   { key: "recall_delta", label: "Recall deltas", explanation: "Re-inject only the changed part of a recalled memory." },
+  { key: "idle_compaction", label: "Idle compaction", explanation: "Summarize an idle conversation with the compaction model once its cache has gone cold." },
 ];
 
 /** One optimizer knob: a small number input with its own explanation. */
@@ -166,6 +168,7 @@ export function optimizerDraft(settings: OptimizerSettings): OptimizerDraft {
     quality_score: settings.quality_score,
     lean_output_nudge: settings.lean_output_nudge,
     recall_delta: settings.recall_delta,
+    idle_compaction: settings.idle_compaction,
     archive_min_chars: String(settings.archive_min_chars),
     compress_min_chars: String(settings.compress_min_chars),
     lean_output_fill_pct: String(settings.lean_output_fill_pct),
@@ -221,6 +224,7 @@ export function optimizerWire(draft: OptimizerDraft): { value?: Partial<Optimize
     quality_score: draft.quality_score,
     lean_output_nudge: draft.lean_output_nudge,
     recall_delta: draft.recall_delta,
+    idle_compaction: draft.idle_compaction,
   };
   type KnobKey = "archive_min_chars" | "compress_min_chars" | "lean_output_fill_pct" | "nudge_cooldown_requests";
   const numbers: [KnobKey, string, string, (n: number) => boolean][] = [

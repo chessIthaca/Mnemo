@@ -104,6 +104,7 @@ function previewSettings(): ModelSettings {
       quality_score: true,
       lean_output_nudge: true,
       recall_delta: false,
+      idle_compaction: true,
       archive_min_chars: 2400,
       compress_min_chars: 3000,
       lean_output_fill_pct: 80,

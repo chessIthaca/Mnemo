@@ -201,6 +201,10 @@ const LEVERS: Record<string, { label: string; explanation: string }> = {
     label: "Compaction",
     explanation: "A summary replaces the older conversation once the context fills up.",
   },
+  idle_compaction: {
+    label: "Idle compaction",
+    explanation: "An idle conversation is summarized by the compaction model once its cache goes cold, so the next message does not resend the whole context.",
+  },
   outline_followup: {
     label: "Outline follow-ups",
     explanation: "Ranged reads of an outlined file, counted against what the outline saved.",

@@ -1729,6 +1729,7 @@ mod settings_dto_tests {
         assert_eq!(v["general"]["optimizer"]["archive"], true);
         assert_eq!(v["general"]["optimizer"]["delta_reads"], true);
         assert_eq!(v["general"]["optimizer"]["recall_delta"], true);
+        assert_eq!(v["general"]["optimizer"]["idle_compaction"], true);
         assert_eq!(v["general"]["optimizer"]["quality_score"], true);
         assert_eq!(
             v["general"]["optimizer"]["archive_min_chars"],

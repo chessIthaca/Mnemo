@@ -22,6 +22,7 @@ function sampleSettings(): ModelSettings {
       quality_score: true,
       lean_output_nudge: true,
       recall_delta: false,
+      idle_compaction: true,
       archive_min_chars: 2400,
       compress_min_chars: 3000,
       lean_output_fill_pct: 80,
@@ -73,6 +74,7 @@ describe("SavingsPage", () => {
       quality_score: true,
       lean_output_nudge: true,
       recall_delta: false,
+      idle_compaction: true,
       archive_min_chars: 2400,
       compress_min_chars: 3000,
       lean_output_fill_pct: 80,
@@ -80,6 +82,29 @@ describe("SavingsPage", () => {
       compress_extra_commands: ["cargo test", "npm run build"],
     }));
     expect(await screen.findByText("Applies after reopening the project.")).toBeTruthy();
+  });
+
+  it("shows the idle-compaction switch checked by default, and saving a toggle-off carries idle_compaction: false", async () => {
+    const made = page();
+    const idle = await screen.findByRole("checkbox", { name: /Idle compaction/ });
+    expect((idle as HTMLInputElement).checked).toBe(true);
+    await fireEvent.click(idle);
+    await fireEvent.click(screen.getByRole("button", { name: "Save levers" }));
+    await waitFor(() => expect(made.transport.save).toHaveBeenCalledWith("optimizer", {
+      delta_reads: true,
+      compress_output: true,
+      archive: true,
+      compaction_survival: true,
+      quality_score: true,
+      lean_output_nudge: true,
+      recall_delta: false,
+      idle_compaction: false,
+      archive_min_chars: 2400,
+      compress_min_chars: 3000,
+      lean_output_fill_pct: 80,
+      nudge_cooldown_requests: 4,
+      compress_extra_commands: ["cargo test", "npm run build"],
+    }));
   });
 
   it("saves edited knobs with the extra commands split on commas", async () => {

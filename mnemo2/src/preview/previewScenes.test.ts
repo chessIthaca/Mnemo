@@ -247,7 +247,9 @@ describe("preview scenes", () => {
     expect(insights?.cost.models.length).toBe(3);
     expect(insights?.cost.unpriced_models).toEqual(["ollama/qwen3:32b"]);
     expect(insights?.cost.per_day).toHaveLength(14);
-    expect(insights?.savings.levers.some((lever) => lever.kind === "delta_read")).toBe(true);
+    expect(insights?.savings.levers.some((lever) => lever.kind === "outline")).toBe(true);
+    // The retired levers are not in the sample: the engine never reports them.
+    expect(insights?.savings.levers.some((lever) => lever.kind === "delta_read" || lever.kind === "skeleton")).toBe(false);
     // The label table dropped `truncation` — nothing emits it any more.
     expect(insights?.savings.levers.some((lever) => lever.kind === "truncation")).toBe(false);
   });

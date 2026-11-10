@@ -50,7 +50,7 @@ const savings = (overrides: Partial<SavingsReport> = {}): SavingsReport => ({
   tokens_saved: 1_080_000,
   estimated_saved_micros: 180_000,
   levers: [
-    { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000, estimated_cost_micros: null },
+    { kind: "compression", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000, estimated_cost_micros: null },
     { kind: "archive_expand", events: 6, tokens_saved: -120_000, estimated_saved_micros: 0, estimated_cost_micros: 20_000 },
   ],
   cache: { prompt_tokens: 2_000_000, cached_tokens: 1_540_000, hit_rate: 0.77, estimated_saved_micros: 120_000 },
@@ -101,7 +101,7 @@ describe("CostView", () => {
     expect(screen.getByText("no price")).toBeTruthy();
 
     // Savings with a friendly lever name, and the cache hit rate.
-    expect(screen.getByText("Delta reads")).toBeTruthy();
+    expect(screen.getByText("Output compression")).toBeTruthy();
     expect(screen.getByText("77%")).toBeTruthy();
 
     // The expansion is a cost row: re-added tokens and what they cost.
@@ -192,6 +192,6 @@ describe("CostView", () => {
     render(CostView);
     // The seeded reports render without any transport at all.
     expect(screen.getByText("$2.10")).toBeTruthy();
-    expect(screen.getByText("Delta reads")).toBeTruthy();
+    expect(screen.getByText("Output compression")).toBeTruthy();
   });
 });

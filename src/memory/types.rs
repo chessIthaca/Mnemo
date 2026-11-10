@@ -657,8 +657,10 @@ pub struct SavingsEvent {
     pub session_id: Option<String>,
     /// The lever that produced the event: `truncation`, `compaction`
     /// (the existing levers, instrumented by backlog 652ae094) or the
-    /// optimizer kinds `delta_read`, `skeleton`, `compression`, `archive`,
-    /// `archive_expand`, `compaction_checkpoint`.
+    /// optimizer kinds `outline`, `outline_followup`, `compression`,
+    /// `archive`, `archive_expand`, `recall_delta`, `old_result_trim`,
+    /// `compaction_checkpoint`. Older rows may carry the retired
+    /// `delta_read` and `skeleton`, which the reports skip.
     pub kind: String,
     /// Free-form detail — the file path, the command line, or the archive
     /// id, depending on the kind.
@@ -758,7 +760,7 @@ pub struct SavingsStats {
 /// One lever kind's savings — a row in the Dashboard's per-kind table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SavingsKindBreakdown {
-    /// The lever kind (`truncation`, `compaction`, `delta_read`, …).
+    /// The lever kind (`truncation`, `compaction`, `outline`, …).
     pub kind: String,
     /// Number of events of this kind.
     pub event_count: u64,

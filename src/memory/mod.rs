@@ -203,6 +203,24 @@ pub const LEDGER_BASELINE_CAP_TOKENS: i64 = 25_000;
 /// cached re-sends.
 pub const SAVED_TOKEN_LIFETIME_REQUESTS: u32 = 15;
 
+/// Savings kinds whose levers the engine no longer has: delta reads
+/// (`delta_read`) and signature skeletons (`skeleton`). Their rows stay in
+/// `savings_events`, and [`MemoryStoreTrait::savings_events_rows`] still
+/// returns them, but the reports ([`MemoryStoreTrait::savings_stats`] and
+/// [`MemoryStoreTrait::savings_valuation`]) skip them, so the Cost tab and the
+/// dashboard list, total and chart only levers that still run.
+pub(crate) const RETIRED_SAVINGS_KINDS: &[&str] = &["delta_read", "skeleton"];
+
+/// The SQL condition that keeps only reported kinds, built from
+/// [`RETIRED_SAVINGS_KINDS`]: `kind NOT IN ('delta_read','skeleton')`.
+fn reported_kinds_sql() -> String {
+    let quoted: Vec<String> = RETIRED_SAVINGS_KINDS
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect();
+    format!("kind NOT IN ({})", quoted.join(","))
+}
+
 /// The SQL expression for one ledger row's honest saving.
 ///
 /// `archive` and `compression` rows are credited
@@ -499,14 +517,16 @@ pub trait MemoryStoreTrait: Send + Sync {
     /// Aggregate the `savings_events` ledger for the Dashboard view (backlog
     /// 652ae094): metered totals, a per-kind and a per-day breakdown, the most
     /// recent events, and the project's prompt-cache efficiency. An empty
-    /// ledger yields zeroed/empty fields, never an error.
+    /// ledger yields zeroed/empty fields, never an error. Rows of retired
+    /// kinds ([`RETIRED_SAVINGS_KINDS`]) are skipped.
     async fn savings_stats(&self) -> Result<SavingsStats>;
 
     /// The two reads that let the Cost tab value the ledger honestly: the
     /// savings grouped by (session, kind, later requests), and per-(session,
     /// model) prompt volume so each session's saved tokens can be priced at
     /// the rates it actually paid. `compaction_checkpoint` rows are bookkeeping
-    /// markers, not levers, and are excluded.
+    /// markers, not levers, and are excluded. Rows of retired kinds
+    /// ([`RETIRED_SAVINGS_KINDS`]) are skipped.
     async fn savings_valuation(&self) -> Result<SavingsValuation>;
 
     /// Record one per-decision spend row (the budget layer's ledger, backlog
@@ -2665,8 +2685,10 @@ impl MemoryStoreTrait for MemoryStore {
             // Totals. The ledger is empty on a fresh project, and the Dashboard
             // must render an honest empty state rather than an error.
             let saved = saved_tokens_sql();
+            // Retired kinds stay in the ledger but are not reported.
+            let reported = reported_kinds_sql();
             let (total, count) = conn.query_row(
-                &format!("SELECT COALESCE(SUM({saved}), 0), COUNT(*) FROM savings_events"),
+                &format!("SELECT COALESCE(SUM({saved}), 0), COUNT(*) FROM savings_events WHERE {reported}"),
                 [],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )?;
@@ -2675,7 +2697,7 @@ impl MemoryStoreTrait for MemoryStore {
             // Per-kind breakdown, biggest saver first. Ties break on the kind
             // name so the ordering is deterministic across runs.
             let mut stmt = conn.prepare(&format!(
-                "SELECT kind, COUNT(*), COALESCE(SUM({saved}), 0) FROM savings_events GROUP BY kind ORDER BY SUM({saved}) DESC, kind"
+                "SELECT kind, COUNT(*), COALESCE(SUM({saved}), 0) FROM savings_events WHERE {reported} GROUP BY kind ORDER BY SUM({saved}) DESC, kind"
             ))?;
             let kind_rows = stmt.query_map([], |row| {
                 Ok(SavingsKindBreakdown {
@@ -2694,7 +2716,7 @@ impl MemoryStoreTrait for MemoryStore {
             // project_stats — this holds the epoch DAY, not day-start seconds —
             // so the frontend multiplies by 86_400_000 ms, not 1000.
             let mut stmt2 = conn.prepare(&format!(
-                "SELECT created_at / 86400 AS day, COUNT(*), COALESCE(SUM({saved}), 0) FROM savings_events GROUP BY day ORDER BY day"
+                "SELECT created_at / 86400 AS day, COUNT(*), COALESCE(SUM({saved}), 0) FROM savings_events WHERE {reported} GROUP BY day ORDER BY day"
             ))?;
             let day_rows = stmt2.query_map([], |row| {
                 Ok(SavingsDayBreakdown {
@@ -2711,9 +2733,9 @@ impl MemoryStoreTrait for MemoryStore {
             // Recent events, newest first. Bounded so the IPC payload can never
             // grow without limit as a project's ledger accumulates.
             const RECENT_LIMIT: i64 = 50;
-            let mut stmt3 = conn.prepare(
-                "SELECT id, session_id, kind, detail, tokens_before, tokens_after, tokens_saved, measured, created_at FROM savings_events ORDER BY created_at DESC, id DESC LIMIT ?1",
-            )?;
+            let mut stmt3 = conn.prepare(&format!(
+                "SELECT id, session_id, kind, detail, tokens_before, tokens_after, tokens_saved, measured, created_at FROM savings_events WHERE {reported} ORDER BY created_at DESC, id DESC LIMIT ?1"
+            ))?;
             let recent_rows = stmt3.query_map(params![RECENT_LIMIT], |row| {
                 Ok(SavingsEvent {
                     id: row.get(0)?,
@@ -2792,10 +2814,11 @@ impl MemoryStoreTrait for MemoryStore {
             // grouped by (session, kind, how many requests followed) — the
             // re-send count the valuation prices at the cached rate.
             let saved = saved_tokens_sql();
+            let reported = reported_kinds_sql();
             let mut groups: BTreeMap<(Option<String>, String, u32), (u64, i64)> = BTreeMap::new();
             let mut stmt = conn.prepare(&format!(
                 "SELECT session_id, kind, created_at, {saved} FROM savings_events \
-                 WHERE kind <> 'compaction_checkpoint'"
+                 WHERE kind <> 'compaction_checkpoint' AND {reported}"
             ))?;
             let rows = stmt.query_map([], |row| {
                 Ok((

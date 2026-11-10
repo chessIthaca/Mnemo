@@ -1363,11 +1363,9 @@ function previewCostInsights(): CostInsights {
       per_day: spendPerDay.map((costMicros, index) => ({ day: day(index), cost_micros: costMicros })),
     },
     savings: {
-      tokens_saved: 8_956_000,
-      estimated_saved_micros: 2_297_000,
+      tokens_saved: 2_866_000,
+      estimated_saved_micros: 702_000,
       levers: [
-        { kind: "delta_read", events: 1_240, tokens_saved: 4_180_000, estimated_saved_micros: 1_090_000, estimated_cost_micros: null },
-        { kind: "skeleton", events: 862, tokens_saved: 1_910_000, estimated_saved_micros: 505_000, estimated_cost_micros: null },
         { kind: "recall_delta", events: 214, tokens_saved: 1_060_000, estimated_saved_micros: 280_000, estimated_cost_micros: null },
         { kind: "compression", events: 388, tokens_saved: 940_000, estimated_saved_micros: 248_000, estimated_cost_micros: null },
         { kind: "archive", events: 46, tokens_saved: 580_000, estimated_saved_micros: 153_000, estimated_cost_micros: null },

@@ -736,6 +736,13 @@ pub struct OptimizerConfig {
     /// request, so the reference is a pointer the model dereferences with
     /// `memory_search`. On by default.
     pub recall_delta: bool,
+    /// **Idle compaction.** When `true`, an agent conversation of at least
+    /// 50,000 tokens that has sat idle past its model's measured prompt-cache
+    /// lifetime is summarized by the compaction model (`[models.summarize]`),
+    /// so the next message does not resend the whole context at the uncached
+    /// rate. Needs a compaction model that differs from the agent's model;
+    /// without one it does nothing. On by default.
+    pub idle_compaction: bool,
     /// Minimum length (chars) of a tool result before lever 3 archives
     /// it. Results under the cap pass through the existing ingestion cap
     /// unchanged.
@@ -781,6 +788,7 @@ impl OptimizerConfig {
             && self.quality_score
             && self.lean_output_nudge
             && self.recall_delta
+            && self.idle_compaction
             && self.archive_min_chars == Self::DEFAULT_ARCHIVE_MIN_CHARS
             && self.compress_min_chars == Self::DEFAULT_COMPRESS_MIN_CHARS
             && self.lean_output_fill_pct == Self::DEFAULT_LEAN_OUTPUT_FILL_PCT
@@ -799,6 +807,7 @@ impl Default for OptimizerConfig {
             quality_score: true,
             lean_output_nudge: true,
             recall_delta: true,
+            idle_compaction: true,
             archive_min_chars: Self::DEFAULT_ARCHIVE_MIN_CHARS,
             compress_min_chars: Self::DEFAULT_COMPRESS_MIN_CHARS,
             lean_output_fill_pct: Self::DEFAULT_LEAN_OUTPUT_FILL_PCT,
@@ -2022,6 +2031,7 @@ auto_type_memories = true
         assert!(cfg.general.optimizer.quality_score);
         assert!(cfg.general.optimizer.lean_output_nudge);
         assert!(cfg.general.optimizer.recall_delta);
+        assert!(cfg.general.optimizer.idle_compaction);
         assert_eq!(
             cfg.general.optimizer.archive_min_chars,
             OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS
@@ -2063,6 +2073,27 @@ recall_delta = false
         let back = toml::to_string(&cfg).unwrap();
         let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
         assert!(!cfg2.general.optimizer.recall_delta);
+
+        let only_idle = r#"
+[general.optimizer]
+idle_compaction = false
+"#;
+        let cfg: GeneralConfig = toml::from_str(only_idle).unwrap();
+        assert!(
+            !cfg.general.optimizer.idle_compaction,
+            "an explicit opt-out is honoured"
+        );
+        assert!(
+            cfg.general.optimizer.recall_delta,
+            "an unnamed lever keeps its default"
+        );
+        assert!(
+            !cfg.general.optimizer.is_default(),
+            "an opted-out lever counts as touched"
+        );
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(!cfg2.general.optimizer.idle_compaction);
 
         // Untouched: no serialized trace; touched: is_default flips.
         assert!(OptimizerConfig::default().is_default());

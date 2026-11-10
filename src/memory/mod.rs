@@ -203,6 +203,52 @@ pub const LEDGER_BASELINE_CAP_TOKENS: i64 = 25_000;
 /// cached re-sends.
 pub const SAVED_TOKEN_LIFETIME_REQUESTS: u32 = 15;
 
+/// Idle gaps (seconds) at which [`cache_lifetime_from_gaps`] tests whether a
+/// model's prompt cache has gone cold, shortest first.
+pub const CACHE_LIFETIME_PROBES_SECS: [i64; 7] = [300, 600, 900, 1200, 1800, 2700, 3600];
+
+/// Fewest gap samples a probe window needs before it can decide.
+const CACHE_LIFETIME_MIN_SAMPLES: usize = 3;
+
+/// Requests smaller than this are left out of the measurement: a small
+/// prompt's cache share says little about the provider's cache.
+const CACHE_LIFETIME_MIN_PROMPT_TOKENS: i64 = 20_000;
+
+/// Only the last 30 days of requests are measured, so a provider change
+/// shows up within a month.
+const CACHE_LIFETIME_WINDOW_SECS: i64 = 30 * 86_400;
+
+/// The idle gap after which a model's prompt cache is mostly cold, from
+/// `(gap_secs, hit_ratio)` samples: each sample is one request, the gap since
+/// the previous request of the same session on the same model, and the share
+/// of its prompt served from cache (0.0..=1.0).
+///
+/// For each probe `p` in [`CACHE_LIFETIME_PROBES_SECS`], shortest first, the
+/// window is the samples with `p <= gap < 2 * p`. The first probe whose window
+/// holds at least [`CACHE_LIFETIME_MIN_SAMPLES`] samples and whose mean hit
+/// ratio is below 0.5 is the lifetime. `None` when no probe decides (too
+/// little data, or the cache outlives an hour).
+pub fn cache_lifetime_from_gaps(samples: &[(i64, f64)]) -> Option<u64> {
+    CACHE_LIFETIME_PROBES_SECS
+        .iter()
+        .copied()
+        .find_map(|probe| {
+            let mut count = 0usize;
+            let mut sum = 0.0f64;
+            for &(gap, ratio) in samples {
+                if gap >= probe && gap < 2 * probe {
+                    count += 1;
+                    sum += ratio;
+                }
+            }
+            if count >= CACHE_LIFETIME_MIN_SAMPLES && sum / (count as f64) < 0.5 {
+                Some(probe as u64)
+            } else {
+                None
+            }
+        })
+}
+
 /// Savings kinds whose levers the engine no longer has: delta reads
 /// (`delta_read`) and signature skeletons (`skeleton`). Their rows stay in
 /// `savings_events`, and [`MemoryStoreTrait::savings_events_rows`] still
@@ -528,6 +574,11 @@ pub trait MemoryStoreTrait: Send + Sync {
     /// markers, not levers, and are excluded. Rows of retired kinds
     /// ([`RETIRED_SAVINGS_KINDS`]) are skipped.
     async fn savings_valuation(&self) -> Result<SavingsValuation>;
+
+    /// How long `model`'s prompt cache survives an idle gap, measured from
+    /// this project's own `request_stats` over the last 30 days (see
+    /// [`cache_lifetime_from_gaps`]). `None` when the data cannot decide.
+    async fn cache_lifetime_secs(&self, model: &str) -> Result<Option<u64>>;
 
     /// Record one per-decision spend row (the budget layer's ledger, backlog
     /// a25a5323): the plan, step, lane, model and token cost of one request,
@@ -2889,6 +2940,58 @@ impl MemoryStoreTrait for MemoryStore {
         })
         .await
         .map_err(|e| Error::Memory(format!("savings_valuation task failed: {e}")))?
+    }
+
+    async fn cache_lifetime_secs(&self, model: &str) -> Result<Option<u64>> {
+        let since = (self.now)() - CACHE_LIFETIME_WINDOW_SECS;
+        let model = model.to_string();
+        let read_conn = self.read_conn().clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
+            let conn = read_conn.lock().expect("read conn lock poisoned");
+            // One row per request the agent main loop made on this model with
+            // a reported cache share, oldest first per session — the gaps
+            // between consecutive rows of a session are that session's idle
+            // gaps. `summarize` rows are compaction's own calls: their prompt
+            // says nothing about the agent conversation's cache.
+            let mut stmt = conn.prepare(
+                "SELECT session_id, created_at, prompt_tokens, cached_tokens \
+                 FROM request_stats \
+                 WHERE model = ?1 AND session_id IS NOT NULL AND cached_tokens IS NOT NULL \
+                 AND prompt_tokens >= ?2 AND created_at >= ?3 \
+                 AND (purpose IS NULL OR purpose <> 'summarize') \
+                 ORDER BY session_id, created_at",
+            )?;
+            let rows = stmt.query_map(
+                params![model, CACHE_LIFETIME_MIN_PROMPT_TOKENS, since],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            let mut samples: Vec<(i64, f64)> = Vec::new();
+            let mut prev: Option<(String, i64)> = None;
+            for row in rows {
+                let (session_id, created_at, prompt_tokens, cached_tokens) = row.map_err(|e| {
+                    Error::Memory(format!("cache_lifetime_secs request read failed: {e}"))
+                })?;
+                if let Some((prev_session, prev_at)) = prev.as_ref() {
+                    // Only two requests of the SAME session measure a gap; a
+                    // zero-prompt row carries no cache share to weigh.
+                    if *prev_session == session_id && created_at > *prev_at && prompt_tokens > 0 {
+                        let ratio = (cached_tokens as f64 / prompt_tokens as f64).clamp(0.0, 1.0);
+                        samples.push((created_at - prev_at, ratio));
+                    }
+                }
+                prev = Some((session_id, created_at));
+            }
+            Ok(cache_lifetime_from_gaps(&samples))
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("cache_lifetime_secs task failed: {e}")))?
     }
 
     async fn prune_tool_result_archive(&self, older_than_secs: i64, batch: usize) -> Result<usize> {

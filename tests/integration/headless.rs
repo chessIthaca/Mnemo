@@ -1120,6 +1120,9 @@ impl MemoryStoreTrait for LoggingStore {
     async fn savings_valuation(&self) -> MemResult<SavingsValuation> {
         self.inner.savings_valuation().await
     }
+    async fn cache_lifetime_secs(&self, model: &str) -> MemResult<Option<u64>> {
+        self.inner.cache_lifetime_secs(model).await
+    }
     async fn record_spend_event(&self, event: &SpendEvent) -> MemResult<()> {
         self.inner.record_spend_event(event).await
     }

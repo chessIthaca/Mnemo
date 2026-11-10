@@ -125,6 +125,10 @@ pub struct AgentTask {
     /// `run_idle_compaction` resets it before each attempt to tell a committed
     /// summary from an abandoned one.
     compaction_committed: bool,
+    /// Set by `compact_context` once its `Compacted` send completes;
+    /// `run_idle_compaction` resets it with `compaction_committed` so a
+    /// committed hard cut sends the end only when it is still missing.
+    compaction_end_sent: bool,
 }
 
 /// Maximum consecutive auto-continue turns before the agent parks for user
@@ -277,6 +281,7 @@ impl AgentTask {
             idle_since: None,
             cache_lifetime: None,
             compaction_committed: false,
+            compaction_end_sent: false,
         }
     }
 
@@ -1643,6 +1648,7 @@ impl AgentTask {
                     },
                 ))
                 .await;
+            self.compaction_end_sent = true;
             // The session's temporary raise (backlog 11513ee5): a manual or
             // run-all between-items compaction that STILL leaves the
             // conversation over the summarize limit raises the effective limit
@@ -1777,6 +1783,7 @@ impl AgentTask {
         }
         let before = crate::agent::context::ContextManager::count_tokens(&self.messages);
         self.compaction_committed = false;
+        self.compaction_end_sent = false;
         // The summarizer receives only the soft Interrupt sent below, never
         // the user's actual command. The named sender stays alive for the
         // whole race so the quiet receiver never reports closed.
@@ -1837,18 +1844,21 @@ impl AgentTask {
                     false,
                 );
             }
-            if hard_cut {
-                // The dropped future may not have delivered Compacted. Do not
-                // await here: this path exists precisely because the bounded
-                // fan-in is full, and the user's command must still run. A
-                // duplicate after an already-delivered Compacted is harmless.
-                let _ = fanin_tx.try_send((
-                    self.id,
-                    AgentEvent::Compacted {
-                        before: before as u32,
-                        after: after as u32,
-                    },
-                ));
+            if hard_cut && !self.compaction_end_sent {
+                // The dropped future had not delivered Compacted. Await the
+                // pairing end: the stashed command's own handling sends through
+                // this same fan-in, so it cannot get ahead of a full channel
+                // anyway. If compact_context already sent Compacted, the flag
+                // above suppresses a duplicate transcript entry.
+                let _ = fanin_tx
+                    .send((
+                        self.id,
+                        AgentEvent::Compacted {
+                            before: before as u32,
+                            after: after as u32,
+                        },
+                    ))
+                    .await;
             }
         } else if hard_cut {
             // Stalled before streaming, or otherwise still uncommitted after
@@ -7875,21 +7885,19 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// If fan-in backpressure holds compact_context AFTER it commits the
-    /// summary, a command can trigger the hard-cut grace. The applied summary
-    /// is then kept, its savings row is recorded, and the command is returned
-    /// for the normal run-loop arms — never misreported as "original kept".
-    #[tokio::test(start_paused = true)]
-    async fn a_cut_after_the_summary_commits_keeps_the_compaction() {
+    /// Drive a committed idle compaction into fan-in backpressure, send a
+    /// Prompt, and drain only after the hard-cut grace. The resumed turn must
+    /// produce its output, exactly one Compacted must pair CompactStarted, no
+    /// "original kept" stop note may appear, the savings row must persist, and
+    /// closing the inbox must let the task exit.
+    async fn committed_cut_scenario(context: Option<(usize, f64)>, fanin_capacity: usize) {
         use crate::memory::MemoryStoreTrait;
 
         let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
         let store = Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
-        // Disable only the checkpoint lever: with a store it would await an
-        // archive write before the summary, allowing the queued command to
-        // interrupt BEFORE the commit. This test needs the deterministic
-        // post-commit layout, and compact_context still has exactly one
-        // pre-commit fan-in send (CompactStarted).
+        // Disable only the checkpoint lever: its archive await could let the
+        // command interrupt before the commit. With it off, CompactStarted is
+        // the sole pre-commit fan-in send.
         let optimizer = Arc::new(std::sync::RwLock::new(crate::config::OptimizerConfig {
             compaction_survival: false,
             ..Default::default()
@@ -7905,12 +7913,46 @@ mod tests {
             None,
         );
         task.session_id = Some("s1".into());
+        if let Some((max_tokens, fill_rate)) = context {
+            // Prove this fixture leaves the compacted conversation over the
+            // summarize limit: compaction_fit must emit a raise note AFTER
+            // Compacted. Use a probe so the task's own ladder is untouched.
+            let mut expected = vec![
+                Message::system("system prompt"),
+                Message::system("## Conversation summary\n\nidle summary"),
+            ];
+            expected.extend(task.messages[task.messages.len() - 6..].iter().cloned());
+            let after = ContextManager::count_tokens(&expected);
+            // A zero synthetic headroom keeps the raise cap above the base
+            // trigger (the default 32k headroom would saturate a 20k window).
+            let probe = ContextManager::new(max_tokens, fill_rate).with_preflight(true, 0);
+            assert!(
+                matches!(
+                    probe.compaction_fit(after),
+                    crate::agent::context::CompactionFit::Raised { .. }
+                ),
+                "the post-Compacted fixture must reach the raise-note send"
+            );
+            *task
+                .agent_loop
+                .context_manager
+                .write()
+                .expect("context_manager lock poisoned") =
+                ContextManager::new(max_tokens, fill_rate).with_preflight(true, 0);
+        }
 
-        // Capacity 1 admits CompactStarted and then applies backpressure to
-        // the first post-commit send (ContextUsage). Keep the receiver alive
-        // and DO NOT drain it: the grace must release the command anyway.
-        let (fanin_tx, _fanin_rx) = mpsc::channel(1);
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(fanin_capacity);
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let agent_loop = task.agent_loop.clone();
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        // Let the idle deadline fire and the compaction reach the blocked
+        // fan-in send. Do not read CompactStarted: that would release the very
+        // backpressure this scenario needs.
+        tokio::time::sleep(std::time::Duration::from_secs(
+            IDLE_CACHE_LIFETIME_FALLBACK_SECS + 1,
+        ))
+        .await;
         cmd_tx
             .send(AgentCommand::Prompt {
                 text: "after commit".into(),
@@ -7918,29 +7960,54 @@ mod tests {
             })
             .await
             .unwrap();
-
-        let start = tokio::time::Instant::now();
-        let end = task.run_idle_compaction(&fanin_tx, &mut cmd_rx).await;
-        assert!(
-            start.elapsed() >= IDLE_CUT_GRACE,
-            "the post-commit blocked send must be released by the grace"
-        );
-        match end {
-            IdleEnd::Command(Some(AgentCommand::Prompt { text, images })) => {
-                assert_eq!(text, "after commit");
-                assert!(images.is_empty());
-            }
-            _ => panic!("the stashed prompt must be returned"),
+        // Let the soft-interrupt grace expire before draining. A missing
+        // Compacted compensation is now awaiting fan-in capacity; an already
+        // sent Compacted needs no compensation.
+        tokio::time::sleep(IDLE_CUT_GRACE + std::time::Duration::from_secs(1)).await;
+        if context.is_some() {
+            // compact_context cloned the tiny manager and already exercised
+            // the raise-note stall. Restore a normal window before the resumed
+            // turn so the fill-rate trigger does not start a SECOND compaction.
+            *agent_loop
+                .context_manager
+                .write()
+                .expect("context_manager lock poisoned") =
+                ContextManager::new(400_000, 0.9);
         }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let mut started = 0;
+        let mut compacted = 0;
+        let mut stop_note = false;
+        let mut saw_output = false;
+        let mut turn_finished = false;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            match event {
+                AgentEvent::CompactStarted => started += 1,
+                AgentEvent::Compacted { .. } => compacted += 1,
+                AgentEvent::Error { error, .. }
+                    if error.starts_with("Idle compaction stopped") =>
+                {
+                    stop_note = true;
+                }
+                AgentEvent::TextDelta(text) if text == "Done!" => saw_output = true,
+                AgentEvent::Finished { .. } => {
+                    turn_finished = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(turn_finished, "the resumed Prompt must finish its turn");
+        assert!(saw_output, "the resumed turn's Done! output must arrive");
+        assert_eq!(started, 1, "exactly one compaction must start");
+        assert_eq!(
+            compacted, 1,
+            "a committed hard cut must deliver exactly one Compacted"
+        );
         assert!(
-            task.messages.iter().any(|message| {
-                message.role == Role::System
-                    && message
-                        .content
-                        .as_text()
-                        .starts_with("## Conversation summary")
-            }),
-            "a cut after the commit must keep the applied summary"
+            !stop_note,
+            "a committed summary must not claim the original was kept"
         );
 
         let mut savings = None;
@@ -7958,7 +8025,37 @@ mod tests {
             savings.is_some(),
             "a committed summary must record its idle_compaction savings row"
         );
+
         drop(cmd_tx);
+        // Live Spend events can follow Finished on a capacity-1 fan-in. Drain
+        // them (and Exited) so the task's final send cannot remain blocked.
+        let exit_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let mut saw_exited = false;
+        while let Some(event) = next_event(&mut fanin_rx, exit_deadline).await {
+            if matches!(event, AgentEvent::Exited) {
+                saw_exited = true;
+                break;
+            }
+        }
+        assert!(saw_exited, "closing the inbox must make the agent exit");
+        handle.await.expect("the agent task must complete");
+    }
+
+    /// Capacity 1 blocks the post-commit ContextUsage, BEFORE compact_context
+    /// can send Compacted. The hard cut therefore exercises the compensating
+    /// awaited Compacted path.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_after_commit_under_fanin_backpressure_records_the_savings() {
+        committed_cut_scenario(None, 1).await;
+    }
+
+    /// Capacity 3 admits CompactStarted, ContextUsage and Compacted, then the
+    /// forced raise-note send blocks. compact_context already sent the end, so
+    /// the hard cut must NOT add a second Compacted.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_after_compacted_was_sent_does_not_duplicate_the_end() {
+        committed_cut_scenario(Some((20_000, 0.1)), 3).await;
     }
 
     /// The dedicated summarizer is re-checked when the timer fires, not only

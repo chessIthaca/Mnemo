@@ -57,7 +57,7 @@ const savings = (overrides: Partial<SavingsReport> = {}): SavingsReport => ({
   tokens_saved: 1_160_000,
   estimated_saved_micros: 180_000,
   levers: [
-    { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000, estimated_cost_micros: null },
+    { kind: "compression", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000, estimated_cost_micros: null },
     { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: 0, estimated_cost_micros: 20_000 },
   ],
   cache: { prompt_tokens: 2_000_000, cached_tokens: 1_540_000, hit_rate: 0.77, estimated_saved_micros: 120_000 },
@@ -72,7 +72,7 @@ const savings = (overrides: Partial<SavingsReport> = {}): SavingsReport => ({
 
 describe("lever names", () => {
   it("maps every ledger kind to a friendly name and a one-line explanation", () => {
-    expect(leverLabel("delta_read")).toBe("Delta reads");
+    expect(leverLabel("compression")).toBe("Output compression");
     expect(leverLabel("old_result_trim")).toBe("Old results trimmed");
     // Dropped from the table: a checkpoint still prettifies through the
     // fallback rather than rendering as its raw id.
@@ -148,8 +148,8 @@ describe("costViewModel", () => {
   it("gives every lever a friendly name, an explanation and a dollar figure", () => {
     const view = costViewModel(cost(), savings());
     expect(view.levers[0]).toMatchObject({
-      kind: "delta_read",
-      label: "Delta reads",
+      kind: "compression",
+      label: "Output compression",
       metaLabel: "1,200,000 tokens · 40 events",
       costLabel: "≈ $0.18",
     });
@@ -174,7 +174,7 @@ describe("costViewModel", () => {
     // token count and stays silent about dollars.
     const unpriced = savings({
       levers: [
-        { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: null, estimated_cost_micros: null },
+        { kind: "compression", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: null, estimated_cost_micros: null },
         { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: null, estimated_cost_micros: null },
       ],
     });

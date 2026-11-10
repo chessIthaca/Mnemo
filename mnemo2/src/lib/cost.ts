@@ -172,17 +172,9 @@ export function costPreviewInsights(): CostInsights | null {
 
 /** Each lever's display name and a one-line explanation of what it does. */
 const LEVERS: Record<string, { label: string; explanation: string }> = {
-  delta_read: {
-    label: "Delta reads",
-    explanation: "Retired. A changed file's re-read was served as a diff; these are past savings.",
-  },
-  skeleton: {
-    label: "Signature skeletons",
-    explanation: "Retired. An unchanged re-read was served as symbol signatures; these are past savings.",
-  },
   outline: {
     label: "Outlines",
-    explanation: "A long file's first read opens with its outline; the rest loads on demand.",
+    explanation: "A whole read of a long source file opens with its outline; ranged reads load the exact lines.",
   },
   compression: {
     label: "Output compression",
@@ -219,7 +211,7 @@ const LEVERS: Record<string, { label: string; explanation: string }> = {
 function fallbackLabel(kind: string): string {
   const words = kind.split(/[_-]+/).filter((word) => word.length > 0);
   if (words.length === 0) return "Other levers";
-  // Sentence case, matching the known labels ("Delta reads", not "Delta Reads").
+  // Sentence case, matching the known labels ("Output compression", not "Output Compression").
   return words
     .map((word, index) => (index === 0 ? `${word[0]!.toUpperCase()}${word.slice(1)}` : word))
     .join(" ");

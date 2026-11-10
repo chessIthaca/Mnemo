@@ -2784,6 +2784,7 @@ async fn savings_events_round_trip_and_negative_expansions() {
         })
         .await
         .unwrap();
+    // The raw row reader still returns a retired kind; only the reports skip it.
     let rows = store.savings_events_rows(Some("s1")).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].kind, "skeleton");
@@ -2930,7 +2931,7 @@ async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
         created_at: at,
     };
     store
-        .record_savings_event(&record("skeleton", 12_000, 900, day1))
+        .record_savings_event(&record("outline", 12_000, 900, day1))
         .await
         .unwrap();
     store
@@ -2938,7 +2939,7 @@ async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
         .await
         .unwrap();
     store
-        .record_savings_event(&record("skeleton", 2_000, 400, day2))
+        .record_savings_event(&record("outline", 2_000, 400, day2))
         .await
         .unwrap();
     // A re-expansion re-adds archived content, so it subtracts from the total.
@@ -2954,7 +2955,7 @@ async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
 
     // Per-kind, biggest saver first; the negative kind sorts last.
     assert_eq!(stats.per_kind.len(), 3);
-    assert_eq!(stats.per_kind[0].kind, "skeleton");
+    assert_eq!(stats.per_kind[0].kind, "outline");
     assert_eq!(stats.per_kind[0].event_count, 2);
     assert_eq!(stats.per_kind[0].saved_tokens, 12_700);
     assert_eq!(stats.per_kind[1].kind, "compression");
@@ -3595,21 +3596,21 @@ async fn savings_stats_clamps_archive_and_compression_to_the_result_cap() {
         .await
         .unwrap();
     store
-        .record_savings_event(&record("skeleton", 12_000, 900, day + 180))
+        .record_savings_event(&record("outline", 12_000, 900, day + 180))
         .await
         .unwrap();
 
     let stats = store.savings_stats().await.unwrap();
 
     // compression: 25,000 - 9,000. archive: (9,000 - 500) + (25,000 - 500).
-    // skeleton is not an archive kind, so its raw saving stands.
+    // outline is not an archive kind, so its raw saving stands.
     assert_eq!(stats.saved_tokens_total, 16_000 + 33_000 + 11_100);
     assert_eq!(stats.per_kind.len(), 3);
     assert_eq!(stats.per_kind[0].kind, "archive");
     assert_eq!(stats.per_kind[0].saved_tokens, 33_000);
     assert_eq!(stats.per_kind[1].kind, "compression");
     assert_eq!(stats.per_kind[1].saved_tokens, 16_000);
-    assert_eq!(stats.per_kind[2].kind, "skeleton");
+    assert_eq!(stats.per_kind[2].kind, "outline");
     assert_eq!(stats.per_kind[2].saved_tokens, 11_100);
     // The per-day series sums to the same honest total.
     let per_day: i64 = stats.per_day.iter().map(|day| day.saved_tokens).sum();
@@ -3621,6 +3622,73 @@ async fn savings_stats_clamps_archive_and_compression_to_the_result_cap() {
         .find(|event| event.kind == "compression")
         .expect("the compression row is recent");
     assert_eq!(compression.tokens_saved, 121_000);
+}
+
+#[tokio::test]
+async fn savings_reports_skip_retired_kinds() {
+    // The delta-read and signature-skeleton levers are retired: their rows
+    // stay in the ledger (the raw reader keeps them), but both reports —
+    // the Cost tab's total, lever list, day chart, recent list and dollars —
+    // list only the levers that still run.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let day1 = 1_700_000_000_i64;
+    let day2 = day1 + 86_400;
+    let record = |kind: &str, before: i64, after: i64, at: i64| SavingsEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        kind: kind.into(),
+        detail: None,
+        tokens_before: before,
+        tokens_after: after,
+        tokens_saved: before - after,
+        measured: false,
+        created_at: at,
+    };
+    store
+        .record_savings_event(&record("delta_read", 5_000, 1_000, day1))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("skeleton", 12_000, 900, day1 + 60))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("compression", 8_000, 1_200, day1 + 120))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("outline", 3_000, 500, day2))
+        .await
+        .unwrap();
+
+    let stats = store.savings_stats().await.unwrap();
+    assert_eq!(stats.event_count, 2);
+    // 6_800 + 2_500: the retired rows' savings (4_000 and 11_100) do not count.
+    assert_eq!(stats.saved_tokens_total, 6_800 + 2_500);
+    let kinds: Vec<&str> = stats.per_kind.iter().map(|row| row.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["compression", "outline"]);
+    assert_eq!(stats.per_day.len(), 2);
+    assert_eq!(stats.per_day[0].day, day1 / 86_400);
+    assert_eq!(stats.per_day[0].event_count, 1);
+    assert_eq!(stats.per_day[0].saved_tokens, 6_800);
+    assert_eq!(stats.per_day[1].day, day2 / 86_400);
+    assert_eq!(stats.per_day[1].saved_tokens, 2_500);
+    assert_eq!(stats.recent.len(), 2);
+    assert!(stats
+        .recent
+        .iter()
+        .all(|row| !RETIRED_SAVINGS_KINDS.contains(&row.kind.as_str())));
+
+    let valuation = store.savings_valuation().await.unwrap();
+    let mut valued: Vec<&str> = valuation.rows.iter().map(|row| row.kind.as_str()).collect();
+    valued.sort();
+    valued.dedup();
+    assert_eq!(valued, vec!["compression", "outline"]);
+    assert_eq!(
+        store.savings_events_rows(Some("s1")).await.unwrap().len(),
+        4,
+        "the ledger keeps the retired rows"
+    );
 }
 
 #[tokio::test]
@@ -3648,7 +3716,7 @@ async fn savings_valuation_counts_later_requests_up_to_the_lifetime() {
         .unwrap();
     // A late event with only two requests after it.
     store
-        .record_savings_event(&event("skeleton", Some("s1"), 12_000, 900, base + 180))
+        .record_savings_event(&event("outline", Some("s1"), 12_000, 900, base + 180))
         .await
         .unwrap();
     // A row with no session cannot be timed against any request.
@@ -3701,12 +3769,12 @@ async fn savings_valuation_counts_later_requests_up_to_the_lifetime() {
     assert_eq!(archive.later_requests, SAVED_TOKEN_LIFETIME_REQUESTS);
     assert_eq!(archive.events, 1);
     assert_eq!(archive.saved_tokens, 25_000);
-    let skeleton = valuation
+    let outline = valuation
         .rows
         .iter()
-        .find(|row| row.kind == "skeleton")
-        .expect("the skeleton row is valued");
-    assert_eq!(skeleton.later_requests, 2);
+        .find(|row| row.kind == "outline")
+        .expect("the outline row is valued");
+    assert_eq!(outline.later_requests, 2);
     let untimed = valuation
         .rows
         .iter()

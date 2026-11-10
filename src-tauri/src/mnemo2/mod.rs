@@ -676,6 +676,7 @@ pub fn run() {
             trace_view::trace_delete_history,
             trace_view::trace_export,
             trace_view::trace_reveal_export,
+            trace_view::trace_steering_stats,
             git_view::git_overview,
             git_view::git_move_main,
             browser::browser_supported,

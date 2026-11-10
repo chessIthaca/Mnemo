@@ -1102,7 +1102,7 @@ impl Default for SteeringNotesCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
-    /// `"dark"` or `"light"`.
+    /// `"light"` (the default), `"dark"` or `"system"` (follow the OS).
     pub theme: String,
     /// Show token usage in the status bar.
     pub show_token_usage: bool,
@@ -1182,7 +1182,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: "dark".to_string(),
+            theme: "light".to_string(),
             show_token_usage: true,
             show_tool_images: true,
             show_tool_activity: true,
@@ -1590,7 +1590,7 @@ show_token_usage = false
         let cfg: GeneralConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.general.safety, SafetyMode::ApproveEachAction);
         assert!((cfg.context.summarize_at_fill_rate - 0.3).abs() < 1e-9);
-        assert_eq!(cfg.ui.theme, "dark");
+        assert_eq!(cfg.ui.theme, "light");
         assert!(cfg.ui.show_token_usage);
     }
 

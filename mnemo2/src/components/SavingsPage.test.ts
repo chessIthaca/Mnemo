@@ -22,6 +22,7 @@ function sampleSettings(): ModelSettings {
       quality_score: true,
       lean_output_nudge: true,
       recall_delta: false,
+      idle_compaction: true,
       archive_min_chars: 2400,
       compress_min_chars: 3000,
       lean_output_fill_pct: 80,
@@ -52,9 +53,9 @@ function page(overrides: Partial<ModelSettingsTransport> = {}) {
 describe("SavingsPage", () => {
   it("renders every lever with its switch state and explanation, and the knobs", async () => {
     page();
-    expect((await screen.findByRole("checkbox", { name: /Delta reads/ }) as HTMLInputElement).checked).toBe(true);
+    expect((await screen.findByRole("checkbox", { name: /Outline reads/ }) as HTMLInputElement).checked).toBe(true);
     expect((screen.getByRole("checkbox", { name: /Recall deltas/ }) as HTMLInputElement).checked).toBe(false);
-    expect(screen.getByText("Re-read file signatures and diffs instead of full file contents.")).toBeTruthy();
+    expect(screen.getByText("Open a long source file with its outline; ranged reads load the exact lines.")).toBeTruthy();
     expect((screen.getByLabelText("Archive after") as HTMLInputElement).value).toBe("2400");
     expect((screen.getByLabelText("Nudge at fill %") as HTMLInputElement).value).toBe("80");
     expect((screen.getByLabelText("Extra commands") as HTMLInputElement).value).toBe("cargo test, npm run build");
@@ -73,6 +74,7 @@ describe("SavingsPage", () => {
       quality_score: true,
       lean_output_nudge: true,
       recall_delta: false,
+      idle_compaction: true,
       archive_min_chars: 2400,
       compress_min_chars: 3000,
       lean_output_fill_pct: 80,
@@ -80,6 +82,29 @@ describe("SavingsPage", () => {
       compress_extra_commands: ["cargo test", "npm run build"],
     }));
     expect(await screen.findByText("Applies after reopening the project.")).toBeTruthy();
+  });
+
+  it("shows the idle-compaction switch checked by default, and saving a toggle-off carries idle_compaction: false", async () => {
+    const made = page();
+    const idle = await screen.findByRole("checkbox", { name: /Idle compaction/ });
+    expect((idle as HTMLInputElement).checked).toBe(true);
+    await fireEvent.click(idle);
+    await fireEvent.click(screen.getByRole("button", { name: "Save levers" }));
+    await waitFor(() => expect(made.transport.save).toHaveBeenCalledWith("optimizer", {
+      delta_reads: true,
+      compress_output: true,
+      archive: true,
+      compaction_survival: true,
+      quality_score: true,
+      lean_output_nudge: true,
+      recall_delta: false,
+      idle_compaction: false,
+      archive_min_chars: 2400,
+      compress_min_chars: 3000,
+      lean_output_fill_pct: 80,
+      nudge_cooldown_requests: 4,
+      compress_extra_commands: ["cargo test", "npm run build"],
+    }));
   });
 
   it("saves edited knobs with the extra commands split on commas", async () => {
@@ -105,7 +130,7 @@ describe("SavingsPage", () => {
 
   it("has no pricing table and points to the Endpoints page", async () => {
     page();
-    await screen.findByRole("checkbox", { name: /Delta reads/ });
+    await screen.findByRole("checkbox", { name: /Outline reads/ });
     expect(screen.queryByRole("region", { name: "Per-model pricing" })).toBeNull();
     expect(screen.queryByLabelText("Model for row 1")).toBeNull();
     expect(screen.queryByRole("button", { name: "Save prices" })).toBeNull();

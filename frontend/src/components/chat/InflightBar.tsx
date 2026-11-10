@@ -491,18 +491,6 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-slate-500">waste</span>
-                    <span className="text-slate-300">
-                      {fmtTokens(contextUsage.quality.waste_tokens)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-500">stale reads</span>
-                    <span className="text-slate-300">
-                      {contextUsage.quality.stale_read_rate}%
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
                     <span className="text-slate-500">decisions</span>
                     <span className="text-slate-300">
                       {contextUsage.quality.decision_density}%

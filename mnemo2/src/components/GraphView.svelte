@@ -1100,7 +1100,7 @@
 </section>
 
 <style>
-  .graph-view { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; background: var(--canvas); }
+  .graph-view { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; container: graph-view / inline-size; background: var(--canvas); }
   .graph-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 24px 12px; }
   .graph-heading h1 { margin: 0; font-family: var(--font-prose); font-size: var(--text-page); font-weight: 500; letter-spacing: -0.03em; }
   .status-line { margin: 6px 0 0; color: var(--muted); font-size: var(--text-meta); }
@@ -1183,9 +1183,16 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes pulse { 50% { opacity: 0.25; } }
 
-  @media (max-width: 880px) {
+  @container graph-view (max-width: 880px) {
+    .graph-body { grid-template-columns: 236px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+    .graph-side { grid-column: 1; grid-row: 1; }
+    .graph-detail { grid-column: 1; grid-row: 2; border-top: 1px solid var(--line); border-right: 1px solid var(--line); border-left: 0; }
+    .graph-canvas-wrap { grid-column: 2; grid-row: 1 / span 2; }
+    .canvas-note { right: auto; bottom: 30px; left: 12px; }
+  }
+  @container graph-view (max-width: 520px) {
     .graph-body { display: flex; flex-direction: column; overflow-y: auto; }
-    .graph-side, .graph-detail { border: 0; overflow: visible; }
+    .graph-side, .graph-detail { flex: 0 0 auto; border: 0; overflow: visible; }
     .graph-canvas-wrap { flex: 0 0 auto; height: 320px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); order: 2; }
     .graph-side { order: 1; }
     .graph-detail { order: 3; }

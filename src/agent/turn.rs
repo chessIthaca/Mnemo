@@ -376,6 +376,15 @@ struct PendingSwapOutcome {
     early: Option<TurnOutcome>,
 }
 
+/// Tools whose output is never archived by [`AgentLoop::ingest_tool_output`]:
+/// each was expanded because the caller asked for exactly that content, so a
+/// preview would only force another request.
+/// - `expand_result`: its own 60,000-char cap and paging, and a second
+///   archive turned 250 of 580 ledger expansions into another preview;
+/// - `plan_read`: expanded 79% of the time — the plan IS the requested text;
+/// - `web_fetch`: expanded 62% of the time — the page IS the requested text.
+const ARCHIVE_EXEMPT_TOOLS: [&str; 3] = ["expand_result", "plan_read", "web_fetch"];
+
 impl AgentLoop {
     /// Run a single turn: send messages to the provider, stream the response,
     /// execute tool calls, and feed results back. Emits events to the fan-in channel.
@@ -2788,8 +2797,8 @@ impl AgentLoop {
             }
 
             // Token-optimizer savings ledger (backlog e4a50d22): a tool
-            // that served an optimized form (delta/skeleton re-read,
-            // compressed command output, archive preview, archive expand)
+            // that served an optimized form (outline read, compressed
+            // command output, archive preview, archive expand)
             // reports its before/after token counts in the result's
             // `data.savings` object — record the ledger row
             // fire-and-forget. `measured` defaults false (the tools
@@ -3173,20 +3182,28 @@ impl AgentLoop {
         } else {
             usize::MAX
         };
-        let (truncated, records) = crate::agent::context::compact_old_tool_results_collecting(
+        let cut = crate::agent::context::compact_old_tool_results_collecting(
             messages,
             10,
             20,
             500,
             min_archive_chars,
         );
-        if truncated > 0 {
+        if cut.truncated > 0 {
             state.token_accounting.reset();
+            // Record what the reclaim really removed (not gated on the
+            // archive flag).
+            self.record_trim_savings(
+                session_id,
+                cut.truncated,
+                cut.chars_before,
+                cut.chars_after,
+            );
         }
         // Fire-and-forget: the context is already bounded, so the archive is a
         // recovery path, never a blocking dependency (a failure is logged).
         if let Some(store) = &self.memory {
-            for record in records {
+            for record in cut.records {
                 let store = Arc::clone(store);
                 tokio::spawn(async move {
                     if let Err(e) = store
@@ -3791,6 +3808,20 @@ impl AgentLoop {
                     },
                 ))
                 .await;
+        }
+        // Record the reclaim itself (never the checkpoint): the context
+        // really shrank, so the ledger gets a before/after it can price.
+        // `summarize_stop` is still owned here (consumed only by the
+        // interrupted-summary branch below), so no earlier capture is needed.
+        if summarize_stop.is_none() && !compact_failed && (token_count as i64) > (used as i64) {
+            self.record_savings_event(
+                session_id,
+                "compaction",
+                None,
+                token_count as i64,
+                used as i64,
+                false,
+            );
         }
         // Invalidate per-turn recall cache on summarize (messages prefix changed).
         state.last_recalled_user_query = None;
@@ -4511,11 +4542,6 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         tokens_after: i64,
         measured: bool,
     ) {
-        // Lever 6 counters (backlog e4a50d22): mirror the ledger row into the
-        // session's running counters so the S–F score is graded from exactly
-        // what the levers logged. In-memory, so this happens even when no
-        // store is attached (the spawn below is the durable half).
-        self.optimizer_state.record(kind, tokens_after);
         let now_epoch = {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
@@ -4535,9 +4561,8 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             created_at: now_epoch,
         };
         // Live event (§5.7, job 3b.4): fan the `Savings` at the point the
-        // ledger row persists — un-gated by the store, mirroring the
-        // in-memory counters above (the durable row is the store's half
-        // alone).
+        // ledger row persists — un-gated by the store (the durable row is
+        // the store's half alone).
         self.emit_live_event(AgentEvent::Savings {
             kind: kind.to_string(),
             tokens_before,
@@ -4555,12 +4580,32 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         }
     }
 
+    /// Record what an old-result trim really removed: kind `old_result_trim`,
+    /// before/after estimated from the cut results' characters (chars/4),
+    /// never gated on the archive flag. Fire-and-forget through
+    /// [`record_savings_event`](Self::record_savings_event).
+    pub(crate) fn record_trim_savings(
+        &self,
+        session_id: Option<&str>,
+        truncated: usize,
+        chars_before: usize,
+        chars_after: usize,
+    ) {
+        self.record_savings_event(
+            session_id,
+            "old_result_trim",
+            Some(format!("{truncated} results")),
+            (chars_before / 4) as i64,
+            (chars_after / 4) as i64,
+            false,
+        );
+    }
+
     /// Token-optimizer lever 6 (backlog e4a50d22): grade the context for a
     /// `ContextUsage` event, or `None` when the quality lever is off — the
     /// event then serializes byte-identically to its pre-lever form.
-    /// `used`/`max` are the values the event itself carries; the rest of the
-    /// signals come from the session counters, which
-    /// [`record_savings_event`](Self::record_savings_event) keeps current.
+    /// `used`/`max` are the values the event itself carries; the grade is
+    /// computed from the window fill plus the decisions counter.
     pub(crate) fn quality_report(
         &self,
         used: u32,
@@ -4625,7 +4670,10 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// substituted result is never lost. The archive write is awaited (a
     /// preview naming a missing row would be a lie). Any failure — no store,
     /// DB error — falls back to today's bounded text: fail-open, logged.
-    async fn ingest_tool_output(
+    ///
+    /// [`ARCHIVE_EXEMPT_TOOLS`] never reach the archive: those results were
+    /// explicitly asked for in full, and a preview only costs another request.
+    pub(crate) async fn ingest_tool_output(
         &self,
         session_id: Option<&str>,
         tool: &str,
@@ -4636,7 +4684,10 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         let Some(store) = &self.memory else {
             return context::cap_tool_result_text(output);
         };
-        if !cfg.archive || output.chars().count() < cfg.archive_min_chars {
+        if !cfg.archive
+            || ARCHIVE_EXEMPT_TOOLS.contains(&tool)
+            || output.chars().count() < cfg.archive_min_chars
+        {
             return context::cap_tool_result_text(output);
         }
         match store.archive_tool_result(session_id, tool, detail, output).await {

@@ -337,9 +337,8 @@ pub struct SettingsSaveDto {
     /// current value, so a dialog that never touched a lever leaves the section
     /// exactly as it was.
     ///
-    /// **Lever 1 — delta + skeleton re-reads**: `read_files` serves a
-    /// signature/import skeleton (or a diff) instead of the full file on a
-    /// re-read. On by default.
+    /// **Lever 1 — outline reads**: a whole read of a source file over 500
+    /// lines serves its signature outline. On by default.
     #[serde(default)]
     pub optimizer_delta_reads: Option<bool>,
     /// **Lever 2 — semantic command-output compression**: large shell output
@@ -371,6 +370,10 @@ pub struct SettingsSaveDto {
     /// default.
     #[serde(default)]
     pub optimizer_recall_delta: Option<bool>,
+    /// **Idle compaction**: an idle conversation whose prompt cache has gone
+    /// cold is summarized by the compaction model. On by default.
+    #[serde(default)]
+    pub optimizer_idle_compaction: Option<bool>,
     /// Minimum tool-result length (chars) before lever 3 archives it.
     /// Default 20000.
     #[serde(default)]
@@ -712,6 +715,9 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(v) = patch.optimizer_recall_delta {
         general.general.optimizer.recall_delta = v;
+    }
+    if let Some(v) = patch.optimizer_idle_compaction {
+        general.general.optimizer.idle_compaction = v;
     }
     if let Some(v) = patch.optimizer_archive_min_chars {
         general.general.optimizer.archive_min_chars = v;
@@ -1058,14 +1064,17 @@ mod tests {
         assert!(current.general.general.optimizer.delta_reads);
         assert!(current.general.general.optimizer.recall_delta);
         assert!(current.general.general.optimizer.archive);
+        assert!(current.general.general.optimizer.idle_compaction);
         let patch = SettingsSaveDto {
             optimizer_delta_reads: Some(false),
             optimizer_archive: Some(false),
+            optimizer_idle_compaction: Some(false),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         assert!(!next.general.general.optimizer.delta_reads);
         assert!(!next.general.general.optimizer.archive);
+        assert!(!next.general.general.optimizer.idle_compaction);
         // Every lever the patch did not name keeps the default, ON.
         assert!(next.general.general.optimizer.compress_output);
         assert!(next.general.general.optimizer.compaction_survival);
@@ -1083,12 +1092,28 @@ mod tests {
         assert!(next.general.general.optimizer.delta_reads);
         assert!(!next.general.general.optimizer.recall_delta);
         assert!(!next.general.general.optimizer.archive);
+        assert!(
+            !next.general.general.optimizer.idle_compaction,
+            "a lever the patch does not name keeps its current value"
+        );
+        // Idle compaction flips back on; an absent field then leaves that
+        // true value alone.
+        let patch = SettingsSaveDto {
+            optimizer_idle_compaction: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.optimizer.idle_compaction);
         // An empty patch changes nothing at all.
         let patch = SettingsSaveDto::default();
         let after = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(!after.general.general.optimizer.archive);
         assert!(after.general.general.optimizer.delta_reads);
         assert!(!after.general.general.optimizer.recall_delta);
+        assert!(
+            after.general.general.optimizer.idle_compaction,
+            "an absent field keeps a true value"
+        );
     }
 
     #[test]

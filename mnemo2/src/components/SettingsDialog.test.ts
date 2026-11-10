@@ -504,6 +504,7 @@ describe("SettingsDialog", () => {
           quality_score: true,
           lean_output_nudge: true,
           recall_delta: false,
+          idle_compaction: true,
           archive_min_chars: 2400,
           compress_min_chars: 3000,
           lean_output_fill_pct: 80,
@@ -524,7 +525,7 @@ describe("SettingsDialog", () => {
     expect(screen.getByText("Status: Keyword only")).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Savings" }));
     const levers = await screen.findByRole("region", { name: "Savings levers" });
-    expect(within(levers).getByText("Delta reads")).toBeTruthy();
+    expect(within(levers).getByText("Outline reads")).toBeTruthy();
     expect(screen.getByText("Model prices are set with each model on the Endpoints page.")).toBeTruthy();
   });
 
@@ -610,6 +611,7 @@ describe("unsaved edits", () => {
           quality_score: true,
           lean_output_nudge: true,
           recall_delta: false,
+          idle_compaction: true,
           archive_min_chars: 2400,
           compress_min_chars: 3000,
           lean_output_fill_pct: 80,
@@ -728,9 +730,9 @@ describe("unsaved edits", () => {
         await screen.findByRole("region", { name: "Savings levers" });
       },
       edit: async () => {
-        await fireEvent.click(screen.getByRole("checkbox", { name: /Delta reads/ }));
+        await fireEvent.click(screen.getByRole("checkbox", { name: /Outline reads/ }));
       },
-      kept: () => !(screen.getByRole("checkbox", { name: /Delta reads/ }) as HTMLInputElement).checked,
+      kept: () => !(screen.getByRole("checkbox", { name: /Outline reads/ }) as HTMLInputElement).checked,
     },
     {
       name: "Safety",

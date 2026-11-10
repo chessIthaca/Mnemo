@@ -212,9 +212,8 @@ mod tests {
         (dir, setup)
     }
 
-    /// Every toggle defaults on and the theme defaults to dark: a fresh
-    /// install hears its notifications and reads the same palette Mnemo1
-    /// ships.
+    /// Every toggle defaults on and the theme defaults to light: a fresh
+    /// install hears its notifications and opens on the paper palette.
     #[test]
     fn read_defaults_when_nothing_is_saved() {
         let (_dir, setup) = fixture();
@@ -222,7 +221,7 @@ mod tests {
         assert!(wire.sound_complete);
         assert!(wire.sound_input_needed);
         assert!(wire.sound_stopped_errors);
-        assert_eq!(wire.theme, "dark");
+        assert_eq!(wire.theme, "light");
     }
 
     /// The snapshot reports exactly what `[ui]` holds, including a theme the

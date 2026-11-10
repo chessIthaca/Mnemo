@@ -47,6 +47,8 @@
   const DETAIL_POLL_MS = 1_000;
   /** The search input's debounce. */
   const SEARCH_DEBOUNCE_MS = 300;
+  /** Below this width of its own the view shows the list or one call, not both. */
+  const NARROW_VIEW_WIDTH = 760;
   const LIST_WIDTH_MIN = 300;
   const LIST_WIDTH_MAX = 720;
   const INSIGHTS_HEIGHT_MIN = 160;
@@ -325,7 +327,7 @@
   }
 
   /**
-   * The poll: one fresh first page every 1.5s while the route is visible.
+   * The poll: one fresh first page every 1.5s while the tab is visible.
    * A failed poll keeps the last good data and stays quiet — the retry
    * banner is for explicit loads.
    */
@@ -788,7 +790,7 @@
     }
     // An entry hand-over wins over the saved filters when one is waiting.
     const entry = traceEntryFilters($app.traceEntry);
-    // The compact tab can hand over the call it has open; the route opens it too.
+    // An entry point can hand over the call it has open; the tab opens it too.
     const wanted = entry?.selected ?? null;
     if (entry !== null) {
       filters = { ...filters, ...entry, selected: null };
@@ -803,19 +805,24 @@
     void reload().then(() => openEntrySelection(wanted));
     const pollTimer = setInterval(() => void poll(), POLL_MS);
     const detailTimer = setInterval(() => void pollDetail(), DETAIL_POLL_MS);
-    const media = window.matchMedia("(max-width: 900px)");
-    narrow = media.matches;
-    const onMedia = () => (narrow = media.matches);
-    media.addEventListener("change", onMedia);
+    // The window width says nothing about the room the tab itself has: the
+    // panel can hold it narrow inside a wide window, and the other way round.
+    const measure = () => {
+      const width = traceRoot?.clientWidth ?? 0;
+      narrow = width > 0 && width < NARROW_VIEW_WIDTH;
+    };
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    if (traceRoot) observer?.observe(traceRoot);
     return () => {
       clearInterval(pollTimer);
       clearInterval(detailTimer);
-      media.removeEventListener("change", onMedia);
+      observer?.disconnect();
       if (reloadTimer !== null) clearTimeout(reloadTimer);
     };
   });
 
-  // Entry points can hand the route filters while it is already open.
+  // Entry points can hand the tab filters while it is already open.
   $effect(() => {
     const entry = $app.traceEntry;
     if (entry === null) return;
@@ -1165,7 +1172,7 @@
         {@render listColumn()}
       {/if}
     {:else}
-      <div class="trace-columns" bind:this={columns} style:grid-template-columns="{listWidth}px 7px minmax(0, 1fr)">
+      <div class="trace-columns" bind:this={columns} style:grid-template-columns="minmax({LIST_WIDTH_MIN}px, {listWidth}px) 7px minmax(360px, 1fr)">
         {@render listColumn()}
         <button
           type="button"
@@ -1183,7 +1190,7 @@
     {/if}
   {/if}
 </section><style>
-  .trace-view { display: flex; min-height: 0; flex: 1; flex-direction: column; }
+  .trace-view { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; overflow-y: auto; }
   .trace-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; padding: 22px 26px 10px; }
   .trace-head h1 { margin: 0; color: var(--ink); font-size: var(--text-page); font-weight: 700; }
   .head-line { margin: 3px 0 0; color: var(--muted); font-size: var(--text-body); }
@@ -1203,14 +1210,14 @@
   .search-box select { padding: 5px 6px 5px 0; border: 0; background: transparent; color: var(--muted); font-size: var(--text-meta); cursor: pointer; }
   .follow-toggle { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--muted); font-size: var(--text-meta); font-weight: 600; cursor: pointer; }
   .follow-toggle input { accent-color: var(--accent-strong); }
-  .trace-columns { display: grid; min-height: 0; flex: 1; align-items: stretch; }
+  .trace-columns { display: grid; flex: 1 0 420px; min-height: 0; align-items: stretch; }
   .divider { display: block; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; background: transparent; cursor: col-resize; touch-action: none; }
   .divider::after { display: block; margin: 0 3px; height: 100%; border-left: 1px solid transparent; content: ""; }
   .divider:hover::after, .divider:focus-visible::after { border-left-color: var(--accent); }
   .divider:focus { outline: none; }
   .divider:focus-visible { outline: none; }
-  .list-column { display: flex; min-width: 0; overflow: auto; flex-direction: column; padding: 0 0 14px; }
-  .detail-column { display: flex; min-width: 0; overflow: hidden; flex-direction: column; }
+  .list-column { display: flex; flex: 1 0 420px; min-width: 0; overflow: auto; flex-direction: column; padding: 0 0 14px; }
+  .detail-column { display: flex; flex: 1 0 420px; min-width: 0; overflow: hidden; flex-direction: column; }
   .chip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 12px 0; }
   .chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 4px 3px 9px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink-soft); font-size: var(--text-meta); }
   .chip-x { display: inline-flex; padding: 2px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); cursor: pointer; }

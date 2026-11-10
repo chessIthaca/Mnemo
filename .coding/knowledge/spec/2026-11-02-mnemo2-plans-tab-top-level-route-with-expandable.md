@@ -11,3 +11,5 @@ Mnemo2's Plans tab is a top-level route beside Lead/Team/Cost/Graph, and its pla
 - `mnemo2/src/lib/planDocument.ts::planDetailMarkdown(markdown, keepSteps)` drops the leading `# Plan:` h1 and the `## Goal` section (already on the card) and drops `## Steps` unless at least one step shows a header; fenced code is fence-tracked, so `## ` inside code is content.
 - Preview: `seedBoardPreview(transport)` in `mnemo2/src/lib/boardEngine.ts` is a dev-only seam consulted by `createBoardTransport` only without a Tauri runtime; the `plans` preview scene mounts the real App and clicks the first `.details-toggle` (the settings-laya scene uses the same mount-then-click pattern).
 - `PlanBoard::create` validates plan thickness (context >= ~40 chars with paths + verification command, every step naming a file path), so Rust test fixtures that build plans must satisfy it.
+
+Amended 2026-11-09: The main tabs beside Plans are now Lead, Team and Cost; Graph moved into the side panel.

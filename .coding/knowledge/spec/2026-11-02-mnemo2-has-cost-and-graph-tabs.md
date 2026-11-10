@@ -1,6 +1,7 @@
 +++
 title = "Mnemo2 has Cost and Graph tabs"
 created = "2026-11-02"
+status = "superseded"
 +++
 
 Mnemo2's top bar shows Lead · Team · Cost · Graph (Route "cost" | "graph"). The cost chip opens Cost; the settings gear opens the project sheet, which links to the app settings dialog.

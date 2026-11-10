@@ -48,9 +48,11 @@ describe("preview scenes", () => {
     }
   });
 
-  it("graph routes to the explorer and seeds its preview transport", async () => {
+  it("graph opens in the panel and seeds its preview transport", async () => {
     const state = build("graph");
-    expect(state.route).toBe("graph");
+    expect(state.workbenchOpen).toBe(true);
+    expect(state.workbenchTab).toBe("graph");
+    expect(state.projectId).not.toBeNull();
     expect(state.projectId).not.toBeNull();
     const transport = createGraphTransport();
     expect(transport).not.toBeNull();
@@ -94,8 +96,10 @@ describe("preview scenes", () => {
       "memory",
       "trace",
       "trace-empty",
-      "trace-tab",
-      "trace-tab-empty",
+      "panel-team-diff",
+      "panel-team-graph",
+      "panel-cost-trace",
+      "panel-plans-memory",
       "lead-tool-rows",
     ]);
     expect(previewScene(null)?.name).toBe(defaultPreviewScene);
@@ -113,7 +117,8 @@ describe("preview scenes", () => {
 
   it("memory seeds the store with 20 records and opens the newest one", async () => {
     const state = build("memory");
-    expect(state.route).toBe("memory");
+    expect(state.workbenchOpen).toBe(true);
+    expect(state.workbenchTab).toBe("memory");
     expect(state.projectId).not.toBeNull();
 
     const transport = createMemoryTransport();
@@ -242,7 +247,11 @@ describe("preview scenes", () => {
     expect(insights?.cost.models.length).toBe(3);
     expect(insights?.cost.unpriced_models).toEqual(["ollama/qwen3:32b"]);
     expect(insights?.cost.per_day).toHaveLength(14);
-    expect(insights?.savings.levers.some((lever) => lever.kind === "delta_read")).toBe(true);
+    expect(insights?.savings.levers.some((lever) => lever.kind === "outline")).toBe(true);
+    // The retired levers are not in the sample: the engine never reports them.
+    expect(insights?.savings.levers.some((lever) => lever.kind === "delta_read" || lever.kind === "skeleton")).toBe(false);
+    // The label table dropped `truncation` — nothing emits it any more.
+    expect(insights?.savings.levers.some((lever) => lever.kind === "truncation")).toBe(false);
   });
 
   it("mission-control shows one running worker in every live phase", () => {

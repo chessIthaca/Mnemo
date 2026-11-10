@@ -2033,6 +2033,109 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "No requirement in the tier-ladder, dispatch-routing or settings specs mentions Mnemo1's enforce gate; only the design note does, and this plan updates it."
+    },
+    {
+      "id": "fa5082c4",
+      "status": "closed",
+      "created_at_ms": 1794222607674,
+      "closed_at_ms": 1794226235378,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-fa5082c4-20261109-121035.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No governed file is touched. The llm-trace spec's 'Trace tab' behaviour (recording, filters, Lead default) is unchanged: only where the view is hosted moves, and it is still called the Trace tab."
+    },
+    {
+      "id": "0c16bd18",
+      "status": "closed",
+      "created_at_ms": 1794232410641,
+      "closed_at_ms": 1794238090639,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-0c16bd18-20261109-152810.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No governed file is touched and no specified capability changes: these are token-optimizer and Cost tab internals, which have no OpenSpec capability."
+    },
+    {
+      "id": "e555e701",
+      "status": "closed",
+      "created_at_ms": 1794264751484,
+      "closed_at_ms": 1794266961923,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e555e701-20261109-232921.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No governed OpenSpec capability covers read_files, the optimizer levers, the quality grade or the savings settings labels; none of the touched files is listed under governed_files."
+    },
+    {
+      "id": "57a33d9a",
+      "status": "closed",
+      "created_at_ms": 1794291175683,
+      "closed_at_ms": 1794294457375,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-57a33d9a-20261110-070737.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Report filtering of retired ledger kinds; no specified capability behavior changes."
+    },
+    {
+      "id": "02b200ad",
+      "status": "closed",
+      "created_at_ms": 1794297311018,
+      "closed_at_ms": 1794321170207,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-02b200ad-20261110-143250.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Idle compaction has an on/off switch",
+              "text": "The Savings page SHALL show an \"Idle compaction\" switch that is on by default, and saving it SHALL turn idle compaction on or off without a restart.",
+              "scenarios": [
+                {
+                  "name": "Default is on",
+                  "when": [
+                    "the user opens Settings → Savings on a config that never set idle_compaction"
+                  ],
+                  "then": [
+                    "the Idle compaction switch is on"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Switching it off is saved",
+                  "when": [
+                    "the user switches Idle compaction off and saves"
+                  ],
+                  "then": [
+                    "config.toml holds idle_compaction = false under [general.optimizer]"
+                  ],
+                  "and": [
+                    "agents stop idle compaction without a restart"
+                  ]
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "68377a13",
+      "status": "closed",
+      "created_at_ms": 1794300755813,
+      "closed_at_ms": 1794306579604,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-68377a13-20261110-102939.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Only the default value of an existing setting changes; the settings-dialog spec does not pin the theme default."
     }
   ]
 }

@@ -67,6 +67,12 @@ export interface SavingsLever {
   tokens_saved: number;
   /** Estimated dollars saved in micro-USD, or null when no price is known. */
   estimated_saved_micros: number | null;
+  /**
+   * Estimated dollars the lever COST in micro-USD, for a lever that re-adds
+   * tokens (an archive expansion, an outline follow-up); null for a lever that
+   * only saves — and null when no price is known.
+   */
+  estimated_cost_micros: number | null;
 }
 
 /** Prompt-cache totals and what the hits saved (`SavingsCache`). */
@@ -95,6 +101,13 @@ export interface SavingsReport {
   cache: SavingsCache;
   /** Tokens saved for the last 14 UTC days. */
   per_day: SavingsDay[];
+  /**
+   * What the project's priced lifetime model traffic cost, in micro-USD — the
+   * traffic these savings are measured against. Null when nothing is priced.
+   */
+  traffic_micros: number | null;
+  /** The first day of that traffic (Unix seconds); null without history. */
+  traffic_since: number | null;
 }
 
 /** Both reports the tab needs — fetched together, rendered together. */
@@ -159,25 +172,13 @@ export function costPreviewInsights(): CostInsights | null {
 
 /** Each lever's display name and a one-line explanation of what it does. */
 const LEVERS: Record<string, { label: string; explanation: string }> = {
-  delta_read: {
-    label: "Delta reads",
-    explanation: "A file that changed since its last read is served as a diff, not as the whole file.",
-  },
-  skeleton: {
-    label: "Signature skeletons",
-    explanation: "An unchanged re-read serves the file's symbol signatures instead of its full text.",
-  },
   outline: {
     label: "Outlines",
-    explanation: "A long file's first read opens with its outline; the rest loads on demand.",
+    explanation: "A whole read of a long source file opens with its outline; ranged reads load the exact lines.",
   },
   compression: {
     label: "Output compression",
     explanation: "Command output is compressed before it enters the context.",
-  },
-  truncation: {
-    label: "Output caps",
-    explanation: "Tool output past the size cap is cut instead of kept in full.",
   },
   archive: {
     label: "Archived results",
@@ -185,15 +186,28 @@ const LEVERS: Record<string, { label: string; explanation: string }> = {
   },
   archive_expand: {
     label: "Archive expansions",
-    explanation: "Expanding an archived result re-adds its tokens, recorded as negative savings.",
+    explanation: "Fetching an archived result re-adds its tokens and costs one more request.",
   },
   recall_delta: {
     label: "Compact recalls",
     explanation: "A repeated memory recall serves a short reference instead of the full snippet.",
   },
-  compaction_checkpoint: {
-    label: "Compaction checkpoints",
-    explanation: "The context compaction drops is checkpointed first; the row records its size, not a saving.",
+  old_result_trim: {
+    label: "Old results trimmed",
+    explanation:
+      "Older tool results are cut to a short stub once 20 newer ones exist; the agent can read them again.",
+  },
+  compaction: {
+    label: "Compaction",
+    explanation: "A summary replaces the older conversation once the context fills up.",
+  },
+  idle_compaction: {
+    label: "Idle compaction",
+    explanation: "An idle conversation is summarized by the compaction model once its cache goes cold, so the next message does not resend the whole context.",
+  },
+  outline_followup: {
+    label: "Outline follow-ups",
+    explanation: "Ranged reads of an outlined file, counted against what the outline saved.",
   },
 };
 
@@ -201,7 +215,7 @@ const LEVERS: Record<string, { label: string; explanation: string }> = {
 function fallbackLabel(kind: string): string {
   const words = kind.split(/[_-]+/).filter((word) => word.length > 0);
   if (words.length === 0) return "Other levers";
-  // Sentence case, matching the known labels ("Delta reads", not "Delta Reads").
+  // Sentence case, matching the known labels ("Output compression", not "Output Compression").
   return words
     .map((word, index) => (index === 0 ? `${word[0]!.toUpperCase()}${word.slice(1)}` : word))
     .join(" ");
@@ -299,7 +313,7 @@ export interface CostLeverRow {
    * "+120,000 tokens re-added · 6 events" for a cost row. */
   metaLabel: string;
   /** The estimated dollars cell: "≈ $0.18" or "—" without a price. A lever
-   * that re-added tokens is a cost, not a saving: it shows no dollars at all. */
+   * that re-added tokens is a cost: "costs ≈ $0.02". */
   costLabel: string;
   /** Whether the lever re-added tokens (a cost, not a saving). */
   readded: boolean;
@@ -343,6 +357,10 @@ export interface CostViewModel {
   savingsTokensLabel: string;
   /** The estimated total saved: "≈ $0.42" or "—". */
   savingsCostLabel: string;
+  /** The traffic the savings are measured against, or "" without a price. */
+  savingsBasisLabel: string;
+  /** How the estimate is made — always shown, so the figure is never bare. */
+  savingsMethodLabel: string;
   /** One row per lever, biggest saver first. */
   levers: CostLeverRow[];
   /** Whether any prompt tokens were recorded. */
@@ -392,10 +410,9 @@ function leverRows(levers: SavingsLever[]): CostLeverRow[] {
     .sort((a, b) => b.tokens_saved - a.tokens_saved)
     .map((lever) => {
       const eventsLabel = `${formatTokenCount(lever.events)} ${lever.events === 1 ? "event" : "events"}`;
-      // A net-negative lever (an expansion re-adding tokens) is a cost, not a
-      // saving: the backend prices it at $0 (insights.rs clamps at
-      // `tokens.max(0)`), so the row shows the tokens it re-added and no dollar
-      // figure — dollars next to a minus would read as a saving either way.
+      // A net-negative lever (an expansion or a follow-up re-adding tokens) is
+      // a cost, not a saving: it shows what it cost, and no dollars at all
+      // without a price.
       const readded = lever.tokens_saved < 0;
       return {
         kind: lever.kind,
@@ -404,7 +421,11 @@ function leverRows(levers: SavingsLever[]): CostLeverRow[] {
         metaLabel: readded
           ? `+${formatSignedTokens(-lever.tokens_saved)} tokens re-added · ${eventsLabel}`
           : `${formatSignedTokens(lever.tokens_saved)} tokens · ${eventsLabel}`,
-        costLabel: readded ? "" : formatEstimate(lever.estimated_saved_micros),
+        costLabel: readded
+          ? lever.estimated_cost_micros === null
+            ? ""
+            : `costs ${formatEstimate(lever.estimated_cost_micros)}`
+          : formatEstimate(lever.estimated_saved_micros),
         readded,
       };
     });
@@ -457,6 +478,12 @@ export function costViewModel(report: CostReport, savings: SavingsReport): CostV
     models: modelRows(report.models),
     savingsTokensLabel: formatSignedTokens(savings.tokens_saved),
     savingsCostLabel: formatEstimate(savings.estimated_saved_micros),
+    savingsBasisLabel:
+      savings.traffic_micros === null || savings.traffic_since === null
+        ? ""
+        : `On ≈ ${formatUsageCost(savings.traffic_micros)} of model traffic since ${dayLabel(savings.traffic_since)}. The spend above counts Mnemo2's own ledger.`,
+    savingsMethodLabel:
+      "Estimates: credited against the 100,000-character result cap, at each session's model rates, counting up to 15 later re-sends.",
     levers: leverRows(savings.levers),
     cacheActive: savings.cache.prompt_tokens > 0,
     cacheHitRateLabel: formatHitRate(savings.cache.hit_rate),

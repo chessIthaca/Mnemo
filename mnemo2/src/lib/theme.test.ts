@@ -86,7 +86,7 @@ describe("parseTheme", () => {
   });
 
   it("falls back to the [ui] default for a missing or unknown word", () => {
-    expect(DEFAULT_THEME).toBe("dark");
+    expect(DEFAULT_THEME).toBe("light");
     for (const value of [null, undefined, "", "midnight", 7, {}]) {
       expect(parseTheme(value)).toBe(DEFAULT_THEME);
     }

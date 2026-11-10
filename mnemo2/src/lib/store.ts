@@ -30,6 +30,7 @@ import {
   refreshDiff,
   selectDiffWorker,
   setBoardWidth,
+  setWideWorkbenchWidth,
   setWorkbenchTab,
   setWorkbenchWidth,
 } from "./store/workbench";
@@ -40,9 +41,7 @@ import {
   closeWorkerPanel,
   openCost,
   openFileInWorkbench,
-  openGraph,
   openLead,
-  openMemory,
   openPlanDocument,
   openPlans,
   openRepoPath,
@@ -114,7 +113,7 @@ import {
 } from "./store/project";
 
 export { SESSION_START_MS, app, createInitialState, currentProject, needsYouCount, selectedWorker } from "./store/core";
-export { MIN_LEAD_WIDTH, MIN_WORKBENCH_WIDTH, maxWorkbenchWidth, clampWorkbenchWidth, MIN_BOARD_WIDTH, MIN_BOARD_OUTPUT_WIDTH, BOARD_DIVIDER_WIDTH, maxBoardWidth, clampBoardWidth, defaultBoardWidth } from "./store/layout";
+export { MIN_LEAD_WIDTH, MIN_WORKBENCH_WIDTH, PANEL_OVERLAY_MAX_WIDTH, maxWorkbenchWidth, clampWorkbenchWidth, panelCoversMain, isWideWorkbenchTab, defaultWideWorkbenchWidth, workbenchPanelWidth, MIN_BOARD_WIDTH, MIN_BOARD_OUTPUT_WIDTH, BOARD_DIVIDER_WIDTH, maxBoardWidth, clampBoardWidth, defaultBoardWidth } from "./store/layout";
 export { OLD_WORKER_STATUSES, isOldWorker } from "./store/teamActions";
 
 /** Surface a transient status or failure message to the user. */
@@ -160,9 +159,7 @@ export const actions = {
   openLead,
   openTeam,
   openCost,
-  openGraph,
   openPlans,
-  openMemory,
   openTrace,
   clearTraceEntry,
   openPlanDocument,
@@ -179,6 +176,7 @@ export const actions = {
   closeWorkbench,
   setWorkbenchTab,
   setWorkbenchWidth,
+  setWideWorkbenchWidth,
   reclampWorkbenchWidth,
   refreshDiff,
   selectDiffWorker,

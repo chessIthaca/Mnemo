@@ -312,10 +312,6 @@ pub struct QualityReport {
     pub grade: QualityGrade,
     /// Window fill at the time of the report (0–100).
     pub fill_pct: u8,
-    /// Cumulative tokens spent on redundant serves (skeletons).
-    pub waste_tokens: u64,
-    /// Share of lever-served reads that were stale re-reads (0–100).
-    pub stale_read_rate: u8,
     /// Decisions seen per 100 messages (0–100) — a low value means the session
     /// is churning without committing to anything.
     pub decision_density: u8,
@@ -325,39 +321,24 @@ pub struct QualityReport {
 /// session's [`OptimizerState`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QualitySignals {
-    /// Reads served through a lever (skeleton or delta).
-    pub reads_total: u64,
-    /// Of those, the ones served as a skeleton (a stale re-read).
-    pub skeleton_serves: u64,
-    /// Cumulative tokens every lever handed the model.
-    pub served_tokens: u64,
-    /// Cumulative tokens spent on redundant serves.
-    pub waste_tokens: u64,
     /// Decisions the compaction-survival lever has preserved.
     pub decisions_seen: u64,
 }
 
 impl QualityReport {
-    /// Grade the context from the current fill level and the session's
-    /// optimizer counters (token-optimizer lever 6, backlog e4a50d22).
+    /// Grade the context from how full the window is (token-optimizer lever 6,
+    /// backlog e4a50d22). The decision density is reported, not scored.
     ///
     /// Deterministic by construction: the same inputs always yield the same
     /// grade, every band boundary is unit-tested, and there is no model call —
     /// the report is a UI signal and a nudge trigger, never a decision.
     pub fn compute(fill_pct: u8, messages: usize, signals: QualitySignals) -> Self {
         let fill_pct = fill_pct.min(100);
-        let waste_ratio_pct = ratio_pct(signals.waste_tokens, signals.served_tokens);
-        let stale_read_rate = ratio_pct(signals.skeleton_serves, signals.reads_total);
         let decision_density = ratio_pct(signals.decisions_seen, messages.max(1) as u64);
-        let score = 100
-            - fill_penalty(fill_pct) as i32
-            - waste_penalty(waste_ratio_pct) as i32
-            - stale_penalty(stale_read_rate) as i32;
+        let score = 100 - fill_penalty(fill_pct) as i32;
         Self {
             grade: QualityGrade::from_score(score),
             fill_pct,
-            waste_tokens: signals.waste_tokens,
-            stale_read_rate,
             decision_density,
         }
     }
@@ -371,8 +352,8 @@ fn ratio_pct(part: u64, whole: u64) -> u8 {
     (part.saturating_mul(100) / whole).min(100) as u8
 }
 
-/// Fill is the primary risk: a full window forces compaction, and compaction is
-/// where detail is lost.
+/// Fill is the risk the grade measures: a full window forces compaction, and
+/// compaction is where detail is lost.
 fn fill_penalty(fill_pct: u8) -> u8 {
     match fill_pct {
         95.. => 70,
@@ -384,48 +365,18 @@ fn fill_penalty(fill_pct: u8) -> u8 {
     }
 }
 
-/// Waste is the secondary signal: tokens the model paid for twice.
-fn waste_penalty(waste_ratio_pct: u8) -> u8 {
-    match waste_ratio_pct {
-        50.. => 30,
-        25..=49 => 18,
-        10..=24 => 8,
-        5..=9 => 3,
-        _ => 0,
-    }
-}
-
-/// Stale re-reads are the tertiary signal — a symptom of the same waste.
-fn stale_penalty(stale_read_rate: u8) -> u8 {
-    match stale_read_rate {
-        50.. => 15,
-        25..=49 => 8,
-        10..=24 => 3,
-        _ => 0,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Lever 6 — session counters
 // ---------------------------------------------------------------------------
 
 /// The session's running optimizer counters (token-optimizer lever 6, backlog
-/// e4a50d22), fed by `AgentLoop::record_savings_event` — one call site updates
-/// the ledger row AND these counters, so the two can never disagree.
+/// e4a50d22), fed by [`note_decisions`](Self::note_decisions) (compaction
+/// survival) and [`tick_request`](Self::tick_request) (the request clock).
 ///
-/// Atomics rather than a lock: `record_savings_event` runs on `&self` from the
-/// turn loop and the tool-ingestion path, and the counters are a cheap monotone
-/// summary of what the levers already logged.
+/// Atomics rather than a lock: both run on `&self` from the turn loop and the
+/// runtime, and the counters are a cheap monotone summary.
 #[derive(Debug)]
 pub struct OptimizerState {
-    /// Reads served through a lever (skeleton or delta).
-    reads_total: AtomicU64,
-    /// Of those, the ones served as a skeleton (a stale re-read).
-    skeleton_serves: AtomicU64,
-    /// Cumulative tokens every lever handed the model.
-    served_tokens: AtomicU64,
-    /// Cumulative tokens spent on redundant serves.
-    waste_tokens: AtomicU64,
     /// Decisions the compaction-survival lever has preserved.
     decisions_seen: AtomicU64,
     /// Requests seen so far — the clock lever 7's nudge cooldown is measured
@@ -448,10 +399,6 @@ impl Default for OptimizerState {
     /// [`NO_GRADE`]: OptimizerState::NO_GRADE
     fn default() -> Self {
         Self {
-            reads_total: AtomicU64::new(0),
-            skeleton_serves: AtomicU64::new(0),
-            served_tokens: AtomicU64::new(0),
-            waste_tokens: AtomicU64::new(0),
             decisions_seen: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             last_nudge_request: AtomicU64::new(0),
@@ -461,29 +408,6 @@ impl Default for OptimizerState {
 }
 
 impl OptimizerState {
-    /// Record one lever event, mirroring the `savings_events` row written
-    /// alongside it. `kind` is the ledger kind; `after` the tokens the model
-    /// was actually handed.
-    pub fn record(&self, kind: &str, after: i64) {
-        let after = after.max(0) as u64;
-        self.served_tokens.fetch_add(after, Ordering::Relaxed);
-        match kind {
-            // A skeleton is a stale re-read: the model already had the file, so
-            // whatever it pays for the second serve is waste.
-            "skeleton" => {
-                self.reads_total.fetch_add(1, Ordering::Relaxed);
-                self.skeleton_serves.fetch_add(1, Ordering::Relaxed);
-                self.waste_tokens.fetch_add(after, Ordering::Relaxed);
-            }
-            // An outline is a FIRST read of a big file — not a re-read, so
-            // not waste.
-            "delta_read" | "outline" => {
-                self.reads_total.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
-
     /// Note the decisions the compaction-survival lever preserved.
     pub fn note_decisions(&self, count: usize) {
         self.decisions_seen
@@ -493,10 +417,6 @@ impl OptimizerState {
     /// A snapshot for [`QualityReport::compute`].
     pub fn snapshot(&self) -> QualitySignals {
         QualitySignals {
-            reads_total: self.reads_total.load(Ordering::Relaxed),
-            skeleton_serves: self.skeleton_serves.load(Ordering::Relaxed),
-            served_tokens: self.served_tokens.load(Ordering::Relaxed),
-            waste_tokens: self.waste_tokens.load(Ordering::Relaxed),
             decisions_seen: self.decisions_seen.load(Ordering::Relaxed),
         }
     }
@@ -591,14 +511,11 @@ pub fn nudge_note(
     if let Some(best) = best {
         if grade_delta(best, report.grade) >= 2 {
             lines.push(format!(
-                "Context quality dropped from {} to {} ({}% of the window used, {}% stale \
-                 re-reads, ~{} tokens spent on repeated serves) — consider compacting or \
-                 narrowing the task before continuing.",
+                "Context quality dropped from {} to {} ({}% of the window used) — consider \
+                 compacting or narrowing the task before continuing.",
                 best.letter(),
                 report.grade.letter(),
                 report.fill_pct,
-                report.stale_read_rate,
-                report.waste_tokens,
             ));
         }
     }
@@ -786,44 +703,25 @@ mod tests {
     }
 
     #[test]
-    fn quality_report_is_s_for_a_roomy_session_with_no_waste() {
+    fn quality_report_is_s_for_a_roomy_session() {
         let report = QualityReport::compute(10, 4, QualitySignals::default());
         assert_eq!(report.grade, QualityGrade::S, "{report:?}");
         assert_eq!(report.fill_pct, 10);
-        assert_eq!(report.waste_tokens, 0);
-        assert_eq!(report.stale_read_rate, 0);
     }
 
     #[test]
-    fn fill_is_the_primary_risk_and_waste_the_secondary() {
-        // Fill alone can reach F (>90% of the window gone).
-        let full = QualityReport::compute(92, 4, QualitySignals::default());
-        assert_eq!(full.grade, QualityGrade::F, "{full:?}");
-        // Waste alone can only reach B: a busy-but-roomy session must never
-        // read as critical, or the nudge would fire on healthy long turns.
-        let wasteful = QualityReport::compute(
-            10,
-            4,
-            QualitySignals {
-                served_tokens: 1000,
-                waste_tokens: 800,
-                ..Default::default()
-            },
-        );
-        assert_eq!(wasteful.grade, QualityGrade::B, "{wasteful:?}");
-        assert_eq!(wasteful.waste_tokens, 800);
-        // Stale re-reads alone: every lever-served read was a repeat -> A.
-        let stale = QualityReport::compute(
-            10,
-            4,
-            QualitySignals {
-                reads_total: 10,
-                skeleton_serves: 10,
-                ..Default::default()
-            },
-        );
-        assert_eq!(stale.grade, QualityGrade::A, "{stale:?}");
-        assert_eq!(stale.stale_read_rate, 100);
+    fn fill_alone_sets_the_grade() {
+        // Fill alone sets the grade: roomy is S, and a full window is F.
+        for (fill, grade) in [
+            (10, QualityGrade::S),
+            (50, QualityGrade::A),
+            (70, QualityGrade::B),
+            (80, QualityGrade::C),
+            (92, QualityGrade::F),
+        ] {
+            let report = QualityReport::compute(fill, 4, QualitySignals::default());
+            assert_eq!(report.grade, grade, "fill {fill}: {report:?}");
+        }
     }
 
     #[test]
@@ -859,72 +757,51 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_state_counts_serves_waste_and_decisions() {
-        // Lever 6: one `record` call site feeds the ledger row and these
-        // counters, so the score is graded from exactly what the levers logged.
+    fn optimizer_state_counts_decisions() {
+        // Lever 6: the decisions counter is what the quality report reads.
         let state = OptimizerState::default();
-        state.record("skeleton", 400);
-        state.record("delta_read", 100);
-        state.record("outline", 30);
-        state.record("compression", 50);
         state.note_decisions(3);
-        let snapshot = state.snapshot();
-        assert_eq!(snapshot.reads_total, 3, "skeleton, delta and outline are all reads");
-        assert_eq!(snapshot.skeleton_serves, 1);
-        assert_eq!(
-            snapshot.served_tokens, 580,
-            "every kind contributes what it served"
-        );
-        assert_eq!(snapshot.waste_tokens, 400, "only the skeleton is redundant");
-        assert_eq!(snapshot.decisions_seen, 3);
-        // A negative `after` (a re-expansion row) never underflows a counter.
-        state.record("archive_expand", -100);
-        assert_eq!(state.snapshot().served_tokens, 580);
+        state.note_decisions(2);
+        assert_eq!(state.snapshot().decisions_seen, 5);
     }
 
-    /// A report built from the given fill / served / waste signals.
-    fn report(fill_pct: u8, served: u64, waste: u64) -> QualityReport {
-        QualityReport::compute(
-            fill_pct,
-            4,
-            QualitySignals {
-                served_tokens: served,
-                waste_tokens: waste,
-                ..Default::default()
-            },
-        )
+    /// A report built from the given fill (no decisions seen).
+    fn report(fill_pct: u8) -> QualityReport {
+        QualityReport::compute(fill_pct, 4, QualitySignals::default())
     }
 
     #[test]
     fn nudge_note_is_none_when_no_trigger_fires() {
         // Below the fill threshold with no baseline grade -> no note at all, so
         // the volatile tail stays untouched.
-        assert_eq!(nudge_note(&report(10, 0, 0), None, true, 75), None);
+        assert_eq!(nudge_note(&report(10), None, true, 75), None);
         // A lean-output flag that is off never fires, however full the window.
-        assert_eq!(nudge_note(&report(99, 0, 0), None, false, 75), None);
+        assert_eq!(nudge_note(&report(99), None, false, 75), None);
     }
 
     #[test]
     fn lean_output_nudge_fires_at_and_above_the_threshold() {
-        let note = nudge_note(&report(75, 0, 0), None, true, 75)
+        let note = nudge_note(&report(75), None, true, 75)
             .expect("exactly at the threshold must fire");
         assert!(note.contains("[context guidance] context is 75% full"), "{note}");
         // One point below the threshold stays quiet.
-        assert_eq!(nudge_note(&report(74, 0, 0), None, true, 75), None);
-        assert!(nudge_note(&report(90, 0, 0), None, true, 75).is_some());
+        assert_eq!(nudge_note(&report(74), None, true, 75), None);
+        assert!(nudge_note(&report(90), None, true, 75).is_some());
     }
 
     #[test]
-    fn quality_drop_nudge_names_the_drop_and_its_components() {
+    fn quality_drop_nudge_names_the_drop_and_the_fill() {
         // Two bands (A -> C) fires, and the note carries both letters plus the
-        // signals the model can act on.
-        let dropped = report(70, 1000, 300);
+        // fill the model can act on.
+        let dropped = report(80);
         assert_eq!(dropped.grade, QualityGrade::C, "{dropped:?}");
         let note = nudge_note(&dropped, Some(QualityGrade::A), false, 75)
             .expect("a two-band drop must fire");
         assert!(note.contains("dropped from A to C"), "{note}");
-        assert!(note.contains("70% of the window used"), "{note}");
-        assert!(note.contains("~300 tokens spent on repeated serves"), "{note}");
+        assert!(note.contains("80% of the window used"), "{note}");
+        // The retired signals are gone from the note.
+        assert!(!note.contains("stale"), "{note}");
+        assert!(!note.contains("repeated serves"), "{note}");
         // It never speaks for the lean-output lever.
         assert!(!note.contains("[context guidance]"), "{note}");
     }
@@ -932,29 +809,11 @@ mod tests {
     #[test]
     fn a_single_band_drop_stays_quiet() {
         // S -> A is ONE band: below the two-band bar, so no note.
-        let a_grade = QualityReport::compute(
-            5,
-            4,
-            QualitySignals {
-                reads_total: 10,
-                skeleton_serves: 10,
-                ..Default::default()
-            },
-        );
+        let a_grade = report(50);
         assert_eq!(a_grade.grade, QualityGrade::A, "{a_grade:?}");
         assert_eq!(nudge_note(&a_grade, Some(QualityGrade::S), false, 75), None);
         // A three-band drop from the same baseline does fire.
-        let c_grade = QualityReport::compute(
-            5,
-            4,
-            QualitySignals {
-                served_tokens: 1000,
-                waste_tokens: 300,
-                reads_total: 10,
-                skeleton_serves: 10,
-                ..Default::default()
-            },
-        );
+        let c_grade = report(80);
         assert_eq!(c_grade.grade, QualityGrade::C, "{c_grade:?}");
         assert!(nudge_note(&c_grade, Some(QualityGrade::S), false, 75).is_some());
     }

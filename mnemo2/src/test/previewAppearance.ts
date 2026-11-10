@@ -23,7 +23,7 @@ export function previewAppearanceSettings(): AppearanceSettings {
     sound_complete: true,
     sound_input_needed: true,
     sound_stopped_errors: false,
-    theme: "dark",
+    theme: "light",
     close_behavior: "tray",
   };
 }

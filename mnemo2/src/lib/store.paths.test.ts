@@ -6,15 +6,16 @@ const state = () => get(app);
 
 describe("Memory path hand-overs", () => {
   beforeEach(() => {
-    // A project is open on the Memory tab, with the Workbench closed.
+    // A project is open on the Cost tab, with the side panel closed.
     app.set({
       ...createInitialState(),
       projectId: "mnemo",
-      route: "memory",
+      route: "cost",
       workbenchOpen: false,
       workbenchTab: "browser",
     });
   });
+
 
   it("opens a plan document on the Plans route with the id pending", () => {
     actions.openPlanDocument(" fc536488 ");
@@ -34,14 +35,14 @@ describe("Memory path hand-overs", () => {
   it("ignores an empty plan id", () => {
     actions.openPlanDocument("   ");
 
-    expect(state().route).toBe("memory");
+    expect(state().route).toBe("cost");
     expect(state().planDocumentId).toBeNull();
   });
 
   it("opens a file in the Workbench's Files tab at its line", () => {
     actions.openFileInWorkbench("src/agent/turn.rs", 4352);
 
-    expect(state().route).toBe("lead");
+    expect(state().route).toBe("cost");
     expect(state().workbenchOpen).toBe(true);
     expect(state().workbenchTab).toBe("files");
     expect(state().workbenchFile).toEqual({ path: "src/agent/turn.rs", line: 4352 });
@@ -72,7 +73,7 @@ describe("Memory path hand-overs", () => {
   it("opens a path ref in the Workbench's Files tab at its line", () => {
     actions.openRepoPath({ path: "src/a.rs", line: 42, kind: "file", planId: null });
 
-    expect(state().route).toBe("lead");
+    expect(state().route).toBe("cost");
     expect(state().workbenchOpen).toBe(true);
     expect(state().workbenchTab).toBe("files");
     expect(state().workbenchFile).toEqual({ path: "src/a.rs", line: 42 });

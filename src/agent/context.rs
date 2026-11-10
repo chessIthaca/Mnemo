@@ -1203,13 +1203,14 @@ pub fn compact_old_tool_results(
     keep_high: usize,
     summary_chars: usize,
 ) -> usize {
-    compact_old_tool_results_collecting(messages, keep, keep_high, summary_chars, usize::MAX).0
+    compact_old_tool_results_collecting(messages, keep, keep_high, summary_chars, usize::MAX).truncated
 }
 
 /// One tool result truncated by [`compact_old_tool_results_collecting`],
 /// carrying its FULL pre-truncation original — the progressive-disclosure
 /// lever (backlog e4a50d22 lever 3) archives these, so a cut result stays
 /// recoverable instead of being lost to the cut.
+#[derive(Debug)]
 pub struct TruncationRecord {
     /// Index of the truncated message in the slice passed in.
     pub message_index: usize,
@@ -1221,13 +1222,30 @@ pub struct TruncationRecord {
     pub pointer: Option<String>,
 }
 
+/// What one [`compact_old_tool_results_collecting`] pass did: how many
+/// results it cut, the archive records, and the character counts of the cut
+/// results before and after (so the turn loop can record what the reclaim
+/// really removed).
+#[derive(Debug)]
+pub struct ToolResultCut {
+    /// How many tool results this pass truncated.
+    pub truncated: usize,
+    /// The pre-truncation originals worth archiving, in truncation order.
+    pub records: Vec<TruncationRecord>,
+    /// Summed characters of the truncated results BEFORE the cut.
+    pub chars_before: usize,
+    /// Summed characters of the truncated results AFTER the cut.
+    pub chars_after: usize,
+}
+
 /// [`compact_old_tool_results`] plus the pre-truncation originals of every
 /// result at or above `min_archive_chars` characters. This is the pure,
 /// store-free half of the progressive-disclosure lever: it mutates nothing
 /// about archiving, so compaction stays deterministic and testable, and the
 /// caller owns the (fallible) archive write.
 ///
-/// Returns `(newly_truncated_count, records)`. Records are in truncation
+/// Returns a [`ToolResultCut`] carrying the newly-truncated count, the
+/// records, and the character counts before/after. Records are in truncation
 /// order; a result under the threshold yields no record (nothing was worth
 /// archiving), and a pass that truncates nothing returns an empty vec.
 pub fn compact_old_tool_results_collecting(
@@ -1236,7 +1254,7 @@ pub fn compact_old_tool_results_collecting(
     keep_high: usize,
     summary_chars: usize,
     min_archive_chars: usize,
-) -> (usize, Vec<TruncationRecord>) {
+) -> ToolResultCut {
     let effective_high = keep_high.max(keep);
     // Collect the indices of all intact (not yet compacted) tool results. A
     // multipart result counts as intact only while it still holds an image
@@ -1274,14 +1292,19 @@ pub fn compact_old_tool_results_collecting(
 
     let mut truncated_count = 0;
     let mut records: Vec<TruncationRecord> = Vec::new();
+    let mut chars_before = 0usize;
+    let mut chars_after = 0usize;
     if truncatable_indices.len() > effective_high {
         // Cut back to `keep` truncatable tool results in one pass.
         let to_compact = &truncatable_indices[..truncatable_indices.len() - keep];
         for &idx in to_compact {
             // Capture BEFORE the cut — once truncated, the original is gone.
             let captured = capture_for_archive(&messages[idx], min_archive_chars, idx, messages);
+            let before = tool_result_chars(&messages[idx]);
             if truncate_tool_result_at(messages, idx, summary_chars) {
                 truncated_count += 1;
+                chars_before += before;
+                chars_after += tool_result_chars(&messages[idx]);
                 if let Some(record) = captured {
                     records.push(record);
                 }
@@ -1311,15 +1334,38 @@ pub fn compact_old_tool_results_collecting(
         .collect();
     for idx in oversize {
         let captured = capture_for_archive(&messages[idx], min_archive_chars, idx, messages);
+        let before = tool_result_chars(&messages[idx]);
         if truncate_tool_result_at(messages, idx, TOOL_RESULT_MAX_CHARS) {
             truncated_count += 1;
+            chars_before += before;
+            chars_after += tool_result_chars(&messages[idx]);
             if let Some(record) = captured {
                 records.push(record);
             }
         }
     }
 
-    (truncated_count, records)
+    ToolResultCut {
+        truncated: truncated_count,
+        records,
+        chars_before,
+        chars_after,
+    }
+}
+
+/// The character count of a tool result's content: the text's chars, or the
+/// summed chars of its text parts (an image part carries no text).
+fn tool_result_chars(message: &Message) -> usize {
+    match &message.content {
+        MessageContent::Text(s) => s.chars().count(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.chars().count()),
+                ContentPart::ImageUrl { .. } => None,
+            })
+            .sum(),
+    }
 }
 
 /// Capture a message's content + originating pointer for the archive, when
@@ -2840,6 +2886,40 @@ mod tests {
                 "message {i} content was mutated below the high-water mark"
             );
         }
+    }
+
+    #[test]
+    fn tool_result_cut_reports_chars_removed() {
+        // 25 fat results, keep 10 of an intact high-water mark of 20: the
+        // hysteresis pass cuts the 15 oldest. The cut reports the characters
+        // it really removed so the turn can record what the reclaim saved.
+        let mut messages = vec![
+            Message::text(Role::System, "system head"),
+            Message::text(Role::User, "user task"),
+        ];
+        for i in 0..25 {
+            messages.push(Message::tool_result(
+                format!("call_{i}"),
+                "read_files",
+                format!("result {i}: {}", "x".repeat(2000)),
+            ));
+        }
+        let before: Vec<usize> = (2..27)
+            .map(|i| messages[i].content.as_text().chars().count())
+            .collect();
+
+        let cut =
+            compact_old_tool_results_collecting(&mut messages, 10, 20, 500, usize::MAX);
+        assert_eq!(cut.truncated, 15);
+        assert!(cut.chars_before > cut.chars_after, "{cut:?}");
+        // The oldest 15 are the ones cut (truncatable indices in order).
+        let direct_before: usize = (2..17).map(|i| before[i - 2]).sum();
+        let direct_after: usize = (2..17)
+            .map(|i| messages[i].content.as_text().chars().count())
+            .sum();
+        assert_eq!(cut.chars_before, direct_before);
+        assert_eq!(cut.chars_after, direct_after);
+        assert_eq!(cut.chars_before - cut.chars_after, direct_before - direct_after);
     }
 
     #[test]

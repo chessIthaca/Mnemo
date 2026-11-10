@@ -303,13 +303,13 @@ export function responseText(detail: TraceDetail): string {
 }
 
 // ---------------------------------------------------------------------------
-// The Trace route's contract — the full-page view of every model call.
+// The Trace tab's contract — the full view of every model call.
 //
 // The wire shape is frozen in the plan's Interfaces section: Rust keeps
 // snake_case serde, this file mirrors it exactly, and the commands below are
-// what the route and the compact Workbench tab both use since step E switched
-// the tab over (`trace_list` takes the query, `trace_detail` a durable key,
-// and `trace_settings`/`trace_export`/`trace_clear_live`/
+// what the tab uses since step E switched it over (`trace_list` takes the
+// query, `trace_detail` a durable key, and
+// `trace_settings`/`trace_export`/`trace_clear_live`/
 // `trace_delete_history` back the data controls).
 // ---------------------------------------------------------------------------
 
@@ -397,7 +397,7 @@ export interface TraceExportResult {
   includes_bodies: boolean;
 }
 
-/** The IPC surface the Trace route needs. */
+/** The IPC surface the Trace tab needs. */
 export interface TracePageTransport {
   /** One filtered page of the log, newest first. */
   list(query: TraceListQuery): Promise<TraceListPage>;
@@ -422,14 +422,14 @@ export interface TracePageTransport {
 let pagePreviewSeed: TracePageTransport | null = null;
 
 /**
- * Point the Trace route at fixture data for the dev-only preview page
+ * Point the Trace tab at fixture data for the dev-only preview page
  * (`npm run check:no-mock` keeps this out of the production entry).
  */
 export function seedTracePagePreview(transport: TracePageTransport | null): void {
   pagePreviewSeed = transport;
 }
 
-/** Build the Trace route's transport, or `null` outside the desktop app. */
+/** Build the Trace tab's transport, or `null` outside the desktop app. */
 export function createTracePageTransport(): TracePageTransport | null {
   if (pagePreviewSeed) return pagePreviewSeed;
   if (!isTauriRuntime()) return null;
@@ -1068,7 +1068,7 @@ export function prefixReuse(current: TraceDetail, previous: TraceDetail | null):
 /** The Time filter's presets. */
 export type TraceTimeKey = "session" | "hour" | "day" | "all" | "custom";
 
-/** Every filter the Trace route's toolbar carries. */
+/** Every filter the Trace tab's toolbar carries. */
 export interface TraceFilters {
   /** "all", "lead", a worker/agent id, or "unattributed". */
   agent: string;
@@ -1446,10 +1446,10 @@ export function saveTracePrefs(projectId: string | null, prefs: TraceViewPrefs):
 }
 
 // ---------------------------------------------------------------------------
-// Route entry — the filter hand-over `openTrace` plants.
+// Tab entry — the filter hand-over `openTrace` plants.
 // ---------------------------------------------------------------------------
 
-/** The filter hand-over an entry point can carry into the Trace route. */
+/** The filter hand-over an entry point can carry into the panel's Trace tab. */
 export interface TraceEntry {
   agent?: string;
   model?: string;
@@ -1460,7 +1460,7 @@ export interface TraceEntry {
   turn_id?: string;
   search?: string;
   search_scope?: TraceSearchScope;
-  /** The call to open on arrival ("run_id:id"), for the compact tab's hand-over. */
+  /** The call to open on arrival ("run_id:id"), for an entry point's hand-over. */
   selected?: string;
 }
 

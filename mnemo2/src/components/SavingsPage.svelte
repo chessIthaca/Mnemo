@@ -34,6 +34,7 @@
       quality_score: true,
       lean_output_nudge: true,
       recall_delta: true,
+      idle_compaction: true,
       archive_min_chars: "",
       compress_min_chars: "",
       lean_output_fill_pct: "",

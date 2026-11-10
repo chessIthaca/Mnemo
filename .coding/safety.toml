@@ -21,37 +21,7 @@
 
 [[rule]]
 tool = "shell"
-pattern = "cargo test"
-kind = "command_class"
-
-[[rule]]
-tool = "shell"
-pattern = "cargo build"
-kind = "command_class"
-
-[[rule]]
-tool = "shell"
-pattern = "cargo check"
-kind = "command_class"
-
-[[rule]]
-tool = "shell"
-pattern = "cd;cargo test"
-kind = "command_class"
-
-[[rule]]
-tool = "shell"
-pattern = "cd;npm run build"
-kind = "command_class"
-
-[[rule]]
-tool = "shell"
-pattern = "cd;npx tsc"
-kind = "command_class"
-
-[[rule]]
-tool = "shell"
-pattern = "cd;npx vite build"
+pattern = "cargo *"
 kind = "command_class"
 
 [[rule]]

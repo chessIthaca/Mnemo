@@ -28,7 +28,7 @@ export type EffectiveTheme = "light" | "dark";
 export const THEME_CHOICES: readonly ThemeChoice[] = ["light", "dark", "system"];
 
 /** The `[ui] theme` default, matching [`UiConfig`](src/config/general.rs). */
-export const DEFAULT_THEME: ThemeChoice = "dark";
+export const DEFAULT_THEME: ThemeChoice = "light";
 
 /** The `localStorage` key mirroring the last choice for the pre-paint read. */
 export const THEME_STORAGE_KEY = "mnemo2.theme";

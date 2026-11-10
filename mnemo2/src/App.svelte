@@ -6,7 +6,6 @@
   import FirstIndexOverlay from "./components/FirstIndexOverlay.svelte";
   import LayaLearningsSheet from "./components/LayaLearningsSheet.svelte";
   import LeadChat from "./components/LeadChat.svelte";
-  import MemoryView from "./components/MemoryView.svelte";
   import PlansView from "./components/PlansView.svelte";
   import StartScreen from "./components/StartScreen.svelte";
   import TeamPeek from "./components/TeamPeek.svelte";
@@ -35,32 +34,20 @@
   <div class="workspace-shell">
     <TopBar />
     <div class="workspace-main">
-      {#if $app.route === "lead"}
-        <div class="lead-column">
-          <LeadChat />
-          {#if $app.workbenchOpen}<Workbench />{:else if $app.workerPanelId}<WorkerPanel />{/if}
+      <div class="main-column">
+        <div class="main-route">
+          {#if $app.route === "lead"}
+            <LeadChat />
+          {:else if $app.route === "team"}
+            <ControlRoom />
+          {:else if $app.route === "cost"}
+            <CostView />
+          {:else}
+            <PlansView />
+          {/if}
         </div>
-      {:else if $app.route === "team"}
-        <ControlRoom />
-      {:else if $app.route === "cost"}
-        <CostView />
-      {:else if $app.route === "trace"}
-        {#await import("./components/TraceView.svelte") then { default: TraceView }}
-          <TraceView />
-        {:catch error}
-          <p class="view-load-error">Could not load this view: {String(error)}</p>
-        {/await}
-      {:else if $app.route === "plans"}
-        <PlansView />
-      {:else if $app.route === "memory"}
-        <MemoryView />
-      {:else}
-        {#await import("./components/GraphView.svelte") then { default: GraphView }}
-          <GraphView />
-        {:catch error}
-          <p class="view-load-error">Could not load this view: {String(error)}</p>
-        {/await}
-      {/if}
+        {#if $app.workbenchOpen}<Workbench />{:else if $app.route === "lead" && $app.workerPanelId}<WorkerPanel />{/if}
+      </div>
     </div>
     {#if $app.teamPeekOpen && $app.route === "lead"}<TeamPeek />{/if}
     <WorkerDeleteSheet />
@@ -73,8 +60,8 @@
 <style>
   .workspace-shell { display: flex; height: 100vh; height: 100dvh; min-height: 0; flex-direction: column; }
   .workspace-main { display: flex; flex: 1; min-height: 0; }
-  .lead-column { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
-  .view-load-error { margin: 24px; color: var(--danger); font-size: var(--text-body); overflow-wrap: anywhere; }
+  .main-column { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
+  .main-route { display: flex; flex: 1; min-width: 0; min-height: 0; }
   @media (max-width: 760px) { .workspace-main { padding-bottom: 64px; } }
 </style>
 

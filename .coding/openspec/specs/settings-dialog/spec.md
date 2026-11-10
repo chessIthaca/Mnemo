@@ -57,3 +57,15 @@ Mnemo2 SHALL check Laya when a project opens if the test set or checkpoint chang
 - **WHEN** the classifier stops answering during a check
 - **THEN** the check shows as failed
 - **AND** no record is written and the gates stay as stored
+
+### Requirement: Idle compaction has an on/off switch
+The Savings page SHALL show an "Idle compaction" switch that is on by default, and saving it SHALL turn idle compaction on or off without a restart.
+
+#### Scenario: Default is on
+- **WHEN** the user opens Settings → Savings on a config that never set idle_compaction
+- **THEN** the Idle compaction switch is on
+
+#### Scenario: Switching it off is saved
+- **WHEN** the user switches Idle compaction off and saves
+- **THEN** config.toml holds idle_compaction = false under [general.optimizer]
+- **AND** agents stop idle compaction without a restart

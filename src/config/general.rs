@@ -135,8 +135,8 @@ pub struct GeneralSection {
     #[serde(default, skip_serializing_if = "BudgetConfig::is_default")]
     pub budget: BudgetConfig,
     /// **Token-optimizer levers (on by default; backlog e4a50d22).** The
-    /// context levers that cut re-reads and command-output waste at the tool
-    /// dispatch layer: delta/skeleton re-reads, semantic command-output
+    /// context levers that cut big-file reads and command-output waste at the
+    /// dispatch layer: outline reads of big files, semantic command-output
     /// compression, archive/expand progressive disclosure, compaction
     /// survival, the S-F quality score, and the lean-output nudge. An absent
     /// section means every lever holds its default (ON) — an explicit
@@ -696,13 +696,11 @@ fn budget_retries_is_default(count: &u32) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OptimizerConfig {
-    /// **Lever 1 — delta, skeleton + outline reads.** When `true`,
-    /// `read_files` serves a signature/import skeleton for re-reads of
-    /// unchanged files and a unified diff for changed ones, instead of the
-    /// full content every time, and a first whole read of a source file over
-    /// 300 lines serves its signature outline (the agent then reads the
-    /// region it needs). Other first reads and ranged reads still serve full
-    /// content. On by default.
+    /// **Lever 1 — outline reads.** When `true`, a whole `read_files` read of
+    /// a source file over 500 lines serves its signature outline (the agent
+    /// then reads the region it needs with a ranged read). Other whole reads
+    /// and every ranged read serve full content. The key keeps its historical
+    /// name so existing configs load. On by default.
     pub delta_reads: bool,
     /// **Lever 2 — semantic command-output compression.** When `true`,
     /// large shell-tool output from known command families (cargo, npm,
@@ -738,6 +736,13 @@ pub struct OptimizerConfig {
     /// request, so the reference is a pointer the model dereferences with
     /// `memory_search`. On by default.
     pub recall_delta: bool,
+    /// **Idle compaction.** When `true`, an agent conversation of at least
+    /// 50,000 tokens that has sat idle past its model's measured prompt-cache
+    /// lifetime is summarized by the compaction model (`[models.summarize]`),
+    /// so the next message does not resend the whole context at the uncached
+    /// rate. Needs a compaction model that differs from the agent's model;
+    /// without one it does nothing. On by default.
+    pub idle_compaction: bool,
     /// Minimum length (chars) of a tool result before lever 3 archives
     /// it. Results under the cap pass through the existing ingestion cap
     /// unchanged.
@@ -783,6 +788,7 @@ impl OptimizerConfig {
             && self.quality_score
             && self.lean_output_nudge
             && self.recall_delta
+            && self.idle_compaction
             && self.archive_min_chars == Self::DEFAULT_ARCHIVE_MIN_CHARS
             && self.compress_min_chars == Self::DEFAULT_COMPRESS_MIN_CHARS
             && self.lean_output_fill_pct == Self::DEFAULT_LEAN_OUTPUT_FILL_PCT
@@ -801,6 +807,7 @@ impl Default for OptimizerConfig {
             quality_score: true,
             lean_output_nudge: true,
             recall_delta: true,
+            idle_compaction: true,
             archive_min_chars: Self::DEFAULT_ARCHIVE_MIN_CHARS,
             compress_min_chars: Self::DEFAULT_COMPRESS_MIN_CHARS,
             lean_output_fill_pct: Self::DEFAULT_LEAN_OUTPUT_FILL_PCT,
@@ -1095,7 +1102,7 @@ impl Default for SteeringNotesCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
-    /// `"dark"` or `"light"`.
+    /// `"light"` (the default), `"dark"` or `"system"` (follow the OS).
     pub theme: String,
     /// Show token usage in the status bar.
     pub show_token_usage: bool,
@@ -1175,7 +1182,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: "dark".to_string(),
+            theme: "light".to_string(),
             show_token_usage: true,
             show_tool_images: true,
             show_tool_activity: true,
@@ -1583,7 +1590,7 @@ show_token_usage = false
         let cfg: GeneralConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.general.safety, SafetyMode::ApproveEachAction);
         assert!((cfg.context.summarize_at_fill_rate - 0.3).abs() < 1e-9);
-        assert_eq!(cfg.ui.theme, "dark");
+        assert_eq!(cfg.ui.theme, "light");
         assert!(cfg.ui.show_token_usage);
     }
 
@@ -2024,6 +2031,7 @@ auto_type_memories = true
         assert!(cfg.general.optimizer.quality_score);
         assert!(cfg.general.optimizer.lean_output_nudge);
         assert!(cfg.general.optimizer.recall_delta);
+        assert!(cfg.general.optimizer.idle_compaction);
         assert_eq!(
             cfg.general.optimizer.archive_min_chars,
             OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS
@@ -2065,6 +2073,27 @@ recall_delta = false
         let back = toml::to_string(&cfg).unwrap();
         let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
         assert!(!cfg2.general.optimizer.recall_delta);
+
+        let only_idle = r#"
+[general.optimizer]
+idle_compaction = false
+"#;
+        let cfg: GeneralConfig = toml::from_str(only_idle).unwrap();
+        assert!(
+            !cfg.general.optimizer.idle_compaction,
+            "an explicit opt-out is honoured"
+        );
+        assert!(
+            cfg.general.optimizer.recall_delta,
+            "an unnamed lever keeps its default"
+        );
+        assert!(
+            !cfg.general.optimizer.is_default(),
+            "an opted-out lever counts as touched"
+        );
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(!cfg2.general.optimizer.idle_compaction);
 
         // Untouched: no serialized trace; touched: is_default flips.
         assert!(OptimizerConfig::default().is_default());

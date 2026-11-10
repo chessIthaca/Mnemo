@@ -642,15 +642,16 @@ function sampleGraphTransport(): GraphTransport {
   };
 }
 
-/** The Graph tab: the code-graph explorer seeded with a sample slice of this project. */
+/** The panel's Graph tab: the code-graph explorer seeded with a sample slice of this project. */
 function graphScene(): AppState {
   seedGraphPreview(sampleGraphTransport());
   return {
     ...baseState(),
-    route: "graph",
+    route: "lead",
     selectedWorkerId: null,
     workerPanelId: null,
-    workbenchOpen: false,
+    workbenchOpen: true,
+    workbenchTab: "graph",
     workerDeletion: null,
     // The scene opens on a rebuild in progress: the notice shows 1,200/2,400 files.
     indexing: {
@@ -1105,44 +1106,54 @@ function previewTraceTransport(rows: TraceRow[]): TracePageTransport {
   };
 }
 
-/** The full Trace route: streaming, failed, unpriced and retained calls in one list. */
+/** The panel's Trace tab: streaming, failed, unpriced and retained calls in one list. */
 function traceScene(): AppState {
   seedTracePagePreview(previewTraceTransport(PREVIEW_TRACE_ROWS));
-  return { ...baseState(), route: "trace", selectedWorkerId: RICH_WORKER_ID, workerPanelId: null };
+  return {
+    ...baseState(),
+    route: "lead",
+    selectedWorkerId: RICH_WORKER_ID,
+    workerPanelId: null,
+    workbenchOpen: true,
+    workbenchTab: "trace",
+  };
 }
 
-/** The Trace route before any model call was recorded. */
+/** The panel's Trace tab before any model call was recorded. */
 function traceEmpty(): AppState {
   seedTracePagePreview(previewTraceTransport([]));
-  return { ...baseState(), route: "trace", selectedWorkerId: RICH_WORKER_ID, workerPanelId: null };
+  return {
+    ...baseState(),
+    route: "lead",
+    selectedWorkerId: RICH_WORKER_ID,
+    workerPanelId: null,
+    workbenchOpen: true,
+    workbenchTab: "trace",
+  };
 }
 
-/** The compact side tab: the newest calls and the actor filters. */
-function traceTab(): AppState {
+/** The panel beside Mission Control: the diff of the worker under review. */
+function panelTeamDiff(): AppState {
+  return { ...missionControl(), workbenchOpen: true, workbenchTab: "diff", workbenchWidth: 460 };
+}
+
+/** The panel's Graph tab beside Mission Control. */
+function panelTeamGraph(): AppState {
+  seedGraphPreview(sampleGraphTransport());
+  return { ...missionControl(), workbenchOpen: true, workbenchTab: "graph" };
+}
+
+/** The panel's Trace tab beside the Cost tab. */
+function panelCostTrace(): AppState {
   seedTracePagePreview(previewTraceTransport(PREVIEW_TRACE_ROWS));
-  return {
-    ...baseState(),
-    workbenchOpen: true,
-    workbenchTab: "trace",
-    workbenchWidth: 460,
-    selectedWorkerId: RICH_WORKER_ID,
-    workerPanelId: null,
-  };
+  return { ...costTab(), workerPanelId: null, workbenchOpen: true, workbenchTab: "trace" };
 }
 
-/** The compact side tab before any model call was recorded. */
-function traceTabEmpty(): AppState {
-  seedTracePagePreview(previewTraceTransport([]));
-  return {
-    ...baseState(),
-    workbenchOpen: true,
-    workbenchTab: "trace",
-    workbenchWidth: 460,
-    selectedWorkerId: RICH_WORKER_ID,
-    workerPanelId: null,
-  };
+/** The panel's Memory tab beside the Plans tab. */
+function panelPlansMemory(): AppState {
+  seedMemoryPreview(sampleMemoryTransport());
+  return { ...plansTab(), workerPanelId: null, workbenchOpen: true, workbenchTab: "memory" };
 }
-
 
 /** The Git tab: branches at different distances from main, and the newest commits on one lane. */
 function gitTab(): AppState {
@@ -1352,18 +1363,17 @@ function previewCostInsights(): CostInsights {
       per_day: spendPerDay.map((costMicros, index) => ({ day: day(index), cost_micros: costMicros })),
     },
     savings: {
-      tokens_saved: 8_946_000,
-      estimated_saved_micros: 2_380_000,
+      tokens_saved: 2_866_000,
+      estimated_saved_micros: 702_000,
       levers: [
-        { kind: "delta_read", events: 1_240, tokens_saved: 4_180_000, estimated_saved_micros: 1_090_000 },
-        { kind: "skeleton", events: 862, tokens_saved: 1_910_000, estimated_saved_micros: 505_000 },
-        { kind: "recall_delta", events: 214, tokens_saved: 1_060_000, estimated_saved_micros: 280_000 },
-        { kind: "compression", events: 388, tokens_saved: 940_000, estimated_saved_micros: 248_000 },
-        { kind: "archive", events: 46, tokens_saved: 580_000, estimated_saved_micros: 153_000 },
-        { kind: "outline", events: 102, tokens_saved: 246_000, estimated_saved_micros: 65_000 },
-        { kind: "truncation", events: 61, tokens_saved: 150_000, estimated_saved_micros: 39_000 },
-        { kind: "compaction_checkpoint", events: 9, tokens_saved: 0, estimated_saved_micros: 0 },
-        { kind: "archive_expand", events: 6, tokens_saved: -120_000, estimated_saved_micros: 0 },
+        { kind: "recall_delta", events: 214, tokens_saved: 1_060_000, estimated_saved_micros: 280_000, estimated_cost_micros: null },
+        { kind: "compression", events: 388, tokens_saved: 940_000, estimated_saved_micros: 248_000, estimated_cost_micros: null },
+        { kind: "archive", events: 46, tokens_saved: 580_000, estimated_saved_micros: 153_000, estimated_cost_micros: null },
+        { kind: "outline", events: 102, tokens_saved: 246_000, estimated_saved_micros: 65_000, estimated_cost_micros: null },
+        { kind: "old_result_trim", events: 61, tokens_saved: 150_000, estimated_saved_micros: 39_000, estimated_cost_micros: null },
+        { kind: "compaction", events: 9, tokens_saved: 90_000, estimated_saved_micros: 24_000, estimated_cost_micros: null },
+        { kind: "archive_expand", events: 6, tokens_saved: -120_000, estimated_saved_micros: 0, estimated_cost_micros: 42_000 },
+        { kind: "outline_followup", events: 118, tokens_saved: -80_000, estimated_saved_micros: 0, estimated_cost_micros: 65_000 },
       ],
       cache: {
         prompt_tokens: 12_400_000,
@@ -1372,6 +1382,8 @@ function previewCostInsights(): CostInsights {
         estimated_saved_micros: 1_850_000,
       },
       per_day: savedPerDay.map((tokensSaved, index) => ({ day: day(index), tokens_saved: tokensSaved })),
+      traffic_micros: 24_800_000,
+      traffic_since: day(0),
     },
   };
 }
@@ -2077,10 +2089,10 @@ function sampleMemoryTransport(): MemoryTransport {
   };
 }
 
-/** The Memory tab over the same project, with the newest record open in the reader. */
+/** The panel's Memory tab over the same project, with the newest record open in the reader. */
 function memoryTab(): AppState {
   seedMemoryPreview(sampleMemoryTransport());
-  return { ...baseState(), route: "memory" };
+  return { ...baseState(), workerPanelId: null, workbenchOpen: true, workbenchTab: "memory" };
 }
 
 /** The lead chat with the tool-row bodies: named-file headlines, the expanded
@@ -2445,7 +2457,7 @@ export const previewScenes: PreviewScene[] = [
     name: "memory",
     title: "Memory",
     description:
-      "The top-level Memory tab: the project's knowledge records newest first with the SPEC/DECISION/BUG/HOW chips, one record rendered as Markdown with its path, date and backlinks, and the Diagnostics card (embedder, per-tier counts, recall test).",
+      "The panel's Memory tab: the project's knowledge records newest first with the SPEC/DECISION/BUG/HOW chips, one record rendered as Markdown with its path, date and backlinks, and the Diagnostics card (embedder, per-tier counts, recall test).",
     build: memoryTab,
     // Diagnostics is collapsed by design, so the scene opens it and runs one
     // recall after mounting — otherwise the screenshot would show an empty
@@ -2469,27 +2481,38 @@ export const previewScenes: PreviewScene[] = [
     name: "trace",
     title: "Trace",
     description:
-      "The full Trace route: the filter bar, the export/retention controls, and a list with a streaming lead call, a failed worker call, an unpriced call and retained metadata, plus the charts and the call detail.",
+      "The panel's Trace tab: the filter bar, the export/retention controls, and a list with a streaming lead call, a failed worker call, an unpriced call and retained metadata, plus the charts and the call detail.",
     build: traceScene,
   },
   {
     name: "trace-empty",
     title: "Trace (empty)",
-    description: "The Trace route before any model call was recorded: the empty state, the filters and the data controls.",
+    description: "The panel's Trace tab before any model call was recorded: the empty state, the filters and the data controls.",
     build: traceEmpty,
   },
   {
-    name: "trace-tab",
-    title: "Trace tab",
-    description:
-      "The compact side Trace tab: the newest calls with All agents / This lead / worker filters, tokens, cache reuse, cost and status.",
-    build: traceTab,
+    name: "panel-team-diff",
+    title: "Panel: Team with Diff",
+    description: "The side panel open on its Diff tab beside Mission Control, resized to 460px.",
+    build: panelTeamDiff,
   },
   {
-    name: "trace-tab-empty",
-    title: "Trace tab (empty)",
-    description: "The compact side Trace tab before any model call was recorded.",
-    build: traceTabEmpty,
+    name: "panel-team-graph",
+    title: "Panel: Team with Graph",
+    description: "The side panel open on its Graph tab beside Mission Control: the code-graph explorer with its sample slice.",
+    build: panelTeamGraph,
+  },
+  {
+    name: "panel-cost-trace",
+    title: "Panel: Cost with Trace",
+    description: "The side panel open on its Trace tab beside the Cost tab: the filter bar and the list with a streaming lead call, a failed worker call, an unpriced call and retained metadata.",
+    build: panelCostTrace,
+  },
+  {
+    name: "panel-plans-memory",
+    title: "Panel: Plans with Memory",
+    description: "The side panel open on its Memory tab beside the Plans tab: the knowledge list and the newest record open in the reader.",
+    build: panelPlansMemory,
   },
   {
     name: "lead-tool-rows",

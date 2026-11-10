@@ -23,6 +23,10 @@
 //!
 //! Both report progress as `(phase, done, total)` via a callback so callers
 //! can drive a progress bar; see [`MaintenancePhase`].
+//!
+//! One more sweep lives here, though nothing in the UI drives it:
+//! [`prune_old_archive_rows`] trims the tool-result archive past
+//! [`ARCHIVE_RETENTION_SECS`], spawned by the engine at startup.
 
 use std::sync::Arc;
 
@@ -238,6 +242,47 @@ pub async fn rebuild_search(
     Ok(RebuildReport {
         memories_reembedded,
     })
+}
+
+/// How long an archived tool result stays readable.
+///
+/// In this project's ledger no expansion was ever older than 6 hours, so a
+/// two-week window keeps every row a session could plausibly still want while
+/// letting the archive stop growing. There is deliberately no setting: the
+/// retention is a property of how agents actually read back, not a preference.
+pub const ARCHIVE_RETENTION_SECS: i64 = 14 * 86_400;
+
+/// How many archive rows one prune batch removes.
+const ARCHIVE_PRUNE_BATCH: usize = 100;
+
+/// Delete every archived tool result older than [`ARCHIVE_RETENTION_SECS`].
+///
+/// Runs in short batches (sleeping between them so a concurrent agent's writes
+/// get the SQLite lock) and stops on the first short batch, when the archive has
+/// no more expired rows. Never VACUUMs: the freed pages are reused by later
+/// inserts, so the file stops growing rather than shrinking. A failure is logged
+/// to stderr and ends the sweep — pruning is housekeeping and must never take a
+/// caller down with it.
+pub async fn prune_old_archive_rows(store: Arc<dyn MemoryStoreTrait>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - ARCHIVE_RETENTION_SECS;
+    loop {
+        match store.prune_tool_result_archive(cutoff, ARCHIVE_PRUNE_BATCH).await {
+            Ok(deleted) => {
+                if deleted < ARCHIVE_PRUNE_BATCH {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                eprintln!("prune_old_archive_rows: archive prune failed: {e}");
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

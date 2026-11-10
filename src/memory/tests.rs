@@ -2784,6 +2784,7 @@ async fn savings_events_round_trip_and_negative_expansions() {
         })
         .await
         .unwrap();
+    // The raw row reader still returns a retired kind; only the reports skip it.
     let rows = store.savings_events_rows(Some("s1")).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].kind, "skeleton");
@@ -2930,7 +2931,7 @@ async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
         created_at: at,
     };
     store
-        .record_savings_event(&record("skeleton", 12_000, 900, day1))
+        .record_savings_event(&record("outline", 12_000, 900, day1))
         .await
         .unwrap();
     store
@@ -2938,7 +2939,7 @@ async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
         .await
         .unwrap();
     store
-        .record_savings_event(&record("skeleton", 2_000, 400, day2))
+        .record_savings_event(&record("outline", 2_000, 400, day2))
         .await
         .unwrap();
     // A re-expansion re-adds archived content, so it subtracts from the total.
@@ -2954,7 +2955,7 @@ async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
 
     // Per-kind, biggest saver first; the negative kind sorts last.
     assert_eq!(stats.per_kind.len(), 3);
-    assert_eq!(stats.per_kind[0].kind, "skeleton");
+    assert_eq!(stats.per_kind[0].kind, "outline");
     assert_eq!(stats.per_kind[0].event_count, 2);
     assert_eq!(stats.per_kind[0].saved_tokens, 12_700);
     assert_eq!(stats.per_kind[1].kind, "compression");
@@ -3561,4 +3562,489 @@ async fn compaction_checkpoint_round_trips_through_the_archive() {
     let hits = store.search_archive("DROPPED_ALPHA", 10).await.unwrap();
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0].id, id);
+}
+
+#[tokio::test]
+async fn savings_stats_clamps_archive_and_compression_to_the_result_cap() {
+    // A tool result was already capped at TOOL_RESULT_MAX_CHARS (100,000 chars
+    // = 25,000 tokens) before any lever ran, so no row may claim more. The
+    // clamp also telescopes a compressed-then-archived result into ONE saving
+    // instead of crediting both steps.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let day = 1_700_000_000_i64;
+    let record = |kind: &str, before: i64, after: i64, at: i64| SavingsEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        kind: kind.into(),
+        detail: None,
+        tokens_before: before,
+        tokens_after: after,
+        tokens_saved: before - after,
+        measured: false,
+        created_at: at,
+    };
+    store
+        .record_savings_event(&record("compression", 130_000, 9_000, day))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("archive", 9_000, 500, day + 60))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("archive", 100_000, 500, day + 120))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("outline", 12_000, 900, day + 180))
+        .await
+        .unwrap();
+
+    let stats = store.savings_stats().await.unwrap();
+
+    // compression: 25,000 - 9,000. archive: (9,000 - 500) + (25,000 - 500).
+    // outline is not an archive kind, so its raw saving stands.
+    assert_eq!(stats.saved_tokens_total, 16_000 + 33_000 + 11_100);
+    assert_eq!(stats.per_kind.len(), 3);
+    assert_eq!(stats.per_kind[0].kind, "archive");
+    assert_eq!(stats.per_kind[0].saved_tokens, 33_000);
+    assert_eq!(stats.per_kind[1].kind, "compression");
+    assert_eq!(stats.per_kind[1].saved_tokens, 16_000);
+    assert_eq!(stats.per_kind[2].kind, "outline");
+    assert_eq!(stats.per_kind[2].saved_tokens, 11_100);
+    // The per-day series sums to the same honest total.
+    let per_day: i64 = stats.per_day.iter().map(|day| day.saved_tokens).sum();
+    assert_eq!(per_day, stats.saved_tokens_total);
+    // `recent` keeps the raw rows: the audit view shows what was recorded.
+    let compression = stats
+        .recent
+        .iter()
+        .find(|event| event.kind == "compression")
+        .expect("the compression row is recent");
+    assert_eq!(compression.tokens_saved, 121_000);
+}
+
+#[tokio::test]
+async fn savings_reports_skip_retired_kinds() {
+    // The delta-read and signature-skeleton levers are retired: their rows
+    // stay in the ledger (the raw reader keeps them), but both reports —
+    // the Cost tab's total, lever list, day chart, recent list and dollars —
+    // list only the levers that still run.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let day1 = 1_700_000_000_i64;
+    let day2 = day1 + 86_400;
+    let record = |kind: &str, before: i64, after: i64, at: i64| SavingsEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        kind: kind.into(),
+        detail: None,
+        tokens_before: before,
+        tokens_after: after,
+        tokens_saved: before - after,
+        measured: false,
+        created_at: at,
+    };
+    store
+        .record_savings_event(&record("delta_read", 5_000, 1_000, day1))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("skeleton", 12_000, 900, day1 + 60))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("compression", 8_000, 1_200, day1 + 120))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("outline", 3_000, 500, day2))
+        .await
+        .unwrap();
+
+    let stats = store.savings_stats().await.unwrap();
+    assert_eq!(stats.event_count, 2);
+    // 6_800 + 2_500: the retired rows' savings (4_000 and 11_100) do not count.
+    assert_eq!(stats.saved_tokens_total, 6_800 + 2_500);
+    let kinds: Vec<&str> = stats.per_kind.iter().map(|row| row.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["compression", "outline"]);
+    assert_eq!(stats.per_day.len(), 2);
+    assert_eq!(stats.per_day[0].day, day1 / 86_400);
+    assert_eq!(stats.per_day[0].event_count, 1);
+    assert_eq!(stats.per_day[0].saved_tokens, 6_800);
+    assert_eq!(stats.per_day[1].day, day2 / 86_400);
+    assert_eq!(stats.per_day[1].saved_tokens, 2_500);
+    assert_eq!(stats.recent.len(), 2);
+    assert!(stats
+        .recent
+        .iter()
+        .all(|row| !RETIRED_SAVINGS_KINDS.contains(&row.kind.as_str())));
+
+    let valuation = store.savings_valuation().await.unwrap();
+    let mut valued: Vec<&str> = valuation.rows.iter().map(|row| row.kind.as_str()).collect();
+    valued.sort();
+    valued.dedup();
+    assert_eq!(valued, vec!["compression", "outline"]);
+    assert_eq!(
+        store.savings_events_rows(Some("s1")).await.unwrap().len(),
+        4,
+        "the ledger keeps the retired rows"
+    );
+}
+
+#[tokio::test]
+async fn savings_valuation_counts_later_requests_up_to_the_lifetime() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let base = 1_700_000_000_i64;
+    let event = |kind: &str, session: Option<&str>, before: i64, after: i64, at: i64| {
+        SavingsEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session.map(str::to_string),
+            kind: kind.into(),
+            detail: None,
+            tokens_before: before,
+            tokens_after: after,
+            tokens_saved: before - after,
+            measured: false,
+            created_at: at,
+        }
+    };
+    // An early event with 20 requests after it: the credit stops at the
+    // 15-request lifetime.
+    store
+        .record_savings_event(&event("archive", Some("s1"), 25_000, 0, base))
+        .await
+        .unwrap();
+    // A late event with only two requests after it.
+    store
+        .record_savings_event(&event("outline", Some("s1"), 12_000, 900, base + 180))
+        .await
+        .unwrap();
+    // A row with no session cannot be timed against any request.
+    store
+        .record_savings_event(&event("compression", None, 8_000, 1_200, base))
+        .await
+        .unwrap();
+    // A compaction checkpoint is bookkeeping, not a lever.
+    store
+        .record_savings_event(&event("compaction_checkpoint", Some("s1"), 0, 0, base))
+        .await
+        .unwrap();
+    let request = |at: i64| RequestStats {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        model: "m".into(),
+        endpoint: None,
+        prompt_tokens: 10,
+        completion_tokens: 1,
+        reasoning_tokens: 0,
+        cached_tokens: None,
+        ttft_ms: None,
+        generation_ms: None,
+        created_at: at,
+        outcome: None,
+        purpose: None,
+    };
+    for i in 0..20 {
+        store
+            .record_request_stats(&request(base + 10 * (i + 1)))
+            .await
+            .unwrap();
+    }
+
+    let valuation = store.savings_valuation().await.unwrap();
+
+    assert_eq!(valuation.rows.len(), 3, "{:?}", valuation.rows);
+    assert!(
+        valuation
+            .rows
+            .iter()
+            .all(|row| row.kind != "compaction_checkpoint"),
+        "the compaction checkpoint is not a lever row"
+    );
+    let archive = valuation
+        .rows
+        .iter()
+        .find(|row| row.kind == "archive")
+        .expect("the archive row is valued");
+    assert_eq!(archive.later_requests, SAVED_TOKEN_LIFETIME_REQUESTS);
+    assert_eq!(archive.events, 1);
+    assert_eq!(archive.saved_tokens, 25_000);
+    let outline = valuation
+        .rows
+        .iter()
+        .find(|row| row.kind == "outline")
+        .expect("the outline row is valued");
+    assert_eq!(outline.later_requests, 2);
+    let untimed = valuation
+        .rows
+        .iter()
+        .find(|row| row.kind == "compression")
+        .expect("the compression row is valued");
+    assert_eq!(untimed.later_requests, 0);
+    assert_eq!(untimed.session_id, None);
+}
+
+#[test]
+fn cache_lifetime_from_gaps_finds_the_first_cold_window() {
+    // Five warm samples in [300, 600) and five cold ones in [600, 1200): the
+    // first probe whose window averages below 0.5 is the lifetime.
+    let mut samples: Vec<(i64, f64)> = vec![(400, 0.9); 5];
+    samples.extend(vec![(700, 0.2); 5]);
+    assert_eq!(cache_lifetime_from_gaps(&samples), Some(600));
+}
+
+#[test]
+fn cache_lifetime_from_gaps_skips_thin_windows() {
+    // Probe 300's window holds only 2 cold samples (under the 3-sample
+    // minimum); 600 and 900 hold none; 1200's window [1200, 2400) holds the
+    // four cold ones.
+    let mut samples: Vec<(i64, f64)> = vec![(400, 0.0); 2];
+    samples.extend(vec![(2000, 0.1); 4]);
+    assert_eq!(cache_lifetime_from_gaps(&samples), Some(1200));
+}
+
+#[test]
+fn cache_lifetime_from_gaps_is_none_when_the_cache_stays_warm() {
+    // A cache that outlives an hour never decides; neither does no data.
+    assert_eq!(cache_lifetime_from_gaps(&vec![(4000, 0.95); 10]), None);
+    assert_eq!(cache_lifetime_from_gaps(&[]), None);
+}
+
+#[tokio::test]
+async fn cache_lifetime_secs_measures_one_model_from_the_request_log() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    // The store's clock is real time, so anchor the rows 20,000 s back: every
+    // one stays inside the 30-day measurement window.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let base = now_secs - 20_000;
+    let request =
+        |session: &str, model: &str, at: i64, prompt: u32, cached: u32, purpose: Option<&str>| {
+            RequestStats {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: Some(session.into()),
+                model: model.into(),
+                endpoint: None,
+                prompt_tokens: prompt,
+                completion_tokens: 1,
+                reasoning_tokens: 0,
+                cached_tokens: Some(cached),
+                ttft_ms: None,
+                generation_ms: None,
+                created_at: at,
+                outcome: None,
+                purpose: purpose.map(str::to_string),
+            }
+        };
+    // Rows 40 days back: outside the 30-day measurement window, and their
+    // only decisive gaps would be the 700 s ones if that window were dropped.
+    let old_base = now_secs - 40 * 86_400;
+    let rows = [
+        // Two requests 100 s apart: a gap under every probe.
+        request("s1", "m", base, 30_000, 27_000, None),
+        request("s1", "m", base + 100, 30_000, 27_000, None),
+        // Three gaps of 700 s, each a 10% cache hit — probe 600's window.
+        request("s1", "m", base + 800, 30_000, 3_000, None),
+        // Compaction's own call, between two "m" requests: filtered out.
+        request("s1", "m", base + 850, 30_000, 0, Some("summarize")),
+        // Under the 20,000-token minimum: filtered out.
+        request("s1", "m", base + 900, 5_000, 0, None),
+        request("s1", "m", base + 1_500, 30_000, 3_000, None),
+        request("s1", "m", base + 2_200, 30_000, 3_000, None),
+        // Four "other" rows 700 s apart, each 97% cached. Mixed into "m",
+        // their three warm gaps would lift probe 600's mean to 0.53 and flip
+        // the answer to None — so "m" proves the model filter.
+        request("s2", "other", base, 30_000, 29_000, None),
+        request("s2", "other", base + 700, 30_000, 29_000, None),
+        request("s2", "other", base + 1_400, 30_000, 29_000, None),
+        request("s2", "other", base + 2_100, 30_000, 29_000, None),
+        // One model per filter, each with FOUR cold rows 700 s apart and no
+        // other request: dropped, each would decide Some(600) on its own, so
+        // the None below proves that filter.
+        request("s3", "sum", base, 30_000, 0, Some("summarize")),
+        request("s3", "sum", base + 700, 30_000, 0, Some("summarize")),
+        request("s3", "sum", base + 1_400, 30_000, 0, Some("summarize")),
+        request("s3", "sum", base + 2_100, 30_000, 0, Some("summarize")),
+        request("s4", "small", base, 5_000, 0, None),
+        request("s4", "small", base + 700, 5_000, 0, None),
+        request("s4", "small", base + 1_400, 5_000, 0, None),
+        request("s4", "small", base + 2_100, 5_000, 0, None),
+        request("s5", "old", old_base, 30_000, 0, None),
+        request("s5", "old", old_base + 700, 30_000, 0, None),
+        request("s5", "old", old_base + 1_400, 30_000, 0, None),
+        request("s5", "old", old_base + 2_100, 30_000, 0, None),
+    ];
+    for row in rows {
+        store.record_request_stats(&row).await.unwrap();
+    }
+
+    assert_eq!(store.cache_lifetime_secs("m").await.unwrap(), Some(600));
+    assert_eq!(store.cache_lifetime_secs("unknown").await.unwrap(), None);
+    assert_eq!(store.cache_lifetime_secs("sum").await.unwrap(), None);
+    assert_eq!(store.cache_lifetime_secs("small").await.unwrap(), None);
+    assert_eq!(store.cache_lifetime_secs("old").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn savings_valuation_lists_session_model_usage() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let request = |model: &str, prompt: u32, cached: Option<u32>| RequestStats {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        model: model.into(),
+        endpoint: None,
+        prompt_tokens: prompt,
+        completion_tokens: 10,
+        reasoning_tokens: 0,
+        cached_tokens: cached,
+        ttft_ms: None,
+        generation_ms: None,
+        created_at: 1_700_000_000,
+        outcome: None,
+        purpose: None,
+    };
+    store
+        .record_request_stats(&request("alpha", 1_000, Some(400)))
+        .await
+        .unwrap();
+    store
+        .record_request_stats(&request("alpha", 1_000, Some(100)))
+        .await
+        .unwrap();
+    // A provider that never reports caching: NULL counts as zero.
+    store
+        .record_request_stats(&request("beta", 500, None))
+        .await
+        .unwrap();
+
+    let valuation = store.savings_valuation().await.unwrap();
+
+    assert_eq!(valuation.sessions.len(), 2, "{:?}", valuation.sessions);
+    let alpha = valuation
+        .sessions
+        .iter()
+        .find(|row| row.model == "alpha")
+        .expect("alpha is listed");
+    assert_eq!(alpha.session_id.as_deref(), Some("s1"));
+    assert_eq!(alpha.prompt_tokens, 2_000);
+    assert_eq!(alpha.cached_tokens, 500);
+    assert_eq!(alpha.requests, 2);
+    let beta = valuation
+        .sessions
+        .iter()
+        .find(|row| row.model == "beta")
+        .expect("beta is listed");
+    assert_eq!(beta.prompt_tokens, 500);
+    assert_eq!(beta.cached_tokens, 0);
+    assert_eq!(beta.requests, 1);
+}
+
+#[tokio::test]
+async fn prune_tool_result_archive_removes_old_rows_and_their_search_entries() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let old = store
+        .archive_tool_result(Some("s1"), "shell", None, "OLDROW distinctive marker")
+        .await
+        .unwrap();
+    let fresh = store
+        .archive_tool_result(Some("s1"), "shell", None, "NEWROW distinctive marker")
+        .await
+        .unwrap();
+    // Archive rows are stamped "now" on write, so the test back-dates the old
+    // one directly to put it past the retention window.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs() as i64;
+    let cutoff = now - maintenance::ARCHIVE_RETENTION_SECS;
+    {
+        let conn = store.conn.lock().expect("conn lock poisoned");
+        conn.execute(
+            "UPDATE tool_result_archive SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![cutoff - 1, old],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        store.prune_tool_result_archive(cutoff, 100).await.unwrap(),
+        1
+    );
+    assert!(store.expand_tool_result(&old).await.unwrap().is_none());
+    let hits = store.search_archive("distinctive", 10).await.unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].id, fresh);
+    // Nothing left to prune.
+    assert_eq!(
+        store.prune_tool_result_archive(cutoff, 100).await.unwrap(),
+        0
+    );
+
+    // A batch of one deletes one row per call, oldest first.
+    let mut old_ids = Vec::new();
+    for index in 0..3 {
+        let id = store
+            .archive_tool_result(Some("s1"), "shell", None, &format!("OLD {index}"))
+            .await
+            .unwrap();
+        old_ids.push(id);
+    }
+    {
+        let conn = store.conn.lock().expect("conn lock poisoned");
+        for (index, id) in old_ids.iter().enumerate() {
+            conn.execute(
+                "UPDATE tool_result_archive SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![cutoff - 100 + index as i64, id],
+            )
+            .unwrap();
+        }
+    }
+    for id in &old_ids {
+        assert_eq!(store.prune_tool_result_archive(cutoff, 1).await.unwrap(), 1);
+        assert!(store.expand_tool_result(id).await.unwrap().is_none());
+    }
+    assert_eq!(
+        store.prune_tool_result_archive(cutoff, 1).await.unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn prune_old_archive_rows_clears_every_old_row() {
+    let store = Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+    // More than one prune batch, so the loop has to go round twice.
+    for index in 0..150 {
+        store
+            .archive_tool_result(Some("s1"), "shell", None, &format!("OLD {index}"))
+            .await
+            .unwrap();
+    }
+    let fresh = store
+        .archive_tool_result(Some("s1"), "shell", None, "FRESH")
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs() as i64;
+    {
+        let conn = store.conn.lock().expect("conn lock poisoned");
+        conn.execute(
+            "UPDATE tool_result_archive SET created_at = ?1 WHERE id <> ?2",
+            rusqlite::params![now - maintenance::ARCHIVE_RETENTION_SECS - 1, fresh],
+        )
+        .unwrap();
+    }
+
+    maintenance::prune_old_archive_rows(store.clone()).await;
+
+    let conn = store.conn.lock().expect("conn lock poisoned");
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tool_result_archive", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(remaining, 1, "only the row inside the window survives");
 }

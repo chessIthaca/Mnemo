@@ -17,12 +17,12 @@ let browserPaneShown = false;
 
 /**
  * Whether the layout leaves room for the native Browser pane. The pane is an
- * OS window above the whole UI, so it may only show on the open Browser tab
- * of the Lead view with no drawer, sheet, or preview over it.
+ * OS window above the whole UI, so it may only show on the panel's open Browser
+ * tab with no drawer, sheet, or preview over it.
  */
 function browserPaneAllowed(state: AppState): boolean {
   return (
-    state.route === "lead" &&
+    state.route !== "start" &&
     state.workbenchOpen &&
     state.workbenchTab === "browser" &&
     !state.teamPeekOpen &&
@@ -39,8 +39,8 @@ function pushBrowserVisibility(): Promise<void> {
 }
 
 // The layout, not a component's mount/unmount, has the final say: any change
-// that covers the Browser tab (another tab, the team drawer, the Team view,
-// a closed workbench) hides the pane, and uncovering it shows it again.
+// that covers the Browser tab (another tab, the team drawer, a closed
+// workbench) hides the pane, and uncovering it shows it again.
 app.subscribe((state) => {
   if (!browserTransport) return;
   if ((browserTabWantsPane && browserPaneAllowed(state)) !== browserPaneShown) {
@@ -167,7 +167,6 @@ export async function navigateBrowser(url: string): Promise<void> {
   if (!value) return;
   app.update((state) => ({
     ...state,
-    route: state.projectId ? "lead" : state.route,
     browserUrl: approximateBrowserUrl(value),
     browserTitle: "",
     browserImage: null,

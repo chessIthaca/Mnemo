@@ -57,21 +57,27 @@ const savings = (overrides: Partial<SavingsReport> = {}): SavingsReport => ({
   tokens_saved: 1_160_000,
   estimated_saved_micros: 180_000,
   levers: [
-    { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000 },
-    { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: 0 },
+    { kind: "compression", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000, estimated_cost_micros: null },
+    { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: 0, estimated_cost_micros: 20_000 },
   ],
   cache: { prompt_tokens: 2_000_000, cached_tokens: 1_540_000, hit_rate: 0.77, estimated_saved_micros: 120_000 },
   per_day: [
     { day: DAY_A, tokens_saved: 1_000_000 },
     { day: DAY_C, tokens_saved: 90_000 },
   ],
+  traffic_micros: 12_500_000,
+  traffic_since: DAY_A,
   ...overrides,
 });
 
 describe("lever names", () => {
   it("maps every ledger kind to a friendly name and a one-line explanation", () => {
-    expect(leverLabel("delta_read")).toBe("Delta reads");
-    expect(leverLabel("compaction_checkpoint")).toBe("Compaction checkpoints");
+    expect(leverLabel("compression")).toBe("Output compression");
+    expect(leverLabel("old_result_trim")).toBe("Old results trimmed");
+    expect(leverLabel("idle_compaction")).toBe("Idle compaction");
+    // Dropped from the table: a checkpoint still prettifies through the
+    // fallback rather than rendering as its raw id.
+    expect(leverLabel("compaction_checkpoint")).toBe("Compaction checkpoint");
     expect(leverExplanation("archive")).toBe(
       "Oversized tool results are archived in full; only a short preview stays in context.",
     );
@@ -143,8 +149,8 @@ describe("costViewModel", () => {
   it("gives every lever a friendly name, an explanation and a dollar figure", () => {
     const view = costViewModel(cost(), savings());
     expect(view.levers[0]).toMatchObject({
-      kind: "delta_read",
-      label: "Delta reads",
+      kind: "compression",
+      label: "Output compression",
       metaLabel: "1,200,000 tokens · 40 events",
       costLabel: "≈ $0.18",
     });
@@ -152,33 +158,51 @@ describe("costViewModel", () => {
     expect(view.savingsCostLabel).toBe("≈ $0.18");
   });
 
-  it("renders a net-negative lever as a cost row with no dollar figure", () => {
+  it("a re-adding lever shows what it cost", () => {
     const view = costViewModel(cost(), savings());
-    // The expansion sinks to the bottom and shows the tokens it re-added.
+    // The expansion sinks to the bottom, shows the tokens it re-added and the
+    // dollars it cost.
     expect(view.levers[1]).toMatchObject({
       kind: "archive_expand",
+      readded: true,
+      metaLabel: "+40,000 tokens re-added · 2 events",
+      costLabel: "costs ≈ $0.02",
+    });
+  });
+
+  it("a re-adding lever with no price shows no dollars", () => {
+    // No price anywhere: the wire carries a null cost, so the row keeps its
+    // token count and stays silent about dollars.
+    const unpriced = savings({
+      levers: [
+        { kind: "compression", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: null, estimated_cost_micros: null },
+        { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: null, estimated_cost_micros: null },
+      ],
+    });
+    const view = costViewModel(cost(), unpriced);
+    expect(view.levers[1]).toMatchObject({
       readded: true,
       metaLabel: "+40,000 tokens re-added · 2 events",
       costLabel: "",
     });
   });
 
-  it("never shows dollars on a negative lever, even when the wire carries them", () => {
-    // The backend prices negative savings at $0 (insights.rs clamps at
-    // `tokens.max(0)`); a wire claiming dollars anyway is ignored — the row
-    // stays a cost, not a saving.
-    const inconsistent = savings({
-      levers: [
-        { kind: "delta_read", events: 40, tokens_saved: 1_200_000, estimated_saved_micros: 180_000 },
-        { kind: "archive_expand", events: 2, tokens_saved: -40_000, estimated_saved_micros: 20_000 },
-      ],
-    });
-    const view = costViewModel(cost(), inconsistent);
-    expect(view.levers[1]).toMatchObject({
-      readded: true,
-      metaLabel: "+40,000 tokens re-added · 2 events",
-      costLabel: "",
-    });
+  it("the savings notes name the traffic and the method", () => {
+    const view = costViewModel(cost(), savings());
+    // The tilde comes from the template, not from formatEstimate.
+    expect(view.savingsBasisLabel).toBe(
+      "On ≈ $12.50 of model traffic since Apr 11. The spend above counts Mnemo2's own ledger.",
+    );
+    expect(view.savingsMethodLabel).toBe(
+      "Estimates: credited against the 100,000-character result cap, at each session's model rates, counting up to 15 later re-sends.",
+    );
+  });
+
+  it("no traffic note without a price", () => {
+    const view = costViewModel(cost(), savings({ traffic_micros: null, traffic_since: null }));
+    expect(view.savingsBasisLabel).toBe("");
+    // The method note is always there: the figure is never bare.
+    expect(view.savingsMethodLabel).not.toBe("");
   });
 
   it("reports the prompt cache hit rate and its dollars", () => {

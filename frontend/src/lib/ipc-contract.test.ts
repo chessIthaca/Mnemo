@@ -231,8 +231,6 @@ describe("IPC contract — event fixtures dispatch through the reducer", () => {
       quality: {
         grade: "C",
         fill_pct: 75,
-        waste_tokens: 1200,
-        stale_read_rate: 30,
         decision_density: 50,
       },
     });
@@ -250,8 +248,6 @@ describe("IPC contract — event fixtures dispatch through the reducer", () => {
       quality: {
         grade: "C",
         fill_pct: 75,
-        waste_tokens: 1200,
-        stale_read_rate: 30,
         decision_density: 50,
       },
     });

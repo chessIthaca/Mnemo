@@ -111,11 +111,17 @@ describe("native Browser tab", () => {
     await vi.waitFor(() => expect(lastVisibility().visible).toBe(true));
   });
 
-  it("hides the pane when the lead view gives way to Mission Control", async () => {
+  it("keeps the pane up across a main-tab switch and hides it on the start screen", async () => {
     app.update((state) => ({ ...state, route: "lead", browserSupported: true }));
     render(Workbench);
     await vi.waitFor(() => expect(transport.ensure).toHaveBeenCalled());
+    expect(lastVisibility().visible).toBe(true);
+
     app.update((state) => ({ ...state, route: "team" }));
+    await vi.waitFor(() => expect(lastVisibility().seq).toBeGreaterThan(0));
+    expect(lastVisibility().visible).toBe(true);
+
+    app.update((state) => ({ ...state, route: "start" }));
     await vi.waitFor(() => expect(lastVisibility().visible).toBe(false));
   });
 });

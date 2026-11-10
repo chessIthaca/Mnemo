@@ -4,7 +4,7 @@
 
 //! Shared helpers for the token-optimizer levers (backlog e4a50d22).
 //!
-//! Tools that serve a reduced form (delta/skeleton re-reads, compressed
+//! Tools that serve a reduced form (outline reads, compressed
 //! command output, archive previews, expansions) report their before/after
 //! token counts as `savings` events in the tool result's `data`; the agent
 //! loop's dispatch layer (`turn.rs::execute_tool_batch`) records each one
@@ -22,7 +22,7 @@ pub(crate) fn estimate_tokens(text: &str) -> i64 {
 }
 
 /// Build one `data.savings` event object for a tool that served a reduced
-/// form. `kind` is the ledger kind (`delta_read`, `skeleton`,
+/// form. `kind` is the ledger kind (`outline`, `outline_followup`,
 /// `compression`, `archive`, `archive_expand`), `detail` the file path or
 /// command, and the token counts the estimates of what WOULD have entered
 /// the context vs. what actually did.

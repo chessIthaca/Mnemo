@@ -22,7 +22,7 @@ use tauri::{Emitter, Manager, PhysicalPosition, WebviewBuilder, WebviewUrl, Wind
 mod console;
 mod ipc;
 mod startup;
-mod watchdog;
+pub(crate) use mnemo_app::watchdog;
 
 use mnemo_app::{instance_marker, webview_udf};
 

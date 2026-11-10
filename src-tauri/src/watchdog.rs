@@ -274,6 +274,31 @@ fn write_report(dir: &Path, data: &ReportData) -> std::io::Result<PathBuf> {
     result.map(|_| path)
 }
 
+/// Where the next report goes. Mnemo2 starts with a temp folder and moves it
+/// to the project's `.coding/logs` once a project opens.
+#[derive(Debug)]
+pub struct ReportDir(Mutex<PathBuf>);
+
+impl ReportDir {
+    /// Fix the folder the next report is written to.
+    pub fn new(dir: PathBuf) -> Self {
+        Self(Mutex::new(dir))
+    }
+
+    /// The current report folder (a clone). A poisoned lock still answers.
+    pub fn get(&self) -> PathBuf {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Move future reports to `dir`. A poisoned lock is still written.
+    pub fn set(&self, dir: PathBuf) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = dir;
+    }
+}
+
 /// The hang watchdog — see the [module docs](self) for the design.
 ///
 /// This is the app-facing control surface: [`note`](Self::note) feeds the
@@ -285,6 +310,9 @@ pub struct Watchdog {
     stop: Arc<AtomicBool>,
     /// Recent activity notes fed by [`Watchdog::note`].
     ring: Arc<ActivityRing>,
+    /// Where the detector writes its next report; moved to the project's
+    /// `.coding/logs` by [`Watchdog::set_report_dir`].
+    report_dir: Arc<ReportDir>,
 }
 
 impl Watchdog {
@@ -312,9 +340,11 @@ impl Watchdog {
         #[cfg(windows)]
         let main_thread_os_id =
             unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let report_dir = Arc::new(ReportDir::new(report_dir));
         let watchdog = Arc::new(Watchdog {
             stop: stop.clone(),
             ring: ring.clone(),
+            report_dir: report_dir.clone(),
         });
         ring.push("watchdog started");
 
@@ -346,6 +376,12 @@ impl Watchdog {
         self.ring.push(activity);
     }
 
+    /// Move where future reports are written. Mnemo2 calls this when a
+    /// project opens, so reports land in the project's `.coding/logs`.
+    pub fn set_report_dir(&self, dir: PathBuf) {
+        self.report_dir.set(dir);
+    }
+
     /// Stop the detector thread (idempotent). Call in `RunEvent::Exit`
     /// before the exit teardown so the watchdog never observes the app's
     /// own shutdown as a stall.
@@ -367,7 +403,7 @@ struct DetectorInputs {
     ring: Arc<ActivityRing>,
     start: Instant,
     stall_threshold: Duration,
-    report_dir: PathBuf,
+    report_dir: Arc<ReportDir>,
     main_thread_rust_id: String,
 }
 
@@ -508,7 +544,7 @@ fn detector_loop(
                 wait_chain_lines,
                 activity: ring.snapshot(),
             };
-            let _ = write_report(&report_dir, &data);
+            let _ = write_report(&report_dir.get(), &data);
         }
 
         // The heartbeat advanced this round → the main thread ran at some
@@ -1137,6 +1173,16 @@ mod tests {
         ring.push("d");
         ring.push("e");
         assert_eq!(ring.snapshot(), vec!["c", "d", "e"]);
+    }
+
+    #[test]
+    fn report_dir_moves() {
+        let a = std::env::temp_dir().join("watchdog-report-dir-a");
+        let b = std::env::temp_dir().join("watchdog-report-dir-b");
+        let dir = ReportDir::new(a.clone());
+        assert_eq!(dir.get(), a);
+        dir.set(b.clone());
+        assert_eq!(dir.get(), b);
     }
 
     #[test]

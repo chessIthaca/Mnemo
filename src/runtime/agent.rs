@@ -1648,12 +1648,18 @@ impl AgentTask {
     }
 
     /// When this agent may run an idle compaction, or `None` when it must not:
-    /// no idle spell is open, the switch is off, the conversation is under
-    /// [`IDLE_COMPACT_MIN_TOKENS`], or there is no dedicated compaction model.
-    /// The delay is the measured cache lifetime of the model the last turn ran
-    /// on, falling back to [`IDLE_CACHE_LIFETIME_FALLBACK_SECS`].
+    /// no idle spell is open, the agent is a subagent, the switch is off, the
+    /// conversation is under [`IDLE_COMPACT_MIN_TOKENS`], or there is no
+    /// dedicated compaction model. The delay is the measured cache lifetime of
+    /// the model the last turn ran on, falling back to
+    /// [`IDLE_CACHE_LIFETIME_FALLBACK_SECS`].
     async fn idle_compaction_deadline(&mut self) -> Option<tokio::time::Instant> {
         let idle_since = self.idle_since?;
+        // A subagent is single-task: it parks when done and is rarely resumed,
+        // so a summarizer call and a transcript note would buy nothing.
+        if self.agent_loop.is_subagent() {
+            return None;
+        }
         if !self.agent_loop.optimizer_config().idle_compaction {
             return None;
         }
@@ -7203,6 +7209,39 @@ mod tests {
         assert!(
             !compact_started,
             "with the switch off the idle spell must never compact"
+        );
+
+        drop(cmd_tx);
+        let _ = handle.await;
+    }
+
+    /// A subagent is single-task and parks when done: idle compaction would
+    /// pay a summarizer call and a transcript note for a chat nobody resumes.
+    #[tokio::test(start_paused = true)]
+    async fn idle_compaction_skips_subagents() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let task = idle_task(
+            Some(Arc::new(SummaryProvider {
+                model: "cheap-summary",
+                gate: None,
+            })),
+            true,
+            None,
+        );
+        task.agent_loop.set_is_subagent(true);
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        tokio::time::sleep(std::time::Duration::from_secs(2 * 3600)).await;
+        let mut compact_started = false;
+        while let Ok((_id, event)) = fanin_rx.try_recv() {
+            if matches!(event, AgentEvent::CompactStarted) {
+                compact_started = true;
+            }
+        }
+        assert!(
+            !compact_started,
+            "a subagent must never be idle-compacted, however long it parks"
         );
 
         drop(cmd_tx);

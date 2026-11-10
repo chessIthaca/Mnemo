@@ -385,8 +385,10 @@ fn install_shell(
             .map(window_geometry::WorkArea::of)
             .collect();
         if let Some(placement) = window_geometry::clamp_restored(&saved, &areas) {
-            let _ = window.set_size(PhysicalSize::new(placement.width, placement.height));
+            // Move first: arriving on a monitor with another scale makes
+            // Windows rescale the window, so it is sized once it is there.
             let _ = window.set_position(PhysicalPosition::new(placement.x, placement.y));
+            let _ = window.set_size(PhysicalSize::new(placement.width, placement.height));
             maximize = placement.maximized;
         }
     }

@@ -51,24 +51,24 @@ enum Wake {
 
 /// How one idle compaction ended.
 enum IdleEnd {
-    /// The compaction ran to an end — summary applied, failed, or skipped by
-    /// a fire-time re-check. Go back to waiting for a command; the idle spell
-    /// is closed either way.
+    /// The compaction ran to an end — summary applied or interrupted, failed,
+    /// or skipped by a fire-time re-check — and no command is waiting. Go back
+    /// to waiting for a command; the idle spell is closed either way.
     Done,
-    /// A command arrived during the summary and cut it short (or the inbox
-    /// closed, `None`): the run loop must handle it through its normal arms.
+    /// A command arrived during the summary (or the inbox closed, `None`). It
+    /// was stashed while the summary was softly interrupted, and the run loop
+    /// must now handle it through its normal arms.
     Command(Option<AgentCommand>),
 }
 
-/// The outcome of racing the idle summarization against the real inbox: the
-/// summary ran to its own end, or a command arrived first and the
-/// summarization future was dropped (the original conversation kept).
+/// How the idle summarization race ended: it returned on its own (including a
+/// soft interrupt), or it still had not stopped when the hard-cut grace
+/// elapsed. A stashed command is carried separately by `run_idle_compaction`.
 enum IdleRace {
-    /// The compaction finished on its own.
+    /// The compaction returned, possibly after the soft interrupt.
     Finished(CompactOutcome),
-    /// A command arrived (or the inbox closed, `None`); the summary was
-    /// abandoned.
-    Cut(Option<AgentCommand>),
+    /// The grace elapsed; the still-running compaction future was dropped.
+    Cut,
 }
 
 /// The agent task's state: its conversation history + the agent loop.
@@ -121,6 +121,10 @@ pub struct AgentTask {
     /// The last measured prompt-cache lifetime: model id, seconds, and when
     /// it was measured.
     cache_lifetime: Option<(String, u64, tokio::time::Instant)>,
+    /// Set by `compact_context` right after it applies a summary;
+    /// `run_idle_compaction` resets it before each attempt to tell a committed
+    /// summary from an abandoned one.
+    compaction_committed: bool,
 }
 
 /// Maximum consecutive auto-continue turns before the agent parks for user
@@ -135,6 +139,10 @@ const IDLE_COMPACT_MIN_TOKENS: usize = 50_000;
 /// The idle delay when the request log cannot tell a model's cache lifetime:
 /// every provider measured so far is cold after an hour.
 const IDLE_CACHE_LIFETIME_FALLBACK_SECS: u64 = 3_600;
+
+/// How long an interrupted idle summary may take to stop on its own before it
+/// is dropped; covers a provider stalled before it streams.
+const IDLE_CUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a measured cache lifetime is reused before it is measured again.
 const CACHE_LIFETIME_REFRESH: std::time::Duration = std::time::Duration::from_secs(3_600);
@@ -268,6 +276,7 @@ impl AgentTask {
             consolidation_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idle_since: None,
             cache_lifetime: None,
+            compaction_committed: false,
         }
     }
 
@@ -1467,7 +1476,9 @@ impl AgentTask {
                     cached_tokens: Some(usage.cached_tokens),
                     ttft_ms: usage.ttft_ms,
                     generation_ms: usage.generation_ms,
-                    outcome: None,
+                    // A summary interrupted after reporting usage was still
+                    // cancelled: preserve the measured usage AND the outcome.
+                    outcome: stop.is_some().then(|| "cancelled".into()),
                     purpose: Some("summarize".into()),
                 },
             );
@@ -1499,6 +1510,7 @@ impl AgentTask {
         // Only apply the summary if the summarization wasn't interrupted.
         if stop.is_none() {
             self.messages = summarized;
+            self.compaction_committed = true;
             // Token-optimizer lever 4 (backlog e4a50d22): the digest note plus
             // the checkpoint pointer, mirroring the auto path in turn.rs.
             if survival {
@@ -1732,16 +1744,19 @@ impl AgentTask {
         Some(idle_since + std::time::Duration::from_secs(secs))
     }
 
-    /// Run one idle compaction: race the summarization (through
-    /// [`Self::compact_context`], fed a quiet inbox so it consumes no
-    /// command) against the REAL inbox. A command that arrives mid-summary
-    /// abandons it — the compaction future is dropped, the ORIGINAL
-    /// conversation is kept, a stop note pairs the dangling
-    /// `CompactStarted`, and the command is handed back for the run loop's
-    /// normal arms (a Prompt runs a turn, Clear clears, Cancel emits
-    /// `Finished` and exits). When the summary finishes instead, an
-    /// `idle_compaction` savings row is recorded when the context shrank.
-    /// Either way the idle spell is closed: one compaction per idle spell.
+    /// Run one idle compaction without letting the summarizer consume the
+    /// agent's commands. The real inbox is raced against `compact_context`
+    /// (fed a quiet inbox); the first command is stashed and forwarded as a
+    /// soft `Interrupt`. Mid-stream that lets `compact_context` keep the
+    /// original conversation, record the cancelled summarize row, and emit
+    /// its interrupted note. A summary stalled before streaming gets
+    /// [`IDLE_CUT_GRACE`] to stop before its future is dropped and the
+    /// message-first stop note is emitted. A summary already committed when
+    /// the grace expires is KEPT: its savings row is recorded and a best-effort
+    /// `Compacted` pairs the start note instead of claiming the original was
+    /// kept. Finally a stashed command is returned for the run loop's normal
+    /// arms (a Prompt runs a turn, Clear clears, Cancel emits `Finished` and
+    /// exits). One compaction per idle spell.
     async fn run_idle_compaction(
         &mut self,
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
@@ -1761,59 +1776,101 @@ impl AgentTask {
             return IdleEnd::Done;
         }
         let before = crate::agent::context::ContextManager::count_tokens(&self.messages);
-        // The summarizer hears NO commands: it is fed a quiet channel whose
-        // sender stays alive for the whole race, so its receiver never
-        // reports closed and never yields a command. The real inbox is raced
-        // against the summary instead — a command cuts the summary short and
-        // is handled by the normal run-loop arms, never swallowed.
-        let (_quiet_tx, mut quiet_rx) = mpsc::channel::<AgentCommand>(1);
-        // `biased` with the compaction polled first: a summary that
-        // completes in the same poll as an arriving command wins.
-        let race = tokio::select! {
-            biased;
-            outcome = self.compact_context(fanin_tx, &mut quiet_rx) => IdleRace::Finished(outcome),
-            cmd = cmd_rx.recv() => IdleRace::Cut(cmd),
-        };
-        match race {
-            IdleRace::Cut(cmd) => {
-                // The compaction future was dropped. When it was dropped
-                // before the summary was applied — the summarizer was still
-                // running — `self.messages` is untouched: the assignment
-                // happens only after the summarizer returns.
-                let _ = fanin_tx
-                    .send((
-                        self.id,
-                        AgentEvent::Error {
-                            error: "Idle compaction stopped — your message comes first; the original conversation is kept.".into(),
-                            retrying: true,
-                        },
-                    ))
-                    .await;
-                // Re-sync the published token count with whatever is in
-                // memory (the summarizer never applied a summary here).
-                self.agent_loop.publish_message_tokens(&self.messages);
-                IdleEnd::Command(cmd)
-            }
-            IdleRace::Finished(CompactOutcome::Completed { .. }) => {
-                // `resumed_input` is always false on this path: no command
-                // can reach the summarizer through the quiet channel.
-                let after = crate::agent::context::ContextManager::count_tokens(&self.messages);
-                if before > after {
-                    self.agent_loop.record_savings_event(
-                        self.session_id.as_deref(),
-                        "idle_compaction",
-                        None,
-                        before as i64,
-                        after as i64,
-                        false,
-                    );
+        self.compaction_committed = false;
+        // The summarizer receives only the soft Interrupt sent below, never
+        // the user's actual command. The named sender stays alive for the
+        // whole race so the quiet receiver never reports closed.
+        let (quiet_tx, mut quiet_rx) = mpsc::channel::<AgentCommand>(1);
+        let (race, stashed) = {
+            let compaction = self.compact_context(fanin_tx, &mut quiet_rx);
+            tokio::pin!(compaction);
+            // The outer Option marks whether a command already arrived; the
+            // inner Option is the command, with None meaning the inbox closed.
+            let mut stashed: Option<Option<AgentCommand>> = None;
+            let mut grace: Option<tokio::time::Instant> = None;
+            let race = loop {
+                tokio::select! {
+                    // Poll the compaction first: a summary completing in the
+                    // same poll as an arriving command wins.
+                    biased;
+                    outcome = &mut compaction => break IdleRace::Finished(outcome),
+                    cmd = cmd_rx.recv(), if stashed.is_none() => {
+                        stashed = Some(cmd);
+                        // Stop through the normal path so the cancelled
+                        // request_stats row and interrupted note are not lost.
+                        // Only the grace below drops the future.
+                        let _ = quiet_tx.try_send(AgentCommand::Interrupt);
+                        grace = Some(tokio::time::Instant::now() + IDLE_CUT_GRACE);
+                    },
+                    () = tokio::time::sleep_until(
+                        grace.unwrap_or_else(tokio::time::Instant::now)
+                    ), if grace.is_some() => break IdleRace::Cut,
                 }
-                IdleEnd::Done
+            };
+            // A hard cut drops the pinned handle; leaving this block drops the
+            // underlying future (tokio::pin! keeps it on the stack), releasing
+            // its borrow of `self` before the commit flag is inspected.
+            drop(compaction);
+            (race, stashed)
+        };
+
+        // A normally completed compaction necessarily committed; the flag is
+        // what additionally distinguishes a hard Cut after the commit.
+        let committed = self.compaction_committed
+            || matches!(
+                &race,
+                IdleRace::Finished(CompactOutcome::Completed { .. })
+            );
+        let hard_cut = matches!(&race, IdleRace::Cut);
+        let after = crate::agent::context::ContextManager::count_tokens(&self.messages);
+        if committed {
+            // A commit wins even when post-commit fan-in backpressure kept the
+            // future alive until the grace: never discard an applied summary
+            // or skip its savings row.
+            if before > after {
+                self.agent_loop.record_savings_event(
+                    self.session_id.as_deref(),
+                    "idle_compaction",
+                    None,
+                    before as i64,
+                    after as i64,
+                    false,
+                );
             }
-            // `Failed` (its Error note was already emitted by
-            // `compact_context`) or `Stopped` (impossible through the quiet
-            // channel, but handled anyway).
-            IdleRace::Finished(_) => IdleEnd::Done,
+            if hard_cut {
+                // The dropped future may not have delivered Compacted. Do not
+                // await here: this path exists precisely because the bounded
+                // fan-in is full, and the user's command must still run. A
+                // duplicate after an already-delivered Compacted is harmless.
+                let _ = fanin_tx.try_send((
+                    self.id,
+                    AgentEvent::Compacted {
+                        before: before as u32,
+                        after: after as u32,
+                    },
+                ));
+            }
+        } else if hard_cut {
+            // Stalled before streaming, or otherwise still uncommitted after
+            // the grace: the original conversation really is untouched.
+            let _ = fanin_tx
+                .send((
+                    self.id,
+                    AgentEvent::Error {
+                        error: "Idle compaction stopped — your message comes first; the original conversation is kept.".into(),
+                        retrying: true,
+                    },
+                ))
+                .await;
+            self.agent_loop.publish_message_tokens(&self.messages);
+        }
+        // Finished(Stopped(Interrupt)) needs no extra note: compact_context
+        // already emitted "Compaction interrupted" and recorded the cancelled
+        // row. Finished(Failed) likewise already emitted its Error.
+
+        match stashed {
+            Some(cmd) => IdleEnd::Command(cmd),
+            None => IdleEnd::Done,
         }
     }
 
@@ -7017,6 +7074,68 @@ mod tests {
         }
     }
 
+    /// A summarizer that reports billed usage, then holds the stream open on
+    /// a gate. A soft interrupt must preserve BOTH that usage and the
+    /// `cancelled` outcome in its request_stats row.
+    struct UsageGatedSummaryProvider {
+        model: &'static str,
+        gate: Arc<tokio::sync::Notify>,
+        usage_seen: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LlmClient for UsageGatedSummaryProvider {
+        fn capabilities(&self) -> &Capabilities {
+            const C: Capabilities = Capabilities {
+                supports_tool_choice: true,
+                supports_strict_schema: true,
+                supports_parallel_tools: true,
+                reliable_finish_reason: true,
+                max_context: 128_000,
+                max_output_tokens: 4096,
+                multimodal: false,
+            };
+            &C
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            self.model
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            use futures::StreamExt;
+
+            let gate = self.gate.clone();
+            let usage_seen = self.usage_seen.clone();
+            let usage = futures::stream::once(async move {
+                // Notify when the Usage event is PRODUCED, so the test sends
+                // its command only after the summarizer has billed usage.
+                usage_seen.notify_one();
+                LlmEvent::Usage {
+                    prompt_tokens: 12_000,
+                    completion_tokens: 40,
+                    reasoning_tokens: 0,
+                    cached_tokens: 0,
+                    ttft_ms: Some(10),
+                    generation_ms: Some(20),
+                }
+            });
+            let held_open = futures::stream::once(async move {
+                gate.notified().await;
+                LlmEvent::TextDelta {
+                    text: "idle summary".into(),
+                }
+            });
+            Ok(Box::pin(usage.chain(held_open)))
+        }
+    }
+
     /// A summarizer whose `complete()` NEVER returns — the worst case a
     /// wedged server can produce. The idle race must still let a Cancel
     /// through (the old design polled commands only inside the
@@ -7369,10 +7488,10 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// A prompt that arrives while the idle summary is held open CUTS the
-    /// summary short: the stop note pairs the dangling CompactStarted, the
-    /// ORIGINAL conversation is kept (no Compacted event), and the prompt
-    /// runs its turn on that original conversation.
+    /// A prompt that arrives while the idle summary is held open softly
+    /// interrupts it: the normal interrupted note pairs CompactStarted, the
+    /// ORIGINAL conversation is kept (no Compacted event), and the prompt runs
+    /// its turn on that original conversation.
     #[tokio::test(start_paused = true)]
     async fn a_prompt_during_idle_compaction_runs_a_turn_on_the_original_conversation() {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -7411,16 +7530,18 @@ mod tests {
             .await
             .expect("the prompt must reach the idle race");
 
-        // The summary is abandoned: the stop note pairs the CompactStarted,
-        // and the prompt still runs a turn on the ORIGINAL conversation.
+        // The soft interrupt stops the stream through compact_context's own
+        // path, and the prompt then runs on the ORIGINAL conversation.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 3600);
-        let mut stopped = false;
+        let mut interrupted = false;
         let mut compacted = false;
         let mut answered = false;
         while let Some(event) = next_event(&mut fanin_rx, deadline).await {
             match event {
-                AgentEvent::Error { error, .. } if error.starts_with("Idle compaction stopped") => {
-                    stopped = true;
+                AgentEvent::Error { error, .. }
+                    if error == "Compaction interrupted — original conversation kept." =>
+                {
+                    interrupted = true;
                 }
                 AgentEvent::Compacted { .. } => compacted = true,
                 AgentEvent::TextDelta(text) if text == "Done!" => {
@@ -7435,8 +7556,8 @@ mod tests {
             }
         }
         assert!(
-            stopped,
-            "cutting the summary short must emit the message-first stop note"
+            interrupted,
+            "a mid-stream soft interrupt must emit compact_context's interrupted note"
         );
         assert!(!compacted, "the summary never landed — no Compacted event");
         assert!(
@@ -7498,18 +7619,24 @@ mod tests {
             "the export must show the original, uncompacted conversation"
         );
 
-        let mut stopped = false;
+        let mut interrupted = false;
+        let mut compacted = false;
         while let Ok((_id, event)) = fanin_rx.try_recv() {
-            if let AgentEvent::Error { error, .. } = event {
-                if error.starts_with("Idle compaction stopped") {
-                    stopped = true;
+            match event {
+                AgentEvent::Error { error, .. }
+                    if error == "Compaction interrupted — original conversation kept." =>
+                {
+                    interrupted = true;
                 }
+                AgentEvent::Compacted { .. } => compacted = true,
+                _ => {}
             }
         }
         assert!(
-            stopped,
-            "cutting the summary short must emit the message-first stop note"
+            interrupted,
+            "a mid-stream soft interrupt must emit compact_context's interrupted note"
         );
+        assert!(!compacted, "the interrupted summary never landed");
 
         drop(cmd_tx);
         let _ = handle.await;
@@ -7608,17 +7735,32 @@ mod tests {
             .await
             .expect("the clear must reach the idle race");
 
-        // clear_context announces the wipe with a zero-usage ContextUsage.
+        // clear_context announces the wipe with a zero-usage ContextUsage;
+        // before that, the soft interrupt emits its own end note.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 3600);
+        let mut interrupted = false;
+        let mut compacted = false;
         let mut cleared = false;
         while let Some(event) = next_event(&mut fanin_rx, deadline).await {
-            if let AgentEvent::ContextUsage { used, .. } = event {
-                if used == 0 {
+            match event {
+                AgentEvent::Error { error, .. }
+                    if error == "Compaction interrupted — original conversation kept." =>
+                {
+                    interrupted = true;
+                }
+                AgentEvent::Compacted { .. } => compacted = true,
+                AgentEvent::ContextUsage { used: 0, .. } => {
                     cleared = true;
                     break;
                 }
+                _ => {}
             }
         }
+        assert!(
+            interrupted,
+            "a mid-stream soft interrupt must emit compact_context's interrupted note"
+        );
+        assert!(!compacted, "the interrupted summary never landed");
         assert!(cleared, "Clear must wipe the conversation mid-summary");
 
         // The follow-up export sees the empty history — the abandoned summary
@@ -7643,6 +7785,180 @@ mod tests {
 
         drop(cmd_tx);
         let _ = handle.await;
+    }
+
+    /// A soft interrupt mid-stream goes through compact_context's stopped
+    /// path: the billed summarize request is persisted with its measured usage
+    /// AND outcome='cancelled', rather than vanishing with a dropped future.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_mid_stream_records_a_cancelled_summarize_row() {
+        use crate::memory::MemoryStoreTrait;
+
+        let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+        let store = Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let usage_seen = Arc::new(tokio::sync::Notify::new());
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let mut task = idle_task(
+            Some(Arc::new(UsageGatedSummaryProvider {
+                model: "cheap-summary",
+                gate,
+                usage_seen: Arc::clone(&usage_seen),
+            })),
+            true,
+            None,
+            Some(store.clone()),
+            None,
+        );
+        task.session_id = Some("s1".into());
+        let handle = tokio::spawn(task.run(cmd_rx, fanin_tx));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 3600);
+        let mut started = false;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            if matches!(event, AgentEvent::CompactStarted) {
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "the idle spell must start a summary");
+        // Do not interrupt before the provider's Usage event was produced.
+        tokio::time::timeout(std::time::Duration::from_secs(60), usage_seen.notified())
+            .await
+            .expect("the summarizer must report usage");
+        tokio::task::yield_now().await;
+
+        cmd_tx
+            .send(AgentCommand::Prompt {
+                text: "hello".into(),
+                images: vec![],
+            })
+            .await
+            .expect("the prompt must reach the idle race");
+
+        // Wait for compact_context's normal soft-interrupt end note, which is
+        // emitted after it records the cancelled summarize row.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 3600);
+        let mut interrupted = false;
+        while let Some(event) = next_event(&mut fanin_rx, deadline).await {
+            if let AgentEvent::Error { error, .. } = event {
+                if error == "Compaction interrupted — original conversation kept." {
+                    interrupted = true;
+                    break;
+                }
+            }
+        }
+        assert!(interrupted, "the soft interrupt must stop the summary");
+
+        // The durable write is fire-and-forget; yield until it lands.
+        let mut cancelled = None;
+        for _ in 0..100 {
+            let rows = store.request_stats_rows("s1").await.unwrap();
+            cancelled = rows.into_iter().find(|row| {
+                row.purpose.as_deref() == Some("summarize")
+                    && row.outcome.as_deref() == Some("cancelled")
+            });
+            if cancelled.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let cancelled = cancelled.expect("the abandoned billed summary must be counted");
+        assert_eq!(
+            cancelled.prompt_tokens, 12_000,
+            "the cancelled row must retain the provider's measured usage"
+        );
+        assert_eq!(cancelled.completion_tokens, 40);
+
+        drop(cmd_tx);
+        let _ = handle.await;
+    }
+
+    /// If fan-in backpressure holds compact_context AFTER it commits the
+    /// summary, a command can trigger the hard-cut grace. The applied summary
+    /// is then kept, its savings row is recorded, and the command is returned
+    /// for the normal run-loop arms — never misreported as "original kept".
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_after_the_summary_commits_keeps_the_compaction() {
+        use crate::memory::MemoryStoreTrait;
+
+        let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+        let store = Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+        // Disable only the checkpoint lever: with a store it would await an
+        // archive write before the summary, allowing the queued command to
+        // interrupt BEFORE the commit. This test needs the deterministic
+        // post-commit layout, and compact_context still has exactly one
+        // pre-commit fan-in send (CompactStarted).
+        let optimizer = Arc::new(std::sync::RwLock::new(crate::config::OptimizerConfig {
+            compaction_survival: false,
+            ..Default::default()
+        }));
+        let mut task = idle_task(
+            Some(Arc::new(SummaryProvider {
+                model: "cheap-summary",
+                gate: None,
+            })),
+            true,
+            Some(optimizer),
+            Some(store.clone()),
+            None,
+        );
+        task.session_id = Some("s1".into());
+
+        // Capacity 1 admits CompactStarted and then applies backpressure to
+        // the first post-commit send (ContextUsage). Keep the receiver alive
+        // and DO NOT drain it: the grace must release the command anyway.
+        let (fanin_tx, _fanin_rx) = mpsc::channel(1);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        cmd_tx
+            .send(AgentCommand::Prompt {
+                text: "after commit".into(),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+
+        let start = tokio::time::Instant::now();
+        let end = task.run_idle_compaction(&fanin_tx, &mut cmd_rx).await;
+        assert!(
+            start.elapsed() >= IDLE_CUT_GRACE,
+            "the post-commit blocked send must be released by the grace"
+        );
+        match end {
+            IdleEnd::Command(Some(AgentCommand::Prompt { text, images })) => {
+                assert_eq!(text, "after commit");
+                assert!(images.is_empty());
+            }
+            _ => panic!("the stashed prompt must be returned"),
+        }
+        assert!(
+            task.messages.iter().any(|message| {
+                message.role == Role::System
+                    && message
+                        .content
+                        .as_text()
+                        .starts_with("## Conversation summary")
+            }),
+            "a cut after the commit must keep the applied summary"
+        );
+
+        let mut savings = None;
+        for _ in 0..100 {
+            let rows = store.savings_events_rows(None).await.unwrap();
+            savings = rows.into_iter().find(|row| {
+                row.kind == "idle_compaction" && row.tokens_before > row.tokens_after
+            });
+            if savings.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            savings.is_some(),
+            "a committed summary must record its idle_compaction savings row"
+        );
+        drop(cmd_tx);
     }
 
     /// The dedicated summarizer is re-checked when the timer fires, not only

@@ -1,6 +1,6 @@
 [package]
 name = "mnemo-app"
-version = "2.1.0"
+version = "2.2.0"
 # Select the desktop app explicitly; it is this package's only binary.
 default-run = "mnemo-app"
 autobins = false

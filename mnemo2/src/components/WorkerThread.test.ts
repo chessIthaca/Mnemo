@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
 import type { Worker, WorkerThreadEntry } from "../lib/types";
 import { createWorkers, fixtureState } from "../test/fixtures";
+import { defineTokenSentinels, tokenSentinels } from "../test/tokens";
 import WorkerThread from "./WorkerThread.svelte";
 
 /** The full 429 the user reported losing — wrapped and selectable, never truncated. */
@@ -16,6 +17,7 @@ function worker(overrides: Partial<Worker> = {}): Worker {
 let frames: Map<number, FrameRequestCallback>;
 let nextFrame: number;
 let resizeCallbacks: ResizeObserverCallback[];
+let clearTokens: () => void;
 
 class ResizeObserverStub {
   disconnect = vi.fn();
@@ -60,6 +62,7 @@ describe("WorkerThread", () => {
     frames = new Map();
     nextFrame = 1;
     resizeCallbacks = [];
+    clearTokens = defineTokenSentinels();
     vi.stubGlobal(
       "requestAnimationFrame",
       vi.fn((callback: FrameRequestCallback) => {
@@ -75,6 +78,7 @@ describe("WorkerThread", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    clearTokens();
   });
 
   it("shows the failure block with the full error text when the worker failed", () => {
@@ -91,7 +95,7 @@ describe("WorkerThread", () => {
     if (!text) throw new Error("failure text missing");
     const style = getComputedStyle(text);
     // Danger colour, wrapping, no truncation — the full text stays selectable.
-    expect(style.color).toBe("var(--danger)");
+    expect(style.color).toBe(tokenSentinels["--danger"]);
     expect(style.whiteSpace).toBe("pre-wrap");
   });
 
@@ -129,14 +133,14 @@ describe("WorkerThread", () => {
     if (!note) throw new Error("retry note missing");
     expect(note.getAttribute("role")).toBe("status");
     expect(note.textContent).toBe("Provider error, retrying: 429 usage limit");
-    expect(getComputedStyle(note).color).toBe("var(--muted)");
+    expect(getComputedStyle(note).color).toBe(tokenSentinels["--muted"]);
 
     const danger = container.querySelector<HTMLElement>(".thread-error");
     if (!danger) throw new Error("final error entry missing");
     expect(danger.getAttribute("role")).toBe("alert");
     expect(danger.textContent).toContain("WORKER ERROR");
     expect(danger.textContent).toContain("429 retries exhausted");
-    expect(getComputedStyle(danger.querySelector<HTMLElement>("p")!).color).toBe("var(--danger)");
+    expect(getComputedStyle(danger.querySelector<HTMLElement>("p")!).color).toBe(tokenSentinels["--danger"]);
   });
 
   it("shows one running clock across a turn's tool cards", () => {

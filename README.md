@@ -128,7 +128,7 @@ PLAN.md               the technical-decisions log
 
 **Prerequisites — Windows 10/11:**
 
-- [Rust](https://rustup.rs) (stable toolchain)
+- [Rust](https://rustup.rs) — rustup installs the version pinned in rust-toolchain.toml on the first build
 - [Node.js LTS](https://nodejs.org)
 - Visual Studio Build Tools with the **Desktop development with C++** workload
 - WebView2 Runtime (preinstalled on Windows 10/11)
@@ -136,7 +136,7 @@ PLAN.md               the technical-decisions log
 **Prerequisites — macOS 11+:**
 
 - Xcode command-line tools: `xcode-select --install`
-- [Rust](https://rustup.rs) (stable toolchain)
+- [Rust](https://rustup.rs) — rustup installs the version pinned in rust-toolchain.toml on the first build
 - [Node.js LTS](https://nodejs.org)
 
 ```bash

@@ -2255,6 +2255,109 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Lint-only refactors (a dropped borrow, as_chunks in place of chunks_exact, a tuple binding in place of late init). No behaviour change."
+    },
+    {
+      "id": "2d837dfb",
+      "status": "open",
+      "created_at_ms": 1794398069531,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Changes two engine default values for memory ranking. No settings-dialog, plan-board or other specified capability behaviour changes."
+    },
+    {
+      "id": "6cff7165",
+      "status": "open",
+      "created_at_ms": 1794398162500,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "The Safety page edits the git commands that always ask",
+              "text": "The Safety page SHALL show the git subcommands that always make the lead ask before running them ([git] core_operations) as an editable list, and saving it SHALL apply to the open lead's next git command without a restart.",
+              "scenarios": [
+                {
+                  "name": "Default list",
+                  "when": [
+                    "the user opens Settings → Safety on a config without a [git] section"
+                  ],
+                  "then": [
+                    "the git field shows merge, push"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Saving a new list",
+                  "when": [
+                    "the user enters merge, push, rebase and saves"
+                  ],
+                  "then": [
+                    "config.toml holds core_operations = [\"merge\", \"push\", \"rebase\"] under [git]"
+                  ],
+                  "and": [
+                    "the open lead asks before its next git rebase without a restart"
+                  ]
+                },
+                {
+                  "name": "A malformed entry is refused",
+                  "when": [
+                    "the user enters push --force and saves"
+                  ],
+                  "then": [
+                    "the page shows an error naming the entry",
+                    "config.toml is unchanged"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "0931c9c8",
+      "status": "open",
+      "created_at_ms": 1794398201178,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Build tooling and CI only: a toolchain file, workflow install steps and their guard test. No product behaviour or specified capability changes."
+    },
+    {
+      "id": "c5d25f4e",
+      "status": "open",
+      "created_at_ms": 1794398264531,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Hides tools that can only fail in Mnemo2; no specified capability (settings-dialog, plan-board, dispatch-routing, worker-brief, ...) describes the browser tool set."
+    },
+    {
+      "id": "f8615038",
+      "status": "open",
+      "created_at_ms": 1794398285596,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Doc comments only."
     }
   ]
 }

@@ -136,7 +136,7 @@ tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-ruby = "0.23.1"
-tree-sitter-php = "0.24.2"
+tree-sitter-php = "0.25.1"
 tree-sitter-html = "0.23.2"
 
 # Windows-only: user-only DACL for keys.toml (Quality M6). Already present

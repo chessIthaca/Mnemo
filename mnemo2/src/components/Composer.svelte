@@ -150,7 +150,15 @@
     );
   }
 
-  /** Pick a menu entry: an argument-less command runs at once, the rest complete. */
+  /** Whether the draft is exactly this argument-less command, so it can run. */
+  function typedOut(command: SlashCommandInfo): boolean {
+    return (
+      !command.takesArgument &&
+      draft.text.trim().toLowerCase() === `/${command.name}`
+    );
+  }
+
+  /** Pick a menu entry with the mouse: an argument-less command runs at once. */
   function activateCommand(command: SlashCommandInfo) {
     if (command.takesArgument) {
       completeCommand(command);
@@ -177,7 +185,10 @@
     }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      activateCommand(highlighted);
+      // Enter runs a command only once its name is typed out: completing a
+      // partial name first keeps "/c" + Enter from running /clear by accident.
+      if (typedOut(highlighted)) activateCommand(highlighted);
+      else completeCommand(highlighted);
       return true;
     }
     if (event.key === "Escape") {

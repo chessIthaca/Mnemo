@@ -659,7 +659,7 @@ describe("Composer", () => {
       expect(draft().text).toBe("/model nothing");
     });
 
-    it("suggests commands while the name is typed and runs the highlighted one", async () => {
+    it("completes a partially typed name on Enter and runs it on the next Enter", async () => {
       setLead(false);
       const compact = vi.spyOn(actions, "compactLead").mockResolvedValue(undefined);
       render(Composer);
@@ -675,10 +675,46 @@ describe("Composer", () => {
 
       await fireEvent.keyDown(textbox(), { key: "ArrowDown" });
       expect(options[1].getAttribute("aria-selected")).toBe("true");
+
+      // Enter on a partial name completes it instead of running it.
+      await enter();
+      expect(compact).not.toHaveBeenCalled();
+      expect(draft().text).toBe("/compact");
+
+      // The name is typed out now, so Enter runs the highlighted command.
+      await enter();
+      await vi.waitFor(() => expect(compact).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+      expect(draft().text).toBe("");
+    });
+
+    it("does not run /clear when Enter lands on a partial name", async () => {
+      setLead(false);
+      const fresh = vi.spyOn(actions, "newLeadConversation").mockResolvedValue(true);
+      const compact = vi.spyOn(actions, "compactLead").mockResolvedValue(undefined);
+      render(Composer);
+
+      await fireEvent.input(textbox(), { target: { value: "/c" } });
+      await enter();
+
+      // /clear is the first match; Enter must only complete it, never run it.
+      await vi.waitFor(() => expect(draft().text).toBe("/clear"));
+      expect(fresh).not.toHaveBeenCalled();
+      expect(compact).not.toHaveBeenCalled();
+    });
+
+    it("runs a typed-out command from the menu on Enter", async () => {
+      setLead(false);
+      const compact = vi.spyOn(actions, "compactLead").mockResolvedValue(undefined);
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      actions.setLeadDraftText("/compact");
+      render(Composer);
+
+      expect(screen.getByRole("listbox", { name: "Slash commands" })).toBeTruthy();
       await enter();
 
       await vi.waitFor(() => expect(compact).toHaveBeenCalledTimes(1));
-      await vi.waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+      expect(send).not.toHaveBeenCalled();
       expect(draft().text).toBe("");
     });
 

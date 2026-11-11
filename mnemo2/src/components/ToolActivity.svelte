@@ -77,7 +77,7 @@
    *  the disclosure state: a thumbnail must not need an expanded card. */
   const imagePaths = $derived(toolImagePaths(entry.toolName, entry.arguments, entry.result));
 
-  // The expanded body, per tool kind — the Mnemo1 CallDetail port: a shell
+  // The expanded body, per tool kind: a shell
   // shows its command and its split output, and edits, writes and reads show
   // the change itself (a coloured diff, the written lines, the files and line
   // ranges read) instead of the Arguments JSON and the raw result text. The

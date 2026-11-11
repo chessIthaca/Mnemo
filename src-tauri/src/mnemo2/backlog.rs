@@ -77,9 +77,9 @@ fn read_items(path: &Path) -> Vec<BacklogItem> {
 /// Trim and validate a backlog idea's text.
 ///
 /// The store's add path never validates, and this section is a plan inbox (no
-/// dispatch), so Mnemo1's dispatch detail bar (headline + a long body naming
-/// exact paths) is deliberately NOT imposed here: one trimmed, non-empty idea
-/// is enough to capture a thought.
+/// dispatch), so the detail a dispatch demands (a headline plus a long body
+/// naming exact paths) is deliberately NOT imposed here: one trimmed,
+/// non-empty idea is enough to capture a thought.
 fn normalize_idea(text: &str) -> Result<String, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -419,8 +419,8 @@ mod tests {
             .id
     }
 
-    /// Append one line written by someone else (another worktree, a git union
-    /// merge, the Mnemo1 UI) straight to the file — no store involved.
+    /// Append one line written by someone else (another worktree, another
+    /// editor, a git union merge) straight to the file — no store involved.
     fn append_on_disk(path: &Path, id: &str, text: &str, status: &str) {
         let mut content = std::fs::read_to_string(path).unwrap_or_default();
         if !content.is_empty() && !content.ends_with('\n') {

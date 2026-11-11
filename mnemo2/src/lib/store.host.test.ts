@@ -5,12 +5,13 @@ import { emptyProjectUsageView } from "./teamState";
 /**
  * Regression: a Tauri WebView is not necessarily the Mnemo2 host.
  *
- * Mnemo1's Browser tab is a Tauri WebView too, so Mnemo2's dev UI opened
- * there used to send `project_pick_folder` to Mnemo1's IPC, which never
- * registered it — Tauri answered `project_pick_folder not allowed by ACL`
- * (the page origin is non-local for Mnemo1, so the ACL check applies).
- * The store must confirm the Mnemo2 handshake before invoking any command,
- * and the team transport needs the same gate.
+ * A Tauri WebView is not necessarily the Mnemo2 host: the dev UI opened in
+ * another one (the in-app Browser pane, or another app's window) used to send
+ * `project_pick_folder` to an IPC that never registered it — Tauri answered
+ * `project_pick_folder not allowed by ACL` (the page origin is non-local
+ * there, so the ACL check applies). The store must confirm the Mnemo2
+ * handshake before invoking any command, and the team transport needs the same
+ * gate.
  */
 const host = vi.hoisted(() => ({
   handshake: false,

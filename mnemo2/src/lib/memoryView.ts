@@ -166,7 +166,7 @@ export interface MemoryTransport {
   read(id: string): Promise<MemoryDetail>;
   backlinks(id: string): Promise<MemoryRow[]>;
   overview(): Promise<MemoryOverview>;
-  /** The Diagnostics recall test (working tier included, like Mnemo1's). */
+  /** The Diagnostics recall test (working tier included, unlike the list). */
   recallTest(query: string, limit?: number): Promise<MemoryHit[]>;
 }
 

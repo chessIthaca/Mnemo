@@ -26,7 +26,7 @@
 //!   On open the journal is re-read and merged by `run_id:id`; rows that the
 //!   live ring no longer holds list as `retained` metadata.
 //! - **Full bodies — opt-in.** The kernel's `traces.jsonl` mirror and
-//!   `traces-history.jsonl` archive stay exactly as Mnemo1 built them:
+//!   `traces-history.jsonl` archive stay exactly as the kernel writes them:
 //!   off by default (`trace_set_log_bodies`), secrets always redacted, and
 //!   failed requests always mirrored (redacted) — the most valuable calls to
 //!   debug must survive regardless of the toggle (decision 2026-11-02).

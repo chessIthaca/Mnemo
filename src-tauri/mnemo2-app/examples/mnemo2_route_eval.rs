@@ -6,10 +6,10 @@
 
 //! `mnemo2_route_eval` — the routing eval's CLI (plan 2ba2168a, design §4.8).
 //!
-//! Asks a RUNNING Laya about the hand set — and, with `--history` / `--mnemo1`,
-//! the mined corpora — one prompt at a time, under four labels and again under
-//! three and two, then prints the threshold sweep, the misses and the
-//! suggested gates.
+//! Asks a RUNNING Laya about the hand set — and, with `--history` /
+//! `--first-prompt`, the mined corpora — one prompt at a time, under four
+//! labels and again under three and two, then prints the threshold sweep, the
+//! misses and the suggested gates.
 //! The last run's suggestions land in `<training_dir>/route_eval.json`, which
 //! the Laya page shows beside its gates.
 //!
@@ -32,14 +32,14 @@ use mnemo_app::mnemo2::dispatch_routing::{self, DispatchRoutingRow};
 use mnemo_app::mnemo2::route_eval::{self, EvalCase};
 
 /// The tool's usage line and the flag explanations.
-const USAGE: &str = "usage: mnemo2_route_eval --laya-url URL [--history] [--mnemo1]\n\
+const USAGE: &str = "usage: mnemo2_route_eval --laya-url URL [--history] [--first-prompt]\n\
 \n\
-  --laya-url URL  the running Laya's base URL (required: the managed sidecar\n\
-                  binds a dynamic loopback port and persists nothing)\n\
-  --history       also classify step texts mined from .coding/plans/*.md and\n\
-                  .coding/reviews/team-*.md plus the dispatch log's labelled\n\
-                  outcomes\n\
-  --mnemo1        classify plain-language first-prompt twins of the hand set";
+  --laya-url URL   the running Laya's base URL (required: the managed sidecar\n\
+                   binds a dynamic loopback port and persists nothing)\n\
+  --history        also classify step texts mined from .coding/plans/*.md and\n\
+                   .coding/reviews/team-*.md plus the dispatch log's labelled\n\
+                   outcomes\n\
+  --first-prompt   classify plain-language first-prompt twins of the hand set";
 
 /// The parsed command line.
 struct Flags {
@@ -48,7 +48,7 @@ struct Flags {
     /// Mine the history corpus and the dispatch log's outcome cases.
     history: bool,
     /// Twin the hand set into first-prompt form.
-    mnemo1: bool,
+    first_prompt: bool,
 }
 
 #[tokio::main]
@@ -65,7 +65,7 @@ async fn main() -> ExitCode {
 /// Parse the flags; an unknown flag or a missing value is an error carrying
 /// the usage text.
 fn parse_flags(args: impl Iterator<Item = String>) -> Result<Flags, String> {
-    let mut flags = Flags { laya_url: None, history: false, mnemo1: false };
+    let mut flags = Flags { laya_url: None, history: false, first_prompt: false };
     let mut args = args.peekable();
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -74,7 +74,7 @@ fn parse_flags(args: impl Iterator<Item = String>) -> Result<Flags, String> {
                 flags.laya_url = Some(url);
             }
             "--history" => flags.history = true,
-            "--mnemo1" => flags.mnemo1 = true,
+            "--first-prompt" => flags.first_prompt = true,
             other => return Err(format!("unknown flag '{other}'\n{USAGE}")),
         }
     }
@@ -86,8 +86,8 @@ fn parse_flags(args: impl Iterator<Item = String>) -> Result<Flags, String> {
 /// outcomes.
 fn corpus(flags: &Flags) -> Result<Vec<EvalCase>, String> {
     let hand_set = route_eval::parse_hand_set(route_eval::HAND_SET_JSONL)?;
-    let hand_set = if flags.mnemo1 {
-        route_eval::mnemo1_twins(&hand_set)
+    let hand_set = if flags.first_prompt {
+        route_eval::first_prompt_twins(&hand_set)
     } else {
         hand_set
     };

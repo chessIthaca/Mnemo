@@ -371,7 +371,7 @@
     attaching = true;
     try {
       // Downscale/re-encode through the shared attachment pipeline before the
-      // data URL ever reaches the store, exactly like the Mnemo1 composer.
+      // data URL ever reaches the store.
       const attached = await Promise.allSettled(
         files.map((file) => fileToAttachedDataUrl(file)),
       );

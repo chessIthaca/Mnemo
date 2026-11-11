@@ -2834,11 +2834,11 @@ fn porcelain_worktree_paths_are_nul_delimited_and_fail_closed() {
     }
 }
 
-/// Mnemo1 (deleted 2026-11-11) left `runall-*` worktrees and `wt/runall-*`
-/// branches in the same `.worktrees/` directory; Mnemo2's cleanup only ever
-/// acts on its own `agent-*` records and refuses anything else, even a forged
-/// record. The legacy checkout is built with plain git — no Mnemo2 code path
-/// may recreate it.
+/// The retired Mnemo1 app (deleted 2026-11-11) left `runall-*` worktrees and
+/// `wt/runall-*` branches in the same `.worktrees/` directory; Mnemo2's cleanup
+/// only ever acts on its own `agent-*` records and refuses anything else, even
+/// a forged record. The legacy checkout is built with plain git — no Mnemo2
+/// code path may recreate it.
 #[tokio::test]
 async fn cleanup_never_touches_mnemo1_runall_worktrees() {
     let repo = tempfile::tempdir().expect("repo");
@@ -2851,7 +2851,7 @@ async fn cleanup_never_touches_mnemo1_runall_worktrees() {
     lifecycle_git(root, &["add", "file.txt"]);
     lifecycle_git(root, &["commit", "-m", "base"]);
     lifecycle_git(root, &["checkout", "-b", "wt/lead"]);
-    // Mnemo1's shape: branch `wt/runall-<item8>`, checkout
+    // The retired app's shape: branch `wt/runall-<item8>`, checkout
     // `.worktrees/runall-<item8>` (gitignored, beside the agent ones).
     let runall_path = root.join(".worktrees").join("runall-abcd1234");
     std::fs::create_dir_all(root.join(".worktrees")).expect(".worktrees");
@@ -2903,7 +2903,7 @@ async fn cleanup_never_touches_mnemo1_runall_worktrees() {
     .expect("cleanup");
     assert_eq!(report.removed, vec![agent_branch.clone()]);
     assert!(!agent_path.exists());
-    assert!(runall_path.is_dir(), "the Mnemo1 checkout survives");
+    assert!(runall_path.is_dir(), "the retired app's checkout survives");
     assert!(phase3::git_value(root, &["rev-parse", &runall_branch])
         .await
         .is_ok());

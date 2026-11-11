@@ -329,9 +329,9 @@ fn enable_laya_in_config(dir: &Path) {
     std::fs::write(&path, text).expect("writing config.toml");
 }
 
-/// Append Mnemo1's per-state `[models]` section to the fixture config —
-/// the shared-config shape plan 7f0b3848 tests against: the slots belong
-/// to Mnemo1's workflow and live in the same config.toml Mnemo2 reads.
+/// Append the per-state `[models]` section to the fixture config — the
+/// shared-config shape plan 7f0b3848 tests against: the slots belong to the
+/// kernel's workflow and live in the same config.toml Mnemo2 reads.
 fn enable_per_state_models_in_config(dir: &Path) {
     let path = dir.join("config.toml");
     let mut text = std::fs::read_to_string(&path).expect("fixture config.toml");
@@ -1469,7 +1469,7 @@ async fn new_conversation_after_reopen_keeps_the_default_model() {
 }
 
 /// Plan 7f0b3848: the lead's model is the picker's choice (or the
-/// default model) in every workflow state. With Mnemo1's
+/// default model) in every workflow state. With a per-state
 /// `[models.executing]` configured in the shared config — the shape
 /// the user's real config.toml has — a Planning → Executing move must
 /// NOT hand the lead's next request to that slot. The protection is
@@ -1481,7 +1481,7 @@ async fn new_conversation_after_reopen_keeps_the_default_model() {
 /// lead's own scripted provider and no model switch is announced —
 /// if per-state routing ever returns for the lead, this goes red.
 #[tokio::test]
-async fn lead_ignores_the_mnemo1_per_state_models_across_a_state_change() {
+async fn lead_ignores_the_per_state_models_across_a_state_change() {
     let root = tempfile::tempdir().expect("workspace");
     let config = tempfile::tempdir().expect("config");
     let state = tempfile::tempdir().expect("state");
@@ -4700,8 +4700,8 @@ async fn high_risk_dispatch_and_review_require_substantive_evidence() {
 }
 
 /// Regression: high-risk dispatch and audits read the dispatched board
-/// plan, not Mnemo1's `.coding/plans/stack.json`, which the board never
-/// writes. A plan created through `plan_create` with acceptance
+/// plan, not `.coding/plans/stack.json`, which the board never writes. A
+/// plan created through `plan_create` with acceptance
 /// scenarios takes a high-risk dispatch and an audit with no stack file,
 /// and its scenarios survive a later `plan_update`.
 #[tokio::test]
@@ -4750,7 +4750,7 @@ async fn high_risk_dispatch_and_audit_use_the_board_plan_without_stack_json() {
     assert!(updated.success, "{}", updated.output);
     assert!(
         !root.path().join(".coding/plans/stack.json").exists(),
-        "the board never writes Mnemo1's plan stack"
+        "the board never writes the plan stack"
     );
 
     let dispatched = team
@@ -5814,8 +5814,8 @@ async fn the_board_notice_reaches_the_actual_lead() {
     lead.shutdown().await;
 }
 
-/// The engine opens the project's own `.coding/` stores (the ones Mnemo1
-/// uses) and hands them to the workflow policy factory.
+/// The engine opens the project's own `.coding/` stores and hands them to the
+/// workflow policy factory.
 #[tokio::test]
 async fn the_lead_engine_shares_the_project_stores() {
     let root = tempfile::tempdir().expect("workspace");

@@ -95,7 +95,7 @@ pub enum PassKind {
     Laya,
 }
 
-/// Fold one pass event (the `"type"`-tagged wire shape both Mnemo1 streams
+/// Fold one pass event (the `"type"`-tagged wire shape the indexing streams
 /// share: `started`, `progress {done,total}`, `done {summary}`,
 /// `failed {error}`) into the pass. Unknown shapes leave it unchanged.
 pub fn apply_pass_event(pass: Option<IndexPass>, event: &Value) -> Option<IndexPass> {

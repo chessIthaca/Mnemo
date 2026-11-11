@@ -7,8 +7,7 @@
 //!
 //! The setting lives in Mnemo2's own `mnemo2.toml` — the file the Laya page's
 //! `[routing]` table already occupies — as `close = "auto" | "tray" | "quit"`,
-//! default `auto`, and never in the shared `config.toml`, which Mnemo1 never
-//! reads this table from:
+//! default `auto`, and never in the shared `config.toml`:
 //!
 //! - `auto` is today's behaviour: a hidden-start Mnemo2 (launched with
 //!   `--hidden`, as the Claude Code plugin's helper does) hides to the tray

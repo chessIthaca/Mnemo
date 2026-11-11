@@ -267,8 +267,8 @@ pub async fn require_clean(root: &Path, label: &str) -> Result<(), String> {
     }
 }
 
-/// The bookkeeping the lead keeps in the project, shared with Mnemo1: plan
-/// files (`.coding/plans/`), the closing team review reports
+/// The bookkeeping the lead keeps in the project: plan files
+/// (`.coding/plans/`), the closing team review reports
 /// (`.coding/reviews/`), memory knowledge records (`.coding/knowledge/`),
 /// OpenSpec current-state specs and archives (`.coding/openspec/`), and Laya's
 /// dispatch routing learnings bundle (`.coding/laya/`), all committed with the

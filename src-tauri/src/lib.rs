@@ -6,8 +6,8 @@
 
 //! The Mnemo2 desktop host's reusable library surface.
 //!
-//! Mnemo1 is retired; the `mnemo2-app` package links this crate (with the
-//! `mnemo2` feature) to build the Mnemo2 desktop app.
+//! The `mnemo2-app` package links this crate (with the `mnemo2` feature) to
+//! build the Mnemo2 desktop app.
 
 // Tauri compiles the Windows resource (COMCTL32 v6 manifest + versioninfo +
 // icon) into OUT_DIR/resource.lib and — now that this package is a library —

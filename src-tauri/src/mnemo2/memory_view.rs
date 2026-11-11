@@ -27,7 +27,7 @@
 //!
 //! Defaults that shape what the tab shows: the list excludes the working tier
 //! (raw tool-event captures — consolidation input, not knowledge), superseded
-//! records (history, reachable through Mnemo1) and quarantined rows (the
+//! records (history a newer record replaced) and quarantined rows (the
 //! startup digest sweep's finds), exactly like recall does. An explicit
 //! `tier: "working"` filter opts back in.
 //!
@@ -499,7 +499,7 @@ async fn search_hits(
 }
 
 /// The Diagnostics recall test: the `MemoryApi`'s own ranking, working tier
-/// included — exactly what Mnemo1's debug view answered, so the two agree.
+/// included — so the card answers exactly what a lead recall does.
 async fn recall_hits(api: &MemoryApi, query: &str, limit: usize) -> Result<Vec<MemoryHit>, String> {
     let mut scored = api
         .search(query, Some(limit))

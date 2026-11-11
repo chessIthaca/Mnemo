@@ -277,10 +277,10 @@ pub fn logged_tier_label(tier: &str) -> Option<&'static str> {
     route_question::label_for_tier(converted)
 }
 
-/// The `--mnemo1` corpus: plain-language first-prompt twins of `cases` — the
-/// same work phrased as a chat request, which is the text Mnemo1's
+/// The `--first-prompt` corpus: plain-language first-prompt twins of `cases` —
+/// the same work phrased as a chat request, which is the text the kernel's
 /// first-prompt route reads (design §4.12).
-pub fn mnemo1_twins(cases: &[EvalCase]) -> Vec<EvalCase> {
+pub fn first_prompt_twins(cases: &[EvalCase]) -> Vec<EvalCase> {
     cases
         .iter()
         .map(|case| {
@@ -1207,12 +1207,12 @@ mod tests {
     }
 
     #[test]
-    fn mnemo1_twins_are_plain_language() {
+    fn first_prompt_twins_are_plain_language() {
         let cases = vec![EvalCase {
             text: "Add a `routine` model picker to the classifier settings section.".to_string(),
             expected: Some("routine".to_string()),
         }];
-        let twins = mnemo1_twins(&cases);
+        let twins = first_prompt_twins(&cases);
         assert_eq!(
             twins,
             vec![EvalCase {

@@ -39,7 +39,10 @@ pub(crate) struct Ctx {
     /// costing ~800 tokens per request to advertise an error. Shared and
     /// atomic so a Settings save takes effect on the next turn without
     /// rebuilding any registry. The off-screen `offscreen_browser_*` tools
-    /// drive the headless browser and ignore this flag.
+    /// drive the headless browser and ignore this flag. Headless hosts
+    /// (Mnemo2, built on the headless engine) hold this gate off entirely:
+    /// they expose no on-screen WebView2 CDP endpoint, so the on-screen
+    /// tools never advertise there whatever the config says.
     pub inspection: Arc<std::sync::atomic::AtomicBool>,
 }
 

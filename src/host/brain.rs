@@ -248,6 +248,9 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // <state_dir>/memory.db (the Sqlite default), the codegraph flag
     // from the loaded config.
     let want_codegraph = config.general.general.codegraph;
+    // c5d25f4e: the app owns the on-screen WebView2 (the Browser pane), so
+    // the on-screen browser gate still resolves from the config here.
+    let want_on_screen_browser = config.general.general.enable_browser_inspection;
     wire_brain(
         config_dir,
         config,
@@ -259,6 +262,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
             memory_enabled: true,
             memory_path: None,
             index_codegraph: want_codegraph,
+            on_screen_browser: want_on_screen_browser,
             // G8: the app path never injects — the backend enum is its
             // only source (and no shared resources: one process, one
             // engine).
@@ -277,7 +281,9 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
 /// `EngineOptions` (G4 — the engine passes its directories explicitly).
 /// 3b.1 (D1): the brain's memory/index decisions, RESOLVED from
 /// EngineOptions.memory + index_codegraph by the callers (the app path
-/// passes the config's values, preserving its behavior).
+/// passes the config's values, preserving its behavior), plus the
+/// per-host on-screen browser gate (c5d25f4e): the headless Engine holds
+/// it off — it has no on-screen WebView2 to attach the tools to.
 pub(crate) struct BrainMemoryOptions {
     /// `false` = MemoryBackend::Disabled: NO store — no recall, no
     /// consolidation, no capture, no memory.db on disk (Engine::memory()
@@ -290,6 +296,11 @@ pub(crate) struct BrainMemoryOptions {
     /// config's `codegraph`; the headless Engine passes
     /// EngineOptions.index_codegraph).
     pub index_codegraph: bool,
+    /// Whether the on-screen `browser_*` tools may ever attach (the app
+    /// passes the config's `enable_browser_inspection`; a headless Engine
+    /// passes `false` — it has no on-screen WebView2 CDP endpoint, so the
+    /// gate stays off whatever the config says).
+    pub on_screen_browser: bool,
     /// G8 (§5.9.8 :726-728): the Rust-only INJECTED store — overrides the
     /// backend wiring entirely (the serde `MemoryBackend` enum stays the
     /// wire). `None` = build from `memory_enabled`/`memory_path` as today.
@@ -352,6 +363,7 @@ pub(crate) fn wire_brain(
         memory_enabled,
         memory_path,
         index_codegraph,
+        on_screen_browser,
         injected_store,
         shared,
     } = memory;
@@ -1007,8 +1019,13 @@ pub(crate) fn wire_brain(
     // In a release build, enable the WebView2 CDP attach only when the user
     // opted in via `enable_browser_inspection` (the env var exposing the port
     // was already set above in `main`). Debug builds always have it on.
+    // Headless hosts (c5d25f4e) pass on_screen_browser: false — there is no
+    // on-screen WebView2 to attach to at all, so the attach never turns on.
     #[cfg(feature = "browser")]
-    if !cfg!(debug_assertions) && config.general.general.enable_browser_inspection {
+    if on_screen_browser
+        && !cfg!(debug_assertions)
+        && config.general.general.enable_browser_inspection
+    {
         browser.set_webview_enabled(true);
     }
     // The shared, runtime-mutable git core-operations list — seeded from the
@@ -1285,8 +1302,13 @@ pub(crate) fn wire_brain(
     // Seed the on-screen browser_* gate from the loaded config: those tools
     // attach over the WebView2 CDP endpoint, which only exists when the user
     // opted in, so with the flag off they stay out of the tools array
-    // entirely rather than advertising a guaranteed failure.
-    factory.set_browser_inspection(config.general.general.enable_browser_inspection);
+    // entirely rather than advertising a guaranteed failure. Headless hosts
+    // (c5d25f4e) hold the gate off entirely — they expose no on-screen
+    // WebView2 CDP endpoint, so the config flag must not advertise the
+    // tools there.
+    factory.set_browser_inspection(
+        on_screen_browser && config.general.general.enable_browser_inspection,
+    );
     // Wire the code knowledge graph when enabled + opened successfully.
     let factory = match codegraph.clone() {
         Some(graph) => factory.with_codegraph(graph),

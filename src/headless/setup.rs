@@ -593,8 +593,9 @@ impl Setup {
             .set_core_operations(new_config.general.git.core_operations.clone());
         live.factory
             .set_shell_filter_config(new_config.general.shell_filter.clone());
-        live.factory
-            .set_browser_inspection(new_config.general.general.enable_browser_inspection);
+        // Headless hosts have no on-screen WebView2 CDP endpoint; the
+        // browser_* tools stay hidden (offscreen_browser_* are unaffected).
+        live.factory.set_browser_inspection(false);
         // The trace limits (retroactive budget; the cap from now on) —
         // only when the patch carries trace fields (the GUI's contract).
         if patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some() {
@@ -1845,6 +1846,52 @@ mod tests {
             Some("alt-model")
         );
         drop(shared);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// c5d25f4e: `patch_settings` may persist `enable_browser_inspection =
+    /// true` (the key stays live for Mnemo1 over the shared config), but a
+    /// headless engine must never mirror it into the factory's on-screen
+    /// `browser_*` gate — there is no on-screen WebView2 CDP endpoint to
+    /// attach to, so the gate stays off whatever the patch saves.
+    #[cfg(feature = "browser")]
+    #[tokio::test]
+    async fn patch_settings_keeps_on_screen_browser_tools_off() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        setup
+            .patch_settings(SettingsSaveDto {
+                enable_browser_inspection: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("patch applies");
+        // The config KEY still persists (Mnemo1 owns the flag)…
+        let persisted = crate::config::Config::load(cfg.path()).expect("reload");
+        assert!(
+            persisted.general.general.enable_browser_inspection,
+            "the key itself stays persisted — only the live mirror is held off"
+        );
+        // …but the headless engine's live gate stays off.
+        assert!(
+            !engine.brain().factory.browser_inspection_enabled(),
+            "a settings save must not re-enable the on-screen browser_* gate on a headless engine"
+        );
         engine.shutdown().await.expect("shutdown");
     }
 

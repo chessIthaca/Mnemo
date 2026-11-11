@@ -13,9 +13,12 @@ import type {
   TracePageTransport,
   TraceRow,
 } from "../lib/trace";
+import type { SteeringTransport } from "../lib/steering";
 
 const mocks = vi.hoisted(() => ({
   transport: null as TracePageTransport | null,
+  /** The steering transport the page builds; null keeps the section quiet. */
+  steering: null as SteeringTransport | null,
   rows: [] as TraceRow[],
   page: {} as Partial<TraceListPage>,
   details: new Map<string, TraceDetail>(),
@@ -40,6 +43,13 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../lib/trace", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/trace")>();
   return { ...original, createTracePageTransport: () => mocks.transport };
+});
+
+// The steering counters come from their own transport; the labels and helpers
+// in ../lib/steering stay real so the section renders as it does in the app.
+vi.mock("../lib/steering", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/steering")>();
+  return { ...original, createSteeringTransport: () => mocks.steering };
 });
 
 function attribution(overrides: Partial<TraceAttribution> = {}): TraceAttribution {
@@ -200,6 +210,7 @@ describe("TraceView", () => {
     vi.useFakeTimers();
     window.localStorage.clear();
     mocks.transport = null;
+    mocks.steering = null;
     mocks.rows = [];
     mocks.page = {};
     mocks.details = new Map();
@@ -334,6 +345,60 @@ describe("TraceView", () => {
     expect(screen.getByRole("button", { name: /lead-model/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /kimi-k3\.1-pro/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /legacy-model/ })).toBeTruthy();
+  });
+
+  it("shows steering notes in the insights", async () => {
+    installTransport();
+    mocks.steering = {
+      stats: async () => ({
+        fired: 4,
+        switched: 3,
+        by_marker: [
+          { marker: "search-nudge", fired: 4, switched: 3, gated: 0 },
+          { marker: "shell-tip", fired: 0, switched: 0, gated: 0 },
+        ],
+        file_tool_mutations: 5,
+        shell_mutations: 1,
+      }),
+    };
+    render(TraceView);
+
+    // The section rides in the Insights body, open by default; the totals
+    // arrive on the first poll, so wait for the numbers, not the frame.
+    await vi.waitFor(() =>
+      expect(screen.getByText(/Followed 3 of 4 \(75%\)/)).toBeTruthy(),
+    );
+    expect(screen.getByRole("region", { name: "Steering notes" })).toBeTruthy();
+    // Only a kind that fired gets a row; the labels are the plain names.
+    expect(screen.getByRole("rowheader", { name: "Use the code graph" })).toBeTruthy();
+    expect(screen.queryByRole("rowheader", { name: "A cheaper tool than the shell" })).toBeNull();
+    expect(screen.getByText(/5 with file tools/)).toBeTruthy();
+  });
+
+  it("says when there are no steering notes", async () => {
+    installTransport();
+    let polls = 0;
+    mocks.steering = {
+      stats: async () => {
+        polls += 1;
+        return {
+          fired: 0,
+          switched: 0,
+          by_marker: [{ marker: "search-nudge", fired: 0, switched: 0, gated: 0 }],
+          file_tool_mutations: 0,
+          shell_mutations: 0,
+        };
+      },
+    };
+    render(TraceView);
+
+    // Wait for the zero snapshot itself, so the quiet line is not just the
+    // placeholder the section shows before the first answer arrives.
+    await vi.waitFor(() => expect(polls).toBeGreaterThan(0));
+    await vi.waitFor(() =>
+      expect(screen.getByText("No steering notes yet this run.")).toBeTruthy(),
+    );
+    expect(screen.queryByRole("table", { name: "Steering notes by kind" })).toBeNull();
   });
 
   it("debounces the search box and carries its scope", async () => {

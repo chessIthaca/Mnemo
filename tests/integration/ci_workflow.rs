@@ -589,3 +589,39 @@ fn cargo_lock_keeps_the_vendored_patches() {
          vendored crate must resolve"
     );
 }
+
+/// The PR gate (`.github/workflows/ci.yml`) must keep building, linting and
+/// testing every pull request to main. Before it existed only CodeQL ran on
+/// pull requests, so v2.2.0 shipped with clippy red and Dependabot PRs looked
+/// green while breaking the build or the tests.
+#[test]
+fn ci_workflow_gates_pull_requests_with_clippy_and_tests() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/ci.yml"
+    ))
+    .expect("ci.yml readable");
+    assert!(
+        text.contains("\n  pull_request:\n"),
+        "ci.yml must trigger on pull_request"
+    );
+    for command in [
+        "npm run build",
+        "npm run build:mnemo2",
+        "npm test --workspace frontend",
+        "npm test --workspace mnemo2",
+        "cargo clippy --workspace --all-targets",
+        "cargo clippy -p mnemo-app --all-targets --features mnemo2",
+        "cargo test --workspace --no-fail-fast",
+        "cargo test -p mnemo-app --features mnemo2 --lib",
+    ] {
+        assert!(
+            text.contains(&format!("run: {command}\n")),
+            "ci.yml lost the step `{command}`"
+        );
+    }
+    assert!(
+        text.contains("\npermissions:\n  contents: read\n"),
+        "ci.yml must scope the GITHUB_TOKEN to exactly contents: read"
+    );
+}

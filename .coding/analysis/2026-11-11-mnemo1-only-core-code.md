@@ -7,6 +7,8 @@ Scope: inventory only. No source was changed and no experimental edit was needed
 
 **Reading the verdicts.** REMOVE means the only non-test producer/consumer was the deleted Mnemo1 shell (or the code exists solely to support another REMOVE row). RETIRE-SETTING means the key/wire value is persisted, and in some cases still shown by Mnemo2, but no live behavior consumes it. KEEP includes public `app`/`headless` embedding surface even where Mnemo2 deliberately disables a feature. Line counts are approximate deletion counts including directly associated tests, not whole-file sizes unless stated.
 
+**Review revision.** Every REMOVE/RETIRE-SETTING row now has a `Checked:` note from `git grep -n <row symbols> -- src src-tauri examples tests mnemo2/src`. That scope includes the root `src-tauri/src/*.rs` host, `src-tauri/tests`, and `src-tauri/mnemo2-app`, not just `src-tauri/src/mnemo2`. The lead also corrected `webview_args`: its UDF/profile helpers are live Mnemo2 infrastructure and only its CDP helpers are removable.
+
 ## Summary
 
 | Candidate | Defined at (file:line) | Verdict | Evidence (one line) | ~Lines |
@@ -30,9 +32,10 @@ Scope: inventory only. No source was changed and no experimental edit was needed
 | `.worktrees` graph exclusion | `src/codegraph/walk.rs:254`; `src/codegraph/watcher.rs:295` | KEEP | It also excludes Mnemo2 `.worktrees/agent-*`; `runall-*` is test data, not a special code path. | 0 |
 | `[general.budget]` and `BudgetConfigDto` | `src/config/general.rs:593`; `src/config/settings_dto.rs:117` | KEEP | `src/agent/turn.rs:596-607,1794-1813` enforces caps; Mnemo2 Models edits them. | 0 |
 | `auto_compact_on_plan_complete` | `src/config/general.rs:175`; `src/config/settings_dto.rs:428` | RETIRE-SETTING | After deletion there is no behavioral reader; only serde, patch application, and tests remain. | 60 |
-| `enable_browser_inspection` | `src/config/general.rs:184`; `src/config/settings_dto.rs:424` | RETIRE-SETTING | Mnemo2/headless force inspection off; retire with the Mnemo1-only inspection implementation. | 35 |
-| Mnemo1 WebView/CDP inspection | `src/browser/mod.rs:72,346,1135`; `src/tool/browser/mod.rs:1` | REMOVE | Only deleted `ipc/browser*.rs` consumed it and only deleted `main.rs` enabled it. | 1,550 |
-| `webview_args` | `src/webview_args.rs:20` | REMOVE | The only caller was deleted `mnemo-app` startup; no headless/example/Mnemo2 reference remains. | 300 |
+| `enable_browser_inspection` | `src/config/general.rs:158`; `src/config/settings_dto.rs:424` | RETIRE-SETTING | Mnemo2/headless force inspection off; retire with the Mnemo1-only inspection implementation. | 35 |
+| Mnemo1 WebView/CDP inspection | `src/browser/mod.rs:262,1214,1529`; `src/tool/browser/mod.rs:862` | REMOVE | Only the explicit `webview_*` path and six on-screen wrappers are dead; shared off-screen browser APIs stay. | 1,250 |
+| `webview_args` UDF/profile helpers | `src/webview_args.rs:114-150` | KEEP | `src-tauri/src/webview_udf.rs:49,52,64` uses them for every Mnemo2 window profile. | 0 |
+| `webview_args` CDP/additional-argument helpers | `src/webview_args.rs:24-110` | REMOVE | After the BrowserManager WebView removal, only their own tests reference the CDP port/argument builders. | 165 |
 | `[ui]` chat/steering display keys | `src/config/general.rs:1005,1107-1167,1234` | RETIRE-SETTING | No reader exists outside `general.rs` and two DTO preservation tests. | 330 |
 | `SteeringNotesDto` | `src/config/settings_dto.rs:227` | REMOVE | Only deleted `ipc/settings.rs` imported it; it is not a `SettingsSaveDto` field. | 20 |
 | `[general.laya].auto_finetune` | `src/config/general.rs:283`; `src-tauri/src/mnemo2/laya_settings.rs:131` | RETIRE-SETTING | It is persisted and exposed on Tiers, but the sole fine-tune consumer was deleted `ipc/finetune.rs`. | 190 |
@@ -40,9 +43,9 @@ Scope: inventory only. No source was changed and no experimental edit was needed
 | Per-task model slots and per-turn routing | `src/config/general.rs:398,859-881` | KEEP | `src/model_resolver.rs` resolves them and `src/agent/loop_impl.rs` routes each turn; Mnemo2 merely sets `skip_turn_routing`. | 0 |
 | External/off-screen browser | `src/browser/mod.rs:273,1903` | KEEP | Mnemo2 browser uses `normalize_url`; core off-screen browser is an embedder/agent feature. | 0 |
 | `SerializableAgentEvent` core contract | `src/runtime/channels.rs:723` | KEEP | Headless sessions, Mnemo2 runtime/team pumps, and `examples/second_consumer.rs:47` use it. | 0 |
-| `PromptDispatched`, `SkillStarted`, `ChildFinished` event variants | `src/runtime/channels.rs:385,516,645,776,807,833` | REMOVE | No live producer/consumer; deleted `ipc/agent.rs`, `events.rs`, and `spawn.rs` created them. | 105 |
+| `PromptDispatched`, `SkillStarted`, `ChildFinished` event variants | `src/runtime/channels.rs:392,402,515,835,841,902` | REMOVE | No live producer/consumer; remaining executable references are conversion and contract-fixture tests. | 105 |
 | `RoutingNotice` | `src/runtime/channels.rs:441,795` | KEEP | Core still produces it at `src/agent/loop_impl.rs:1697`; Mnemo2 intentionally filters it. | 0 |
-| `UNATTENDED_PROMPT_PREFIX` / automatic unattended policy | `src/runtime/channels.rs:167`; `src/app/workflow_policy.rs:356` | UNSURE | Its only identified producer was Run-All, but it is also a public prompt/policy convention an embedder could use. | 120 |
+| `UNATTENDED_PROMPT_PREFIX` / automatic unattended policy | `src/runtime/channels.rs:167`; `src/app/workflow_policy.rs:356` | KEEP | Lead decision: retain this public embedding/policy convention and rename only its stale Run-All docs. | 0 |
 
 ## Candidates
 
@@ -52,6 +55,7 @@ The synchronous timing wrapper at `src/host/brain.rs:164-177` and project-discov
 
 - **Live references outside the module:** none to these four symbols. Searches covered `src-tauri/**`, `src/headless/**`, `examples/**`, and `tests/**`. The large shared body beginning at `brain.rs:353` is `wire_brain`, **not** `build_brain_inner`, and must not be deleted.
 - **Dead references:** `674702df^:src-tauri/src/main.rs` called `mnemo::build_brain`; `console.rs` only cited it in comments. `src/codegraph/watcher.rs:155` and `src/config/mod.rs:807,866,1424` are comments, not callers. `src/codegraph/query.rs:517,524` uses the string as unrelated parser fixture data.
+- **Checked:** full-host `git grep` found no additional caller in root `src-tauri/src`, `src-tauri/tests`, or `mnemo2-app`; only the known comments and unrelated `codegraph/query.rs` string fixture remain.
 - **Removal touches:** `src/host/brain.rs` (the two builder functions, `BrainOutcome`, and now-unused imports); `src/host/startup.rs` (`project_flag_from_args` only); comments in `src/codegraph/watcher.rs` and `src/config/mod.rs` belong to documentation cleanup. Keep `Brain`, `wire_brain`, `SharedResources`, `resolve_startup_provider`, and `should_reembed_at_startup`.
 
 ### `should_reembed_at_startup` — KEEP
@@ -110,15 +114,21 @@ The item side of `src/app/worktrees.rs` is separate from the live agent side. Re
 
 **Dead references:** `674702df^:src-tauri/src/ipc/{run_all.rs,backlog_cmds.rs,spawn.rs}` contained the dispatch/landing callers. Keep `current_branch`, `agent_short_id`, `agent_branch`, `provision_agent_worktree`, `remove_worktree_only`, `remove_agent_worktree`, `rollback_agent_worktree`, and their shared private helpers: Mnemo2 team audit/control/deletion/merge/spawn/workbench uses them (`team/audit.rs:12`, `deletion.rs:12`, `merge.rs:14`, `spawn.rs:13`, `workbench.rs:12`). `provision_worktree_impl`, `remove_worktree_only_impl`, `git_raw`, retry/wait helpers, and `worktrees_dir` are shared, not part of this deletion.
 
+**Checked:** full-host `git grep` found only the known Mnemo2 legacy-fixture caller outside `worktrees.rs`; `LandError`/`Landed` hits elsewhere are unrelated prose or UI strings.
+
 ### Seeded code-graph copies — REMOVE
 
 `CodeGraph::snapshot_db` (`src/codegraph/mod.rs:312`) and `CodeGraph::index_seeded` (`:502`) were the Run-All worktree fast path. All current non-test references are documentation between those two functions and their tests; neither `src-tauri/**`, `src/headless/**`, nor `examples/**` calls them. Deleted `674702df^:src-tauri/src/ipc/spawn.rs:162,181` was the real caller. Remove both functions, imports used only by them, the seeded-index branch/helpers that become unreachable, and the tests at `mod.rs:1167` and `:2065` onward that exist specifically for snapshot/seeded behavior. Keep ordinary `CodeGraph::index` and watcher behavior.
+
+**Checked:** full-host `git grep` found no reference outside `src/codegraph/mod.rs`; in particular there is no root-host, `src-tauri/tests`, integration-test, or `mnemo2-app` caller.
 
 ### Backlog dispatch selectors — REMOVE
 
 The shell-only selectors are `pending_item` (`src/app/backlog.rs:809`), `next_pending` (`:817`), `next_pending_eligible` (`:832`), and `next_pending_eligible_excluding` (`:848`). Current searches found no non-test caller outside `src/app/backlog.rs`; `src-tauri/src/mnemo2/backlog.rs` lists/edits items and never dispatches through them. Deleted `ipc/backlog_cmds.rs:438` used `next_pending`, and deleted `ipc/run_all.rs` used the eligible variants.
 
 Removal edits only `src/app/backlog.rs`: delete these methods and the tests whose sole purpose is selection/dispatch order. Rewrite deferral/requeue tests that use `pending_item` merely as a convenient lookup to use `items().iter().find(...)` instead; those tests protect live behavior and must not be deleted. Do **not** remove `deferred`, `set_deferred`, `set_auto_defer_reason`, `transition`, or `set_status`.
+
+**Checked:** full-host `git grep` found no executable caller outside `src/app/backlog.rs`; `mnemo2/backlog.rs:745` and `tool/workflow/backlog.rs:1194` are only test names containing `pending_item`.
 
 ### Backlog deferral and backlog tools — KEEP
 
@@ -143,35 +153,44 @@ Only comments that present Run-All as a current host feature need editing. Do no
 
 This is enforced, not a dead display field. `src/host/brain.rs:1055-1059,1259` shares the loaded config with every factory-built loop, and `src/host/rewire.rs:114` updates it after a live settings patch. `src/agent/turn.rs:596-613` runs the gate on every iteration and `:1796-1813` reads the live caps before pausing a plan; `src/agent/budget.rs:127-183` evaluates per-plan tokens, per-plan escalations, and per-step failed-cycle retries. The feature is independently reachable by headless embedders and does not depend on per-turn model routing.
 
-Mnemo2 reads it at `src-tauri/src/mnemo2/model_settings.rs:75,161-175,208-213` and writes it through the shared patch. `mnemo2/src/lib/modelSettings.ts:71-85,181-195,253-270` converts the wire/draft and `ModelsPage.svelte:365-390` shows it. Keep the config, DTO, backend, UI, and tests. This evidence supersedes the earlier assumption in the 2026-11-11 settings decision that the whole section could retire.
+Mnemo2 reads it at `src-tauri/src/mnemo2/model_settings.rs:75,161-175,208-213` and writes it through the shared patch. `mnemo2/src/lib/modelSettings.ts:71-85,181-195,253-270` converts the wire/draft and `ModelsPage.svelte:365-390` shows it. Keep the config, DTO, backend, UI, and tests. The lead confirmed on review that this section stays KEEP and will supersede the earlier 2026-11-11 retirement assumption in the decision record.
 
 ### `auto_compact_on_plan_complete` — RETIRE-SETTING
 
 Defined at `src/config/general.rs:166-175`, defaulted at `:923`, and patched at `src/config/settings_dto.rs:425-428,781-783`. The former runtime reader (`read_run_all_auto_compact` in deleted-shell history) is gone; current searches find no read in `src/runtime/**`, `src/headless/**`, `src-tauri/**`, or examples. Mnemo2 does not show it.
 
-Removal touches `src/config/general.rs` (field/default, `auto_compact_on_plan_complete_defaults_false` and `..._round_trips` at `:2271-2295`, and the stale removed-key comment at `:2226-2230` if still accurate) and `src/config/settings_dto.rs` (wire field, apply block, `auto_compact_on_plan_complete_patch_applies` at `:954-975`). Existing TOML keys remain harmless because unknown fields are accepted.
+Removal touches `src/config/general.rs` (field/default, `auto_compact_on_plan_complete_defaults_false` and `..._round_trips` at `:2271-2295`, and the `GeneralSection` test initializer at `:2609-2612`) and `src/config/settings_dto.rs` (wire field, apply block, `auto_compact_on_plan_complete_patch_applies` at `:954-975`). Existing TOML keys remain harmless because unknown fields are accepted.
+
+**Checked:** full-host `git grep` found only those config/patch definitions and tests; there is no runtime, root-host, `src-tauri/tests`, integration-test, or `mnemo2-app` behavioral reader.
 
 ### `enable_browser_inspection` — RETIRE-SETTING
 
-The key is defined at `src/config/general.rs:184` and patched at `src/config/settings_dto.rs:424,778-780`. Its only behavior is the Mnemo1 WebView/CDP tool path: `src/host/brain.rs:840` enabled it, while live headless construction explicitly forces it off (`src/headless/setup.rs:598`, `src/headless/engine.rs:884-887,1093-1098`). Mnemo2 has no settings control for it.
+The key is defined at `src/config/general.rs:158` and patched at `src/config/settings_dto.rs:424,778-780`. Its only behavior is the Mnemo1 WebView/CDP tool path: `wire_brain` gates it at `src/host/brain.rs:1025-1029,1309-1310`, while live headless construction explicitly forces it off (`src/headless/setup.rs:598`, `src/headless/engine.rs:884-887,1093-1098`). Mnemo2 has no settings control for it.
 
-Retire the field/default and patch field/apply/test together with the inspection implementation below. Removal also touches the config fixture at `src/config/general.rs:2223-2235`; there is no dedicated settings-DTO browser-inspection test. Until the implementation step lands, do not remove the key by itself: `AgentLoopFactory::with_config` still reads it at `src/agent/factory.rs:988-1003`.
+Retire the field/default and patch field/apply together with the inspection implementation below. Also remove `enable_browser_inspection_defaults_false`/`..._round_trips` at `general.rs:2245-2269` and its test initializer at `:2609`; there is no dedicated settings-DTO browser-inspection test. Until the implementation step lands, do not remove the key by itself: `AgentLoopFactory::with_config` still reads it at `src/agent/factory.rs:988-1003`.
+
+**Checked:** full-host `git grep` found only the known factory/browser/config/brain/headless references and their tests; no additional root-host, `src-tauri/tests`, integration-test, or `mnemo2-app` consumer exists.
 
 ### Mnemo1 WebView/CDP inspection — REMOVE
 
-This is the on-screen browser attached to the deleted Mnemo1 WebView2, not the external/off-screen browser. Only deleted `674702df^:src-tauri/src/ipc/browser.rs`, `browser_webview.rs`, and `main.rs` called its host API. There are no current Mnemo2/headless/example producers of a WebView CDP endpoint.
+This is the on-screen browser attached to the deleted Mnemo1 WebView2, not the external/off-screen browser. Only deleted `674702df^:src-tauri/src/ipc/browser.rs`, `browser_webview.rs`, and `main.rs` called its host API. There is no current producer of a WebView CDP endpoint.
 
-Removal must cover all of the following:
+- `src/tool/browser/mod.rs`: remove only `BrowserScreenshotTool` (`:862`), `BrowserEvalTool` (`:930`), `BrowserSnapshotTool` (`:986`), `BrowserNavigateTool` (`:1033`), `BrowserClickTool` (`:1090`), and `BrowserTypeTool` (`:1145`), plus their exclusive helpers/tests. Keep the off-screen tools in the same module.
+- `src/agent/factory.rs`: remove the inspection flag (`:423,584`), accessors (`:992-1003`), six registrations (`:1773-1778`), gating/tests (`:2599-2620,3182-3197,3236`). Remove `BrainMemoryOptions.on_screen_browser` and corresponding `src/host/brain.rs` wiring; update headless initializers/tests in `src/headless/engine.rs:878-887,1093-1098,1229` and `src/headless/setup.rs:1859-1892`.
+- `src/browser/mod.rs`: remove `ChildEnsurer`/`set_child_ensurer`, `webview_url`, `webview_enabled`, `set_webview_enabled`, `new_with_webview_url`, private `ensure_webview`, `webview_page*`, child/read-target helpers, explicit `webview_screenshot`/`webview_eval`/`webview_snapshot`/`webview_navigate`/`webview_click`/`webview_type`, `close_webview`, WebView-only click helpers, and WebView tests. This removes the `cdp_port` reads at `:324,1881`.
+- **Keep shared browser surface:** `PageInfo`, `ConsoleEntry`, `ConsoleEvent`, `subscribe_console`, and ordinary `navigate`/`list_pages`/`screenshot`/`console`/`snapshot`/`eval`/`click`/`type_text` methods are used by, or support, live off-screen tools and the embeddable console stream. Do not delete them.
 
-- `src/tool/browser/mod.rs`: `BrowserScreenshotTool` (`:15`), `BrowserEvalTool` (`:43`), `BrowserSnapshotTool` (`:74`), `BrowserNavigateTool` (`:113`), `BrowserClickTool` (`:144`), and `BrowserTypeTool` (`:178`), their helpers and tests. This module also contains external-browser tools; retain those and their `pub use` entries.
-- `src/agent/factory.rs`: the inspection flag (`:423,584`), `set_browser_inspection`/`browser_inspection_enabled` (`:992-1003`), registration of the six tools (`:1773-1778`), gating (`:3182-3197`), and the associated tests around `:2599-2620,3236`. Remove `on_screen_browser` handling from `BrainMemoryOptions` and the corresponding factory setup in `src/host/brain.rs`; change the two headless initializers at `src/headless/engine.rs:878-887,1093-1098` and remove/replace the tests at `engine.rs:1229` and `src/headless/setup.rs:1859,1892`.
-- `src/browser/mod.rs`: `PageInfo`, `ConsoleEntry`, `ConsoleEvent` (`:72-105`), WebView state and `set_webview_enabled`/`subscribe_console` (`:287-352`), WebView launch/navigation/close/CDP/page/console/evaluate/screenshot APIs (approximately `:346-385` and `:1135-1530`), child-ensurer wiring used only by old startup, and their tests. Preserve `BrowserManager` itself and the external/off-screen operations.
+**Checked:** full-host `git grep` found the six wrappers only in factory/tool code, and explicit WebView methods only in `browser/mod.rs`, those wrappers, `host/brain.rs`, and tests. The private `webview_page*`/target/click-helper search also stayed inside `browser/mod.rs`. Shared DTO/off-screen hits are the KEEP exceptions above.
 
-The approximate count is intentionally conservative; the implementer should use the symbol list, not delete whole large modules.
+### `webview_args` UDF/profile helpers — KEEP
 
-### `webview_args` — REMOVE
+`mutex_name_for`, `secondary_webview_data_dir`, `set_webview_data_dir`, and `webview_data_dir` (`src/webview_args.rs:114-150`) are live Mnemo2 profile infrastructure. `src-tauri/src/webview_udf.rs:49,52,64` calls them; `src-tauri/src/mnemo2/mod.rs:398` installs the default data dir for every window and `mnemo2/browser.rs:245` applies it to secondary windows. `src-tauri/tests/webview_udf.rs` pins this source contract. Keep these functions, their tests, and `pub mod webview_args;` at `src/lib.rs:43`.
 
-`src/webview_args.rs:20-291` builds `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` and chooses a CDP port for `mnemo-app`. The only real caller was deleted `674702df^:src-tauri/src/main.rs`. Current searches find no caller in Mnemo2, headless, examples, or tests outside this module. Delete the file, `pub mod webview_args;` at `src/lib.rs:43`, and the module's tests. This is independent of the external browser feature.
+### `webview_args` CDP/additional-argument helpers — REMOVE
+
+Remove `DEFAULT_CDP_PORT`, `build_webview2_args`, `pick_cdp_port`, `set_cdp_port`, `cdp_port`, the private `CDP_PORT` cell (`src/webview_args.rs:24-110`), and their tests; rewrite the module docs/imports around the retained UDF helpers. The only non-test callers are `BrowserManager`'s WebView constructors at `src/browser/mod.rs:324,1881`, removed by step 2. Step 3 therefore edits only `src/webview_args.rs`, after step 2.
+
+**Checked:** full-host `git grep` separately identified the live UDF callers above and found no other CDP-helper caller beyond `browser/mod.rs` and this module's tests.
 
 ### `[ui]` chat/steering display keys — RETIRE-SETTING
 
@@ -179,24 +198,30 @@ The dead keys are `show_token_usage`, `show_tool_images`, `show_tool_activity`, 
 
 Delete `SteeringNotesCfg`, `UiConfig::STEERING_NOTE_KEYS`, `effective_steering_note_visible`, the nine fields, their defaults, and their dedicated tests at `general.rs:2322-2328,2358-2515` plus related preservation assertions at `:1575-1595,2678-2679`. Keep `UiConfig` itself and its `theme`, `sound_complete`, `sound_input_needed`, and `sound_stopped_errors`: Mnemo2 reads/writes those at `src-tauri/src/mnemo2/appearance_settings.rs:53-70,116-139`.
 
-In `src/config/settings_dto.rs`, rewrite `ui_fields_are_absent_from_the_engine_patch` (`:905-934`) and `ui_table_survives_an_engine_patch` (`:937-951`) to use live `theme`/sound fields rather than deleted ones. No Mnemo2 page or test change is needed for this row because none references these keys.
+In `src/config/settings_dto.rs`, rewrite `ui_fields_are_absent_from_the_engine_patch` (`:905-934`) and `ui_table_survives_an_engine_patch` (`:937-951`) to use live `theme`/sound fields rather than deleted ones. Also rewrite the persistence fixtures at `src/config/mod.rs:954,1143,1324-1358` and `tests/integration/headless_setup.rs:428,459`. No Mnemo2 page or test change is needed because none references these keys.
+
+**Checked:** full-host `git grep` found config/DTO code, the added `config/mod.rs` and headless-integration persistence fixtures, and config tests; same-named hits in `agent/`/`tool/` are live steering producer/helper functions, not readers of `[ui]`, and must stay. There is no settings reader in root host code, `src-tauri/tests`, or `mnemo2-app`.
 
 ### `SteeringNotesDto` — REMOVE
 
 `src/config/settings_dto.rs:219-250` defines a standalone DTO that deleted `674702df^:src-tauri/src/ipc/settings.rs:17,1042,1603` used in the app-owned half of the old wire. It is not a field of `SettingsSaveDto` and has no current importer. Delete the struct; update the UI-preservation tests as described above. Do not remove the whole settings DTO module.
 
+**Checked:** full-host `git grep` found `SteeringNotesDto` only in `settings_dto.rs`; no root-host, `src-tauri/tests`, integration-test, example, or Mnemo2 import exists.
+
 ### `[general.laya].auto_finetune` — RETIRE-SETTING
 
-The core field is `src/config/general.rs:283`; it participates only in `LayaConfig::is_default` at `:360` and serde tests. `src/memory/classifier.rs:51` is explanatory text, not a consumer. Deleted `674702df^:src-tauri/src/ipc/finetune.rs` was the fine-tune implementation/reader. No current code starts training or changes behavior from this flag.
+The core field is `src/config/general.rs:283`; it participates only in `LayaConfig::is_default` at `:360` and serde tests. `src/memory/classifier.rs:162` is explanatory text, not a consumer. Deleted `674702df^:src-tauri/src/ipc/finetune.rs` was the fine-tune implementation/reader. No current code starts training or changes behavior from this flag.
 
 Mnemo2 nevertheless exposes it: `src-tauri/src/mnemo2/laya_settings.rs:131,193,231,359`; `mnemo2/src/lib/layaSettings.ts:24,34,117-127`; the generic Tiers metadata renderer at `TiersPage.svelte:328-336`. Removal touches:
 
 - `src/config/general.rs`: field, `is_default`, and assertions at `:1742,2118`;
-- `src/config/settings_dto.rs`: `laya_auto_finetune` at `:322-325`, apply at `:686-688`, and `laya_auto_finetune_patch_applies` at `:1030-1054`;
-- `src-tauri/src/mnemo2/laya_settings.rs`: status/patch fields, read/write mapping, and tests at `:1049,1210-1212`; update the stale deleted-finetune comment at `src-tauri/src/mnemo2/runtime.rs:1137` in the documentation step;
+- `src/config/settings_dto.rs`: `laya_auto_finetune` at `:322-325`, apply at `:686-688`, and `laya_patch_applies_failure_triage_flags_and_auto_finetune` at `:1030-1054`;
+- `src-tauri/src/mnemo2/laya_settings.rs`: status/patch fields, read/write mapping, and tests at `:1049,1242,1262`; update the stale deleted-finetune comment at `src-tauri/src/mnemo2/runtime.rs:1137` in the documentation step;
 - `mnemo2/src/lib/layaSettings.ts`: flag union/type/metadata; `mnemo2/src/lib/layaSettings.test.ts:70`; fixtures in `mnemo2/src/components/SettingsDialog.test.ts:173`, `TiersPage.test.ts:75`, and `mnemo2/src/test/previewLaya.ts:29`.
 
 `TiersPage.svelte` needs no direct edit: it renders the shared metadata array, so removing that entry removes the checkbox. Keep all other Laya flags and `laya_a`/`laya_b` routing.
+
+**Checked:** full-host `git grep` found only the listed core/DTO/Mnemo2 wire, UI, test, preview, and classifier-comment references; no root-host, `src-tauri/tests`, integration-test, or `mnemo2-app` training consumer exists.
 
 ### Remaining settings DTO surface — KEEP
 
@@ -222,23 +247,25 @@ Mnemo2 sets `skip_turn_routing` (`src-tauri/src/mnemo2/runtime.rs:235-240`) and 
 
 These three are Mnemo1 UI-shaped events with no live producer or consumer:
 
-- `AgentEvent::PromptDispatched` (`src/runtime/channels.rs:385-389`) and its serializable twin (`:776-779`);
-- `AgentEvent::SkillStarted` (`:516-525`) and its serializable twin (`:807-811`);
-- `AgentEvent::ChildFinished` (`:645-652`) and its serializable twin (`:833-837`).
+- `AgentEvent::PromptDispatched` (`src/runtime/channels.rs:392`) and its serializable twin (`:835`);
+- `AgentEvent::SkillStarted` (`:402`) and its serializable twin (`:841`);
+- `AgentEvent::ChildFinished` (`:515`) and its serializable twin (`:902`).
 
-Current references outside `channels.rs` are only agent conversion tests at `src/agent/tests.rs:16946,17029` and headless serialization tests at `src/headless/session.rs:1693,1752,1767`. Mnemo2 has no match for any variant. Deleted `674702df^:src-tauri/src/ipc/agent.rs:898` constructed `SkillStarted`, `ipc/events.rs:81` forwarded `PromptDispatched`, and `ipc/spawn.rs`/`events.rs` created child-finished notifications.
+Deleted `674702df^:src-tauri/src/ipc/agent.rs:898` constructed `SkillStarted`, `ipc/events.rs:81` forwarded `PromptDispatched`, and `ipc/spawn.rs`/`events.rs` created child-finished notifications. Current executable references outside `channels.rs` are contract fixtures at `tests/integration/contract_fixtures.rs:216,223,276`; `src/host/runtime.rs:749-750,1066` contains stale comments only.
 
-Removal touches `src/runtime/channels.rs` (six variants, conversion arms, and conversion tests) and deletes/rewrites the three variant-specific tests in `src/agent/tests.rs` and `src/headless/session.rs`. Keep `WorkflowStateChanged`, which core workflow code still emits, and keep all host-tool/policy events.
+Removal touches `src/runtime/channels.rs` (six variants, conversion arms, conversion tests, and stale docs) and removes/rewrites the three fixtures in `tests/integration/contract_fixtures.rs`. Keep `WorkflowStateChanged` and all host-tool/policy events.
+
+**Checked:** full-host `git grep` found no producer/consumer in root `src-tauri/src`, `src-tauri/tests`, `mnemo2-app`, Mnemo2 UI, headless sessions, or examples beyond those fixtures/comments.
 
 ### `RoutingNotice` — KEEP
 
 Although its comment says Mnemo1 displayed it and Mnemo2 filters it (`src/runtime/channels.rs:441-451`), the core still produces `AgentEvent::RoutingNotice` at `src/agent/loop_impl.rs:1697` and tests the behavior extensively. Headless consumers may observe it. The Mnemo2 filters at `src-tauri/src/mnemo2/runtime.rs:1734` and `team/pump.rs:780` are intentional UI policy, not evidence that the event is unproduced.
 
-### `UNATTENDED_PROMPT_PREFIX` / automatic unattended policy — UNSURE
+### `UNATTENDED_PROMPT_PREFIX` / automatic unattended policy — KEEP
 
-`src/runtime/channels.rs:159-167` defines the magic prompt prefix; `src/agent/loop_impl.rs:3545-3549` strips it, and `src/app/workflow_policy.rs:350-362` turns it into `PromptHook.unattended`. Deleted `ipc/run_all.rs:1337` is the only identified producer. There is no current Mnemo2/headless/example producer.
+`src/runtime/channels.rs:159-167` defines the magic prompt prefix; `src/agent/loop_impl.rs:3545-3549` strips it, and `src/app/workflow_policy.rs:350-362` turns it into `PromptHook.unattended`. Deleted `ipc/run_all.rs:1337` was the in-repo producer, but an embedder can send this public prefix through the ordinary prompt API and obtain unattended plan-question behavior.
 
-The counterweight is the embedding rule: an embedder can send this public prefix through the ordinary prompt API and obtain unattended plan-question behavior today. Removing it also changes `PromptHook.unattended`, plan auto-fork/question behavior, and workflow-policy tests, so this is not just deletion of an unused constant. The lead must decide whether this prompt convention is a supported kernel feature or was Mnemo1 Run-All wire format. See the first question below.
+**Lead decision:** KEEP the prefix, `PromptHook.unattended`, plan auto-fork/question behavior, and policy tests as a supported embedding convention. Step 6, which owns `runtime/channels.rs`, renames only the stale Run-All documentation to generic unattended-session wording; no code is removed.
 
 ## Settings
 
@@ -248,7 +275,7 @@ Production readers are listed below; serde defaults and tests that only assert p
 |---|---|---|---|---|
 | `[general.budget].enabled`, `max_tokens_per_plan`, `max_escalations_per_plan`, `max_retries_per_lane` | `src/config/general.rs:593-645`; read by `src/agent/budget.rs:127-183`, `src/agent/turn.rs:596-613,1796-1813`; wired by `src/host/brain.rs:1055-1059,1259`, updated by `src/host/rewire.rs:114`, and exposed by Mnemo2 `model_settings.rs:75,161-175,208-213` | **Yes** — pauses/asks at plan iteration boundaries for token, escalation, and failed-cycle retry caps | **Yes**, Models page (`mnemo2/src/lib/modelSettings.ts:71-85,181-195,253-270`; `ModelsPage.svelte:365-390`) | KEEP |
 | `[general].auto_compact_on_plan_complete` | `src/config/general.rs:175`; `src/config/settings_dto.rs:428,781-783` only | **No** — no runtime reader remains | No | RETIRE-SETTING |
-| `[general].enable_browser_inspection` | `src/config/general.rs:184`; `src/config/settings_dto.rs:424,778-780`; factory gate at `src/agent/factory.rs:988-1003,3197` | The factory gate works, but every live headless/Mnemo2 path forces it `false` (`src/headless/setup.rs:598`); only deleted Mnemo1 startup supplied an on-screen browser | No | RETIRE-SETTING with the WebView/CDP removal |
+| `[general].enable_browser_inspection` | `src/config/general.rs:158`; `src/config/settings_dto.rs:424,778-780`; factory gate at `src/agent/factory.rs:988-1003,3197` | The factory gate works, but every live headless/Mnemo2 path forces it `false` (`src/headless/setup.rs:598`); only deleted Mnemo1 startup supplied an on-screen browser | No | RETIRE-SETTING with the WebView/CDP removal |
 | `[ui].show_token_usage` | `src/config/general.rs:1108,1186`; no external reader | No | No | RETIRE-SETTING |
 | `[ui].show_tool_images` | `src/config/general.rs:1112,1187`; no external reader | No | No | RETIRE-SETTING |
 | `[ui].show_tool_activity` | `src/config/general.rs:1121,1188`; no external reader | No | No | RETIRE-SETTING |
@@ -274,7 +301,7 @@ These are comments, not reasons to delete the surrounding code. Paths are curren
 - `src/host/brain.rs:7,58` — old Tauri `main.rs` construction path (handled by the builder removal).
 - `src/host/embed_download.rs:6` — `ipc/embeddings.rs`; `src/host/index_progress.rs:13-17` — old `main.rs`/`ipc/projects.rs`; `src/host/laya.rs:17-22` — `ipc/laya.rs`; `src/host/rewire.rs:5-18` — `ipc/rewire.rs` and an already-completed future move.
 - `src/host/runtime.rs:1155` — `frontend/src/lib/state/agents.ts` seed pattern. Its Run-All wording at `:25-44,259-270,1277` should instead describe generic worktree-bound sessions: `src/headless/engine.rs:195-207,371` still constructs `WorktreeBinding` for live sessions.
-- `src/browser/mod.rs:10-11,287,346,633` — old `ipc/browser.rs`, startup `main.rs`, and old frontend console listener; `src/webview_args.rs:9-10` — old `mnemo-app` startup (both handled by their removals).
+- `src/browser/mod.rs:10-11,287,346,633` — old `ipc/browser.rs`, startup `main.rs`, and old frontend console listener; `src/webview_args.rs:5-110` — old CDP/`mnemo-app` startup docs handled by the CDP-only removal, while the live UDF helpers and module export stay.
 - `src/runtime/channels.rs:13,161-163,286,379,1048-1050,1121` — `ipc/approval.rs`, `ipc/run_all.rs`, GUI `main.rs`, old frontend seed/lane projections. The approval/host-tool documentation should name `src/headless/session.rs` and `src-tauri/src/mnemo2/**` instead.
 - `src/runtime/agent.rs:1498,2131` — old `ipc/events.rs` channel forwarding; `src/runtime/mod.rs:310` — old `ipc/events.rs` seed.
 - `src/config/settings_dto.rs:13-14,404,910` — old `ipc/settings.rs`; `src/config/endpoints.rs:982` — same; `src/config/mcp.rs:636,701` — `ipc/mcp.rs`; `src/config/general.rs:2229` — `ipc/run_all.rs` (the setting-specific comments are handled by retirement).
@@ -293,7 +320,7 @@ Pure string fixtures such as `src/memory/knowledge_index.rs:411` (`src-tauri/src
 
 ## Proposed removal steps
 
-The file sets below are pairwise disjoint. Steps 1–6 can otherwise land independently; **step 2 must follow step 1**, **step 7 must follow step 1**, and **step 8 is last**. Comments in a file owned by steps 1–7 are fixed in that step; step 8 owns only files not touched earlier. Estimated counts include tests.
+The file sets below are pairwise disjoint. Steps 1–6 can otherwise land independently; **step 2 must follow step 1**, **step 3 must follow step 2**, **step 7 must follow step 1**, and **step 8 is last**. Comments in a file owned by steps 1–7 are fixed in that step; step 8 owns only files not touched earlier. Estimated counts include tests.
 
 ### Step 1 — Remove Mnemo1 shell startup and on-screen inspection wiring (~1,000 lines)
 
@@ -302,18 +329,19 @@ The file sets below are pairwise disjoint. Steps 1–6 can otherwise land indepe
 - **Rewrite:** the two headless `BrainMemoryOptions` initializers; headless tests that currently prove inspection stays off should instead prove the removed tools are absent. Update Run-All wording in `factory.rs` to generic worktree-session wording.
 - **Verify:** `cargo test --workspace --all-features`; search for `build_brain`, `BrainOutcome`, `project_flag_from_args`, `BrowserScreenshotTool`, `BrowserEvalTool`, `BrowserSnapshotTool`, `BrowserNavigateTool`, `BrowserClickTool`, `BrowserTypeTool`, and `set_browser_inspection` and confirm no live references. Confirm `should_reembed_at_startup` still has its `wire_brain` caller.
 
-### Step 2 — Remove the now-unreachable WebView CDP manager surface (~550 lines; after step 1)
+### Step 2 — Remove the now-unreachable WebView CDP manager surface (~750 lines; after step 1)
 
 - **Files:** `src/browser/mod.rs` only.
-- **Delete:** `PageInfo`, `ConsoleEntry`, `ConsoleEvent`, WebView enable/subscription state, child-ensurer/CDP launch/navigation/page/console/evaluate/screenshot methods, and their tests. Trim imports orphaned by those deletions.
-- **Keep:** `BrowserManager`, `normalize_url` (`:1903`), external/off-screen browser operations, and their tests.
-- **Verify:** `cargo test --workspace --all-features`; search the deleted symbol names and confirm `src-tauri/src/mnemo2/browser.rs:145` still compiles.
+- **Delete:** `ChildEnsurer`/`set_child_ensurer`, `webview_url`, `webview_enabled`, `set_webview_enabled`, `new_with_webview_url`, `ensure_webview`, `webview_page*`, child/read-target helpers, explicit `webview_*` methods, `close_webview`, WebView-only click helpers, and WebView tests. This removes both `cdp_port` calls (`:324,1881`). Trim orphaned imports.
+- **Keep:** `BrowserManager`, `PageInfo`, `ConsoleEntry`, `ConsoleEvent`, `subscribe_console`, ordinary off-screen navigation/page/console/evaluate/screenshot/click/type methods, `normalize_url` (`:1903`), and their tests.
+- **Verify:** `cargo test --workspace --all-features`; search the deleted explicit `webview_*` names and confirm off-screen tool tests plus `src-tauri/src/mnemo2/browser.rs:145` still compile.
 
-### Step 3 — Delete the Mnemo1 WebView2 argument builder (~300 lines)
+### Step 3 — Remove only the WebView CDP/argument helpers (~165 lines; after step 2)
 
-- **Files:** `src/webview_args.rs` (delete), `src/lib.rs` (remove line 43 module export).
-- **Delete:** the entire port-selection/browser-argument module and its unit tests.
-- **Verify:** `cargo test --workspace`; search for `webview_args`, `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, and the deleted helper names.
+- **Files:** `src/webview_args.rs` only. Do not remove the file or its existing module export.
+- **Delete:** `DEFAULT_CDP_PORT`, `build_webview2_args`, `pick_cdp_port`, `set_cdp_port`, `cdp_port`, private `CDP_PORT`, and their tests. Rewrite module docs/imports around the retained UDF helpers.
+- **Keep:** `mutex_name_for`, `secondary_webview_data_dir`, `set_webview_data_dir`, `webview_data_dir`, and their tests for `src-tauri/src/webview_udf.rs` and `src-tauri/tests/webview_udf.rs`.
+- **Verify:** `cargo test --workspace`; run the `webview_udf` host tests, search the deleted CDP helper names, and confirm `webview_udf::install_default_data_dir` still compiles for every Mnemo2 window.
 
 ### Step 4 — Remove Run-All item worktrees, landing, and graph seeding (~1,130 lines)
 
@@ -331,28 +359,23 @@ The file sets below are pairwise disjoint. Steps 1–6 can otherwise land indepe
 
 ### Step 6 — Remove three Mnemo1-only UI event variants (~105 lines)
 
-- **Files:** `src/runtime/channels.rs`, `src/agent/tests.rs`, `src/headless/session.rs`.
-- **Delete:** both enum forms and conversion arms for `PromptDispatched`, `SkillStarted`, and `ChildFinished`, plus their variant-only tests. Update stale IPC/frontend comments in `channels.rs` while retaining the public event contract.
-- **Verify:** `cargo test --workspace`; check `examples/second_consumer.rs` and Mnemo2 runtime/team pumps still compile and their event round-trip tests pass.
+- **Files:** `src/runtime/channels.rs`, `tests/integration/contract_fixtures.rs`.
+- **Delete:** both enum forms and conversion arms for `PromptDispatched`, `SkillStarted`, and `ChildFinished`, their conversion tests, and the three contract fixtures. Update stale IPC/frontend comments and rename `UNATTENDED_PROMPT_PREFIX` docs to generic unattended-session wording while retaining that prefix and its policy behavior.
+- **Verify:** `cargo test --workspace`; check `examples/second_consumer.rs`, contract fixtures, and Mnemo2 runtime/team pumps still compile and their event round-trip tests pass.
 
 ### Step 7 — Retire inert config keys and the auto-fine-tune UI (~500 lines; after step 1)
 
-- **Files:** `src/config/general.rs`, `src/config/settings_dto.rs`, `src/memory/classifier.rs` (comment only), `src-tauri/src/mnemo2/laya_settings.rs`, `mnemo2/src/lib/layaSettings.ts`, `mnemo2/src/lib/layaSettings.test.ts`, `mnemo2/src/components/SettingsDialog.test.ts`, `mnemo2/src/components/TiersPage.test.ts`, `mnemo2/src/test/previewLaya.ts`.
+- **Files:** `src/config/general.rs`, `src/config/settings_dto.rs`, `src/config/mod.rs`, `src/memory/classifier.rs` (comment only), `src-tauri/src/mnemo2/laya_settings.rs`, `tests/integration/headless_setup.rs`, `mnemo2/src/lib/layaSettings.ts`, `mnemo2/src/lib/layaSettings.test.ts`, `mnemo2/src/components/SettingsDialog.test.ts`, `mnemo2/src/components/TiersPage.test.ts`, `mnemo2/src/test/previewLaya.ts`.
 - **Delete:** `auto_compact_on_plan_complete`, `enable_browser_inspection`, `laya_auto_finetune`/`auto_finetune`, the nine `[ui]` chat/activity fields, `SteeringNotesCfg`, `UiConfig::STEERING_NOTE_KEYS`, `effective_steering_note_visible`, `SteeringNotesDto`, associated apply code, wire fields, metadata, and dedicated tests.
-- **Rewrite:** settings preservation tests to use live theme/sound fields and unrelated Laya flags. `TiersPage.svelte` needs no edit because it consumes the metadata array. Do not touch `BudgetConfigDto`, per-task model slots, pricing, or other Laya flags.
+- **Rewrite:** settings preservation tests in `settings_dto.rs`, `config/mod.rs`, and `tests/integration/headless_setup.rs` to use live theme/sound fields and unrelated Laya flags; update stale `build_brain` comments in `config/mod.rs` in this step because it owns that file. `TiersPage.svelte` needs no edit because it consumes the metadata array. Do not touch `BudgetConfigDto`, per-task model slots, pricing, or other Laya flags.
 - **Verify:** `cargo test --workspace`, `npm test --prefix mnemo2`, and `npm run check --prefix mnemo2`. Load a config containing every removed key and confirm it is ignored; confirm Tiers no longer shows Auto fine-tune and Appearance still shows theme/sounds.
 
 ### Step 8 — Refresh remaining stale comments and fixtures (~100 lines; last)
 
-- **Files:** `src/app/project.rs`, `src/app/tool/workflow/backlog.rs`, `src/app/tool/workflow/plan.rs`, `src/app/workflow/mod.rs`, `src/agent/context.rs`, `src/agent/loop_impl.rs`, `src/codegraph/walk.rs`, `src/codegraph/watcher.rs`, `src/config/endpoints.rs`, `src/config/mcp.rs`, `src/config/mod.rs`, `src/error.rs`, `src/headless/codegraph_api.rs`, `src/headless/memory_api.rs`, `src/host/mod.rs`, `src/host/embed_download.rs`, `src/host/index_progress.rs`, `src/host/laya.rs`, `src/host/runtime.rs`, `src/host/rewire.rs`, `src/provider/client_factory.rs`, `src/provider/models.rs`, `src/runtime/agent.rs`, `src/runtime/mod.rs`, `src-tauri/src/mnemo2/appearance_settings.rs`, `src-tauri/src/mnemo2/indexing.rs`, `src-tauri/src/mnemo2/memory_maintenance.rs`, `src-tauri/src/mnemo2/model_settings.rs`, `src-tauri/src/mnemo2/runtime.rs`.
+- **Files:** `src/app/project.rs`, `src/app/tool/workflow/backlog.rs`, `src/app/tool/workflow/plan.rs`, `src/app/workflow/mod.rs`, `src/agent/context.rs`, `src/agent/loop_impl.rs`, `src/codegraph/walk.rs`, `src/codegraph/watcher.rs`, `src/config/endpoints.rs`, `src/config/mcp.rs`, `src/error.rs`, `src/headless/codegraph_api.rs`, `src/headless/memory_api.rs`, `src/host/mod.rs`, `src/host/embed_download.rs`, `src/host/index_progress.rs`, `src/host/laya.rs`, `src/host/runtime.rs`, `src/host/rewire.rs`, `src/provider/client_factory.rs`, `src/provider/models.rs`, `src/runtime/agent.rs`, `src/runtime/mod.rs`, `src-tauri/src/mnemo2/appearance_settings.rs`, `src-tauri/src/mnemo2/indexing.rs`, `src-tauri/src/mnemo2/memory_maintenance.rs`, `src-tauri/src/mnemo2/model_settings.rs`, `src-tauri/src/mnemo2/runtime.rs`.
 - **Delete/rewrite:** only comments and stale path fixtures identified in `## Stale doc comments`; no behavior changes. Keep accurate historical comparisons.
-- **Verify:** `cargo test --workspace` (fixtures are compiled), then search `src/` and `src-tauri/src/mnemo2/` for `src-tauri/src/ipc`, `src-tauri/src/main.rs`, `frontend/`, and present-tense Mnemo1 host descriptions. Remaining hits should be deliberate history or test data, each with a reason.
-
-If the lead approves removing the UNSURE unattended convention, fold that into **step 6** (it already owns `runtime/channels.rs`) and add `src/app/workflow_policy.rs`, `src/agent/loop_impl.rs`, `src/runtime/agent.rs`, and the related plan-policy tests to that step; in that variant step 8 must not edit those added files.
+- **Verify:** `cargo test --workspace` (fixtures are compiled), then search `src/` and all of `src-tauri/src/` for `src-tauri/src/ipc`, `src-tauri/src/main.rs`, `frontend/`, and present-tense Mnemo1 host descriptions. Remaining hits should be deliberate history or test data, each with a reason.
 
 ## Questions for the lead
 
-1. **Is `UNATTENDED_PROMPT_PREFIX` a supported embedding convention or Mnemo1 Run-All wire format?** Options: (a) KEEP it, rename its docs to generic unattended sessions, and retain `PromptHook.unattended`; (b) REMOVE the prefix stripping, automatic policy branch, and now-dead unattended hook/tests as an extension of the UI-event step. **Recommendation: KEEP (option a)** under the plan's public-library rule unless the product explicitly declares the prompt prefix Mnemo1-only. It is observable behavior available through the ordinary public prompt API, unlike the shell-only event DTOs.
-2. **Decision-record reconciliation, not an UNSURE verdict:** may the earlier 2026-11-11 note that listed `[general.budget]` for retirement be superseded? **Recommendation: yes** — record that the inventory found live enforcement in `agent/turn.rs`/`agent/budget.rs` and a live Mnemo2 editor, so the section stays. Removing it would be a product feature removal, not dead-code cleanup.
-
-No other summary row is UNSURE.
+None. The review resolved both former questions; the KEEP decisions are recorded in the unattended-policy and budget candidate sections.

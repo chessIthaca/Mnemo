@@ -923,6 +923,13 @@ pub async fn lead_set_model(
         .await
 }
 
+/// Start a fresh lead conversation on the current model; refused while the
+/// lead works. Returns the new (empty) lead snapshot.
+#[tauri::command]
+pub async fn lead_new(state: State<'_, Mnemo2State>) -> Result<LeadSnapshot, String> {
+    current(&state).await?.new_conversation().await
+}
+
 /// Resolve a pending approval request.
 #[tauri::command]
 pub async fn lead_approve(

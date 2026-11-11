@@ -879,6 +879,67 @@ impl LeadRuntime {
         self.snapshot().await
     }
 
+    /// Start a fresh lead conversation on the current model and effort.
+    ///
+    /// Like [`LeadRuntime::set_model`], the headless surface has no in-place
+    /// reset that also clears the saved transcript, so this closes the live
+    /// session and spawns a new one with an empty transcript. The generation
+    /// advances so stale events cannot touch the new UI. Refused while a turn
+    /// runs (including a pending approval or question).
+    pub async fn new_conversation(&self) -> Result<LeadSnapshot, String> {
+        let team = self.team_handle().await?;
+        let (old, selected, effort, saved_model) = {
+            let mut guard = self.live.lock().await;
+            let live = guard
+                .as_ref()
+                .ok_or_else(|| "the lead session is not open".to_string())?;
+            if live.busy.load(Ordering::SeqCst) {
+                return Err(
+                    "stop the current turn before starting a new conversation".to_string(),
+                );
+            }
+            let selected = live.model.lock().await.clone();
+            let effort = live.reasoning_effort.clone();
+            // A load error means there is no explicit choice to keep.
+            let saved_model = self.persistence.load().ok().and_then(|lead| lead.model);
+            let old = guard.take().expect("live session checked above");
+            (old, selected, effort, saved_model)
+        };
+        let generation = self.generation.load(Ordering::SeqCst) + 1;
+        let live = match self
+            .spawn_live(
+                generation,
+                selected,
+                saved_model.clone(),
+                effort.clone(),
+                Transcript::default(),
+            )
+            .await
+        {
+            Ok(live) => live,
+            Err(err) => {
+                *self.live.lock().await = Some(old);
+                return Err(err);
+            }
+        };
+        if let Err(err) = self
+            .persistence
+            .save(saved_model, effort, Transcript::default())
+        {
+            live.abort();
+            let _ = live.session.send(SessionCommand::Interrupt).await;
+            let previous_session = old.session.id();
+            *self.live.lock().await = Some(old);
+            team.attach_lead(previous_session).await;
+            return Err(err);
+        }
+        self.generation.store(generation, Ordering::SeqCst);
+        old.abort();
+        let _ = old.session.send(SessionCommand::Interrupt).await;
+        *self.live.lock().await = Some(live);
+        self.snapshot().await
+    }
+
     /// Hand the project back to the in-app lead: detach any external lead and
     /// give the in-app lead session the notices the external lead never read
     /// (a steer while it works, a prompt when it idles; all in one message).

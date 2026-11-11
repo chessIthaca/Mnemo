@@ -1297,6 +1297,177 @@ async fn changes_model_only_while_idle_and_resumes_the_transcript() {
     runtime.shutdown().await;
 }
 
+/// `/new` (plan 13336839 step 1): a fresh conversation keeps the chosen
+/// model and effort, empties the live transcript, advances the generation,
+/// and writes the empty transcript to `lead.json`.
+#[tokio::test]
+async fn new_conversation_empties_the_transcript_and_keeps_the_model() {
+    let root = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config");
+    let state = tempfile::tempdir().expect("state");
+    write_config(config.path(), &["scripted-a", "scripted-b"]);
+    let runtime = LeadRuntime::open_inner(
+        options(&root, &config, &state),
+        Some(Arc::new(ScriptedLlm::new(vec![text_turn(&["first"])]))),
+    )
+    .await
+    .expect("the lead opens");
+    let fresh_len = runtime
+        .snapshot()
+        .await
+        .expect("a fresh snapshot")
+        .transcript
+        .messages
+        .len();
+    let mut rx = runtime.subscribe();
+    runtime
+        .send_prompt("first turn".to_string(), Vec::new())
+        .await
+        .expect("prompt");
+    drain_turn(&mut rx).await;
+    // The pump persists a finished turn from a deferred task (it sleeps 10 ms
+    // after the terminal event); wait for that write before the switch, so the
+    // assertions at the end see this call's own save and not the first turn's
+    // late one.
+    let after_turn = wait_for_persisted(&state.path().join(LEAD_STATE_FILE)).await;
+    assert_eq!(
+        after_turn.model.as_deref(),
+        Some("test/scripted-a"),
+        "the first turn persisted on the model it ran on"
+    );
+    let switched = runtime
+        .set_model("test/scripted-b".to_string(), None)
+        .await
+        .expect("the model switch succeeds");
+    assert_eq!(switched.model.as_deref(), Some("test/scripted-b"));
+    assert!(
+        !switched.transcript.messages.is_empty(),
+        "the transcript carries over"
+    );
+    let before = runtime.snapshot().await.expect("snapshot");
+    let cleared = runtime
+        .new_conversation()
+        .await
+        .expect("the new conversation starts");
+    assert_eq!(
+        cleared.transcript.messages.len(),
+        fresh_len,
+        "the new conversation starts as empty as a freshly opened lead"
+    );
+    assert_eq!(cleared.model.as_deref(), Some("test/scripted-b"));
+    assert_eq!(cleared.model_id.as_deref(), Some("scripted-b"));
+    assert!(
+        cleared.generation > before.generation,
+        "the generation advances so stale events cannot touch the new UI"
+    );
+    let saved: PersistedLead = serde_json::from_slice(
+        &std::fs::read(state.path().join(LEAD_STATE_FILE)).expect("lead.json"),
+    )
+    .expect("lead JSON");
+    assert_eq!(saved.model.as_deref(), Some("test/scripted-b"));
+    assert_eq!(
+        serde_json::to_value(&saved.transcript).expect("the persisted transcript"),
+        serde_json::to_value(&cleared.transcript).expect("the live transcript"),
+        "lead.json holds the empty transcript"
+    );
+    runtime.shutdown().await;
+}
+
+/// `/new` while a turn runs is refused up front: the running turn (and any
+/// approval or question it waits on) must be stopped first.
+#[tokio::test]
+async fn new_conversation_is_refused_while_the_lead_works() {
+    let root = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config");
+    let state = tempfile::tempdir().expect("state");
+    write_config(config.path(), &["scripted-a"]);
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+    let runtime = LeadRuntime::open_inner(
+        options(&root, &config, &state),
+        Some(Arc::new(ScriptedLlm::new_gated(
+            vec!["scripted-a"],
+            vec![(Some(gate_rx), text_turn(&["turn one"]))],
+        ))),
+    )
+    .await
+    .expect("the lead opens");
+    let mut rx = runtime.subscribe();
+    runtime
+        .send_prompt("first".to_string(), Vec::new())
+        .await
+        .expect("the first prompt is accepted");
+    assert!(
+        runtime.snapshot().await.expect("snapshot").busy,
+        "the gated turn is busy"
+    );
+
+    let refused = runtime
+        .new_conversation()
+        .await
+        .expect_err("a busy lead cannot start a new conversation");
+    assert!(
+        refused.contains("stop the current turn"),
+        "the refusal asks to stop the turn first: {refused}"
+    );
+
+    gate_tx.send(()).expect("the first turn is released");
+    drain_turn(&mut rx).await;
+    runtime.shutdown().await;
+}
+
+/// `/new` on a lead that never chose a model writes no explicit model to
+/// `lead.json`: the configured default keeps serving, and a reopen restores
+/// that same default.
+#[tokio::test]
+async fn new_conversation_after_reopen_keeps_the_default_model() {
+    let root = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config");
+    let state = tempfile::tempdir().expect("state");
+    write_config(config.path(), &["scripted-a", "scripted-b"]);
+    let runtime = LeadRuntime::open_inner(
+        options(&root, &config, &state),
+        Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+    )
+    .await
+    .expect("the lead opens");
+    let cleared = runtime
+        .new_conversation()
+        .await
+        .expect("the new conversation starts");
+    assert_eq!(
+        cleared.model.as_deref(),
+        Some("test/scripted-a"),
+        "the configured default model keeps serving"
+    );
+    let saved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(state.path().join(LEAD_STATE_FILE)).expect("lead.json"),
+    )
+    .expect("lead JSON");
+    assert!(
+        saved["model"].is_null(),
+        "no explicit model choice was written: {saved}"
+    );
+    runtime.shutdown().await;
+
+    let reopened = LeadRuntime::open_inner(
+        options(&root, &config, &state),
+        Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+    )
+    .await
+    .expect("the lead reopens");
+    assert_eq!(
+        reopened
+            .snapshot()
+            .await
+            .expect("the reopened snapshot")
+            .model
+            .as_deref(),
+        Some("test/scripted-a"),
+        "the reopened lead still runs the configured default"
+    );
+    reopened.shutdown().await;
+}
+
 /// Plan 7f0b3848: the lead's model is the picker's choice (or the
 /// default model) in every workflow state. With Mnemo1's
 /// `[models.executing]` configured in the shared config — the shape

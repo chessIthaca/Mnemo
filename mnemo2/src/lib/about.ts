@@ -2,9 +2,9 @@
  * The About page's data: the running version, where Mnemo's source and license
  * live, and the open-source projects Mnemo2 is built on.
  *
- * The Rust groups are shared with Mnemo1's About dialog
- * (`frontend/src/components/about/dependencies.ts`) — the same crates build
- * both apps. That manifest's "Frontend —" groups cover the React app and do
+ * The Rust groups were copied from Mnemo1's retired About dialog and now
+ * live in `./aboutDependencies.ts` — the same crates build both apps. That
+ * manifest's "Frontend —" groups cover the React app and do
  * not apply to Mnemo2, so they are filtered out and Mnemo2's own interface
  * groups (`MNEMO2_INTERFACE_GROUPS`, mirroring mnemo2/package.json) are added.
  */

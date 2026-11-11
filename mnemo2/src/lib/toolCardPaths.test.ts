@@ -3,12 +3,12 @@
 // See LICENSE in the repository root.
 
 /**
- * Unit tests for the tool-card presentation helpers
- * (`frontend/src/lib/toolCardPaths.ts`): the file-path extractor driving the
- * clickable file-name links in the ToolCard header, plus the readable-IO
- * parsing powering the expanded call-detail body — shell calls
- * (`shellCallFromArgs` / `parseShellOutput`, backlog 8c1d8a47), file_edit
- * diffs (`fileEditDiff`), and read_files line ranges
+ * Unit tests for the tool-card presentation helpers (`./toolCardPaths.ts`,
+ * copied from Mnemo1's retired frontend and owned here): the file-path
+ * extractor driving the clickable file-name links in the ToolCard header,
+ * plus the readable-IO parsing powering the expanded call-detail body —
+ * shell calls (`shellCallFromArgs` / `parseShellOutput`, backlog 8c1d8a47),
+ * file_edit diffs (`fileEditDiff`), and read_files line ranges
  * (`parseReadFilesSections` / `argPathLines`, backlog cb3461fe).
  */
 

@@ -8,6 +8,7 @@ import {
   createWorkers,
   fixtureState,
 } from "../test/fixtures";
+import { defineTokenSentinels, tokenSentinels } from "../test/tokens";
 import { initialLeadRuntime } from "../lib/leadState";
 import type { LeadEntry, Worker } from "../lib/types";
 import LeadChat from "./LeadChat.svelte";
@@ -625,6 +626,7 @@ describe("LeadChat", () => {
   it("keeps human messages inline in exchange order and caps prose at 100 characters", () => {
     const previousRootSize = document.documentElement.style.fontSize;
     document.documentElement.style.fontSize = "13px";
+    const clearTokens = defineTokenSentinels();
     try {
       setLeadEntries([
         { id: "human", kind: "message", time: "now", author: "user", body: "Review this change" },
@@ -642,11 +644,11 @@ describe("LeadChat", () => {
       expect(getComputedStyle(user).maxWidth).toBe("650px");
       const prose = assistant.querySelector<HTMLElement>(".markdown p")!;
       const proseStyle = getComputedStyle(prose);
-      expect(proseStyle.fontSize).toBe("var(--text-body)");
-      // jsdom cannot resolve the token; apply its value to exercise the ch unit.
-      prose.style.fontSize = "13px";
-      expect(getComputedStyle(prose).maxWidth).toBe("650px");
+      // The prose takes the body token (a 14px sentinel), so 100ch is 100 × 7px.
+      expect(proseStyle.fontSize).toBe(tokenSentinels["--text-body"]);
+      expect(proseStyle.maxWidth).toBe("700px");
     } finally {
+      clearTokens();
       document.documentElement.style.fontSize = previousRootSize;
     }
   });

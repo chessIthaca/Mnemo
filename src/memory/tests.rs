@@ -962,15 +962,18 @@ async fn staleness_grace_follows_the_configured_decay_tau() {
         "a record within the configured tau's grace must not be de-ranked"
     );
 
-    // Default 7-day tau: the same record is deep in the ramp and sinks.
-    store.set_memory_search_config(MemorySearchConfig::default());
+    // A short 7-day tau: the same record is deep in the ramp and sinks.
+    store.set_memory_search_config(MemorySearchConfig {
+        decay_half_life_days: 7.0,
+        ..MemorySearchConfig::default()
+    });
     let results = store
         .recall_peek("pipeline", &MemoryFilter::new())
         .await
         .unwrap();
     assert_eq!(
         results[0].memory.title, "fresh pipeline note",
-        "under the default tau the aged record sinks again"
+        "under a 7-day tau the aged record sinks again"
     );
 }
 

@@ -52,9 +52,9 @@
     "skip_dirs": [".git", "node_modules", "target", "dist"]
   },
   "memory": {
-    "decay_half_life_days": 7.0,
+    "decay_half_life_days": 20.0,
     "per_query_cap": 50,
-    "derived_per_class_cap": 5,
+    "derived_per_class_cap": 10,
     "plan_budget": 400,
     "bug_budget": 600,
     "spec_budget": 500,

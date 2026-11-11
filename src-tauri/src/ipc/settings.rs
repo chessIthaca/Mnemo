@@ -1770,10 +1770,11 @@ mod settings_dto_tests {
         assert_eq!(v["ui"]["sound_stopped_errors"], true);
         assert_eq!(v["trace"]["memory_budget_mb"], 16);
         assert_eq!(v["trace"]["request_body_cap_kb"], 256);
-        // The [memory] retrieval knobs render their defaults (Phase 2).
-        assert_eq!(v["memory"]["decay_half_life_days"], 7.0);
+        // The [memory] retrieval knobs render their defaults (Phase 2; the
+        // half-life and per-class cap were raised on 2026-11-11).
+        assert_eq!(v["memory"]["decay_half_life_days"], 20.0);
         assert_eq!(v["memory"]["per_query_cap"], 50);
-        assert_eq!(v["memory"]["derived_per_class_cap"], 5);
+        assert_eq!(v["memory"]["derived_per_class_cap"], 10);
         assert_eq!(v["memory"]["plan_budget"], 400);
         assert_eq!(v["memory"]["decision_budget"], 300);
         assert_eq!(v["endpoints"], serde_json::json!([]));

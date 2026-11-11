@@ -155,7 +155,6 @@ function makeMcpTransport() {
 function makeLayaTransport() {
   const control = {
     choice: "suggest",
-    laya_routing: true,
     laya_status: "ready",
     checkpoint: "Laya (English)",
     knn_rows: 42,
@@ -171,10 +170,7 @@ function makeLayaTransport() {
         failure_triage: false,
         failure_triage_knn: false,
         steer_tool_choice: false,
-        routing: true,
-        reflex: false,
       },
-      routing: { threshold: 0.8, first_prompt_min_confidence: null, enforce: false },
     })),
     topControl: vi.fn(async () => control),
     routingStatus: vi.fn(async () => ({
@@ -534,7 +530,7 @@ describe("SettingsDialog", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Models" }));
     const work = await screen.findByRole("region", { name: "Compaction" });
     expect(within(work).getByLabelText("Compaction model")).toBeTruthy();
-    expect(screen.getByText(/Mnemo1's per-task models/)).toBeTruthy();
+    expect(screen.getByText(/The per-task model slots in config\.toml/)).toBeTruthy();
     expect(screen.getByText("Status: Keyword only")).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Savings" }));
     const levers = await screen.findByRole("region", { name: "Savings levers" });

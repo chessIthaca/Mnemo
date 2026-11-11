@@ -27,20 +27,12 @@ const READY: LayaStatus = {
     failure_triage: true,
     failure_triage_knn: false,
     steer_tool_choice: false,
-    routing: true,
-    reflex: false,
-  },
-  routing: {
-    threshold: 0.8,
-    first_prompt_min_confidence: null,
-    enforce: false,
   },
 };
 
 /** The top control the scene opens on: Suggest, Laya ready, kNN warm. */
 const CONTROL: TiersTopControl = {
   choice: "suggest",
-  laya_routing: true,
   laya_status: "ready",
   checkpoint: "Laya (English)",
   knn_rows: 42,
@@ -94,19 +86,13 @@ function createPreviewLayaTransport(): LayaTransport {
     routingStatus: async () => structuredClone(routingStatus),
     topControl: async () => structuredClone(control),
     saveTopControl: async (choice: TierChoice) => {
-      const layaRouting = choice !== "off";
       control = {
         ...control,
         choice,
-        laya_routing: layaRouting,
       };
       routingStatus = {
         ...routingStatus,
         settings: { ...routingStatus.settings, mode: choice },
-      };
-      status = {
-        ...status,
-        flags: { ...status.flags, routing: layaRouting },
       };
       return structuredClone(control);
     },

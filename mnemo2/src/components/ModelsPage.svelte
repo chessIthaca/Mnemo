@@ -231,7 +231,7 @@
 <div class="models-page">
   <div class="models-scroll">
     <p class="page-note">
-      Mnemo1's per-task models (planning, executing, bug fixing, reviewing) stay in the shared config.toml; Mnemo2 doesn't use them.
+      The per-task model slots in config.toml (planning, executing, bug fixing, reviewing) are not used by Mnemo2.
     </p>
     {#if loadError}
       <p class="load-error" role="alert">{loadError}</p>

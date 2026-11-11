@@ -17,7 +17,6 @@ import {
 /** A ready top-control wire, for the transport tests. */
 const CONTROL: TiersTopControl = {
   choice: "suggest",
-  laya_routing: true,
   laya_status: "ready",
   checkpoint: "Laya (English)",
   knn_rows: 42,
@@ -60,18 +59,15 @@ describe("layaSettings", () => {
     expect(createLayaTransport()).toBeNull();
   });
 
-  it("lists the five switches with one plain sentence each, and never the routing flag", () => {
+  it("lists the four switches with one plain sentence each", () => {
     expect(LAYA_FLAG_META.map((flag) => flag.key)).toEqual([
       "auto_type_memories",
       "failure_triage",
       "failure_triage_knn",
       "steer_tool_choice",
-      "reflex",
     ]);
     // Every flag carries a plain one-line explanation.
     for (const flag of LAYA_FLAG_META) expect(flag.explanation.trim()).not.toBe("");
-    // The `routing` flag rides the top control; it is not one of the switches.
-    expect(LAYA_FLAG_META.some((flag) => flag.key === "routing")).toBe(false);
   });
 
   it("words every status", () => {
@@ -113,10 +109,10 @@ describe("layaSettings", () => {
   it("saves one flag through save_laya_settings and starts the check through its own command", async () => {
     const { calls, bindings } = recordingBindings();
     const transport = createTauriLayaTransport(bindings);
-    await transport.saveFlag("reflex", true);
+    await transport.saveFlag("failure_triage", true);
     await transport.checkLaya();
     expect(calls.map((call) => call.command)).toEqual(["save_laya_settings", "laya_check_start"]);
-    // One flag at a time, and never the routing gates — the check owns those.
-    expect(calls[0].payload).toEqual({ flags: { reflex: true }, routing: null });
+    // One flag at a time — nothing else rides the payload.
+    expect(calls[0].payload).toEqual({ flags: { failure_triage: true } });
   });
 });

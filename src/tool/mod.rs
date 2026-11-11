@@ -9,9 +9,9 @@
 //! - **Workflow tools** (`create_plan`, `update_plan`, `complete_step`, `abandon_plan`) drive the plan lifecycle.
 //! - **Memory tools** (`memory_write`, `memory_recall`, `memory_consolidate`) are
 //!   always available regardless of workflow state.
-//! - **Browser tools** (`browser_navigate`, `browser_screenshot`, `browser_console`, ...)
-//!   drive the headless debug browser; reads are visible everywhere, mutations are
-//!   approval-gated.
+//! - **Browser tools** (`offscreen_browser_navigate`, `offscreen_browser_screenshot`,
+//!   `offscreen_browser_console`, ...) drive the headless debug browser; reads are
+//!   visible everywhere, mutations are approval-gated.
 
 pub mod agent;
 #[cfg(feature = "browser")]
@@ -37,7 +37,8 @@ pub enum ToolCategory {
     Workflow,
     /// Four-tier memory tools — always available.
     Memory,
-    /// Headless-browser debugging tools (`browser_navigate`, `browser_screenshot`, ...).
+    /// Headless-browser debugging tools (`offscreen_browser_navigate`,
+    /// `offscreen_browser_screenshot`, ...).
     Browser,
 }
 
@@ -1162,7 +1163,7 @@ impl ToolFilter {
 pub const DEFERRED_GROUPS: &[(&str, &str)] = &[
     (
         "browser",
-        "drive a headless browser (and the app's own tab): navigate, click, type, eval JS, screenshot, DOM snapshot, console logs, multi-page control",
+        "drive a headless browser: navigate, click, type, eval JS, screenshot, DOM snapshot, console logs, multi-page control",
     ),
     (
         "image",
@@ -2447,7 +2448,7 @@ mod tests {
     }
 
     /// A tool that reports itself unavailable — stands in for an image tool
-    /// with no vision model, or an on-screen browser tool with CDP off.
+    /// with no vision model.
     struct UnavailableTool;
 
     #[async_trait]

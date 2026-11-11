@@ -2,24 +2,10 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Startup helpers shared by the GUI, the console and the headless API —
-//! pure functions over config and process arguments.
+//! Startup helpers the brain's `wire_brain` calls (provider resolution, the
+//! startup re-embed check) — pure functions over config.
 
 use crate::config::{Config, Endpoint};
-
-/// The `--project <path>` CLI override, when present. Only the
-/// space-separated form is honored (matching `--console`'s spelling); a
-/// trailing `--project` with no value yields `None`.
-pub fn project_flag_from_args(
-    args: impl IntoIterator<Item = String>,
-) -> Option<std::path::PathBuf> {
-    args.into_iter()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find(|w| w[0] == "--project")
-        .and_then(|w| w.get(1))
-        .map(std::path::PathBuf::from)
-}
 
 /// The startup provider's endpoint + model, resolved from config with the
 /// documented fallback ordering:

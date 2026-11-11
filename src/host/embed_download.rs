@@ -3,10 +3,9 @@
 // See LICENSE in the repository root.
 
 //! Bundled embedding-model surface (job 4 D6, §5.8 :542-547) — the
-//! download/load core MOVED here from the app's `ipc/embeddings.rs`,
-//! Tauri-free: the shared `EmbedderStatus` Arc is the state carrier and
-//! [`EmbedderStatusSink`] is the push (the app's command layer forwards
-//! to `embedder://status`; the headless `Setup` feeds its
+//! download/load core, Tauri-free:
+//! the shared `EmbedderStatus` Arc is the state carrier and
+//! [`EmbedderStatusSink`] is the push (the headless `Setup` feeds its
 //! `EventReceiver<SetupEvent>`).
 //!
 //! The cache dir is a PARAMETER — callers derive it from their config
@@ -31,12 +30,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::embedder::EmbedderStatus;
 
-/// The status-change push (D6): the moved core writes the shared
+/// The status-change push (D6): the core writes the shared
 /// [`EmbedderStatus`] Arc AND hands every change to this sink — the
-/// app's command layer forwards to `embedder://status`, the headless
-/// `Setup::install_embedding_model` feeds its
-/// `EventReceiver<SetupEvent>`. `None` = status writes only (the
-/// console twin).
+/// headless `Setup::install_embedding_model` feeds its
+/// `EventReceiver<SetupEvent>`. `None` = status writes only.
 pub type EmbedderStatusSink = Arc<dyn Fn(&EmbedderStatus) + Send + Sync>;
 
 /// A catalog entry for the headless surface (§5.8 :542): the bundled

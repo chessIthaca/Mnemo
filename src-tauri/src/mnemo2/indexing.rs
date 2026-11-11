@@ -1,7 +1,7 @@
 //! The project's startup indexing passes, as one status the UI can render.
 //!
-//! The engine runs Mnemo1's two startup passes on open: the code graph index
-//! and the derived-memory reconcile. Both report on the engine's host-event
+//! The engine runs the kernel's two startup passes on open: the code graph
+//! index and the derived-memory reconcile. Both report on the engine's host-event
 //! bus; this module folds them into an [`IndexingSnapshot`] and rebroadcasts
 //! it. Every open shows its code pass (the engine's own stream stays silent
 //! for a pass under a second, so this view starts the pass itself). A project

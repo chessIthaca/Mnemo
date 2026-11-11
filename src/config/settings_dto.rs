@@ -4,15 +4,15 @@
 
 //! Settings-patch DTO types + validation + config assembly (review M1b).
 //!
-//! These types are the wire format for the `save_settings` Tauri command —
+//! These types are the wire format for a settings-save patch —
 //! plain serde structs with no Tauri dependencies. They live in the brain
-//! (not the IPC adapter) so the validation + config-assembly logic is
-//! unit-testable without Tauri state, and the console runtime can reuse the
-//! same validation if it ever gains a settings-save path.
+//! (not the host app) so the validation + config-assembly logic is
+//! unit-testable without Tauri state, and any host runtime can reuse the
+//! same validation for its own settings-save path.
 //!
-//! The IPC layer (`src-tauri/src/ipc/settings.rs`) constructs these from the
-//! frontend payload, calls [`validate_and_apply_settings_patch`], then
-//! persists + reloads + re-syncs the live provider — the Tauri-specific parts
+//! Mnemo2's settings modules (src-tauri/src/mnemo2/**) construct these from
+//! the frontend payload, call [`validate_and_apply_settings_patch`], then
+//! persist + reload + re-sync the live provider — the Tauri-specific parts
 //! that belong in the adapter.
 
 use serde::{Deserialize, Serialize};
@@ -353,9 +353,9 @@ pub struct SettingsSaveDto {
     // show_*/chat_*/sound_* toggles, steering_notes) are ABSENT from
     // the engine patch — compile-time absent (row 33: "SettingsPatch
     // cannot set [ui] fields"). The app owns the `[ui]` table: the
-    // GUI's wire splits at the app boundary (ipc/settings.rs carries
-    // the UI half and applies it app-side). On disk nothing moves —
-    // same file, same tables.
+    // GUI's wire splits at the app boundary — Mnemo2's appearance
+    // module (src-tauri/src/mnemo2/appearance_settings.rs) applies the
+    // UI half app-side. On disk nothing moves — same file, same tables.
     #[serde(default)]
     pub models: Option<ModelsConfigDto>,
     /// Pre-prompt model routing (`[general.routing]`, backlog 091e694d).
@@ -844,7 +844,8 @@ mod tests {
         // COMPILE-TIME ABSENT from the engine patch — a wire still
         // carrying them deserializes (serde drops unknown keys) and the
         // apply leaves the [ui] table untouched. The app owns [ui]; the
-        // GUI's wire splits at the app boundary (ipc/settings.rs).
+        // GUI's wire splits at the app boundary (Mnemo2's appearance
+        // module, src-tauri/src/mnemo2/appearance_settings.rs).
         let current = Config::default();
         let patch = serde_json::from_value::<SettingsSaveDto>(serde_json::json!({
             "theme": "dark",

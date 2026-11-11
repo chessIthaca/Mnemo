@@ -254,7 +254,7 @@ static TEST_DESIGN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::
 /// Backlog 51ee41c1: count the DISTINCT module directories referenced by
 /// path-like tokens in `texts` — every `src/<module>/` prefix (including
 /// the inner `src/` of `src-tauri/src/<module>/...` and
-/// `frontend/src/<dir>/...`), so files in the same module count once
+/// `mnemo2/src/<dir>/...`), so files in the same module count once
 /// (`src/codegraph/mod.rs` + `src/codegraph/store.rs` → 1) while a bare
 /// `src/lib.rs` (no module segment) counts none. The feature-scale
 /// steering note fires when a bug_fixing payload BOTH carries more
@@ -3120,7 +3120,7 @@ mod tests {
     fn referenced_module_dirs_counts_distinct_modules() {
         // Backlog 51ee41c1: same-module files count once, a bare
         // src/<file> (no module segment) counts none, and the inner src/
-        // of src-tauri/src/... + frontend/src/... matches.
+        // of src-tauri/src/... + mnemo2/src/... matches.
         assert_eq!(
             referenced_module_dirs(&[
                 "fix src/codegraph/mod.rs and src/codegraph/store.rs",
@@ -3131,8 +3131,8 @@ mod tests {
         assert_eq!(referenced_module_dirs(&["see src/lib.rs"]), 0);
         assert_eq!(
             referenced_module_dirs(&[
-                "src-tauri/src/ipc/projects.rs",
-                "frontend/src/components/projects/ProjectPicker.tsx",
+                "src-tauri/src/mnemo2/backlog.rs",
+                "mnemo2/src/components/BacklogSection.svelte",
             ]),
             2
         );

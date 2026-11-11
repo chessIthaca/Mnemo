@@ -1926,8 +1926,8 @@ mod tests {
     use crate::memory::embedder::HashEmbedder;
 
     /// The concrete app workflow behind a loop's neutral handle (2b.3): the
-    /// arm tests attach policies through the same app→app downcast the IPC
-    /// uses.
+    /// arm tests attach policies through the same app→app downcast the
+    /// app-side policy factory uses.
     fn concrete(
         handle: &std::sync::Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     ) -> std::sync::Arc<tokio::sync::Mutex<crate::app::workflow::Workflow>> {
@@ -4745,14 +4745,14 @@ mod tests {
         // CONTRACT PIN (run-all defect 2026-08-20): a Suggestion sent to an
         // IDLE agent runs as its OWN complete turn before any Prompt queued
         // behind it is processed — the Prompt never merges into the steer's
-        // turn. Run-All used to send its unattended preamble as a Suggestion
-        // before the item's Prompt; every item then resolved on a steer-only
-        // turn (plan-loop gate → CantResolve) and the NEXT item was
-        // dispatched before the real prompt ran. The fix embeds the preamble
-        // in the Prompt (ipc::run_all::run_all_prompt); this test pins the
+        // turn. Mnemo1's Run-All used to send its unattended preamble as a
+        // Suggestion before the item's Prompt; every item then resolved on a
+        // steer-only turn (plan-loop gate → CantResolve) and the NEXT item
+        // was dispatched before the real prompt ran. The 2026-08-20 fix
+        // embedded the preamble in the Prompt instead; this test pins the
         // runtime behavior the fix depends on — if the idle-Suggestion arm
         // ever changes to buffer the steer instead of running a turn, this
-        // fails and the run-all rationale must be re-examined.
+        // fails and the once-per-turn contract must be re-examined.
         let dir = tempdir().unwrap();
         let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
             dir.path().join("plans"),

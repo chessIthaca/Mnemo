@@ -608,11 +608,11 @@ pub struct AgentLoop {
     /// end. Empty for directly-built test loops (no corpus — consolidation
     /// sees only the session's tool events, the historical behavior).
     pub(crate) plans_dir: std::path::PathBuf,
-    /// The per-agent root override this loop was built with (parallel run-all
-    /// worktree agents, plan ffd7a86f) — `None` for every factory-default
-    /// build. Read by the IPC spawner so SUBAGENTS spawned by this agent
-    /// inherit the same root (a worktree agent's reviewer must see the
-    /// worktree's diff, not the main tree's).
+    /// The per-agent root override this loop was built with
+    /// (worktree-bound sessions, plan ffd7a86f) — `None` for every
+    /// factory-default build. Read by the host spawn path so SUBAGENTS
+    /// spawned by this agent inherit the same root (a worktree session's
+    /// reviewer must see the worktree's diff, not the main tree's).
     pub(crate) root_spec: Option<crate::agent::factory::AgentRootSpec>,
     /// The optional failure-triage gate (the Laya classifier's failure-
     /// handling consumer, `[general.laya] failure_triage`): the shared
@@ -1398,10 +1398,10 @@ impl AgentLoop {
             .unwrap_or_default()
     }
 
-    /// Store the per-agent root override (parallel run-all worktree agents,
+    /// Store the per-agent root override (worktree-bound sessions,
     /// plan ffd7a86f). Returns `self` for chaining. Wired by
-    /// [`AgentLoopFactory::build_with_root_spec`]; read by the IPC spawner so
-    /// subagents inherit the same root.
+    /// [`AgentLoopFactory::build_with_root_spec`]; read by the host spawn
+    /// path so subagents inherit the same root.
     pub fn with_root_spec(mut self, root: Option<crate::agent::factory::AgentRootSpec>) -> Self {
         self.root_spec = root;
         self
@@ -1870,10 +1870,10 @@ impl AgentLoop {
 
     /// The context-manager fill rate this loop was built with — the LIVE
     /// value the engine's fill-rate summarization path uses (the fraction
-    /// of the window at which summarization triggers). The run-all
-    /// between-items auto-compact gate (backlog ffd4bac3) reads it so its
-    /// threshold tracks the same dial the user tuned, even if the config
-    /// changed after the loop was built.
+    /// of the window at which summarization triggers). The headless
+    /// session's model-switch path (`build_turn_provider`) reads it so
+    /// the provider keeps tracking the same dial the user tuned, even if
+    /// the config changed after the loop was built.
     pub fn fill_rate(&self) -> f64 {
         self.fill_rate
     }

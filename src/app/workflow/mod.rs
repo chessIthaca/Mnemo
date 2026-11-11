@@ -48,8 +48,8 @@ pub enum WorkflowState {
     Skill,
     /// A parented sub-agent's role state — like [`Skill`](Self::Skill), this
     /// is NOT a lifecycle phase. It is stamped by the spawn path
-    /// (`spawn_agent_shared`, src-tauri/src/ipc/spawn.rs) on every agent with
-    /// a parent, replacing whatever state [`Workflow::load_latest`] derived
+    /// (`spawn_agent_shared`) on every agent with a parent, replacing
+    /// whatever state [`Workflow::load_latest`] derived
     /// from the shared main plan. The plan stack stays loaded as a READ-ONLY
     /// MIRROR of the main plan (so `current_plan` shows reviewers the plan
     /// under review and the UI staircase keeps its context), but the state

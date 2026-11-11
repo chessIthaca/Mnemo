@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Host-side wiring shared by every frontend (the Tauri GUI, the console, and
-//! the headless API): the brain builder + its host-notifier seam, the shared
-//! agent-spawn path + lifecycle bookkeeping, startup helpers, the maintenance
-//! busy-flag, and the startup code-graph index progress. Nothing in this
-//! module may depend on Tauri or on the app crate.
+//! Host-side wiring shared by every frontend (the Mnemo2 Tauri app and the
+//! headless API/embedders): the brain builder + its host-notifier seam, the
+//! shared agent-spawn path + lifecycle bookkeeping, startup helpers, the
+//! maintenance busy-flag, and the startup code-graph index progress. Nothing
+//! in this module may depend on Tauri or on the app crate.
 
 // 3a.1 (D1): the brain module compiles on EVERY feature combination — the
 // feature-gated pieces (the bundled ONNX embedder, the shared headless

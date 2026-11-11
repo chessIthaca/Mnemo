@@ -2,27 +2,26 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Startup code-graph index progress: the event the host forwards to its UI
-//! and the process-wide snapshot the `get_index_progress` command reads.
-//! Moved from the app crate so the brain builder can live in the lib.
+//! Startup code-graph index progress: the event the host notifier forwards
+//! to its UI and the process-wide snapshot the code-graph status line reads
+//! for catch-up. Moved from the app crate so the brain builder can live in
+//! the lib.
 
 use serde::{Deserialize, Serialize};
 
 use crate::host::maintenance::{should_forward_progress, PROGRESS_EVERY};
 
-/// The Tauri event channel the STARTUP indexing pass (main.rs) and the
-/// create-project seed pass (ipc/projects.rs) stream file progress on, so the
-/// open-project overlay can show a progress bar + "N/M files indexed"
-/// counter. Distinct from the app crate's `REINDEX_CHANNEL` (the Settings
-/// card's manual rebuild) so the two UIs never fold each other's traffic.
+/// The event channel the STARTUP indexing pass streams file progress on,
+/// so the open-project overlay can show a progress bar + "N/M files indexed"
+/// counter.
 pub const INDEX_PROGRESS_CHANNEL: &str = "codegraph://index-progress";
 
 /// An event on the [`INDEX_PROGRESS_CHANNEL`] stream — the indexing progress
 /// behind the open-project overlay. The same `"type"`-tagged, kebab-case
 /// shape as [`ReconcileEvent`](crate::host::maintenance::ReconcileEvent),
 /// but with NO `phase` field: a code index has exactly one phase. Pinned by
-/// `index_progress_event_wire_shape`; the frontend folds it via
-/// `applyIndexProgress` in IndexingOverlay.tsx.
+/// `index_progress_event_wire_shape`; Mnemo2 folds it into its indexing
+/// snapshot (src-tauri/src/mnemo2/indexing.rs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum IndexProgressEvent {
@@ -94,14 +93,14 @@ static STARTUP_INDEX_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// overlay's catch-up fetch would flash a dialog the cold-start contract
 /// says must not appear.
 ///
-/// WHY a snapshot: the webview listening on `codegraph://index-progress` is
-/// (re)created on every app start AND every project switch; React mounts and
-/// subscribes some time after the startup pass has already begun, so events
-/// emitted before the subscription are lost. The pass mirrors its live
-/// progress here so a late-mounting overlay can fetch a snapshot via the
-/// app crate's `get_index_progress` command and catch up. Only the startup
-/// pass records — the Settings-card maintenance stream and the Graph-tab
-/// refresh have their own always-mounted UIs and never touch it.
+/// WHY a snapshot: a UI listening on the index-progress channel mounts some
+/// time after the startup pass has already begun (on every app start AND
+/// every project switch), so events emitted before the subscription are
+/// lost. The pass mirrors its live progress here so a late-mounting overlay
+/// can read the current state via the code-graph status line and catch up.
+/// Only the startup pass records — the Settings-card maintenance stream and
+/// the Graph-tab refresh have their own always-mounted UIs and never touch
+/// it.
 pub fn mark_startup_index_active(switched: bool) {
     STARTUP_INDEX_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
     STARTUP_INDEX_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);

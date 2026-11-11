@@ -152,13 +152,13 @@ impl GraphWatcher {
 
         let task_root = root.clone();
         // Run the debounce loop on a Tokio runtime. Most callers are already
-        // inside one (IPC handlers, tests), but `build_brain` runs from
-        // Tauri's `.setup()` hook on the main thread — there is NO reactor
-        // there, and a bare `tokio::spawn` panics ("no reactor running"),
-        // crashing the app on startup. Fall back to a dedicated thread with
-        // its own single-threaded runtime: the loop is one task that exits
-        // when the channel closes (watcher dropped), so the thread terminates
-        // on its own and never needs a handle.
+        // inside one (the headless engine, tests), but a host may build its
+        // brain from a context with NO reactor (e.g. an app's setup hook on
+        // the main thread) — a bare `tokio::spawn` panics
+        // ("no reactor running"), crashing the app on startup. Fall back to
+        // a dedicated thread with its own single-threaded runtime: the loop
+        // is one task that exits when the channel closes (watcher dropped),
+        // so the thread terminates on its own and never needs a handle.
         let task = match tokio::runtime::Handle::try_current() {
             Ok(handle) => Some(handle.spawn(async move {
                 Self::debounce_loop(graph, task_root, rx, debounce).await;
@@ -298,28 +298,28 @@ mod tests {
         std::fs::create_dir_all(root.join("target")).unwrap();
         std::fs::write(root.join("target/x.rs"), "fn x() {}").unwrap();
         assert!(!is_indexable_path(&root.join("target/x.rs"), root));
-        // .worktrees/ — app-managed run-all worktrees (linked worktrees
+        // .worktrees/ — app-managed worktrees (linked worktrees
         // under the main tree, each a duplicate copy). A worktree's own
         // .coding/codegraph.db is written continuously by that worktree's
         // index passes and must not trigger a main-tree pass.
-        std::fs::create_dir_all(root.join(".worktrees/runall-abcd12/.coding")).unwrap();
-        std::fs::create_dir_all(root.join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::create_dir_all(root.join(".worktrees/agent-abcd12/.coding")).unwrap();
+        std::fs::create_dir_all(root.join(".worktrees/agent-abcd12/src")).unwrap();
         std::fs::write(
-            root.join(".worktrees/runall-abcd12/.coding/codegraph.db"),
+            root.join(".worktrees/agent-abcd12/.coding/codegraph.db"),
             "db",
         )
         .unwrap();
         std::fs::write(
-            root.join(".worktrees/runall-abcd12/src/b.tsx"),
+            root.join(".worktrees/agent-abcd12/src/b.tsx"),
             "export const B = 1;",
         )
         .unwrap();
         assert!(
-            !is_indexable_path(&root.join(".worktrees/runall-abcd12/.coding/codegraph.db"), root),
+            !is_indexable_path(&root.join(".worktrees/agent-abcd12/.coding/codegraph.db"), root),
             "a worktree DB write must not trigger a main-tree pass"
         );
         assert!(
-            !is_indexable_path(&root.join(".worktrees/runall-abcd12/src/b.tsx"), root),
+            !is_indexable_path(&root.join(".worktrees/agent-abcd12/src/b.tsx"), root),
             "no file under a worktree directory is watched from the main tree"
         );
         // `.coding/` artifacts ARE watched — only the app's SQLite stores
@@ -361,8 +361,8 @@ mod tests {
         assert!(!is_indexable_path(&other.path().join("o.rs"), root));
         // Root-relative guard (green before AND after the .worktrees fix):
         // a root that IS itself a worktree path stays watched — the fix
-        // must not blind a run-all item instance's own watcher.
-        let wt_root = root.join(".worktrees/runall-abcd12");
+        // must not blind a worktree session's own watcher.
+        let wt_root = root.join(".worktrees/agent-abcd12");
         std::fs::create_dir_all(wt_root.join("src")).unwrap();
         std::fs::write(wt_root.join("src/own.tsx"), "export const O = 1;").unwrap();
         assert!(

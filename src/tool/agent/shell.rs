@@ -325,8 +325,8 @@ struct ShellArgs {
     /// malformed, so the deserialization now enforces what the schema
     /// advertises.
     ///
-    /// Consumed by the frontend from the raw tool-call args
-    /// (`frontend/src/components/chat/Message.tsx` `argLabel`), so it's never
+    /// Consumed by the frontend from the raw tool-call args (Mnemo2's
+    /// `argLabel` helper, `mnemo2/src/lib/toolCardPaths.ts`), so it's never
     /// read in Rust — it's kept here so serde parses/validates it.
     #[expect(dead_code, reason = "consumed by the frontend from raw tool-call args")]
     purpose: String,

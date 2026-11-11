@@ -120,7 +120,7 @@ pub struct ContextManager {
     /// The configured fill-rate fraction (e.g. 0.3) — stored so
     /// [`Self::effective_summarize_at`] can delegate to the shared
     /// [`Self::effective_summarize_threshold`] helper (backlog ffd4bac3:
-    /// the run-all between-items gate computes the SAME threshold
+    /// off-manager callers compute the SAME threshold
     /// through it).
     fill_rate: f64,
     summarize_at: usize,
@@ -227,7 +227,7 @@ pub enum CompactionFit {
 /// The transcript note announcing a temporary raise: what happened, by how
 /// much the effective limit moved, and that it resets itself. Emitted by every
 /// path that completes a compaction pass (the auto path in `turn.rs`, the
-/// manual `/compact` + run-all path in `runtime/agent.rs`) so the lever is
+/// manual `/compact` path in `runtime/agent.rs`) so the lever is
 /// visible instead of silently changing how full the context is allowed to get.
 pub(crate) fn compaction_raise_note(steps: usize, factor: f64, limit: usize) -> String {
     format!(
@@ -416,11 +416,10 @@ impl ContextManager {
     /// The effective summarize trigger for a `(max_tokens, fill_rate)`
     /// pair — the shared core of [`Self::effective_summarize_at`], so
     /// off-manager callers compute the SAME threshold as the fill-rate
-    /// path instead of duplicating the formula. The run-all between-items
-    /// auto-compact gate (backlog ffd4bac3) reads the user's
-    /// `summarize_at_fill_rate` dial through this. Exactly the fill-rate
-    /// product, no other cap — the proxy-cache ceiling was removed
-    /// 2027-01-25 (a LiteLLM user sets a lower fill rate instead).
+    /// path instead of duplicating the formula (backlog ffd4bac3).
+    /// Exactly the fill-rate product, no other cap — the proxy-cache
+    /// ceiling was removed 2027-01-25 (a LiteLLM user sets a lower fill
+    /// rate instead).
     pub fn effective_summarize_threshold(max_tokens: usize, fill_rate: f64) -> usize {
         (max_tokens as f64 * fill_rate) as usize
     }

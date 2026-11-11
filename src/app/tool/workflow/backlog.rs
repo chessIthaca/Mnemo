@@ -252,11 +252,11 @@ struct BacklogStatusArgs {
     /// Optional note (e.g. why the item failed / was resolved).
     #[serde(default)]
     note: Option<String>,
-    /// Set (`true`) / clear (`false`) the deferred (skip Run-All) flag —
-    /// ORTHOGONAL to status: the item keeps its current status (typically
-    /// `Pending`) and stays visible, but Run-All never selects or counts
-    /// it. Lets a run-all session park a queued item it cannot resolve
-    /// instead of failing it.
+    /// Set (`true`) / clear (`false`) the deferred (skip automatic dispatch)
+    /// flag — ORTHOGONAL to status: the item keeps its current status
+    /// (typically `Pending`), stays visible, and is reserved for manual
+    /// handling (automatic dispatch skips it). Lets a session park a queued
+    /// item it cannot resolve instead of failing it.
     #[serde(default)]
     deferred: Option<bool>,
 }
@@ -314,7 +314,7 @@ impl Tool for BacklogStatusTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "backlog_status",
-            "Change a backlog item's status and/or its deferred (skip Run-All) \
+            "Change a backlog item's status and/or its deferred (skip automatic dispatch) \
              flag. The id comes from backlog_add's output or the Backlog tab. \
              Status is tied to the plan lifecycle: done = the plan reached \
              Complete (normally automatic at turn resolution — set it manually \
@@ -326,11 +326,12 @@ impl Tool for BacklogStatusTool {
              Legal transitions: pending -> in_flight; pending or in_flight -> \
              done/failed/cant_resolve; in_flight -> pending (deferral); \
              done/failed/cant_resolve -> pending (requeue). deferred (boolean, \
-             optional): set/clear the skip-Run-All flag — ORTHOGONAL to status \
-             (the item stays pending and visible; only Run-All selection skips \
-             it). Pass deferred alone, without status, to park/un-park a \
-             queued item without a status change — e.g. a run-all session \
-              deferring an item it cannot resolve instead of failing it. \
+             optional): set/clear the parked flag (skip automatic dispatch) — \
+             ORTHOGONAL to status (the item stays pending and visible, \
+             reserved for manual handling or later re-inclusion). Pass \
+             deferred alone, without status, to park/un-park a queued item \
+             without a status change — e.g. a session parking an item it \
+             cannot resolve instead of failing it. \
               note alone (no status, no deferred) amends the item's note \
               without touching anything else. At least one of status, \
               deferred, or note is required.",
@@ -715,14 +716,16 @@ mod tests {
         assert!(first.success, "output: {}", first.output);
 
         let top = tool
-            .execute(json!({"text": "Fix the run-all stall first\n\nProblem: run-all stalls after the plan closes (2027-01-08); repro: start run-all with two items. Fix direction: resume the dispatch loop on the finish notification in src-tauri/src/ipc/run_all.rs. Acceptance: cargo test run_all. Related: backlog e33a07fd.", "position": "top"}))
+            .execute(json!({"text": "Fix the worker dispatch stall first
+
+Problem: the worker dispatch loop stalls after the worker's plan closes (2027-01-08); repro: dispatch two workers on one plan. Fix direction: resume the dispatch loop on the finish notification in src-tauri/src/mnemo2/team/dispatch.rs. Acceptance: cargo test team. Related: backlog e33a07fd.", "position": "top"}))
             .await;
         assert!(top.success, "output: {}", top.output);
 
         let items = tool.store.lock().await.items().to_vec();
         assert_eq!(items.len(), 2);
         assert!(
-            items[0].text.starts_with("Fix the run-all stall"),
+            items[0].text.starts_with("Fix the worker dispatch stall"),
             "the top item is first in store order"
         );
         // The result names the top insert and reports it in the data.

@@ -2,11 +2,11 @@
  * The About page's data: the running version, where Mnemo's source and license
  * live, and the open-source projects Mnemo2 is built on.
  *
- * The Rust groups were copied from Mnemo1's retired About dialog and now
- * live in `./aboutDependencies.ts` — the same crates build both apps. That
- * manifest's "Frontend —" groups cover the React app and do
- * not apply to Mnemo2, so they are filtered out and Mnemo2's own interface
- * groups (`MNEMO2_INTERFACE_GROUPS`, mirroring mnemo2/package.json) are added.
+ * The Rust groups were copied from the retired Mnemo1 app's About dialog and
+ * now live in `./aboutDependencies.ts`. That manifest's "Frontend —" groups
+ * cover the React frontend that retired with it and do not apply to Mnemo2, so
+ * they are filtered out and Mnemo2's own interface groups
+ * (`MNEMO2_INTERFACE_GROUPS`, mirroring mnemo2/package.json) are added.
  */
 
 import { getVersion } from "@tauri-apps/api/app";
@@ -97,8 +97,8 @@ export const MNEMO2_INTERFACE_GROUPS: DependencyGroup[] = [
 
 /**
  * What the About page lists: Mnemo's Rust crates (library, app shell, vendored
- * patches) followed by Mnemo2's own interface groups. Mnemo1's React "Frontend
- * —" groups are dropped.
+ * patches) followed by Mnemo2's own interface groups. The retired React
+ * "Frontend —" groups are dropped.
  */
 export const ABOUT_GROUPS: DependencyGroup[] = [
   ...DEPENDENCY_GROUPS.filter((group) => group.title.startsWith("Rust")),

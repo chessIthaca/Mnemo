@@ -5,8 +5,8 @@
 /**
  * Curated dependency manifest for the About dialog.
  *
- * The list was copied from Mnemo1's retired About dialog and is now owned
- * here. It lists the DIRECT dependencies of Mnemo — the library crate
+ * The list was copied from the retired Mnemo1 app's About dialog and is now
+ * owned here. It lists the DIRECT dependencies of Mnemo — the library crate
  * (`/Cargo.toml`), the Tauri app shell (`/src-tauri/Cargo.toml`), and the
  * frontend runtime and build/dev groups below — each annotated with its SPDX
  * license label, a registry page (crates.io / npmjs.com), and a link to the

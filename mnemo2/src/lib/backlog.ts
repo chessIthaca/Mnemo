@@ -24,9 +24,9 @@ export interface BacklogItem {
   created_at: number;
   /** The failure note of a finished item. */
   note?: string | null;
-  /** Deferred (kept, but skipped by Mnemo1's Run-All); absent means false. */
+  /** Deferred: kept in the list, dimmed and badged; absent means false. */
   deferred?: boolean;
-  /** The dispatched plan's root id, when Mnemo1 dispatched this item. */
+  /** The dispatched plan's root id, when a plan was dispatched from this item. */
   plan_id?: string | null;
   /** That plan's title at dispatch. */
   plan_title?: string | null;

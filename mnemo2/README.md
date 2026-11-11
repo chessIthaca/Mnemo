@@ -35,15 +35,14 @@ npm run build:mnemo2:native
 ```
 
 `mnemo2` is a separate npm workspace (`mnemo2/`). Vite uses port **5180** and
-outputs to `target/mnemo2-dist`, distinct from the Mnemo1 frontend on 5179.
-The native host uses its own `src-tauri/mnemo2-app/tauri.conf.json` and
-binary; it does not replace or extend Mnemo1's IPC surface. It also clears
-inherited `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, so it never reuses
-Mnemo1's CDP port 9222.
+outputs to `target/mnemo2-dist`. The native host uses its own
+`src-tauri/mnemo2-app/tauri.conf.json` and binary; it registers only Mnemo2's
+own commands. It also clears inherited
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, so it never picks up a CDP debugging
+port (9222) from a parent process.
 
-The native host is the `mnemo2` Cargo feature. The default `cargo test
---workspace` compiles Mnemo1 alone; `npm run test:mnemo2:native` runs the
-feature-enabled Mnemo2 lib tests.
+The native host is the `mnemo2` Cargo feature; `npm run test:mnemo2:native`
+runs the feature-enabled Mnemo2 lib tests.
 
 ## Preview scenes (dev only)
 
@@ -354,8 +353,7 @@ complete for the current tip; a high-risk worker must have a completed audit
 linked to that same tip and a nonempty adjudication; and every branch-tip check
 must have passed. A fix or fixer commit replaces the check result and must be
 re-run before merge. The lead is the reviewer of record and remains accountable
-for the adjudication. This is Mnemo2's policy; Mnemo1's spawned read-only
-reviewer workflow is unchanged.
+for the adjudication. This is Mnemo2's policy.
 
 ## Claude Code as the lead
 
@@ -439,7 +437,7 @@ all live. Setup and day-to-day use are in
   context window is used as a small circular progress ring (green, amber, or
   red by fill level; neutral while the window size is unknown). Live
   `context_usage` events update it without a snapshot reload. Hovering, focusing,
-  or clicking the ring opens a Mnemo1-style popup with the used/max totals, the
+  or clicking the ring opens a popup with the used/max totals, the
   per-role breakdown (system / user / assistant / tool) as proportional bars, and
   a **Compact now** button that sends a real between-turns compact command; the
   outcome arrives as `compact_started` / `compacted` lead events, and a busy or

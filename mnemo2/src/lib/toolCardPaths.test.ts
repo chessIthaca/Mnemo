@@ -3,8 +3,8 @@
 // See LICENSE in the repository root.
 
 /**
- * Unit tests for the tool-card presentation helpers (`./toolCardPaths.ts`,
- * copied from Mnemo1's retired frontend and owned here): the file-path
+ * Unit tests for the tool-card presentation helpers (`./toolCardPaths.ts`):
+ * the file-path
  * extractor driving the clickable file-name links in the ToolCard header,
  * plus the readable-IO parsing powering the expanded call-detail body —
  * shell calls (`shellCallFromArgs` / `parseShellOutput`, backlog 8c1d8a47),

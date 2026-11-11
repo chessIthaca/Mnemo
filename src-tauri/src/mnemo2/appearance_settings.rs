@@ -346,8 +346,7 @@ mod tests {
         assert_eq!(config.general.ui.theme, "light", "nothing was written");
     }
 
-    /// Every word the page offers round-trips, including `system`, which
-    /// Mnemo1's Appearance section also stores.
+    /// Every word the page offers round-trips, `system` included.
     #[test]
     fn every_theme_word_round_trips() {
         let (_dir, setup) = fixture();

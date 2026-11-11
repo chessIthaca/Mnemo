@@ -6,9 +6,9 @@
 
 //! Mnemo2's minimal Tauri host.
 //!
-//! Mnemo2 is an application built on the headless engine, not a second copy
-//! of Mnemo1's IPC/tool surface. This module owns only the desktop shell and
-//! the lead-session bridge.
+//! Mnemo2 is an application built on the headless engine, with its own IPC
+//! surface rather than a copy of another app's. This module owns only the
+//! desktop shell and the lead-session bridge.
 
 /// The headless-engine-backed lead conversation.
 pub mod runtime;
@@ -171,8 +171,7 @@ pub mod ui_log;
 
 
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
-/// from any other Tauri WebView (for example Mnemo1's Browser tab), which
-/// also exposes `__TAURI_INTERNALS__`.
+/// from any other Tauri WebView, which also exposes `__TAURI_INTERNALS__`.
 #[tauri::command]
 fn mnemo2_host_ping() -> &'static str {
     "pong"
@@ -961,8 +960,8 @@ mod tests {
         assert_eq!(progress.pending_step(), "closing the browser");
     }
 
-    /// The native shell must compile with Mnemo2's own Tauri identity. Sharing
-    /// Mnemo1's identity also shares its WebView2 user-data folder, which
+    /// The native shell must compile with Mnemo2's own Tauri identity. Two apps
+    /// that share an identity also share their WebView2 user-data folder, which
     /// deadlocks the second process before its webview initializes.
     #[test]
     fn context_uses_mnemo2_identifier() {

@@ -1000,10 +1000,9 @@ impl LeadRuntime {
     }
 
     async fn start_engine(&self, provider: Option<Arc<dyn LlmClient>>) -> Result<(), String> {
-        // The engine's state dir is the project's own `.coding/`, the same one
-        // Mnemo1 uses: memory.db, knowledge/, codegraph.db, plans/ and reviews/
-        // are one shared set of project stores. (Mnemo2's own state stays in
-        // `.coding/mnemo2/`.)
+        // The engine's state dir is the project's own `.coding/`: memory.db,
+        // knowledge/, codegraph.db, plans/ and reviews/ are one shared set of
+        // project stores. (Mnemo2's own state stays in `.coding/mnemo2/`.)
         // Best effort, as before: this only keeps the shared caches out of
         // `git status`, so a failed or cancelled task is ignored.
         let root = self.workspace_root.clone();
@@ -1011,7 +1010,7 @@ impl LeadRuntime {
         std::fs::create_dir_all(self.workspace_root.join(".coding"))
             .map_err(|err| format!("could not create the project's .coding directory: {err}"))?;
         let workspace = Workspace::new(self.workspace_root.clone());
-        // Mnemo1 indexes the graph unless the config turns it off.
+        // The graph is indexed unless the config turns it off.
         let index_codegraph = Config::load(&self.config_dir)
             .map(|config| config.general.general.codegraph)
             .unwrap_or(true);
@@ -1104,7 +1103,7 @@ impl LeadRuntime {
     }
 
     /// Attach the managed Laya classifier to the just-started engine —
-    /// the headless twin of Mnemo1's startup attach (main.rs:78-127):
+    /// the headless twin of the desktop app's old startup attach:
     /// when the live `[general.laya]` config enables Laya and the
     /// English checkpoint is already installed, the engine-backed
     /// `Setup` fills the brain's classifier slot and parks the sidecar
@@ -1137,7 +1136,7 @@ impl LeadRuntime {
         // this manager plus the
         // slot (`Setup::classifier_slot`), the status Arc and the live
         // config (`Setup::live_config`). It is NOT spawned: the gate
-        // lived in the Mnemo1 app's IPC layer, deleted with Mnemo1 —
+        // lived in the retired Mnemo1 app's IPC layer, deleted with it —
         // nothing remains to call, so the gate has to be built in the
         // lib first. Until it
         // lands, Mnemo2 skips the startup fine-tune (the classifier
@@ -1728,7 +1727,8 @@ async fn pump_events(
             // the lead stays busy and no error is recorded (bug 2026-11-02,
             // plan 1238e0de: this used to arrive as an `Error`).
             SerializableAgentEvent::ModelSwapSummarized { .. } => false,
-            // Mnemo1-only informational notice; the lead pump ignores it.
+            // An informational per-turn routing notice; the lead pump ignores
+            // it.
             SerializableAgentEvent::RoutingNotice { .. } => false,
             SerializableAgentEvent::ModelChanged { model: changed, .. } => {
                 // The engine's bus is engine-wide: only OUR session's
@@ -1801,8 +1801,8 @@ async fn pump_events(
 
 /// Keep the shared project caches (`memory.db`, `codegraph.db`, logs, ...) out
 /// of `git status` through the repository's local `info/exclude`, so the
-/// lead's clean-checkout merge gate never trips on them. Mnemo1 gets the same
-/// rules from the `.gitignore` its `Project::init` merges. Best effort: a
+/// lead's clean-checkout merge gate never trips on them. The kernel's
+/// `Project::init` merges the same rules into `.gitignore`. Best effort: a
 /// project that is not a Git checkout (or an unwritable exclude file) is left
 /// alone.
 fn ignore_project_caches(root: &Path) {

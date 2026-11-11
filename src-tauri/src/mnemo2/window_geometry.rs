@@ -8,10 +8,10 @@
 //! ([`SavedGeometry`]; every value is a PHYSICAL pixel: the outer top-left,
 //! the inner size and the outer size, so the window frame is derivable).
 //! On startup [`clamp_restored`] pulls a saved window that is now off screen
-//! or too small fully onto a monitor — the same rules Mnemo1's restore
-//! uses: a monitor keeps a position only when at least 80 logical px
-//! overlap its work area on both axes, an unusable one centres the window,
-//! and the size stays between 800x560 logical and the monitor's work area.
+//! or too small fully onto a monitor. The rules: a monitor keeps a position
+//! only when at least 80 logical px overlap its work area on both axes, an
+//! unusable one centres the window, and the size stays between 800x560
+//! logical and the monitor's work area.
 
 use std::path::{Path, PathBuf};
 

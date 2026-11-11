@@ -2,7 +2,7 @@
  * Tool-call images for the chat tool cards.
  *
  * Two halves: `toolImagePaths` reads the paths a completed tool call reported
- * out of its arguments and result (Mnemo1's rules, ported verbatim), and
+ * out of its arguments and result, and
  * `createToolImageTransport` fetches one as a `data:` URL from the host —
  * through the lead's project root, or a worker's checkout.
  */

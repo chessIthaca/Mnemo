@@ -879,6 +879,11 @@ async fn start_inner(
                     memory_enabled,
                     memory_path,
                     index_codegraph: opts.index_codegraph,
+                    // c5d25f4e: a headless engine has no on-screen WebView2
+                    // CDP endpoint — the on-screen browser_* gate stays off
+                    // whatever `enable_browser_inspection` says (the
+                    // offscreen_browser_* family is unaffected).
+                    on_screen_browser: false,
                     injected_store,
                     shared,
                 },
@@ -1089,6 +1094,7 @@ mod tests {
                 memory_enabled: false,
                 memory_path: None,
                 index_codegraph: false,
+                on_screen_browser: false,
                 injected_store: None,
                 shared: None,
             },
@@ -1210,6 +1216,59 @@ mod tests {
         };
         assert_eq!(err.code(), "spawn_failed");
         assert!(err.to_string().contains("worktree"), "{err}");
+    }
+
+    /// c5d25f4e: a headless engine has no on-screen WebView2 CDP endpoint
+    /// (Mnemo2 strips the WebView2 env at startup and has no Browser pane
+    /// attach), so whatever `[general] enable_browser_inspection` says the
+    /// on-screen `browser_*` gate must stay off and a session's tools array
+    /// must not advertise any of them — the `offscreen_browser_*` family
+    /// drives the headless browser and is unaffected.
+    #[cfg(feature = "browser")]
+    #[tokio::test]
+    async fn headless_engine_never_advertises_on_screen_browser_tools() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        // The user's real-world config shape: the flag opted in (set for
+        // Mnemo1 over the shared config dir). The engine must still hold
+        // the on-screen gate off.
+        std::fs::write(
+            cfg.path().join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"test-model\"\nenable_browser_inspection = true\n",
+        )
+        .unwrap();
+        let engine = EngineBuilder::new(opts(ws.path(), cfg.path()))
+            .start()
+            .await
+            .unwrap();
+        let factory = &engine.brain().factory;
+        assert!(
+            !factory.browser_inspection_enabled(),
+            "a headless engine has no on-screen CDP endpoint — the gate must stay off"
+        );
+        // The tools a spawned session would advertise: a loop built through
+        // the factory's production path, its registry read with the deferred
+        // browser group revealed (the factory gate test's `loaded` view).
+        let agent = factory.build();
+        agent.tools.load_group("browser");
+        let names: Vec<String> = agent
+            .tools
+            .schemas(&Capabilities::openai(), &crate::tool::ToolFilter::Executing)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with("browser_") && !n.starts_with("offscreen_")),
+            "on-screen browser_* must never be advertised, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("offscreen_browser_")),
+            "offscreen_browser_* is unaffected and must appear, got: {names:?}"
+        );
+        engine.shutdown().await.unwrap();
     }
 }
 

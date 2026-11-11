@@ -9,9 +9,8 @@
 # path filters; the codeql-config file this workflow points at does.
 #
 # Actions are pinned to full commit SHAs (version in the trailing comment, so
-# Dependabot can keep them current) — the one exception is
-# dtolnay/rust-toolchain, which reads its own ref to select the toolchain and
-# publishes no version tags, so it stays `@stable` (see the
+# Dependabot can keep them current), with no exceptions; Rust comes from
+# rust-toolchain.toml via `rustup toolchain install` (see the
 # workflows_pin_actions_to_full_shas regression test).
 name: CodeQL
 

@@ -1,0 +1,16 @@
+# The one Rust version for this repo: local cargo commands and every CI job
+# (.github/workflows/*.yml run `rustup toolchain install`, which reads this
+# file). New clippy lints under #![deny(warnings)] used to turn CI red
+# whenever a new stable shipped; pinning makes that a deliberate change.
+#
+# To bump: change `channel`, run
+#   cargo clippy --workspace --all-targets
+#   cargo clippy -p mnemo-app --all-targets --features mnemo2
+#   cargo test --workspace
+# and fix what the new version reports in the same PR. Dependabot does not
+# update this file.
+
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

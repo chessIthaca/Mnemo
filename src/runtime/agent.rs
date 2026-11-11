@@ -1814,10 +1814,9 @@ impl AgentTask {
                     ), if grace.is_some() => break IdleRace::Cut,
                 }
             };
-            // A hard cut drops the pinned handle; leaving this block drops the
-            // underlying future (tokio::pin! keeps it on the stack), releasing
-            // its borrow of `self` before the commit flag is inspected.
-            drop(compaction);
+            // Leaving this block drops the pinned compaction future (tokio::pin!
+            // keeps it on the stack), so a hard cut cancels it and its borrow of
+            // `self` ends before the commit flag is inspected.
             (race, stashed)
         };
 

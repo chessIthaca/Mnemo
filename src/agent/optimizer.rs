@@ -747,10 +747,7 @@ mod tests {
 
     #[test]
     fn decision_density_is_decisions_per_hundred_messages() {
-        let signals = QualitySignals {
-            decisions_seen: 3,
-            ..Default::default()
-        };
+        let signals = QualitySignals { decisions_seen: 3 };
         assert_eq!(QualityReport::compute(10, 6, signals).decision_density, 50);
         // Never divides by zero on an empty conversation (capped at 100).
         assert_eq!(QualityReport::compute(0, 0, signals).decision_density, 100);

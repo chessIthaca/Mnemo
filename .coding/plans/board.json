@@ -2402,6 +2402,28 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Removes code with no live caller and settings nothing enforces. The only governed files touched are src-tauri/src/mnemo2/team/tests.rs (a test fixture rewritten to build its legacy worktree with git directly) and src-tauri/src/mnemo2/laya_settings.rs (the inert auto_finetune flag; no dispatch-routing requirement mentions fine-tuning). Specified behavior is unchanged."
+    },
+    {
+      "id": "1b4555ee",
+      "status": "closed",
+      "created_at_ms": 1794437236367,
+      "closed_at_ms": 1794441430786,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1b4555ee-20261111-235710.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only change to one Mnemo2 runtime test's stub sequencing; no behaviour or spec changes."
+    },
+    {
+      "id": "c463f284",
+      "status": "closed",
+      "created_at_ms": 1794438831853,
+      "closed_at_ms": 1794441425241,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-c463f284-20261111-235705.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No OpenSpec requirement mentions Mnemo1, [general.laya] routing/reflex, enforce or per-turn routing (grep of .coding/openspec/specs). The Tiers page still configures the ladder, the routing choice and the Laya settings on one page (tier-ladder 'One Tiers page'); dispatch routing modes are unchanged."
     }
   ]
 }

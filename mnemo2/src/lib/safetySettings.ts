@@ -3,9 +3,10 @@ import { isTauriRuntime } from "./runtime";
 
 /**
  * Safety settings for the Safety page: the transport to
- * `safety_settings_get` / `save_safety_mode` / `save_safety_rules`, the
- * four `[general] safety` modes with their one-line explanations, and the
- * rule shapes the editor saves. The wire shapes mirror
+ * `safety_settings_get` / `save_safety_mode` / `save_safety_rules` /
+ * `save_git_approval`, the four `[general] safety` modes with their
+ * one-line explanations, the rule shapes the editor saves, and the git
+ * subcommands that always ask. The wire shapes mirror
  * `SafetySettingsWire` in `src-tauri/src/mnemo2/safety_settings.rs` — the
  * JSON keys are snake_case, like every other Mnemo2 DTO.
  */
@@ -35,6 +36,8 @@ export interface SafetySettings {
   mode: SafetyModeId;
   /** `<project>/.coding/safety.toml`, in file order. */
   rules: SafetyRule[];
+  /** `[git] core_operations`: git subcommands the lead always asks about. */
+  git_approval: string[];
   /** A project is open — the rules editor is on. */
   project_open: boolean;
   /** An open lead is live — a mode save applies to its next action. */
@@ -111,6 +114,7 @@ export function normalizeSafetySettings(wire: SafetySettingsWire): SafetySetting
   return {
     mode: wire.mode as SafetyModeId,
     rules: wire.rules.map((rule) => ({ tool: rule.tool, pattern: rule.pattern, kind: rule.kind ?? "literal" })),
+    git_approval: [...(wire.git_approval ?? [])],
     project_open: wire.project_open,
     live_lead: wire.live_lead,
   };
@@ -140,6 +144,28 @@ export function rulesDiffer(a: SafetyRule[], b: SafetyRule[]): boolean {
   return JSON.stringify(a) !== JSON.stringify(b);
 }
 
+/**
+ * Parse the git field: commas, spaces or new lines separate; case and
+ * duplicates fold. Each entry must name one git subcommand.
+ */
+export function parseGitApproval(text: string): { operations: string[] } | { error: string } {
+  const operations: string[] = [];
+  for (const raw of text.split(/[\s,]+/)) {
+    const entry = raw.trim().toLowerCase();
+    if (entry === "") continue;
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(entry)) {
+      return { error: `"${entry}" is not a git subcommand — use one word, like merge or push.` };
+    }
+    if (!operations.includes(entry)) operations.push(entry);
+  }
+  return { operations };
+}
+
+/** The field text for a saved list: "merge, push". */
+export function formatGitApproval(operations: string[]): string {
+  return operations.join(", ");
+}
+
 // ── Transport ───────────────────────────────────────────────────────────────
 
 /** The Tauri API surface the transport needs, injected for tests and previews. */
@@ -155,6 +181,8 @@ export interface SafetyTransport {
   saveMode(mode: SafetyModeId): Promise<SafetySettings>;
   /** Replace the open project's rules (the whole list). */
   saveRules(rules: SafetyRule[]): Promise<SafetySettings>;
+  /** Save `[git] core_operations`; applies to the lead's next git call. */
+  saveGitApproval(operations: string[]): Promise<SafetySettings>;
 }
 
 /** The real IPC transport over the Tauri bindings. */
@@ -165,6 +193,8 @@ export function createTauriSafetyTransport(bindings: SafetyTransportBindings): S
       bindings.invoke<SafetySettingsWire>("save_safety_mode", { mode }).then(normalizeSafetySettings),
     saveRules: (rules) =>
       bindings.invoke<SafetySettingsWire>("save_safety_rules", { rules }).then(normalizeSafetySettings),
+    saveGitApproval: (operations) =>
+      bindings.invoke<SafetySettingsWire>("save_git_approval", { operations }).then(normalizeSafetySettings),
   };
 }
 

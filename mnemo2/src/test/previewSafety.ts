@@ -16,7 +16,7 @@ import {
   type SafetyTransport,
 } from "../lib/safetySettings";
 
-/** The snapshot the scene shows: a project-scoped mode and two rules. */
+/** The snapshot the scene shows: a project-scoped mode, two rules and the default git list. */
 export function previewSafetySettings(): SafetySettings {
   return {
     mode: "auto-approve-project",
@@ -24,6 +24,7 @@ export function previewSafetySettings(): SafetySettings {
       { tool: "shell", pattern: "cargo test", kind: "command_class" },
       { tool: "file_write", pattern: "^file_write:.*\\.md$", kind: "literal" },
     ],
+    git_approval: ["merge", "push"],
     project_open: true,
     live_lead: true,
   };
@@ -45,6 +46,10 @@ export function createPreviewSafetyTransport(): SafetyTransport {
     },
     saveRules: async (rules: SafetyRule[]) => {
       snapshot = { ...snapshot, rules: rules.map((rule) => ({ ...rule })) };
+      return clone(snapshot);
+    },
+    saveGitApproval: async (operations: string[]) => {
+      snapshot = { ...snapshot, git_approval: [...operations] };
       return clone(snapshot);
     },
   };

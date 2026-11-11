@@ -108,7 +108,13 @@ function makeTransport(overrides: Partial<SettingsTransport> = {}) {
 }
 
 function safetySnapshot() {
-  return { mode: "approve-each-action", rules: [], project_open: true, live_lead: false };
+  return {
+    mode: "approve-each-action",
+    rules: [],
+    git_approval: ["merge", "push"],
+    project_open: true,
+    live_lead: false,
+  };
 }
 
 function makeSafetyTransport() {
@@ -116,6 +122,7 @@ function makeSafetyTransport() {
     get: vi.fn(async () => safetySnapshot()),
     saveMode: vi.fn(async () => safetySnapshot()),
     saveRules: vi.fn(async () => safetySnapshot()),
+    saveGitApproval: vi.fn(async () => safetySnapshot()),
   };
 }
 

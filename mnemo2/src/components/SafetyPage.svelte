@@ -3,6 +3,8 @@
     SAFETY_MODES,
     SAFETY_RULE_KINDS,
     emptyRule,
+    formatGitApproval,
+    parseGitApproval,
     ruleDraft,
     rulesDiffer,
     safetyModeMeta,
@@ -16,13 +18,14 @@
 
   /**
    * The Safety settings page: the four `[general] safety` approval modes
-   * (the autonomous one visibly marked risky) and the open project's
-   * auto-approve rules. Both save on their own button through the
-   * sanctioned settings pipeline — the mode moves the open lead's live
-   * approval gate on its next action, and the rules replace
-   * `<project>/.coding/safety.toml`, which the lead re-reads on its next
-   * dispatch. Workers never prompt in any mode, and the page says so
-   * instead of implying a gate the team does not have.
+   * (the autonomous one visibly marked risky), the open project's
+   * auto-approve rules, and the machine-global git commands that always
+   * ask. Each saves on its own button through the sanctioned settings
+   * pipeline — the mode moves the open lead's live approval gate on its
+   * next action, the rules replace `<project>/.coding/safety.toml` (which
+   * the lead re-reads on its next dispatch), and the git list moves the
+   * lead's next git call. Workers never prompt in any mode, and the page
+   * says so instead of implying a gate the team does not have.
    */
   let { transport }: { transport: SafetyTransport } = $props();
 
@@ -41,9 +44,16 @@
   let rulesError = $state("");
   let rulesSaved = $state(false);
 
+  let gitDraft = $state("");
+  let gitOriginal = $state("");
+  let gitSaving = $state(false);
+  let gitError = $state("");
+  let gitSaved = $state(false);
+
   const modeDirty = $derived(modeDraft !== (snapshot?.mode ?? modeDraft));
   const rulesDirty = $derived(rulesDiffer(rulesDraft, rulesOriginal));
-  trackUnsaved(() => modeDirty || rulesDirty);
+  const gitDirty = $derived(gitKey(gitDraft) !== gitKey(gitOriginal));
+  trackUnsaved(() => modeDirty || rulesDirty || gitDirty);
   /** The draft selects the no-prompt mode: show the standing warning. */
   const riskySelected = $derived(safetyModeMeta(modeDraft).risky);
 
@@ -72,6 +82,16 @@
       rulesDraft = settings.rules.map((rule) => ({ ...rule }));
       rulesOriginal = settings.rules.map((rule) => ({ ...rule }));
     }
+    if (!gitDirty) {
+      gitDraft = formatGitApproval(settings.git_approval);
+      gitOriginal = gitDraft;
+    }
+  }
+
+  /** The dirty check's key for the git field: "merge,push", or the raw text when invalid. */
+  function gitKey(text: string): string {
+    const parsed = parseGitApproval(text);
+    return "error" in parsed ? `!${text}` : parsed.operations.join(",");
   }
 
   async function saveMode(): Promise<void> {
@@ -131,6 +151,34 @@
   function removeRule(index: number): void {
     rulesDraft = rulesDraft.filter((_, position) => position !== index);
     rulesSaved = false;
+  }
+
+  async function saveGit(): Promise<void> {
+    gitError = "";
+    gitSaved = false;
+    const parsed = parseGitApproval(gitDraft);
+    if ("error" in parsed) {
+      gitError = parsed.error;
+      return;
+    }
+    gitSaving = true;
+    try {
+      accept(await transport.saveGitApproval(parsed.operations));
+      // `accept` leaves a dirty draft alone, so adopt the saved list here.
+      gitDraft = formatGitApproval(snapshot?.git_approval ?? parsed.operations);
+      gitOriginal = gitDraft;
+      gitSaved = true;
+    } catch (failure) {
+      gitError = errorText(failure);
+    } finally {
+      gitSaving = false;
+    }
+  }
+
+  function discardGit(): void {
+    gitDraft = gitOriginal;
+    gitError = "";
+    gitSaved = false;
   }
 </script>
 
@@ -255,6 +303,39 @@
         {/if}
       </section>
 
+      <section class="group" aria-label="Git commands that always ask">
+        <header>
+          <h3>Git commands that always ask</h3>
+          <p class="micro">
+            The lead asks before running these git commands, even in an auto-approve mode or when a safety rule
+            matches. One word each, separated by commas. Leave it empty to let the mode and rules decide. Team workers
+            never ask.
+          </p>
+        </header>
+        <input
+          class="git-approval"
+          bind:value={gitDraft}
+          oninput={() => (gitSaved = false)}
+          placeholder="merge, push"
+          aria-label="Git commands that always ask"
+          spellcheck="false"
+        />
+        <div class="section-actions">
+          {#if gitError}<p class="section-error" role="alert">{gitError}</p>{/if}
+          {#if gitSaved && !gitDirty}
+            <p class="section-note">
+              {#if snapshot.live_lead}Saved. The lead's next git command follows it — no restart.{:else}Saved. Applies the next time a project opens.{/if}
+            </p>
+          {/if}
+          <div class="section-buttons">
+            <button class="button button-quiet" disabled={gitSaving || !gitDirty} onclick={discardGit}>Discard</button>
+            <button class="button button-primary" disabled={gitSaving || !gitDirty} onclick={saveGit}>
+              {gitSaving ? "Saving…" : "Save git commands"}
+            </button>
+          </div>
+        </div>
+      </section>
+
       <section class="group" aria-label="When this applies">
         <header>
           <h3>When this applies</h3>
@@ -336,6 +417,16 @@
   .rule-remove { min-height: 32px; padding: 5px 10px; }
   .rule-add { display: flex; justify-content: flex-start; }
   .rule-add .button { min-height: 32px; padding: 5px 10px; }
+
+  .git-approval {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 7px 10px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--surface);
+    font-size: var(--text-body);
+  }
 
   .section-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 2px; }
   .section-error { margin: 0; color: var(--danger); font-size: var(--text-body); overflow-wrap: anywhere; flex: 1; }

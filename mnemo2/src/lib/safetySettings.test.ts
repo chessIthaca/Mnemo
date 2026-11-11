@@ -5,7 +5,9 @@ import {
   createSafetyTransport,
   createTauriSafetyTransport,
   emptyRule,
+  formatGitApproval,
   normalizeSafetySettings,
+  parseGitApproval,
   ruleDraft,
   rulesDiffer,
   safetyModeMeta,
@@ -23,6 +25,7 @@ const WIRE = {
   ],
   project_open: true,
   live_lead: true,
+  git_approval: ["merge", "push"],
 };
 
 /** The four words the backend's `parse_safety_mode` accepts. */
@@ -64,8 +67,17 @@ describe("safety settings normalization", () => {
       ],
       project_open: true,
       live_lead: true,
+      git_approval: ["merge", "push"],
     });
   });
+
+
+  it("reads a wire without a git list as an empty one", () => {
+    // The backend always sends the field; an older host's reply simply lacks it.
+    const olderWire = JSON.parse(JSON.stringify({ ...WIRE, git_approval: undefined }));
+    expect(normalizeSafetySettings(olderWire).git_approval).toEqual([]);
+  });
+
 
   it("names both rule kinds with a blurb", () => {
     expect(SAFETY_RULE_KINDS.map((kind) => kind.value)).toEqual(["literal", "command_class"]);
@@ -102,6 +114,32 @@ describe("rule drafts", () => {
   });
 });
 
+describe("git approval list", () => {
+  it("splits on commas, spaces and new lines, folding case and duplicates", () => {
+    expect(parseGitApproval("merge, push")).toEqual({ operations: ["merge", "push"] });
+    expect(parseGitApproval("Merge,PUSH\nrebase merge")).toEqual({ operations: ["merge", "push", "rebase"] });
+  });
+
+  it("treats blank text as an empty list", () => {
+    expect(parseGitApproval("")).toEqual({ operations: [] });
+    expect(parseGitApproval(" , ")).toEqual({ operations: [] });
+  });
+
+  it("names a malformed entry instead of saving it", () => {
+    expect(parseGitApproval("push --force")).toEqual({
+      error: '"--force" is not a git subcommand — use one word, like merge or push.',
+    });
+    expect(parseGitApproval("pu$h")).toEqual({
+      error: '"pu$h" is not a git subcommand — use one word, like merge or push.',
+    });
+  });
+
+  it("formats a saved list as the field text", () => {
+    expect(formatGitApproval(["merge", "push"])).toBe("merge, push");
+    expect(formatGitApproval([])).toBe("");
+  });
+});
+
 describe("safety transport", () => {
   it("maps every method to its command and normalizes the reply", async () => {
     const invoked: { command: string; args?: Record<string, unknown> }[] = [];
@@ -117,11 +155,13 @@ describe("safety transport", () => {
     await expect(transport.get()).resolves.toEqual(normalizeSafetySettings(WIRE));
     await expect(transport.saveMode("autonomous")).resolves.toEqual(normalizeSafetySettings(WIRE));
     await expect(transport.saveRules(rules)).resolves.toEqual(normalizeSafetySettings(WIRE));
+    await expect(transport.saveGitApproval(["merge"])).resolves.toEqual(normalizeSafetySettings(WIRE));
 
     expect(invoked).toEqual([
       { command: "safety_settings_get", args: undefined },
       { command: "save_safety_mode", args: { mode: "autonomous" } },
       { command: "save_safety_rules", args: { rules } },
+      { command: "save_git_approval", args: { operations: ["merge"] } },
     ]);
   });
 
@@ -130,6 +170,7 @@ describe("safety transport", () => {
       get: async () => normalizeSafetySettings(WIRE),
       saveMode: async () => normalizeSafetySettings(WIRE),
       saveRules: async () => normalizeSafetySettings(WIRE),
+      saveGitApproval: async () => normalizeSafetySettings(WIRE),
     };
     expect(createSafetyTransport()).toBeNull();
     setPreviewSafetyTransport(planted);

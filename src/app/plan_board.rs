@@ -1114,7 +1114,7 @@ impl PlanBoard {
             let done = plan.steps.len() - todo.len();
             out.push_str(&format!(
                 "- {} \"{}\" {done}/{} done; todo {}\n",
-                &plan.id,
+                plan.id,
                 clip(&plan.title, 60),
                 plan.steps.len(),
                 if todo.is_empty() {

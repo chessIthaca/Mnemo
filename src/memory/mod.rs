@@ -1125,8 +1125,10 @@ impl MemoryStore {
 
     /// Decode an embedding BLOB back to Vec<f32>.
     fn decode_embedding(blob: &[u8]) -> Vec<f32> {
-        blob.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        blob.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     }
 
@@ -1204,18 +1206,14 @@ impl MemoryStore {
     /// cosine) rather than killing the write. A pre-set embedding (e.g. a
     /// test) gets an empty model fingerprint of the embedding's length.
     async fn embedding_for_insert(&self, memory: &mut Memory) -> (Vec<u8>, String, i64) {
-        let embed_model;
-        let embed_dim;
-        if memory.embedding.is_empty() {
+        let (embed_model, embed_dim) = if memory.embedding.is_empty() {
             let embedder = self.embedder_handle();
             memory.embedding = embedder.embed(&memory.content).await;
-            embed_model = embedder.model_id().to_string();
-            embed_dim = embedder.dim() as i64;
+            (embedder.model_id().to_string(), embedder.dim() as i64)
         } else {
             // A pre-set embedding (e.g. a test) has no known model fingerprint.
-            embed_model = String::new();
-            embed_dim = memory.embedding.len() as i64;
-        }
+            (String::new(), memory.embedding.len() as i64)
+        };
         (
             Self::encode_embedding(&memory.embedding),
             embed_model,

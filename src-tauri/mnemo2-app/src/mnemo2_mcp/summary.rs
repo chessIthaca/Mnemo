@@ -96,12 +96,9 @@ fn parse_cwd(env: &Env, args: &[String], allow_json: bool) -> Option<PathBuf> {
                 index += 2;
             }
             argument => {
-                if let Some(path) = argument.strip_prefix("--cwd=") {
-                    cwd = Some(PathBuf::from(path));
-                    index += 1;
-                } else {
-                    return None;
-                }
+                let path = argument.strip_prefix("--cwd=")?;
+                cwd = Some(PathBuf::from(path));
+                index += 1;
             }
         }
     }

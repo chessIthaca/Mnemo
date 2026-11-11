@@ -11,8 +11,10 @@
 //!
 //! Every answer is read from the open project's memory store — the same store
 //! [`mnemo::headless::MemoryApi`] wraps, so the tab and the agent's memory
-//! tools can never disagree about what the project knows. The tab is strictly
-//! READ-ONLY: no command here writes, edits, supersedes or deletes a record.
+//! tools can never disagree about what the project knows. The tab never writes,
+//! edits, supersedes or deletes a record: the one deliberate exception is the
+//! upkeep the user asked for (clean up memory, rebuild search, rebuild index),
+//! which lives in [`crate::mnemo2::memory_maintenance`].
 //!
 //! Why the store trait and not `MemoryApi` everywhere: `MemoryApi::list` is
 //! tier-only (no typed-record filter, no paging) and truncates every body to
@@ -322,7 +324,7 @@ impl MemoryOverviewView {
 pub const ENGINE_STARTING: &str = "the project engine is still starting";
 
 /// The open project's engine, or a clear "nothing is open" error.
-async fn engine(state: &Mnemo2State) -> Result<Arc<Engine>, String> {
+pub(crate) async fn engine(state: &Mnemo2State) -> Result<Arc<Engine>, String> {
     let started = Instant::now();
     let lead = match state.open_lead().await {
         Some(lead) => lead,

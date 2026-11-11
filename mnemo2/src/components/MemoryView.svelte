@@ -2,6 +2,16 @@
   import { onDestroy, untrack } from "svelte";
   import { Brain, LoaderCircle, Search } from "@lucide/svelte";
   import {
+    applyMaintenanceEvent,
+    createMaintenanceTransport,
+    idleOp,
+    MAINTENANCE_OPS,
+    progressLabel,
+    type MaintenanceEvent,
+    type MaintenanceOp,
+    type OpState,
+  } from "../lib/memoryMaintenance";
+  import {
     createMemoryTransport,
     displayTitle,
     embedderLabel,
@@ -24,6 +34,7 @@
   import Markdown from "./Markdown.svelte";
 
   const transport = createMemoryTransport();
+  const maintenance = createMaintenanceTransport();
 
   /** How long typing settles before a search runs. */
   const SEARCH_DEBOUNCE_MS = 200;
@@ -83,6 +94,17 @@
   let recallQuery = $state("");
   let recallHits = $state<MemoryHit[] | null>(null);
   let recallError = $state("");
+
+  /** The upkeep actions' state, one entry per action. */
+  let ops = $state<Record<MaintenanceOp, OpState>>({
+    cleanup: idleOp(),
+    rebuild: idleOp(),
+    index: idleOp(),
+  });
+  /** Why a start could not run (one already going, memory off) — shown above the rows. */
+  let startError = $state("");
+  /** True while any action runs: every button is off, so a second start is impossible. */
+  const anyRunning = $derived(Object.values(ops).some((state) => state.running));
 
   /** Turn a rejected command into one readable line (errors stay inline). */
   function errorMessage(value: unknown): string {
@@ -261,6 +283,39 @@
     }
   }
 
+  /** Fold one upkeep event into its action's line; a finished run re-reads the card. */
+  function onMaintenanceEvent(event: MaintenanceEvent): void {
+    ops[event.op] = applyMaintenanceEvent(ops[event.op], event);
+    if (event.type === "done") {
+      void loadOverview();
+      void loadList(true);
+    }
+  }
+
+  /** The upkeep stream's listener, kept for the tab's life. */
+  let maintenanceUnlisten: (() => void) | null = null;
+
+  // Subscribe once: the actions run in the background, so their progress has
+  // to arrive as events. A tab destroyed before `listen` resolves calls the
+  // just-returned unlisten at once — no listener outlives the component.
+  if (maintenance) {
+    void maintenance.onEvent(onMaintenanceEvent).then((unlisten) => {
+      if (disposed) unlisten();
+      else maintenanceUnlisten = unlisten;
+    });
+  }
+
+  /** Start one upkeep action; a start that cannot run says why. */
+  async function runMaintenance(op: MaintenanceOp): Promise<void> {
+    if (!maintenance) return;
+    startError = "";
+    try {
+      await maintenance.run(op);
+    } catch (failure) {
+      startError = errorMessage(failure);
+    }
+  }
+
   // The tab mounts only while the panel shows it, so this first read is the
   // tab-open load; no poll — knowledge changes when the agent or the user
   // writes a record, not on a clock.
@@ -274,6 +329,8 @@
     disposed = true;
     clearTimeout(searchTimer);
     for (const timer of timers) clearTimeout(timer);
+    maintenanceUnlisten?.();
+    maintenanceUnlisten = null;
   });
 
   /** The rows the list renders: search hits when a query ran, else the page. */
@@ -461,6 +518,43 @@
                   </ol>
                 {/if}
               {/if}
+
+              {#if maintenance}
+                <section class="maintenance" aria-label="Memory upkeep">
+                  {#if startError !== ""}
+                    <p class="upkeep-error" role="alert">{startError}</p>
+                  {/if}
+                  {#each MAINTENANCE_OPS as action (action.op)}
+                    <div class="upkeep">
+                      <h4>{action.title}</h4>
+                      <p class="upkeep-note">{action.description}</p>
+                      <button
+                        class="button button-quiet"
+                        disabled={anyRunning}
+                        onclick={() => void runMaintenance(action.op)}
+                      >{action.button}</button>
+                      {#if ops[action.op].running}
+                        <p class="upkeep-line" role="status">
+                          <span>{progressLabel(ops[action.op])}</span>
+                          {#if ops[action.op].total > 0}
+                            <progress
+                              aria-label={action.title}
+                              value={ops[action.op].done}
+                              max={ops[action.op].total}
+                            ></progress>
+                          {:else}
+                            <progress aria-label={action.title}></progress>
+                          {/if}
+                        </p>
+                      {:else if ops[action.op].error !== null}
+                        <p class="upkeep-error" role="alert">{ops[action.op].error}</p>
+                      {:else if ops[action.op].summary !== null}
+                        <p class="upkeep-done">{ops[action.op].summary}</p>
+                      {/if}
+                    </div>
+                  {/each}
+                </section>
+              {/if}
             {/if}
           </div>
         </details>
@@ -631,6 +725,16 @@
   .recall-hit { display: flex; width: 100%; align-items: center; gap: 6px; padding: 3px 0; border: 0; background: transparent; color: var(--ink); font-size: var(--text-meta); text-align: left; cursor: pointer; }
   .recall-hit:hover .recall-title { text-decoration: underline; }
   .recall-title { overflow: hidden; flex: 1; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* The upkeep actions: clean up memory, rebuild search, rebuild index. */
+  .maintenance { display: grid; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); gap: 14px; }
+  .upkeep h4 { margin: 0 0 3px; color: var(--ink); font-size: var(--text-meta); font-weight: 660; text-transform: uppercase; letter-spacing: 0.04em; }
+  .upkeep-note { margin: 0 0 6px; color: var(--muted); font-size: var(--text-meta); line-height: 1.45; }
+  .upkeep .button { min-height: 28px; padding: 4px 10px; font-size: var(--text-meta); }
+  .upkeep-line { display: flex; align-items: center; gap: 8px; margin: 7px 0 0; color: var(--ink-soft); font-size: var(--text-meta); }
+  .upkeep-line progress { flex: 1; min-width: 0; height: 5px; accent-color: var(--accent); }
+  .upkeep-done { margin: 7px 0 0; color: var(--ink-soft); font-size: var(--text-meta); }
+  .upkeep-error { margin: 7px 0 0; color: var(--danger); font-size: var(--text-meta); }
 
   .memory-reader { min-width: 0; overflow-y: auto; background: var(--surface); }
   .record { max-width: 760px; padding: 22px 30px 40px; }

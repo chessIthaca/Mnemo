@@ -12,15 +12,24 @@ import type {
   MemoryTransport,
 } from "../lib/memoryView";
 import { ENGINE_STARTING } from "../lib/memoryView";
+import type { MaintenanceEvent, MaintenanceOp, MaintenanceTransport } from "../lib/memoryMaintenance";
 
 const mocks = vi.hoisted(() => ({
   transport: null as MemoryTransport | null,
+  maintenance: null as MaintenanceTransport | null,
 }));
 
 // MemoryView builds its own transport on mount; the tests plant one instead.
 vi.mock("../lib/memoryView", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/memoryView")>();
   return { ...original, createMemoryTransport: () => mocks.transport };
+});
+
+// The upkeep transport is planted the same way: absent (null) unless a test
+// wants the three actions, so every other test renders the tab unchanged.
+vi.mock("../lib/memoryMaintenance", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/memoryMaintenance")>();
+  return { ...original, createMaintenanceTransport: () => mocks.maintenance };
 });
 
 function row(
@@ -167,6 +176,28 @@ function plantedTransport(): MemoryTransport & { queries: MemoryListQuery[] } {
   };
 }
 
+/** A planted upkeep transport: records the runs it was asked for, and holds
+ * the event handler so a test can push `started` / `progress` / `done`. */
+function plantedMaintenance() {
+  const runs: MaintenanceOp[] = [];
+  let handler: ((event: MaintenanceEvent) => void) | null = null;
+  const transport: MaintenanceTransport = {
+    run: async (op) => {
+      runs.push(op);
+    },
+    onEvent: async (next) => {
+      handler = next;
+      return () => {};
+    },
+  };
+  return {
+    transport,
+    runs,
+    push: (event: MaintenanceEvent) => handler?.(event),
+    subscribed: () => handler !== null,
+  };
+}
+
 /** The list pane (the left column) and the reader. */
 const listPane = () => screen.getByRole("complementary", { name: "Records" });
 const reader = () => screen.getByRole("article", { name: "Record" });
@@ -174,6 +205,7 @@ const reader = () => screen.getByRole("article", { name: "Record" });
 describe("MemoryView", () => {
   beforeEach(() => {
     mocks.transport = plantedTransport();
+    mocks.maintenance = null;
   });
 
   it("lists the records newest first and reads the newest one", async () => {
@@ -438,5 +470,91 @@ describe("MemoryView", () => {
     await waitFor(() => expect(spinner.querySelector(".elapsed-time")).toBeTruthy(), {
       timeout: 2500,
     });
+  });
+
+  /** Open Diagnostics and hand back its upkeep section. */
+  async function openUpkeep(): Promise<HTMLElement> {
+    await waitFor(() => expect(within(listPane()).getByText("the tab reads the store")).toBeTruthy());
+    await fireEvent.click(within(listPane()).getByText("Diagnostics"));
+    return waitFor(() => {
+      const section = listPane().querySelector("section.maintenance") as HTMLElement | null;
+      expect(section).toBeTruthy();
+      return section as HTMLElement;
+    });
+  }
+
+  it("shows the three upkeep actions in Diagnostics", async () => {
+    const upkeep = plantedMaintenance();
+    mocks.maintenance = upkeep.transport;
+    render(MemoryView);
+
+    const section = await openUpkeep();
+    expect(within(section).getByText("Clean up memory")).toBeTruthy();
+    expect(within(section).getByText("Rebuild search")).toBeTruthy();
+    expect(within(section).getByText("Rebuild index")).toBeTruthy();
+    expect(within(section).getByRole("button", { name: "Clean up" })).toBeTruthy();
+    expect(within(section).getAllByRole("button", { name: "Rebuild" })).toHaveLength(2);
+    await waitFor(() => expect(upkeep.subscribed()).toBe(true));
+  });
+
+  it("runs a cleanup and shows its result", async () => {
+    const upkeep = plantedMaintenance();
+    mocks.maintenance = upkeep.transport;
+    const transport = plantedTransport();
+    const overviewCalls = vi.fn(transport.overview);
+    transport.overview = overviewCalls;
+    mocks.transport = transport;
+    render(MemoryView);
+
+    const section = await openUpkeep();
+    const cleanUp = within(section).getByRole("button", { name: "Clean up" }) as HTMLButtonElement;
+    await fireEvent.click(cleanUp);
+    expect(upkeep.runs).toEqual(["cleanup"]);
+
+    const overviewReads = overviewCalls.mock.calls.length;
+    upkeep.push({ type: "started", op: "cleanup" });
+    upkeep.push({
+      type: "progress",
+      op: "cleanup",
+      done: 1,
+      total: 2,
+      phase: "consolidating",
+    });
+
+    await waitFor(() => expect(within(section).getByText("consolidating 1/2")).toBeTruthy());
+    expect(cleanUp.disabled).toBe(true);
+    for (const button of within(section).getAllByRole("button")) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    }
+
+    upkeep.push({
+      type: "done",
+      op: "cleanup",
+      summary: "2 session(s) consolidated · 9 working row(s) removed · database compacted",
+    });
+
+    expect(await within(section).findByText(/2 session\(s\) consolidated/)).toBeTruthy();
+    await waitFor(() => expect(cleanUp.disabled).toBe(false));
+    // A finished run re-reads the Diagnostics card.
+    await waitFor(() => expect(overviewCalls.mock.calls.length).toBeGreaterThan(overviewReads));
+  });
+
+  it("shows why a cleanup could not start", async () => {
+    const upkeep = plantedMaintenance();
+    upkeep.transport.run = async () => {
+      throw "another memory maintenance run is still going";
+    };
+    mocks.maintenance = upkeep.transport;
+    render(MemoryView);
+
+    const section = await openUpkeep();
+    await fireEvent.click(within(section).getByRole("button", { name: "Clean up" }));
+
+    expect(
+      await within(section).findByText("another memory maintenance run is still going"),
+    ).toBeTruthy();
+    expect((within(section).getByRole("button", { name: "Clean up" }) as HTMLButtonElement).disabled).toBe(
+      false,
+    );
   });
 });

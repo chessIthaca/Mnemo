@@ -43,7 +43,6 @@ use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
 use crate::codegraph::extract::{extract_file, extract_file_with, ParserCache, RefKind};
@@ -287,39 +286,6 @@ fn scan_exact_test_title(bytes: &[u8], title: &str) -> Option<&'static str> {
     None
 }
 
-/// Copy the graph DB at `src_db` into a fresh, consistent snapshot at
-/// `dest_db` — run-all worktree seeding (2026-09-08 performance LOW-2
-/// lever b): a spawned worktree agent's cold index pass otherwise re-reads,
-/// re-hashes and re-parses every file the main tree's graph already
-/// indexed.
-///
-/// `VACUUM INTO` is documented to produce "a consistent snapshot of the
-/// original database" — it reads through the live WAL without blocking
-/// writers. A plain file copy is NOT safe here: reading `db` + `-wal` +
-/// `-shm` at different moments yields an incoherent trio, and a copy that
-/// includes upsert commits but misses the trailing `rebuild_edges` commit
-/// serves new symbols with stale cross-file edges — NOT self-healing,
-/// because a seeded pass that re-parses nothing (`reindexed == 0`) never
-/// fires its own edge rebuild, and the incremental index trusts the stored
-/// content hashes. (Missed whole-file commits, by contrast, ARE
-/// self-healing — a fresh parse.) Seeding is safe on the destination side
-/// by construction: the worktree's index pass re-checks every file's
-/// content hash against the worktree's actual bytes, so unchanged files
-/// skip the parse and changed files just re-parse (never worse than cold).
-///
-/// Best-effort by design: any error propagates to the caller, which falls
-/// back to the cold full-index pass.
-pub fn snapshot_db(src_db: &Path, dest_db: &Path) -> Result<()> {
-    if let Some(parent) = dest_db.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let conn = Connection::open_with_flags(src_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.busy_timeout(Duration::from_millis(5000))?;
-    let dest = dest_db.to_string_lossy();
-    conn.execute("VACUUM INTO ?1", [dest.as_ref()])?;
-    Ok(())
-}
-
 /// The latency budget for an inline stale-reindex pass
 /// ([`CodeGraph::reindex_stale_files`]) — shared by the content-index
 /// (`search`/`search_read`) and symbol-index (`graph_search`) repair paths.
@@ -489,25 +455,10 @@ impl CodeGraph {
     /// Individual file failures (unreadable, upsert error) are logged and
     /// skipped — indexing is best-effort and never fatal to the app.
     pub fn index(&self, progress: Option<&dyn Fn(usize, usize)>) -> Result<IndexStats> {
-        self.index_inner(progress, true)
+        self.index_inner(progress)
     }
 
-    /// A pass over a DB seeded from ANOTHER tree (run-all worktree
-    /// seeding, [`snapshot_db`]): the stored mtimes are the source tree's
-    /// and say nothing about this tree's files, so the mtime fast path is
-    /// bypassed and every file is content-hash-checked exactly once —
-    /// deterministic, so a same-millisecond coincidence between the source
-    /// tree's last write and this tree's checkout can never skip a changed
-    /// file (review LOW-3, 2026-09-08).
-    pub fn index_seeded(&self, progress: Option<&dyn Fn(usize, usize)>) -> Result<IndexStats> {
-        self.index_inner(progress, false)
-    }
-
-    fn index_inner(
-        &self,
-        progress: Option<&dyn Fn(usize, usize)>,
-        trust_mtime: bool,
-    ) -> Result<IndexStats> {
+    fn index_inner(&self, progress: Option<&dyn Fn(usize, usize)>) -> Result<IndexStats> {
         self.indexing.store(true, Ordering::Relaxed);
         let _indexing = IndexFlagGuard(&self.indexing);
         let started = std::time::Instant::now();
@@ -596,7 +547,7 @@ impl CodeGraph {
                                 break;
                             };
                             if let Some(entry) =
-                                extract_job(path, rel, trust_mtime, stored, &mut parsers)
+                                extract_job(path, rel, stored, &mut parsers)
                             {
                                 out.push((i, entry));
                             }
@@ -1151,7 +1102,6 @@ fn worker_count() -> usize {
 fn extract_job(
     path: &Path,
     rel: &str,
-    trust_mtime: bool,
     stored: &HashMap<String, FileMeta>,
     parsers: &mut ParserCache,
 ) -> Option<UpsertEntry> {
@@ -1162,9 +1112,6 @@ fn extract_job(
     // hash comparison, so editors that touch a file without changing
     // its content still don't trigger a re-parse. This turns a full
     // project re-read into a stat-only sweep on steady-state passes.
-    // Seeded passes pass `trust_mtime = false`: stored mtimes from
-    // another tree are meaningless for this tree's files (see
-    // [`CodeGraph::index_seeded`]).
     let disk_mtime = mtime_of(path);
     let meta = stored.get(rel);
     let stored_hash = meta.and_then(|m| m.content_hash.as_deref());
@@ -1174,8 +1121,7 @@ fn extract_job(
     // The extract-version clause keeps the fast path honest for the
     // version backfill (plan 0d53d659): an unchanged mtime alone must not
     // skip a file whose rows predate the current extractor.
-    if trust_mtime
-        && stored_mtime == Some(disk_mtime)
+    if stored_mtime == Some(disk_mtime)
         && has_content
         && stored_hash.is_some()
         && indexed_version == Some(schema::EXTRACTOR_VERSION)
@@ -2059,66 +2005,6 @@ mod tests {
         // the backfill never fires perpetually.
         let stats = graph.index(None).unwrap();
         assert_eq!(stats.files_reindexed, 0);
-    }
-
-    /// Run-all worktree seeding (2026-09-08 performance LOW-2 lever b): a
-    /// [`snapshot_db`] copy of one tree's DB, opened over a second tree
-    /// where exactly ONE file changed, must re-parse exactly that file —
-    /// the seeded pass bypasses the mtime fast path (stored mtimes are the
-    /// source tree's, meaningless here), so every file is content-hash
-    /// checked and the seeded rows for unchanged files answer queries
-    /// identically to a cold build. Tree A's graph stays open across the
-    /// snapshot so its committed rows live in the un-checkpointed WAL —
-    /// pinning the live-WAL consistency property that motivated VACUUM
-    /// INTO over a plain file copy (review LOW-4, 2026-09-08).
-    #[test]
-    fn snapshot_db_seeds_and_reindexes_only_changed_files() {
-        // Tree A ("the main tree"): two source files, cold-indexed on disk.
-        let dir_a = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir_a.path().join(".coding")).unwrap();
-        std::fs::write(dir_a.path().join("a.rs"), "pub fn alpha() -> u32 { 1 }\n")
-            .unwrap();
-        std::fs::write(dir_a.path().join("b.rs"), "pub fn beta() -> u32 { 2 }\n")
-            .unwrap();
-        let db_a = dir_a.path().join(".coding/codegraph.db");
-        // Held open for the whole test: with the connection alive the
-        // committed rows sit in the un-checkpointed WAL (a DB this small
-        // never hits the 1000-page auto-checkpoint), so the snapshot below
-        // MUST read through the WAL — a naive db-only fs::copy would yield
-        // an empty DB and the `files_reindexed == 1` assertion would fail.
-        let graph_a = CodeGraph::open(dir_a.path().to_path_buf(), &db_a).unwrap();
-        let stats_a = graph_a.index(None).unwrap();
-        assert_eq!(stats_a.files_reindexed, 2, "cold pass parses both files");
-        assert!(graph_a.symbol_exists("alpha"));
-        assert!(graph_a.symbol_exists("beta"));
-
-        // Tree B ("the worktree"): a.rs IDENTICAL, b.rs changed. Seed B's
-        // DB from A's snapshot, then run the seeded index pass — it
-        // bypasses the mtime fast path by design, so every file is
-        // read+hashed and only the hash-mismatched b.rs re-parses.
-        let dir_b = tempfile::tempdir().unwrap();
-        std::fs::write(dir_b.path().join("a.rs"), "pub fn alpha() -> u32 { 1 }\n")
-            .unwrap();
-        std::fs::write(dir_b.path().join("b.rs"), "pub fn beta2() -> u32 { 3 }\n")
-            .unwrap();
-        let db_b = dir_b.path().join(".coding/codegraph.db");
-        snapshot_db(&db_a, &db_b).unwrap();
-        let graph = CodeGraph::open(dir_b.path().to_path_buf(), &db_b).unwrap();
-        let stats = graph.index_seeded(None).unwrap();
-        assert_eq!(stats.files_scanned, 2, "the sweep reads+hashes every file");
-        assert_eq!(
-            stats.files_reindexed, 1,
-            "exactly the changed file re-parses"
-        );
-        // The seeded rows answer for the unchanged file; the changed
-        // file's new symbol is found and its old one is gone — identical
-        // to a cold build over tree B.
-        assert!(
-            graph.symbol_exists("alpha"),
-            "unchanged file answered from the seeded rows"
-        );
-        assert!(graph.symbol_exists("beta2"));
-        assert!(!graph.symbol_exists("beta"));
     }
 
     /// Backlog 5a85e36c (plan 85368a1f): the initial index pass must stay

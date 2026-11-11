@@ -667,6 +667,7 @@ pub fn run() {
             safety_settings::safety_settings_get,
             safety_settings::save_safety_mode,
             safety_settings::save_safety_rules,
+            safety_settings::save_git_approval,
             mcp_settings::mcp_settings_get,
             mcp_settings::mcp_settings_save,
             mcp_settings::mcp_settings_test,

@@ -459,11 +459,9 @@ fn build_workflow_stages_each_macos_dmg() {
 /// release job's token is `contents: write`. SHA pins make the executed commit
 /// immutable.
 ///
-/// The documented exception is `dtolnay/rust-toolchain@stable`: that action
-/// reads its own ref to choose the toolchain (`@stable`, `@nightly`,
-/// `@1.75.0`, …) and publishes no version tags, so a SHA pin would break it.
-/// Because of that exception the repo-level "require SHA pinning" Actions
-/// setting stays off (it would reject the rust-toolchain step).
+/// There are no exceptions: Rust is installed by `rustup toolchain install`
+/// from rust-toolchain.toml, not by an action, so the repo-level "require SHA
+/// pinning" Actions setting can be on.
 ///
 /// The guard enumerates `.github/workflows/` itself — every `*.yml`/`*.yaml`
 /// file found there is checked, so a workflow file added later is covered
@@ -472,7 +470,7 @@ fn build_workflow_stages_each_macos_dmg() {
 /// instead of passing vacuously.
 #[test]
 fn workflows_pin_actions_to_full_shas() {
-    const ALLOWED_UNPINNED: [&str; 1] = ["dtolnay/rust-toolchain@stable"];
+    const ALLOWED_UNPINNED: [&str; 0] = [];
     let root = env!("CARGO_MANIFEST_DIR");
     let workflows_dir = format!("{root}/.github/workflows");
     let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&workflows_dir)
@@ -623,5 +621,171 @@ fn ci_workflow_gates_pull_requests_with_clippy_and_tests() {
     assert!(
         text.contains("\npermissions:\n  contents: read\n"),
         "ci.yml must scope the GITHUB_TOKEN to exactly contents: read"
+    );
+}
+
+/// One Rust version for local builds and CI, pinned in `rust-toolchain.toml`.
+///
+/// CI used to install whatever stable Rust was current
+/// (`dtolnay/rust-toolchain@stable`) while a developer machine could sit on an
+/// older release, so a new stable could turn the PR gate red on clippy lints
+/// alone (build run 42067076616, the 1.95 lint storm, PR #118's 1.99.1
+/// lints). The committed channel makes a bump a deliberate one-line change,
+/// and a bare `rustup toolchain install` installs its channel and components
+/// on any dev machine and on every runner (rustup >= 1.28, which the GitHub
+/// runners ship).
+///
+/// The guard fails when the file goes missing, pins a floating channel
+/// ("stable"/"beta"/"nightly") or an incomplete `major.minor`, drops clippy,
+/// declares `targets` (that would fetch the Apple std libraries on every
+/// Windows machine and runner), or when a workflow reintroduces
+/// `dtolnay/rust-toolchain` or runs cargo without installing the pinned
+/// toolchain first. The macOS job must add its cross-build target itself.
+#[test]
+fn rust_toolchain_is_pinned_for_local_and_ci() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let rel = "rust-toolchain.toml";
+    let text = std::fs::read_to_string(format!("{root}/{rel}")).unwrap_or_else(|e| {
+        panic!(
+            "{rel} is missing at the repo root ({e}): local cargo commands and \
+             every CI job take their Rust version from it"
+        )
+    });
+
+    // An exact version, not a floating channel: "stable"/"beta"/"nightly" and
+    // an incomplete "1.99" all let a new release in without a commit.
+    let channel = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("channel = "))
+        .unwrap_or_else(|| panic!("{rel} declares no `channel = \"...\"` line"));
+    let channel = channel.trim().trim_matches('"');
+    let parts: Vec<&str> = channel.split('.').collect();
+    let exact_version = parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+    assert!(
+        exact_version,
+        "{rel} pins channel {channel:?}: use an exact three-part version such \
+         as \"1.99.1\" — \"stable\", \"beta\", \"nightly\" and \"1.99\" all \
+         let a new Rust release in without a commit"
+    );
+
+    let components = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("components"))
+        .unwrap_or_else(|| panic!("{rel} declares no `components` line"));
+    assert!(
+        components.contains("\"clippy\""),
+        "{rel} must list clippy in `components` — every CI job runs `cargo \
+         clippy` under #![deny(warnings)]: {components}"
+    );
+
+    // A `targets` KEY, not the substring: the bump comment above names the
+    // `--all-targets` clippy runs, and only a key makes rustup fetch std
+    // libraries (the macOS job adds aarch64-apple-darwin itself).
+    assert!(
+        !text
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("targets")),
+        "{rel} must not declare a `targets` key: rustup would then download \
+         those std libraries on every machine and runner that reads the file. \
+         The macOS job adds aarch64-apple-darwin itself"
+    );
+
+    // Every workflow that runs cargo must install the pinned toolchain first —
+    // a runner's preinstalled Rust is whatever its image tag happens to carry.
+    let workflows_dir = format!("{root}/.github/workflows");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&workflows_dir)
+        .unwrap_or_else(|e| panic!("{workflows_dir} readable: {e}"))
+        .map(|entry| entry.expect(".github/workflows entry readable").path())
+        .filter(|path| {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+            ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+        })
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        ".github/workflows holds no *.yml/*.yaml workflow files — the \
+         toolchain guard would pass vacuously"
+    );
+    for path in &paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<non-UTF-8 workflow file name>");
+        let workflow_rel = format!(".github/workflows/{name}");
+        let workflow =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{workflow_rel} readable: {e}"));
+        assert!(
+            !workflow.contains("dtolnay/rust-toolchain"),
+            "{workflow_rel} still installs Rust with dtolnay/rust-toolchain — \
+             replace the action with `run: rustup toolchain install`, which \
+             reads {rel}"
+        );
+        // Byte offset of the first cargo command: a `run:` one-liner, or a line
+        // inside a `run: |` block (those carry no `run:` prefix).
+        let mut offset = 0;
+        let mut first_cargo: Option<(usize, String)> = None;
+        for line in workflow.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if first_cargo.is_none()
+                && (trimmed.starts_with("run: cargo ") || trimmed.starts_with("cargo "))
+            {
+                first_cargo = Some((
+                    offset + line.len() - line.trim_start().len(),
+                    trimmed.to_string(),
+                ));
+            }
+            offset += line.len();
+        }
+        if let Some((cargo_at, cargo_line)) = first_cargo {
+            let install_at = workflow.find("rustup toolchain install").unwrap_or_else(|| {
+                panic!(
+                    "{workflow_rel} runs `{cargo_line}` without installing the \
+                     pinned toolchain — add a step `run: rustup toolchain \
+                     install` before it, so the job uses {rel} and not the \
+                     runner's preinstalled Rust"
+                )
+            });
+            assert!(
+                install_at < cargo_at,
+                "{workflow_rel}: `rustup toolchain install` comes after the \
+                 first cargo command (`{cargo_line}`) — the pinned toolchain \
+                 must be installed first"
+            );
+        }
+    }
+
+    // The Apple cross-build target belongs to the macOS job only: rustup would
+    // otherwise download those std libraries on every Windows dev machine.
+    let build_rel = ".github/workflows/build.yml";
+    let build = std::fs::read_to_string(format!("{root}/{build_rel}"))
+        .unwrap_or_else(|e| panic!("{build_rel} readable: {e}"));
+    let macos = job_block(&build, "macos");
+    let target_at = macos
+        .find("rustup target add aarch64-apple-darwin")
+        .unwrap_or_else(|| {
+            panic!(
+                "{build_rel}: the macos job must run `rustup target add \
+                 aarch64-apple-darwin` — without that std the pinned toolchain \
+                 cannot run `npx tauri build --target aarch64-apple-darwin`"
+            )
+        });
+    let build_at = macos
+        .find("npx tauri build --target aarch64-apple-darwin")
+        .unwrap_or_else(|| {
+            panic!(
+                "{build_rel}: the macos job must build with `npx tauri build \
+                 --target aarch64-apple-darwin`"
+            )
+        });
+    assert!(
+        target_at < build_at,
+        "{build_rel}: `rustup target add aarch64-apple-darwin` comes after the \
+         first `npx tauri build --target aarch64-apple-darwin` — add the target \
+         before the build"
     );
 }

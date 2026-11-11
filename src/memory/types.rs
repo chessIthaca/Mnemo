@@ -496,25 +496,36 @@ impl MemoryFilter {
     }
 }
 
+/// Default recency half-life (days) for recall/primer ranking.
+pub const DEFAULT_DECAY_HALF_LIFE_DAYS: f64 = 20.0;
+
+/// Default cap on derived (indexer/captured) records per class in one result
+/// set.
+pub const DEFAULT_DERIVED_PER_CLASS_CAP: usize = 10;
+
 /// The retrieval/indexing scale knobs (Phase 2), live-editable from
 /// Settings → Memory. Persisted as the `[memory]` section of `config.toml`;
 /// the store holds a snapshot that recall and the indexer read per call,
-/// so a Settings save takes effect without a restart. Defaults equal the
-/// historical hardcoded behavior — an untouched config changes nothing.
+/// so a Settings save takes effect without a restart. Defaults mirror the
+/// historical hardcoded behavior for the per-query cap and the budgets; the
+/// decay half-life and the derived per-class cap were raised on 2026-11-11
+/// (see the field docs) — an untouched config otherwise changes nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemorySearchConfig {
     /// Recency half-life (days) for the Ebbinghaus strength decay used in
-    /// recall/primer ranking. Default 7.0 — the historical constant.
+    /// recall/primer ranking. Default [`DEFAULT_DECAY_HALF_LIFE_DAYS`] (20
+    /// days, raised from 7 on 2026-11-11).
     pub decay_half_life_days: f64,
     /// Default per-query result cap when the caller passes no explicit limit
     /// (an explicit filter limit always wins). Default 50 — the effective
     /// ceiling today (the FTS candidate pool is 50).
     pub per_query_cap: usize,
     /// Max DERIVED records of one record type in a single recall result
-    /// (authored records are never capped). Default 5 — the scale backstop
-    /// that keeps thousands of indexer digests from crowding authored
-    /// knowledge out of a result set.
+    /// (authored records are never capped). Default
+    /// [`DEFAULT_DERIVED_PER_CLASS_CAP`] (10, raised from 5 on 2026-11-11) —
+    /// the scale backstop that keeps thousands of indexer digests from
+    /// crowding authored knowledge out of a result set.
     pub derived_per_class_cap: usize,
     /// Digest auto-truncation lengths (chars) for derived/captured digests,
     /// read by the indexer and finish-capture. Defaults mirror
@@ -534,9 +545,9 @@ impl Default for MemorySearchConfig {
     fn default() -> Self {
         // Budgets derive from content_budget() so the two can never drift.
         Self {
-            decay_half_life_days: 7.0,
+            decay_half_life_days: DEFAULT_DECAY_HALF_LIFE_DAYS,
             per_query_cap: 50,
-            derived_per_class_cap: 5,
+            derived_per_class_cap: DEFAULT_DERIVED_PER_CLASS_CAP,
             plan_budget: MemoryRecordType::Plan.content_budget().unwrap_or(400),
             bug_budget: MemoryRecordType::Bug.content_budget().unwrap_or(600),
             spec_budget: MemoryRecordType::Spec.content_budget().unwrap_or(500),
@@ -569,7 +580,7 @@ impl MemorySearchConfig {
             decay_half_life_days: if self.decay_half_life_days.is_finite() {
                 self.decay_half_life_days.clamp(0.1, 365.0)
             } else {
-                7.0
+                DEFAULT_DECAY_HALF_LIFE_DAYS
             },
             per_query_cap: self.per_query_cap.clamp(1, 500),
             derived_per_class_cap: self.derived_per_class_cap.clamp(1, 100),
@@ -1164,5 +1175,31 @@ mod tests {
         assert!(!f.exclude_superseded);
         assert_eq!(f.record_type, Some(MemoryRecordType::Bug));
         assert_eq!(f.title_prefix.as_deref(), Some("BUG: login"));
+    }
+
+    #[test]
+    fn memory_search_config_defaults_are_20_days_and_cap_10() {
+        // The compiled-in [memory] defaults (raised 2026-11-11): a 20-day
+        // recency half-life and a derived per-class cap of 10.
+        let cfg = MemorySearchConfig::default();
+        assert_eq!(cfg.decay_half_life_days, 20.0);
+        assert_eq!(cfg.derived_per_class_cap, 10);
+    }
+
+    #[test]
+    fn clamped_non_finite_half_life_falls_back_to_the_default() {
+        // TOML allows nan/inf; clamped() must fall back to the SAME constant
+        // default() uses so the two values cannot drift apart.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let clamped = MemorySearchConfig {
+                decay_half_life_days: bad,
+                ..MemorySearchConfig::default()
+            }
+            .clamped();
+            assert_eq!(
+                clamped.decay_half_life_days, DEFAULT_DECAY_HALF_LIFE_DAYS,
+                "a non-finite half-life ({bad}) falls back to the default"
+            );
+        }
     }
 }

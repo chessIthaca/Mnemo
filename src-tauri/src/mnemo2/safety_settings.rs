@@ -26,11 +26,20 @@
 //!   check). Read and replaced through `Setup::safety_rules` /
 //!   `Setup::set_safety_rules`; rules are per project, so the editor is
 //!   reported closed without an open lead.
+//! - **Git commands that always ask** — `[git] core_operations` in the same
+//!   `config.toml`: the git subcommands that force the approval prompt even
+//!   in an auto-approve mode or when a rule matches (`Tool::never_auto_for`,
+//!   enforced on the `GitTool` and the shell's git guard). Saved through the
+//!   same `Setup::patch_settings` call, which pushes the list into the live
+//!   factory (`src/headless/setup.rs:593`), so an open lead's very next git
+//!   call follows it — no restart. Machine-global, so the field shows with
+//!   or without a project; team workers never prompt in any case.
 //!
 //! Every write is validated first: the mode by the shared settings
 //! validator, each rule's literal pattern by the kernel's own
 //! `Rule::new` (a typo'd regex would otherwise save fine and silently
-//! never match).
+//! never match), and each git subcommand by [`validate_git_approval`] (a
+//! wrong word would save fine and never gate anything).
 
 use std::path::Path;
 
@@ -48,8 +57,9 @@ use crate::mnemo2::runtime::LeadRuntime;
 // ── Wire shape (the `safety_settings_get` snapshot) ─────────────────────────
 
 /// The Safety page's snapshot: the saved `[general] safety` mode, the open
-/// project's rules (empty without one), and the two hints the page needs to
-/// stay honest about when a save takes effect.
+/// project's rules (empty without one), the machine-global git approval
+/// list, and the two hints the page needs to stay honest about when a save
+/// takes effect.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SafetySettingsWire {
     /// The saved mode's kebab-case word (`approve-each-action`, …) — exactly
@@ -58,6 +68,10 @@ pub struct SafetySettingsWire {
     /// `<project>/.coding/safety.toml`, in file order. Empty when no
     /// project is open (there is no file to read).
     pub rules: Vec<SafetyRuleDto>,
+    /// `[git] core_operations`: git subcommands the lead always asks about
+    /// before running, even in an auto-approve mode or when a rule matches.
+    /// Machine-global (config.toml), so it shows with or without a project.
+    pub git_approval: Vec<String>,
     /// Whether a project is open — the rules are per project, so the
     /// editor is off without one.
     pub project_open: bool,
@@ -103,6 +117,37 @@ fn validate_rules(rules: &[SafetyRuleDto]) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate and normalize `[git] core_operations` before it is saved. Each
+/// entry must name one git subcommand (`merge`, `push`, `rebase`, …): an
+/// ASCII letter or digit first, then ASCII letters, digits and `-`. Case and
+/// surrounding spaces fold, empties drop, and duplicates keep their
+/// first-seen order. An empty list is valid — nothing forces a prompt, and
+/// the mode and rules decide.
+fn validate_git_approval(ops: &[String]) -> Result<Vec<String>, String> {
+    let mut clean: Vec<String> = Vec::new();
+    for raw in ops {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let folded = entry.to_lowercase();
+        let mut chars = folded.chars();
+        let valid = chars
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+            && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+        if !valid {
+            return Err(format!(
+                "\"{entry}\" is not a git subcommand — use one word, like merge or push."
+            ));
+        }
+        if !clean.contains(&folded) {
+            clean.push(folded);
+        }
+    }
+    Ok(clean)
+}
+
 /// Save `[general] safety` through the shared patch pipeline (validation +
 /// persist + the live handle on an open lead).
 async fn save_mode(setup: &Setup, mode: &str) -> Result<(), String> {
@@ -127,6 +172,17 @@ async fn save_rules(
         .map_err(|err| err.to_string())
 }
 
+/// Save `[git] core_operations` through the shared patch pipeline
+/// (validation + persist + the live factory's list on an open lead).
+async fn save_git_approval_list(setup: &Setup, ops: Vec<String>) -> Result<(), String> {
+    let clean = validate_git_approval(&ops)?;
+    let patch = SettingsSaveDto {
+        core_operations: Some(clean),
+        ..SettingsSaveDto::default()
+    };
+    setup.patch_settings(patch).await.map_err(|err| err.to_string())
+}
+
 /// Read the page snapshot from a `Setup` on the lead's (or the machine
 /// global) config dir. `runtime` is `Some` when a lead is open: its
 /// workspace root is the project whose rules are shown, and its engine
@@ -143,6 +199,7 @@ async fn read_snapshot(
     Ok(SafetySettingsWire {
         mode: safety_mode_word(config.general.general.safety).to_string(),
         rules,
+        git_approval: config.general.git.core_operations.clone(),
         project_open: runtime.is_some(),
         live_lead: runtime.is_some(),
     })
@@ -170,6 +227,19 @@ pub async fn save_safety_mode(
 ) -> Result<SafetySettingsWire, String> {
     let (setup, runtime) = settings_setup(&state).await?;
     save_mode(&setup, &mode).await?;
+    read_snapshot(&setup, runtime.as_deref()).await
+}
+
+/// Save `[git] core_operations` (the git commands that always ask) and
+/// return the fresh snapshot. Machine-global: works without an open
+/// project; on an open lead the next git call follows it — no restart.
+#[tauri::command]
+pub async fn save_git_approval(
+    state: State<'_, Mnemo2State>,
+    operations: Vec<String>,
+) -> Result<SafetySettingsWire, String> {
+    let (setup, runtime) = settings_setup(&state).await?;
+    save_git_approval_list(&setup, operations).await?;
     read_snapshot(&setup, runtime.as_deref()).await
 }
 
@@ -243,6 +313,63 @@ mod tests {
         assert!(!wire.live_lead);
         assert!(!wire.project_open);
         assert!(wire.rules.is_empty());
+    }
+
+    /// A config with no `[git]` section still shows the historical default
+    /// list, so the page never opens on an empty field by accident.
+    #[tokio::test]
+    async fn snapshot_reports_the_default_git_approval_list() {
+        let (_dir, setup) = fixture();
+        let wire = read_snapshot(&setup, None).await.expect("snapshot");
+        assert_eq!(wire.git_approval, vec!["merge", "push"]);
+    }
+
+    /// Saved entries fold (case, spaces), drop empties and duplicates, and
+    /// land in `config.toml` under `[git] core_operations` — the key the
+    /// factory's live list is reloaded from.
+    #[tokio::test]
+    async fn save_git_approval_persists_cleaned_and_reads_back() {
+        let (dir, setup) = fixture();
+        save_git_approval_list(
+            &setup,
+            vec!["merge".into(), " push ".into(), "Rebase ".into(), "push".into()],
+        )
+        .await
+        .expect("save the list");
+        let config = Config::load(dir.path()).expect("reload config");
+        assert_eq!(
+            config.general.git.core_operations,
+            vec!["merge", "push", "rebase"]
+        );
+        let wire = read_snapshot(&setup, None).await.expect("snapshot");
+        assert_eq!(wire.git_approval, vec!["merge", "push", "rebase"]);
+    }
+
+    /// An empty list saves: nothing forces a prompt, and the mode and rules
+    /// decide.
+    #[tokio::test]
+    async fn save_git_approval_accepts_an_empty_list() {
+        let (dir, setup) = fixture();
+        save_git_approval_list(&setup, Vec::new())
+            .await
+            .expect("save an empty list");
+        let config = Config::load(dir.path()).expect("reload config");
+        assert!(config.general.git.core_operations.is_empty());
+    }
+
+    /// A malformed entry is refused before the pipeline runs, so the file on
+    /// disk is untouched and the error names what to fix.
+    #[tokio::test]
+    async fn save_git_approval_rejects_a_non_subcommand_and_leaves_the_file_alone() {
+        let (dir, setup) = fixture();
+        let path = dir.path().join("config.toml");
+        let before = std::fs::read_to_string(&path).expect("read config.toml");
+        let err = save_git_approval_list(&setup, vec!["push --force".into()])
+            .await
+            .expect_err("a malformed entry is rejected");
+        assert!(err.contains("push --force"), "the error names it: {err}");
+        let after = std::fs::read_to_string(&path).expect("reread config.toml");
+        assert_eq!(after, before, "the rejection wrote nothing");
     }
 
     #[tokio::test]

@@ -60,14 +60,13 @@ describe("layaSettings", () => {
     expect(createLayaTransport()).toBeNull();
   });
 
-  it("lists the six switches with one plain sentence each, and never the routing flag", () => {
+  it("lists the five switches with one plain sentence each, and never the routing flag", () => {
     expect(LAYA_FLAG_META.map((flag) => flag.key)).toEqual([
       "auto_type_memories",
       "failure_triage",
       "failure_triage_knn",
       "steer_tool_choice",
       "reflex",
-      "auto_finetune",
     ]);
     // Every flag carries a plain one-line explanation.
     for (const flag of LAYA_FLAG_META) expect(flag.explanation.trim()).not.toBe("");

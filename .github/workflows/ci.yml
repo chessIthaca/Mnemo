@@ -38,12 +38,8 @@ jobs:
 
       - name: Install npm deps
         run: npm ci --no-audit --no-fund
-      - name: Build the Mnemo1 frontend
-        run: npm run build
       - name: Build the Mnemo2 frontend (runs svelte-check)
         run: npm run build:mnemo2
-      - name: Frontend unit tests
-        run: npm test --workspace frontend
       - name: Mnemo2 unit tests
         run: npm test --workspace mnemo2
       - name: Clippy for the workspace

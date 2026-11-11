@@ -4,8 +4,8 @@
 
 //! Mnemo2's hang watchdog wiring.
 //!
-//! The watchdog itself is shared with Mnemo1
-//! ([`crate::watchdog`](crate::watchdog)); this module owns Mnemo2's side:
+//! The watchdog itself lives in
+//! [`crate::watchdog`](crate::watchdog); this module owns Mnemo2's side:
 //! it starts the detector once on the main thread during setup, points its
 //! reports at the open project's `.coding/logs` (a temp folder until a
 //! project opens) and stops it when the exit begins, so the app's own

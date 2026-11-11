@@ -29,8 +29,7 @@ governed_files:
     - src-tauri/src/mnemo2/dispatch_routing.rs
     - src-tauri/src/mnemo2/route_eval.rs
     - src-tauri/src/mnemo2/laya_settings.rs
-    - src-tauri/src/ipc/finetune.rs
-    - src-tauri/src/bin/mnemo2_route_eval.rs
+    - src-tauri/mnemo2-app/examples/mnemo2_route_eval.rs
     - src/agent/route_question.rs
     - src/agent/route_knn.rs
     - src/agent/model_routing.rs

@@ -12,8 +12,8 @@
 //! The marker is best-effort — `write` failures (read-only project, disk
 //! trouble) must never block startup. Stale markers from dead instances are
 //! ignored: `conflict_for` consults a caller-supplied aliveness predicate
-//! (`startup::instance_pid_alive` in the app — Windows `OpenProcess` +
-//! exit-code probe, elsewhere a `ps` check) instead of enumerating
+//! (`pid_alive` in this module — Windows `OpenProcess` + exit-code probe,
+//! elsewhere a `ps` check) instead of enumerating
 //! processes here, which keeps this module platform-neutral and
 //! unit-testable. On Windows the probe must go deeper than OpenProcess: an
 //! exited process keeps its kernel object while any process still holds a

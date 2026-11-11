@@ -4,29 +4,34 @@
 
 #![deny(warnings)]
 
-//! The Mnemo desktop shells' reusable library surface.
+//! The Mnemo2 desktop host's reusable library surface.
 //!
-//! The Mnemo1 Tauri shell remains a standalone binary (`main.rs`); this
-//! library exposes the intentionally separate Mnemo2 host without pulling
-//! Mnemo1's larger IPC surface into the Mnemo2 binary.
+//! Mnemo1 is retired; the `mnemo2-app` package links this crate (with the
+//! `mnemo2` feature) to build the Mnemo2 desktop app.
 
-// Tauri supplies resource.lib to binaries but not to a library's unit-test
-// target. Link the manifest here too so TaskDialogIndirect resolves to COMCTL32 v6.
+// Tauri compiles the Windows resource (COMCTL32 v6 manifest + versioninfo +
+// icon) into OUT_DIR/resource.lib and — now that this package is a library —
+// embed-resource links it with a PROPAGATING `cargo:rustc-link-lib` that
+// would double-manifest every downstream binary (mnemo2-app ships its own).
+// build.rs therefore moves the real file to resource-tests.lib and leaves an
+// empty stub at the propagated path; link the real one here so the
+// feature-gated unit tests (which import TaskDialogIndirect) keep their
+// manifest.
 #[cfg(all(windows, test, feature = "mnemo2"))]
-#[link(name = "resource", kind = "static")]
+#[link(name = "resource-tests", kind = "static")]
 extern "C" {}
 
-/// Per-instance WebView2 user-data-dir arbitration shared by both shells.
+/// Per-instance WebView2 user-data-dir arbitration for the Mnemo2 host.
 pub mod webview_udf;
 
-/// Same-project instance markers shared by both shells.
+/// Same-project instance markers used by the Mnemo2 host and its MCP helper.
 pub mod instance_marker;
 
-/// The hang watchdog both shells use: freeze reports for a stalled main thread.
+/// The hang watchdog: freeze reports for a stalled main thread.
 pub mod watchdog;
 
 /// The Mnemo2 desktop host: a minimal Tauri shell around the headless
-/// engine's lead session. Gated by the `mnemo2` feature so the Mnemo1 main
-/// binary does not link its Tauri context.
+/// engine's lead session. Gated by the `mnemo2` feature; the `mnemo2-app`
+/// package enables it.
 #[cfg(feature = "mnemo2")]
 pub mod mnemo2;

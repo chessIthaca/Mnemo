@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 /// Roots scanned, relative to the repo root.
-const ROOTS: &[&str] = &["src", "src-tauri/src", "frontend/src", "tests"];
+const ROOTS: &[&str] = &["src", "src-tauri/src", "mnemo2/src", "tests"];
 
 /// Directory names skipped anywhere in the walk.
 const SKIP_DIRS: &[&str] = &[

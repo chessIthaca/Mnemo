@@ -4,13 +4,9 @@
   "license": "MIT",
   "version": "2.2.0",
   "workspaces": [
-    "frontend",
     "mnemo2"
   ],
   "scripts": {
-    "start": "node scripts/start.mjs",
-    "dev": "npm run dev --workspace frontend",
-    "build": "npm run build --workspace frontend",
     "dev:mnemo2": "npm run dev --workspace mnemo2",
     "build:mnemo2": "npm run build --workspace mnemo2",
     "dev:mnemo2:native": "cargo run -p mnemo2-app --bin mnemo2",

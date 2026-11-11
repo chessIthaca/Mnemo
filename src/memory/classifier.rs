@@ -159,11 +159,10 @@ pub enum ClassifierStatus {
     /// `Failed` (timeout/crash) follows.
     Starting,
     /// The startup failure-triage fine-tune is running in the background
-    /// (managed mode, the `auto_finetune` opt-in): the sidecar keeps
-    /// serving the current checkpoint. On success the server restarts
-    /// against the fine-tuned artifact (`Starting` → `Ready`); on any skip
-    /// the status returns to `Ready` — only a still-own `FineTuning` is
-    /// ever overwritten by the restore.
+    /// (managed mode): the sidecar keeps serving the current checkpoint. On
+    /// success the server restarts against the fine-tuned artifact
+    /// (`Starting` → `Ready`); on any skip the status returns to `Ready` —
+    /// only a still-own `FineTuning` is ever overwritten by the restore.
     FineTuning {
         /// Human-facing description (the checkpoint id being fine-tuned).
         label: String,

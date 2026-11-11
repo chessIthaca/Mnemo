@@ -72,7 +72,6 @@ function status(overrides: Partial<LayaStatus> = {}): LayaStatus {
       auto_type_memories: false,
       failure_triage: false,
       failure_triage_knn: false,
-      auto_finetune: false,
       steer_tool_choice: false,
       routing: true,
       reflex: false,

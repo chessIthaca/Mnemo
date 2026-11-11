@@ -26,7 +26,6 @@ const READY: LayaStatus = {
     auto_type_memories: true,
     failure_triage: true,
     failure_triage_knn: false,
-    auto_finetune: true,
     steer_tool_choice: false,
     routing: true,
     reflex: false,

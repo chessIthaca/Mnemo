@@ -16,22 +16,20 @@ export const LAYA_EVENT_CHANNEL = "mnemo2://laya-event";
 
 // ── Wire shapes ─────────────────────────────────────────────────────────────
 
-/** One of the seven `[general.laya]` opt-in flags the page manages. */
+/** One of the six `[general.laya]` opt-in flags the page manages. */
 export type LayaFlagKey =
   | "auto_type_memories"
   | "failure_triage"
   | "failure_triage_knn"
-  | "auto_finetune"
   | "steer_tool_choice"
   | "routing"
   | "reflex";
 
-/** The seven `[general.laya]` opt-in flags as `laya_status` reports them. */
+/** The six `[general.laya]` opt-in flags as `laya_status` reports them. */
 export interface LayaFlags {
   auto_type_memories: boolean;
   failure_triage: boolean;
   failure_triage_knn: boolean;
-  auto_finetune: boolean;
   steer_tool_choice: boolean;
   routing: boolean;
   reflex: boolean;
@@ -120,11 +118,6 @@ export const LAYA_FLAG_META: readonly LayaFlagMeta[] = [
     key: "reflex",
     label: "Reflex (plan-step tiers, Mnemo1)",
     explanation: "Each Mnemo1 plan step runs on the tier Laya picks for it.",
-  },
-  {
-    key: "auto_finetune",
-    label: "Auto fine-tune (Mnemo1)",
-    explanation: "Mnemo1 retrains Laya on your local logs at startup, in the background, once enough new failures have been logged.",
   },
 ];
 

@@ -170,7 +170,6 @@ function makeLayaTransport() {
         auto_type_memories: true,
         failure_triage: false,
         failure_triage_knn: false,
-        auto_finetune: false,
         steer_tool_choice: false,
         routing: true,
         reflex: false,

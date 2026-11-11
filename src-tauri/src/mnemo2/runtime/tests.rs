@@ -7995,6 +7995,7 @@ async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker
     // summarizes first.
     let (release1, gate1) = tokio::sync::oneshot::channel();
     let (release4, gate4) = tokio::sync::oneshot::channel();
+    let (release_summary, gate_summary) = tokio::sync::oneshot::channel();
     let (release_last, gate_last) = tokio::sync::oneshot::channel();
     let mut turns = vec![StubTurn {
         body: stub_message_parent_turn(1),
@@ -8015,12 +8016,17 @@ async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker
         gate: Some(gate4),
     });
     // The deferred swap's summarization call, served by the OLD model.
+    // GATED: when the kernel decides the conversation needs a summary,
+    // the test releases it explicitly; when it skips summarization, the
+    // FIRST model-b request takes this turn instead — so whichever
+    // request reaches it is held either way.
     turns.push(StubTurn {
         body: stub_text_turn("Summary of the earlier work."),
-        gate: None,
+        gate: Some(gate_summary),
     });
-    // The post-swap request, held so the record is inspected while the
-    // worker is genuinely working on the new model.
+    // The post-swap request on the summarized path, held so the record
+    // is inspected while the worker is genuinely working on the new
+    // model.
     turns.push(StubTurn {
         body: stub_text_turn("done on the new model"),
         gate: Some(gate_last),
@@ -8080,20 +8086,33 @@ async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker
         "the worker keeps working through the deferred switch: {switched:?}"
     );
 
-    // Release request 4: when the deferred swap decided the conversation
-    // needs one, the turn loop first sends a summarization request to the
-    // OLD model; either way the next request then serves the NEW model and
-    // is held (the test's last stub turn) so the record can be inspected
-    // while the worker is genuinely working on the new model.
+    // Release request 4 and observe which path the deferred swap took —
+    // the kernel decides either way. Summary sent: the summarization
+    // request arrives on the OLD model, the test releases it, and the
+    // next request then serves the NEW model, held by the test's last
+    // stub turn. Summary skipped: the swap completes silently and the
+    // FIRST model-b request takes the gated summary turn instead, so
+    // it is held there. Either way the record is inspected while the
+    // worker is genuinely working on the new model.
     release4.send(()).expect("release request 4");
-    for _ in 0..2 {
-        if stub.models().last().map(String::as_str) == Some("model-b") {
-            break;
-        }
+    tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
+        .await
+        .expect("a request arrives after the switch");
+    let summarized = stub.models().last().map(String::as_str) == Some("model-a");
+    // Whichever stub turn ends up holding the first model-b request: the
+    // last turn when the summary ran first, the summary turn itself
+    // when the swap skipped summarization (that request took it).
+    let release_model_b = if summarized {
+        release_summary
+            .send(())
+            .expect("release the summarization response");
         tokio::time::timeout(Duration::from_secs(30), stub.next_arrival())
             .await
-            .expect("a request arrives after the switch");
-    }
+            .expect("the model-b request arrives");
+        release_last
+    } else {
+        release_summary
+    };
     assert_eq!(
         stub.models().last().map(String::as_str),
         Some("model-b"),
@@ -8140,7 +8159,10 @@ async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker
         stub.models()
     );
 
-    release_last.send(()).expect("release the final response");
+    // Release whichever stub turn holds the model-b request: the last
+    // turn on the summarized path, the summary turn the first model-b
+    // request took when the swap skipped summarization.
+    release_model_b.send(()).expect("release the model-b response");
     let settled = wait_for_worker_status(
         &team,
         "worker0001",

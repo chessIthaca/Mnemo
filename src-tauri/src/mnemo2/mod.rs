@@ -663,6 +663,7 @@ pub fn run() {
             ipc::project_cleanup,
             ipc::workbench_diff,
             ipc::workbench_screenshot,
+            ipc::workbench_tool_image,
             ipc::workbench_preferences,
             ipc::workbench_preferences_set,
             files_view::files_list,

@@ -13,14 +13,14 @@ use crate::host::maintenance::{should_forward_progress, PROGRESS_EVERY};
 /// The Tauri event channel the STARTUP indexing pass (main.rs) and the
 /// create-project seed pass (ipc/projects.rs) stream file progress on, so the
 /// open-project overlay can show a progress bar + "N/M files indexed"
-/// counter. Distinct from [`REINDEX_CHANNEL`] (the Settings card's manual
-/// rebuild) so the two UIs never fold each other's traffic.
+/// counter. Distinct from the app crate's `REINDEX_CHANNEL` (the Settings
+/// card's manual rebuild) so the two UIs never fold each other's traffic.
 pub const INDEX_PROGRESS_CHANNEL: &str = "codegraph://index-progress";
 
 /// An event on the [`INDEX_PROGRESS_CHANNEL`] stream — the indexing progress
 /// behind the open-project overlay. The same `"type"`-tagged, kebab-case
-/// shape as [`ReconcileEvent`] (memory_maintenance.rs), but with NO `phase`
-/// field: a code index has exactly one phase. Pinned by
+/// shape as [`ReconcileEvent`](crate::host::maintenance::ReconcileEvent),
+/// but with NO `phase` field: a code index has exactly one phase. Pinned by
 /// `index_progress_event_wire_shape`; the frontend folds it via
 /// `applyIndexProgress` in IndexingOverlay.tsx.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,10 +98,10 @@ static STARTUP_INDEX_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// (re)created on every app start AND every project switch; React mounts and
 /// subscribes some time after the startup pass has already begun, so events
 /// emitted before the subscription are lost. The pass mirrors its live
-/// progress here so a late-mounting overlay can fetch a snapshot via
-/// [`get_index_progress`] and catch up. Only the startup pass records — the
-/// Settings-card maintenance stream and the Graph-tab refresh have their own
-/// always-mounted UIs and never touch it.
+/// progress here so a late-mounting overlay can fetch a snapshot via the
+/// app crate's `get_index_progress` command and catch up. Only the startup
+/// pass records — the Settings-card maintenance stream and the Graph-tab
+/// refresh have their own always-mounted UIs and never touch it.
 pub fn mark_startup_index_active(switched: bool) {
     STARTUP_INDEX_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
     STARTUP_INDEX_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);

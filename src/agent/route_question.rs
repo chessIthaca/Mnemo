@@ -4,9 +4,9 @@
 
 //! The shared Laya routing question (plan 2ba2168a, design §4.3).
 //!
-//! Both routing surfaces — Mnemo2's per-dispatch tier choice and Mnemo1's
-//! once-per-session route — ask Laya the SAME calibrated choice question over
-//! four neutral labels:
+//! Both routing surfaces — Mnemo2's per-dispatch tier choice and the
+//! kernel's once-per-session route — ask Laya the SAME calibrated choice
+//! question over four neutral labels:
 //!
 //! - [`LABEL_TRIVIAL`] — a mechanical edit ([`DESCRIBE_TRIVIAL`]);
 //! - [`LABEL_ROUTINE`] — specified implementation work ([`DESCRIBE_ROUTINE`]);
@@ -50,7 +50,7 @@
 //! order and the provider's call ids ignored) and [`Strikes`] counts
 //! consecutive failed or repeated calls, firing exactly once per streak when
 //! the count reaches its limit. Both live here so Mnemo2's worker pump and
-//! Mnemo1's turn loop share one definition.
+//! the kernel's turn loop share one definition.
 
 use std::collections::BTreeMap;
 
@@ -71,8 +71,8 @@ pub const LABEL_INVOLVED: &str = "involved";
 /// open design decision.
 pub const LABEL_HARD: &str = "hard";
 
-/// The question shown to Laya. One shared string, so Mnemo1 and Mnemo2 ask
-/// byte-identical questions.
+/// The question shown to Laya. One shared string, so both routing surfaces
+/// ask byte-identical questions.
 pub const ROUTE_INSTRUCTIONS: &str =
     "How demanding is this task for a coding agent that has the full spec in front of it?";
 

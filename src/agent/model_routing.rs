@@ -180,12 +180,12 @@ pub fn cap_task_text(text: &str) -> String {
 }
 
 /// The ladder tier id a legacy routing row carried, mapped when read
-/// (plan 87932c46: old routing-log rows keep their bytes). Mnemo1's
-/// pre-ladder `cheap` target IS the `trivial` tier and `capable` IS `high`;
-/// Mnemo2's legacy `simple` / `average` / `difficult` tier ids never appear
-/// in this log, but the ladder owns their stored-data conversion, so route
-/// through it anyway. Every other value -- including all current tier ids --
-/// passes through unchanged.
+/// (plan 87932c46: old routing-log rows keep their bytes). The retired
+/// Mnemo1 app's pre-ladder `cheap` target IS the `trivial` tier and
+/// `capable` IS `high`; Mnemo2's legacy `simple` / `average` / `difficult`
+/// tier ids never appear in this log, but the ladder owns their
+/// stored-data conversion, so route through it anyway. Every other
+/// value -- including all current tier ids -- passes through unchanged.
 fn map_legacy_target_id(raw: Option<String>) -> Option<String> {
     raw.map(|value| match value.as_str() {
         "cheap" => "trivial".to_string(),
@@ -314,7 +314,7 @@ pub fn session_routing_log_path() -> PathBuf {
     training_log_dir().join("session_routing.jsonl")
 }
 
-/// Append-only calibration events for Mnemo1's route-once lifecycle.
+/// Append-only calibration events for the route-once lifecycle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SessionRoutingRow {
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(decision.target, Some(RouteTarget::High));
         let actual = stub.question.lock().expect("question lock").clone();
         let expected = crate::agent::route_question::route_question(offered);
-        assert_eq!(actual, expected, "Mnemo1 asks the kernel question byte-for-byte");
+        assert_eq!(actual, expected, "the per-turn lane asks the shared question byte-for-byte");
     }
 
     #[tokio::test]
@@ -774,8 +774,9 @@ mod tests {
 
     #[test]
     fn legacy_target_labels_map_onto_ladder_ids_when_read() {
-        // Old rows keep their bytes; every reader sees ladder ids (Mnemo1's
-        // pre-ladder `cheap` was the `trivial` tier, `capable` was `high`).
+        // Old rows keep their bytes; every reader sees ladder ids (the
+        // retired Mnemo1 app's pre-ladder `cheap` was the `trivial` tier,
+        // `capable` was `high`).
         let legacy = r#"{"ts":1,"turn_id":"t","agent_id":"main","shadow":true,"label":"trivial","confidence":0.9,"threshold":0.8,"target":"cheap","lane":"cheap","step_index":1,"enforced":false,"task_text":"x"}"#;
         let row: RouteDecisionRow = serde_json::from_str(legacy).expect("legacy row parses");
         assert_eq!(row.target.as_deref(), Some("trivial"));

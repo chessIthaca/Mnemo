@@ -155,7 +155,7 @@ pub struct ConstitutionSize {
     pub present: bool,
     /// The file as written (every scope's text included).
     pub raw: Size,
-    /// What a Mnemo1 Classic session loads.
+    /// What a Classic-workflow session loads.
     pub classic: Size,
     /// What a Mnemo2 lead/worker session loads.
     pub team: Size,

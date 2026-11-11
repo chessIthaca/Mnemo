@@ -2560,10 +2560,10 @@ mod tests {
         // Windows-only (user decision 2026-09-20): the deferral delta is
         // measured on the Windows browser group — the ten offscreen
         // tools plus the image group on a vision-configured install
-        // (11263 chars, 2026-11-12). The on-screen WebView2 tools were
-        // removed with Mnemo1, so no platform-conditional schema weight
-        // remains; the floor below is that measurement rounded down to
-        // the next multiple of 500.
+        // (11263 chars, 2026-11-12). The on-screen WebView2 tools are
+        // gone, so no platform-conditional schema weight remains; the
+        // floor below is that measurement rounded down to the next
+        // multiple of 500.
         #[cfg(all(feature = "browser", windows))]
         {
             // a fully
@@ -3680,7 +3680,7 @@ mod tests {
         }
         let count = registry_len(&factory, &dir);
         // The browser family is feature-gated: 10 offscreen tools on every
-        // platform (the on-screen WebView2 tools were removed with Mnemo1).
+        // platform (the on-screen WebView2 tools are gone).
         // The git pair is repo-gated (2c.3) — the tempdir is not a repo.
         let browser = if cfg!(feature = "browser") { 10 } else { 0 };
         let expected = 26 + browser;
@@ -3775,7 +3775,7 @@ mod tests {
         );
         let count = registry.iter().count();
         // The browser family is feature-gated: 10 offscreen tools on every
-        // platform (the on-screen WebView2 tools were removed with Mnemo1).
+        // platform (the on-screen WebView2 tools are gone).
         // The git pair is repo-gated (2c.3) — the tempdir is not a repo.
         let browser = if cfg!(feature = "browser") { 10 } else { 0 };
         let expected = 25 + browser;

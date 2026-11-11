@@ -708,7 +708,8 @@ pub struct MemoryConsolidateTool {
     /// per built loop, shared with the loop itself (the factory mints it in
     /// `build_inner`). Read at call time so the consolidation LLM calls carry
     /// the calling agent's attribution (`memory_consolidation` purpose);
-    /// empty until the spawn path stamps it (unattributed, Mnemo1).
+    /// empty until the spawn path stamps it (before that, calls are
+    /// unattributed).
     trace_identity: Arc<crate::provider::trace::TraceIdentityHandle>,
 }
 

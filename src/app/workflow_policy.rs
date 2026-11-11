@@ -116,7 +116,8 @@ const STRATEGY_SPAWN_LINE: &str = "- spawn_agent:";
 /// Which workflow this policy runs (`.coding/design/mnemo2.md` Phase 5.1).
 #[derive(Clone)]
 enum WorkflowMode {
-    /// Mnemo1: the plan workflow with a reviewer-written review report.
+    /// The kernel's Classic workflow: the plan workflow with a
+    /// reviewer-written review report.
     Classic,
     /// The Mnemo2 lead: plans live on the plan board, tasks run on
     /// TeamManager workers, and the tool surface is free.
@@ -417,8 +418,8 @@ impl AgentPolicy for WorkflowPolicy {
 /// for `TEAM_CLOSING_SEQUENCE`, the `spawn_agent` strategy line dropped, the
 /// constitution scoped to Team, and the Mnemo2 team rules appended. The
 /// universal rules and strategy are derived from the kernel blocks by string
-/// surgery (so Mnemo1's text stays the single source); a missing marker keeps
-/// the block whole, and a test pins the markers.
+/// surgery (so the kernel's text stays the single source); a missing marker
+/// keeps the block whole, and a test pins the markers.
 fn team_stable_head(k: &KernelPromptBlocks, c: &Constitution) -> String {
     let universal_rules = match k.rules.find(RULES_CLOSING_MARKER) {
         Some(at) => &k.rules[..at],

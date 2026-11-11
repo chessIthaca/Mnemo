@@ -1409,7 +1409,7 @@ C
         assert_eq!(parsed.context, "C");
         assert_eq!(parsed.serialize(), text);
 
-        // Mnemo1 plans carry neither section, and serialize without them.
+        // Older plans carry neither section, and serialize without them.
         let old = PlanFile::new("T", "G", "C", vec!["one".into()]);
         assert!(old.decisions.is_none() && old.progress.is_none());
         assert!(old.interfaces.is_none());

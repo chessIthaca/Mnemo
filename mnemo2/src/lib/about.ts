@@ -17,7 +17,7 @@ import {
   DEPENDENCY_GROUPS,
   type DependencyEntry,
   type DependencyGroup,
-} from "../../../frontend/src/components/about/dependencies";
+} from "./aboutDependencies";
 
 export { APP_LICENSE_URL };
 export type { DependencyEntry, DependencyGroup };

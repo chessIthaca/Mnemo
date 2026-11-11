@@ -1,8 +1,8 @@
 <script lang="ts">
   import { X } from "@lucide/svelte";
   import { get } from "svelte/store";
-  import { parseNumericAnswer } from "../../../frontend/src/lib/answerSelect";
-  import { fileToAttachedDataUrl } from "../../../frontend/src/lib/attachImages";
+  import { parseNumericAnswer } from "../lib/answerSelect";
+  import { fileToAttachedDataUrl } from "../lib/attachImages";
   import { actions, app } from "../lib/store";
   import type { LeadAnswerInput } from "../lib/types";
   import ComposerBox from "./ComposerBox.svelte";

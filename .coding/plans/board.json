@@ -2244,6 +2244,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "CI configuration plus a guard test; no app behaviour or specified capability changes."
+    },
+    {
+      "id": "c96106bb",
+      "status": "closed",
+      "created_at_ms": 1794394434174,
+      "closed_at_ms": 1794395381529,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-c96106bb-20261111-110941.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Lint-only refactors (a dropped borrow, as_chunks in place of chunks_exact, a tuple binding in place of late init). No behaviour change."
     }
   ]
 }

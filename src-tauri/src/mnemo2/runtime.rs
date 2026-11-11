@@ -981,6 +981,12 @@ impl LeadRuntime {
             .start()
             .await
             .map_err(|err| format!("could not start the headless engine: {err}"))?;
+        // The project is open: hang reports now land in its .coding/logs,
+        // and the watchdog notes the milestone for the next report.
+        crate::mnemo2::hang::set_report_dir(crate::mnemo2::hang::project_dir(
+            &self.workspace_root,
+        ));
+        crate::mnemo2::hang::note(format!("project opened: {}", self.workspace_root.display()));
         let ledger = Arc::new(LeadTeamLedger::new(self.team.clone()));
         let reviews_dir = engine.reviews_dir();
         let plans_dir = reviews_dir

@@ -22,6 +22,9 @@ pub mod webview_udf;
 /// Same-project instance markers shared by both shells.
 pub mod instance_marker;
 
+/// The hang watchdog both shells use: freeze reports for a stalled main thread.
+pub mod watchdog;
+
 /// The Mnemo2 desktop host: a minimal Tauri shell around the headless
 /// engine's lead session. Gated by the `mnemo2` feature so the Mnemo1 main
 /// binary does not link its Tauri context.

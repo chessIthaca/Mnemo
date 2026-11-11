@@ -375,8 +375,8 @@ pub struct AgentLoop {
     /// built loop and hands clones to both the loop and the memory tools
     /// (the `dismissed_recall` pattern) — the spawn path stamps it
     /// post-build (pre-registration, before any turn can run), and a loop
-    /// built without a host identity keeps it empty forever (Mnemo1:
-    /// records stay unattributed).
+    /// built without a host identity keeps it empty forever (records stay
+    /// unattributed).
     pub(crate) trace_identity:
         Arc<crate::provider::trace::TraceIdentityHandle>,
     /// This agent's id in the runtime (`AgentManager`), used so the agent's
@@ -693,12 +693,13 @@ pub struct AgentLoop {
     /// conversation messages only, and a model switch rebuilds the head,
     /// so the task survives both byte-for-byte. `None` = ordinary session.
     pub(crate) pinned_task: std::sync::RwLock<Option<String>>,
-    /// Plan 2ba2168a step 1: a session opted out of the pre-prompt routing
-    /// gate at spawn — its turns are never classified and no routing.jsonl
+    /// Plan 2ba2168a step 1: a session opted out of per-turn routing at
+    /// spawn — it enters neither the per-turn router nor the per-step
+    /// reflex lane, so its turns are never classified and no routing.jsonl
     /// rows are written for them (Mnemo2 routes once at dispatch instead).
-    /// `false` = the per-turn gate (Mnemo1, unchanged).
+    /// `false` = both kernel routing gates in force.
     pub(crate) skip_turn_routing: std::sync::atomic::AtomicBool,
-    /// Mnemo1's route lifecycle, epoch, and nudge claim under ONE lock.
+    /// The per-turn route lifecycle, epoch, and nudge claim under ONE lock.
     pub(crate) route_session: Arc<std::sync::Mutex<RouteSessionState>>,
     /// Consecutive failed-or-repeated tool calls behind a stuck nudge.
     pub(crate) strikes: std::sync::Mutex<super::route_question::Strikes>,
@@ -1258,7 +1259,8 @@ impl AgentLoop {
             pinned_task: std::sync::RwLock::new(None),
             // Plan 2ba2168a step 1: false until the spawn path opts the
             // session out (`set_skip_turn_routing`) — every constructor
-            // starts with the per-turn gate in force.
+            // starts with both routing gates (per-turn router and per-step
+            // lane) in force.
             skip_turn_routing: std::sync::atomic::AtomicBool::new(false),
             route_session: Arc::new(std::sync::Mutex::new(RouteSessionState::new())),
             strikes: std::sync::Mutex::new(super::route_question::Strikes::new(3)),
@@ -1304,7 +1306,7 @@ impl AgentLoop {
     }
 
     /// Snapshot the loop's trace identity (`None` = unattributed loop —
-    /// Mnemo1 paths, or a spawn without host identity).
+    /// built without a host identity, or a spawn without host identity).
     pub fn trace_identity(&self) -> Option<crate::provider::trace::TraceIdentity> {
         self.trace_identity.get()
     }
@@ -1321,7 +1323,7 @@ impl AgentLoop {
             task.map(|t| t.trim_end().to_string());
     }
 
-    /// The session's pinned task (`None` = ordinary session — Mnemo1, or a
+    /// The session's pinned task (`None` = an ordinary session, or a
     /// spawn without a task).
     pub fn pinned_task(&self) -> Option<String> {
         self.pinned_task
@@ -1333,15 +1335,17 @@ impl AgentLoop {
     /// Stamp the loop's per-turn-routing skip (plan 2ba2168a step 1) —
     /// called ONCE by the spawn path post-build (pre-registration, before
     /// any turn can run, so no request can race the stamp). `true` marks a
-    /// session that routes once at dispatch (Mnemo2 workers and leads);
-    /// `false` keeps the per-turn gate (Mnemo1).
+    /// session that routes once at dispatch (Mnemo2 workers and leads) and
+    /// enters neither the per-turn router nor the per-step reflex lane;
+    /// `false` keeps both kernel routing gates in force.
     pub fn set_skip_turn_routing(&self, skip: bool) {
         self.skip_turn_routing
             .store(skip, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether this session's turns skip the pre-prompt routing gate
-    /// (`false` = the per-turn gate Mnemo1 runs).
+    /// Whether this session's turns skip the pre-prompt routing gate and
+    /// the per-step reflex lane (`false` = both kernel routing gates in
+    /// force).
     pub fn skip_turn_routing(&self) -> bool {
         self.skip_turn_routing
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1457,7 +1461,7 @@ impl AgentLoop {
     /// Whether the live `[general.laya] routing` opt-in currently exposes a
     /// first-prompt policy FOR THIS LOOP. Subagents and sessions that opted out
     /// of turn routing (Mnemo2 leads/workers route at dispatch) must not write
-    /// Mnemo1 session rows from an external model change.
+    /// per-turn routing session rows from an external model change.
     pub fn session_routing_enabled(&self) -> bool {
         !self.is_subagent()
             && !self.skip_turn_routing()

@@ -1251,9 +1251,11 @@ impl AgentLoop {
     /// Runs before the first request is built. All gates must
     /// hold: the loop carries a routing gate with a live classifier in the
     /// shared slot, the `[general.laya] routing` opt-in is on (the resolver's
-    /// live policy), and the conversation has a user message to classify. The
-    /// decision row is written here; the outcome row is written by the
-    /// returned state's `Drop`.
+    /// live policy), and the conversation has a user message to classify. A
+    /// session that routes once at dispatch (`skip_turn_routing`, set by
+    /// Mnemo2 for its lead and workers) enters neither this per-turn router
+    /// nor the per-step reflex lane. The decision row is written here; the
+    /// outcome row is written by the returned state's `Drop`.
     ///
     /// `None` -- no new first-prompt row -- when routing is settled/off, any
     /// gate is off, or the classifier gives no usable answer. The classifier
@@ -1265,8 +1267,8 @@ impl AgentLoop {
         agent_id: AgentId,
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
     ) -> Option<TurnRoute> {
-        // Spawned sessions and Mnemo2 workers/leads never enter Mnemo1's
-        // session router. In particular they write no routing.jsonl rows.
+        // Spawned sessions and Mnemo2 workers/leads never enter the
+        // per-turn router. In particular they write no routing.jsonl rows.
         if self.is_subagent()
             || self
                 .skip_turn_routing
@@ -1623,19 +1625,32 @@ impl AgentLoop {
     /// The escalation-lane route target for the plan step the agent is on now
     /// (backlog ad56c7bd) — ONE compound-reflex call per step per attempt.
     ///
-    /// Every miss keeps the iteration's pre-existing model: no handle, the
-    /// reflex flag off, a spawned agent, no live routing policy, no active
-    /// step, a below-gate / malformed / unknown-label answer, and an unset or
+    /// A session that routes once at dispatch (`skip_turn_routing`, set by
+    /// Mnemo2 for its lead and workers) enters neither the per-turn router
+    /// nor this lane. Every miss keeps the iteration's pre-existing model:
+    /// no handle, the reflex flag off, a session routed once at dispatch,
+    /// a spawned agent, no live routing policy, no active step, a
+    /// below-gate / malformed / unknown-label answer, and an unset or
     /// dangling `[general.routing]` lane target all return `None` (the
-    /// resolver's own fall-through is the last guard). Shadow mode (`enforce`
-    /// off) classifies and logs but returns `None` — the ladder is validated
-    /// on the corpus before it may ever switch a model. Rows are written
-    /// best-effort; a log failure never fails the turn.
+    /// resolver's own fall-through is the last guard). Shadow mode
+    /// (`enforce` off) classifies and logs but returns `None` — the ladder
+    /// is validated on the corpus before it may ever switch a model. Rows
+    /// are written best-effort; a log failure never fails the turn.
     async fn step_lane_target(&self, agent_id: AgentId) -> Option<model_routing::RouteTarget> {
-        // Fast exits, cheapest first: no handle, flag off, spawned agent, or
-        // no live routing policy -> ZERO classifier calls, byte-identical.
+        // Fast exits, cheapest first: no handle, flag off, a session routed
+        // once at dispatch, a spawned agent, or no live routing policy ->
+        // ZERO classifier calls, byte-identical.
         let handle = self.reflex.as_ref()?;
         if !handle.is_enabled() {
+            return None;
+        }
+        // A session that routes once at dispatch (skip_turn_routing — set
+        // by Mnemo2 for its lead and workers) enters neither the per-turn
+        // router nor this lane.
+        if self
+            .skip_turn_routing
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return None;
         }
         if self.is_subagent() {
@@ -2924,7 +2939,7 @@ impl AgentLoop {
             };
             messages.push(tool_message);
 
-            // Route-once stuck signal (main Mnemo1 session only): three
+            // Route-once stuck signal (main sessions only): three
             // consecutive failed-or-repeated calls may produce ONE suggestion.
             // They never arm a provider switch. The separate previous signature
             // only selects the wording; Strikes owns the exactly-once streak.

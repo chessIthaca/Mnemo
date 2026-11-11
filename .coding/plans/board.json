@@ -2233,6 +2233,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Lint-only rewrites with identical behaviour: a pattern instead of a guard, an equivalent boolean, a no-op drop removed, and two test-only tidy-ups."
+    },
+    {
+      "id": "70e12e6d",
+      "status": "closed",
+      "created_at_ms": 1794385136908,
+      "closed_at_ms": 1794385403224,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-70e12e6d-20261111-082323.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "CI configuration plus a guard test; no app behaviour or specified capability changes."
     }
   ]
 }

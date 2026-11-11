@@ -8,7 +8,7 @@ import Composer from "./Composer.svelte";
 
 const attach = vi.hoisted(() => ({ fileToAttachedDataUrl: vi.fn() }));
 
-vi.mock("../../../frontend/src/lib/attachImages", () => ({
+vi.mock("../lib/attachImages", () => ({
   fileToAttachedDataUrl: attach.fileToAttachedDataUrl,
 }));
 
@@ -452,8 +452,8 @@ describe("Composer", () => {
     // clipboard File -> FileReader -> data URL -> store -> <img> path.
     const actual =
       await vi.importActual<
-        typeof import("../../../frontend/src/lib/attachImages")
-      >("../../../frontend/src/lib/attachImages");
+        typeof import("../lib/attachImages")
+      >("../lib/attachImages");
     attach.fileToAttachedDataUrl.mockImplementation(actual.fileToAttachedDataUrl);
     render(Composer);
 
@@ -500,8 +500,8 @@ describe("Composer", () => {
     // -> <img> path, not a mocked conversion.
     const actual =
       await vi.importActual<
-        typeof import("../../../frontend/src/lib/attachImages")
-      >("../../../frontend/src/lib/attachImages");
+        typeof import("../lib/attachImages")
+      >("../lib/attachImages");
     attach.fileToAttachedDataUrl.mockImplementation(actual.fileToAttachedDataUrl);
     render(Composer);
 

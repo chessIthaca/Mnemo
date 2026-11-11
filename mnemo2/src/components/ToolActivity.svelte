@@ -9,7 +9,7 @@
     shellCallFromArgs,
     toolErrorSummary,
     webFetchUrl,
-  } from "../../../frontend/src/lib/toolCardPaths";
+  } from "../lib/toolCardPaths";
   import { parseAnsi, stripAnsi, terminalTail } from "../lib/ansi";
   import { formatElapsed } from "../lib/elapsed";
   import { app } from "../lib/store";

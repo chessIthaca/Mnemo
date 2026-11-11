@@ -1,4 +1,4 @@
-import { actionPhrase, argPaths, basename, dedupePaths, prettyToolName } from "../../../frontend/src/lib/toolCardPaths";
+import { actionPhrase, argPaths, basename, dedupePaths, prettyToolName } from "./toolCardPaths";
 
 /** Team tool headlines: `worker` names the worker the call acts on, when it names one. */
 const teamPhrases: Record<string, (worker: string | null) => string> = {

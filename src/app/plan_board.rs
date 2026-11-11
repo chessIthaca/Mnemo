@@ -415,7 +415,7 @@ impl PlanBoard {
         // explicit no-impact declaration — and that declaration needs a
         // reason.
         let no_spec_impact = match draft.no_spec_impact.as_deref().map(str::trim) {
-            Some(reason) if reason.is_empty() => {
+            Some("") => {
                 return Err("the no-spec-impact declaration needs a reason".to_string());
             }
             declared => declared.map(str::to_string),
@@ -1505,10 +1505,10 @@ impl PlanBoard {
             {
                 continue;
             }
-            if !config
+            if config
                 .governed_files
                 .get(&delta.capability)
-                .is_some_and(|files| !files.is_empty())
+                .is_none_or(|files| files.is_empty())
             {
                 issues.push(format!(
                     "the spec delta creates the new capability '{}', which declares \

@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 /// The Tauri event channel the STARTUP derived-index reconciliation streams
-/// on. Distinct from [`CHANNEL`]: the reconcile is not a Settings → Memory
+/// on. Distinct from the app crate's `CHANNEL` (the Settings → Memory
+/// maintenance stream): the reconcile is not a Settings → Memory
 /// operation — it is the startup check that the semantic DB matches the
 /// on-disk truth (plans, reviews, knowledge records, backlog), with a wait
 /// dialog + progress bar. NO events are emitted when the corpus is already
@@ -21,8 +22,8 @@ use serde::{Deserialize, Serialize};
 pub const RECONCILE_CHANNEL: &str = "memory://reconcile";
 
 /// An event on the [`RECONCILE_CHANNEL`] stream — the startup derived-index
-/// reconciliation. Internally tagged (`"type"`, kebab-case) like
-/// [`MaintenanceEvent`], but simpler (no op field — the channel is
+/// reconciliation. Internally tagged (`"type"`, kebab-case) like the app
+/// crate's `MaintenanceEvent`, but simpler (no op field — the channel is
 /// reconcile-only).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]

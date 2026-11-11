@@ -467,7 +467,8 @@ impl Tool for SpawnAgentTool {
         };
 
         // Prefer the parent-aware spawn when the concrete spawner supports it
-        // (the IPC layer's `IpcSpawner`) AND we know our owning agent's id, so
+        // (the host-provided spawner; the headless one lives in src/headless)
+        // AND we know our owning agent's id, so
         // the child is registered as this agent's child and the completion-
         // notification feedback loop fires. Fall back to the plain trait
         // `spawn` (no parent) otherwise. Both arms spawn — the only

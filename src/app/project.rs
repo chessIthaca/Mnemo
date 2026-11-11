@@ -353,7 +353,7 @@ prompt = "Custom project-specific merge flow."
         // The git-file entries the app's own state depends on: without them a
         // fresh project's first commit sweeps .coding/memory.db +
         // .coding/codegraph.db (multi-MB caches) into the user's repo, and
-        // .coding/backlog.jsonl conflicts across run-all worktrees instead of
+        // .coding/backlog.jsonl conflicts across worktrees instead of
         // merging by union.
         let dir = tempdir().unwrap();
         Project::init(dir.path()).unwrap();

@@ -1991,7 +1991,7 @@ failure_triage_knn = true
     fn removed_run_all_strict_success_key_is_tolerated() {
         // The opt-in run_all_strict_success flag was removed 2026-08-20: the
         // plan-loop gate (workflow must reach Complete before an item can be
-        // marked Done) is now mandatory — see src-tauri/src/ipc/run_all.rs.
+        // marked Done) is now mandatory.
         // An old config.toml that still carries the key must keep loading
         // (serde ignores unknown fields), so the removal must not break
         // upgrades.

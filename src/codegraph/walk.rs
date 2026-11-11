@@ -251,12 +251,12 @@ mod tests {
         std::fs::write(dir.join("node_modules/pkg/x.ts"), "export const x = 1;").unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/y.rs"), "fn y() {}").unwrap();
-        // App-managed run-all worktrees (agent.md): a linked worktree under
+        // App-managed worktrees: a linked worktree under
         // the main tree is a duplicate copy, not project source — both
         // walkers must skip it.
-        std::fs::create_dir_all(dir.join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::create_dir_all(dir.join(".worktrees/agent-abcd12/src")).unwrap();
         std::fs::write(
-            dir.join(".worktrees/runall-abcd12/src/dup.ts"),
+            dir.join(".worktrees/agent-abcd12/src/dup.ts"),
             "export const d = 1;",
         )
         .unwrap();

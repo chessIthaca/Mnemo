@@ -1133,15 +1133,13 @@ impl LeadRuntime {
             Some(Arc::clone(setup.laya_manager()));
         eprintln!("mnemo2: the managed Laya classifier attached to the lead engine");
         // TODO(plan e02de747): the design (§2) spawns the startup
-        // fine-tune gate right here — `spawn_startup_finetune`
-        // (src-tauri/src/ipc/finetune.rs:585) on this manager plus the
+        // fine-tune gate right here — a `spawn_startup_finetune` on
+        // this manager plus the
         // slot (`Setup::classifier_slot`), the status Arc and the live
-        // config (`Setup::live_config`). It is NOT spawned: that
-        // function hangs off main.rs's binary-only `mod ipc;` tree —
-        // this lib-compiled module (src-tauri/src/lib.rs) has no `ipc`
-        // module, so the call does not even resolve for the mnemo2
-        // binary. Lifting the gate into the lib is a crate-layout
-        // change outside this step's single-file ownership; until it
+        // config (`Setup::live_config`). It is NOT spawned: the gate
+        // lived in the Mnemo1 app's IPC layer, deleted with Mnemo1 —
+        // nothing remains to call, so the gate has to be built in the
+        // lib first. Until it
         // lands, Mnemo2 skips the startup fine-tune (the classifier
         // serves whatever checkpoint is installed).
     }

@@ -14,11 +14,10 @@
 //! [`ClassifierStatus`](crate::memory::classifier::ClassifierStatus) to
 //! `Ready`/`Failed`.
 //!
-//! Job 4 D5 (§5.1 :168, §5.8 :554): the Tauri-free core MOVED here from
-//! the app's `ipc/laya.rs` — the manager, the pipeline, and the server
-//! lifecycle are host-agnostic; the app's command layer keeps only the
-//! Tauri glue (the `classifier://status` emit via [`StatusSink`], the
-//! IPC commands) and the headless `Setup::classifier_setup` feeds its
+//! Job 4 D5 (§5.1 :168, §5.8 :554): the Tauri-free core (moved out of the
+//! app's IPC layer) — the manager, the pipeline, and the server
+//! lifecycle are host-agnostic; a host app keeps only the
+//! Tauri glue, and the headless `Setup::classifier_setup` feeds its
 //! `EventReceiver<SetupEvent>` through the same sink.
 //!
 //! Opt-in-gated: `[general.laya]` absent or `enabled = false` means
@@ -40,10 +39,10 @@ use crate::memory::classifier::{Classifier, ClassifierSlot, ClassifierStatus, La
 use crate::process_tree::KillOnCloseJob;
 
 /// A status-change push (job 4 D5): the core writes the shared status
-/// Arc AND hands every change to this sink — the app's command layer
-/// forwards to `classifier://status`, the headless
+/// Arc AND hands every change to this sink — the headless
 /// [`Setup::classifier_setup`](crate::headless::setup::Setup::classifier_setup)
-/// feeds its `EventReceiver<SetupEvent>`. `None` = no push (the status
+/// feeds its `EventReceiver<SetupEvent>` (a host app forwards the same push
+/// to its UI). `None` = no push (the status
 /// Arc is still written).
 pub type StatusSink = Arc<dyn Fn(&ClassifierStatus) + Send + Sync>;
 

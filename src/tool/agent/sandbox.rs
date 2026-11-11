@@ -21,10 +21,7 @@
 //! `file_append`, `search`, `describe_image`) now wrap their ENTRY-POINT
 //! blocking work — including the `validate` call — in one `spawn_blocking`
 //! closure (they `clone()` the cheap `Sandbox` and move it in). Four sync-path
-//! callers remain in THIS crate's tool layer. The app's IPC file commands
-//! (`src-tauri/src/ipc/files.rs`) validate by design as well — inline on the
-//! async task or inside their own `spawn_blocking` closure depending on the
-//! command, never with `State` held across an await. Those four perform one
+//! callers remain in THIS crate's tool layer. Those four perform one
 //! `canonicalize` (the fourth adds one preview read) and are kept sync by
 //! design, with the trade-off noted:
 //! - [`crate::agent::approval::is_project_scoped`] — one `validate` per

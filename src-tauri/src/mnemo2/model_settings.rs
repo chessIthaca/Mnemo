@@ -5,8 +5,8 @@
 //! Model-role settings commands for Mnemo2's Settings dialog — the
 //! backend of its **Models** and **Savings** pages (plan d6a64d60).
 //!
-//! Mnemo2 shares Mnemo1's config dir, so every value here edits the same
-//! `config.toml`/`endpoints.toml` the engine reads:
+//! Mnemo2 shares the legacy Mnemo config dir, so every value here edits the
+//! same `config.toml`/`endpoints.toml` the engine reads:
 //!
 //! - **Models page** — the per-task `[models]` slots Mnemo2's page owns
 //!   (`planning`, `executing`, `bug_fixing`, `reviewing`, `summarize`),
@@ -19,7 +19,7 @@
 //! and the shared embedding catalog; every write rides the one
 //! sanctioned pipeline — `Setup::patch_settings` →
 //! `validate_and_apply_settings_patch` → `Config::save_all` — the same
-//! one Mnemo1's `save_settings` runs, so the same validation, the same
+//! one every settings write rides, so the same validation, the same
 //! on-disk result and the same live rewire apply. A save rewrites
 //! `config.toml` fully from the in-memory schema (comments and unknown
 //! keys are dropped by design — the schema is the source of truth), but

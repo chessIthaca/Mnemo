@@ -10,8 +10,9 @@
 //! Each is fire-and-forget: the command validates that an upkeep run can start
 //! (project open, memory on, nothing else running) and returns; the run itself
 //! streams `started` / `progress` / `done` / `failed` on
-//! [`MAINTENANCE_CHANNEL`], the same wire shape Mnemo1's Settings → Memory uses
-//! (`mnemo2/src/lib/memoryMaintenance.ts` mirrors those structs).
+//! [`MAINTENANCE_CHANNEL`], the same wire shape the legacy Mnemo Settings →
+//! Memory page used (`mnemo2/src/lib/memoryMaintenance.ts` mirrors those
+//! structs).
 //!
 //! Why the events and not the return value: a cleanup consolidates sessions and
 //! may take minutes on a large store. The UI shows a live progress line and a

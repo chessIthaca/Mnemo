@@ -43,7 +43,7 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | **Optional Laya classifier** | An opt-in "System 1" text classifier: a managed `laya-serve` sidecar — downloaded in Settings, auto-started/stopped by the app on 127.0.0.1 — answers typed questions (choice / score / yes-no) with calibrated probabilities for cheap decisions. Off by default — while it is off, nothing is called. Optional memory auto-typing corrects a record's typed prefix when the classifier is confident (needs a fine-tuned checkpoint; seed examples cover SPEC/DECISION/BUG/HOW), and optional failure triage classifies every tool/provider failure (transient / permanent / needs-user / flaky-test) to steer retries — read-only calls auto-retry without a model roundtrip — while every classified failure is logged with its true outcome so a startup fine-tune can retrain the checkpoint from real dispositions (managed mode) — and an optional kNN overlay (`failure_triage_knn`) learns from that same log immediately, embedding each failure with the local memory embedder and majority-voting the most similar logged failures (vote share = confidence; needs no `laya-serve`). Optional tool-choice steering (`steer_tool_choice`) lets the classifier pick how `search`/`search_read` auto-delegation routes a query — symbol / text / memory — instead of the shape heuristics, and every steered search is logged with its disposition (delegated? escaped?) to seed a fine-tune. Optional pre-prompt model routing (`routing` + a `[general.routing]` block) classifies each main-agent turn's task text as trivial vs architectural and — once enforcement is on and the answer clears the confidence gate — runs the turn on the configured cheap / capable model instead of the state/default chain, never overriding a skill, subagent or bug-fixing pin; it ships **shadow-first** (enforcement off by default), logging every decision and its outcome (task text → label/confidence → target → turn status, iterations, tool calls) to `routing.jsonl` for the fine-tune that must precede enforcement. Optional step-granular escalation lanes (`lane_medium` / `lane_high` / `escalate`, needing the same routing opt-in plus the compound reflex opt-in) classify each **plan step** in one call and serve it on the matching user-chosen model — a step keeps its configured model while a lane target is unset, the ladder re-asks only after a failed cycle, and it shares the same confidence gate and shadow-first switch. Optional harness-run verification (`[general.verify]`: `enabled` + `test_command` + `timeout_secs`, off by default and inert with an empty command) runs the project's own checks at each plan-step boundary — a successful skeleton `complete_step` — and appends a compact evidence note (exit status, distinct error lines, counts, always capped) to the tool result, so deterministic evidence costs no model roundtrip; a decided reflex `verify` action re-runs the checks harness-side and rides the note on the next request's prompt tail, and a hang is killed at `timeout_secs` and surfaced as a failure-shaped note. Optional budget caps (`[general.budget]`: `enabled` + `max_tokens_per_plan` (0 = off) / `max_escalations_per_plan` / `max_retries_per_lane`, off by default) make spend deterministic: a cap reached at a plan-step boundary PAUSES the plan through a pending question (continue for this plan / double the cap / end the turn) instead of killing it, a per-decision `spend_events` ledger traces every main plan request to its lane/model/reason, and `finish` appends a per-plan cost report — tokens per lane, lane per step, retries, escalations, deterministic checks, cache hits; real numbers only — to the plan file. |
 | **Parallel agents** | Spawn sub-agents for research or review; a Run-All backlog dispatches queued plans into parallel worktrees. |
 | **Token-optimizer levers** | Seven context-economy levers (`[general.optimizer]`, all on by default since 2027-01-25 — uncheck any in Settings → Savings): outline-first reads of big files, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, cache-safe lean-output nudges, and recall delta (a repeat auto-recall renders as a compact reference instead of re-sending the memory snippet) — each writing a `savings_events` row. Settable in **Settings → Savings**. |
-| **Desktop shell** | Tauri 2 + React UI, embedded WebView2 browser tab (Windows), headless REPL console mode, MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns (the warning retracts once the other instance exits; the instance marker is cleaned up on exit). |
+| **Desktop shell** | Tauri 2 desktop app, embedded WebView2 browser tab (Windows), MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns (the warning retracts once the other instance exits; the instance marker is cleaned up on exit). |
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
 
@@ -103,12 +103,11 @@ src/                  the `mnemo` library — the harness core (no Tauri)
   model_resolver.rs     per-state model routing + effort resolution
   mcp/                  Model Context Protocol client (stdio + remote, OAuth)
   backlog.rs            the Run-All queue
-src-tauri/            the `mnemo-app` desktop shell (Tauri 2)
-  src/                  startup, watchdog, console (headless REPL mode), IPC
+src-tauri/            the Mnemo2 host library (`mnemo-app`) and the Mnemo2 app (`mnemo2-app`)
+  src/                  the host: webview_udf, instance markers, watchdog, mnemo2/
   tests/                source-contract tests guarding the vendored wry patches
-frontend/             React 19 + TypeScript 7 + Vite 8 + Tailwind 4 UI
 tests/integration/    cross-boundary integration tests
-scripts/              the npm launcher (start.mjs) + maintenance scripts
+scripts/              maintenance scripts
 vendor/               patched wry — with a PATCHES.md, wired via [patch.crates-io]
 assets/               diagrams (workflow.svg)
 agent.md              the project constitution — loaded before every agent turn
@@ -116,7 +115,7 @@ PLAN.md               the technical-decisions log
 .coding/              the agent's own state, versioned with the repo (see below)
 ```
 
-**The lib/app split.** `mnemo` is a plain Rust library — the state machine, memory, graph, and tools all work headless. `mnemo-app` is the Tauri 2 shell that embeds it, always selecting the heavier optional features (embedded browser, embeddings).
+**The lib/app split.** `mnemo` is a plain Rust library — the state machine, memory, graph, and tools all work headless. `mnemo-app` is the library that hosts the Tauri 2 Mnemo2 app (the `mnemo2-app` crate embeds it), always selecting the heavier optional features (embedded browser, embeddings).
 
 **`.coding/` is the memory the repo carries.** Plans, review reports, knowledge files, and the backlog travel in git and merge across machines; the SQLite caches (`memory.db`, `codegraph.db`) are rebuildable and gitignored. A fresh clone of Mnemo's own repo arrives with its development history already loaded. Creating a project seeds those ignore rules (and the backlog's union-merge attribute) into the new project's `.gitignore`/`.gitattributes`, appending only what is missing — existing user lines are never touched.
 
@@ -143,24 +142,14 @@ PLAN.md               the technical-decisions log
 git clone https://github.com/chessIthaca/Mnemo.git
 cd Mnemo
 npm install
-npm start
+npm run rebuild:mnemo2   # release build (asks running instances to leave first)
 ```
 
-`npm start` compiles the Rust core, bundles nothing, and launches the desktop app. Launcher modes:
-
-| Command | What it does |
-|---|---|
-| `npm start` | build + launch the release binary |
-| `npm start dev` | Vite dev server + native window, hot-reloading UI |
-| `npm start build` | compile the binary only |
-| `npm start bundle` | produce platform installers (`.msi`/`.nsis` on Windows, `.app`/`.dmg` on macOS) under `target/release/bundle` |
-
-Prefer driving the toolchain yourself? The Tauri CLI is hoisted to the root `node_modules`, so run it from `src-tauri/`:
+Development:
 
 ```bash
-cd src-tauri
-npx tauri dev      # dev build + app window
-npx tauri build    # release build (add --no-bundle to keep it to the binary)
+npm run dev:mnemo2            # Vite dev server (browser-only preview)
+npm run dev:mnemo2:native    # Tauri host + real lead and team (run dev:mnemo2 first)
 ```
 
 ---
@@ -169,10 +158,6 @@ npx tauri build    # release build (add --no-bundle to keep it to the binary)
 
 ```bash
 cargo test                 # the mnemo library crate
-cargo test -p mnemo-app    # the desktop shell app crate
-cd frontend
-npx tsc --noEmit           # type check (vitest hides type defects)
-npm test                   # frontend unit tests
 ```
 
 The Mnemo2 Phase 4 workspace is a separate Svelte 5 cockpit. In its native Tauri

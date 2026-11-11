@@ -10,8 +10,7 @@
 
 .DESCRIPTION
   Targets the same file set as add-copyright-headers.ps1:
-  src/**/*.rs, src-tauri/**/*.rs, tests/**/*.rs,
-  frontend/src/**/*.ts + *.tsx, frontend/*.ts (config files), frontend/*.js.
+  src/**/*.rs, src-tauri/**/*.rs, tests/**/*.rs.
   Skips target/, node_modules/, dist/ (not scanned).
 
   Two within-line string replacements per file:
@@ -41,11 +40,7 @@ $root   = Split-Path -Parent $PSScriptRoot   # repo root = parent of scripts/
 $targets =
     @(Get-ChildItem -Recurse -Filter *.rs  -Path (Join-Path $root 'src')) +
     @(Get-ChildItem -Recurse -Filter *.rs  -Path (Join-Path $root 'src-tauri')) +
-    @(Get-ChildItem -Recurse -Filter *.rs  -Path (Join-Path $root 'tests')) +
-    @(Get-ChildItem -Recurse -Filter *.ts  -Path (Join-Path $root 'frontend\src')) +
-    @(Get-ChildItem -Recurse -Filter *.tsx -Path (Join-Path $root 'frontend\src')) +
-    @(Get-ChildItem -Filter *.ts -Path (Join-Path $root 'frontend')) +
-    @(Get-ChildItem -Filter *.js -Path (Join-Path $root 'frontend'))
+    @(Get-ChildItem -Recurse -Filter *.rs  -Path (Join-Path $root 'tests'))
 
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $bomBytes = [byte[]](0xEF, 0xBB, 0xBF)

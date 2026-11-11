@@ -9,9 +9,11 @@
 //! commands, and fans-in their events.
 //!
 //! **IPC note:** `AgentEvent::ApprovalRequest` carries a `oneshot::Sender`
-//! which is NOT serializable across the Tauri IPC boundary. The IPC adapter
-//! (`ipc/approval.rs`) holds the oneshot in a map keyed by `tool_call_id`,
-//! and emits a serializable `ApprovalRequestData` to the frontend instead.
+//! which is NOT serializable across the Tauri IPC boundary. The host on the
+//! far side — `src/headless/session.rs`'s event pump, or Mnemo2's
+//! `src-tauri/src/mnemo2` — holds the oneshot in a map keyed by
+//! `tool_call_id`, and forwards the serializable [`SerializableAgentEvent`]
+//! instead.
 
 use std::path::PathBuf;
 
@@ -156,17 +158,18 @@ pub struct ConversationExport {
     pub max_tokens: u32,
 }
 
-/// The marker prefix of an unattended (run-all) dispatched prompt.
+/// The marker prefix of an unattended-session prompt.
 ///
-/// `run_all_prompt` (src-tauri/src/ipc/run_all.rs) builds every run-all
-/// dispatched prompt with this prefix — the unattended-mode preamble rides
-/// INSIDE the Prompt text (one command, one turn) — and the agent task's
-/// `Prompt` arm detects it to set its unattended mode: the runtime's only
+/// An embedder that drives a session with no user watching may build the
+/// prompt with this prefix — the unattended-mode preamble rides INSIDE the
+/// Prompt text (one command, one turn) — and the agent task's `Prompt` arm
+/// detects it to set its unattended mode: the runtime's only
 /// harness-visible dispatch-context signal. In unattended mode the
 /// auto-continue gate also covers Planning (a premature turn end
 /// mid-exploration would otherwise park with nobody watching and halt the
 /// whole run); interactive Planning still parks (a deliberate turn end
-/// there is usually a question-wait for the user).
+/// there is usually a question-wait for the user). The constant's value is
+/// the on-the-wire marker existing embedders send, so it stays unchanged.
 pub const UNATTENDED_PROMPT_PREFIX: &str = "[backlog run-all — unattended mode]";
 
 /// One recalled memory in a [`AgentEvent::MemoryRecalled`] payload: its tier
@@ -207,8 +210,8 @@ pub enum ParkReason {
 /// Agent → UI (fanned-in through the manager, tagged with AgentId).
 ///
 /// This enum is NOT directly serializable because `ApprovalRequest` carries a
-/// `oneshot::Sender`. Use `AgentEvent::to_serializable()` to convert it for
-/// the IPC boundary (the adapter holds the oneshot separately).
+/// `oneshot::Sender`. Use [`AgentEvent::into_serializable`] to convert it for
+/// the IPC boundary (the host holds the oneshot separately).
 #[derive(Debug)]
 pub enum AgentEvent {
     /// The agent started processing.
@@ -261,8 +264,8 @@ pub enum AgentEvent {
     /// `core_operation` is true when the call is a core operation (e.g.
     /// `git merge` / `git push`) that must always prompt regardless of safety
     /// mode or rules — the UI hides the no-op "Mark Safe" / "Allow for
-    /// project" buttons for these, and the IPC layer never auto-resolves
-    /// them on a mode change.
+    /// project" buttons for these, and the host (`src/headless/session.rs`,
+    /// `src-tauri/src/mnemo2`) never auto-resolves them on a mode change.
     ApprovalRequest {
         tool_call_id: String,
         tool_name: String,
@@ -382,27 +385,10 @@ pub enum AgentEvent {
     /// image attachments (base64 data URLs; may be empty) — carried through
     /// so the transcript's steer entry can render them like a user prompt's.
     SuggestionInjected { text: String, images: Vec<String> },
-    /// A prompt was dispatched to this agent from outside the main input —
-    /// currently the backlog dispatch paths (manual ▶, auto-feed, Run-All).
-    /// Emitted by the dispatcher (not the agent itself) right after sending
-    /// the `Prompt` command, so the frontend can show the prompt as the goal
-    /// at the top of the transcript — mirroring how the main input optimistically
-    /// appends the user message before the agent starts streaming. `images` is
-    /// the list of base64 data URLs the backlog item carried (may be empty).
-    PromptDispatched { text: String, images: Vec<String> },
-    /// A skill was started on this agent from outside the normal tool-call
-    /// pipeline — currently the toolbar path (`enter_skill` / the "Merge to
-    /// main" button). Emitted by `enter_skill` right after `start_skill`
-    /// succeeds, so the frontend can announce the skill in the transcript like
-    /// a tool call does (`▶ skill "name" start`), mirroring how `skill_end`
-    /// already appears. The agent-driven `skill_start` tool announces itself
-    /// via its own ToolCard, so it does NOT emit this event (that would
-    /// duplicate). `name` is the skill name; `prompt` is the goal the agent
-    /// drives toward while the skill is active.
-    SkillStarted { name: String, prompt: String },
-    /// The active model changed for this agent — emitted by the IPC layer
-    /// (`set_model` / `save_endpoints`) right after the provider is swapped
-    /// into every live agent loop, and by the turn loop's per-request seam
+    /// The active model changed for this agent — emitted by the host
+    /// (`AgentSession::set_model` in `src/headless/session.rs`, and Mnemo2's
+    /// `src-tauri/src/mnemo2`) right after the provider is swapped into every
+    /// live agent loop, and by the turn loop's per-request seam
     /// when a mid-run change (model picker, Settings save, a completed
     /// deferred pick) makes the effective model/effort differ from the last
     /// serve, so the frontend can update the per-agent
@@ -459,9 +445,10 @@ pub enum AgentEvent {
     MemoryRecalled { hits: Vec<RecallHit> },
     /// The agent asked the user a question via the `ask_user` tool and is
     /// paused awaiting the answer. Mirrors [`AgentEvent::ApprovalRequest`]:
-    /// the `oneshot::Sender` can't cross the IPC boundary, so the adapter
-    /// holds it in a pending-questions map keyed by `question_id` and emits a
-    /// serializable form to the frontend. The agent task blocks on the
+    /// the `oneshot::Sender` can't cross the IPC boundary, so the host
+    /// (`src/headless/session.rs`, or `src-tauri/src/mnemo2`) holds it in a
+    /// pending-questions map keyed by `question_id` and emits a serializable
+    /// form to the frontend. The agent task blocks on the
     /// receiver until the user answers (one question at a time — the turn
     /// can't proceed, so a second question can't be asked until this one is
     /// answered).
@@ -505,18 +492,6 @@ pub enum AgentEvent {
     /// accurate. This is distinct from `Finished`, which fires at the end of
     /// every turn while the agent remains alive.
     Exited,
-    /// A tool-spawned background agent finished its task.
-    ///
-    /// Emitted by the event forwarder (not the agent itself) when an agent
-    /// with a recorded `parent_id` reaches `Finished` (or a final `Error`).
-    /// The forwarder uses it to route a completion notification back to the
-    /// parent agent, and the frontend can surface a "done" marker on the child
-    /// in the sidebar. `success` is `false` when the task ended in an error.
-    ChildFinished {
-        child_id: AgentId,
-        name: String,
-        success: bool,
-    },
     /// The agent encountered an error.
     ///
     /// `retrying` is `true` when this is a transient retry note (the agent will
@@ -717,7 +692,8 @@ pub struct SessionLimits {
 /// A serializable version of `AgentEvent` for the IPC boundary.
 ///
 /// `ApprovalRequest` becomes `ApprovalRequest` without the `responder` — the
-/// adapter holds the oneshot in a pending-approvals map.
+/// host holds the oneshot in a pending-approvals map (`src/headless/session.rs`
+/// in the kernel, `src-tauri/src/mnemo2` in the app).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SerializableAgentEvent {
@@ -830,20 +806,9 @@ pub enum SerializableAgentEvent {
         text: String,
         images: Vec<String>,
     },
-    /// A prompt was dispatched to this agent from outside the main input
-    /// (backlog dispatch). See [`AgentEvent::PromptDispatched`].
-    PromptDispatched {
-        text: String,
-        images: Vec<String>,
-    },
-    /// A skill was started on this agent from the toolbar path. See
-    /// [`AgentEvent::SkillStarted`].
-    SkillStarted {
-        name: String,
-        prompt: String,
-    },
     /// The active model changed for this agent. See
-    /// [`AgentEvent::ModelChanged`]. Emitted by the IPC layer right after a
+    /// [`AgentEvent::ModelChanged`]. Emitted by the host
+    /// (`src/headless/session.rs` / `src-tauri/src/mnemo2`) right after a
     /// provider swap so the frontend updates the per-agent model label without
     /// a `list_agents` poll. `provider` (the serving endpoint's
     /// `endpoints.toml` name) is absent when unknown — the frontend then falls
@@ -882,7 +847,8 @@ pub enum SerializableAgentEvent {
     },
     /// The agent asked the user a question (the `ask_user` tool) and is
     /// paused awaiting the answer. See [`AgentEvent::UserQuestion`]. The
-    /// `responder` is held by the IPC adapter's pending-questions map.
+    /// `responder` is held by the host's pending-questions map
+    /// (`src/headless/session.rs`, or `src-tauri/src/mnemo2`).
     UserQuestion {
         question_id: String,
         question: String,
@@ -897,13 +863,6 @@ pub enum SerializableAgentEvent {
         phase: PhaseKind,
     },
     Exited,
-    /// A tool-spawned background agent finished its task. See
-    /// [`AgentEvent::ChildFinished`].
-    ChildFinished {
-        child_id: AgentId,
-        name: String,
-        success: bool,
-    },
     Error {
         error: String,
         retrying: bool,
@@ -1002,9 +961,9 @@ impl AgentEvent {
     /// Convert to a serializable form for the IPC boundary.
     ///
     /// Returns a [`SerializedEvent`] holding the serializable event plus any
-    /// non-serializable oneshot senders the adapter must hold in a pending map
+    /// non-serializable oneshot senders the host must hold in a pending map
     /// (an approval sender for `ApprovalRequest`, a question sender for
-    /// `UserQuestion`).
+    /// `UserQuestion`) — see `src/headless/session.rs`.
     pub fn into_serializable(self) -> SerializedEvent {
         match self {
             AgentEvent::Started => SerializedEvent {
@@ -1201,20 +1160,6 @@ impl AgentEvent {
                 host_tool_sender: None,
                 policy_hook_sender: None,
             },
-            AgentEvent::PromptDispatched { text, images } => SerializedEvent {
-                event: SerializableAgentEvent::PromptDispatched { text, images },
-                approval_sender: None,
-                question_sender: None,
-                host_tool_sender: None,
-                policy_hook_sender: None,
-            },
-            AgentEvent::SkillStarted { name, prompt } => SerializedEvent {
-                event: SerializableAgentEvent::SkillStarted { name, prompt },
-                approval_sender: None,
-                question_sender: None,
-                host_tool_sender: None,
-                policy_hook_sender: None,
-            },
             AgentEvent::ModelChanged {
                 model,
                 provider,
@@ -1283,21 +1228,6 @@ impl AgentEvent {
             },
             AgentEvent::Exited => SerializedEvent {
                 event: SerializableAgentEvent::Exited,
-                approval_sender: None,
-                question_sender: None,
-                host_tool_sender: None,
-                policy_hook_sender: None,
-            },
-            AgentEvent::ChildFinished {
-                child_id,
-                name,
-                success,
-            } => SerializedEvent {
-                event: SerializableAgentEvent::ChildFinished {
-                    child_id,
-                    name,
-                    success,
-                },
                 approval_sender: None,
                 question_sender: None,
                 host_tool_sender: None,
@@ -2044,66 +1974,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_dispatched_roundtrips_json() {
-        // A PromptDispatched event must serialize as
-        // `{"kind":"prompt_dispatched","text":"...","images":[...]}` and
-        // round-trip back, so the frontend can show a backlog-dispatched
-        // prompt as the goal at the top of the transcript.
-        let event = AgentEvent::PromptDispatched {
-            text: "fix the flaky test".into(),
-            images: vec!["data:image/png;base64,xxx".into()],
-        };
-        let SerializedEvent {
-            event: serial,
-            approval_sender: sender,
-            ..
-        } = event.into_serializable();
-        assert!(sender.is_none(), "prompt_dispatched has no oneshot");
-        let json = serde_json::to_string(&serial).unwrap();
-        assert!(json.contains("\"kind\":\"prompt_dispatched\""));
-        assert!(json.contains("fix the flaky test"));
-        assert!(json.contains("data:image/png;base64,xxx"));
-        let back: SerializableAgentEvent = serde_json::from_str(&json).unwrap();
-        match back {
-            SerializableAgentEvent::PromptDispatched { text, images } => {
-                assert_eq!(text, "fix the flaky test");
-                assert_eq!(images, vec!["data:image/png;base64,xxx".to_string()]);
-            }
-            _ => panic!("expected PromptDispatched"),
-        }
-    }
-
-    #[test]
-    fn skill_started_roundtrips_json() {
-        // A SkillStarted event must serialize as
-        // `{"kind":"skill_started","name":"...","prompt":"..."}` and
-        // round-trip back, so the frontend can announce a toolbar-started
-        // skill in the transcript like a tool call does.
-        let event = AgentEvent::SkillStarted {
-            name: "merge_to_main".into(),
-            prompt: "Merge the branch into main.".into(),
-        };
-        let SerializedEvent {
-            event: serial,
-            approval_sender: sender,
-            ..
-        } = event.into_serializable();
-        assert!(sender.is_none(), "skill_started has no oneshot");
-        let json = serde_json::to_string(&serial).unwrap();
-        assert!(json.contains("\"kind\":\"skill_started\""));
-        assert!(json.contains("\"name\":\"merge_to_main\""));
-        assert!(json.contains("Merge the branch into main."));
-        let back: SerializableAgentEvent = serde_json::from_str(&json).unwrap();
-        match back {
-            SerializableAgentEvent::SkillStarted { name, prompt } => {
-                assert_eq!(name, "merge_to_main");
-                assert_eq!(prompt, "Merge the branch into main.");
-            }
-            _ => panic!("expected SkillStarted"),
-        }
-    }
-
-    #[test]
     fn model_changed_roundtrips_json() {
         // A ModelChanged event must serialize as
         // `{"kind":"model_changed","model":"..."}` and round-trip back, so the
@@ -2215,42 +2085,6 @@ mod tests {
                 assert_eq!(hits[0].title, "backlog decisions");
             }
             _ => panic!("expected MemoryRecalled"),
-        }
-    }
-
-    #[test]
-    fn child_finished_roundtrips_json() {
-        // The completion-notification event must serialize as
-        // `{"kind":"child_finished","child_id":N,"name":"...","success":bool}`
-        // and round-trip back, so the frontend can mark the child "done".
-        let event = AgentEvent::ChildFinished {
-            child_id: 3,
-            name: "rust-core-reviewer".into(),
-            success: true,
-        };
-        let SerializedEvent {
-            event: serial,
-            approval_sender: sender,
-            ..
-        } = event.into_serializable();
-        assert!(sender.is_none(), "child_finished has no oneshot");
-        let json = serde_json::to_string(&serial).unwrap();
-        assert!(json.contains("\"kind\":\"child_finished\""));
-        assert!(json.contains("\"child_id\":3"));
-        assert!(json.contains("rust-core-reviewer"));
-        assert!(json.contains("\"success\":true"));
-        let back: SerializableAgentEvent = serde_json::from_str(&json).unwrap();
-        match back {
-            SerializableAgentEvent::ChildFinished {
-                child_id,
-                name,
-                success,
-            } => {
-                assert_eq!(child_id, 3);
-                assert_eq!(name, "rust-core-reviewer");
-                assert!(success);
-            }
-            other => panic!("expected ChildFinished, got {other:?}"),
         }
     }
 

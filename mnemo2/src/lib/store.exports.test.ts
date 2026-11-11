@@ -106,6 +106,7 @@ describe("store public surface", () => {
       "showToast",
       "interruptLead",
       "compactLead",
+      "newLeadConversation",
       "approveLead",
       "answerLead",
       "setLeadModel",

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
@@ -549,6 +549,211 @@ describe("Composer", () => {
     );
     expect(draft()).toEqual({ text: "keep text", images: [] });
     expect(screen.queryByAltText("Attachment 1")).toBeNull();
+  });
+
+  describe("slash commands", () => {
+    const enter = () => fireEvent.keyDown(textbox(), { key: "Enter" });
+
+    function addSecondModel() {
+      app.update((state) => ({
+        ...state,
+        leadRuntime: {
+          ...state.leadRuntime,
+          models: [
+            ...state.leadRuntime.models,
+            {
+              endpoint: "test",
+              model: "scripted-b",
+              spec: "test/scripted-b",
+              is_default: false,
+            },
+          ],
+        },
+      }));
+    }
+
+    it("runs /compact instead of sending it", async () => {
+      setLead(false);
+      const compact = vi.spyOn(actions, "compactLead").mockResolvedValue(undefined);
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      actions.setLeadDraftText("/compact");
+      render(Composer);
+
+      await enter();
+
+      await vi.waitFor(() => expect(compact).toHaveBeenCalledTimes(1));
+      expect(send).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(draft().text).toBe(""));
+    });
+
+    it("starts a fresh conversation on /new and keeps the attachments", async () => {
+      setLead(false);
+      const image = "data:image/png;base64,keep";
+      const fresh = vi.spyOn(actions, "newLeadConversation").mockResolvedValue(true);
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      actions.addLeadDraftImage(image);
+      actions.setLeadDraftText("/new");
+      render(Composer);
+
+      await enter();
+
+      await vi.waitFor(() => expect(fresh).toHaveBeenCalledTimes(1));
+      expect(send).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(draft()).toEqual({ text: "", images: [image] }));
+    });
+
+    it("keeps the /new draft when the lead refuses to start over", async () => {
+      setLead(true);
+      const fresh = vi.spyOn(actions, "newLeadConversation").mockResolvedValue(false);
+      actions.setLeadDraftText("/new");
+      render(Composer);
+
+      await enter();
+
+      await vi.waitFor(() => expect(fresh).toHaveBeenCalledTimes(1));
+      expect(draft().text).toBe("/new");
+    });
+
+    it("sends anything else that starts with a slash as a normal message", async () => {
+      setLead(false);
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      actions.setLeadDraftText("/usr/bin is missing");
+      render(Composer);
+
+      await enter();
+
+      await vi.waitFor(() =>
+        expect(send).toHaveBeenCalledWith("/usr/bin is missing", []),
+      );
+    });
+
+    it("switches to the model that /model names", async () => {
+      setLead(false);
+      addSecondModel();
+      const setModel = vi.spyOn(actions, "setLeadModel").mockReturnValue(undefined);
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      actions.setLeadDraftText("/model scripted-b");
+      render(Composer);
+
+      await enter();
+
+      expect(setModel).toHaveBeenCalledWith("test/scripted-b", null);
+      expect(send).not.toHaveBeenCalled();
+      expect(draft().text).toBe("");
+    });
+
+    it("explains an unknown /model name and keeps the draft", async () => {
+      setLead(false);
+      const setModel = vi.spyOn(actions, "setLeadModel").mockReturnValue(undefined);
+      const toast = vi.spyOn(actions, "showToast");
+      actions.setLeadDraftText("/model nothing");
+      render(Composer);
+
+      await enter();
+
+      expect(toast).toHaveBeenCalledWith(
+        `No model matches "nothing". Models: test/scripted-a`,
+        "error",
+      );
+      expect(setModel).not.toHaveBeenCalled();
+      expect(draft().text).toBe("/model nothing");
+    });
+
+    it("completes a partially typed name on Enter and runs it on the next Enter", async () => {
+      setLead(false);
+      const compact = vi.spyOn(actions, "compactLead").mockResolvedValue(undefined);
+      render(Composer);
+
+      await fireEvent.input(textbox(), { target: { value: "/c" } });
+
+      const listbox = screen.getByRole("listbox", { name: "Slash commands" });
+      const options = within(listbox).getAllByRole("option");
+      expect(options).toHaveLength(2);
+      expect(options[0].textContent).toContain("/clear");
+      expect(options[1].textContent).toContain("/compact");
+      expect(options[0].getAttribute("aria-selected")).toBe("true");
+
+      await fireEvent.keyDown(textbox(), { key: "ArrowDown" });
+      expect(options[1].getAttribute("aria-selected")).toBe("true");
+
+      // Enter on a partial name completes it instead of running it.
+      await enter();
+      expect(compact).not.toHaveBeenCalled();
+      expect(draft().text).toBe("/compact");
+
+      // The name is typed out now, so Enter runs the highlighted command.
+      await enter();
+      await vi.waitFor(() => expect(compact).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+      expect(draft().text).toBe("");
+    });
+
+    it("does not run /clear when Enter lands on a partial name", async () => {
+      setLead(false);
+      const fresh = vi.spyOn(actions, "newLeadConversation").mockResolvedValue(true);
+      const compact = vi.spyOn(actions, "compactLead").mockResolvedValue(undefined);
+      render(Composer);
+
+      await fireEvent.input(textbox(), { target: { value: "/c" } });
+      await enter();
+
+      // /clear is the first match; Enter must only complete it, never run it.
+      await vi.waitFor(() => expect(draft().text).toBe("/clear"));
+      expect(fresh).not.toHaveBeenCalled();
+      expect(compact).not.toHaveBeenCalled();
+    });
+
+    it("runs a typed-out command from the menu on Enter", async () => {
+      setLead(false);
+      const compact = vi.spyOn(actions, "compactLead").mockResolvedValue(undefined);
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      actions.setLeadDraftText("/compact");
+      render(Composer);
+
+      expect(screen.getByRole("listbox", { name: "Slash commands" })).toBeTruthy();
+      await enter();
+
+      await vi.waitFor(() => expect(compact).toHaveBeenCalledTimes(1));
+      expect(send).not.toHaveBeenCalled();
+      expect(draft().text).toBe("");
+    });
+
+    it("opens the Slash commands sheet on /help", async () => {
+      setLead(false);
+      actions.setLeadDraftText("/help");
+      render(Composer);
+
+      await enter();
+
+      const sheet = await screen.findByRole("dialog", { name: "Slash commands" });
+      expect(sheet.textContent).toContain("/model <name> [effort]");
+      expect(sheet.textContent).toContain("Start a fresh conversation");
+      expect(sheet.textContent).toContain(
+        "Anything else that starts with / is sent to the lead as a normal message.",
+      );
+      expect(draft().text).toBe("");
+    });
+
+    it("runs /stop while an approval is pending", async () => {
+      setLead(false);
+      app.update((state) => ({
+        ...state,
+        leadRuntime: {
+          ...state.leadRuntime,
+          pending: { kind: "approval", request_id: "req-1" },
+        },
+      }));
+      const stop = vi.spyOn(actions, "interruptLead").mockResolvedValue(undefined);
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      actions.setLeadDraftText("/stop");
+      render(Composer);
+
+      await enter();
+
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(1));
+      expect(send).not.toHaveBeenCalled();
+      expect(draft().text).toBe("");
+    });
   });
 
   describe("with Claude Code leading the project", () => {

@@ -35,6 +35,8 @@ export interface LeadTransport {
   /** Compact the lead's context between turns; the session stays open. */
   compact(): Promise<void>;
   setModel(spec: string, reasoningEffort?: string | null): Promise<LeadSnapshot>;
+  /** Start a fresh conversation on the current model (the host's lead_new). */
+  newConversation(): Promise<LeadSnapshot>;
   approve(requestId: string, decision: LeadApprovalDecision): Promise<void>;
   answer(questionId: string, answer: LeadAnswerInput): Promise<void>;
   close(): Promise<void>;
@@ -77,6 +79,7 @@ export function createTauriLeadTransport(bindings: LeadTransportBindings): LeadT
         spec,
         reasoningEffort: reasoningEffort ?? null,
       }),
+    newConversation: () => bindings.invoke<LeadSnapshot>("lead_new"),
     approve: (requestId, decision) =>
       bindings.invoke<void>("lead_approve", { requestId, decision }),
     answer: (questionId, answer) =>

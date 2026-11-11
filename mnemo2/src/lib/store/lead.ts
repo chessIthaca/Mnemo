@@ -436,6 +436,51 @@ export function setLeadModel(spec: string, reasoningEffort: string | null = null
     });
 }
 
+/**
+ * Start a fresh lead conversation on the current model (`lead_new`).
+ *
+ * Resolves `true` once the host replaced the session with an empty transcript;
+ * `false` when there is no transport, or the lead is mid-turn (the host refuses
+ * both, so the caller keeps the draft and the toast explains why).
+ */
+export async function newLeadConversation(): Promise<boolean> {
+  const transport = leadTransport;
+  if (!transport) {
+    app.update((current) =>
+      withToast(
+        current,
+        "The native lead is not connected, so it cannot start a new conversation.",
+        "error",
+      ),
+    );
+    return false;
+  }
+  const state = get(app);
+  if (state.leadRuntime.busy || state.leadRuntime.pending !== null) {
+    app.update((current) =>
+      withToast(
+        current,
+        "Stop the current turn (Stop or /stop) before starting a new conversation.",
+      ),
+    );
+    return false;
+  }
+  const token = leadSessionToken;
+  try {
+    const snapshot = await transport.newConversation();
+    if (token === leadSessionToken) {
+      leadStream.flush();
+      app.update((current) => applyLeadSnapshot(current, snapshot));
+    }
+    return true;
+  } catch (error) {
+    if (token === leadSessionToken) {
+      app.update((current) => withToast(current, leadError(error), "error"));
+    }
+    return false;
+  }
+}
+
 export function retryLead() {
   const state = get(app);
   const project = state.projects.find((item) => item.id === state.projectId);

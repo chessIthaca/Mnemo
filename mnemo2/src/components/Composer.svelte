@@ -3,6 +3,14 @@
   import { get } from "svelte/store";
   import { parseNumericAnswer } from "../lib/answerSelect";
   import { fileToAttachedDataUrl } from "../lib/attachImages";
+  import {
+    SLASH_COMMANDS,
+    filterSlashCommands,
+    parseSlash,
+    resolveModel,
+    type SlashCommand,
+    type SlashCommandInfo,
+  } from "../lib/slash";
   import { actions, app } from "../lib/store";
   import type { LeadAnswerInput } from "../lib/types";
   import ComposerBox from "./ComposerBox.svelte";
@@ -17,6 +25,11 @@
   let freeformQuestionId = $state<string | null>(null);
   // Claude Code leads this project: sending to the built-in lead asks first.
   let confirmingExternal = $state(false);
+  // The slash menu: which suggestion is highlighted, and the draft Escape
+  // dismissed the menu for (it stays hidden until the draft changes).
+  let menuIndex = $state(0);
+  let menuDismissedFor = $state<string | null>(null);
+  let helpOpen = $state(false);
   const externalLeading = $derived($app.externalLead.attached);
   // The draft lives in store state (not component state) so unmounting the
   // Lead view — for example by opening the Team view — never loses it.
@@ -61,6 +74,21 @@
     pendingQuestion !== null &&
       freeformQuestionId === pendingQuestion.question_id,
   );
+  // The command suggestions: only while the draft is still a command name,
+  // and never in freeform-answer mode (where a slash is ordinary text).
+  const menu = $derived(
+    freeformMode || menuDismissedFor === draft.text
+      ? []
+      : filterSlashCommands(draft.text),
+  );
+  let lastMenuDraft = "";
+  $effect(() => {
+    // A changed draft reshapes the menu; the highlight returns to its top.
+    if (draft.text === lastMenuDraft) return;
+    lastMenuDraft = draft.text;
+    menuIndex = 0;
+  });
+
   /** The open `ask_user` question this box answers, if any. */
   const questionId = $derived(
     $app.leadRuntime.pending?.kind === "question" ? $app.leadRuntime.pending.question_id ?? null : null,
@@ -115,7 +143,121 @@
     }
   }
 
+  /** Replace the draft with a command's usage, ready for its argument. */
+  function completeCommand(command: SlashCommandInfo) {
+    actions.setLeadDraftText(
+      command.takesArgument ? `/${command.name} ` : `/${command.name}`,
+    );
+  }
+
+  /** Pick a menu entry: an argument-less command runs at once, the rest complete. */
+  function activateCommand(command: SlashCommandInfo) {
+    if (command.takesArgument) {
+      completeCommand(command);
+      return;
+    }
+    actions.setLeadDraftText(`/${command.name}`);
+    void send();
+  }
+
+  /** The menu's keys; true when the key belonged to the menu. */
+  function handleMenuKeydown(event: KeyboardEvent): boolean {
+    if (menu.length === 0) return false;
+    const highlighted = menu[Math.min(menuIndex, menu.length - 1)];
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      menuIndex = (menuIndex + step + menu.length) % menu.length;
+      return true;
+    }
+    if (event.key === "Tab") {
+      event.preventDefault();
+      completeCommand(highlighted);
+      return true;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      activateCommand(highlighted);
+      return true;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      menuDismissedFor = draft.text;
+      return true;
+    }
+    return false;
+  }
+
+  /** Run a parsed command; a refusal toasts and leaves the draft untouched. */
+  async function runSlash(command: SlashCommand) {
+    switch (command.kind) {
+      case "invalid":
+        actions.showToast(command.message, "error");
+        return;
+      case "help":
+        helpOpen = true;
+        actions.setLeadDraftText("");
+        return;
+      case "new":
+        if (await actions.newLeadConversation()) actions.setLeadDraftText("");
+        return;
+      case "compact":
+        await actions.compactLead();
+        actions.setLeadDraftText("");
+        return;
+      case "stop":
+        if (canInterrupt) await stop();
+        else actions.showToast("The lead is not working right now.");
+        actions.setLeadDraftText("");
+        return;
+      case "model":
+        runModelCommand(command.name, command.effort);
+        return;
+    }
+  }
+
+  /** Apply /model; an unknown model or effort keeps the draft for a retry. */
+  function runModelCommand(name: string, effort: string | null) {
+    const models = $app.leadRuntime.models;
+    if (!name) {
+      actions.showToast(
+        `Usage: /model <name> [effort]. Models: ${models.map((model) => model.spec).join(", ")}`,
+        "error",
+      );
+      return;
+    }
+    const resolved = resolveModel(name, models);
+    if ("error" in resolved) {
+      actions.showToast(resolved.error, "error");
+      return;
+    }
+    if (effort !== null) {
+      const efforts =
+        models.find((model) => model.spec === resolved.spec)?.reasoning_efforts ?? [];
+      if (!efforts.includes(effort)) {
+        actions.showToast(
+          efforts.length === 0
+            ? `${resolved.spec} takes no reasoning effort.`
+            : `${resolved.spec} takes: ${efforts.join(", ")}.`,
+          "error",
+        );
+        return;
+      }
+    }
+    actions.setLeadModel(resolved.spec, effort);
+    actions.setLeadDraftText("");
+  }
+
   async function send(confirmedExternal = false) {
+    // A slash command runs here, ahead of the answer branch and the send gate:
+    // commands work while the lead is busy or holding a pending interaction.
+    if (!freeformMode) {
+      const command = parseSlash(draft.text);
+      if (command) {
+        await runSlash(command);
+        return;
+      }
+    }
     // A confirmed send is the prompt the user approved, even if a question
     // arrived while the confirmation was open.
     if (!confirmedExternal && canAnswerQuestion && pendingQuestion) {
@@ -267,17 +409,38 @@
       {/each}
     </ul>
   {/if}
+  {#if menu.length > 0}
+    <ul class="slash-menu" role="listbox" aria-label="Slash commands">
+      {#each menu as command, index (command.name)}
+        <li
+          class="slash-item"
+          class:selected={index === menuIndex}
+          role="option"
+          aria-selected={index === menuIndex}
+          onmousedown={(event) => {
+            // Keep the textarea focused: a blur would swallow the click.
+            event.preventDefault();
+            activateCommand(command);
+          }}
+        >
+          <span class="slash-usage">{command.usage}</span>
+          <span class="slash-description">{command.description}</span>
+        </li>
+      {/each}
+    </ul>
+  {/if}
   <ComposerBox
     value={draft.text}
     label="Message the lead"
     placeholder={freeformMode
       ? "Type your freeform answer…"
-      : "Ask, plan, or redirect the team…"}
+      : "Ask, plan, or redirect the team — / for commands"}
     send={sendButton}
     stop={stopButton}
     oninput={actions.setLeadDraftText}
     onsubmit={() => void send()}
     onpaste={handlePaste}
+    onkeydown={handleMenuKeydown}
     onescape={freeformMode ? () => { freeformQuestionId = null; } : undefined}
   />
 
@@ -299,6 +462,18 @@
     <button class="button button-quiet" type="button" onclick={() => (confirmingExternal = false)}>Cancel</button>
     <button class="button button-primary" type="button" onclick={sendAnyway}>Send anyway</button>
   </div>
+</Sheet>
+
+<Sheet open={helpOpen} title="Slash commands" eyebrow="LEAD" onclose={() => (helpOpen = false)}>
+  <ul class="slash-help">
+    {#each SLASH_COMMANDS as command (command.name)}
+      <li>
+        <code>{command.usage}</code>
+        <span>{command.description}</span>
+      </li>
+    {/each}
+  </ul>
+  <p class="slash-help-note">Anything else that starts with / is sent to the lead as a normal message.</p>
 </Sheet>
 
 <style>
@@ -343,6 +518,17 @@
   }
   .remove-image:hover { background: var(--line); }
   .composer-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 14px; padding: 8px 4px 0; }
+
+  .slash-menu { display: flex; flex-direction: column; gap: 2px; margin: 0 0 8px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); list-style: none; }
+  .slash-item { display: flex; align-items: baseline; gap: 10px; padding: 6px 8px; border-radius: 8px; cursor: pointer; }
+  .slash-item.selected { background: var(--surface-soft); }
+  .slash-usage { flex: 0 0 auto; color: var(--ink); font-family: var(--font-mono); font-size: var(--text-meta); font-weight: 600; }
+  .slash-description { min-width: 0; overflow: hidden; color: var(--muted); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
+  .slash-help { display: flex; flex-direction: column; gap: 10px; margin: 0 0 16px; padding: 0; list-style: none; }
+  .slash-help li { display: flex; flex-direction: column; gap: 2px; }
+  .slash-help code { color: var(--ink); font-family: var(--font-mono); font-size: var(--text-body); font-weight: 600; }
+  .slash-help span { color: var(--muted); font-size: var(--text-meta); }
+  .slash-help-note { margin: 0; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: var(--text-meta); }
   .composer-status { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: var(--text-meta); font-weight: 600; letter-spacing: 0.04em; }
 
   .confirm-copy { margin: 0 0 16px; color: var(--muted); font-size: var(--text-body); line-height: 1.55; }

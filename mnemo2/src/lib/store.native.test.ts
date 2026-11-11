@@ -67,6 +67,14 @@ function makeTransport(initial: LeadSnapshot) {
     approve: vi.fn(async () => {}),
     answer: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
+    newConversation: vi.fn(async () => {
+      current = {
+        ...current,
+        generation: current.generation + 1,
+        transcript: { messages: [] },
+      };
+      return current;
+    }),
     onEvent: vi.fn(async (handler) => {
       capture.handler = handler;
       return () => {};
@@ -126,6 +134,41 @@ describe("native lead store path", () => {
     );
     await vi.waitFor(() => expect(get(app).leadRuntime.modelId).toBe("scripted-b"));
     expect(get(app).leadRuntime.generation).toBe(2);
+  });
+
+  it("refuses a new conversation while the lead is mid-turn", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+    actions.sendLeadMessage("start the turn");
+    await vi.waitFor(() => expect(get(app).leadRuntime.busy).toBe(true));
+
+    await expect(actions.newLeadConversation()).resolves.toBe(false);
+    expect(harness.transport.newConversation).not.toHaveBeenCalled();
+    expect(get(app).toast?.message).toBe(
+      "Stop the current turn (Stop or /stop) before starting a new conversation.",
+    );
+    expect(get(app).leadEntries.length).toBeGreaterThan(0);
+  });
+
+  it("starts a new conversation and applies the emptied transcript", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+    harness.emit({
+      generation: 1,
+      event: { agent: 1, event: { kind: "text_delta", text: "earlier work" } },
+    });
+    expect(get(app).leadEntries).toHaveLength(1);
+
+    await expect(actions.newLeadConversation()).resolves.toBe(true);
+    expect(harness.transport.newConversation).toHaveBeenCalled();
+    // The returned snapshot replaces the transcript; the model is unchanged.
+    expect(get(app).leadEntries).toHaveLength(0);
+    expect(get(app).leadRuntime.generation).toBe(2);
+    expect(get(app).leadRuntime.model).toBe("test/scripted-a");
   });
 
   it("forwards an image-only submission to the transport", async () => {

@@ -148,6 +148,7 @@ function makeLeadTransport(openGate: Promise<void>): LeadTransport {
     interrupt: vi.fn(async () => {}),
     compact: vi.fn(async () => {}),
     setModel: vi.fn(async () => snapshot()),
+    newConversation: vi.fn(async () => snapshot()),
     approve: vi.fn(async () => {}),
     answer: vi.fn(async () => {}),
     close: vi.fn(async () => {}),

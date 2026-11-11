@@ -51,6 +51,7 @@ describe("native lead transport", () => {
     await transport.answer("q-1", { kind: "choice", index: 1 });
     await transport.prompt("with an image", ["data:image/png;base64,one"]);
     await transport.close();
+    await transport.newConversation();
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "lead_open", {
       workspaceRoot: "C:/project",
@@ -74,6 +75,7 @@ describe("native lead transport", () => {
       answer: { kind: "choice", index: 1 },
     });
     expect(invokeMock).toHaveBeenNthCalledWith(10, "lead_close");
+    expect(invokeMock).toHaveBeenLastCalledWith("lead_new");
     expect(invokeMock).toHaveBeenCalledWith("lead_prompt", {
       text: "with an image",
       images: ["data:image/png;base64,one"],

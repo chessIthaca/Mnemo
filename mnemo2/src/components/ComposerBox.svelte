@@ -36,6 +36,7 @@
     onsubmit,
     onpaste,
     onescape,
+    onkeydown,
   }: {
     value: string;
     label: string;
@@ -47,9 +48,16 @@
     onsubmit: () => void;
     onpaste?: (event: ClipboardEvent) => void;
     onescape?: () => void;
+    /**
+     * The parent's key hook, called before the box's own handling; return true
+     * when it handled the key (it calls preventDefault itself) so the box does
+     * nothing else.
+     */
+    onkeydown?: (event: KeyboardEvent) => boolean;
   } = $props();
 
   function handleKeydown(event: KeyboardEvent) {
+    if (onkeydown?.(event)) return;
     if (event.key === "Escape" && onescape) {
       event.preventDefault();
       onescape();

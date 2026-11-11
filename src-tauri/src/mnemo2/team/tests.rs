@@ -2834,9 +2834,11 @@ fn porcelain_worktree_paths_are_nul_delimited_and_fail_closed() {
     }
 }
 
-/// Mnemo1 owns `runall-*` worktrees and `wt/runall-*` branches in the same
-/// `.worktrees/` directory; Mnemo2's cleanup only ever acts on its own
-/// `agent-*` records and refuses anything else, even a forged record.
+/// Mnemo1 (deleted 2026-11-11) left `runall-*` worktrees and `wt/runall-*`
+/// branches in the same `.worktrees/` directory; Mnemo2's cleanup only ever
+/// acts on its own `agent-*` records and refuses anything else, even a forged
+/// record. The legacy checkout is built with plain git — no Mnemo2 code path
+/// may recreate it.
 #[tokio::test]
 async fn cleanup_never_touches_mnemo1_runall_worktrees() {
     let repo = tempfile::tempdir().expect("repo");
@@ -2849,14 +2851,21 @@ async fn cleanup_never_touches_mnemo1_runall_worktrees() {
     lifecycle_git(root, &["add", "file.txt"]);
     lifecycle_git(root, &["commit", "-m", "base"]);
     lifecycle_git(root, &["checkout", "-b", "wt/lead"]);
-    let (runall_path, runall_branch) = mnemo::app::worktrees::provision_item_worktree(
-        root.to_path_buf(),
-        "abcd1234-item".to_string(),
-    )
-    .await
-    .expect("runall worktree");
-    assert!(runall_branch.starts_with("wt/runall-"), "{runall_branch}");
-    assert!(runall_path.ends_with("runall-abcd1234"), "{runall_path:?}");
+    // Mnemo1's shape: branch `wt/runall-<item8>`, checkout
+    // `.worktrees/runall-<item8>` (gitignored, beside the agent ones).
+    let runall_path = root.join(".worktrees").join("runall-abcd1234");
+    std::fs::create_dir_all(root.join(".worktrees")).expect(".worktrees");
+    lifecycle_git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "wt/runall-abcd1234",
+            runall_path.to_str().expect("runall path"),
+        ],
+    );
+    let runall_branch = "wt/runall-abcd1234".to_string();
     let (agent_path, agent_branch) = provision_agent_worktree(
         root.to_path_buf(),
         "agent001".to_string(),

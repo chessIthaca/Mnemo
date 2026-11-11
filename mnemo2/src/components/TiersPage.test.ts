@@ -73,10 +73,7 @@ function status(overrides: Partial<LayaStatus> = {}): LayaStatus {
       failure_triage: false,
       failure_triage_knn: false,
       steer_tool_choice: false,
-      routing: true,
-      reflex: false,
     },
-    routing: { threshold: 0.8, first_prompt_min_confidence: null, enforce: false },
     ...overrides,
   };
 }
@@ -85,7 +82,6 @@ function status(overrides: Partial<LayaStatus> = {}): LayaStatus {
 function control(overrides: Partial<TiersTopControl> = {}): TiersTopControl {
   return {
     choice: "suggest",
-    laya_routing: true,
     laya_status: "ready",
     checkpoint: "Laya (English)",
     knn_rows: 42,
@@ -168,11 +164,9 @@ function makeLaya(
       routingWireSnapshot({ mode: nextControl.choice, ...routing.settings }, routing.summary, routing.eval ?? null),
     ),
     saveTopControl: vi.fn(async (choice) => {
-      const layaRouting = choice !== "off";
       nextControl = {
         ...nextControl,
         choice,
-        laya_routing: layaRouting,
       };
       return structuredClone(nextControl);
     }),
@@ -233,7 +227,7 @@ describe("TiersPage", () => {
   });
 
   it("disables the three Laya choices when Laya is not installed and offers the install", async () => {
-    renderPage({ laya: makeLaya({ control: { choice: "off", laya_status: "not_installed", laya_routing: false } }) });
+    renderPage({ laya: makeLaya({ control: { choice: "off", laya_status: "not_installed" } }) });
     // The readiness line only renders once the control's wire has loaded.
     await screen.findByText("Laya is not installed");
     const watch = screen.getByRole("radio", { name: /Watch only/ });
@@ -254,23 +248,11 @@ describe("TiersPage", () => {
     expect(screen.getByText(/needs Laya running/)).toBeTruthy();
   });
 
-  it("shows no warning for Auto when the Laya routing flag is on", async () => {
-    renderPage({ laya: makeLaya({ control: { choice: "auto", laya_routing: true } }) });
-    await screen.findByText("Laya (English) ready");
-    expect((screen.getByRole("radio", { name: /^Auto/ }) as HTMLInputElement).checked).toBe(true);
-    expect(screen.queryByText(/does not match this choice/)).toBeNull();
-  });
-
-  it("warns when the Laya routing flag disagrees with the choice", async () => {
-    renderPage({ laya: makeLaya({ control: { choice: "auto", laya_routing: false } }) });
-    expect(await screen.findByText(/does not match this choice/)).toBeTruthy();
-  });
-
-  it("says Mnemo1's model switching stays in its own settings", async () => {
+  it("describes the top control as Mnemo2's own and shows no Reflex switch", async () => {
     renderPage();
-    expect(
-      await screen.findByText(/Whether Mnemo1 switches models stays in Mnemo1's own settings\./),
-    ).toBeTruthy();
+    expect(await screen.findByText("Sets how Mnemo2 picks a worker's tier.")).toBeTruthy();
+    // The kernel's per-turn routing switches never reach the page.
+    expect(screen.queryByRole("checkbox", { name: /Reflex/ })).toBeNull();
   });
 
   it("offers Retry with the failure's error after a failed start", async () => {
@@ -291,7 +273,7 @@ describe("TiersPage", () => {
   });
 
   it("saves the picked choice once through the combined command", async () => {
-    const page = renderPage({ laya: makeLaya({ control: { choice: "off", laya_routing: false } }) });
+    const page = renderPage({ laya: makeLaya({ control: { choice: "off" } }) });
     await screen.findByRole("radio", { name: /Watch only/ });
     await fireEvent.click(screen.getByRole("radio", { name: /Watch only/ }));
     await waitFor(() => expect(page.laya.transport.saveTopControl).toHaveBeenCalledTimes(1));
@@ -339,7 +321,7 @@ describe("TiersPage", () => {
     const escalate = helpingScope.getByRole("region", { name: "Escalate tier" });
     expect(within(escalate).queryByText(/Laya:/)).toBeNull();
 
-    const notHelping = renderPage({ laya: makeLaya({ control: { choice: "off", laya_routing: false } }) });
+    const notHelping = renderPage({ laya: makeLaya({ control: { choice: "off" } }) });
     const offScope = within(notHelping.container);
     await waitFor(() => expect(offScope.getByRole("region", { name: "Medium tier" })).toBeTruthy());
     // With the lead picking, no rung carries a Laya label.
@@ -348,7 +330,7 @@ describe("TiersPage", () => {
   });
 
   it("hides 'How Laya is doing' for 'No: the lead picks' and shows it read-only when Laya helps", async () => {
-    const off = renderPage({ laya: makeLaya({ control: { choice: "off", laya_routing: false } }) });
+    const off = renderPage({ laya: makeLaya({ control: { choice: "off" } }) });
     await screen.findByText("Laya (English) ready");
     expect(off.container.textContent).not.toContain("How Laya is doing");
 
@@ -427,23 +409,23 @@ describe("TiersPage", () => {
 
   it("a flag switch saves at once and reverts on failure", async () => {
     const page = renderPage({ laya: makeLaya() });
-    const box = await within(page.container).findByRole("checkbox", { name: /Reflex \(plan-step tiers, Mnemo1\)/ });
+    const box = await within(page.container).findByRole("checkbox", { name: /Auto-type memories/ });
     expect((box as HTMLInputElement).checked).toBe(false);
     await fireEvent.click(box);
-    await waitFor(() => expect(page.laya.transport.saveFlag).toHaveBeenCalledWith("reflex", true));
+    await waitFor(() => expect(page.laya.transport.saveFlag).toHaveBeenCalledWith("auto_type_memories", true));
     // The save refreshed the snapshot: the switch stays on.
     expect(
-      (within(page.container).getByRole("checkbox", { name: /Reflex \(plan-step tiers, Mnemo1\)/ }) as HTMLInputElement)
+      (within(page.container).getByRole("checkbox", { name: /Auto-type memories/ }) as HTMLInputElement)
         .checked,
     ).toBe(true);
 
     const failing = renderPage({ laya: makeLaya({ saveFlagRejects: true }) });
-    const failingBox = await within(failing.container).findByRole("checkbox", { name: /Reflex \(plan-step tiers, Mnemo1\)/ });
+    const failingBox = await within(failing.container).findByRole("checkbox", { name: /Auto-type memories/ });
     await fireEvent.click(failingBox);
     await waitFor(() => expect(failing.laya.transport.saveFlag).toHaveBeenCalledTimes(1));
     // The save refused: the box goes back and the error shows.
     expect(
-      (within(failing.container).getByRole("checkbox", { name: /Reflex \(plan-step tiers, Mnemo1\)/ }) as HTMLInputElement)
+      (within(failing.container).getByRole("checkbox", { name: /Auto-type memories/ }) as HTMLInputElement)
         .checked,
     ).toBe(false);
     expect(await within(failing.container).findByText("Laya settings unavailable")).toBeTruthy();

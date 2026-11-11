@@ -121,14 +121,14 @@ describe("ModelsPage", () => {
     expect(screen.getByText("Status: Not installed")).toBeTruthy();
   });
 
-  it("shows only what Mnemo2 uses and says where Mnemo1's per-task models live", async () => {
+  it("shows only what Mnemo2 uses and that the per-task model slots are not used", async () => {
     page();
     const compaction = await screen.findByRole("region", { name: "Compaction" });
     expect(within(compaction).getByLabelText("Compaction model")).toBeTruthy();
     for (const gone of ["Planning", "Executing", "Bug fixing", "Reviewing"]) {
       expect(screen.queryByLabelText(gone)).toBeNull();
     }
-    expect(screen.getByText(/stay in the shared config\.toml; Mnemo2 doesn't use them/)).toBeTruthy();
+    expect(screen.getByText(/The per-task model slots in config\.toml \(planning, executing, bug fixing, reviewing\) are not used by Mnemo2\./)).toBeTruthy();
     expect(screen.getByRole("region", { name: "Vision" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "Code indexing" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "Budget" })).toBeTruthy();

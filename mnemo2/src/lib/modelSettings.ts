@@ -24,8 +24,8 @@ export const EMBEDDING_KEYWORD_ID = "hash";
  * The one `[models]` slot Mnemo2's Models page owns: the compaction model
  * (`"endpoint/model"`, or null for the agent's own model).
  *
- * Mnemo1's per-task slots (planning, executing, bug fixing, reviewing) stay
- * in the shared `config.toml` for Mnemo1; Mnemo2's lead and workers run on
+ * The per-task model slots (planning, executing, bug fixing, reviewing) stay
+ * in the shared `config.toml`; Mnemo2's lead and workers run on
  * tier models, so the page never reads or writes them.
  */
 export interface TaskModels {

@@ -1,0 +1,57 @@
+# PR gate: build, lint and test every pull request to main and every push to
+# main. Before this workflow only CodeQL ran on pull requests, so v2.2.0
+# shipped with clippy red and Dependabot PRs looked green while breaking the
+# build or the tests. build.yml stays the release pipeline (manual or v* tags).
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# One run per ref: a new push to the same pull request cancels the run in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The tauri CLI reads CI as a clap bool, so only "true" or "false" (see build.yml).
+  CI: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Install npm deps
+        run: npm ci --no-audit --no-fund
+      - name: Build the Mnemo1 frontend
+        run: npm run build
+      - name: Build the Mnemo2 frontend (runs svelte-check)
+        run: npm run build:mnemo2
+      - name: Frontend unit tests
+        run: npm test --workspace frontend
+      - name: Mnemo2 unit tests
+        run: npm test --workspace mnemo2
+      - name: Clippy for the workspace
+        run: cargo clippy --workspace --all-targets
+      - name: Clippy for the Mnemo2 host
+        run: cargo clippy -p mnemo-app --all-targets --features mnemo2
+      - name: Rust tests for the workspace
+        run: cargo test --workspace --no-fail-fast
+      - name: Rust tests for the Mnemo2 host
+        run: cargo test -p mnemo-app --features mnemo2 --lib

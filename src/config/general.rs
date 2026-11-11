@@ -1495,12 +1495,12 @@ mod tests {
     #[test]
     fn memory_section_defaults_when_absent() {
         // Back-compat: a config.toml without a [memory] section loads with
-        // the compiled-in defaults (an untouched config changes nothing).
+        // the compiled-in defaults (2026-11-11: a 20-day half-life, cap 10).
         let cfg: GeneralConfig = toml::from_str("").unwrap();
         let m = &cfg.memory;
-        assert_eq!(m.decay_half_life_days, 7.0);
+        assert_eq!(m.decay_half_life_days, 20.0);
         assert_eq!(m.per_query_cap, 50);
-        assert_eq!(m.derived_per_class_cap, 5);
+        assert_eq!(m.derived_per_class_cap, 10);
         assert_eq!(m.plan_budget, 400);
         assert_eq!(m.bug_budget, 600);
         assert_eq!(m.spec_budget, 500);

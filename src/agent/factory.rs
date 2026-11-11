@@ -847,9 +847,9 @@ impl AgentLoopFactory {
     /// transition gate (the agent cannot change state while spawned
     /// subagents are running).
     ///
-    /// Called once by the IPC layer alongside [`set_spawner`](Self::set_spawner)
-    /// (the concrete `IpcSpawner` implements both traits). Only affects agents
-    /// built **after** this call, so the IPC layer sets it before building the
+    /// Called once by the host wiring alongside [`set_spawner`](Self::set_spawner)
+    /// (the host-provided spawner implements both traits). Only affects agents
+    /// built **after** this call, so the host sets it before building the
     /// main agent.
     pub fn set_descendant_tracker(&self, tracker: Arc<dyn crate::runtime::DescendantTracker>) {
         *self
@@ -2016,8 +2016,8 @@ mod tests {
     use tokio::sync::Mutex;
 
     /// The concrete app workflow behind a loop's neutral handle (2b.3): the
-    /// tests read the rich surface through the same app→app downcast the IPC
-    /// uses.
+    /// tests read the rich surface through the same app→app downcast the
+    /// app-side policy factory uses.
     fn concrete(
         handle: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     ) -> Arc<Mutex<Workflow>> {
@@ -4043,8 +4043,8 @@ mod tests {
             "main builds allow plan tools"
         );
 
-        // Simulate sub-agent construction (as IpcSpawner does for parent_id.is_some()).
-        // Simulate sub-agent construction (as IpcSpawner does for parent_id.is_some())
+        // Simulate sub-agent construction (as the host spawner does for parent_id.is_some()).
+        // Simulate sub-agent construction (as the host spawner does for parent_id.is_some())
         // — the spawn path's compound stamp (2b.3: the kernel rides the
         // neutral handle; the plan-mutation deny + the role state ride
         // app-side under one call).

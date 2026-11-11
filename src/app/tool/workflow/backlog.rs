@@ -353,7 +353,7 @@ impl Tool for BacklogStatusTool {
                     },
                     "deferred": {
                         "type": "boolean",
-                        "description": "Set (true) / clear (false) the deferred (skip Run-All) flag — orthogonal to status: the item keeps its status and stays visible, but Run-All never selects or counts it. Pass without `status` to park/un-park a queued item."
+                        "description": "Set (true) / clear (false) the deferred (skip automatic dispatch) flag — orthogonal to status: the item keeps its status and stays visible, kept in the backlog but not dispatched automatically (parked for manual handling or later re-inclusion). Pass without `status` to park/un-park a queued item."
                     }
                 },
                 "required": ["id"]
@@ -373,7 +373,7 @@ impl Tool for BacklogStatusTool {
         if args.status.is_none() && args.deferred.is_none() && args.note.is_none() {
             return ToolResult::error(
                 "either 'status' (a status transition), 'deferred' (set/clear the \
-                 skip-Run-All flag), or 'note' (amend the item's note) is required",
+                 skip-automatic-dispatch flag), or 'note' (amend the item's note) is required",
             );
         }
         let mut store = self.store.lock().await;
@@ -435,7 +435,7 @@ impl Tool for BacklogStatusTool {
             msg.push_str(&format!(" → {}", status_str(status)));
         }
         if let Some(deferred) = args.deferred {
-            msg.push_str(&format!(" deferred (skip Run-All) = {deferred}"));
+            msg.push_str(&format!(" deferred (skip automatic dispatch) = {deferred}"));
         }
         if args.status.is_none() && args.note.is_some() {
             msg.push_str(" note amended");
@@ -516,7 +516,7 @@ impl Tool for BacklogListTool {
             .map(|i| {
                 let mut line = format!("{} [{}]", i.id, status_str(i.status));
                 if i.deferred {
-                    line.push_str(" (deferred — skipped by Run-All)");
+                    line.push_str(" (deferred — skipped by automatic dispatch)");
                 }
                 if let Some(note) = &i.note {
                     line.push_str(&format!(" — {note}"));
@@ -1190,12 +1190,12 @@ Problem: the worker dispatch loop stalls after the worker's plan closes (2027-01
         assert!(result.output.contains("empty"), "output: {}", result.output);
     }
 
-    // ---- deferred (skip Run-All) — backlog f2d2809b, user request
-    // 2027-01-07 ----
+    // ---- deferred (skip automatic dispatch) — backlog f2d2809b, user
+    // request 2027-01-07 ----
 
     #[tokio::test]
     async fn status_tool_deferred_only_parks_a_pending_item() {
-        // A run-all session parks a queued item it cannot resolve instead
+        // A session parks a queued item it cannot resolve instead
         // of failing it: `deferred` alone (no status) sets the flag without
         // touching the status — a same-status transition would be refused
         // by the guarded table, so the flag must not require one.
@@ -1356,7 +1356,7 @@ Problem: the worker dispatch loop stalls after the worker's plan closes (2027-01
         let result = tool.execute(json!({})).await;
         assert!(result.success, "output: {}", result.output);
         assert!(
-            result.output.contains("(deferred — skipped by Run-All)"),
+            result.output.contains("(deferred — skipped by automatic dispatch)"),
             "output: {}",
             result.output
         );

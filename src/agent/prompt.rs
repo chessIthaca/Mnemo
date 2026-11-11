@@ -619,7 +619,8 @@ pub fn assemble_spec_head(spec: &PromptSpec, c: &Constitution) -> String {
     // §5.9.1 :621: the spec's constitution mode filters the loaded sources
     // BEFORE the sections push (None drops both; Both = today's bytes).
     // Spec heads are headless guardrail sessions (Mnemo2 executor workers):
-    // they read the Team-scoped constitution, without Mnemo1's plan rules.
+    // they read the Team-scoped constitution, without the plan-first
+    // workflow's rules.
     let c = c
         .restricted(spec.constitution)
         .scoped(crate::project::ConstitutionScope::Team);

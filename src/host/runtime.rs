@@ -64,8 +64,7 @@ fn parent_root_binding(
 /// OWN spawn name (design §2: the display name is the session's, never the
 /// parent's). The headless `SessionId` IS the allocated `AgentId` today,
 /// but it stays a separate wire concept (the design freezes `session_id`
-/// as its own field). `None` when neither applies: unattributed records
-/// (Mnemo1).
+/// as its own field). `None` when neither applies: unattributed records.
 fn session_trace_identity(
     seed: Option<&crate::provider::trace::TraceIdentity>,
     parent: Option<&Arc<AgentLoop>>,
@@ -130,7 +129,8 @@ pub struct SessionOptions {
     /// Trace attribution (plan c3ba2b58 step A): the identity stamped on
     /// this loop's model-call records (who the agent is in the trace:
     /// lead/worker/subagent/system + worker/plan labels). `None` keeps
-    /// the records unattributed (every pre-c3ba2b58 caller = Mnemo1).
+    /// the records unattributed (every pre-c3ba2b58 caller was the
+    /// retired Mnemo1 app).
     /// Applied post-build via [`AgentLoop::set_trace_identity`] with the
     /// allocated agent/session ids filled in; a subagent with no explicit
     /// seed inherits its parent's identity instead (see
@@ -145,8 +145,8 @@ pub struct SessionOptions {
     /// When true, this session's turns are never classified by the
     /// pre-prompt routing gate, and no routing.jsonl rows are written for
     /// them. Mnemo2 routes at dispatch instead. Stamped on the loop
-    /// post-build via [`AgentLoop::set_skip_turn_routing`]; `false` (every
-    /// Mnemo1 caller) keeps today's per-turn gate.
+    /// post-build via [`AgentLoop::set_skip_turn_routing`]; `false`
+    /// (every non-Mnemo2 caller) keeps today's per-turn gate.
     pub skip_turn_routing: bool,
 }
 
@@ -312,7 +312,7 @@ async fn spawn_agent_shared_inner(
     agent_loop.set_pinned_task(pinned_task.clone());
     // The per-turn-routing skip (plan 2ba2168a step 1): stamped
     // unconditionally post-build, pre-registration — no request can race
-    // the stamp. `false` (every Mnemo1 caller) keeps the per-turn gate.
+    // the stamp. `false` (every non-Mnemo2 caller) keeps the per-turn gate.
     agent_loop.set_skip_turn_routing(skip_turn_routing);
     // 3c/G2 (§5.9.2): register the session's host tools into the registry
     // via the shared dynamic slot — the late-registration path the MCP
@@ -941,11 +941,12 @@ impl HostRuntime {
                 limits: None,
                 // the main agent registers no host tools (3c/G2)
                 host_tools: vec![],
-                // Mnemo1's main agent is unattributed (c3ba2b58 step A)
+                // the main agent is unattributed (c3ba2b58 step A)
                 trace_identity: None,
-                // Mnemo1 has no pinned task (40eef714)
+                // the main agent has no pinned task (40eef714)
                 pinned_task: None,
-                // Mnemo1 keeps the per-turn routing gate (2ba2168a step 1)
+                // the main agent keeps the per-turn routing gate
+                // (2ba2168a step 1)
                 skip_turn_routing: false,
             },
         )
@@ -1885,8 +1886,9 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_without_a_trace_identity_stays_unattributed() {
-        // Mnemo1's path, unchanged: no seed → no identity → unattributed
-        // records. A parentless seedless spawn never fabricates one.
+        // The unstamped path, unchanged: no seed → no identity →
+        // unattributed records. A parentless seedless spawn never fabricates
+        // one.
         let dir = tempfile::tempdir().unwrap();
         let (host, agent_loops) = test_spawn_host(dir.path());
         let (agent_id, _) = spawn_agent_shared(

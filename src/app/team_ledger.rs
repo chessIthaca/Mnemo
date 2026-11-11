@@ -7,8 +7,8 @@
 //!
 //! A Mnemo2 lead runs its plans through TeamManager-tracked workers the
 //! engine cannot see. The plan board and its tools read the team through
-//! this trait; the Mnemo2 host implements it over its `TeamRuntime`. Mnemo1
-//! never wires one, so the Classic workflow is unaffected.
+//! this trait; the Mnemo2 host implements it over its `TeamRuntime`. The
+//! kernel's Classic workflow never wires one, so it is unaffected.
 //!
 //! Step indices are 0-based, matching `plan_format::Step::index`
 //! (the board tools' `step` argument is 1-based — convert at the

@@ -68,7 +68,7 @@ impl Tier {
     }
 }
 
-/// The ordered five-rung model ladder shared by Mnemo1 and Mnemo2.
+/// The ordered five-rung model ladder shared by the kernel and Mnemo2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TierLadder {

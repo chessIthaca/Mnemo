@@ -7,8 +7,8 @@
 //! The lean [`EndpointDto`](super::EndpointDto) carries bare model ids; this
 //! module adds per-model specs, per-model pricing, the `[tiers]` table and
 //! the usage/test helpers a settings UI needs. Everything persists into the
-//! same `endpoints.toml` / `keys.toml` Mnemo1 reads, preserving every field
-//! the DTOs do not carry.
+//! same shared `endpoints.toml` / `keys.toml`, preserving every field the
+//! DTOs do not carry.
 
 use std::collections::{HashMap, HashSet};
 
@@ -760,7 +760,7 @@ simple = ["a/m2"]
     }
 
     #[test]
-    fn mnemo1_save_preserves_tiers() {
+    fn save_all_preserves_tiers() {
         let (dir, _setup) = setup_with(BASE);
         let current = Config::load(dir.path()).unwrap();
         let built = current.endpoints.clone();

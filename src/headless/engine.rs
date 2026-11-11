@@ -452,7 +452,8 @@ impl Engine {
                 // Plan 2ba2168a step 1: the session's per-turn-routing
                 // skip — the host spawn path stamps it on the loop, so a
                 // Mnemo2 session's turns are never classified by the
-                // per-prompt gate. `false` = the gate (Mnemo1, unchanged).
+                // per-prompt gate. `false` = the gate (the default,
+                // unchanged).
                 skip_turn_routing: opts.skip_turn_routing,
             },
         )
@@ -590,10 +591,11 @@ impl Engine {
     }
 
     /// Let worktree-less sessions use the project's main plans dir
-    /// (`<state_dir>/plans`, the stack Mnemo1's main agent uses) instead of a
-    /// private `agents/<id>` dir, so plans survive respawns and are shared
-    /// with other hosts of the project. Affects sessions spawned afterwards;
-    /// worktree-bound sessions keep their in-checkout plans dir.
+    /// (`<state_dir>/plans`, the stack the kernel's main agent uses)
+    /// instead of a private `agents/<id>` dir, so plans survive respawns
+    /// and are shared with other hosts of the project. Affects sessions
+    /// spawned afterwards; worktree-bound sessions keep their in-checkout
+    /// plans dir.
     pub fn use_project_plans(&self) {
         self.inner
             .shared_plans
@@ -1212,9 +1214,9 @@ mod tests {
         assert!(err.to_string().contains("worktree"), "{err}");
     }
 
-    /// The six on-screen `browser_*` tools (Mnemo1's WebView2 CDP
-    /// inspection path) were removed from the factory entirely — no
-    /// platform registers them any more. This pins that they never
+    /// The six on-screen `browser_*` tools (the retired Mnemo1 app's
+    /// WebView2 CDP inspection path) were removed from the factory
+    /// entirely — no platform registers them any more. This pins that they never
     /// reappear in a headless session's tools array; the
     /// `offscreen_browser_*` family drives the headless browser and is
     /// unaffected.

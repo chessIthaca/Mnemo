@@ -460,7 +460,7 @@ impl AgentSession {
     /// serves. For a loop that already served the seed is a no-op — the
     /// pin's first serve announces via the kernel's normal diff.
     ///
-    /// The effort bookkeeping mirrors Mnemo1's picker swap
+    /// The effort bookkeeping mirrors the picker swap
     /// (`config_io::swap_provider_into_loop`): the switch's display effort
     /// — the requested one, else the model's configured default chain —
     /// is recorded in the pinned + default display slots and the stale
@@ -533,9 +533,10 @@ impl AgentSession {
         // loop that already served this is a no-op — the pin's first serve
         // announces via the kernel's normal diff.
         loop_arc.seed_served_effective_if_empty();
-        // The effort bookkeeping Mnemo1's swap performs: the switch's display
-        // effort — what the picker requested, or the model's configured
-        // default chain — is recorded in the pinned + default display slots
+        // The effort bookkeeping the picker swap performs: the switch's
+        // display effort — what the picker requested, or the model's
+        // configured default chain — is recorded in the pinned + default
+        // display slots
         // and the stale per-turn mirrors (model, endpoint, effort) are
         // cleared, so the pin's first serve reports the NEW effort
         // (`model_changed` carries it; the baseline above captured the OLD
@@ -1150,7 +1151,7 @@ mod lifecycle_tests {
                 host_tools: Vec::new(),
                 trace_identity: None,
                 pinned_task: None,
-                // Mnemo1-side sessions keep the per-turn gate
+                // Non-Mnemo2 sessions keep the per-turn gate
                 // (plan 2ba2168a step 1).
                 skip_turn_routing: false,
             },
@@ -1232,7 +1233,7 @@ mod lifecycle_tests {
             host_tools: Vec::new(),
             trace_identity: None,
             pinned_task: None,
-            // Mnemo1-side sessions keep the per-turn gate
+            // Non-Mnemo2 sessions keep the per-turn gate
             // (plan 2ba2168a step 1).
             skip_turn_routing: false,
         };

@@ -12,7 +12,7 @@
 //! generated — review & re-run"; once committed, any Rust-side shape change
 //! (a renamed field, a new `skip_serializing_if`, a changed enum tag) makes
 //! this test fail until the fixture is consciously updated. The TypeScript
-//! half of the drift check retired with Mnemo1's frontend; the fixtures
+//! half of the drift check went with the retired frontend; the fixtures
 //! remain the committed record of the wire shapes Mnemo2 consumes.
 //!
 //! Fixtures are read via `env!("CARGO_MANIFEST_DIR")` (the brain crate root =

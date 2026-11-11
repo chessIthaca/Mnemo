@@ -4,11 +4,11 @@
 
 //! The Mnemo2 plan board (`.coding/design/mnemo2.md` Phase 6).
 //!
-//! The lead holds any number of plans at once; each is a Mnemo1-format plan
-//! file under `.coding/plans/` (steps, `## Progress`, `## Decisions`), and
-//! `board.json` beside them records which plans are open, closed, or
-//! abandoned. Plans are the record of intent: they outlive their close and
-//! are digested into project memory.
+//! The lead holds any number of plans at once; each is a plan file under
+//! `.coding/plans/` in the kernel's plan-file format (steps, `## Progress`,
+//! `## Decisions`), and `board.json` beside them records which plans are
+//! open, closed, or abandoned. Plans are the record of intent: they outlive
+//! their close and are digested into project memory.
 //!
 //! Step numbers in this API are 1-based where a model or a worker sees them
 //! (`brief_for`, [`BoardStep::number`]) and 0-based where the host's task
@@ -2005,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_round_trip_through_the_board_and_the_mnemo1_parser() {
+    fn plans_round_trip_through_the_board_and_the_plan_file_parser() {
         let dir = tempfile::tempdir().unwrap();
         let board = board(dir.path());
         let a = create(&board, "Importer");
@@ -2030,8 +2030,8 @@ mod tests {
         assert_eq!(edited.steps.len(), 3);
         board.tick(&a.id, 0, "merged abc123").unwrap();
 
-        // Mnemo1's parser reads the same file: steps, kind, and context
-        // survive, and the new sections round-trip.
+        // The kernel's plan-file parser reads the same file: steps, kind,
+        // and context survive, and the new sections round-trip.
         let path = dir.path().join("plans").join(format!("{}.md", a.id));
         let parsed = PlanFile::read_from_file(&path).unwrap();
         assert_eq!(parsed.title, "Importer");

@@ -341,7 +341,7 @@ impl LlmRequestContext {
 /// wires (the `dismissed_recall` pattern), so a tool can stamp its own
 /// LLM calls with the calling agent's identity at call time. Empty (all
 /// calls unattributed) until the spawn path stamps it post-build; a loop
-/// built without a host identity keeps it empty forever (Mnemo1).
+/// built without a host identity keeps it empty forever.
 #[derive(Debug, Default)]
 pub struct TraceIdentityHandle {
     identity: std::sync::RwLock<Option<TraceIdentity>>,
@@ -882,9 +882,9 @@ impl LlmRequestLog {
     }
 
     /// Begin a new record for a request about to be POSTed — the legacy
-    /// empty-context path: the record stays unattributed. Mnemo1's entry
-    /// point and the compatibility wrapper for external callers; the
-    /// agent loop uses [`Self::start_with_context`].
+    /// empty-context path: the record stays unattributed. A compatibility
+    /// wrapper for external callers; the agent loop uses
+    /// [`Self::start_with_context`].
     pub fn start(
         &self,
         model: &str,
@@ -1405,8 +1405,8 @@ impl LlmRequestLog {
     }
 
     /// Set the record ring's capacity (records kept in memory). The
-    /// default ([`MAX_RECORDS`] = 32) is Mnemo1's; Mnemo2 raises it to 128
-    /// at startup (plan c3ba2b58 step B). Shrinking below the current
+    /// default ([`MAX_RECORDS`] = 32) is the kernel's; Mnemo2 raises it to
+    /// 128 at startup (plan c3ba2b58 step B). Shrinking below the current
     /// length evicts the oldest records immediately so the bound holds
     /// without waiting for the next insert; 0 keeps nothing (a degenerate
     /// but honest setting).
@@ -3867,8 +3867,8 @@ mod tests {
     #[test]
     fn start_with_context_stamps_run_id_and_attribution() {
         // Attribution lands at creation — before any retry, streaming, or
-        // ring eviction can reorder things. The summary (the wire type Mnemo1
-        // renders and Mnemo2 lists) carries it verbatim.
+        // ring eviction can reorder things. The summary (the wire type
+        // Mnemo2 lists) carries it verbatim.
         let log = LlmRequestLog::new();
         let identity = worker_identity("wt-alpha", "7");
         let ctx = LlmRequestContext::attributed(
@@ -3899,7 +3899,7 @@ mod tests {
 
     #[test]
     fn start_without_context_remains_unattributed() {
-        // The legacy `start` entry point (Mnemo1, external callers, the
+        // The legacy `start` entry point (external callers, the
         // provider-fallback paths) must behave exactly as before: a record
         // with a run id but NO attribution.
         let log = LlmRequestLog::new();
@@ -3983,7 +3983,7 @@ mod tests {
     #[test]
     fn ring_capacity_bounds_new_inserts() {
         // New inserts past the configured capacity evict the oldest;
-        // the default (MAX_RECORDS = 32) is Mnemo1's unchanged ring.
+        // the default (MAX_RECORDS = 32) is the kernel's unchanged ring.
         let log = LlmRequestLog::new();
         log.set_ring_capacity(2);
         for i in 0..4 {
@@ -3994,7 +3994,7 @@ mod tests {
         assert_eq!(rows[0].id, 3);
         assert_eq!(rows[1].id, 4);
         let fresh = LlmRequestLog::new();
-        assert_eq!(fresh.ring_capacity(), 32, "Mnemo1's default stays 32");
+        assert_eq!(fresh.ring_capacity(), 32, "the kernel default stays 32");
     }
 
     #[test]
@@ -4083,7 +4083,7 @@ mod tests {
 
     #[test]
     fn empty_identity_handle_context_is_unattributed() {
-        // A loop built without a host identity (Mnemo1) keeps its handle
+        // A loop built without a host identity keeps its handle
         // empty forever — its contexts are unattributed, never mislabelled.
         let handle = TraceIdentityHandle::new();
         assert_eq!(handle.get(), None);

@@ -78,12 +78,12 @@ use crate::tool::memory::{
 };
 use crate::tool::ToolRegistry;
 
-/// A per-agent root override for parallel run-all worktree agents
+/// A per-agent root override for parallel worktree agents
 /// (plan ffd7a86f).
 ///
 /// The factory's own `sandbox` / `project_root` / `codegraph` bind every
 /// built agent to the MAIN project tree. A worktree agent must instead
-/// work in its own git worktree (its own branch), so the run-all spawn
+/// work in its own git worktree (its own branch), so the worktree spawn
 /// path builds it with this spec: the file/shell/search tools, the git
 /// tools, and the code graph all bind to the worktree root. Everything
 /// else (memory, backlog wiring, skills, provider, spawner, reviews)
@@ -99,7 +99,7 @@ pub struct AgentRootSpec {
     /// The git root for the `git` / `git_read` tools — the worktree root.
     pub project_root: PathBuf,
     /// The code graph over the worktree tree. `None` mirrors the factory's
-    /// optional graph (indexing disabled); the run-all spawn path builds a
+    /// optional graph (indexing disabled); the worktree spawn path builds a
     /// fresh graph over the worktree's `.coding/codegraph.db`.
     pub codegraph: Option<Arc<crate::codegraph::CodeGraph>>,
 }
@@ -420,11 +420,6 @@ pub struct AgentLoopFactory {
     /// by every live `ShellTool` on its next command — no registry rebuild
     /// needed. Defaults to enabled with no overrides.
     shell_filter: Arc<RwLock<ShellFilterConfig>>,
-    /// Live mirror of `[general] enable_browser_inspection`, shared with every
-    /// built registry's browser `Ctx`. Drives whether the six on-screen
-    /// `browser_*` tools are advertised at all (see `Tool::available`) —
-    /// atomic so a Settings save lands on the next turn without a rebuild.
-    browser_inspection: Arc<std::sync::atomic::AtomicBool>,
     /// Live mirror of `[general.optimizer]` (token-optimizer levers,
     /// backlog e4a50d22), shared with every lever-bearing tool built from
     /// this factory (read_files outline reads, shell output
@@ -581,9 +576,6 @@ impl AgentLoopFactory {
             // overrides via `with_shell_filter_config` from the loaded config
             // at startup.
             shell_filter: Arc::new(RwLock::new(ShellFilterConfig::default())),
-            // Mirrors the config default (`enable_browser_inspection = false`)
-            // until the IPC layer pushes the loaded value at startup.
-            browser_inspection: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Optimizer config at its default (every lever ON, 2027-01-25);
             // the IPC layer overrides via `with_optimizer_config` from the
             // loaded config at startup (mirrors `shell_filter`).
@@ -855,9 +847,9 @@ impl AgentLoopFactory {
     /// transition gate (the agent cannot change state while spawned
     /// subagents are running).
     ///
-    /// Called once by the IPC layer alongside [`set_spawner`](Self::set_spawner)
-    /// (the concrete `IpcSpawner` implements both traits). Only affects agents
-    /// built **after** this call, so the IPC layer sets it before building the
+    /// Called once by the host wiring alongside [`set_spawner`](Self::set_spawner)
+    /// (the host-provided spawner implements both traits). Only affects agents
+    /// built **after** this call, so the host sets it before building the
     /// main agent.
     pub fn set_descendant_tracker(&self, tracker: Arc<dyn crate::runtime::DescendantTracker>) {
         *self
@@ -983,21 +975,6 @@ impl AgentLoopFactory {
     /// agent loop and the `describe_image` tool via [`SwappableVision`].
     pub fn set_vision(&self, vision: Option<Arc<dyn ImageDescriber>>) {
         self.vision.set(vision);
-    }
-
-    /// Push `[general] enable_browser_inspection` into the shared flag every
-    /// registry's browser `Ctx` reads. Called by the IPC layer at startup and
-    /// again on every Settings save, so hiding/showing the on-screen
-    /// `browser_*` tools takes effect on the next turn.
-    pub fn set_browser_inspection(&self, enabled: bool) {
-        self.browser_inspection
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Whether the on-screen `browser_*` tools are currently advertised.
-    pub fn browser_inspection_enabled(&self) -> bool {
-        self.browser_inspection
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Shared vision slot (for the IPC layer / diagnostics).
@@ -1745,7 +1722,6 @@ impl AgentLoopFactory {
         let ctx = || bt::Ctx {
             manager: Arc::clone(&self.browser),
             sandbox: sandbox.clone(),
-            inspection: Arc::clone(&self.browser_inspection),
         };
         registry.register(Box::new(bt::OffscreenNavigateTool(ctx())));
         registry.register(Box::new(bt::OffscreenListPagesTool(ctx())));
@@ -1757,26 +1733,6 @@ impl AgentLoopFactory {
         registry.register(Box::new(bt::OffscreenClickTool(ctx())));
         registry.register(Box::new(bt::OffscreenTypeTool(ctx())));
         registry.register(Box::new(bt::OffscreenSwitchPageTool(ctx())));
-        // Live WebView2 (Browser tab) inspection + control tools — attach to
-        // the app's own WebView2 via CDP to inspect/drive the interactive
-        // tab the human sees. browser_screenshot/browser_snapshot are
-        // read-only (AutoRun); browser_eval/browser_navigate/browser_click/
-        // browser_type run arbitrary JS / mutate the visible tab
-        // (NeedsApproval).
-        //
-        // Windows-only: the child webview is a WebView2 instance and these
-        // tools attach via its CDP debug endpoint — neither exists on other
-        // platforms, so they are not registered there (the Browser tab shows
-        // an explanatory panel instead; see ipc::browser_webview).
-        #[cfg(windows)]
-        {
-            registry.register(Box::new(bt::BrowserScreenshotTool(ctx())));
-            registry.register(Box::new(bt::BrowserEvalTool(ctx())));
-            registry.register(Box::new(bt::BrowserSnapshotTool(ctx())));
-            registry.register(Box::new(bt::BrowserNavigateTool(ctx())));
-            registry.register(Box::new(bt::BrowserClickTool(ctx())));
-            registry.register(Box::new(bt::BrowserTypeTool(ctx())));
-        }
     }
 
     /// The static deferred tools whose schemas the reveal response renders —
@@ -2060,8 +2016,8 @@ mod tests {
     use tokio::sync::Mutex;
 
     /// The concrete app workflow behind a loop's neutral handle (2b.3): the
-    /// tests read the rich surface through the same app→app downcast the IPC
-    /// uses.
+    /// tests read the rich surface through the same app→app downcast the
+    /// app-side policy factory uses.
     fn concrete(
         handle: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     ) -> Arc<Mutex<Workflow>> {
@@ -2593,31 +2549,27 @@ mod tests {
             factory.plans_dir(),
         );
 
-        // Default config: no vision model, browser inspection off — the
-        // `image_*` and on-screen `browser_*` tools hide themselves.
+        // Default config: no vision model — the `image_*` tools hide
+        // themselves.
         assert!(!factory.vision_slot().is_configured());
-        assert!(!factory.browser_inspection_enabled());
 
         // Apples-to-apples with the pre-disclosure behaviour only exists with
         // the browser feature on (the browser group carries ~900 tokens of
         // deferred schema); light builds skip this block.
         //
-        // Windows-only too (user decision 2026-09-20): the browser group
-        // is platform-conditional — the six on-screen WebView2 tools
-        // (register_browser_tools, cfg(windows)) exist only on Windows, so
-        // on macOS the all-loaded array is ~3.5k chars smaller and the
-        // deferral delta falls below the 12k threshold (measured 14700 on
-        // Windows vs 11246 on the macOS CI leg, run 35521221353 — the
-        // default array is identical, 32796 chars, on both sides). The
-        // assertion is calibrated to the Windows browser group; macOS
-        // skips it (the ceilings loop below still runs there).
+        // Windows-only (user decision 2026-09-20): the deferral delta is
+        // measured on the Windows browser group — the ten offscreen
+        // tools plus the image group on a vision-configured install
+        // (11263 chars, 2026-11-12). The on-screen WebView2 tools were
+        // removed with Mnemo1, so no platform-conditional schema weight
+        // remains; the floor below is that measurement rounded down to
+        // the next multiple of 500.
         #[cfg(all(feature = "browser", windows))]
         {
             // a fully
-            // configured install (vision on, CDP on) with every group already
+            // configured install (vision on) with every group already
             // revealed is exactly what the old code shipped on every request.
             let f2 = make_factory_with(dir.path(), Some(Arc::new(MockDescriber)));
-            f2.set_browser_inspection(true);
             let wf2 = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans2"))));
             let r2 = f2.build_registry(
                 &crate::app::workflow::as_handle(wf2.clone()),
@@ -2640,8 +2592,8 @@ mod tests {
             // un-defers a family (or adds a big always-on tool), this is the
             // assertion that notices.
             assert!(
-                c1 >= c0 + 12_000,
-                "deferral must save >12k chars on a fully configured install                  ({c1} loaded vs {c0} default) — did a group stop being deferred?"
+                c1 >= c0 + 11_000,
+                "deferral must save >11k chars on a fully configured install                  ({c1} loaded vs {c0} default) — did a group stop being deferred?"
             );
         }
 
@@ -3174,76 +3126,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(windows, feature = "browser"))]
-    #[test]
-    fn onscreen_browser_tools_advertised_only_with_inspection_enabled() {
-        // The six on-screen browser_* tools attach to the app's WebView2 over
-        // its CDP endpoint, which exists only when the user opted in. With
-        // `enable_browser_inspection = false` (the default) they are hidden
-        // rather than advertised as a guaranteed failure. The headless
-        // offscreen_browser_* family is unaffected.
-        let dir = tempdir().unwrap();
-        let factory = make_factory(dir.path());
-        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(
-            &crate::app::workflow::as_handle(workflow.clone()),
-            None,
-            None,
-            factory.plans_dir(),
-        );
-        let caps = crate::provider::Capabilities::openai();
-
-        assert!(
-            !factory.browser_inspection_enabled(),
-            "inspection is off by default"
-        );
-        let names = |r: &ToolRegistry| -> Vec<String> {
-            r.schemas(&caps, &crate::tool::ToolFilter::Executing)
-                .into_iter()
-                .map(|s| s.name)
-                .collect()
-        };
-        // TWO independent gates now stand between a browser tool and the
-        // tools array: `available()` (is the CDP endpoint even there?) and
-        // `deferred_group()` (has the agent asked for the browser group?).
-        let off = names(&registry);
-        assert!(
-            registry.get("browser_eval").is_some(),
-            "still REGISTERED — only advertising is gated"
-        );
-        assert!(
-            !off.iter().any(|n| n.contains("browser_")),
-            "the whole browser family is deferred until load_tools, got: {off:?}"
-        );
-
-        // Reveal the group: the headless family appears, but the on-screen
-        // tools stay hidden because their CDP endpoint is still off.
-        registry.load_group("browser");
-        let loaded = names(&registry);
-        assert!(
-            loaded.iter().any(|n| n.starts_with("offscreen_browser_")),
-            "the headless family appears once the group is loaded"
-        );
-        assert!(
-            !loaded
-                .iter()
-                .any(|n| n.starts_with("browser_") && !n.starts_with("offscreen_")),
-            "on-screen tools stay hidden while inspection is off, got: {loaded:?}"
-        );
-
-        // Flipping the shared flag takes effect on the next schemas() call —
-        // no registry rebuild, which is what makes the Settings toggle live.
-        factory.set_browser_inspection(true);
-        let on = names(&registry);
-        assert_eq!(
-            on.iter()
-                .filter(|n| n.starts_with("browser_") && !n.starts_with("offscreen_"))
-                .count(),
-            6,
-            "all six on-screen tools return once inspection is enabled, got: {on:?}"
-        );
-    }
-
     #[cfg(feature = "browser")]
     #[test]
     fn browser_group_is_deferred_until_loaded() {
@@ -3685,19 +3567,6 @@ mod tests {
                 "offscreen_browser_type",
                 "offscreen_browser_switch_page",
             ]);
-            // Windows-only: the live WebView2 (Browser tab) inspection + control
-            // tools attach to the app's own WebView2 via CDP — registered only on
-            // Windows targets (see register_browser_tools), so the expected set
-            // is platform-conditional too.
-            #[cfg(windows)]
-            v.extend([
-                "browser_screenshot",
-                "browser_eval",
-                "browser_snapshot",
-                "browser_navigate",
-                "browser_click",
-                "browser_type",
-            ]);
             v
         };
         for &name in &expected {
@@ -3810,16 +3679,10 @@ mod tests {
             );
         }
         let count = registry_len(&factory, &dir);
-        // The browser family is feature-gated: 10 offscreen tools on EVERY
-        // platform plus 6 on-screen WebView2 tools that register only on
-        // Windows (the `#[cfg(windows)]` block in `build_registry` — a user
-        // decision of 2026-09-20). The git pair is repo-gated (2c.3) — the
-        // tempdir is not a repo.
-        let browser = if cfg!(feature = "browser") {
-            10 + if cfg!(windows) { 6 } else { 0 }
-        } else {
-            0
-        };
+        // The browser family is feature-gated: 10 offscreen tools on every
+        // platform (the on-screen WebView2 tools were removed with Mnemo1).
+        // The git pair is repo-gated (2c.3) — the tempdir is not a repo.
+        let browser = if cfg!(feature = "browser") { 10 } else { 0 };
         let expected = 26 + browser;
         assert_eq!(
             count,
@@ -3911,16 +3774,10 @@ mod tests {
             "the rest of the Memory group stays"
         );
         let count = registry.iter().count();
-        // The browser family is feature-gated: 10 offscreen tools on EVERY
-        // platform plus 6 on-screen WebView2 tools that register only on
-        // Windows (the `#[cfg(windows)]` block in `build_registry` — a user
-        // decision of 2026-09-20). The git pair is repo-gated (2c.3) — the
-        // tempdir is not a repo.
-        let browser = if cfg!(feature = "browser") {
-            10 + if cfg!(windows) { 6 } else { 0 }
-        } else {
-            0
-        };
+        // The browser family is feature-gated: 10 offscreen tools on every
+        // platform (the on-screen WebView2 tools were removed with Mnemo1).
+        // The git pair is repo-gated (2c.3) — the tempdir is not a repo.
+        let browser = if cfg!(feature = "browser") { 10 } else { 0 };
         let expected = 25 + browser;
         assert_eq!(
             count,
@@ -4186,8 +4043,8 @@ mod tests {
             "main builds allow plan tools"
         );
 
-        // Simulate sub-agent construction (as IpcSpawner does for parent_id.is_some()).
-        // Simulate sub-agent construction (as IpcSpawner does for parent_id.is_some())
+        // Simulate sub-agent construction (as the host spawner does for parent_id.is_some()).
+        // Simulate sub-agent construction (as the host spawner does for parent_id.is_some())
         // — the spawn path's compound stamp (2b.3: the kernel rides the
         // neutral handle; the plan-mutation deny + the role state ride
         // app-side under one call).
@@ -4246,7 +4103,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_with_root_spec_binds_tools_to_override_root() {
-        // Parallel run-all (plan ffd7a86f): a worktree agent's file tools
+        // Parallel worktree sessions (plan ffd7a86f): a worktree agent's file tools
         // must operate on the OVERRIDE root (its git worktree), not the
         // factory's project root — and the spec is stored on the loop so
         // subagents inherit the same root (spawn_agent_shared reads it).
@@ -4382,7 +4239,7 @@ mod tests {
             assert!(!wf.plan_mutations_allowed());
         }
         assert!(
-            // `false`: subagents are never run-all dispatched (the
+            // `false`: subagents are never dispatched unattended (the
             // unattended flag is derived from the MAIN agent's Prompt).
             !child.workflow_handle().expects_progress(false).await,
             "a Subagent-state loop never expects progress (auto-continue parks)"

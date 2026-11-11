@@ -7,12 +7,13 @@
 //!
 //! The page's three toggles are the `[ui] sound_complete`,
 //! `sound_input_needed` and `sound_stopped_errors` flags the engine already
-//! persists (Mnemo1's Settings → Sounds section reads the same keys). `[ui]`
-//! is deliberately absent from the engine's `SettingsSaveDto` patch — the GUI
-//! owns that table — so this module writes it app-side: load the shared
+//! persists (the same keys the legacy Mnemo Settings → Sounds section read).
+//! `[ui]`
+//! is deliberately absent from the engine's `SettingsSaveDto` patch (the GUI
+//! owns that table), so this module writes it app-side: load the shared
 //! `config.toml` through [`Config::load`], apply the flags, and save the whole
-//! set back through [`Config::save_all`] (the atomic four-file commit Mnemo1's
-//! own app-side settings writer uses). Every unrelated section survives
+//! set back through [`Config::save_all`] (the atomic four-file commit the
+//! legacy app-side settings writer used). Every unrelated section survives
 //! because the full config round-trips through memory.
 //!
 //! The sounds themselves are synthesized in the frontend

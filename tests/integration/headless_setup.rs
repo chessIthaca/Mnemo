@@ -425,7 +425,15 @@ fn settings_exposes_engine_config_and_preserves_ui() {
     // A GUI user's [ui] half in the same file.
     std::fs::write(
         cfg.path().join("config.toml"),
-        "[general]\ndefault_provider = \"test\"\ndefault_model = \"test-model\"\nbundled_embedding_model = \"hash\"\n\n[ui]\ntheme = \"dark\"\nchat_thread_line = false\n",
+        "[general]
+default_provider = \"test\"
+default_model = \"test-model\"
+bundled_embedding_model = \"hash\"
+
+[ui]
+theme = \"dark\"
+sound_complete = false
+",
     )
     .unwrap();
     let setup = Setup::open(Some(cfg.path().to_path_buf())).unwrap();
@@ -456,7 +464,7 @@ fn settings_exposes_engine_config_and_preserves_ui() {
         .unwrap();
     let reloaded = mnemo::config::Config::load(cfg.path()).unwrap();
     assert_eq!(reloaded.general.ui.theme, "dark", "the [ui] table rides through");
-    assert!(!reloaded.general.ui.chat_thread_line);
+    assert!(!reloaded.general.ui.sound_complete);
 }
 
 // -- D5: the classifier surface (§5.8 :554) --

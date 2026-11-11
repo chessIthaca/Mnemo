@@ -204,14 +204,14 @@ impl AgentManager {
 /// Spawns background agents from within the agent loop.
 ///
 /// This is the seam that lets the `spawn_agent` **tool** (in the core library)
-/// start a new agent without depending on the Tauri IPC layer. The IPC layer
-/// provides the concrete implementation (backed by the real `AgentManager` +
-/// `AgentLoopFactory`); the tool only knows this trait.
+/// start a new agent without depending on any host layer. The host wiring
+/// provides the concrete implementation (`HostSpawner`, backed by the real
+/// `AgentManager` + `AgentLoopFactory`); the tool only knows this trait.
 ///
 /// Keeping this behind a trait (rather than giving the tool an `AgentManager`
 /// directly) is deliberate: the `AgentManager` alone can't build a per-agent
 /// `AgentLoop` (that's the factory's job) and doesn't own the async runtime the
-/// task is spawned on. The IPC implementation bundles all of that.
+/// task is spawned on. The host-side implementation bundles all of that.
 #[async_trait::async_trait]
 pub trait AgentSpawner: Send + Sync {
     /// Spawn a new background agent with the given display name and task
@@ -237,7 +237,7 @@ pub trait AgentSpawner: Send + Sync {
 
     /// If this spawner can record a parent for the agents it spawns, return
     /// it as a [`ParentAwareSpawner`] trait object. The default returns `None`
-    /// (no parent tracking); the IPC-layer spawner overrides it to return
+    /// (no parent tracking); the host spawner overrides it to return
     /// `Some(self)`. This keeps [`AgentSpawner`] object-safe while letting the
     /// `spawn_agent` tool reach the parent-aware path without knowing the
     /// concrete type.
@@ -248,7 +248,7 @@ pub trait AgentSpawner: Send + Sync {
 
 /// A spawner that can record the spawning agent as the new agent's parent.
 ///
-/// Implemented by the concrete IPC-layer spawner and reached from the
+/// Implemented by the concrete host-side spawner and reached from the
 /// `spawn_agent` tool via [`AgentSpawner::parent_aware`]. When the tool knows
 /// its owning agent's id, it uses this to register the child as that agent's
 /// child, so the completion-notification feedback loop fires when the child
@@ -288,7 +288,7 @@ pub trait ParentAwareSpawner: Send + Sync {
 ///
 /// Like [`AgentSpawner`], this is a brain-side trait: the workflow / dispatch
 /// layer consults it to gate state transitions on running subagents without
-/// depending on the IPC layer. The concrete implementation is the IPC-layer
+/// depending on any host layer. The concrete implementation is the host-side
 /// spawner (backed by the real [`AgentManager`]), reached from the
 /// `spawn_agent` tool / dispatch via the [`AgentLoopFactory`] wiring.
 ///
@@ -304,10 +304,10 @@ pub trait ParentAwareSpawner: Send + Sync {
 /// park a parent whose turn ends while its descendants run.
 ///
 /// Update timing (backlog 2c406d72): the tracker is updated synchronously
-/// BEFORE the child-finish notification is sent — the IPC event forwarder
-/// clears the finishing agent's running flag first and only then sends the
-/// completion `Suggestion` to the parent (`notify_parent_on_completion` in
-/// src-tauri/src/ipc/events.rs). The notification and the tracker therefore
+/// BEFORE the child-finish notification is sent — the host-side lifecycle
+/// bookkeeping (src/host/runtime.rs) clears the finishing agent's running
+/// flag first and only then sends the completion `Suggestion` to the parent.
+/// The notification and the tracker therefore
 /// agree by construction: the moment the parent can observe that a child
 /// finished, this method already reports it as not running.
 #[async_trait::async_trait]

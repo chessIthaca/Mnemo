@@ -5,9 +5,8 @@
 //! Build an LLM client from an endpoint + model.
 //!
 //! Centralizes the api-key fallback chain + endpoint-kind dispatch that were
-//! previously duplicated across several call sites (the main provider in
-//! `main.rs`, the vision provider in `main.rs`, `set_model` in
-//! `ipc/commands.rs`/`config_io.rs`, the Settings re-sync, memory
+//! previously duplicated across several call sites (the main provider and
+//! vision provider builds, `set_model`, the Settings re-sync, memory
 //! maintenance). Keeping the credential-resolution chain and the
 //! OpenAI-vs-Anthropic dispatch in one place prevents drift (e.g. a new env
 //! var added to one copy and forgotten in the others, or an Anthropic
@@ -199,8 +198,8 @@ pub fn build_openai_client(
 /// the default model), then builds a client via the shared
 /// [`openai_client_config`] path. The model's effective multimodal flag
 /// ([`Endpoint::multimodal_for`] — per-model override, else the endpoint
-/// flag) + reasoning effort are used, mirroring the main provider build in
-/// `main.rs` so a per-context model behaves like the default one. The
+/// flag) + reasoning effort are used, mirroring the startup provider build
+/// so a per-context model behaves like the default one. The
 /// effort resolves the per-context `ModelRef::reasoning_effort` override
 /// first (normalized through the same gate / allow-list clamp / "off" wire
 /// encoding as configured values), else the model's own default chain

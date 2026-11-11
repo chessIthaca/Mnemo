@@ -29,9 +29,9 @@ use crate::error::{Error, Result};
 
 use super::sse_util::check_response;
 
-/// Resolve the credentials for a model-listing request (job 4 D2,
-/// moved from the app's ipc/models.rs so the GUI pickers and the
-/// standalone `Setup` surface share ONE implementation): the explicit
+/// Resolve the credentials for a model-listing request (job 4 D2, so the
+/// Settings pickers and the standalone `Setup` surface share ONE
+/// implementation): the explicit
 /// override args first (empty strings treated as absent — the
 /// override path keeps a picker in sync with unsaved edits), then the
 /// saved endpoint (`endpoints.toml` base_url + kind, `keys.toml`
@@ -80,7 +80,7 @@ pub fn resolve_endpoint_credentials(
 }
 
 /// Fetch the live model list via the HTTP helper selected by the
-/// resolved kind wire string (job 4 D2, moved from ipc/models.rs):
+/// resolved kind wire string (job 4 D2):
 /// `"anthropic"` uses the Anthropic headers (`x-api-key` +
 /// `anthropic-version`), anything else the OpenAI-compatible path.
 pub async fn fetch_by_kind(

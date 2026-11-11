@@ -2,6 +2,7 @@
 title = "Mnemo1-only settings — which retire, which stay config-only, which move to Mnemo2"
 created = "2026-11-11"
 evidence = "User approval 2026-11-11. grep of mnemo2/src, src-tauri/src/mnemo2 and src/headless shows no reads of the [ui] chat/steering toggles. src-tauri/src/ipc/run_all.rs reads auto_compact_on_plan_complete."
+status = "superseded"
 +++
 
 The user approved this split on 2026-11-11, while preparing Mnemo1's retirement.

@@ -4,27 +4,24 @@
 
 //! The brain: config, project, memory store, provider, model resolver, safety,
 //! code graph, MCP, skills and the agent factory — built once per process and
-//! shared by every agent. Moved from the Tauri app's `main.rs`; frontends pass
-//! a [`HostNotifier`] for background startup events and a Tokio handle for the
-//! background tasks the build spawns.
+//! shared by every agent. Hosts pass a [`HostNotifier`] for background startup
+//! events and a Tokio handle for the background tasks the build spawns.
 
 use std::sync::{Arc, RwLock};
 
 use crate::agent::context::ContextManager;
 use crate::agent::factory::AgentLoopFactory;
-use crate::config::{global_config_dir, Config, SafetyMode};
+use crate::config::{Config, SafetyMode};
 use crate::host::index_progress::{
     clear_startup_index, ensure_startup_index_visible, mark_startup_index_active,
     record_startup_index_progress, startup_should_forward, IndexProgressEvent,
 };
 use crate::host::maintenance::{claim_busy, BusyGuard, ReconcileEvent};
 use crate::host::notifier::{HostEvent, SharedNotifier};
-use crate::host::startup::{
-    project_flag_from_args, resolve_startup_provider, should_reembed_at_startup,
-};
+use crate::host::startup::{resolve_startup_provider, should_reembed_at_startup};
 use crate::memory::embedder::HashEmbedder;
 use crate::memory::MemoryStore;
-use crate::workspace::{CODING_DIR_NAME, Workspace, ensure_minimal_project, find_coding_dir_ancestor};
+use crate::workspace::Workspace;
 use crate::provider::trace::LlmRequestLog;
 use crate::provider::{LlmClient, ProviderKind};
 use crate::safety_rules::SafetyRules;
@@ -37,10 +34,10 @@ use crate::provider::openai::{OpenAiClient, OpenAiClientConfig};
 
 /// The built brain — everything needed to run the agent.
 ///
-/// `pub` with all fields `pub` so every host (the Tauri GUI, the console,
-/// the headless API) can reuse the exact same construction path and wire
-/// its own state from the pieces it needs: `build_brain` takes a
-/// host-notifier + a runtime handle, never a Tauri app.
+/// `pub` with all fields `pub` so every host embedding the kernel can
+/// reuse the exact same construction path and wire its own state from
+/// the pieces it needs: `wire_brain` takes a host-notifier + a runtime
+/// handle, never a Tauri app.
 pub struct Brain {
     pub factory: Arc<AgentLoopFactory>,
     /// The agent-facing memory funnel (G8): the dyn handle the factory,
@@ -54,10 +51,8 @@ pub struct Brain {
     /// load, the rewire swaps), the debug API (`MemoryApi`), the kNN
     /// overlay, and `Setup::for_engine`'s live handles read THIS slot —
     /// an injected store owns its embedding + its debug surface. `pub`
-    /// because the APP crate is a documented consumer (the IpcState
-    /// wiring + the two startup hooks in `src-tauri/src/main.rs` + the
-    /// console twin in `console.rs`) — the pre-split field was `pub` for
-    /// exactly that (review round 1, finding 1).
+    /// because host crates are documented consumers — the pre-split
+    /// field was `pub` for exactly that (review round 1, finding 1).
     pub own_memory_store: Option<Arc<MemoryStore>>,
     /// The resolved kernel workspace (2c.3 G3): the root + the state dir.
     /// The brain no longer holds the app's Project (the kernel facade must
@@ -77,9 +72,9 @@ pub struct Brain {
     /// (Trace tab). One instance for the whole app.
     pub trace: Arc<LlmRequestLog>,
     /// The shared headless debug browser — the same `Arc` wired into the
-    /// factory (agent tools) and the IPC state (Browser tab commands).
+    /// factory (agent tools) and shared with the host's browser UI.
     /// 3a.1 (D1): browser-feature only — the bare build has no browser
-    /// module, so this field (and its wiring in `build_brain_inner`)
+    /// module, so this field (and its wiring in `wire_brain`)
     /// compile out.
     #[cfg(feature = "browser")]
     pub browser: Arc<crate::browser::BrowserManager>,
@@ -92,11 +87,11 @@ pub struct Brain {
     /// unless the config enables Laya.
     pub classifier_status: Arc<RwLock<crate::memory::classifier::ClassifierStatus>>,
     /// The shared classifier SLOT (the live handle, backlog a147b63c):
-    /// created in `build_brain_inner` and shared by the factory's
-    /// `memory_write` tools (call-time read) and the IPC `RuntimeState`
-    /// (rewire swaps it) — one Arc, no rebuilds. The auto-typing FLAG
-    /// mirror lives in the factory's gate handle (Settings saves flip it
-    /// via `set_auto_typing_enabled`).
+    /// created in `wire_brain` and shared by the factory's
+    /// `memory_write` tools (call-time read) and the headless `Setup`'s
+    /// live handles (rewire swaps it) — one Arc, no rebuilds. The
+    /// auto-typing FLAG mirror lives in the factory's gate handle
+    /// (Settings saves flip it via `set_auto_typing_enabled`).
     pub classifier_slot:
         Arc<RwLock<Option<Arc<dyn crate::memory::classifier::Classifier>>>>,
     /// A configured bundled embedding model that wasn't installed at startup
@@ -119,171 +114,14 @@ pub struct Brain {
     pub _graph_watcher: Option<crate::codegraph::watcher::GraphWatcher>,
 }
 
-/// The outcome of [`build_brain`]: either the brain is ready to run, or no
-/// project could be resolved and the app should show the project picker.
-///
-/// `NeedsProject` carries the loaded global `Config` (so the picker can list
-/// the registered projects from `projects.toml`) without building any of the
-/// project-scoped subsystems (provider, sandbox, memory, constitution…).
-/// Both payloads ride boxed — `Config` is ~1.7 KB and `Brain` ~216 B; the
-/// boxes keep `BrainOutcome` cheap to hold and pass (boxing only `Config`
-/// left `Brain` itself over the 200 B large_enum_variant threshold).
-pub enum BrainOutcome {
-    /// The brain built successfully — the app runs normally.
-    Ready(Box<Brain>),
-    /// No project resolved at startup — the frontend shows the project
-    /// picker. The window is open but the agent can't run until a project is
-    /// chosen (which restarts the app into the selected project).
-    NeedsProject(Box<Config>),
-}
-
-/// Build the brain: load config, resolve project, wire provider + factory —
-/// and always report how long it took.
-///
-/// The factory holds the shared, stateless deps (provider, constitution
-/// source, memory store, sandbox, safety rules, safety mode, context manager,
-/// plans dir). Each agent — including the first "main" agent — is built via
-/// `factory.build()`, which gives it its own `Workflow` + `ToolRegistry`.
-///
-/// Returns [`BrainOutcome::NeedsProject`] when no project can be resolved
-/// (the cwd is not inside a project, no `--project` flag was given, and no
-/// pending-project marker from a prior switch is present). In that case the
-/// frontend shows the project picker instead of the normal UI.
-///
-/// `build_brain` runs on the main thread (Tauri's sync `.setup` hook) BEFORE
-/// the event loop starts pumping messages, so its duration is the app's
-/// main-thread stall at startup. The measurement is printed permanently: it is
-/// the baseline for hang diagnostics (AppHangB1, 2026-08-20) — if this number
-/// ever grows to seconds, startup work must move off the main thread.
-///
-/// First measurement (2026-08-20): **537 ms total** — under the 1 s
-/// restructure bar, and its single largest contributor (the bundled model's
-/// ~110 MB ONNX init) is already deferred off the main thread
-/// ([`EmbedderStartupPlan::UseHashThenLocalLoad`]); the rest is config load +
-/// MemoryStore open + provider/factory wiring, all sub-100 ms pieces.
-pub fn build_brain(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handle) -> anyhow::Result<BrainOutcome> {
-    let started = std::time::Instant::now();
-    let outcome = build_brain_inner(notifier, rt);
-    eprintln!(
-        "mnemo: build_brain took {}ms on the main thread ({})",
-        started.elapsed().as_millis(),
-        match &outcome {
-            Ok(BrainOutcome::Ready(_)) => "ready",
-            Ok(BrainOutcome::NeedsProject(_)) => "needs-project",
-            Err(_) => "error",
-        }
-    );
-    outcome
-}
-
-/// The measured body of [`build_brain`] — see its doc comment for the
-/// timing wrapper above. The APP path: the global config + the app's
-/// project discovery (pending marker → `--project` flag → cwd walk-up),
-/// then the shared wiring tail ([`wire_brain`]).
-fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handle) -> anyhow::Result<BrainOutcome> {
-    let config_dir = global_config_dir();
-    let config = Config::load(&config_dir)?;
-
-    // Resolve the project. Resolution order:
-    //   1. Pending-project marker — set by a prior `switch_project` call
-    //      right before a restart. The marker is consumed here. The path must
-    //      already be a project; if its `.coding/` is missing (e.g. the user
-    //      deleted it), fall through to the picker rather than silently
-    //      re-initializing.
-    //   2. `--project <path>` flag — CLI override. Initializes the project if
-    //      it isn't one yet (preserves the CLI workflow).
-    //   3. Auto-detect — walk up from the cwd looking for `.coding/`.
-    //   4. Otherwise — no project; return NeedsProject so the picker shows.
-    //
-    // The registry is deliberately NOT auto-picked: the picker lists its
-    // entries but never opens one without an explicit choice (per the
-    // "always show the dialog unless the cwd is a project" rule).
-    //
-    // `switched_open` records that THIS launch is the reload half of a
-    // `switch_project` (a pending-project marker was consumed and valid):
-    // the startup indexing pass uses it to skip the 1-second progress gate —
-    // the user explicitly opened this project and the UI they clicked from
-    // was just torn down for the restart, so the splash dialog must show
-    // immediately rather than after a silent second.
-    let mut switched_open = false;
-    let workspace = if let Some(pending) = crate::config::take_pending_project() {
-        if pending.join(CODING_DIR_NAME).is_dir() {
-            switched_open = true;
-            Arc::new(Workspace::new(&pending))
-        } else {
-            // Marker pointed at a non-project dir — show the picker, but say
-            // WHY on stderr so a stale marker is diagnosable (backlog
-            // 16e4a7f8: the silent fall-through re-showed the picker with no
-            // explanation).
-            eprintln!(
-                "mnemo: pending-project marker pointed at '{}' which has no .coding/ — showing the picker",
-                pending.display()
-            );
-            return Ok(BrainOutcome::NeedsProject(Box::new(config)));
-        }
-    } else if let Some(flagged) = project_flag_from_args(std::env::args()) {
-        if flagged.join(CODING_DIR_NAME).exists() {
-            Arc::new(Workspace::new(&flagged))
-        } else {
-            eprintln!(
-                "No project found at '{}'. Initializing...",
-                flagged.display()
-            );
-            // The kernel-minimal bootstrap in place of the app's Project::init
-            // (G3): .coding/plans + the shipped skills + the agent.md template —
-            // the kernel never writes .gitignore/.gitattributes.
-            ensure_minimal_project(&flagged)?;
-            Arc::new(Workspace::new(&flagged))
-        }
-    } else {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(found) = find_coding_dir_ancestor(&cwd) {
-            Arc::new(Workspace::new(&found))
-        } else {
-            return Ok(BrainOutcome::NeedsProject(Box::new(config)));
-        }
-    };
-
-    // 3b.1 (D1): the app path keeps today's behavior — the store at
-    // <state_dir>/memory.db (the Sqlite default), the codegraph flag
-    // from the loaded config.
-    let want_codegraph = config.general.general.codegraph;
-    // c5d25f4e: the app owns the on-screen WebView2 (the Browser pane), so
-    // the on-screen browser gate still resolves from the config here.
-    let want_on_screen_browser = config.general.general.enable_browser_inspection;
-    wire_brain(
-        config_dir,
-        config,
-        workspace,
-        switched_open,
-        notifier,
-        rt,
-        BrainMemoryOptions {
-            memory_enabled: true,
-            memory_path: None,
-            index_codegraph: want_codegraph,
-            on_screen_browser: want_on_screen_browser,
-            // G8: the app path never injects — the backend enum is its
-            // only source (and no shared resources: one process, one
-            // engine).
-            injected_store: None,
-            shared: None,
-        },
-    )
-    .map(|brain| BrainOutcome::Ready(Box::new(brain)))
-}
-
 /// The shared wiring tail (3a.4): everything from an EXPLICIT config dir +
 /// config + workspace to a running [`Brain`] — the trace log, provider
 /// stack, memory store, sandbox, safety, resolver, factory. No discovery,
-/// no global-config read, no picker: the app reaches this through
-/// [`build_brain`]'s resolution; the headless Engine through
-/// `EngineOptions` (G4 — the engine passes its directories explicitly).
+/// no global-config read, no picker: the headless Engine reaches this
+/// through `EngineOptions` (G4 — the engine passes its directories
+/// explicitly).
 /// 3b.1 (D1): the brain's memory/index decisions, RESOLVED from
-/// EngineOptions.memory + index_codegraph by the callers (the app path
-/// passes the config's values, preserving its behavior), plus the
-/// per-host on-screen browser gate (c5d25f4e): the headless Engine holds
-/// it off — it has no on-screen WebView2 to attach the tools to.
+/// EngineOptions.memory + index_codegraph by the callers.
 pub(crate) struct BrainMemoryOptions {
     /// `false` = MemoryBackend::Disabled: NO store — no recall, no
     /// consolidation, no capture, no memory.db on disk (Engine::memory()
@@ -296,11 +134,6 @@ pub(crate) struct BrainMemoryOptions {
     /// config's `codegraph`; the headless Engine passes
     /// EngineOptions.index_codegraph).
     pub index_codegraph: bool,
-    /// Whether the on-screen `browser_*` tools may ever attach (the app
-    /// passes the config's `enable_browser_inspection`; a headless Engine
-    /// passes `false` — it has no on-screen WebView2 CDP endpoint, so the
-    /// gate stays off whatever the config says).
-    pub on_screen_browser: bool,
     /// G8 (§5.9.8 :726-728): the Rust-only INJECTED store — overrides the
     /// backend wiring entirely (the serde `MemoryBackend` enum stays the
     /// wire). `None` = build from `memory_enabled`/`memory_path` as today.
@@ -363,7 +196,6 @@ pub(crate) fn wire_brain(
         memory_enabled,
         memory_path,
         index_codegraph,
-        on_screen_browser,
         injected_store,
         shared,
     } = memory;
@@ -1009,25 +841,11 @@ pub(crate) fn wire_brain(
         Arc::new(RwLock::new(config.clone())),
         trace.clone(),
     ));
-    // The shared headless debug browser — one instance for the agent tools and
-    // the IPC layer (the right-panel Browser tab). Lazily spawned on first use.
+    // The shared headless debug browser — one instance for the agent tools
+    // and the host's browser UI. Lazily spawned on first use.
     // 3a.1 (D1): browser-feature only (the bare build has no browser module).
     #[cfg(feature = "browser")]
     let browser = crate::browser::BrowserManager::new();
-    // Agent-side bootstrap: browser_navigate can create the Browser tab's
-    // child webview when the tab was never opened (plan 5ae26d22).
-    // In a release build, enable the WebView2 CDP attach only when the user
-    // opted in via `enable_browser_inspection` (the env var exposing the port
-    // was already set above in `main`). Debug builds always have it on.
-    // Headless hosts (c5d25f4e) pass on_screen_browser: false — there is no
-    // on-screen WebView2 to attach to at all, so the attach never turns on.
-    #[cfg(feature = "browser")]
-    if on_screen_browser
-        && !cfg!(debug_assertions)
-        && config.general.general.enable_browser_inspection
-    {
-        browser.set_webview_enabled(true);
-    }
     // The shared, runtime-mutable git core-operations list — seeded from the
     // loaded `[git]` config section (default ["merge", "push"]). Every GitTool
     // built from the factory shares this Arc<RwLock<...>>, so a save_settings
@@ -1299,16 +1117,6 @@ pub(crate) fn wire_brain(
     // Record the startup default's DISPLAY effort (backlog 51dab4da) —
     // stamped onto every loop the factory builds (see build_inner).
     factory.set_default_display_effort(Some(startup_display_effort));
-    // Seed the on-screen browser_* gate from the loaded config: those tools
-    // attach over the WebView2 CDP endpoint, which only exists when the user
-    // opted in, so with the flag off they stay out of the tools array
-    // entirely rather than advertising a guaranteed failure. Headless hosts
-    // (c5d25f4e) hold the gate off entirely — they expose no on-screen
-    // WebView2 CDP endpoint, so the config flag must not advertise the
-    // tools there.
-    factory.set_browser_inspection(
-        on_screen_browser && config.general.general.enable_browser_inspection,
-    );
     // Wire the code knowledge graph when enabled + opened successfully.
     let factory = match codegraph.clone() {
         Some(graph) => factory.with_codegraph(graph),

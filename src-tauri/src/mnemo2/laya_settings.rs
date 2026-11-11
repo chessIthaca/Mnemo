@@ -115,7 +115,7 @@ static SETUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 // ── Wire shapes ─────────────────────────────────────────────────────────────
 
-/// The seven `[general.laya]` opt-in flags as the Laya page shows them.
+/// The six `[general.laya]` opt-in flags as the Laya page shows them.
 /// The master `enabled` flag rides the status object itself — its only
 /// sanctioned change paths are `laya_setup`/`laya_disable`.
 #[derive(Debug, Clone, Serialize)]
@@ -127,8 +127,6 @@ pub struct LayaFlagsWire {
     /// The kNN overlay for failure triage (local, rides the memory
     /// embedder).
     pub failure_triage_knn: bool,
-    /// Startup failure-triage fine-tune (managed runtime only).
-    pub auto_finetune: bool,
     /// Tool-choice steering on the compound reflex.
     pub steer_tool_choice: bool,
     /// Pre-prompt model routing (shadow-first master for the routing
@@ -165,13 +163,13 @@ pub struct LayaStatusWire {
     /// The coarse runtime state: `"disabled"`, `"not_installed"`,
     /// `"installing"`, `"starting"`, `"ready"` or `"failed"`.
     pub status: &'static str,
-    /// The seven opt-in flags.
+    /// The six opt-in flags.
     pub flags: LayaFlagsWire,
     /// The routing lanes.
     pub routing: RoutingWire,
 }
 
-/// The `flags` payload of `save_laya_settings` — the seven opt-in flags,
+/// The `flags` payload of `save_laya_settings` — the six opt-in flags,
 /// each absent = keep. The master `enabled` key is a struct field only so
 /// a caller that sends it is REJECTED with a clear message instead of
 /// having it silently dropped: it never rides the settings patch (the
@@ -189,8 +187,6 @@ pub struct LayaFlagsPatch {
     pub failure_triage: Option<bool>,
     /// The kNN overlay for failure triage. Absent = keep.
     pub failure_triage_knn: Option<bool>,
-    /// Startup failure-triage fine-tune. Absent = keep.
-    pub auto_finetune: Option<bool>,
     /// Tool-choice steering. Absent = keep.
     pub steer_tool_choice: Option<bool>,
     /// Pre-prompt model routing (the master flag for the lanes). Absent =
@@ -228,7 +224,6 @@ pub(crate) fn laya_status_read(setup: &Setup, in_flight: bool) -> Result<LayaSta
             auto_type_memories: laya.auto_type_memories,
             failure_triage: laya.failure_triage,
             failure_triage_knn: laya.failure_triage_knn,
-            auto_finetune: laya.auto_finetune,
             steer_tool_choice: laya.steer_tool_choice,
             routing: laya.routing,
             reflex: laya.reflex,
@@ -356,7 +351,6 @@ pub(crate) async fn save_laya_settings_core(
         laya_steer_tool_choice: flags.steer_tool_choice,
         laya_failure_triage: flags.failure_triage,
         laya_failure_triage_knn: flags.failure_triage_knn,
-        laya_auto_finetune: flags.auto_finetune,
         laya_routing: flags.routing,
         laya_reflex: flags.reflex,
         routing,
@@ -1042,11 +1036,10 @@ simple = ["ep1/exec-model"]
         assert!(wire.enabled);
         assert!(!wire.installed, "no checkpoint in the fixture");
         assert_eq!(wire.status, "not_installed");
-        // The seven flags round out of the config.
+        // The six flags round out of the config.
         assert!(wire.flags.auto_type_memories);
         assert!(!wire.flags.failure_triage);
         assert!(!wire.flags.failure_triage_knn);
-        assert!(!wire.flags.auto_finetune);
         assert!(!wire.flags.steer_tool_choice);
         assert!(!wire.flags.routing);
         assert!(!wire.flags.reflex);
@@ -1233,13 +1226,12 @@ simple = ["ep1/exec-model"]
         let config = Config::load(dir.path()).expect("reload");
         assert!(config.general.general.laya.enabled, "the rejection wrote nothing");
 
-        // All seven flags + the routing block through the sanctioned patch.
+        // All six flags + the routing block through the sanctioned patch.
         let flags = LayaFlagsPatch {
             enabled: None,
             auto_type_memories: Some(false),
             failure_triage: Some(true),
             failure_triage_knn: Some(true),
-            auto_finetune: Some(true),
             steer_tool_choice: Some(true),
             routing: Some(true),
             reflex: Some(true),
@@ -1259,7 +1251,6 @@ simple = ["ep1/exec-model"]
         assert!(!laya.auto_type_memories, "a false flips it off");
         assert!(laya.failure_triage);
         assert!(laya.failure_triage_knn);
-        assert!(laya.auto_finetune);
         assert!(laya.steer_tool_choice);
         assert!(laya.routing);
         assert!(laya.reflex);

@@ -3,19 +3,18 @@
 // See LICENSE in the repository root.
 
 //! The runtime-rewire core (§5.8 :538, job 4 D4) — the AppHandle-free
-//! half moved from the app's ipc/rewire.rs: rebuild the vision client +
+//! half (moved out of the app's IPC layer): rebuild the vision client +
 //! memory embedder from a config, push the factory's live toggles, and
 //! sync the per-context model resolver. The headless
 //! [`Setup::patch_settings`](crate::headless::setup::Setup::patch_settings)
-//! and the GUI's save path share this ONE implementation.
+//! and Mnemo2's settings save path
+//! (src-tauri/src/mnemo2/model_settings.rs) share this ONE implementation.
 //!
 //! The caller owns the spawn policy: [`rewire_vision_embedder`] returns
 //! the re-embed future when the bundled model changed and the new
-//! embedder is Ready (the app spawns it on `tauri::async_runtime`, the
-//! headless engine on tokio). The MANAGED-CLASSIFIER leg stays app-side
-//! until job 4 D5 moves the Laya core — the classifier slot/status Arcs
-//! live in the brain, so the swap becomes host-agnostic when the
-//! manager moves.
+//! embedder is Ready (a host app spawns it on its async runtime, the
+//! headless engine on tokio). The MANAGED-CLASSIFIER leg is host-agnostic
+//! — the classifier slot/status Arcs live in the brain.
 
 use std::future::Future;
 use std::pin::Pin;

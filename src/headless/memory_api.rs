@@ -3,15 +3,12 @@
 // See LICENSE in the repository root.
 
 //! The memory data API (§5.6 :415-433) — the binding-ready read surface
-//! over the engine's memory store, ONE implementation shared by the
-//! headless `Engine` and the app's IPC commands (3b.2, D2). The wire
-//! types moved here VERBATIM from `src-tauri/src/ipc/memory_debug.rs`
-//! (+ `MemoryIndexStatus` from `memory_maintenance.rs`) — their serde
-//! shapes are pinned by the row-19 contract fixtures
-//! (`stats_memory_codegraph_ipc_unchanged`), so the bytes cannot drift.
-//! The engine reaches this via `Engine::memory()` (which errors
-//! `memory_disabled` when `EngineOptions.memory` is `Disabled`); the
-//! IPC commands construct it directly from their state handles.
+//! over the engine's memory store, ONE implementation shared by every
+//! consumer riding the headless `Engine` (3b.2, D2). The wire types' serde
+//! shapes are unchanged since the move out of the app's IPC layer, so
+//! existing consumers keep their bytes. The engine reaches this via
+//! `Engine::memory()` (which errors `memory_disabled` when
+//! `EngineOptions.memory` is `Disabled`).
 
 use std::sync::Arc;
 

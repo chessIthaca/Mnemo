@@ -633,8 +633,8 @@ pub const SOURCE_GLOBAL: &str = "global";
 
 /// One configured MCP server + the file it lives in (§5.8 :551's wire):
 /// `def` is flattened so a payload is the plain server fields plus
-/// `source`. Job 4 D8 moved it lib-side from the app's `ipc/mcp.rs` so
-/// the headless `Setup` shares the exact wire.
+/// `source` (job 4 D8, moved lib-side so the headless `Setup` shares the
+/// exact wire).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerWire {
     /// The server definition (flattened — the payload is the plain
@@ -697,8 +697,8 @@ pub struct SplitSave {
     pub global: Vec<McpServerDef>,
 }
 
-/// Split `servers` by source and save both files (§5.8 :551 — the core
-/// moved lib-side from the app's `ipc/mcp.rs`, byte-identical semantics):
+/// Split `servers` by source and save both files (§5.8 :551, moved
+/// lib-side with byte-identical semantics):
 /// validate each subset, re-add shadowed global twins from the CURRENT
 /// global file (a project override SHADOWS its twin — the twin is
 /// invisible in the merged list, so rewriting from the payload alone

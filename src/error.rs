@@ -4,8 +4,8 @@
 
 //! Unified error type for the Mnemo library.
 //!
-//! Library code uses `thiserror` for typed errors; the binary boundary (`main.rs`)
-//! converts these into `anyhow::Error` for reporting.
+//! Library code uses `thiserror` for typed errors; a host binary converts
+//! these into `anyhow::Error` for reporting.
 
 use std::path::PathBuf;
 

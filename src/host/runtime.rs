@@ -19,29 +19,28 @@ use crate::runtime::{AgentManager, AgentSpawner, DescendantTracker, ParentAwareS
 use crate::tool::{SafetyLevel, ToolCategory, ToolFilter};
 
 /// The per-agent loop map: `Arc<tokio::Mutex<HashMap<AgentId, Arc<AgentLoop>>>>`.
-/// Shared by the spawn path, the event forwarders and the IPC state.
+/// Shared by the spawn path, the event forwarders and the host runtime.
 pub type AgentLoopMap =
     Arc<tokio::sync::Mutex<std::collections::HashMap<AgentId, Arc<AgentLoop>>>>;
-/// A parallel run-all worktree agent's build binding (plan ffd7a86f):
-/// the item's git worktree root + the code graph over it. The spawned
-/// agent is PARENTLESS (a main agent of its own — the run's per-agent
-/// resolution keys on it), bound to the worktree via
+/// A worktree-bound session's build binding (plan ffd7a86f): the
+/// worktree's git root + the code graph over it. The spawned
+/// agent is PARENTLESS (a main agent of its own — its session's
+/// per-agent resolution keys on it), bound to the worktree via
 /// [`AgentLoopFactory::build_with_root_spec`].
 pub struct WorktreeBinding {
-    /// The item's worktree root (a fresh checkout of `main` on the item's
-    /// own `wt/runall-*` branch).
+    /// The worktree's root (a fresh checkout of `main` on the session's
+    /// own `wt/*` branch — e.g. a Mnemo2 worker's `wt/agent-*`).
     pub worktree: std::path::PathBuf,
     /// The code graph over the worktree tree (a fresh graph over the
-    /// worktree's `.coding/codegraph.db`, one index pass at spawn — the DB
-    /// seeded from the main tree's when available, see
-    /// [`spawn_run_all_agent`]). `None` on a graph-open failure — the
+    /// worktree's `.coding/codegraph.db`, opened at spawn — no
+    /// main-tree seeding). `None` on a graph-open failure — the
     /// `graph_*` tools are omitted for that agent, same as a main-tree
     /// open failure.
     pub codegraph: Option<std::sync::Arc<crate::codegraph::CodeGraph>>,
 }
 
-/// The parent's per-agent root binding for subagent inheritance (parallel
-/// run-all worktree agents, plan ffd7a86f).
+/// The parent's per-agent root binding for subagent inheritance
+/// (worktree-bound sessions, plan ffd7a86f).
 ///
 /// `Some((spec, plans_dir))` when the parent loop was built with a root
 /// spec: a worktree agent's subagents — notably its closing-sequence
@@ -154,12 +153,12 @@ pub struct SessionOptions {
 /// Spawn a background agent: build its loop via the factory, spawn its task,
 /// register it with the manager, and track its loop for `get_workflow_state`.
 ///
-/// Shared by the `spawn_agent` Tauri command (the UI button), the
-/// [`IpcSpawner`] (the agent's `spawn_agent` tool), and main-agent startup
-/// (main.rs), so all three paths behave identically. When `initial_prompt` is
+/// Shared by the [`HostSpawner`] (the agent's `spawn_agent` tool), the
+/// host runtime's main-agent startup, and the headless engine's session
+/// spawn, so every path behaves identically. When `initial_prompt` is
 /// `Some`, it's sent as the agent's first turn right after registration.
 /// `parent_id` is the agent that spawned this one via the tool (`None` for
-/// UI-button spawns and the main agent) — used to notify the parent when this
+/// a parentless spawn and the main agent) — used to notify the parent when this
 /// agent finishes. Returns `(agent_id, name)`.
 ///
 /// The only supported role is `reviewer`; any other role rejects the spawn.
@@ -256,19 +255,19 @@ async fn spawn_agent_shared_inner(
     // A UI-spawned parentless agent gets its own plans dir
     // (.coding/plans/agents/<id>/) so its plans don't clobber the main
     // agent's; the main agent + subagents share the main dir.
-    // A subagent inherits its parent's per-agent root override (parallel
-    // run-all worktree agents, plan ffd7a86f) — see parent_root_binding.
+    // A subagent inherits its parent's per-agent root override
+    // (worktree-bound sessions, plan ffd7a86f) — see parent_root_binding.
     let parent_binding = parent
         .as_ref()
         .and_then(|parent| parent_root_binding(parent));
     let agent_loop = if let Some((spec, parent_plans_dir)) = parent_binding {
         factory.build_with_root_spec(agent_id, parent_plans_dir, spec)
     } else if let Some(binding) = worktree {
-        // A parallel run-all worktree agent (plan ffd7a86f): PARENTLESS,
+        // A worktree-bound session (plan ffd7a86f): PARENTLESS,
         // bound to its own git worktree — the spec's sandbox/project root
         // + graph all point at the worktree, and its plans dir lives
-        // INSIDE the worktree so plan bookkeeping lands on the item's own
-        // branch.
+        // INSIDE the worktree so plan bookkeeping lands on the worktree's
+        // own branch.
         let plans_dir = binding
             .worktree
             .join(".coding")
@@ -741,15 +740,13 @@ pub async fn cleanup_inactive_subagents(
     }
 }
 
-/// The console's [`AgentSpawner`] — the AppHandle-free twin of
-/// [`crate::ipc::spawn::IpcSpawner`]. Delegates to the same shared spawn
-/// path (`spawn_agent_shared`) so a console-spawned background agent is
-/// indistinguishable from a GUI one (own workflow, manager registration,
-/// loop-map tracking). Two GUI-only niceties are skipped: no
-/// `PromptDispatched` event (it exists purely to render the task as the
-/// first message in a UI transcript) and no `ChildFinished` emit (a
-/// sidebar-only marker) — the parent completion Suggestion IS sent, by the
-/// console's [`LifecycleBookkeeping`], with the same text the GUI uses.
+/// The host-side [`AgentSpawner`] — the kernel's own spawner, wired into
+/// the factory by the host runtime. Delegates to the same shared spawn
+/// path (`spawn_agent_shared`) so a tool-spawned background agent is
+/// indistinguishable from the main agent (own workflow, manager
+/// registration, loop-map tracking). The parent completion Suggestion IS
+/// sent, by [`LifecycleBookkeeping`], with the same composition for every
+/// frontend.
 pub struct HostSpawner {
     factory: Arc<AgentLoopFactory>,
     manager: Arc<tokio::sync::Mutex<AgentManager>>,
@@ -774,8 +771,7 @@ impl HostSpawner {
 #[async_trait::async_trait]
 impl AgentSpawner for HostSpawner {
     /// Spawn a background agent with no parent and no forced model —
-    /// delegates to `spawn_with_parent` with both as `None` (mirrors
-    /// `IpcSpawner`).
+    /// delegates to `spawn_with_parent` with both as `None`.
     async fn spawn(
         &self,
         name: &str,
@@ -797,8 +793,7 @@ impl AgentSpawner for HostSpawner {
 #[async_trait::async_trait]
 impl ParentAwareSpawner for HostSpawner {
     /// Spawn a background agent on behalf of the given parent (the agent
-    /// whose `spawn_agent` tool call triggered this). Same semantics as
-    /// `IpcSpawner::spawn_with_parent` minus the UI-only event emit.
+    /// whose `spawn_agent` tool call triggered this).
     async fn spawn_with_parent(
         &self,
         name: &str,
@@ -865,8 +860,8 @@ impl DescendantTracker for HostSpawner {
 /// manager + per-agent loop map, the [`HostSpawner`] wired into the
 /// factory, the fan-in event receiver, the main agent's id, and the
 /// [`LifecycleBookkeeping`] — the assembly the console built inline until
-/// 3a.2 (D2) hoisted it, now the piece a headless Engine, a daemon, or the
-/// GUI can hold directly. Nothing here reads stdin, writes stdout, or
+/// 3a.2 (D2) hoisted it, now the piece a headless Engine or a host app
+/// (Mnemo2) can hold directly. Nothing here reads stdin, writes stdout, or
 /// touches a Tauri handle.
 ///
 /// Field-level mirror of the old console assembly: `AgentManager::new(256)`,
@@ -1024,16 +1019,15 @@ impl LifecycleBookkeeping {
 
     /// The agent's turn ended (a `Finished` or a final non-retrying `Error`)
     /// — mark it idle and, for a tool-spawned child, notify its parent once.
-    /// `success` mirrors the GUI forwarder: `true` for `Finished`, `false`
-    /// for a final error (drives the failed-reviewer protocol).
+    /// `success`: `true` for `Finished`, `false` for a final error (drives
+    /// the failed-reviewer protocol).
     pub async fn on_turn_ended(&self, id: AgentId, success: bool) {
         {
             let mgr = self.manager.lock().await;
             mgr.set_running(id, false);
         }
-        // Notify at most once per child (mirrors the forwarder's
-        // `notified_children` set — the insert decides, before the
-        // parent-existence check, exactly like `events.rs`).
+        // Notify at most once per child (the `notified_children` set —
+        // the insert decides, before the parent-existence check).
         if self
             .notified_children
             .lock()
@@ -1061,14 +1055,13 @@ impl LifecycleBookkeeping {
     }
 
     /// Send the child's parent the completion-notification `Suggestion`,
-    /// including the child's last review-report path when it wrote one — the
-    /// same composition as the GUI's `notify_parent_on_completion` (minus
-    /// the sidebar-only `ChildFinished` emit), including the failed-reviewer
+    /// including the child's last review-report path when it wrote one — ONE
+    /// composition for every frontend, including the failed-reviewer
     /// protocol: a `role: "reviewer"` child that ended (failed OR finished
     /// cleanly) with no report sets the parent's reviewer-failure latch and
     /// gets the ask-the-user text instead of the generic no-report steer.
     /// Best-effort: a full inbox or a gone parent drops the notification
-    /// silently (a nicety, not a guarantee — same as the GUI).
+    /// silently (a nicety, not a guarantee).
     async fn notify_parent(&self, id: AgentId, success: bool) {
         let (parent_id, child_name, child_role) = {
             let mgr = self.manager.lock().await;
@@ -1149,11 +1142,10 @@ mod tests {
     // NOTE: there is deliberately no unit test for the registration-time
     // ContextUsage emission in spawn_agent_shared (used=0, max=window). The
     // harness here builds AgentLoop directly (see parent_in_state below) and
-    // has no AgentLoopFactory, which spawn_agent_shared requires — and the
-    // send depends on `tauri::async_runtime`, which isn't available in these
-    // lib-only tests. The emission mirrors the /new clear-context emission
-    // (src/runtime/agent.rs:561-573), the frontend seed path has its own
-    // store test (useAgentStore.test.ts seedContextCaps), and the payload
+    // has no AgentLoopFactory, which spawn_agent_shared requires. The
+    // emission mirrors the /new clear-context emission
+    // (src/runtime/agent.rs:1903), Mnemo2's store applies the event in
+    // leadState.ts (covered by its context_usage tests), and the payload
     // shape is verified by the event fixture contract test
     // (contract_fixtures.rs).
 
@@ -1274,9 +1266,10 @@ mod tests {
 
     #[tokio::test]
     async fn parent_root_binding_returns_spec_and_plans_dir() {
-        // Parallel run-all (plan ffd7a86f): a subagent of a root-spec
-        // (worktree) agent inherits the parent's root spec AND plans dir;
-        // a factory-default parent yields None (today's behavior).
+        // A worktree-bound session (plan ffd7a86f): a subagent of a
+        // root-spec (worktree) agent inherits the parent's root spec AND
+        // plans dir; a factory-default parent yields None (today's
+        // behavior).
         let dir = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
         // Canonicalize so the sandbox's canonicalized root compares equal

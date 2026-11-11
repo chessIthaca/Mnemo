@@ -2380,6 +2380,28 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Deletes the retired Mnemo1 app. The only governed file touched is src-tauri/src/ipc/finetune.rs (listed under dispatch-routing), whose Laya startup fine-tune no dispatch-routing requirement specifies; Mnemo2's dispatch routing is unchanged."
+    },
+    {
+      "id": "eebf6282",
+      "status": "closed",
+      "created_at_ms": 1794420289447,
+      "closed_at_ms": 1794423750874,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-eebf6282-20261111-190230.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Research only: writes one analysis report under .coding/analysis/ and changes no code."
+    },
+    {
+      "id": "a7cabd27",
+      "status": "closed",
+      "created_at_ms": 1794423866219,
+      "closed_at_ms": 1794434625494,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-a7cabd27-20261111-220345.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Removes code with no live caller and settings nothing enforces. The only governed files touched are src-tauri/src/mnemo2/team/tests.rs (a test fixture rewritten to build its legacy worktree with git directly) and src-tauri/src/mnemo2/laya_settings.rs (the inert auto_finetune flag; no dispatch-routing requirement mentions fine-tuning). Specified behavior is unchanged."
     }
   ]
 }

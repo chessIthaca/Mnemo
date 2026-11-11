@@ -4,15 +4,15 @@
 
 //! Settings-patch DTO types + validation + config assembly (review M1b).
 //!
-//! These types are the wire format for the `save_settings` Tauri command —
+//! These types are the wire format for a settings-save patch —
 //! plain serde structs with no Tauri dependencies. They live in the brain
-//! (not the IPC adapter) so the validation + config-assembly logic is
-//! unit-testable without Tauri state, and the console runtime can reuse the
-//! same validation if it ever gains a settings-save path.
+//! (not the host app) so the validation + config-assembly logic is
+//! unit-testable without Tauri state, and any host runtime can reuse the
+//! same validation for its own settings-save path.
 //!
-//! The IPC layer (`src-tauri/src/ipc/settings.rs`) constructs these from the
-//! frontend payload, calls [`validate_and_apply_settings_patch`], then
-//! persists + reloads + re-syncs the live provider — the Tauri-specific parts
+//! Mnemo2's settings modules (src-tauri/src/mnemo2/**) construct these from
+//! the frontend payload, call [`validate_and_apply_settings_patch`], then
+//! persist + reload + re-sync the live provider — the Tauri-specific parts
 //! that belong in the adapter.
 
 use serde::{Deserialize, Serialize};
@@ -216,50 +216,6 @@ pub struct MemorySearchDto {
     pub review_budget: Option<usize>,
 }
 
-/// The `[ui.steering_notes]` section patch — every field optional (an omitted
-/// field keeps the existing override).
-///
-/// The kinds + their defaults live in
-/// [`SteeringNotesCfg`](crate::config::general::SteeringNotesCfg) and
-/// `UiConfig::effective_steering_note_visible`; `None` here means "leave the
-/// override as it is", not "reset to the default".
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SteeringNotesDto {
-    /// See `SteeringNotesCfg::auto_delegated`.
-    #[serde(default)]
-    pub auto_delegated: Option<bool>,
-    /// See `SteeringNotesCfg::search_nudge`.
-    #[serde(default)]
-    pub search_nudge: Option<bool>,
-    /// See `SteeringNotesCfg::shell_tip`.
-    #[serde(default)]
-    pub shell_tip: Option<bool>,
-    /// See `SteeringNotesCfg::graph_miss`.
-    #[serde(default)]
-    pub graph_miss: Option<bool>,
-    /// See `SteeringNotesCfg::recall_rider`.
-    #[serde(default)]
-    pub recall_rider: Option<bool>,
-    /// See `SteeringNotesCfg::read_nudge`.
-    #[serde(default)]
-    pub read_nudge: Option<bool>,
-    /// See `SteeringNotesCfg::literal_tip`.
-    #[serde(default)]
-    pub literal_tip: Option<bool>,
-    /// See `SteeringNotesCfg::known_memory_hit`.
-    #[serde(default)]
-    pub known_memory_hit: Option<bool>,
-    /// See `SteeringNotesCfg::consolidation_due`.
-    #[serde(default)]
-    pub consolidation_due: Option<bool>,
-    /// See `SteeringNotesCfg::shell_redirect`.
-    #[serde(default)]
-    pub shell_redirect: Option<bool>,
-    /// See `SteeringNotesCfg::edit_stale_read`.
-    #[serde(default)]
-    pub edit_stale_read: Option<bool>,
-}
-
 /// Patch payload for non-endpoint Settings sections.
 ///
 /// All fields are optional — only present fields are applied. Endpoints and
@@ -319,10 +275,6 @@ pub struct SettingsSaveDto {
     /// `failure_triage` itself is on). Absent = keep the current value.
     #[serde(default)]
     pub laya_failure_triage_knn: Option<bool>,
-    /// Startup failure-triage fine-tune (managed runtime only, opt-in).
-    /// Absent = keep the current value.
-    #[serde(default)]
-    pub laya_auto_finetune: Option<bool>,
     /// Laya pre-prompt MODEL ROUTING (opt-in; enable only against a
     /// fine-tuned checkpoint, and expect shadow mode first). Absent = keep
     /// the current value.
@@ -401,9 +353,9 @@ pub struct SettingsSaveDto {
     // show_*/chat_*/sound_* toggles, steering_notes) are ABSENT from
     // the engine patch — compile-time absent (row 33: "SettingsPatch
     // cannot set [ui] fields"). The app owns the `[ui]` table: the
-    // GUI's wire splits at the app boundary (ipc/settings.rs carries
-    // the UI half and applies it app-side). On disk nothing moves —
-    // same file, same tables.
+    // GUI's wire splits at the app boundary — Mnemo2's appearance
+    // module (src-tauri/src/mnemo2/appearance_settings.rs) applies the
+    // UI half app-side. On disk nothing moves — same file, same tables.
     #[serde(default)]
     pub models: Option<ModelsConfigDto>,
     /// Pre-prompt model routing (`[general.routing]`, backlog 091e694d).
@@ -420,12 +372,6 @@ pub struct SettingsSaveDto {
     pub skip_dirs: Option<Vec<String>>,
     #[serde(default)]
     pub core_operations: Option<Vec<String>>,
-    #[serde(default)]
-    pub enable_browser_inspection: Option<bool>,
-    /// Patch `[general].auto_compact_on_plan_complete` — the Run-All
-    /// between-items auto-compact (see `GeneralSection`'s docs).
-    #[serde(default)]
-    pub auto_compact_on_plan_complete: Option<bool>,
     #[serde(default)]
     pub trace_memory_budget_mb: Option<usize>,
     #[serde(default)]
@@ -683,9 +629,6 @@ pub fn validate_and_apply_settings_patch(
     if let Some(knn) = patch.laya_failure_triage_knn {
         general.general.laya.failure_triage_knn = knn;
     }
-    if let Some(finetune) = patch.laya_auto_finetune {
-        general.general.laya.auto_finetune = finetune;
-    }
     if let Some(routing) = patch.laya_routing {
         general.general.laya.routing = routing;
     }
@@ -774,12 +717,6 @@ pub fn validate_and_apply_settings_patch(
         if let Some(v) = memory.review_budget {
             cur.review_budget = v;
         }
-    }
-    if let Some(enabled) = patch.enable_browser_inspection {
-        general.general.enable_browser_inspection = enabled;
-    }
-    if let Some(on) = patch.auto_compact_on_plan_complete {
-        general.general.auto_compact_on_plan_complete = on;
     }
     // Model-ref conversion shared by the [models] and [general.routing]
     // patches: a trimmed endpoint + model and an optional trimmed effort (an
@@ -907,29 +844,20 @@ mod tests {
         // COMPILE-TIME ABSENT from the engine patch — a wire still
         // carrying them deserializes (serde drops unknown keys) and the
         // apply leaves the [ui] table untouched. The app owns [ui]; the
-        // GUI's wire splits at the app boundary (ipc/settings.rs).
+        // GUI's wire splits at the app boundary (Mnemo2's appearance
+        // module, src-tauri/src/mnemo2/appearance_settings.rs).
         let current = Config::default();
         let patch = serde_json::from_value::<SettingsSaveDto>(serde_json::json!({
             "theme": "dark",
-            "chat_thread_line": false,
-            "show_token_usage": true,
-            "steering_notes": { "auto_delegated": false },
+            "sound_complete": false,
         }))
         .unwrap();
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         let fresh = Config::default();
         assert_eq!(next.general.ui.theme, fresh.general.ui.theme);
         assert_eq!(
-            next.general.ui.chat_thread_line,
-            fresh.general.ui.chat_thread_line
-        );
-        assert_eq!(
-            next.general.ui.show_token_usage,
-            fresh.general.ui.show_token_usage
-        );
-        assert_eq!(
-            next.general.ui.steering_notes.auto_delegated,
-            fresh.general.ui.steering_notes.auto_delegated
+            next.general.ui.sound_complete,
+            fresh.general.ui.sound_complete
         );
     }
 
@@ -940,38 +868,14 @@ mod tests {
         // theme survives a standalone consumer's engine-side save).
         let mut current = Config::default();
         current.general.ui.theme = "dark".to_string();
-        current.general.ui.chat_thread_line = false;
+        current.general.ui.sound_complete = false;
         let patch = SettingsSaveDto {
             summarize_at_fill_rate: Some(0.5),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         assert_eq!(next.general.ui.theme, "dark");
-        assert!(!next.general.ui.chat_thread_line);
-    }
-
-    #[test]
-    fn auto_compact_on_plan_complete_patch_applies() {
-        // The Run-All auto-compact flag rides the save patch: Some flips the
-        // value in both directions; None (absent) keeps the current value.
-        let current = Config::default();
-        let patch = SettingsSaveDto {
-            auto_compact_on_plan_complete: Some(true),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
-        assert!(next.general.general.auto_compact_on_plan_complete);
-        // Flip back off.
-        let patch = SettingsSaveDto {
-            auto_compact_on_plan_complete: Some(false),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert!(!next.general.general.auto_compact_on_plan_complete);
-        // Absent leaves the current value (here: false).
-        let patch = SettingsSaveDto::default();
-        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert!(!next.general.general.auto_compact_on_plan_complete);
+        assert!(!next.general.ui.sound_complete);
     }
 
     #[test]
@@ -1027,30 +931,25 @@ mod tests {
     }
 
     #[test]
-    fn laya_patch_applies_failure_triage_flags_and_auto_finetune() {
-        // The triage flags + fine-tune ride the same save path: Some flips
-        // them, absent keeps the current value — and an untouched config
-        // stays default.
+    fn laya_patch_applies_failure_triage_flags() {
+        // The triage flags ride the same save path: Some flips them, absent
+        // keeps the current value — and an untouched config stays default.
         let current = Config::default();
         assert!(!current.general.general.laya.failure_triage);
         assert!(!current.general.general.laya.failure_triage_knn);
-        assert!(!current.general.general.laya.auto_finetune);
         let patch = SettingsSaveDto {
             laya_failure_triage: Some(true),
             laya_failure_triage_knn: Some(true),
-            laya_auto_finetune: Some(true),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         assert!(next.general.general.laya.failure_triage);
         assert!(next.general.general.laya.failure_triage_knn);
-        assert!(next.general.general.laya.auto_finetune);
-        // Absent keeps all three on.
+        // Absent keeps both on.
         let patch = SettingsSaveDto::default();
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(next.general.general.laya.failure_triage);
         assert!(next.general.general.laya.failure_triage_knn);
-        assert!(next.general.general.laya.auto_finetune);
     }
 
     #[test]

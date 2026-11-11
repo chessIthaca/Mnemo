@@ -97,7 +97,7 @@ pub struct GeneralSection {
     /// disabled section changes nothing: no classifier calls, no startup
     /// cost, no new failure modes. Omitted from the saved config while every
     /// field holds its default, so configs that never touched Laya keep no
-    /// trace of it (mirrors `[ui.steering_notes]`).
+    /// trace of it (mirrors `[general.optimizer]`).
     #[serde(default, skip_serializing_if = "LayaConfig::is_default")]
     pub laya: LayaConfig,
     /// **Pre-prompt model routing (opt-in; backlog 091e694d).** The policy
@@ -145,17 +145,6 @@ pub struct GeneralSection {
     /// keep no optimizer trace (mirrors `[general.laya]`).
     #[serde(default, skip_serializing_if = "OptimizerConfig::is_default")]
     pub optimizer: OptimizerConfig,
-    /// **Agent browser inspection (opt-in, security tradeoff).** When `true`,
-    /// the app exposes the WebView2 Chrome DevTools Protocol on
-    /// `localhost:9222` (the next free port when several instances run) so
-    /// the agent's `browser_*` tools can attach to the live
-    /// Browser tab's child webview and inspect/control it. Off by default
-    /// because the CDP endpoint is **unauthenticated** — any local process on
-    /// the machine could connect and run arbitrary JavaScript inside the app's
-    /// webview (the same trust level as the app UI: prompts, code, secrets).
-    /// Enabling is an explicit acceptance of that risk. Debug builds ignore
-    /// this flag and always expose CDP (the port is dev-only there).
-    pub enable_browser_inspection: bool,
     /// **CodeGraph (opt-out).** When `true` (the default), the codebase is
     /// parsed into the per-project knowledge graph
     /// (`<root>/.coding/codegraph.db`) in a background task at startup and the
@@ -163,16 +152,6 @@ pub struct GeneralSection {
     /// indexing entirely (the tools and tab report "graph unavailable").
     #[serde(default = "default_codegraph_enabled")]
     pub codegraph: bool,
-    /// **Run-All auto-compact (opt-in).** When `true`, a Run-All loop
-    /// compacts the main agent's context between items — after each
-    /// completed plan resolves and before the next backlog item is
-    /// dispatched — so every item starts with a clean summarized context
-    /// instead of exhausting the window mid-item overnight. Run-All only:
-    /// interactive plan completions never trigger it. A failed or no-op
-    /// compaction logs and proceeds (compaction is an optimization, never
-    /// a blocker). Default `false`.
-    #[serde(default)]
-    pub auto_compact_on_plan_complete: bool,
 }
 
 /// Configuration for a separate vision model used for image-to-text when the
@@ -250,9 +229,7 @@ pub struct LayaConfig {
     /// flag alone gates every classification + training-log write. Off by
     /// default, and meant to be enabled only against a **fine-tuned**
     /// checkpoint — base Laya checkpoints are near-chance zero-shot on this
-    /// task, which is exactly what [`auto_finetune`](Self::auto_finetune)
-    /// builds the labeled corpus for. Omitted from the saved config while
-    /// false.
+    /// task. Omitted from the saved config while false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub failure_triage: bool,
     /// Opt in to the kNN OVERLAY for failure triage (item 4b): on top of
@@ -270,17 +247,6 @@ pub struct LayaConfig {
     /// omitted from the saved config while false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub failure_triage_knn: bool,
-    /// Opt in to the startup failure-triage FINE-TUNE (managed runtime only):
-    /// at startup the app compares the logged failure corpus against the
-    /// last run's marker and, when enough new labeled rows accumulated, runs
-    /// the Laya fine-tune on the managed venv and serves the fine-tuned
-    /// checkpoint. Off by default, and never blocking startup. A "check"
-    /// with no training surface installed (laya 0.3.20 ships none) exports
-    /// the labeled dataset and skips cleanly, leaving the marker untouched
-    /// so the next startup re-checks. Omitted from the saved config while
-    /// false.
-    #[serde(default, skip_serializing_if = "laya_flag_off")]
-    pub auto_finetune: bool,
     /// Opt in to Laya TOOL-CHOICE STEERING (backlog e2c47d5f): the `search`
     /// and `search_read` tools let a confident classifier pick which class a
     /// query belongs to — symbol / text / memory — and route the winning
@@ -339,9 +305,8 @@ pub struct LayaConfig {
 
 /// `skip_serializing_if` guard for the Laya-gated boolean opt-ins
 /// ([`LayaConfig`]'s `auto_type_memories`, `failure_triage`,
-/// `failure_triage_knn`, `auto_finetune`, `steer_tool_choice`, `routing`,
-/// `reflex`,
-/// and [`RoutingConfig::enforce`]): `false` (the default) stays unwritten,
+/// `failure_triage_knn`, `steer_tool_choice`, `routing`, `reflex`, and
+/// [`RoutingConfig::enforce`]): `false` (the default) stays unwritten,
 /// so untouched configs keep their exact pre-consumer shape.
 fn laya_flag_off(off: &bool) -> bool {
     !*off
@@ -350,14 +315,12 @@ fn laya_flag_off(off: &bool) -> bool {
 impl LayaConfig {
     /// True while every field holds its default — the `[general.laya]`
     /// section is then omitted from `config.toml` (mirrors
-    /// [`SteeringNotesCfg`]'s empty-table skip), so untouched configs keep no
-    /// Laya trace.
+    /// [`OptimizerConfig`]'s skip), so untouched configs keep no Laya trace.
     fn is_default(&self) -> bool {
         !self.enabled
             && !self.auto_type_memories
             && !self.failure_triage
             && !self.failure_triage_knn
-            && !self.auto_finetune
             && !self.steer_tool_choice
             && !self.routing
             && !self.reflex
@@ -918,9 +881,7 @@ impl Default for GeneralSection {
             verify: VerifyConfig::default(),
             budget: BudgetConfig::default(),
             optimizer: OptimizerConfig::default(),
-            enable_browser_inspection: false,
             codegraph: default_codegraph_enabled(),
-            auto_compact_on_plan_complete: false,
         }
     }
 }
@@ -999,172 +960,12 @@ impl Default for ContextConfig {
     }
 }
 
-/// Per-kind display toggles for the steering notes that ride in tool output
-/// (`[ui.steering_notes]`).
-///
-/// Each field is an OPTIONAL override: `Some(v)` wins, `None` falls back to
-/// the kind's default — resolved by
-/// [`UiConfig::effective_steering_note_visible`]. Absent overrides are not
-/// serialized; when every field is absent the whole table is omitted from
-/// `config.toml`, so a config that never touched a kind stays compact.
-///
-/// This is a GUI-only display filter, the same contract as
-/// [`UiConfig::show_delegation_notes`]: the tool-result TEXT (the model's
-/// context, including a note's re-issue escape hatch) is never modified —
-/// only the chat ToolCard's rendering drops the note's line.
-///
-/// The keys mirror `MarkerKind::label()` (`src/agent/steering_stats.rs`, the
-/// stable kebab labels surfaced on the wire), transcribed to snake_case, plus
-/// `auto_delegated` — the display family covering the two `AUTO-DELEGATED`
-/// blocks (the code-graph delegation and the memory delegation, the latter
-/// carrying no marker substring of its own).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct SteeringNotesCfg {
-    /// Show the `AUTO-DELEGATED to the code graph` / `… to memory` block that
-    /// `search` / `search_read` prepend when a query is auto-delegated.
-    /// Defaults to [`UiConfig::show_delegation_notes`] (hidden unless that
-    /// legacy toggle is on); set it explicitly to decouple the two.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auto_delegated: Option<bool>,
-    /// Show the symbol-nudge line ("… is an indexed symbol …") that steers a
-    /// symbol-shaped `search` to the graph tools. Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub search_nudge: Option<bool>,
-    /// Show the shell TIP ("TIP: for file-content search …") that steers a
-    /// content search away from `shell`. Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shell_tip: Option<bool>,
-    /// Show the graph-miss line ("No symbols matched …") on an empty graph
-    /// lookup. Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_miss: Option<bool>,
-    /// Show the auto-recall rider ("RECALLED CONTEXT …") appended to a tool
-    /// result. Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recall_rider: Option<bool>,
-    /// Show the read nudge ("SYMBOL NUDGE: …") after a file read. Default
-    /// true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub read_nudge: Option<bool>,
-    /// Show the literal-engine TIP ("TIP: pattern has no regex
-    /// metacharacters …"), which points at `literal: true`. Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub literal_tip: Option<bool>,
-    /// Show the known-memory-hit note ("known memory hit: …") when a pattern
-    /// matches a known backlog id. Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub known_memory_hit: Option<bool>,
-    /// Show the consolidation-due note ("working-memory events accumulated
-    /// this session"). Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub consolidation_due: Option<bool>,
-    /// Show the shell-redirect TIP ("TIP: output redirection detected …").
-    /// Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shell_redirect: Option<bool>,
-    /// Show the stale-read note ("Re-read the file …") after a failed
-    /// `file_edit`. Default true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub edit_stale_read: Option<bool>,
-}
-
-impl SteeringNotesCfg {
-    /// True when no kind carries an explicit override (all `None`) — the
-    /// `[ui]` field is then omitted from the serialized config entirely.
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
-impl Default for SteeringNotesCfg {
-    /// Every override absent — the effective defaults live in
-    /// [`UiConfig::effective_steering_note_visible`], which also honors the
-    /// legacy `show_delegation_notes` for `auto_delegated`.
-    fn default() -> Self {
-        Self {
-            auto_delegated: None,
-            search_nudge: None,
-            shell_tip: None,
-            graph_miss: None,
-            recall_rider: None,
-            read_nudge: None,
-            literal_tip: None,
-            known_memory_hit: None,
-            consolidation_due: None,
-            shell_redirect: None,
-            edit_stale_read: None,
-        }
-    }
-}
-
 /// UI configuration (`[ui]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
     /// `"light"` (the default), `"dark"` or `"system"` (follow the OS).
     pub theme: String,
-    /// Show token usage in the status bar.
-    pub show_token_usage: bool,
-    /// Render the analyzed/captured image inline below image-command results
-    /// (the image_* vision tools and the browser screenshot tools) in the
-    /// agent chat. Defaults to `true`; set `false` to hide them.
-    pub show_tool_images: bool,
-    /// Show agent-activity cards (tool calls, memory reads/writes, vision
-    /// image-parsing, skill announcements) in the chat transcript. GUI-only
-    /// display filter: the transcript store and the model's context echo are
-    /// unaffected — the Output tab and the console still log every tool call.
-    /// Defaults to `true` — tool results show in the chat out of the box
-    /// (user request 2027-01-13, backlog 57687857); set `false` to hide them
-    /// (an explicit `show_tool_activity = false` in config opts out and wins
-    /// over the default).
-    pub show_tool_activity: bool,
-    /// Show knowledge-access activity cards (graph_* tool calls, memory tool
-    /// calls, and auto-recall entries) in the chat transcript. GUI-only
-    /// display filter: the transcript store and the model's context echo are
-    /// unaffected — the console still logs every tool call.
-    /// Defaults to `true` (the user wants to see graph + memory + auto-recall
-    /// activity — these compact cards surface the agent's knowledge-tool usage
-    /// without the noise of the full `show_tool_activity` toggle); set `false`
-    /// to hide them.
-    pub show_knowledge_activity: bool,
-    /// Show the AUTO-DELEGATED steering line that `search` / `search_read`
-    /// emit when a symbol-shaped query is auto-delegated to the code graph
-    /// or memory (a `note: `-prefixed prepend above the plain results —
-    /// backlog c439dda0: the file matches always follow in the same
-    /// response).
-    /// GUI-only display filter: the tool result
-    /// text (the model's context, including the re-issue escape-hatch hint)
-    /// is unaffected — only the chat ToolCard's rendering hides the line;
-    /// the delegated answer (def:/callers:/full 360° lines) always stays.
-    /// Defaults to `false` (the note is model guidance, not end-user
-    /// information); set `true` to show it.
-    pub show_delegation_notes: bool,
-    /// Per-kind display toggles for the steering notes that ride in tool
-    /// output (`[ui.steering_notes]`). Each kind defaults to visible except
-    /// `auto_delegated`, which inherits `show_delegation_notes` above — see
-    /// [`SteeringNotesCfg`] and [`Self::effective_steering_note_visible`].
-    /// Omitted from the saved config while no override is set.
-    #[serde(skip_serializing_if = "SteeringNotesCfg::is_empty")]
-    pub steering_notes: SteeringNotesCfg,
-    /// Draw a subtle vertical thread line along consecutive activity cards
-    /// (tool/memory/vision/skill) in the chat transcript, visually grouping
-    /// them under the response that triggered them. GUI-only display filter;
-    /// defaults to `true`; set `false` to hide the line.
-    pub chat_thread_line: bool,
-    /// Cap assistant prose paragraphs at ~100 columns for readability on
-    /// wide windows (code blocks, diffs, and tool outputs stay full width).
-    /// GUI-only display filter; defaults to `true`; set `false` to let prose
-    /// span the full transcript width.
-    pub chat_prose_cap: bool,
-    /// Alternate a faint background band per conversation turn (prompt →
-    /// response → tools) in the chat transcript. GUI-only display filter;
-    /// defaults to `true`; set `false` to disable the banding.
-    pub chat_turn_tint: bool,
-    /// Show each transcript entry's creation time as a native hover tooltip
-    /// (no permanent clutter). GUI-only display filter; defaults to `true`;
-    /// set `false` to disable the tooltips.
-    pub chat_hover_timestamps: bool,
     /// Play a ding when an agent's plan reaches the Complete state.
     /// Defaults to `true`; set `false` to silence the completion chime.
     pub sound_complete: bool,
@@ -1183,69 +984,9 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: "light".to_string(),
-            show_token_usage: true,
-            show_tool_images: true,
-            show_tool_activity: true,
-            show_knowledge_activity: true,
-            show_delegation_notes: false,
-            steering_notes: SteeringNotesCfg::default(),
-            chat_thread_line: true,
-            chat_prose_cap: true,
-            chat_turn_tint: true,
-            chat_hover_timestamps: true,
             sound_complete: true,
             sound_input_needed: true,
             sound_stopped_errors: true,
-        }
-    }
-}
-
-impl UiConfig {
-    /// The stable snake_case keys of every steering-note kind, in the order
-    /// the Chat settings section lists them. Mirrors the fields of
-    /// [`SteeringNotesCfg`] (a test pins the two together) and the
-    /// `MarkerKind::label()` set plus `auto_delegated`.
-    pub const STEERING_NOTE_KEYS: [&'static str; 11] = [
-        "auto_delegated",
-        "search_nudge",
-        "shell_tip",
-        "graph_miss",
-        "recall_rider",
-        "read_nudge",
-        "literal_tip",
-        "known_memory_hit",
-        "consolidation_due",
-        "shell_redirect",
-        "edit_stale_read",
-    ];
-
-    /// Resolve one steering-note kind's visibility. An explicit
-    /// `[ui.steering_notes]` override wins; an absent one falls back to the
-    /// kind's default:
-    ///
-    /// - `auto_delegated` → [`Self::show_delegation_notes`] — the legacy
-    ///   toggle keeps working for configs written before the per-kind table
-    ///   existed (default: hidden);
-    /// - every other kind → `true` (visible today, unchanged by this
-    ///   feature).
-    ///
-    /// An unknown key resolves to `true`: an unrecognized name must never
-    /// hide a note by accident.
-    pub fn effective_steering_note_visible(&self, key: &str) -> bool {
-        let notes = &self.steering_notes;
-        match key {
-            "auto_delegated" => notes.auto_delegated.unwrap_or(self.show_delegation_notes),
-            "search_nudge" => notes.search_nudge.unwrap_or(true),
-            "shell_tip" => notes.shell_tip.unwrap_or(true),
-            "graph_miss" => notes.graph_miss.unwrap_or(true),
-            "recall_rider" => notes.recall_rider.unwrap_or(true),
-            "read_nudge" => notes.read_nudge.unwrap_or(true),
-            "literal_tip" => notes.literal_tip.unwrap_or(true),
-            "known_memory_hit" => notes.known_memory_hit.unwrap_or(true),
-            "consolidation_due" => notes.consolidation_due.unwrap_or(true),
-            "shell_redirect" => notes.shell_redirect.unwrap_or(true),
-            "edit_stale_read" => notes.edit_stale_read.unwrap_or(true),
-            _ => true,
         }
     }
 }
@@ -1574,7 +1315,7 @@ summarize_at_fill_rate = 0.75
 
 [ui]
 theme = "light"
-show_token_usage = false
+sound_complete = false
 "#;
         let cfg: GeneralConfig = toml::from_str(text).unwrap();
         assert_eq!(cfg.general.default_provider.as_deref(), Some("openai"));
@@ -1582,7 +1323,7 @@ show_token_usage = false
         assert_eq!(cfg.general.safety, SafetyMode::AutoReadApproveWrites);
         assert!((cfg.context.summarize_at_fill_rate - 0.75).abs() < 1e-9);
         assert_eq!(cfg.ui.theme, "light");
-        assert!(!cfg.ui.show_token_usage);
+        assert!(!cfg.ui.sound_complete);
     }
 
     #[test]
@@ -1591,7 +1332,45 @@ show_token_usage = false
         assert_eq!(cfg.general.safety, SafetyMode::ApproveEachAction);
         assert!((cfg.context.summarize_at_fill_rate - 0.3).abs() < 1e-9);
         assert_eq!(cfg.ui.theme, "light");
-        assert!(cfg.ui.show_token_usage);
+        assert!(cfg.ui.sound_complete);
+    }
+
+    #[test]
+    fn retired_keys_in_an_existing_config_are_ignored() {
+        // An existing config.toml may still carry keys the code no longer
+        // reads: Mnemo1's Run-All auto-compact, the on-screen browser flag,
+        // the chat/tool display toggles, the per-kind steering-note table and
+        // Laya's startup fine-tune. The structs do not deny unknown fields, so
+        // loading must ignore them — no migration, no error — while the keys
+        // that ARE live keep their values.
+        let text = r#"
+[general]
+auto_compact_on_plan_complete = true
+enable_browser_inspection = true
+
+[general.laya]
+auto_finetune = true
+
+[ui]
+theme = "dark"
+show_token_usage = false
+show_tool_images = false
+show_tool_activity = false
+show_knowledge_activity = false
+show_delegation_notes = true
+chat_thread_line = false
+chat_prose_cap = false
+chat_turn_tint = false
+chat_hover_timestamps = false
+sound_complete = false
+
+[ui.steering_notes]
+auto_delegated = true
+literal_tip = false
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.ui.theme, "dark");
+        assert!(!cfg.ui.sound_complete);
     }
 
     #[test]
@@ -1739,7 +1518,6 @@ bundled_embedding_model = "all-MiniLM-L6-v2"
         assert!(!cfg.general.laya.enabled);
         assert!(!cfg.general.laya.auto_type_memories);
         assert!(!cfg.general.laya.failure_triage);
-        assert!(!cfg.general.laya.auto_finetune);
     }
 
     #[test]
@@ -1758,7 +1536,7 @@ enabled = true
 
     #[test]
     fn laya_section_is_omitted_while_default_and_written_once_touched() {
-        // Convention parity with [ui.steering_notes]: an untouched (default)
+        // Convention parity with [general.optimizer]: an untouched (default)
         // section is skipped in config.toml; enabling Laya writes it, and it
         // round-trips.
         let cfg: GeneralConfig = toml::from_str("").unwrap();
@@ -2109,40 +1887,32 @@ idle_compaction = false
 
     #[test]
     fn laya_failure_triage_flags_default_off_and_round_trip() {
-        // All three flags follow the same opt-in convention as auto-typing:
+        // Both flags follow the same opt-in convention as auto-typing:
         // absent ⇒ false, false leaves no serialized trace, and any flag
         // alone counts as "touched" so the section gets written.
         let cfg: GeneralConfig = toml::from_str("").unwrap();
         assert!(!cfg.general.laya.failure_triage);
         assert!(!cfg.general.laya.failure_triage_knn);
-        assert!(!cfg.general.laya.auto_finetune);
-
         let text = r#"
 [general.laya]
 enabled = true
 failure_triage = true
 failure_triage_knn = true
-auto_finetune = true
 "#;
         let cfg: GeneralConfig = toml::from_str(text).unwrap();
         assert!(cfg.general.laya.failure_triage);
         assert!(cfg.general.laya.failure_triage_knn);
-        assert!(cfg.general.laya.auto_finetune);
         let back = toml::to_string(&cfg).unwrap();
         assert!(back.contains("failure_triage"));
         assert!(back.contains("failure_triage_knn"));
-        assert!(back.contains("auto_finetune"));
         let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
         assert!(cfg2.general.laya.failure_triage);
         assert!(cfg2.general.laya.failure_triage_knn);
-        assert!(cfg2.general.laya.auto_finetune);
-
         let untouched = LayaConfig::default();
         assert!(untouched.is_default());
         let serialized = toml::to_string(&untouched).unwrap();
         assert!(!serialized.contains("failure_triage"));
         assert!(!serialized.contains("failure_triage_knn"));
-        assert!(!serialized.contains("auto_finetune"));
         assert!(!LayaConfig {
             failure_triage: true,
             ..Default::default()
@@ -2150,11 +1920,6 @@ auto_finetune = true
         .is_default());
         assert!(!LayaConfig {
             failure_triage_knn: true,
-            ..Default::default()
-        }
-        .is_default());
-        assert!(!LayaConfig {
-            auto_finetune: true,
             ..Default::default()
         }
         .is_default());
@@ -2226,7 +1991,7 @@ auto_finetune = true
     fn removed_run_all_strict_success_key_is_tolerated() {
         // The opt-in run_all_strict_success flag was removed 2026-08-20: the
         // plan-loop gate (workflow must reach Complete before an item can be
-        // marked Done) is now mandatory — see src-tauri/src/ipc/run_all.rs.
+        // marked Done) is now mandatory.
         // An old config.toml that still carries the key must keep loading
         // (serde ignores unknown fields), so the removal must not break
         // upgrades.
@@ -2241,59 +2006,6 @@ run_all_strict_success = true
         assert_eq!(cfg.general.default_provider.as_deref(), Some("openai"));
     }
 
-    #[test]
-    fn enable_browser_inspection_defaults_false() {
-        // The flag is opt-in: a fresh config must default to false so the
-        // unauthenticated CDP port is never exposed unless the user opts in.
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(!cfg.general.enable_browser_inspection);
-    }
-
-    #[test]
-    fn enable_browser_inspection_round_trips() {
-        // The flag must round-trip through TOML so the user's opt-in persists.
-        let text = r#"
-[general]
-default_provider = "openai"
-default_model = "gpt-4o"
-safety = "autonomous"
-enable_browser_inspection = true
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(cfg.general.enable_browser_inspection);
-        // Re-serialize + re-parse.
-        let back = toml::to_string(&cfg).unwrap();
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(cfg2.general.enable_browser_inspection);
-    }
-
-    #[test]
-    fn auto_compact_on_plan_complete_defaults_false() {
-        // The flag is opt-in: a fresh config must default to false so the
-        // run-all loop never spends a summarization call between items
-        // unless the user opts in.
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(!cfg.general.auto_compact_on_plan_complete);
-    }
-
-    #[test]
-    fn auto_compact_on_plan_complete_round_trips() {
-        // The flag must round-trip through TOML so the opt-in persists
-        // across save/reload.
-        let text = r#"
-[general]
-default_provider = "openai"
-default_model = "gpt-4o"
-safety = "autonomous"
-auto_compact_on_plan_complete = true
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(cfg.general.auto_compact_on_plan_complete);
-        // Re-serialize + re-parse.
-        let back = toml::to_string(&cfg).unwrap();
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(cfg2.general.auto_compact_on_plan_complete);
-    }
 
     #[test]
     fn codegraph_defaults_true() {
@@ -2318,14 +2030,6 @@ codegraph = false
         assert!(!cfg2.general.codegraph);
     }
 
-    #[test]
-    fn show_tool_activity_defaults_true() {
-        // Agent-activity cards are SHOWN out of the box (backlog 57687857 —
-        // user request 2027-01-13: tool results visible by default).
-        // Users opt OUT by setting show_tool_activity to false.
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(cfg.ui.show_tool_activity);
-    }
 
     #[test]
     fn sounds_default_on_and_round_trip() {
@@ -2354,233 +2058,6 @@ sound_stopped_errors = false
         assert!(!cfg2.ui.sound_stopped_errors);
     }
 
-    #[test]
-    fn show_tool_activity_round_trips() {
-        // Explicit `false` (the user's opt-out) must survive a save/reload
-        // round trip; the default is covered by show_tool_activity_defaults_true.
-        let text = r#"
-[ui]
-theme = "dark"
-show_token_usage = true
-show_tool_activity = false
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(!cfg.ui.show_tool_activity);
-        // Re-serialize + re-parse.
-        let back = toml::to_string(&cfg).unwrap();
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(!cfg2.ui.show_tool_activity);
-    }
-
-    #[test]
-    fn show_delegation_notes_defaults_false() {
-        // The AUTO-DELEGATED steering note is model guidance (the re-issue
-        // escape hatch), not end-user information — hidden out of the box
-        // (users opt in by setting it to true).
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(!cfg.ui.show_delegation_notes);
-    }
-
-    #[test]
-    fn show_delegation_notes_round_trips() {
-        let text = r#"
-[ui]
-show_delegation_notes = true
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(cfg.ui.show_delegation_notes);
-        // Re-serialize + re-parse.
-        let back = toml::to_string(&cfg).unwrap();
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(cfg2.ui.show_delegation_notes);
-    }
-
-    #[test]
-    fn steering_notes_default_to_visible_except_auto_delegated() {
-        // Every steering-note kind is visible out of the box EXCEPT the
-        // AUTO-DELEGATED family, which inherits the legacy
-        // `show_delegation_notes` default (hidden) — an untouched config
-        // therefore behaves exactly as it did before this table existed.
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(!cfg.ui.effective_steering_note_visible("auto_delegated"));
-        for key in UiConfig::STEERING_NOTE_KEYS {
-            if key != "auto_delegated" {
-                assert!(
-                    cfg.ui.effective_steering_note_visible(key),
-                    "{key} should default to visible"
-                );
-            }
-        }
-        // An unknown key resolves visible — never hide a note by accident.
-        assert!(cfg.ui.effective_steering_note_visible("not-a-kind"));
-    }
-
-    #[test]
-    fn steering_notes_explicit_value_wins() {
-        let text = r#"
-[ui.steering_notes]
-auto_delegated = true
-literal_tip = false
-known_memory_hit = false
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        // An explicit override beats the legacy-derived default.
-        assert!(cfg.ui.effective_steering_note_visible("auto_delegated"));
-        assert!(!cfg.ui.effective_steering_note_visible("literal_tip"));
-        assert!(!cfg.ui.effective_steering_note_visible("known_memory_hit"));
-        // Untouched kinds keep their defaults.
-        assert!(cfg.ui.effective_steering_note_visible("search_nudge"));
-    }
-
-    #[test]
-    fn steering_notes_legacy_toggle_seeds_auto_delegated() {
-        // A config written before the per-kind table existed keeps working:
-        // `show_delegation_notes = true` shows the AUTO-DELEGATED family...
-        let legacy: GeneralConfig = toml::from_str("[ui]\nshow_delegation_notes = true\n").unwrap();
-        assert!(legacy.ui.effective_steering_note_visible("auto_delegated"));
-        // ...while that legacy key stays the ONLY override (the other kinds
-        // rest on their own defaults, not on the legacy toggle).
-        assert!(legacy.ui.steering_notes.auto_delegated.is_none());
-        assert!(legacy.ui.effective_steering_note_visible("literal_tip"));
-    }
-
-    #[test]
-    fn steering_notes_every_key_maps_to_a_field() {
-        // Pin STEERING_NOTE_KEYS against the struct: each key must address a
-        // real override, and setting it must not disturb any other kind.
-        for key in UiConfig::STEERING_NOTE_KEYS {
-            let mut cfg = UiConfig::default();
-            match key {
-                "auto_delegated" => cfg.steering_notes.auto_delegated = Some(false),
-                "search_nudge" => cfg.steering_notes.search_nudge = Some(false),
-                "shell_tip" => cfg.steering_notes.shell_tip = Some(false),
-                "graph_miss" => cfg.steering_notes.graph_miss = Some(false),
-                "recall_rider" => cfg.steering_notes.recall_rider = Some(false),
-                "read_nudge" => cfg.steering_notes.read_nudge = Some(false),
-                "literal_tip" => cfg.steering_notes.literal_tip = Some(false),
-                "known_memory_hit" => cfg.steering_notes.known_memory_hit = Some(false),
-                "consolidation_due" => cfg.steering_notes.consolidation_due = Some(false),
-                "shell_redirect" => cfg.steering_notes.shell_redirect = Some(false),
-                "edit_stale_read" => cfg.steering_notes.edit_stale_read = Some(false),
-                other => panic!("unknown steering-note key {other}"),
-            }
-            assert!(
-                !cfg.effective_steering_note_visible(key),
-                "{key} override should hide the note"
-            );
-            // Setting one override must not disturb any OTHER kind: compare
-            // each against the untouched default resolution (auto_delegated
-            // is hidden by default, so "unchanged" is not always "visible").
-            let baseline = UiConfig::default();
-            for other in UiConfig::STEERING_NOTE_KEYS {
-                if other != key {
-                    assert_eq!(
-                        cfg.effective_steering_note_visible(other),
-                        baseline.effective_steering_note_visible(other),
-                        "{other} changed by the {key} override"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn steering_notes_round_trips() {
-        let text = r#"
-[ui.steering_notes]
-auto_delegated = true
-search_nudge = false
-literal_tip = false
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        // Re-serialize: only the overrides that were set appear (no key
-        // noise for the untouched kinds).
-        let back = toml::to_string(&cfg).unwrap();
-        assert!(
-            !back.contains("shell_tip"),
-            "an absent override must not be written: {back}"
-        );
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(cfg2.ui.effective_steering_note_visible("auto_delegated"));
-        assert!(!cfg2.ui.effective_steering_note_visible("search_nudge"));
-        assert!(!cfg2.ui.effective_steering_note_visible("literal_tip"));
-        assert_eq!(cfg2.ui.steering_notes, cfg.ui.steering_notes);
-    }
-
-    #[test]
-    fn steering_notes_table_omitted_while_unset() {
-        // An untouched config must not grow an empty [ui.steering_notes]
-        // table (cosmetic parity with configs written before the feature).
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        let back = toml::to_string(&cfg).unwrap();
-        assert!(
-            !back.contains("steering_notes"),
-            "unset table should be omitted: {back}"
-        );
-    }
-
-    #[test]
-    fn show_knowledge_activity_defaults_true() {
-        // Knowledge-access cards (graph + memory + auto-recall) are visible
-        // out of the box (backlog 68c4c9a5): the user wants to see graph +
-        // memory + auto-recall activity without enabling the full
-        // show_tool_activity toggle.
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(cfg.ui.show_knowledge_activity);
-    }
-
-    #[test]
-    fn show_knowledge_activity_round_trips() {
-        let text = r#"
-[ui]
-theme = "dark"
-show_token_usage = true
-show_knowledge_activity = false
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(!cfg.ui.show_knowledge_activity);
-        // Re-serialize + re-parse.
-        let back = toml::to_string(&cfg).unwrap();
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(!cfg2.ui.show_knowledge_activity);
-    }
-
-    #[test]
-    fn chat_readability_defaults_true() {
-        // The four chat-readability affordances (thread line, prose cap,
-        // turn tint, hover timestamps — plan afa81f0a) ship enabled; each
-        // can be opted out individually.
-        let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(cfg.ui.chat_thread_line);
-        assert!(cfg.ui.chat_prose_cap);
-        assert!(cfg.ui.chat_turn_tint);
-        assert!(cfg.ui.chat_hover_timestamps);
-    }
-
-    #[test]
-    fn chat_readability_round_trips() {
-        let text = r#"
-[ui]
-theme = "dark"
-show_token_usage = true
-chat_thread_line = false
-chat_prose_cap = true
-chat_turn_tint = false
-chat_hover_timestamps = true
-"#;
-        let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(!cfg.ui.chat_thread_line);
-        assert!(cfg.ui.chat_prose_cap);
-        assert!(!cfg.ui.chat_turn_tint);
-        assert!(cfg.ui.chat_hover_timestamps);
-        // Re-serialize + re-parse.
-        let back = toml::to_string(&cfg).unwrap();
-        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(!cfg2.ui.chat_thread_line);
-        assert!(cfg2.ui.chat_prose_cap);
-        assert!(!cfg2.ui.chat_turn_tint);
-        assert!(cfg2.ui.chat_hover_timestamps);
-    }
 
     #[test]
     fn save_round_trips_all_sections() {
@@ -2606,9 +2083,7 @@ chat_hover_timestamps = true
                 verify: VerifyConfig::default(),
                 budget: BudgetConfig::default(),
                 optimizer: OptimizerConfig::default(),
-                enable_browser_inspection: false,
                 codegraph: true,
-                auto_compact_on_plan_complete: false,
             },
             context: ContextConfig {
                 summarize_at_fill_rate: 0.3,
@@ -2617,19 +2092,6 @@ chat_hover_timestamps = true
             },
             ui: UiConfig {
                 theme: "light".into(),
-                show_token_usage: false,
-                show_tool_images: false,
-                show_tool_activity: true,
-                show_knowledge_activity: false,
-                show_delegation_notes: true,
-                steering_notes: SteeringNotesCfg {
-                    literal_tip: Some(false),
-                    ..Default::default()
-                },
-                chat_thread_line: false,
-                chat_prose_cap: true,
-                chat_turn_tint: false,
-                chat_hover_timestamps: true,
                 sound_complete: false,
                 sound_input_needed: true,
                 sound_stopped_errors: false,
@@ -2666,21 +2128,9 @@ chat_hover_timestamps = true
         assert_eq!(em.model, "nomic-embed-text");
         assert!((reloaded.context.summarize_at_fill_rate - 0.3).abs() < 1e-9);
         assert_eq!(reloaded.ui.theme, "light");
-        assert!(!reloaded.ui.show_token_usage);
-        assert!(reloaded.ui.show_tool_activity);
-        assert!(!reloaded.ui.show_knowledge_activity);
-        assert!(reloaded.ui.show_delegation_notes);
-        // The per-kind steering-note table rides the save path too: only the
-        // kind carrying an override is written, and the legacy toggle still
-        // seeds auto_delegated on reload.
-        assert_eq!(reloaded.ui.steering_notes.literal_tip, Some(false));
-        assert_eq!(reloaded.ui.steering_notes.search_nudge, None);
-        assert!(!reloaded.ui.effective_steering_note_visible("literal_tip"));
-        assert!(reloaded.ui.effective_steering_note_visible("auto_delegated"));
-        assert!(!reloaded.ui.chat_thread_line);
-        assert!(reloaded.ui.chat_prose_cap);
-        assert!(!reloaded.ui.chat_turn_tint);
-        assert!(reloaded.ui.chat_hover_timestamps);
+        assert!(!reloaded.ui.sound_complete);
+        assert!(reloaded.ui.sound_input_needed);
+        assert!(!reloaded.ui.sound_stopped_errors);
         assert_eq!(
             reloaded.markdown.skip_dirs,
             vec![".git".to_string(), "build".to_string()]

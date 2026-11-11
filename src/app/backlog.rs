@@ -64,7 +64,7 @@ pub const MAX_ITEM_TEXT_CHARS: usize = 4000;
 pub const MAX_HEADLINE_CHARS: usize = 100;
 
 /// The minimum length of a backlog item's BODY, in characters — the detail
-/// bar (2027-01-07): Run-All dispatches items to whatever model/effort is
+/// bar (2027-01-07): a dispatched item goes to whatever model/effort is
 /// configured, and a terse body leaves a lesser-reasoning session
 /// floundering (re-deriving context, missing file paths, fixing the wrong
 /// thing). Enforced by [`normalize_item_text`] alongside
@@ -94,7 +94,7 @@ pub(crate) fn body_carries_detail_marker(body: &str) -> bool {
     static PATHISH: OnceLock<regex::Regex> = OnceLock::new();
     let pathish = PATHISH.get_or_init(|| {
         regex::Regex::new(
-            // Two separators (src/lib/foo.rs, frontend/src/lib/tauri.ts,
+            // Two separators (src/lib/foo.rs, mnemo2/src/lib/store.ts,
             // URLs) OR a separator plus an extension (src/foo.rs) OR a
             // Windows drive prefix (C:\repo\src) OR a bare filename with a
             // code-ish extension (README.md, Cargo.toml).
@@ -147,7 +147,7 @@ fn is_live(item: &BacklogItem) -> bool {
 /// The body also passes the detail bar (2027-01-07): at least
 /// [`MIN_BODY_CHARS`] characters AND at least one file-path-like token (or
 /// an explicit no-code marker — see [`body_carries_detail_marker`]).
-/// Run-All dispatches items to whatever model/effort is configured, so a
+/// A dispatched item goes to whatever model/effort is configured, so a
 /// terse body leaves a lesser-reasoning session floundering; the rejection
 /// message names the five elements the body must carry so an LLM caller
 /// can retry in one shot.
@@ -256,17 +256,17 @@ pub struct BacklogItem {
     pub created_at: u64,
     /// Optional note (e.g. the error message for a failed/cant-resolve item).
     pub note: Option<String>,
-    /// Deferred (skip Run-All): the item stays in the backlog — visible,
-    /// still pending work, manually dispatchable — but Run-All never
-    /// selects or counts it (user request 2027-01-07: a "keep but do not
-    /// auto-run" state for items reserved for manual in-app handling or
-    /// later re-inclusion). ORTHOGONAL to [`BacklogStatus`]: the item
-    /// keeps its status and every existing transition keeps working; only
-    /// the Run-All selection path ([`BacklogStore::next_pending_eligible`])
-    /// skips deferred items — auto-feed and the per-item dispatch button
-    /// still see them. Serialized only when `true`: old JSONL lines without
-    /// the field parse as `false`, and non-deferred lines stay
-    /// byte-identical to the pre-change format (union-merge friendly).
+    /// Deferred (skip automatic dispatch): the item stays in the backlog —
+    /// visible, still pending work, manually actionable (user request
+    /// 2027-01-07: a "keep but do not auto-run" state for items reserved for
+    /// manual in-app handling or later re-inclusion). ORTHOGONAL to
+    /// [`BacklogStatus`]: the item keeps its status and every existing
+    /// transition keeps working. The flag is still written and displayed by
+    /// the backlog tool and Mnemo2's backlog view; Mnemo1's Run-All
+    /// dispatcher — the only selector that consulted it — is gone. Serialized
+    /// only when `true`: old JSONL lines without the field parse as `false`,
+    /// and non-deferred lines stay byte-identical to the pre-change format
+    /// (union-merge friendly).
     #[serde(default, skip_serializing_if = "is_false")]
     pub deferred: bool,
     /// The ROOT plan id of the plan dispatched for this item — the
@@ -347,10 +347,9 @@ impl BacklogStatus {
 ///
 /// `End` (the default) appends — the queue is FIFO, and every
 /// pre-position caller keeps exactly today's behavior. `Top` inserts at
-/// the FRONT so the item is dispatched first — for urgent/priority items
-/// only (the motivating incident: the run-all stall item had to be
-/// manually sent to top through the UI because the agent tool could only
-/// append).
+/// the FRONT so the item is handled first — for urgent/priority items
+/// only (the motivating incident: a stalled item had to be manually moved
+/// to the top through the UI because the agent tool could only append).
 ///
 /// Union-merge safety (`.coding/backlog.jsonl` merges by line
 /// concatenation, see `.gitattributes`): a `Top` insert PREPENDS one
@@ -562,8 +561,8 @@ impl BacklogStore {
 
     /// Soft-delete the item with the given id: the item is marked
     /// `deleted_at` and disappears from every read path ([`Self::items`],
-    /// [`Self::next_pending`], dispatch, the memory indexer), but its JSONL
-    /// line and image sidecar files stay on disk until [`Self::open`] purges
+    /// the memory indexer), but its JSONL line and image sidecar files stay
+    /// on disk until [`Self::open`] purges
     /// it [`PURGE_AFTER_SECS`] (30 days) later. Keeping the line (instead of
     /// dropping it) makes the deletion survive the git union merge — a
     /// hard-removed line would be resurrected by the other side's copy.
@@ -613,8 +612,8 @@ impl BacklogStore {
     /// Change an item's status through the shared guarded transition table.
     ///
     /// The single sanctioned status-mutation path for production code (the
-    /// `backlog_status` agent tool AND the harness's dispatch/resolution
-    /// sites in `run_all.rs` / `backlog_cmds.rs`). Raw [`Self::set_status`]
+    /// `backlog_status` agent tool and Mnemo2's backlog commands in
+    /// `src-tauri/src/mnemo2/backlog.rs`). Raw [`Self::set_status`]
     /// remains for tests and internal seed states, but production transitions
     /// must route here so the guard can never drift.
     ///
@@ -812,60 +811,12 @@ impl BacklogStore {
         }
     }
 
-    /// Return the first live `Pending` item in display order, if any.
-    /// Soft-deleted items are never dispatched.
-    pub fn next_pending(&self) -> Option<BacklogItem> {
-        self.items
-            .iter()
-            .find(|i| i.status == BacklogStatus::Pending && is_live(i))
-            .cloned()
-    }
-
-    /// Return the first live `Pending` item that is NOT deferred — the
-    /// Run-All selection (user request 2027-01-07: exclude items from
-    /// Run-All). Deferred items ([`BacklogItem::deferred`]) stay pending
-    /// and visible but are never selected or counted by a run; when only
-    /// deferred items remain, this returns `None` and the run ends
-    /// cleanly. [`Self::next_pending`] (auto-feed, the dispatch-next
-    /// button) and [`Self::pending_item`] (the per-item ▶ button — manual
-    /// in-app handling of a deferred item) still see them.
-    pub fn next_pending_eligible(&self) -> Option<BacklogItem> {
-        self.items
-            .iter()
-            .find(|i| i.status == BacklogStatus::Pending && is_live(i) && !i.deferred)
-            .cloned()
-    }
-
-    /// Return the first live `Pending` non-deferred item whose id is NOT
-    /// in `exclude` — the PARALLEL run-all selection (plan ffd7a86f).
-    ///
-    /// [`Self::next_pending_eligible`] peeks without consuming (items
-    /// stay `Pending` until the workflow enters `Executing`), so the
-    /// parallel dispatch window must explicitly skip the ids already
-    /// handed out: the main agent's `current_item` and every spawned
-    /// run's item. Without the exclusion the window would hand the SAME
-    /// top item to a spawned agent while the main agent works it.
-    pub fn next_pending_eligible_excluding(
-        &self,
-        exclude: &[String],
-    ) -> Option<BacklogItem> {
-        self.items
-            .iter()
-            .find(|i| {
-                i.status == BacklogStatus::Pending
-                    && is_live(i)
-                    && !i.deferred
-                    && !exclude.contains(&i.id)
-            })
-            .cloned()
-    }
-
-    /// Set or clear the deferred (skip Run-All) flag on the item with the
-    /// given id — the "keep but do not auto-run" state. ORTHOGONAL to
-    /// status: the item keeps its current status (typically `Pending`)
-    /// and every existing transition keeps working; only Run-All selection
-    /// ([`Self::next_pending_eligible`]) skips deferred items. Returns
-    /// `false` (no-op, no persist) for an unknown or soft-deleted id.
+    /// Set or clear the deferred (skip automatic dispatch) flag on the item
+    /// with the given id — the "keep but do not auto-run" state. ORTHOGONAL
+    /// to status: the item keeps its current status (typically `Pending`)
+    /// and every existing transition keeps working. The flag is persisted and
+    /// round-tripped; nothing selects on it any more. Returns `false` (no-op,
+    /// no persist) for an unknown or soft-deleted id.
     pub fn set_deferred(&mut self, id: &str, deferred: bool) -> bool {
         self.reload_from_disk();
         let Some(item) = self.items.iter_mut().find(|i| i.id == id && is_live(i)) else {
@@ -874,18 +825,6 @@ impl BacklogStore {
         item.deferred = deferred;
         self.persist();
         true
-    }
-
-    /// Return the item with the given id, but only if it is `Pending`.
-    ///
-    /// Used by the per-item dispatch path (the ▶ button on a specific card):
-    /// unlike `next_pending`, this targets an exact id and refuses non-pending
-    /// items so a stale click on an already-dispatched card is a no-op.
-    pub fn pending_item(&self, id: &str) -> Option<BacklogItem> {
-        self.items
-            .iter()
-            .find(|i| i.id == id && i.status == BacklogStatus::Pending && is_live(i))
-            .cloned()
     }
 
     /// Soft-delete all finished items (`Done`, `Failed`, `CantResolve`),
@@ -1549,7 +1488,7 @@ mod tests {
     fn detail_marker_recognizes_paths_but_not_prose() {
         // Path-like tokens count…
         assert!(body_carries_detail_marker("fix src/auth/session.rs first"));
-        assert!(body_carries_detail_marker("see frontend/src/lib/tauri.ts:373"));
+        assert!(body_carries_detail_marker("see mnemo2/src/lib/store.ts:373"));
         assert!(body_carries_detail_marker("in C:\\repo\\src\\main.rs"));
         assert!(body_carries_detail_marker("update README.md"));
         assert!(body_carries_detail_marker("check Cargo.toml deps"));
@@ -1628,9 +1567,9 @@ mod tests {
     #[test]
     fn add_at_top_lands_first_in_store_and_file_order() {
         // Backlog 06a31736: a Top insert must land at the FRONT of the
-        // display order — the item is dispatched first (next_pending) —
-        // and the persisted line order must match, so the Backlog tab and
-        // a reopened store agree.
+        // display order — the item is handled first — and the persisted
+        // line order must match, so the Backlog tab and a reopened store
+        // agree.
         let dir = TestDir::new("add_top");
         let mut store = BacklogStore::open(dir.path());
         let a = store.add("first".into(), vec![]);
@@ -1642,12 +1581,6 @@ mod tests {
         assert_eq!(items[0].id, t.id, "the Top insert is first");
         assert_eq!(items[1].id, a.id);
         assert_eq!(items[2].id, b.id);
-        assert_eq!(
-            store.next_pending().map(|i| i.id),
-            Some(t.id.clone()),
-            "the Top insert is dispatched first"
-        );
-
         // The persisted line order matches (reopen from disk).
         let reopened = BacklogStore::open(dir.path());
         assert_eq!(reopened.items().len(), 3);
@@ -2036,40 +1969,6 @@ mod tests {
     }
 
     #[test]
-    fn next_pending_returns_first_pending_in_order() {
-        let dir = TestDir::new("next_pending");
-        let mut store = BacklogStore::open(dir.path());
-        assert!(store.next_pending().is_none());
-
-        let a = store.add("a".into(), vec![]);
-        let b = store.add("b".into(), vec![]);
-        assert_eq!(store.next_pending().unwrap().id, a.id);
-
-        store.set_status(&a.id, BacklogStatus::InFlight, None);
-        assert_eq!(store.next_pending().unwrap().id, b.id);
-
-        store.set_status(&b.id, BacklogStatus::Done, None);
-        assert!(store.next_pending().is_none());
-    }
-
-    #[test]
-    fn pending_item_returns_only_pending() {
-        let dir = TestDir::new("pending_item");
-        let mut store = BacklogStore::open(dir.path());
-
-        let a = store.add("a".into(), vec![]);
-        let b = store.add("b".into(), vec![]);
-        store.set_status(&a.id, BacklogStatus::InFlight, None);
-
-        // The pending item is returned by its id.
-        assert_eq!(store.pending_item(&b.id).unwrap().id, b.id);
-        // The in-flight item is NOT returned (only Pending qualifies).
-        assert!(store.pending_item(&a.id).is_none());
-        // An unknown id is None.
-        assert!(store.pending_item("no-such-id").is_none());
-    }
-
-    #[test]
     fn clear_finished_drops_terminal_statuses() {
         let dir = TestDir::new("clear_finished");
         let mut store = BacklogStore::open(dir.path());
@@ -2311,7 +2210,10 @@ mod tests {
         // Hidden from every read path...
         assert_eq!(store.items().len(), 1);
         assert_eq!(store.items()[0].id, b.id);
-        assert_eq!(store.next_pending().map(|i| i.id), Some(b.id.clone()));
+        assert!(
+            store.items().iter().all(|i| i.id != a.id),
+            "the soft-deleted item is invisible to the read path"
+        );
         // ...but the JSONL line persists, marked deleted_at.
         let raw = std::fs::read_to_string(dir.path()).unwrap();
         assert_eq!(raw.lines().count(), 2, "both lines stay on disk");
@@ -2325,7 +2227,7 @@ mod tests {
         assert_eq!(store.items()[0].id, b.id);
     }
 
-    // ---- deferred (skip Run-All) — user request 2027-01-07 ----
+    // ---- deferred (keep but do not auto-run) — user request 2027-01-07 ----
 
     #[test]
     fn deferred_flag_round_trips_and_is_omitted_when_false() {
@@ -2366,79 +2268,6 @@ mod tests {
     }
 
     #[test]
-    fn next_pending_eligible_excluding_skips_handed_out_ids() {
-        // Parallel run-all (plan ffd7a86f): the selection PEEKS (items stay
-        // `Pending` until the workflow enters `Executing`), so the parallel
-        // dispatch window must skip the ids already handed out — the main
-        // agent's `current_item` and every spawned run's item. Without the
-        // exclusion the window would hand the SAME top item to a spawned
-        // agent while the main agent works it.
-        let dir = TestDir::new("parallel_exclude");
-        let mut store = BacklogStore::open(dir.path());
-        let a = store.add("a".into(), vec![]);
-        let b = store.add("b".into(), vec![]);
-        let c = store.add("c".into(), vec![]);
-
-        // The plain selector returns the top item — twice (it peeks,
-        // nothing is consumed).
-        assert_eq!(store.next_pending_eligible().unwrap().id, a.id);
-        assert_eq!(store.next_pending_eligible().unwrap().id, a.id);
-        // The parallel selector skips the handed-out ids: with a+b excluded
-        // it hands out c…
-        assert_eq!(
-            store
-                .next_pending_eligible_excluding(&[a.id.clone(), b.id.clone()])
-                .expect("c is next")
-                .id,
-            c.id
-        );
-        // …and with everything handed out there is nothing left.
-        assert!(store
-            .next_pending_eligible_excluding(&[a.id.clone(), b.id.clone(), c.id.clone()])
-            .is_none());
-    }
-
-    #[test]
-    fn next_pending_eligible_skips_deferred_items() {
-        let dir = TestDir::new("eligible_selection");
-        let mut store = BacklogStore::open(dir.path());
-        let a = store.add("a".into(), vec![]);
-        let b = store.add("b".into(), vec![]);
-
-        // Defer the first item: Run-All selection skips it…
-        assert!(store.set_deferred(&a.id, true));
-        assert_eq!(
-            store.next_pending_eligible().expect("b is eligible").id,
-            b.id
-        );
-        // …while next_pending (auto-feed, dispatch-next) and pending_item
-        // (the per-item ▶ button — manual in-app handling) still see it.
-        assert_eq!(
-            store.next_pending().expect("next_pending unchanged").id,
-            a.id
-        );
-        assert_eq!(
-            store.pending_item(&a.id).expect("manual dispatch works").id,
-            a.id
-        );
-
-        // Un-defer restores eligibility.
-        assert!(store.set_deferred(&a.id, false));
-        assert_eq!(
-            store.next_pending_eligible().expect("a eligible again").id,
-            a.id
-        );
-
-        // All deferred → nothing eligible (the run ends cleanly).
-        assert!(store.set_deferred(&a.id, true));
-        assert!(store.set_deferred(&b.id, true));
-        assert!(
-            store.next_pending_eligible().is_none(),
-            "only-deferred backlog yields no eligible item"
-        );
-    }
-
-    #[test]
     fn set_deferred_unknown_or_deleted_id_is_noop() {
         let dir = TestDir::new("deferred_unknown_id");
         let mut store = BacklogStore::open(dir.path());
@@ -2451,14 +2280,19 @@ mod tests {
     #[test]
     fn deferral_survives_status_transitions_and_requeue() {
         // The flag is orthogonal to status: transitions/requeue preserve it
-        // (a deferred item requeued after a failure stays out of Run-All).
+        // (a deferred item requeued after a failure keeps the flag).
         let dir = TestDir::new("deferred_survives_requeue");
         let mut store = BacklogStore::open(dir.path());
         let a = store.add("a".into(), vec![]);
         assert!(store.set_deferred(&a.id, true));
         assert!(store.transition(&a.id, BacklogStatus::Failed, Some("boom".to_string())));
         assert!(store.requeue(&a.id));
-        let item = store.pending_item(&a.id).expect("requeued to pending");
+        let item = store
+            .items()
+            .into_iter()
+            .find(|i| i.id == a.id)
+            .expect("requeued item is listed");
+        assert_eq!(item.status, BacklogStatus::Pending, "requeued to pending");
         assert!(item.deferred, "the flag survives transition + requeue");
         assert_eq!(item.note, None, "requeue clears the note but not the flag");
     }

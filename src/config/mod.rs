@@ -804,7 +804,7 @@ fn migrate_legacy_dir(old: &Path, new: &Path) -> bool {
 /// The path of the one-shot "pending project" marker file.
 ///
 /// When the user switches projects from the UI, the chosen project path is
-/// written here, then the app is restarted. On restart, [`build_brain`] reads
+/// written here, then the app is restarted. On restart, the startup path reads
 /// (and consumes) this marker to know which project to open — because a Tauri
 /// restart reuses the original argv, the marker is the side-channel that
 /// carries the selection across the restart boundary.
@@ -863,7 +863,7 @@ fn consume_marker_at(file: &Path) -> Option<PathBuf> {
 /// Used at window creation to detect the reload half of a switch restart
 /// (so the relaunched window can be focused like the one it replaced) — the
 /// marker itself is still consumed later by [`take_pending_project`] in
-/// `build_brain`.
+/// startup.
 pub fn peek_pending_project() -> Option<PathBuf> {
     read_marker_at(&pending_project_path())
 }
@@ -951,7 +951,7 @@ summarize_at_fill_rate = 0.5
 
 [ui]
 theme = "dark"
-show_token_usage = true
+sound_complete = false
 "#,
         );
         write(
@@ -1140,7 +1140,7 @@ summarize_at_fill_rate = 0.4
 
 [ui]
 theme = "dark"
-show_token_usage = true
+sound_complete = false
 "#,
         );
         write(
@@ -1321,7 +1321,7 @@ summarize_at_fill_rate = 0.3
 
 [ui]
 theme = "light"
-show_token_usage = false
+sound_complete = false
 "#,
         );
         write(
@@ -1355,7 +1355,7 @@ api_key = "sk-x"
         // Unrelated sections preserved:
         assert!((reloaded.general.context.summarize_at_fill_rate - 0.3).abs() < 1e-9);
         assert_eq!(reloaded.general.ui.theme, "light");
-        assert!(!reloaded.general.ui.show_token_usage);
+        assert!(!reloaded.general.ui.sound_complete);
     }
 
     // ── pending-project marker ──────────────────────────────────────────────
@@ -1421,7 +1421,7 @@ api_key = "sk-x"
     #[test]
     fn pending_marker_peek_does_not_consume() {
         // The switch-restart focus path peeks the marker before the window
-        // exists; build_brain's take must still see it afterwards.
+        // exists; the startup take must still see it afterwards.
         let dir = tempdir().unwrap();
         let marker = dir.path().join(".pending_project");
         write_marker_at(&marker, Path::new("/some/project")).unwrap();

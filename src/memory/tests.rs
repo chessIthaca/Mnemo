@@ -3806,7 +3806,7 @@ fn cache_lifetime_from_gaps_skips_thin_windows() {
 #[test]
 fn cache_lifetime_from_gaps_is_none_when_the_cache_stays_warm() {
     // A cache that outlives an hour never decides; neither does no data.
-    assert_eq!(cache_lifetime_from_gaps(&vec![(4000, 0.95); 10]), None);
+    assert_eq!(cache_lifetime_from_gaps(&[(4000, 0.95); 10]), None);
     assert_eq!(cache_lifetime_from_gaps(&[]), None);
 }
 

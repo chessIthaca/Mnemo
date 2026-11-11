@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   safetyTransport: null as unknown,
   mcpTransport: null as unknown,
   specsTransport: null as unknown,
+  aboutTransport: null as unknown,
 }));
 
 vi.mock("../lib/settingsEngine", async (importOriginal) => {
@@ -46,6 +47,11 @@ vi.mock("../lib/mcpSettings", async (importOriginal) => {
 vi.mock("../lib/specsSettings", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/specsSettings")>();
   return { ...original, createSpecsTransport: () => mocks.specsTransport };
+});
+
+vi.mock("../lib/about", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/about")>();
+  return { ...original, createAboutTransport: () => mocks.aboutTransport };
 });
 
 function endpoint(name: string, overrides: Partial<EndpointDetailDto> = {}): EndpointDetailDto {
@@ -213,6 +219,7 @@ describe("SettingsDialog", () => {
     mocks.safetyTransport = null;
     mocks.mcpTransport = null;
     mocks.specsTransport = null;
+    mocks.aboutTransport = null;
     app.set(fixtureState());
   });
 
@@ -575,6 +582,19 @@ describe("SettingsDialog", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Tiers" }));
     expect(await screen.findByText("Laya settings are available in the desktop app.")).toBeTruthy();
   });
+
+  it("the About page shows the version and opens links", async () => {
+    makeTransport();
+    const aboutTransport = { version: async () => "9.9.9", open: vi.fn(async () => {}) };
+    mocks.aboutTransport = aboutTransport;
+    await openDialog();
+
+    await fireEvent.click(screen.getByRole("button", { name: "About" }));
+    expect(await screen.findByText("v9.9.9")).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Source code" }));
+    expect(aboutTransport.open).toHaveBeenCalledWith("https://github.com/chessIthaca/Mnemo");
+  });
 });
 
 /**
@@ -589,6 +609,7 @@ describe("unsaved edits", () => {
     mocks.safetyTransport = null;
     mocks.mcpTransport = null;
     mocks.specsTransport = null;
+    mocks.aboutTransport = null;
     app.set(fixtureState());
   });
 

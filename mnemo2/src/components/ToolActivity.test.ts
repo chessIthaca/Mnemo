@@ -1,7 +1,19 @@
-import { fireEvent, render, waitFor } from "@testing-library/svelte";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearToolImageCache } from "../lib/toolImages";
 import type { LeadEntry } from "../lib/types";
 import ToolActivity from "./ToolActivity.svelte";
+
+// The host image read is faked: every tool image resolves to the same tiny PNG.
+vi.mock("../lib/toolImages", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/toolImages")>();
+  return {
+    ...original,
+    createToolImageTransport: () => ({
+      read: async () => "data:image/png;base64,AAAA",
+    }),
+  };
+});
 
 type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
 
@@ -306,5 +318,47 @@ describe("ToolActivity turn time", () => {
     });
     expect(statusText(container)).toBe("0:03");
     expect(timeTitle(container)).toBe("Turn time 0:03 · running 0:02");
+  });
+});
+
+describe("ToolActivity tool images", () => {
+  beforeEach(() => clearToolImageCache());
+
+  /** A finished screenshot call whose image sits in the checkout. */
+  function shot(overrides: Partial<ToolEntry> = {}): ToolEntry {
+    return {
+      id: "tool-1",
+      kind: "tool",
+      time: "now",
+      toolCallId: "call-1",
+      toolName: "offscreen_browser_screenshot",
+      arguments: '{"url":"http://localhost:1420"}',
+      liveOutput: "",
+      result: {
+        success: true,
+        output: "saved",
+        data: { path: ".coding/browser/screenshots/shot.png" },
+      },
+      ...overrides,
+    } as ToolEntry;
+  }
+
+  it("shows a screenshot thumbnail and opens the viewer", async () => {
+    render(ToolActivity, { entry: shot() });
+    const thumbnail = await screen.findByRole("button", { name: "Open shot.png" });
+    expect(thumbnail.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,AAAA");
+
+    await fireEvent.click(thumbnail);
+    const dialog = await screen.findByRole("dialog", { name: "shot.png" });
+    expect(within(dialog).getByRole("button", { name: "Copy image" })).toBeTruthy();
+    expect(within(dialog).getByText("Close")).toBeTruthy();
+  });
+
+  it("shows no image for a failed call", async () => {
+    const { container } = render(ToolActivity, {
+      entry: shot({ result: { success: false, output: "the browser crashed" } }),
+    });
+    await waitFor(() => expect(container.querySelector(".tool-error")).toBeTruthy());
+    expect(container.querySelector(".tool-images")).toBeNull();
   });
 });

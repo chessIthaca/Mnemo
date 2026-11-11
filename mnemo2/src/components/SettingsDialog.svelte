@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { createAboutTransport } from "../lib/about";
   import { createLayaTransport } from "../lib/layaSettings";
   import { createMcpTransport } from "../lib/mcpSettings";
   import { createModelSettingsTransport } from "../lib/modelSettings";
@@ -10,6 +11,7 @@
   import { errorText } from "../lib/settingsState";
   import { createSpecsTransport } from "../lib/specsSettings";
   import { provideUnsavedRegistry } from "../lib/unsavedEdits";
+  import AboutPage from "./AboutPage.svelte";
   import AppearancePage from "./AppearancePage.svelte";
   import EndpointsPage from "./EndpointsPage.svelte";
   import InlineConfirm from "./InlineConfirm.svelte";
@@ -31,12 +33,13 @@
     | "savings"
     | "safety"
     | "mcp"
-    | "appearance";
+    | "appearance"
+    | "about";
 
   /**
-   * The rail, in two groups: the open project's own settings first, then every
-   * page that spans the whole install. Safety and MCP keep their per-project
-   * sections inside the install-wide pages.
+   * The rail, in three groups: the open project's own settings first, then every
+   * page that spans the whole install, then the app itself. Safety and MCP keep
+   * their per-project sections inside the install-wide pages.
    */
   const railGroups: { label: string; pages: { id: Page; label: string }[] }[] = [
     { label: "This project", pages: [{ id: "project", label: "Project" }, { id: "specs", label: "Specs" }] },
@@ -52,6 +55,7 @@
         { id: "appearance", label: "Appearance" },
       ],
     },
+    { label: "Mnemo2", pages: [{ id: "about", label: "About" }] },
   ];
 
   let {
@@ -138,6 +142,9 @@
   const mcpTransport = $derived(open ? createMcpTransport() : null);
   const appearanceTransport = $derived(open ? createAppearanceTransport() : null);
   const specsTransport = $derived(open ? createSpecsTransport() : null);
+  // About talks to the shell directly, so it is ready whether or not the
+  // settings load succeeded — unlike the pages above it never gates on `open`.
+  const aboutTransport = createAboutTransport();
 
   $effect(() => {
     const active = transport;
@@ -235,6 +242,8 @@
           {:else}
             <p class="settings-empty">Sound and theme settings are available in the desktop app.</p>
           {/if}
+        {:else if page === "about"}
+          <AboutPage transport={aboutTransport} />
         {:else if loadError}
           <p class="settings-error" role="alert">{loadError}</p>
         {:else if loading}

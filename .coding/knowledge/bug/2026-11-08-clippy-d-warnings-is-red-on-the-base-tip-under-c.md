@@ -2,6 +2,7 @@
 title = "clippy -D warnings is red on the base tip under clippy 1.95 (plan_board.rs:418, :1508)"
 created = "2026-11-08"
 evidence = "`cargo clippy --all-targets -- -D warnings` run twice in a worker worktree: with a change (2 errors at plan_board.rs:418,1508) and with the change stashed at base tip dc5108b3 (identical 2 errors, exit 101); `git blame -L 418,418` and `-L 1508,1511` both show commit e238cf799; no rust-toolchain.toml exists (rustc 1.95.0, 2026-04-14)."
+status = "superseded"
 +++
 
 Any worker running the standard verification `cargo clippy --all-targets -- -D warnings` in this repo currently fails on two PRE-EXISTING lints that have nothing to do with its own change:

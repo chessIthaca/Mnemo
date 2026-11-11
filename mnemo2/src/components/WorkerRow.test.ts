@@ -1,8 +1,9 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { app } from "../lib/store";
 import type { Worker } from "../lib/types";
 import { createWorkers, fixtureState } from "../test/fixtures";
+import { defineTokenSentinels, tokenSentinels } from "../test/tokens";
 import ActivityStatus from "./ActivityStatus.svelte";
 import WorkerRow from "./WorkerRow.svelte";
 
@@ -16,7 +17,14 @@ const brief = [
 const worker = (): Worker => ({ ...createWorkers()[0], task: brief });
 
 describe("WorkerRow", () => {
-  beforeEach(() => app.set(fixtureState()));
+  let clearTokens: () => void;
+
+  beforeEach(() => {
+    app.set(fixtureState());
+    clearTokens = defineTokenSentinels();
+  });
+
+  afterEach(() => clearTokens());
 
   it("renders the summary, not the raw Markdown, in the three-line clamp", () => {
     const { container } = render(WorkerRow, { worker: worker(), onSelect: vi.fn() });
@@ -39,9 +47,9 @@ describe("WorkerRow", () => {
     if (!summary || !progress || !bar) throw new Error("Worker summary or progress bar missing");
 
     const summaryStyle = getComputedStyle(summary);
-    expect(summaryStyle.fontFamily).toBe("var(--font-ui)");
-    expect(summaryStyle.fontSize).toBe("var(--text-meta)");
-    expect(summaryStyle.color).toBe("var(--muted)");
+    expect(summaryStyle.fontFamily).toBe(tokenSentinels["--font-ui"]);
+    expect(summaryStyle.fontSize).toBe(tokenSentinels["--text-meta"]);
+    expect(summaryStyle.color).toBe(tokenSentinels["--muted"]);
     expect(summaryStyle.webkitLineClamp).toBe("3");
 
     const progressStyle = getComputedStyle(progress);
@@ -78,7 +86,7 @@ describe("WorkerRow", () => {
     // The timer ticks since the worker was created, not the static elapsed text.
     expect(live?.textContent).toContain("18:");
     expect(live?.classList.contains("meta")).toBe(true);
-    expect(getComputedStyle(live!).fontSize).toBe("var(--text-meta)");
+    expect(getComputedStyle(live!).fontSize).toBe(tokenSentinels["--text-meta"]);
     // The static cost-and-elapsed line is gone while the worker runs.
     expect(container.querySelector(".worker-meta small")).toBeNull();
   });
@@ -130,7 +138,8 @@ describe("WorkerRow", () => {
     // The pill keeps its natural width; the line under it fills the column and truncates.
     const pill = meta.querySelector<HTMLElement>(".status-label");
     if (!pill) throw new Error("status pill missing");
-    expect(getComputedStyle(pill).display).toBe("inline-flex");
+    // As a flex item the pill's inline-flex is blockified to flex (as in browsers); its natural width comes from the column's align-items: flex-start.
+    expect(getComputedStyle(pill).display).toBe("flex");
 
     const line = meta.querySelector<HTMLElement>("small");
     if (!line) throw new Error("cost and elapsed line missing");

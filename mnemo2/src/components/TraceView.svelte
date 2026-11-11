@@ -7,9 +7,11 @@
   import { Copy, Download, FolderOpen, History, Search, Trash2, X } from "@lucide/svelte";
   import { formatBytes } from "../lib/files";
   import { actions, app, SESSION_START_MS } from "../lib/store";
+  import { createSteeringTransport, type SteeringStats } from "../lib/steering";
   import TraceCharts from "./TraceCharts.svelte";
   import TraceDetailPane from "./TraceDetail.svelte";
   import TraceList from "./TraceList.svelte";
+  import TraceSteering from "./TraceSteering.svelte";
   import {
     activeTraceChips,
     createTracePageTransport,
@@ -59,6 +61,9 @@
   }
 
   const transport = createTracePageTransport();
+  const steeringTransport = createSteeringTransport();
+
+  let steering = $state<SteeringStats | null>(null);
 
   let filters = $state<TraceFilters>({ ...DEFAULT_TRACE_FILTERS });
   let rows = $state<TraceRow[]>([]);
@@ -343,6 +348,20 @@
       );
       if (token !== reloadToken) return;
       mergePolledPage(page);
+    } catch {
+      // The next tick tries again.
+    }
+  }
+
+  /**
+   * The steering counters are process-wide totals, not a per-agent page, so
+   * one poll on the same rhythm keeps them current without a second timer
+   * cadence. A failed read keeps the last good snapshot and stays quiet.
+   */
+  async function pollSteering(): Promise<void> {
+    if (steeringTransport === null || document.visibilityState === "hidden") return;
+    try {
+      steering = await steeringTransport.stats();
     } catch {
       // The next tick tries again.
     }
@@ -805,6 +824,8 @@
     void reload().then(() => openEntrySelection(wanted));
     const pollTimer = setInterval(() => void poll(), POLL_MS);
     const detailTimer = setInterval(() => void pollDetail(), DETAIL_POLL_MS);
+    const steeringTimer = setInterval(() => void pollSteering(), POLL_MS);
+    void pollSteering();
     // The window width says nothing about the room the tab itself has: the
     // panel can hold it narrow inside a wide window, and the other way round.
     const measure = () => {
@@ -817,6 +838,7 @@
     return () => {
       clearInterval(pollTimer);
       clearInterval(detailTimer);
+      clearInterval(steeringTimer);
       observer?.disconnect();
       if (reloadTimer !== null) clearTimeout(reloadTimer);
     };
@@ -1055,6 +1077,7 @@
           style:overflow={insightsHeight === null ? undefined : "auto"}
         >
           <TraceCharts rows={rows} scopeLabel={insightsScopeLabel} plotScale={plotScale} onbucket={applyBucket} />
+          <TraceSteering stats={steering} />
         </div>
         <button
           type="button"

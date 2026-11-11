@@ -138,6 +138,12 @@ pub mod specs_settings;
 /// table and the once-per-run tray notification (plan c5b76b54).
 pub mod window_settings;
 
+/// Freeze reports for Mnemo2's main thread.
+pub mod hang;
+
+/// The main window's remembered size and position.
+pub mod window_geometry;
+
 /// The local endpoint for an external lead (Claude Code over MCP).
 pub mod mcp_server;
 
@@ -153,6 +159,9 @@ pub mod model_settings;
 /// records and memories, one record's Markdown with its backlinks, and the
 /// Diagnostics card (embedder status, per-tier counts, recall test).
 pub mod memory_view;
+
+/// The Memory tab's upkeep: clean up, rebuild search, rebuild index.
+pub mod memory_maintenance;
 
 /// The UI log: every popup and every uncaught frontend error, appended to
 /// `<project>/.coding/logs/mnemo2-ui.jsonl` (or the config dir's `logs/` when no
@@ -354,17 +363,38 @@ fn install_shell(
     app: &tauri::AppHandle,
     started_hidden: bool,
     tray_ok: bool,
+    config_dir: std::path::PathBuf,
 ) -> tauri::Result<()> {
     use tauri::Manager as _;
     use tauri::{PhysicalPosition, PhysicalSize, WebviewBuilder, WebviewUrl, WindowBuilder};
 
+    // The window starts hidden: a remembered geometry, when there is one,
+    // is applied before the shell exists, so restoring never flashes the
+    // default centred 1440x900 first.
     let window = WindowBuilder::new(app, "main")
         .title("Mnemo2")
         .inner_size(1440.0, 900.0)
         .min_inner_size(360.0, 540.0)
         .center()
-        .visible(!started_hidden)
+        .visible(false)
         .build()?;
+    let saved = window_geometry::load(&config_dir);
+    let mut maximize = false;
+    if let Some(saved) = saved {
+        let areas: Vec<window_geometry::WorkArea> = window
+            .available_monitors()
+            .unwrap_or_default()
+            .iter()
+            .map(window_geometry::WorkArea::of)
+            .collect();
+        if let Some(placement) = window_geometry::clamp_restored(&saved, &areas) {
+            // Move first: arriving on a monitor with another scale makes
+            // Windows rescale the window, so it is sized once it is there.
+            let _ = window.set_position(PhysicalPosition::new(placement.x, placement.y));
+            let _ = window.set_size(PhysicalSize::new(placement.width, placement.height));
+            maximize = placement.maximized;
+        }
+    }
     crate::webview_udf::install_default_data_dir(app, std::process::id());
     let shell = window.add_child(
         crate::webview_udf::apply(
@@ -379,41 +409,79 @@ fn install_shell(
     let resize_worker = mnemo::thread_util::spawn_latest_wins(move |size: PhysicalSize<u32>| {
         let _ = resize_sink.set_size(size);
     });
-    let hider = window.clone();
-    let closer = app.clone();
-    window.on_window_event(move |event| match event {
-        tauri::WindowEvent::Resized(size) => resize_worker.submit(*size),
-        tauri::WindowEvent::CloseRequested { api, .. } => {
-            // Closing follows the stored `[window] close` behaviour, read
-            // live from the managed state so an Appearance save applies
-            // without a restart. The default (`auto`) keeps today's rule:
-            // a hidden-start Mnemo2 parks in the tray; a visible one
-            // closes and exits.
-            let live = closer.try_state::<window_settings::WindowBehavior>();
-            let behavior = live
-                .as_ref()
-                .map(|state| state.close_behavior())
-                .unwrap_or_default();
-            match window_settings::close_action(behavior, started_hidden, tray_ok) {
-                window_settings::CloseAction::HideToTray => {
-                    api.prevent_close();
-                    let _ = hider.hide();
-                    // Say where the window went — once per run.
-                    if live.is_some_and(|state| state.take_tray_notice()) {
-                        show_tray_notice(&closer);
-                    }
-                }
-                // Quit goes through the tray-quit path, so running
-                // workers still get their confirmation dialog.
-                window_settings::CloseAction::Quit => {
-                    api.prevent_close();
-                    request_quit(&closer);
-                }
-                window_settings::CloseAction::CloseNormally => {}
+    let geometry_saver = mnemo::thread_util::spawn_latest_wins({
+        let dir = config_dir.clone();
+        move |geometry: window_geometry::SavedGeometry| {
+            if let Err(err) = window_geometry::save(&dir, &geometry) {
+                eprintln!("mnemo2: could not save the window position: {err}");
             }
         }
-        _ => {}
     });
+    let last = std::sync::Arc::new(std::sync::Mutex::new(saved));
+    let geometry_window = window.clone();
+    let hider = window.clone();
+    let closer = app.clone();
+    // The restored geometry was applied before the handler below existed,
+    // so the Resized event it caused reached no one: push the window's
+    // current size through the resize worker once more. The worker is not
+    // Clone, so this has to happen before the handler takes ownership.
+    resize_worker.submit(window.inner_size()?);
+    window.on_window_event(move |event| {
+        // Every move and resize is recorded; the saver coalesces to the
+        // latest geometry.
+        let record = || {
+            let previous = *last.lock().unwrap();
+            if let Some(next) = window_geometry::observe(&geometry_window, previous) {
+                if Some(next) != previous {
+                    *last.lock().unwrap() = Some(next);
+                    geometry_saver.submit(next);
+                }
+            }
+        };
+        match event {
+            tauri::WindowEvent::Resized(size) => {
+                resize_worker.submit(*size);
+                record();
+            }
+            tauri::WindowEvent::Moved(_) => record(),
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                // Closing follows the stored `[window] close` behaviour, read
+                // live from the managed state so an Appearance save applies
+                // without a restart. The default (`auto`) keeps today's rule:
+                // a hidden-start Mnemo2 parks in the tray; a visible one
+                // closes and exits.
+                let live = closer.try_state::<window_settings::WindowBehavior>();
+                let behavior = live
+                    .as_ref()
+                    .map(|state| state.close_behavior())
+                    .unwrap_or_default();
+                match window_settings::close_action(behavior, started_hidden, tray_ok) {
+                    window_settings::CloseAction::HideToTray => {
+                        api.prevent_close();
+                        let _ = hider.hide();
+                        // Say where the window went — once per run.
+                        if live.is_some_and(|state| state.take_tray_notice()) {
+                            show_tray_notice(&closer);
+                        }
+                    }
+                    // Quit goes through the tray-quit path, so running
+                    // workers still get their confirmation dialog.
+                    window_settings::CloseAction::Quit => {
+                        api.prevent_close();
+                        request_quit(&closer);
+                    }
+                    window_settings::CloseAction::CloseNormally => {}
+                }
+            }
+            _ => {}
+        }
+    });
+    if !started_hidden {
+        window.show()?;
+        if maximize {
+            let _ = window.maximize();
+        }
+    }
     Ok(())
 }
 
@@ -552,7 +620,10 @@ pub fn run() {
                 window_settings::load_close_behavior(&config_dir),
             ));
             let started_hidden = starts_hidden(hidden, tray_ok);
-            install_shell(app.handle(), started_hidden, tray_ok)?;
+            install_shell(app.handle(), started_hidden, tray_ok, config_dir.clone())?;
+            // The hang watchdog must own the main thread's id; setup runs on
+            // the main thread.
+            hang::start(app.handle());
             start_endpoint(app.handle());
             Ok(())
         })
@@ -663,6 +734,7 @@ pub fn run() {
             ipc::project_cleanup,
             ipc::workbench_diff,
             ipc::workbench_screenshot,
+            ipc::workbench_tool_image,
             ipc::workbench_preferences,
             ipc::workbench_preferences_set,
             files_view::files_list,
@@ -676,6 +748,7 @@ pub fn run() {
             trace_view::trace_delete_history,
             trace_view::trace_export,
             trace_view::trace_reveal_export,
+            trace_view::trace_steering_stats,
             git_view::git_overview,
             git_view::git_move_main,
             browser::browser_supported,
@@ -697,6 +770,9 @@ pub fn run() {
             memory_view::memory_backlinks,
             memory_view::memory_overview,
             memory_view::memory_recall_test,
+            memory_maintenance::memory_cleanup,
+            memory_maintenance::memory_rebuild_search,
+            memory_maintenance::memory_rebuild_index,
             ui_log::ui_log,
         ])
         .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
@@ -720,6 +796,11 @@ pub fn run() {
                 {
                     return;
                 }
+
+                // The exit is the app working as intended: stop the hang
+                // watchdog before the shutdown begins, so the teardown is
+                // never reported as a freeze.
+                hang::stop();
 
                 let shutdown_app = app.clone();
                 let progress = std::sync::Arc::new(ShutdownProgress::new());

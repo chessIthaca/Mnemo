@@ -2136,6 +2136,103 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Only the default value of an existing setting changes; the settings-dialog spec does not pin the theme default."
+    },
+    {
+      "id": "09d6fe1f",
+      "status": "closed",
+      "created_at_ms": 1794352068657,
+      "closed_at_ms": 1794380782752,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-09d6fe1f-20261111-070622.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "llm-trace",
+          "added": [
+            {
+              "requirement": "Steering notes are counted in the Trace tab",
+              "text": "The Trace tab SHALL show, for the current app run and across the lead and every worker, how often each steering note in a tool result was shown and how often the agent's next call followed it, plus file edits made with file tools versus through the shell.",
+              "scenarios": [
+                {
+                  "name": "Notes were shown",
+                  "when": [
+                    "the agents received steering notes in tool results during this app run",
+                    "the user opens the Trace tab's Insights"
+                  ],
+                  "then": [
+                    "each note kind that was shown appears with how often it was shown and followed",
+                    "the total followed share is shown as a percentage"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "No notes yet",
+                  "when": [
+                    "no steering note fired during this app run",
+                    "the user opens the Trace tab's Insights"
+                  ],
+                  "then": [
+                    "the section says there are no steering notes yet this run"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Settings has an About page",
+              "text": "The Settings dialog SHALL have an About page that shows the running Mnemo2 version, its MIT license, a link to the source code, and the open-source projects Mnemo2 is built on with their licenses.",
+              "scenarios": [
+                {
+                  "name": "Reading the version",
+                  "when": [
+                    "the user opens Settings and picks About"
+                  ],
+                  "then": [
+                    "the page shows the version of the running app"
+                  ],
+                  "and": [
+                    "the page lists the open-source projects with their licenses"
+                  ]
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "a659d5ad",
+      "status": "closed",
+      "created_at_ms": 1794376861458,
+      "closed_at_ms": 1794377338081,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-a659d5ad-20261111-060858.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only change plus a devDependency bump: no component, app behavior or spec'd capability changes."
+    },
+    {
+      "id": "3ce7d708",
+      "status": "closed",
+      "created_at_ms": 1794379949270,
+      "closed_at_ms": 1794380776824,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3ce7d708-20261111-070616.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Lint-only rewrites with identical behaviour: a pattern instead of a guard, an equivalent boolean, a no-op drop removed, and two test-only tidy-ups."
     }
   ]
 }

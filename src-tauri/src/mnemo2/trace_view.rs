@@ -1719,7 +1719,21 @@ pub async fn trace_reveal_export(
     let support = trace_support_of(&lead)?;
     let target = validate_reveal_path(support.logs_dir(), &path)?;
     open_in_file_manager(&target)
-}// ---------------------------------------------------------------------------
+}
+
+/// The steering counters for this app run: how often each note in a tool
+/// result fired and how often the agent's next call followed it, plus file
+/// edits by vehicle. The lead and every worker share one loop factory, so
+/// this covers the whole team.
+#[tauri::command]
+pub async fn trace_steering_stats(
+    state: State<'_, Mnemo2State>,
+) -> Result<mnemo::SteeringStatsSnapshot, String> {
+    let (_lead, engine) = open_trace(&state).await?;
+    Ok(engine.host().factory.steering().snapshot())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2759,5 +2773,29 @@ mod tests {
                 .is_err(),
             "a nonexistent file cannot reveal"
         );
+    }
+
+    /// The Insights steering table reads these exact keys off the wire; a
+    /// rename on either side would silently blank the section.
+    #[test]
+    fn steering_snapshot_wire_shape() {
+        let value = serde_json::to_value(mnemo::SteeringStats::new().snapshot())
+            .expect("a fresh snapshot serializes");
+        for key in ["fired", "switched", "file_tool_mutations", "shell_mutations"] {
+            assert_eq!(value[key], 0, "{key} is a count that starts at zero");
+        }
+        let by_marker = value["by_marker"]
+            .as_array()
+            .expect("by_marker is an array of per-kind counts");
+        assert!(!by_marker.is_empty(), "every marker kind is listed");
+        for entry in by_marker {
+            assert!(
+                entry["marker"].is_string(),
+                "a marker is its stable kebab label"
+            );
+            for key in ["fired", "switched", "gated"] {
+                assert_eq!(entry[key], 0, "{key} is a count that starts at zero");
+            }
+        }
     }
 }

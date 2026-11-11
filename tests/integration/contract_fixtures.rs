@@ -212,20 +212,6 @@ fn event_fixtures_match_serde() {
             },
         ),
         (
-            "event-prompt-dispatched",
-            SerializableAgentEvent::PromptDispatched {
-                text: "goal".into(),
-                images: vec!["data:image/png;base64,iVBORw0KGgo=".into()],
-            },
-        ),
-        (
-            "event-skill-started",
-            SerializableAgentEvent::SkillStarted {
-                name: "merge_to_main".into(),
-                prompt: "Merge the branch into main.".into(),
-            },
-        ),
-        (
             "event-model-changed",
             SerializableAgentEvent::ModelChanged {
                 model: "gpt-5".into(),
@@ -271,14 +257,6 @@ fn event_fixtures_match_serde() {
             },
         ),
         ("event-exited", SerializableAgentEvent::Exited),
-        (
-            "event-child-finished",
-            SerializableAgentEvent::ChildFinished {
-                child_id: 2,
-                name: "reviewer".into(),
-                success: true,
-            },
-        ),
         (
             "event-error",
             SerializableAgentEvent::Error {

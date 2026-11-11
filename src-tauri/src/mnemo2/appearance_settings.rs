@@ -88,8 +88,8 @@ pub struct AppearanceSettingsPatch {
     pub close_behavior: Option<window_settings::CloseBehavior>,
 }
 
-/// The `[ui] theme` words this app writes — the same three Mnemo1's
-/// Appearance section understands (`frontend/src/hooks/appearance.ts`).
+/// The `[ui] theme` words this app writes — the same three Mnemo2's
+/// Appearance page offers (`mnemo2/src/components/AppearancePage.svelte`).
 const THEME_WORDS: [&str; 3] = ["light", "dark", "system"];
 
 /// Normalise a requested palette word. An unknown word is a caller error, not

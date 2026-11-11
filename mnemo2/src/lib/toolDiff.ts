@@ -6,8 +6,8 @@
  * arguments, and a write shows the content it wrote as added lines.
  */
 
-import { fileEditDiff } from "../../../frontend/src/lib/toolCardPaths";
-import { type DiffLine, computeDiff, parseUnifiedDiff } from "../../../frontend/src/lib/diffLines";
+import { fileEditDiff } from "./toolCardPaths";
+import { type DiffLine, computeDiff, parseUnifiedDiff } from "./diffLines";
 import type { LeadToolResult } from "./types";
 
 /** One rendered diff: the file it belongs to (`null` when a result-carried

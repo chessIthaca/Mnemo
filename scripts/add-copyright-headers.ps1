@@ -7,8 +7,7 @@
   Prepends the Mnemo copyright + license header to every source file.
 
 .DESCRIPTION
-  Covers: src/**/*.rs, src-tauri/**/*.rs, tests/**/*.rs,
-  frontend/src/**/*.ts + *.tsx, frontend/*.ts (config files).
+  Covers: src/**/*.rs, src-tauri/**/*.rs, tests/**/*.rs.
   Skips .coding/, target/, node_modules/, dist/ (not scanned) and any file
   whose first 500 chars already contain the copyright marker (idempotent).
 
@@ -44,11 +43,7 @@ $headerLines = @(
 $targets =
     @(Get-ChildItem -Recurse -Filter *.rs  -Path (Join-Path $root 'src')) +
     @(Get-ChildItem -Recurse -Filter *.rs  -Path (Join-Path $root 'src-tauri')) +
-    @(Get-ChildItem -Recurse -Filter *.rs  -Path (Join-Path $root 'tests')) +
-    @(Get-ChildItem -Recurse -Filter *.ts  -Path (Join-Path $root 'frontend\src')) +
-    @(Get-ChildItem -Recurse -Filter *.tsx -Path (Join-Path $root 'frontend\src')) +
-    @(Get-ChildItem -Filter *.ts -Path (Join-Path $root 'frontend')) +
-    @(Get-ChildItem -Filter *.js -Path (Join-Path $root 'frontend'))
+    @(Get-ChildItem -Recurse -Filter *.rs  -Path (Join-Path $root 'tests'))
 
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $bomBytes = [byte[]](0xEF, 0xBB, 0xBF)

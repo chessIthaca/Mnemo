@@ -15,11 +15,10 @@ use mnemo::runtime::channels::{AgentEvent, Approval, SerializableAgentEvent, Ser
 use mnemo::tool::ToolResult;
 
 // We can't import from src-tauri (it's a separate crate), so we re-test the
-// core logic that the IPC adapter relies on: into_serializable + the approval
-// map pattern. The actual PendingApprovals map lives in src-tauri, keyed by
-// (agent_id, tool_call_id) so that cleanup_for_agent drops only the exited
-// agent's approvals — the multi-agent isolation behavior is unit-tested in
-// src-tauri/src/ipc/approval.rs. The channel contract itself is tested here.
+// core logic that the serialized-event channel relies on: into_serializable +
+// the approval map pattern. The PendingApprovals bridge this suite was
+// written against retired with Mnemo1; the channel contract itself is tested
+// here.
 
 #[tokio::test]
 async fn text_delta_serializes() {

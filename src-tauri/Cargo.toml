@@ -1,8 +1,6 @@
 [package]
 name = "mnemo-app"
 version = "2.2.0"
-# Select the desktop app explicitly; it is this package's only binary.
-default-run = "mnemo-app"
 autobins = false
 edition = "2021"
 description = "The Mnemo Tauri app shell"
@@ -53,14 +51,8 @@ toml = "1"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
-# The Mnemo2 host is a separate shell. Gating it keeps its
-# `generate_context!` out of the Mnemo1 main-bin link unit, which would
-# otherwise double-embed `_EMBED_INFO_PLIST` in macOS dev/test builds.
+# Gates the Mnemo2 host (`src/mnemo2`); the `mnemo2-app` package enables it.
 mnemo2 = []
-
-[[bin]]
-name = "mnemo-app"
-path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3"

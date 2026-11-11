@@ -7,18 +7,16 @@
 //!
 //! For every event variant this test constructs one representative sample,
 //! serializes it via `serde_json::to_value`, and asserts EXACT equality
-//! against a committed fixture under `frontend/src/lib/ipc-fixtures/`. If a
+//! against a committed fixture under `tests/fixtures/ipc-contract/`. If a
 //! fixture is missing it is written and the test panics with "newly
 //! generated — review & re-run"; once committed, any Rust-side shape change
 //! (a renamed field, a new `skip_serializing_if`, a changed enum tag) makes
-//! this test fail until the fixture is consciously updated. The frontend's
-//! vitest contract suite imports the same fixtures and feeds them through
-//! the real reducer, so a fixture change is caught on the TS side too — the
-//! two sides cannot silently drift.
+//! this test fail until the fixture is consciously updated. The TypeScript
+//! half of the drift check retired with Mnemo1's frontend; the fixtures
+//! remain the committed record of the wire shapes Mnemo2 consumes.
 //!
 //! Fixtures are read via `env!("CARGO_MANIFEST_DIR")` (the brain crate root =
-//! the repo root), so the same files are the single source of truth for both
-//! the Rust and TS drift checks.
+//! the repo root).
 
 use std::path::PathBuf;
 
@@ -30,14 +28,13 @@ use mnemo::app::workflow::WorkflowState;
 use serde_json::{json, Value};
 
 /// Resolve the absolute path of a fixture under
-/// `frontend/src/lib/ipc-fixtures/` from the brain crate's manifest dir
+/// `tests/fixtures/ipc-contract/` from the brain crate's manifest dir
 /// (the repo root).
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("frontend")
-        .join("src")
-        .join("lib")
-        .join("ipc-fixtures")
+        .join("tests")
+        .join("fixtures")
+        .join("ipc-contract")
         .join(format!("{name}.json"))
 }
 

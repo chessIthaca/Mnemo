@@ -2358,6 +2358,28 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Doc comments only."
+    },
+    {
+      "id": "13336839",
+      "status": "closed",
+      "created_at_ms": 1794412714681,
+      "closed_at_ms": 1794415640805,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-13336839-20261111-164720.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds a lead-composer UI feature and one lead host command; no OpenSpec capability (dispatch-routing, external-lead, tier-ladder, worker-brief, plan-board, settings-dialog, llm-trace) specifies the lead composer or lead conversation lifecycle."
+    },
+    {
+      "id": "00a768bd",
+      "status": "closed",
+      "created_at_ms": 1794412834221,
+      "closed_at_ms": 1794417728270,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-00a768bd-20261111-172208.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Deletes the retired Mnemo1 app. The only governed file touched is src-tauri/src/ipc/finetune.rs (listed under dispatch-routing), whose Laya startup fine-tune no dispatch-routing requirement specifies; Mnemo2's dispatch routing is unchanged."
     }
   ]
 }

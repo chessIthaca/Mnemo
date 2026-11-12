@@ -2435,6 +2435,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "A version bump, refreshed lockfile versions and a changelog section; no specified behavior changes."
+    },
+    {
+      "id": "22002e68",
+      "status": "open",
+      "created_at_ms": 1794493017194,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Build tooling only: restores an npm devDependency and adds a workflow hygiene test; no product behavior changes."
     }
   ]
 }

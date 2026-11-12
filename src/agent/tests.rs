@@ -4224,9 +4224,20 @@ async fn constitution_reread_after_agent_md_edit() {
     assert!(prompts[0].contains("PROJECT-RULE-V1"));
     drop(prompts);
 
-    // Edit the project constitution + bump mtime.
+    // Edit the project constitution and bump its mtime EXPLICITLY.
+    // ConstitutionSource re-reads only when the mtime differs by exact
+    // equality, and a second write in the same file-timestamp tick as the
+    // first keeps the old mtime, so the edit was missed (flaked on Windows
+    // CI, PR #125). Same fix as
+    // project::agent_md::tests::source_rereads_after_mtime_change.
     std::fs::write(&ppath, "PROJECT-RULE-V2-NEW").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    {
+        // Write access is required for set_times on Windows.
+        let f = std::fs::File::options().write(true).open(&ppath).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60));
+        f.set_times(times).unwrap();
+    }
 
     // Turn 2 — the new rule must appear (re-read from disk).
     let mut messages2 = vec![Message::user_text("again")];

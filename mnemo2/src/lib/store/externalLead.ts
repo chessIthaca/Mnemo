@@ -103,8 +103,8 @@ export async function initOpenWorker(): Promise<void> {
   const token = ++openWorkerToken;
   const start = (async () => {
     try {
-      // Like the external-lead listeners: Mnemo1's Browser tab is a Tauri
-      // WebView too, and only the real Mnemo2 host emits this event.
+      // Like the external-lead listeners: a Tauri WebView is not necessarily
+      // this host, and only the real Mnemo2 host emits this event.
       if (!(await probeMnemo2Host())) return;
       const unlisten = await transport.onOpenWorker((request) => {
         if (token === openWorkerToken) handleOpenWorkerRequest(request);

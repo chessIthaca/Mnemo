@@ -16,12 +16,12 @@ export function isTauriRuntime(): boolean {
 /**
  * Whether this page is running inside the **Mnemo2** host specifically.
  *
- * `isTauriRuntime` is not enough: Mnemo1's Browser tab is a Tauri WebView too,
- * so Mnemo2's dev UI viewed there would send its commands to Mnemo1's IPC,
- * which never registered them — Tauri answers `project_pick_folder not
- * allowed by ACL`. Only the real Mnemo2 host answers the handshake, so a
- * rejected handshake means "no native shell" (browser-only mode) rather than
- * a broken native session.
+ * `isTauriRuntime` is not enough: a Tauri WebView is not necessarily this host
+ * — the in-app Browser pane, or another app's window, is one too — and the dev
+ * UI opened there would send its commands to an IPC that never registered
+ * them (`project_pick_folder not allowed by ACL`). Only the real Mnemo2 host
+ * answers the handshake, so a rejected handshake means "no native shell"
+ * (browser-only mode) rather than a broken native session.
  */
 export async function probeMnemo2Host(
   invoker: typeof invoke = invoke,

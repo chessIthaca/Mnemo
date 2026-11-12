@@ -149,7 +149,7 @@ pub struct PlanFile {
     #[serde(skip)]
     pub reviews: Vec<ReviewRoundStamp>,
     /// The plan board's decision log (Mnemo2 Phase 6): the raw `## Decisions`
-    /// body, one dated bullet per decision. `None` for Mnemo1 plans.
+    /// body, one dated bullet per decision. `None` for older plans.
     /// Persisted verbatim; `#[serde(skip)]` keeps it off the frontend wire
     /// shape.
     #[serde(skip)]
@@ -168,7 +168,7 @@ pub struct PlanFile {
     #[serde(skip)]
     pub acceptance: Option<String>,
     /// The plan board's outcome log (Mnemo2 Phase 6): the raw `## Progress`
-    /// body, one bullet per step outcome. `None` for Mnemo1 plans.
+    /// body, one bullet per step outcome. `None` for older plans.
     /// Persisted verbatim; `#[serde(skip)]` keeps it off the frontend wire
     /// shape.
     #[serde(skip)]
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(plan.interfaces.as_deref(), Some("- i1"));
         assert_eq!(plan.progress.as_deref(), Some("- p1"));
 
-        // A Mnemo1 file has neither section.
+        // An older plan file has neither section.
         let old = PlanFile::parse("# Plan: T\n\n## Goal\nG\n\n## Steps\n- [ ] 1. one\n").unwrap();
         assert!(old.decisions.is_none() && old.progress.is_none() && old.interfaces.is_none());
     }

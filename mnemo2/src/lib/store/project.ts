@@ -143,8 +143,9 @@ export async function openProject(projectId: string, allowConflict = false): Pro
 export async function loadProjects(): Promise<void> {
   const transport = createProjectTransport();
   if (!transport) return;
-  // Only the real Mnemo2 host answers the handshake; Mnemo1's Browser tab is
-  // a Tauri WebView too and its IPC never registered these commands.
+  // Only the real Mnemo2 host answers the handshake; another Tauri WebView
+  // (the in-app Browser pane, another app's window) never registered these
+  // commands.
   if (!(await probeMnemo2Host())) return;
   try {
     const records = await transport.list();
@@ -241,9 +242,10 @@ export async function openFolder(): Promise<void> {
     app.update((state) => withToast(state, "Opening a folder needs the native shell.", "error"));
     return;
   }
-  // A Tauri WebView is not necessarily the Mnemo2 host: Mnemo1's Browser tab
-  // has one too, and its IPC never registered this command (Tauri answers
-  // "not allowed by ACL"). Confirm the handshake before invoking anything.
+  // A Tauri WebView is not necessarily the Mnemo2 host: the in-app Browser
+  // pane (or another app's window) is one too, and its IPC never registered
+  // this command (Tauri answers "not allowed by ACL"). Confirm the handshake
+  // before invoking anything.
   if (!(await probeMnemo2Host())) {
     app.update((state) => withToast(state, "Opening a folder needs the native shell.", "error"));
     return;

@@ -6,13 +6,11 @@
 //! the backend of its **Laya** page (plan e02de747, design
 //! `.coding/design/mnemo2-laya.md` §4).
 //!
-//! Mnemo2 shares Mnemo1's config dir, so every value here edits the same
-//! `config.toml` the lead's engine reads, through the same kernel seams
-//! Mnemo1 rides:
+//! Mnemo2 edits the shared config dir's `config.toml` — the same file
+//! the lead's engine reads — through the kernel's own settings seams:
 //!
 //! - [`laya_status`] — the page's snapshot: the master `enabled` toggle,
-//!   `installed`, a coarse `status` word, the seven opt-in flags and the
-//!   `[general.routing]` block.
+//!   `installed`, a coarse `status` word and the four opt-in flags.
 //! - [`laya_setup`] — enable + install through the kernel's own
 //!   `Setup::classifier_setup(true)` leg: persist + live-apply + the
 //!   managed download pipeline (uv + venv + `laya[serve]` + the English
@@ -24,8 +22,8 @@
 //! - [`laya_disable`] — the kernel's own disable leg (persist `enabled =
 //!   false`, live-apply, clear the lead's slot, park `Disabled`), then
 //!   stop every manager that may hold a `laya-serve` child.
-//! - [`save_laya_settings`] — the seven opt-in flags + `[general.routing]`
-//!   through the sanctioned `Setup::patch_settings` pipeline (the same
+//! - [`save_laya_settings`] — the four opt-in flags through the
+//!   sanctioned `Setup::patch_settings` pipeline (the same
 //!   one the Models/Savings pages ride). The master `enabled` flag never
 //!   rides this patch: the kernel rejects the DTO field whole, and the
 //!   page routes it through `laya_setup`/`laya_disable`, which own the
@@ -33,8 +31,8 @@
 //! - [`save_tiers_top_control`] — the Settings > Tiers top control: the
 //!   one choice (off/shadow/suggest/auto) writes `[routing]` through
 //!   [`update_routing_settings`] (the single-writer load-modify-save the
-//!   automatic Laya check's gate application shares), then Mnemo1's two
-//!   halves through the same patch pipeline; a choice other than `off`
+//!   automatic Laya check's gate application shares) and touches nothing
+//!   else in `config.toml`; a choice other than `off`
 //!   starts the check ([`crate::mnemo2::laya_check`]) — the eval's old
 //!   Run/Apply buttons are retired with it.
 //!
@@ -46,8 +44,8 @@
 //! `LeadRuntime::laya_manager()` for the session. A settings-side setup
 //! runs on the per-call `Setup`'s own manager (every `Setup` builds a
 //! fresh one), so this module holds exactly that `Arc` —
-//! [`HELD_SETUP_MANAGER`], the same role Mnemo1's `IpcState` manager
-//! plays — and every path that must touch a running sidecar reuses the
+//! [`HELD_SETUP_MANAGER`], the settings-side counterpart of the
+//! runtime's `laya_manager()` hold — and every path that must touch a running sidecar reuses the
 //! held instances. Nothing here ever builds a second manager.
 //!
 //! The hold never outlives its consumer either (review finding
@@ -68,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use mnemo::config::general::LayaConfig;
-use mnemo::config::settings_dto::{RoutingConfigDto, SettingsSaveDto};
+use mnemo::config::settings_dto::SettingsSaveDto;
 use mnemo::config::Config;
 use mnemo::headless::{EventReceiver, RecvError, Setup, SetupEvent};
 use mnemo::laya::{LayaManager, english_checkpoint};
@@ -115,7 +113,7 @@ static SETUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 // ── Wire shapes ─────────────────────────────────────────────────────────────
 
-/// The six `[general.laya]` opt-in flags as the Laya page shows them.
+/// The four `[general.laya]` opt-in flags as the Laya page shows them.
 /// The master `enabled` flag rides the status object itself — its only
 /// sanctioned change paths are `laya_setup`/`laya_disable`.
 #[derive(Debug, Clone, Serialize)]
@@ -129,27 +127,6 @@ pub struct LayaFlagsWire {
     pub failure_triage_knn: bool,
     /// Tool-choice steering on the compound reflex.
     pub steer_tool_choice: bool,
-    /// Pre-prompt model routing (shadow-first master for the routing
-    /// lanes).
-    pub routing: bool,
-    /// The compound reflex (the lane ladder's top opt-in).
-    pub reflex: bool,
-}
-
-/// The `[general.routing]` block of the `laya_status` snapshot: Mnemo1's
-/// first-prompt gate, the step-lane threshold and the enforce gate. The
-/// per-tier models no longer live here — the unified ladder (`Settings >
-/// Tiers`) owns them.
-#[derive(Debug, Clone, Serialize)]
-pub struct RoutingWire {
-    /// The confidence gate: a first-prompt or step-lane decision routes
-    /// only at `confidence >= threshold`.
-    pub threshold: f64,
-    /// The first-prompt gate (`None` = the kernel default).
-    pub first_prompt_min_confidence: Option<f64>,
-    /// Whether a confident decision actually switches the turn's model
-    /// (`false` = shadow).
-    pub enforce: bool,
 }
 
 /// The `laya_status` snapshot — everything the Laya page renders.
@@ -163,13 +140,11 @@ pub struct LayaStatusWire {
     /// The coarse runtime state: `"disabled"`, `"not_installed"`,
     /// `"installing"`, `"starting"`, `"ready"` or `"failed"`.
     pub status: &'static str,
-    /// The six opt-in flags.
+    /// The four opt-in flags.
     pub flags: LayaFlagsWire,
-    /// The routing lanes.
-    pub routing: RoutingWire,
 }
 
-/// The `flags` payload of `save_laya_settings` — the six opt-in flags,
+/// The `flags` payload of `save_laya_settings` — the four opt-in flags,
 /// each absent = keep. The master `enabled` key is a struct field only so
 /// a caller that sends it is REJECTED with a clear message instead of
 /// having it silently dropped: it never rides the settings patch (the
@@ -189,11 +164,6 @@ pub struct LayaFlagsPatch {
     pub failure_triage_knn: Option<bool>,
     /// Tool-choice steering. Absent = keep.
     pub steer_tool_choice: Option<bool>,
-    /// Pre-prompt model routing (the master flag for the lanes). Absent =
-    /// keep.
-    pub routing: Option<bool>,
-    /// The compound reflex. Absent = keep.
-    pub reflex: Option<bool>,
 }
 
 // ── Cores (the Tauri-free hearts the tests exercise) ────────────────────────
@@ -208,7 +178,6 @@ pub struct LayaFlagsPatch {
 pub(crate) fn laya_status_read(setup: &Setup, in_flight: bool) -> Result<LayaStatusWire, String> {
     let config = Config::load(setup.config_dir()).map_err(|err| err.to_string())?;
     let laya = &config.general.general.laya;
-    let routing = &config.general.general.routing;
     let manager = setup.laya_manager();
     let installed = manager.is_checkpoint_installed(english_checkpoint().id);
     let live = manager
@@ -225,13 +194,6 @@ pub(crate) fn laya_status_read(setup: &Setup, in_flight: bool) -> Result<LayaSta
             failure_triage: laya.failure_triage,
             failure_triage_knn: laya.failure_triage_knn,
             steer_tool_choice: laya.steer_tool_choice,
-            routing: laya.routing,
-            reflex: laya.reflex,
-        },
-        routing: RoutingWire {
-            threshold: routing.threshold,
-            first_prompt_min_confidence: routing.first_prompt_min_confidence,
-            enforce: routing.enforce,
         },
     })
 }
@@ -327,15 +289,14 @@ pub(crate) async fn laya_disable_core(
     Ok(())
 }
 
-/// The `save_laya_settings` core: the seven opt-in flags + the
-/// `[general.routing]` block through the sanctioned patch pipeline. A
-/// present `enabled` key is rejected with the message that routes it to
-/// `laya_setup`/`laya_disable` — the kernel would reject the DTO field
-/// whole, but this message names the right commands.
+/// The `save_laya_settings` core: the four opt-in flags through the
+/// sanctioned patch pipeline. A present `enabled` key is rejected with
+/// the message that routes it to `laya_setup`/`laya_disable` — the
+/// kernel would reject the DTO field whole, but this message names the
+/// right commands.
 pub(crate) async fn save_laya_settings_core(
     setup: &Setup,
     flags: Option<LayaFlagsPatch>,
-    routing: Option<RoutingConfigDto>,
 ) -> Result<(), String> {
     let flags = flags.unwrap_or_default();
     if flags.enabled.is_some() {
@@ -351,9 +312,6 @@ pub(crate) async fn save_laya_settings_core(
         laya_steer_tool_choice: flags.steer_tool_choice,
         laya_failure_triage: flags.failure_triage,
         laya_failure_triage_knn: flags.failure_triage_knn,
-        laya_routing: flags.routing,
-        laya_reflex: flags.reflex,
-        routing,
         ..SettingsSaveDto::default()
     };
     setup.patch_settings(patch).await.map_err(|err| err.to_string())
@@ -547,19 +505,17 @@ pub async fn laya_disable(state: State<'_, Mnemo2State>) -> Result<(), String> {
     laya_disable_core(&setup, &managers, &SETUP_IN_FLIGHT).await
 }
 
-/// Save the seven opt-in flags and/or the `[general.routing]` block
-/// through the sanctioned settings patch (the same pipeline the Models
-/// and Savings pages ride, including the live rewire on an open lead).
-/// The master `enabled` flag never rides this patch — send it through
-/// `laya_setup`/`laya_disable`.
+/// Save the four opt-in flags through the sanctioned settings patch (the
+/// same pipeline the Models and Savings pages ride, including the live
+/// rewire on an open lead). The master `enabled` flag never rides this
+/// patch — send it through `laya_setup`/`laya_disable`.
 #[tauri::command]
 pub async fn save_laya_settings(
     state: State<'_, Mnemo2State>,
     flags: Option<LayaFlagsPatch>,
-    routing: Option<RoutingConfigDto>,
 ) -> Result<(), String> {
     let (setup, runtime) = settings_setup(&state).await?;
-    save_laya_settings_core(&setup, flags, routing).await?;
+    save_laya_settings_core(&setup, flags).await?;
     settings_refresh(runtime).await
 }
 
@@ -572,8 +528,6 @@ pub struct TiersTopControlWire {
     /// The saved choice — the key of [`tiers_top_control_writes`]:
     /// `off`, `shadow`, `suggest` or `auto`.
     pub choice: String,
-    /// Mnemo1's `[general.laya] routing` half of the choice.
-    pub laya_routing: bool,
     /// Laya's coarse readiness word: `not_installed`, `disabled`,
     /// `installing`, `starting`, `ready` or `failed`.
     pub laya_status: &'static str,
@@ -586,34 +540,29 @@ pub struct TiersTopControlWire {
     pub knn_min_rows: usize,
 }
 
-/// The choice's exact writes (design §7.1): the mnemo2.toml `[routing]`
-/// mode and the `[general.laya] routing` master flag. Mnemo1's
-/// `[general.routing] enforce` gate is not one of them — it belongs to
-/// Mnemo1's own settings. Pure, so the tests can pin every
-/// row of the table and the command stays a thin caller.
-pub fn tiers_top_control_writes(
-    choice: &str,
-) -> Result<(dispatch_routing::RoutingMode, bool), String> {
+/// The choice's exact write (design §7.1): the mnemo2.toml `[routing]`
+/// mode, and nothing else — the kernel's `[general.laya]` and
+/// `[general.routing]` config stays exactly as it is. Pure, so the tests
+/// can pin every row of the table and the command stays a thin caller.
+pub fn tiers_top_control_writes(choice: &str) -> Result<dispatch_routing::RoutingMode, String> {
     match choice {
-        "off" => Ok((dispatch_routing::RoutingMode::Off, false)),
-        "shadow" => Ok((dispatch_routing::RoutingMode::Shadow, true)),
-        "suggest" => Ok((dispatch_routing::RoutingMode::Suggest, true)),
-        "auto" => Ok((dispatch_routing::RoutingMode::Auto, true)),
+        "off" => Ok(dispatch_routing::RoutingMode::Off),
+        "shadow" => Ok(dispatch_routing::RoutingMode::Shadow),
+        "suggest" => Ok(dispatch_routing::RoutingMode::Suggest),
+        "auto" => Ok(dispatch_routing::RoutingMode::Auto),
         other => Err(format!(
             "unknown tier choice `{other}` — pick one of: off, shadow, suggest, auto"
         )),
     }
 }
 
-/// Assemble the control's wire: the saved choice, Mnemo1's `laya` routing
-/// flag and Laya's readiness, read from the same files the save path
-/// writes.
+/// Assemble the control's wire: the saved choice and Laya's readiness,
+/// read from the same file the save path writes.
 async fn tiers_top_control_read(
     setup: &Setup,
     runtime: Option<Arc<LeadRuntime>>,
 ) -> Result<TiersTopControlWire, String> {
     let routing = dispatch_routing::load_routing_settings(setup.config_dir());
-    let config = Config::load(setup.config_dir()).map_err(|err| err.to_string())?;
     let in_flight = SETUP_IN_FLIGHT.load(Ordering::SeqCst);
     let status = laya_status_read(setup, in_flight)?;
     let team = match runtime.as_ref() {
@@ -626,7 +575,6 @@ async fn tiers_top_control_read(
     };
     Ok(TiersTopControlWire {
         choice: mode_key(routing.mode).to_string(),
-        laya_routing: config.general.general.laya.routing,
         laya_status: status.status,
         checkpoint: status.installed.then(|| english_checkpoint().name.to_string()),
         knn_rows,
@@ -645,12 +593,11 @@ pub async fn tiers_top_control_status(
 }
 
 /// Save the top control's choice in one call (design §7.1): the mnemo2.toml
-/// `[routing]` mode and the `[general.laya]` routing master flag, through
-/// the sanctioned write paths, then reload the open team and the engine's
-/// config. Mnemo1's `enforce` gate is not written — it stays under Mnemo1's
-/// own settings. A choice other than `off` also starts the Laya check
-/// (plan 8106337a) — an error there never fails the save.
-/// Returns the fresh wire.
+/// `[routing]` mode, through the sanctioned write path, then reload the
+/// open team and the engine's config. The kernel's `[general.laya]` and
+/// `[general.routing]` config is not written. A choice other than `off`
+/// also starts the Laya check (plan 8106337a) — an error there never
+/// fails the save. Returns the fresh wire.
 #[tauri::command]
 pub async fn save_tiers_top_control(
     state: State<'_, Mnemo2State>,
@@ -661,7 +608,7 @@ pub async fn save_tiers_top_control(
         Some(runtime) => runtime.team_handle().await.ok(),
         None => None,
     };
-    save_tiers_top_control_core(&setup, &choice, team.as_deref()).await?;
+    save_tiers_top_control_core(&setup, &choice, team.as_deref())?;
     settings_refresh(runtime.clone()).await?;
     // A choice other than `off` is one of the check's triggers (plan
     // 8106337a): the check runs unless Laya is down or the fingerprint
@@ -676,28 +623,18 @@ pub async fn save_tiers_top_control(
     tiers_top_control_read(&setup, runtime).await
 }
 
-/// The `save_tiers_top_control` core — the two writes without the Tauri
-/// state, so the tests can pin them against a temp config dir: the
-/// mnemo2.toml mode (plus a live team's reload, when one is handed in),
-/// then the `laya` routing master flag through the sanctioned settings
-/// patch (which holds the OS config lock). Mnemo1's `[general.routing]`
-/// block is not written — `enforce` stays under Mnemo1's own settings.
-pub(crate) async fn save_tiers_top_control_core(
+/// The `save_tiers_top_control` core — the one write without the Tauri
+/// state, so the tests can pin it against a temp config dir: the
+/// mnemo2.toml mode (plus a live team's reload, when one is handed in).
+/// The kernel's `[general.laya]` and `[general.routing]` config is not
+/// written.
+pub(crate) fn save_tiers_top_control_core(
     setup: &Setup,
     choice: &str,
     team: Option<&TeamRuntime>,
 ) -> Result<(), String> {
-    let (mode, laya_routing) = tiers_top_control_writes(choice)?;
-    update_routing_settings(setup.config_dir(), team, |settings| settings.mode = mode)?;
-    save_laya_settings_core(
-        setup,
-        Some(LayaFlagsPatch {
-            routing: Some(laya_routing),
-            ..LayaFlagsPatch::default()
-        }),
-        None,
-    )
-    .await
+    let mode = tiers_top_control_writes(choice)?;
+    update_routing_settings(setup.config_dir(), team, |settings| settings.mode = mode)
 }
 
 // Mnemo2 dispatch routing (plan 2ba2168a, design §4.9/§4.10)
@@ -956,10 +893,10 @@ mod tests {
     use crate::mnemo2::runtime::LeadRuntimeOptions;
 
     /// A temp config dir with a rich fixture: a `config.toml` whose
-    /// Laya-owned sections (`[general.laya]`, `[general.routing]`) sit
-    /// beside ones no Laya save touches, and an `endpoints.toml` with an
-    /// endpoint, a pricing row and tiers. Returns the TempDir (kept
-    /// alive) and a `Setup` on it.
+    /// `[general.laya]` section sits beside ones no Laya save touches —
+    /// the kernel's `[general.routing]` block included — and an
+    /// `endpoints.toml` with an endpoint, a pricing row and tiers.
+    /// Returns the TempDir (kept alive) and a `Setup` on it.
     fn fixture() -> (tempfile::TempDir, Setup) {
         let dir = tempfile::tempdir().expect("config dir");
         std::fs::write(
@@ -1036,18 +973,11 @@ simple = ["ep1/exec-model"]
         assert!(wire.enabled);
         assert!(!wire.installed, "no checkpoint in the fixture");
         assert_eq!(wire.status, "not_installed");
-        // The six flags round out of the config.
+        // The four flags round out of the config.
         assert!(wire.flags.auto_type_memories);
         assert!(!wire.flags.failure_triage);
         assert!(!wire.flags.failure_triage_knn);
         assert!(!wire.flags.steer_tool_choice);
-        assert!(!wire.flags.routing);
-        assert!(!wire.flags.reflex);
-        // The routing block: Mnemo1's gates only — the models live on the
-        // unified ladder, not in the status wire.
-        assert!((wire.routing.threshold - 0.75).abs() < 1e-9);
-        assert_eq!(wire.routing.first_prompt_min_confidence, None);
-        assert!(wire.routing.enforce);
 
         // Installed + the fresh Disabled Arc a lead-less Setup reads: the
         // master flag is on with nothing running — "disabled", never a
@@ -1130,85 +1060,58 @@ simple = ["ep1/exec-model"]
     }
 
     #[tokio::test]
-    async fn the_top_control_writes_the_mode_and_the_routing_flag() {
-        let (dir, setup) = fixture();
-        for (choice, mode, laya_routing) in [
-            ("off", dispatch_routing::RoutingMode::Off, false),
-            ("shadow", dispatch_routing::RoutingMode::Shadow, true),
-            ("suggest", dispatch_routing::RoutingMode::Suggest, true),
-            ("auto", dispatch_routing::RoutingMode::Auto, true),
-        ] {
-            save_tiers_top_control_core(&setup, choice, None)
-                .await
-                .expect("save choice");
-            let settings = dispatch_routing::load_routing_settings(dir.path());
-            assert_eq!(settings.mode, mode, "{choice}: the mnemo2.toml mode");
-            let config = Config::load(dir.path()).expect("reload");
-            assert_eq!(
-                config.general.general.laya.routing,
-                laya_routing,
-                "{choice}: the laya routing master flag"
-            );
-            // The read derives the same choice back, with its Mnemo1
-            // routing flag for the mismatch warning.
-            let wire = tiers_top_control_read(&setup, None)
-                .await
-                .expect("read");
-            assert_eq!(wire.choice, choice);
-            assert_eq!(wire.laya_routing, laya_routing);
+    async fn the_top_control_writes_only_the_dispatch_mode() {
+        for seed in [true, false] {
+            let (dir, setup) = fixture();
+            // Seed the two kernel routing switches a hand-edited
+            // config.toml may hold — the per-turn `routing` master flag
+            // and the `[general.routing]` enforce gate. No Laya save
+            // writes either: every choice must leave both exactly as
+            // they were (regression: the choice save once flipped the
+            // routing master flag with it).
+            std::fs::write(
+                dir.path().join("config.toml"),
+                std::fs::read_to_string(dir.path().join("config.toml"))
+                    .expect("read fixture config")
+                    .replace(
+                        "auto_type_memories = true",
+                        &format!("auto_type_memories = true\nrouting = {seed}"),
+                    )
+                    .replace("enforce = true", &format!("enforce = {seed}")),
+            )
+            .expect("write config.toml");
+
+            for (choice, mode) in [
+                ("off", dispatch_routing::RoutingMode::Off),
+                ("shadow", dispatch_routing::RoutingMode::Shadow),
+                ("suggest", dispatch_routing::RoutingMode::Suggest),
+                ("auto", dispatch_routing::RoutingMode::Auto),
+            ] {
+                save_tiers_top_control_core(&setup, choice, None).expect("save choice");
+                let settings = dispatch_routing::load_routing_settings(dir.path());
+                assert_eq!(settings.mode, mode, "{choice}: the mnemo2.toml mode");
+
+                let config = Config::load(dir.path()).expect("reload");
+                assert_eq!(
+                    config.general.general.laya.routing, seed,
+                    "{choice}: the per-turn routing master flag keeps its value"
+                );
+                assert_eq!(
+                    config.general.general.routing.enforce, seed,
+                    "{choice}: the enforce gate keeps its value"
+                );
+                // The read derives the same choice back from the mode.
+                let wire = tiers_top_control_read(&setup, None)
+                    .await
+                    .expect("read");
+                assert_eq!(wire.choice, choice);
+            }
         }
     }
 
-    #[tokio::test]
-    async fn auto_on_the_top_control_leaves_mnemo1_enforce_alone() {
-        let (dir, setup) = fixture();
-        // The fixture stores enforce = true; park it off through the
-        // sanctioned patch, as Mnemo1's own Classifier settings would.
-        save_laya_settings_core(
-            &setup,
-            None,
-            Some(RoutingConfigDto {
-                enforce: Some(false),
-                ..RoutingConfigDto::default()
-            }),
-        )
-        .await
-        .expect("enforce off");
-        // Picking Auto must not reach Mnemo1's gate: the bug turned it on.
-        save_tiers_top_control_core(&setup, "auto", None)
-            .await
-            .expect("save auto");
-        let config = Config::load(dir.path()).expect("reload");
-        assert!(
-            !config.general.general.routing.enforce,
-            "auto left Mnemo1's enforce gate off"
-        );
-        // The other direction: once enforcement is on, no choice turns it
-        // off.
-        save_laya_settings_core(
-            &setup,
-            None,
-            Some(RoutingConfigDto {
-                enforce: Some(true),
-                ..RoutingConfigDto::default()
-            }),
-        )
-        .await
-        .expect("enforce on");
-        for choice in ["auto", "shadow", "suggest", "off"] {
-            save_tiers_top_control_core(&setup, choice, None)
-                .await
-                .expect("save choice");
-            let config = Config::load(dir.path()).expect("reload");
-            assert!(
-                config.general.general.routing.enforce,
-                "{choice}: the choice leaves Mnemo1's enforce gate alone"
-            );
-        }
-    }
 
     #[tokio::test]
-    async fn save_rejects_enabled_and_round_trips_flags_and_routing() {
+    async fn save_rejects_enabled_and_round_trips_flags() {
         let (dir, setup) = fixture();
         // The master flag never rides the save — and the rejection changes
         // nothing on disk.
@@ -1218,7 +1121,6 @@ simple = ["ep1/exec-model"]
                 enabled: Some(true),
                 ..Default::default()
             }),
-            None,
         )
         .await
         .expect_err("enabled is rejected");
@@ -1226,22 +1128,15 @@ simple = ["ep1/exec-model"]
         let config = Config::load(dir.path()).expect("reload");
         assert!(config.general.general.laya.enabled, "the rejection wrote nothing");
 
-        // All six flags + the routing block through the sanctioned patch.
+        // All four flags through the sanctioned patch.
         let flags = LayaFlagsPatch {
             enabled: None,
             auto_type_memories: Some(false),
             failure_triage: Some(true),
             failure_triage_knn: Some(true),
             steer_tool_choice: Some(true),
-            routing: Some(true),
-            reflex: Some(true),
         };
-        let routing = RoutingConfigDto {
-            threshold: Some(0.9),
-            first_prompt_min_confidence: Some(Some(0.55)),
-            enforce: Some(false),
-        };
-        save_laya_settings_core(&setup, Some(flags), Some(routing))
+        save_laya_settings_core(&setup, Some(flags))
             .await
             .expect("save");
 
@@ -1252,10 +1147,14 @@ simple = ["ep1/exec-model"]
         assert!(laya.failure_triage);
         assert!(laya.failure_triage_knn);
         assert!(laya.steer_tool_choice);
-        assert!(laya.routing);
-        assert!(laya.reflex);
+        assert!(!laya.routing, "the kernel's routing switch stays off");
+        assert!(!laya.reflex, "the kernel's reflex switch stays off");
+        // The `[general.routing]` block survives the save untouched —
+        // the patch no longer carries it.
         let routing = &config.general.general.routing;
-        assert_eq!(routing.first_prompt_min_confidence, Some(0.55));
+        assert!((routing.threshold - 0.75).abs() < 1e-9);
+        assert_eq!(routing.first_prompt_min_confidence, None);
+        assert!(routing.enforce);
         assert_eq!(
             config.tiers.get("trivial").unwrap().models,
             vec!["ep1/exec-model", "ep1/tiny"]
@@ -1265,19 +1164,18 @@ simple = ["ep1/exec-model"]
             config.tiers.get("high").unwrap().models,
             vec!["ep1/plan-model", "ep1/big", "ep1/top"]
         );
-        assert!((routing.threshold - 0.9).abs() < 1e-9);
-        assert!(!routing.enforce);
-
-        // Keep semantics: a flags-only save leaves the routing block alone.
+        // Keep semantics: absent flags keep their stored values.
         let flags = LayaFlagsPatch {
-            reflex: Some(false),
+            steer_tool_choice: Some(false),
             ..Default::default()
         };
-        save_laya_settings_core(&setup, Some(flags), None)
+        save_laya_settings_core(&setup, Some(flags))
             .await
             .expect("keep");
         let config = Config::load(dir.path()).expect("reload");
-        assert!(!config.general.general.laya.reflex);
+        assert!(!config.general.general.laya.steer_tool_choice, "the one named flag flips");
+        assert!(!config.general.general.laya.routing, "the kernel's routing switch stays off");
+        assert!(!config.general.general.laya.reflex, "the kernel's reflex switch stays off");
         assert_eq!(
             config.tiers.get("trivial").unwrap().models,
             vec!["ep1/exec-model", "ep1/tiny"]

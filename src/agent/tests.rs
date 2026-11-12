@@ -5162,7 +5162,7 @@ async fn pinned_task_survives_compaction_after_the_head_is_installed() {
 async fn blank_pinned_task_leaves_the_head_unchanged() {
     // A whitespace-only pinned task is None (stored as unset), and with
     // no pinned task the head bytes are exactly as before — the pinned
-    // block must not appear (Mnemo1 unchanged, prefix-cache stable).
+    // block must not appear (identical head bytes, prefix-cache stable).
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),
@@ -17232,8 +17232,8 @@ async fn skip_turn_routing_writes_no_routing_rows() {
 
 #[tokio::test]
 async fn turn_routing_still_runs_by_default() {
-    // The Mnemo1 regression pin (plan 2ba2168a step 1): without the skip
-    // stamp the per-turn gate behaves exactly as before — one
+    // The per-turn-gate regression pin (plan 2ba2168a step 1): without the
+    // skip stamp the per-turn gate behaves exactly as before — one
     // classification, one decision row.
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("routing.jsonl");
@@ -18371,7 +18371,7 @@ async fn skip_turn_routing_session_model_change_writes_no_session_row() {
     ));
     assert!(
         !session_log_path(&log_path).exists(),
-        "a skip-turn-routing session writes no Mnemo1 session rows"
+        "a skip-turn-routing session writes no per-turn routing session rows"
     );
 }
 
@@ -18411,7 +18411,7 @@ async fn subagent_model_change_writes_no_session_row() {
     ));
     assert!(
         !session_log_path(&log_path).exists(),
-        "a subagent writes no Mnemo1 session rows"
+        "a subagent writes no per-turn routing session rows"
     );
 }
 
@@ -20441,6 +20441,74 @@ async fn lane_reflex_flag_off_never_asks_the_classifier() {
     assert!(
         decisions.iter().all(|row| row.lane.is_none()),
         "no lane rows without the opt-in"
+    );
+}
+
+#[tokio::test]
+async fn lane_skip_turn_routing_never_asks_the_classifier() {
+    // The acceptance path is fully armed (reflex on, a live routing policy,
+    // enforce, an active plan step) but the session routes once at dispatch
+    // (`skip_turn_routing`, set by Mnemo2 for its lead and workers): it
+    // enters neither the per-turn router nor the per-step lane — the
+    // classifier call counter stays at zero, no corpus row is written, no
+    // lane decision lands in the log, and the iteration's model is
+    // untouched.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(routing_policy_with_threshold(0.80, true)),
+        medium: Some(stub_model_ref("medium-model")),
+        high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+    agent.set_skip_turn_routing(true);
+
+    let (outcome, mut fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(
+        outcome.text, "from-default",
+        "the lane must not switch a session that routes once at dispatch"
+    );
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "skip_turn_routing = zero classifier calls"
+    );
+    assert!(!reflex_log.exists(), "no corpus without a lane entry");
+    let (decisions, _) = read_routing_log(&routing_log);
+    assert!(
+        decisions.iter().all(|row| row.lane.is_none()),
+        "no lane rows for a session that routes once at dispatch"
+    );
+    let events = take_model_changed(&mut fanin_rx);
+    assert!(
+        events.iter().all(|(model, _)| model != "medium-model"),
+        "the lane model must never be announced: {events:?}"
     );
 }
 

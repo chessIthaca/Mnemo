@@ -80,7 +80,7 @@ pub struct ModelSettingsWire {
 /// model — as a compact `"endpoint/model"` string or `null` (no override:
 /// the agent's own model applies).
 ///
-/// Mnemo1's per-task slots (`planning`, `executing`, `bug_fixing`,
+/// The per-task model slots (`planning`, `executing`, `bug_fixing`,
 /// `reviewing`) and the other slots outside this page (`complete`, `free`,
 /// `subagent`, per-skill) are neither read nor written here and survive
 /// every save. A slot carrying a `reasoning_effort` override keeps it when
@@ -345,7 +345,7 @@ fn slot_dto(
 
 /// The `"models"` section: `{summarize?}`, each `"endpoint/model"` (set),
 /// `null` (clear) or absent (keep). Every other `[models.*]` key —
-/// Mnemo1's per-task slots, `complete`, `free`, `subagent`, per-skill —
+/// the per-task model slots, `complete`, `free`, `subagent`, per-skill —
 /// is untouched.
 async fn apply_models(setup: &Setup, value: Value) -> Result<(), String> {
     let patch: TaskModelsPatch = serde_json::from_value(value)
@@ -543,7 +543,8 @@ fn spawn_embedder_forwarder(app: AppHandle, mut events: EventReceiver<SetupEvent
 // shared pipeline rewrites config.toml fully from the schema, so
 // surviving keys prove only the named section was patched. Comments
 // and unknown keys are dropped by that same documented design (the
-// schema is the source of truth — identical to Mnemo1's save_settings).
+// schema is the source of truth — the same drop the sanctioned
+// settings patch applies).
 
 #[cfg(test)]
 mod tests {
@@ -654,7 +655,7 @@ simple = ["ep1/exec-model"]
     }
 
     /// The `[models.*]` keys a compaction save must leave exactly as the
-    /// fixture set them — Mnemo1's per-task slots, the complete/free/subagent
+    /// fixture set them — the per-task model slots, the complete/free/subagent
     /// slots and the per-skill table.
     const UNTOUCHED_MODEL_SLOTS: [&str; 8] = [
         "bug_fixing = ep1/plan-model",
@@ -727,7 +728,7 @@ simple = ["ep1/exec-model"]
         // The one slot the page owns takes the save...
         let wire = model_settings_read(&setup).expect("read");
         assert_eq!(wire.task_models.summarize.as_deref(), Some("ep1/other-model"));
-        // ...and every other [models.*] key — Mnemo1's per-task slots, the
+        // ...and every other [models.*] key — the per-task model slots, the
         // complete/free/subagent slots and the per-skill table — is untouched.
         let config = Config::load(dir.path()).expect("reload");
         let mut expected: Vec<String> = UNTOUCHED_MODEL_SLOTS.iter().map(|s| s.to_string()).collect();
@@ -736,7 +737,7 @@ simple = ["ep1/exec-model"]
         assert_eq!(
             config.general.models.planning.as_ref().unwrap().reasoning_effort.as_deref(),
             Some("high"),
-            "Mnemo1's planning slot keeps its reasoning effort"
+            "the per-task planning slot keeps its reasoning effort"
         );
         // Unrelated schema keys survive the rewrite.
         assert_eq!(config.general.general.safety, SafetyMode::AutoApproveProject);
@@ -759,8 +760,8 @@ simple = ["ep1/exec-model"]
         let expected: Vec<String> = UNTOUCHED_MODEL_SLOTS.iter().map(|s| s.to_string()).collect();
         assert_eq!(model_slots(&Config::load(dir.path()).expect("reload")), expected);
 
-        // A stale client still sending the old five-slot shape — the Mnemo1
-        // slots as nulls — must not clear them either: those fields are gone
+        // A stale client still sending the old five-slot shape — the
+        // per-task slots as nulls — must not clear them either: those fields are gone
         // from the patch, so the shared pipeline never sees them. Before this
         // page owned only `summarize`, these nulls cleared the slots (the red
         // case this test pins).

@@ -149,7 +149,7 @@ export function writeDiffSections(toolName: string, args: string): ToolDiffSecti
   const path = pathArg(record.path) ?? pathArg(record.file);
   if (path === null || typeof record.content !== "string") return null;
   const appended = toolName === "file_append" || record.mode === "append";
-  // An empty write is one empty added line, exactly like Mnemo1's NewFileView.
+  // An empty write is one empty added line.
   const lines = (record.content.length === 0 ? [""] : record.content.split("\n")).map(
     (text): DiffLine => ({ type: "add", text }),
   );

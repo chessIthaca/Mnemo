@@ -262,9 +262,9 @@ pub struct BacklogItem {
     /// manual in-app handling or later re-inclusion). ORTHOGONAL to
     /// [`BacklogStatus`]: the item keeps its status and every existing
     /// transition keeps working. The flag is still written and displayed by
-    /// the backlog tool and Mnemo2's backlog view; Mnemo1's Run-All
-    /// dispatcher — the only selector that consulted it — is gone. Serialized
-    /// only when `true`: old JSONL lines without the field parse as `false`,
+    /// the backlog tool and Mnemo2's backlog view; the Run-All dispatcher —
+    /// the only selector that consulted it — is gone. Serialized only when
+    /// `true`: old JSONL lines without the field parse as `false`,
     /// and non-deferred lines stay byte-identical to the pre-change format
     /// (union-merge friendly).
     #[serde(default, skip_serializing_if = "is_false")]

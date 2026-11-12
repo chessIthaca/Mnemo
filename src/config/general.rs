@@ -416,8 +416,8 @@ struct LegacyRoutingConfig {
     escalate: Option<ModelRef>,
 }
 
-/// Merge retired Mnemo1 routing lanes from the original config text into
-/// their mapped tiers. Returns whether any lane model was present.
+/// Merge the retired Mnemo1 app's routing lanes from the original config
+/// text into their mapped tiers. Returns whether any lane model was present.
 pub(crate) fn merge_legacy_lanes(
     config_text: &str,
     ladder: &mut crate::config::endpoints::TierLadder,
@@ -1338,11 +1338,12 @@ sound_complete = false
     #[test]
     fn retired_keys_in_an_existing_config_are_ignored() {
         // An existing config.toml may still carry keys the code no longer
-        // reads: Mnemo1's Run-All auto-compact, the on-screen browser flag,
-        // the chat/tool display toggles, the per-kind steering-note table and
-        // Laya's startup fine-tune. The structs do not deny unknown fields, so
-        // loading must ignore them — no migration, no error — while the keys
-        // that ARE live keep their values.
+        // reads: the retired Mnemo1 app's Run-All auto-compact, the
+        // on-screen browser flag, the chat/tool display toggles, the
+        // per-kind steering-note table and Laya's startup fine-tune. The
+        // structs do not deny unknown fields, so loading must ignore
+        // them — no migration, no error — while the keys that ARE live
+        // keep their values.
         let text = r#"
 [general]
 auto_compact_on_plan_complete = true

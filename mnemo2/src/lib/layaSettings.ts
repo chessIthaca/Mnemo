@@ -16,34 +16,19 @@ export const LAYA_EVENT_CHANNEL = "mnemo2://laya-event";
 
 // ── Wire shapes ─────────────────────────────────────────────────────────────
 
-/** One of the six `[general.laya]` opt-in flags the page manages. */
+/** One of the four `[general.laya]` opt-in flags the page manages. */
 export type LayaFlagKey =
   | "auto_type_memories"
   | "failure_triage"
   | "failure_triage_knn"
-  | "steer_tool_choice"
-  | "routing"
-  | "reflex";
+  | "steer_tool_choice";
 
-/** The six `[general.laya]` opt-in flags as `laya_status` reports them. */
+/** The four `[general.laya]` opt-in flags as `laya_status` reports them. */
 export interface LayaFlags {
   auto_type_memories: boolean;
   failure_triage: boolean;
   failure_triage_knn: boolean;
   steer_tool_choice: boolean;
-  routing: boolean;
-  reflex: boolean;
-}
-
-/** Mnemo1's routing gates, as `laya_status` reports them: the models live on
- * the unified ladder (Settings > Tiers), only the gates remain here. */
-export interface Mnemo1Routing {
-  /** The step-lane confidence gate (`0.0..=1.0`). */
-  threshold: number;
-  /** The first-prompt gate, `null` = the kernel default. */
-  first_prompt_min_confidence: number | null;
-  /** Whether a confident decision actually switches the turn's model. */
-  enforce: boolean;
 }
 
 /** The coarse runtime state `laya_status` reports. */
@@ -57,7 +42,6 @@ export interface LayaStatus {
   installed: boolean;
   status: LayaStatusWord;
   flags: LayaFlags;
-  routing: Mnemo1Routing;
 }
 
 /** One setup-pipeline event from the laya channel (`SetupEvent` on the wire). */
@@ -91,8 +75,8 @@ export interface LayaFlagMeta {
 }
 
 /** The collapsed "Other things Laya can do" section's flags in display order,
- * with one-line explanations. The `routing` flag is not here — the top
- * control owns it — and the two Mnemo1-only flags say so in their labels. */
+ * with one-line explanations — the kernel's per-turn routing switches never
+ * ride this list. */
 export const LAYA_FLAG_META: readonly LayaFlagMeta[] = [
   {
     key: "auto_type_memories",
@@ -113,11 +97,6 @@ export const LAYA_FLAG_META: readonly LayaFlagMeta[] = [
     key: "steer_tool_choice",
     label: "Steer tool choice",
     explanation: "A confident classifier picks whether a search is for a symbol, plain text or a memory; every fallback keeps the built-in heuristics.",
-  },
-  {
-    key: "reflex",
-    label: "Reflex (plan-step tiers, Mnemo1)",
-    explanation: "Each Mnemo1 plan step runs on the tier Laya picks for it.",
   },
 ];
 
@@ -158,7 +137,7 @@ export function createTauriLayaTransport(bindings: LayaTransportBindings): LayaT
     setup: () => bindings.invoke<void>("laya_setup"),
     disable: () => bindings.invoke<void>("laya_disable"),
     saveFlag: (key, value) =>
-      bindings.invoke<void>("save_laya_settings", { flags: { [key]: value }, routing: null }),
+      bindings.invoke<void>("save_laya_settings", { flags: { [key]: value } }),
     onLayaEvent: (handler) =>
       bindings.listen<LayaEvent>(LAYA_EVENT_CHANNEL, (event) => handler(event.payload)),
     routingStatus: () => bindings.invoke<RoutingStatusWire>("routing_settings_status"),
@@ -194,8 +173,8 @@ export function createLayaTransport(bindings?: LayaTransportBindings): LayaTrans
 /** One dispatch-routing mode (design §4.5). */
 export type RoutingModeName = "off" | "shadow" | "suggest" | "auto";
 
-/** One answer of the Settings > Tiers top control (design §7.1) — a
- * `RoutingModeName` plus the Mnemo1 halves the choice saves with it. */
+/** One answer of the Settings > Tiers top control (design §7.1) — the
+ * mnemo2.toml `[routing]` mode the save writes. */
 export type TierChoice = RoutingModeName;
 
 /** The top control's status (`tiers_top_control_status`): the saved choice
@@ -203,8 +182,6 @@ export type TierChoice = RoutingModeName;
 export interface TiersTopControl {
   /** The saved choice (`off` = the lead picks). */
   choice: TierChoice;
-  /** Mnemo1's `[general.laya] routing` half of the choice. */
-  laya_routing: boolean;
   /** Laya's coarse readiness word. */
   laya_status: LayaStatusWord;
   /** The installed checkpoint's name, when one is installed. */

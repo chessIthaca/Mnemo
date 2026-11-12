@@ -4745,10 +4745,10 @@ mod tests {
         // CONTRACT PIN (run-all defect 2026-08-20): a Suggestion sent to an
         // IDLE agent runs as its OWN complete turn before any Prompt queued
         // behind it is processed — the Prompt never merges into the steer's
-        // turn. Mnemo1's Run-All used to send its unattended preamble as a
-        // Suggestion before the item's Prompt; every item then resolved on a
-        // steer-only turn (plan-loop gate → CantResolve) and the NEXT item
-        // was dispatched before the real prompt ran. The 2026-08-20 fix
+        // turn. Run-All used to send its unattended preamble as a Suggestion
+        // before the item's Prompt; every item then resolved on a steer-only
+        // turn (plan-loop gate → CantResolve) and the NEXT item was
+        // dispatched before the real prompt ran. The 2026-08-20 fix
         // embedded the preamble in the Prompt instead; this test pins the
         // runtime behavior the fix depends on — if the idle-Suggestion arm
         // ever changes to buffer the steer instead of running a turn, this

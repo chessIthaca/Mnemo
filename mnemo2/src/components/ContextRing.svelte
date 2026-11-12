@@ -2,9 +2,8 @@
   import { actions, app } from "../lib/store";
   import { formatTokenCount } from "../lib/usage";
 
-  // Mnemo1's context colour thresholds (InflightBar contextColor): green
-  // below half, amber below eighty percent, red from there. Neutral grey
-  // while the window size is unknown.
+  // The context colour thresholds: green below half, amber below eighty
+  // percent, red from there. Neutral grey while the window size is unknown.
   const RADIUS = 8.5;
   const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
 

@@ -328,7 +328,7 @@ fn impact_in(view: &GraphView, symbol_id: &str) -> Option<Vec<GraphImpactSymbol>
 }
 
 /// The most-connected symbols — the tab's entry points when nothing is
-/// selected (instead of Mnemo1's unfiltered 300-node hairball).
+/// selected (instead of the unfiltered 300-node hairball).
 ///
 /// Candidates come from an unfiltered [`GraphView::slice`], which already
 /// pre-selects the graph's most-connected nodes when the graph is bigger than

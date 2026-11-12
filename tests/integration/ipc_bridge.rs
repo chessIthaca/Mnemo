@@ -17,7 +17,7 @@ use mnemo::tool::ToolResult;
 // We can't import from src-tauri (it's a separate crate), so we re-test the
 // core logic that the serialized-event channel relies on: into_serializable +
 // the approval map pattern. The PendingApprovals bridge this suite was
-// written against retired with Mnemo1; the channel contract itself is tested
+// written against is gone; the channel contract itself is tested
 // here.
 
 #[tokio::test]

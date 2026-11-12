@@ -10,7 +10,8 @@
 //! `routine`, `involved` or `hard`, which map onto the ladder's `trivial`,
 //! `routine`, `medium` and `high` tiers. The question, its descriptions and
 //! the default gates all come from the kernel's shared [`route_question`]
-//! module, so Mnemo1's first-prompt gate asks the byte-identical question.
+//! module, so the kernel's own first-prompt gate asks the byte-identical
+//! question.
 //! Empty tiers remain offered and fold down to a model when the dispatch runs.
 //!
 //! This module owns the Mnemo2-specific pieces:
@@ -149,7 +150,7 @@ fn strip_step_prefix(step_text: &str) -> &str {
 }
 
 /// `text`'s word count, by the same `split_whitespace` rule for every caller
-/// (the step, the brief, and Mnemo1's first prompt all count words this way).
+/// (the step, the brief, and a first prompt all count words this way).
 fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
@@ -338,7 +339,7 @@ impl Default for RoutingSettings {
     }
 }
 
-/// Mnemo2's own settings file, kept separate from Mnemo1's `config.toml`.
+/// Mnemo2's own settings file, kept separate from the shared `config.toml`.
 pub fn routing_settings_path(config_dir: &Path) -> PathBuf {
     config_dir.join("mnemo2.toml")
 }
@@ -742,8 +743,8 @@ impl DispatchRoutingRow {
 }
 
 /// The dispatch routing log's file:
-/// `~/.mnemo/laya/training/dispatch_routing.jsonl`, beside the Mnemo1
-/// `routing.jsonl`.
+/// `~/.mnemo/laya/training/dispatch_routing.jsonl`, beside the kernel's
+/// per-turn `routing.jsonl`.
 pub fn dispatch_routing_log_path() -> PathBuf {
     training_log_dir().join("dispatch_routing.jsonl")
 }
@@ -1096,8 +1097,8 @@ high = "high"
             let ours = routing_question(tiers);
             let kernel = route_question::route_question(tiers.offered());
             assert_eq!(ours, kernel, "bits: {bits}");
-            // Byte for byte, not just semantically equal: Mnemo1 and Mnemo2
-            // must send the backend identical bytes.
+            // Byte for byte, not just semantically equal: dispatch and the
+            // kernel's own gate must send the backend identical bytes.
             assert_eq!(
                 serde_json::to_string(&ours).expect("ours"),
                 serde_json::to_string(&kernel).expect("kernel"),

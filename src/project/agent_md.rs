@@ -51,7 +51,7 @@ impl Constitution {
     /// The constitution as a session in `scope` reads it
     /// (`.coding/design/mnemo2.md` Phase 5.2): text wrapped in
     /// `<!-- mnemo:classic -->` … `<!-- /mnemo:classic -->` applies only to
-    /// Mnemo1's Classic workflow, text wrapped in `<!-- mnemo:team -->` …
+    /// the Classic workflow, text wrapped in `<!-- mnemo:team -->` …
     /// `<!-- /mnemo:team -->` only to Mnemo2 (its lead and workers), and
     /// unmarked text to everyone.
     pub fn scoped(&self, scope: ConstitutionScope) -> Constitution {
@@ -66,7 +66,7 @@ impl Constitution {
 /// ([`Constitution::scoped`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstitutionScope {
-    /// Mnemo1's plan-first workflow: drops `mnemo:team` sections.
+    /// The kernel's plan-first workflow: drops `mnemo:team` sections.
     Classic,
     /// The Mnemo2 lead and its executor workers: drops `mnemo:classic`
     /// sections.

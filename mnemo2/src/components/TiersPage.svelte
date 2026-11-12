@@ -51,7 +51,7 @@
 
   /** The control's own wire: the saved choice plus Laya's readiness. */
   let topControl = $state<TiersTopControl | null>(null);
-  /** The full Laya snapshot — the runtime state, the flags and Mnemo1's gates. */
+  /** The full Laya snapshot — the runtime state and the flags. */
   let snapshot = $state<LayaStatus | null>(null);
   /** The Mnemo2 `[routing]` table, its log summary and the last check's record. */
   let routingStatus = $state<RoutingStatusWire | null>(null);
@@ -115,8 +115,7 @@
 
   /**
    * A warning when the saved choice cannot run: Laya is not up (install,
-   * turn on or retry applies it once it is), or Mnemo1's routing flag on
-   * disk disagrees with the choice (a hand-edited config).
+   * turn on or retry applies it once it is).
    */
   const choiceWarning = $derived.by(() => {
     if (topControl === null) return null;
@@ -127,9 +126,6 @@
       if (topControl.laya_status !== "ready") {
         return "This choice needs Laya running: install or turn it on above. The lead's tier stands until then.";
       }
-    }
-    if (topControl.laya_routing !== (choice !== "off")) {
-      return "Mnemo1's Laya routing flag on disk does not match this choice — picking the choice again realigns it.";
     }
     return null;
   });
@@ -160,7 +156,7 @@
     setupError = "";
     try {
       topControl = await layaTransport.saveTopControl(target);
-      // The mode is half of the `[routing]` table — re-read it so the
+      // The mode is the `[routing]` table's headline — re-read it so the
       // summary and the check's record follow, and refresh the status
       // behind it.
       await refreshRouting();
@@ -477,7 +473,7 @@
       <header>
         <h3>Does Laya help pick the tier?</h3>
         <p class="micro">
-          Sets how Mnemo2 picks a worker's tier, and turns Laya's routing on or off in Mnemo1. Whether Mnemo1 switches models stays in Mnemo1's own settings.
+          Sets how Mnemo2 picks a worker's tier.
         </p>
       </header>
       <div class="choice-grid" role="radiogroup" aria-label="Who picks the tier">

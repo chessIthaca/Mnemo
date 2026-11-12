@@ -7,6 +7,29 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (procedure:
 `.coding/skills/new_release.toml`).
 
+## [2.3.0] — 2026-11-12
+
+Mnemo2 is now the only Mnemo app. Mnemo1, the original desktop app, is retired: its code is gone and its installers no longer ship.
+
+### Added
+- Slash commands in Mnemo2's lead composer: `/new`, `/clear`, `/compact`, `/model`, `/stop` and `/help` (#120).
+- The last Mnemo1 app features Mnemo2 still lacked (#117).
+- Every pull request now runs the build, clippy and the tests (#118).
+
+### Changed
+- The Rust toolchain is pinned to 1.99.1 in `rust-toolchain.toml` (#119).
+- Settings → Tiers only sets how Mnemo2 picks a worker's tier; the Mnemo1 routing switch, the Reflex option and the mismatch warning are gone (#122).
+- Dependency updates, among them rusqlite 0.41, tree-sitter-php 0.25, jsdom 31 and the CodeQL actions (#108–#113, #116, #117).
+
+### Removed
+- Mnemo1: the `frontend/` app, its Tauri binary, `start.bat`, `build.bat` and its installers (#120).
+- About 5,500 lines of Mnemo1-only core code and dead settings; retired keys in an existing `config.toml` are ignored (#121).
+
+### Fixed
+- Mnemo2 workers are no longer moved to another model mid-plan by the per-step reflex lane (#122).
+- A flaky model-switch test (#122).
+- Backlog items that Mnemo1's Run-All left "With the lead" are closed (#123).
+
 ## [1.3.0] — 2026-09-29
 
 The GitHub-reporting sweep: every open Dependabot alert and CodeQL

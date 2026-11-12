@@ -560,6 +560,97 @@ fn workflows_never_mention_mnemo1_frontend() {
     }
 }
 
+/// Every `npx tauri` call in build.yml needs the Tauri CLI installed by
+/// `npm ci`: some package.json in the npm workspace must declare
+/// `@tauri-apps/cli`, and package-lock.json must lock it with its `tauri`
+/// bin, or npx fails with "could not determine executable to run".
+/// Regression: retiring Mnemo1 (674702df) deleted frontend/package.json,
+/// the only package that declared the CLI, and the v2.3.0 tag build
+/// (run 43233239658) died at "Tauri build Mnemo2 (.app + .dmg, aarch64)"
+/// with no installers. PR CI never runs the Tauri CLI, so only this guard
+/// catches it before a tag.
+#[test]
+fn build_workflow_tauri_cli_is_declared_and_locked() {
+    let root = env!("CARGO_MANIFEST_DIR");
+
+    // a. Every `npx tauri` invocation in the release workflow.
+    let workflow = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
+    let npx_calls: Vec<String> = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("npx tauri"))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !npx_calls.is_empty(),
+        "build.yml no longer calls `npx tauri` — whatever builds the \
+         installers now has to be covered by this guard instead"
+    );
+
+    // b. The root package.json plus every workspace package it lists.
+    let root_manifest = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/package.json"
+    ))
+    .expect("root package.json readable");
+    let root_json: serde_json::Value =
+        serde_json::from_str(&root_manifest).expect("root package.json is valid JSON");
+    let mut manifests = vec![String::from("package.json")];
+    for dir in root_json["workspaces"]
+        .as_array()
+        .expect("root package.json declares a workspaces array")
+    {
+        let dir = dir
+            .as_str()
+            .expect("every workspaces entry is a string");
+        manifests.push(format!("{dir}/package.json"));
+    }
+
+    // c. At least one of them must declare the CLI.
+    let mut declaring = Vec::new();
+    let mut inspected = Vec::new();
+    for rel in &manifests {
+        let text = std::fs::read_to_string(format!("{root}/{rel}"))
+            .unwrap_or_else(|e| panic!("{rel} readable: {e}"));
+        let pkg: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{rel} is valid JSON: {e}"));
+        inspected.push(rel.clone());
+        let declared = pkg["devDependencies"]["@tauri-apps/cli"].as_str().is_some()
+            || pkg["dependencies"]["@tauri-apps/cli"].as_str().is_some();
+        if declared {
+            declaring.push(rel.clone());
+        }
+    }
+    assert!(
+        !declaring.is_empty(),
+        "no package.json in the npm workspace declares @tauri-apps/cli, so \
+         `npm ci` installs no `tauri` executable and build.yml fails at \
+         {npx_calls:?} with \"could not determine executable to run\" — add it \
+         as a devDependency of mnemo2: `npm install -D \
+         @tauri-apps/cli@^2.12.4 -w mnemo2` (inspected: {inspected:?})"
+    );
+
+    // d. package-lock.json must lock it together with its `tauri` bin.
+    let lock_text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/package-lock.json"
+    ))
+    .expect("package-lock.json readable");
+    let lock: serde_json::Value =
+        serde_json::from_str(&lock_text).expect("package-lock.json is valid JSON");
+    let entry = &lock["packages"]["node_modules/@tauri-apps/cli"];
+    assert!(
+        entry["bin"]["tauri"].as_str().is_some(),
+        "package-lock.json does not lock @tauri-apps/cli with its `tauri` bin, \
+         so `npm ci` would install no `tauri` executable — re-run `npm install \
+         -D @tauri-apps/cli@^2.12.4 -w mnemo2`"
+    );
+}
+
 // Failure text for the vendored-patch lock guard below.
 const UNUSED_PATCH_MSG: &str = "Cargo.lock carries a [[patch.unused]] entry: a [patch.crates-io] override (the wry path patch in Cargo.toml) no longer applies to the resolved version, so the registry crate would ship instead of the vendored build — losing the WebView2 OS-account SSO + hard-reload patches. Re-pin tauri / tauri-runtime-wry by hand together with vendor/wry (see vendor/wry/PATCHES.md and the .github/dependabot.yml ignore list), then re-run this guard";
 

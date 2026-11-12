@@ -1,6 +1,7 @@
 +++
 title = "cut a Mnemo release with the security and Dependabot fixes folded in"
 created = "2026-11-05"
+status = "superseded"
 +++
 
 Before tagging a Mnemo release, check GitHub for open security alerts (gh api repos/chessIthaca/Mnemo/dependabot/alerts?state=open, code-scanning/alerts, secret-scanning/alerts) and the open Dependabot PRs, and fold them into the lead working branch rather than merging the PRs into main: main lags the lead branch by many commits, so the PRs would conflict, and Dependabot closes them once main has the updates. Use targeted `cargo update -p <crate> --precise` and `npm install <pkg>@^x -w <workspace>` only. The workspace vendors tauri/wry ([patch.crates-io]), so Cargo.lock must keep no [[patch.unused]] (guard: `cargo test --test integration cargo_lock_keeps`). Keep @tauri-apps/plugin-* (npm) and tauri-plugin-* (crates) on the same major.minor. The version lives in Cargo.toml, src-tauri/Cargo.toml, src-tauri/tauri.conf.json, package.json, frontend/package.json, the AboutDialog.tsx fallback, mnemo2/package.json, src-tauri/mnemo2-app/tauri.conf.json and mnemo2/plugin/.claude-plugin/plugin.json. Then open a PR into main, merge it, and push a v* tag: .github/workflows/build.yml builds the installers and publishes the GitHub release. deepmerge (low alert, via vite-plugin-svelte) had no fixed version in November 2026.

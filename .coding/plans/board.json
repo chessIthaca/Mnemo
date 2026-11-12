@@ -2424,6 +2424,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "No OpenSpec requirement mentions Mnemo1, [general.laya] routing/reflex, enforce or per-turn routing (grep of .coding/openspec/specs). The Tiers page still configures the ladder, the routing choice and the Laya settings on one page (tier-ladder 'One Tiers page'); dispatch routing modes are unchanged."
+    },
+    {
+      "id": "28eff481",
+      "status": "closed",
+      "created_at_ms": 1794481089680,
+      "closed_at_ms": 1794481526595,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-28eff481-20261112-110526.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "A version bump, refreshed lockfile versions and a changelog section; no specified behavior changes."
     }
   ]
 }

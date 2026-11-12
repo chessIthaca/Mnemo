@@ -2446,6 +2446,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Build tooling only: restores an npm devDependency and adds a workflow hygiene test; no product behavior changes."
+    },
+    {
+      "id": "e1d2d242",
+      "status": "open",
+      "created_at_ms": 1794496690741,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only change: makes an existing test deterministic; no product behavior changes."
     }
   ]
 }

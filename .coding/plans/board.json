@@ -2460,10 +2460,10 @@
     },
     {
       "id": "2261ac6b",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794573930826,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1794574334501,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-2261ac6b-20261113-125214.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},

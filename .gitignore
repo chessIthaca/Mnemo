@@ -102,5 +102,7 @@ docs/costsaving.md
 # The "mnemo" Claude Code plugin: the mnemo2-mcp helper is copied here by
 # `npm run build:mnemo2:native` (scripts/install-mnemo2-mcp.mjs).
 mnemo2/plugin/bin/
-# the staged mnemo2-mcp sidecar (scripts/stage-mnemo2-mcp-sidecar.mjs)
+# the staged mnemo2-mcp sidecar, for both crates that run tauri_build
+# (scripts/stage-mnemo2-mcp-sidecar.mjs)
 src-tauri/mnemo2-app/binaries/
+src-tauri/binaries/

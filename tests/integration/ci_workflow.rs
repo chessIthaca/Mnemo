@@ -795,6 +795,28 @@ fn build_workflow_bundles_the_mnemo2_mcp_helper() {
              helper binary and stage it into src-tauri/mnemo2-app/binaries/"
         );
     }
+
+    // Both crates in the workspace run `tauri_build` — the app package
+    // (src-tauri/mnemo2-app) and the host library mnemo-app (src-tauri) —
+    // and the Tauri CLI hands the merged config (with `externalBin`) to
+    // every one of those build scripts, each resolving `binaries/...`
+    // relative to its own manifest dir. With only the app package's copy
+    // staged, the library's build script fails with
+    // `resource path binaries\mnemo2-mcp-<triple>[.exe] doesn't exist`
+    // (build.yml run 43645076288 died on both platforms).
+    for needle in [
+        "join(root, \"src-tauri\", \"mnemo2-app\", \"binaries\")",
+        "join(root, \"src-tauri\", \"binaries\")",
+    ] {
+        assert!(
+            script.contains(needle),
+            "{script_rel} no longer contains {needle} — it must stage the \
+             helper for BOTH crates that run tauri_build (the app package \
+             src-tauri/mnemo2-app and the host library mnemo-app in \
+             src-tauri), because each resolves externalBin from its own \
+             manifest dir (regression: build.yml run 43645076288)"
+        );
+    }
 }
 
 // Failure text for the vendored-patch lock guard below.

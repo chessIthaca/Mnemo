@@ -82,13 +82,13 @@ Mnemo2's own settings, kept apart from the shared `config.toml`.
 
 ```toml
 [routing]
-mode = "off" # off | shadow | suggest | auto (Settings → Tiers)
-cost_notice_usd = 2.0 # tell the lead when one worker passes this cost, then at each doubling; 0 = off
+mode = "off"              # off | shadow | suggest | auto (Settings → Tiers)
+cost_notice_usd = 2.0     # tell the lead when one worker passes this cost, then at each doubling; 0 = off
 fallback_tier = "routine" # the tier auto mode uses when Laya is not confident enough
-nudges = true # send escalation nudges to the lead
+nudges = true             # send escalation nudges to the lead
 
 [window]
-close = "auto" # auto | tray | quit (Settings → Appearance)
+close = "auto"            # auto | tray | quit (Settings → Appearance)
 ```
 
 The `mode` values:

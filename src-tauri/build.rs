@@ -2,32 +2,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-/// The Tauri CLI hands its merged config to every crate's build script in
-/// `TAURI_CONFIG`. The release build merges tauri.bundle.conf.json, whose
-/// `bundle.externalBin` (the mnemo2-mcp sidecar) belongs to the app package
-/// (src-tauri/mnemo2-app) alone: from this crate tauri_build would copy the
-/// same sidecar into target/<profile>/ in parallel with the app package's
-/// copy, and Windows refuses the second open (os error 32, CI run
-/// 43648972717). Drop externalBin here; nothing else changes.
-fn strip_external_bin_from_tauri_config() {
-    let Ok(raw) = std::env::var("TAURI_CONFIG") else {
-        return;
-    };
-    let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return;
-    };
-    let removed = config
-        .get_mut("bundle")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|bundle| bundle.remove("externalBin"))
-        .is_some();
-    if removed {
-        std::env::set_var("TAURI_CONFIG", config.to_string());
-    }
-}
-
 fn main() {
-    strip_external_bin_from_tauri_config();
     // `tauri_build::build()` only tracks the default `tauri.conf.json`.
     // The Mnemo2 host has its own config, so make cargo rebuild when it changes.
     println!("cargo:rerun-if-changed=mnemo2-app/tauri.conf.json");

@@ -75,14 +75,10 @@ jobs:
       # root target/ bundle dirs.
       - name: Build the Mnemo2 frontend
         run: npm run build:mnemo2
-      # The helper is built from the same package, so it is staged first and
-      # bundled through tauri.bundle.conf.json (never tauri.conf.json, which
-      # would break plain cargo builds).
-      - name: Stage the mnemo2-mcp helper for the installers
-        run: node scripts/stage-mnemo2-mcp-sidecar.mjs
       - name: Tauri build Mnemo2 (unsigned installers)
-        run: npx tauri build --config tauri.bundle.conf.json
+        run: npx tauri build
         working-directory: src-tauri/mnemo2-app
+      # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp included; fail if that ever stops.
       - name: Check the installers carry mnemo2-mcp
         shell: pwsh
         run: |
@@ -228,14 +224,10 @@ jobs:
       # dirs under Mnemo2_* names.
       - name: Build the Mnemo2 frontend
         run: npm run build:mnemo2
-      # The helper is built from the same package, so it is staged first and
-      # bundled through tauri.bundle.conf.json (never tauri.conf.json, which
-      # would break plain cargo builds).
-      - name: Stage the mnemo2-mcp helper for the installers
-        run: node scripts/stage-mnemo2-mcp-sidecar.mjs --target aarch64-apple-darwin
       - name: Tauri build Mnemo2 (.app + .dmg, aarch64)
-        run: npx tauri build --target aarch64-apple-darwin --config tauri.bundle.conf.json
+        run: npx tauri build --target aarch64-apple-darwin
         working-directory: src-tauri/mnemo2-app
+      # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp included; fail if that ever stops.
       - name: Check the app bundle carries mnemo2-mcp
         run: test -x target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app/Contents/MacOS/mnemo2-mcp
       # upload-artifact@v4 does not preserve file permissions (the Mach-O

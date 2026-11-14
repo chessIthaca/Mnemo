@@ -8,9 +8,6 @@ license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# build.rs strips `bundle.externalBin` from the Tauri CLI's TAURI_CONFIG so
-# only the app package copies the mnemo2-mcp sidecar (src-tauri/build.rs).
-serde_json = "1"
 
 [dependencies]
 mnemo = { path = "..", features = ["browser", "embeddings"] }

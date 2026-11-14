@@ -26,7 +26,7 @@ The system prompts (preamble, workflow lifecycle, app rules, tool strategy, memo
 
 `config.toml` holds the defaults, safety mode, the `[memory]` retrieval knobs — recency-decay half-life, per-query cap, derived per-class cap, digest budgets — and the `[context]` compaction knobs.
 
-`summarize_at_fill_rate` (fraction of window triggering summarization) plus `preflight_compact` / `compact_headroom_tokens` (defaults on / 32 000) enabling aggressive keep_recent=3 compaction once a session exceeds its remaining headroom before each provider call).
+`[context]` holds `summarize_at_fill_rate` (the fraction of the window that triggers summarization) and `preflight_compact` / `compact_headroom_tokens` (defaults on / 32 000), which enable aggressive keep_recent=3 compaction once a session exceeds its remaining headroom before each provider call.
 
 The automatic compaction-limit fallback (no config key of its own): a compaction pass that still leaves the conversation at/over the effective threshold temporarily RAISES the effective limit, +10% per failed pass and cumulative (x1.1, x1.2, ..., at most 10 steps), never at or above the true window (`max_tokens - max(compact_headroom_tokens, 1)` - the one-token floor holds even for a degenerate `compact_headroom_tokens = 0`); every raise is announced in the transcript and logged, and the limit resets to the configured dial once a compaction fits at the un-raised threshold (also on `/new`, or when the model is swapped), so a boundary session continues instead of re-compacting until the bounded abort while the provider's hard window stays hard (a genuine provider length error is still an error).
 

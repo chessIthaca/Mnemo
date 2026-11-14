@@ -1179,7 +1179,8 @@ impl Shared {
             let memory = engine
                 .as_ref()
                 .and_then(|engine| engine.memory_store_handle());
-            code_search_tools(&target.root, graph, memory)
+            let config_dir = self.host.config_dir();
+            code_search_tools(&target.root, graph, memory, Some(&config_dir))
         } else {
             Vec::new()
         };
@@ -1343,11 +1344,15 @@ fn is_code_search_tool(name: &str) -> bool {
 /// over this project: the engine's names, descriptions and schemas, on the
 /// same sandbox and the same code-graph and memory handles the in-app lead's
 /// registry uses. Without a running engine (or its graph) the tools still
-/// answer — the search walks the tree instead of the content index.
+/// answer — the search walks the tree instead of the content index. With
+/// `staleness_dir` (the config dir) every stale-index repair is appended to
+/// its `index-staleness.jsonl`, like the in-app lead's registry; the tool list
+/// passes `None` because it only reads schemas.
 fn code_search_tools(
     root: &Path,
     graph: Option<Arc<mnemo::codegraph::CodeGraph>>,
     memory: Option<Arc<dyn mnemo::memory::MemoryStoreTrait>>,
+    staleness_dir: Option<&Path>,
 ) -> Vec<Box<dyn mnemo::tool::Tool>> {
     let Ok(sandbox) = Sandbox::new(root) else {
         return Vec::new();
@@ -1357,6 +1362,10 @@ fn code_search_tools(
     if let Some(memory) = memory {
         search = search.with_memory(memory.clone());
         search_read = search_read.with_memory(memory);
+    }
+    if let Some(dir) = staleness_dir {
+        search = search.with_staleness_log(mnemo::index_staleness::StalenessLog::at(dir));
+        search_read = search_read.with_staleness_log(mnemo::index_staleness::StalenessLog::at(dir));
     }
     vec![Box::new(search), Box::new(search_read)]
 }
@@ -1403,7 +1412,12 @@ fn tool_list(target: &Target) -> Vec<Value> {
         .board_tools()
         .into_iter()
         .chain(target.lead.knowledge_tools())
-        .chain(code_search_tools(target.lead.workspace_root(), None, None));
+        .chain(code_search_tools(
+            target.lead.workspace_root(),
+            None,
+            None,
+            None,
+        ));
     tools.extend(engine_tools.map(|tool| {
         let schema = tool.schema();
         json!({
@@ -2564,6 +2578,65 @@ mod tests {
         assert!(text.contains("truncated by Mnemo2"), "{text}");
         assert!(text.contains("Narrow the query"), "{text}");
         fixture.shutdown().await;
+    }
+
+    /// Regression: the external lead's `search` / `search_read` repaired
+    /// stale index entries without recording them, because
+    /// `code_search_tools` built both tools without a staleness log (the
+    /// in-app lead's registry has one). Each repair must now land in
+    /// `<config dir>/index-staleness.jsonl`, and the note must point at it.
+    #[tokio::test]
+    async fn code_search_repairs_are_recorded_in_the_staleness_log() {
+        let project = tempfile::tempdir().expect("project");
+        let config = tempfile::tempdir().expect("config");
+        let file = project.path().join("notes.md");
+        std::fs::write(&file, "alpha marker\n").expect("seed");
+        let graph = mnemo::codegraph::CodeGraph::open_in_memory(project.path().to_path_buf())
+            .expect("graph");
+        graph.index(None).expect("index");
+        let tools = code_search_tools(project.path(), Some(Arc::new(graph)), None, Some(config.path()));
+        let log_path = config.path().join("index-staleness.jsonl");
+        for (round, tool_name) in [(1u64, "search"), (2u64, "search_read")] {
+            // The edit-to-watcher gap: new content, a later mtime, no reindex.
+            std::fs::write(&file, format!("alpha marker\nalpha fresh {round}\n"))
+                .expect("edit");
+            let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5 * round);
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .expect("open")
+                .set_modified(later)
+                .expect("mtime");
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name() == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} is built"));
+            let result = tool.execute(json!({ "pattern": "alpha", "literal": true })).await;
+            assert!(result.success, "{tool_name}: {}", result.output);
+            assert!(
+                result.output.contains("full list: index-staleness.jsonl"),
+                "{tool_name}: the note points at the log: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains(&format!("alpha fresh {round}")),
+                "{tool_name}: fresh content: {}",
+                result.output
+            );
+        }
+        let log = std::fs::read_to_string(&log_path).expect("the staleness log is written");
+        let records: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON record per line"))
+            .collect();
+        for tool_name in ["search", "search_read"] {
+            assert!(
+                records
+                    .iter()
+                    .any(|rec| rec["tool"] == tool_name && rec["path"] == "notes.md"),
+                "a {tool_name} record for notes.md: {log}"
+            );
+        }
     }
 
     /// The text of a successful `tools/call` reply.

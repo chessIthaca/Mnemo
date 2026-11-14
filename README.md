@@ -9,9 +9,11 @@ Named after Mnemosyne, the Greek titaness of memory — because the point is tha
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 ![Node](https://img.shields.io/badge/node-LTS-green)
 
-Mnemo is a **Rust + Tauri desktop app** that turns an LLM into a disciplined coding agent. It runs the model inside an **enforced plan-first state machine**, keeps a **four-tier persistent memory** across sessions, navigates the codebase through a **tree-sitter knowledge graph**, and puts **approval gates on every mutation**.
+Mnemo is a **Rust + Tauri desktop app** for coding with a team of LLM agents. A **lead** plans the work on a plan board and hands each step to a **worker**. Every worker runs on a model tier you choose, in its own git branch and checkout. The lead reviews each worker's diff, records evidence and checks, and merges it into its working branch. Memory, a tree-sitter code graph and approval gates come with every session.
 
-It is not a chat window with file access — it is a harness that makes a good model reliable and a small model viable.
+The app is called **Mnemo2**. Mnemo1, the original single-agent app, retired in 2.3.0 (see the [CHANGELOG](CHANGELOG.md)).
+
+You can lead from Mnemo2's own lead chat, or let **Claude Code** lead through the [`mnemo` plugin](mnemo2/plugin/README.md).
 
 ---
 
@@ -25,9 +27,9 @@ If you've iterated with coding agents, you know the pattern. The pain points Mne
 - **Memory doesn't survive.** Everything your agent learned about your project last week is gone today.
 - **The harness trusts the model.** Mutations go out unchecked; one confident wrong turn costs an hour of cleanup.
 
-**Not a model problem — an allocation problem.** The same model is brilliant when the plan is right and hopeless when it's reconstructing intent from a stale context. So Mnemo allocates: a sharp model plans, a cheap model executes, a reviewer audits, and every handoff is a file on disk.
+**Not a model problem — an allocation problem.** The same model is brilliant when the plan is right and hopeless when it's reconstructing intent from a stale context. So Mnemo allocates: the lead plans and reviews, cheaper workers implement on the tier each step needs, and every handoff (plan, review, memory record) is a file on disk.
 
-The spec-loop, enforced end to end: **spec → plan → code → test → review → commit**, with every artifact persisted — not remembered.
+The loop, enforced end to end: **plan → dispatch → checks → review → merge → pull request**, with every artifact persisted — not remembered.
 
 ---
 
@@ -35,15 +37,14 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 
 | | |
 |---|---|
-| **Enforced workflow** | Planning → Executing → Reviewing → Complete — a state machine decides which tools exist at each moment; the agent cannot skip ahead. |
+| **Lead and team** | The lead plans on a plan board and dispatches each step to a worker in its own `wt/agent-*` branch and checkout; several workers run at once (Team tab, worker slots). |
+| **Tiers** | Five model tiers (trivial, routine, medium, high, escalate) set in Settings → Tiers. Optional Laya routing can watch, suggest or pick each worker's tier. |
+| **Review gate** | No merge without the lead's review evidence, checks recorded on the exact commit and every finding closed; high-risk work also needs an independent read-only audit. Merges are local `--no-ff`; nothing pushes to `main`. |
 | **Four-tier memory** | Working → episodic → semantic → procedural, persisted in SQLite with recall ranked by relevance, recency and staleness (records not re-accessed within the decay half-life sink by up to −0.25); sessions auto-consolidate into durable knowledge at turn boundaries, not only via the manual tool. |
 | **Knowledge graph** | Tree-sitter parses 12 languages (Rust, TS/TSX, JS, Python, Go, Java, C/C++, C#, Ruby, PHP, HTML) into a per-project SQLite graph: callers, callees, imports, blast radius, shortest paths. |
-| **Safety first** | Approval gates on mutations, git merge/push always gated, read-only reviewer agents that cannot self-approve, `.coding/` state sandboxed from the file tools. |
-| **Multi-model routing** | Per-workflow-state model slots, per-model context/reasoning budgets, effort control, stop-boundary handling for exotic tokenizers. |
-| **Optional Laya classifier** | An opt-in "System 1" text classifier: a managed `laya-serve` sidecar — downloaded in Settings, auto-started/stopped by the app on 127.0.0.1 — answers typed questions (choice / score / yes-no) with calibrated probabilities for cheap decisions. Off by default — while it is off, nothing is called. Optional memory auto-typing corrects a record's typed prefix when the classifier is confident (needs a fine-tuned checkpoint; seed examples cover SPEC/DECISION/BUG/HOW), and optional failure triage classifies every tool/provider failure (transient / permanent / needs-user / flaky-test) to steer retries — read-only calls auto-retry without a model roundtrip — while every classified failure is logged with its true outcome so a startup fine-tune can retrain the checkpoint from real dispositions (managed mode) — and an optional kNN overlay (`failure_triage_knn`) learns from that same log immediately, embedding each failure with the local memory embedder and majority-voting the most similar logged failures (vote share = confidence; needs no `laya-serve`). Optional tool-choice steering (`steer_tool_choice`) lets the classifier pick how `search`/`search_read` auto-delegation routes a query — symbol / text / memory — instead of the shape heuristics, and every steered search is logged with its disposition (delegated? escaped?) to seed a fine-tune. Optional pre-prompt model routing (`routing` + a `[general.routing]` block) classifies each main-agent turn's task text as trivial vs architectural and — once enforcement is on and the answer clears the confidence gate — runs the turn on the configured cheap / capable model instead of the state/default chain, never overriding a skill, subagent or bug-fixing pin; it ships **shadow-first** (enforcement off by default), logging every decision and its outcome (task text → label/confidence → target → turn status, iterations, tool calls) to `routing.jsonl` for the fine-tune that must precede enforcement. Optional step-granular escalation lanes (`lane_medium` / `lane_high` / `escalate`, needing the same routing opt-in plus the compound reflex opt-in) classify each **plan step** in one call and serve it on the matching user-chosen model — a step keeps its configured model while a lane target is unset, the ladder re-asks only after a failed cycle, and it shares the same confidence gate and shadow-first switch. Optional harness-run verification (`[general.verify]`: `enabled` + `test_command` + `timeout_secs`, off by default and inert with an empty command) runs the project's own checks at each plan-step boundary — a successful skeleton `complete_step` — and appends a compact evidence note (exit status, distinct error lines, counts, always capped) to the tool result, so deterministic evidence costs no model roundtrip; a decided reflex `verify` action re-runs the checks harness-side and rides the note on the next request's prompt tail, and a hang is killed at `timeout_secs` and surfaced as a failure-shaped note. Optional budget caps (`[general.budget]`: `enabled` + `max_tokens_per_plan` (0 = off) / `max_escalations_per_plan` / `max_retries_per_lane`, off by default) make spend deterministic: a cap reached at a plan-step boundary PAUSES the plan through a pending question (continue for this plan / double the cap / end the turn) instead of killing it, a per-decision `spend_events` ledger traces every main plan request to its lane/model/reason, and `finish` appends a per-plan cost report — tokens per lane, lane per step, retries, escalations, deterministic checks, cache hits; real numbers only — to the plan file. |
-| **Parallel agents** | Spawn sub-agents for research or review; a Run-All backlog dispatches queued plans into parallel worktrees. |
-| **Token-optimizer levers** | Seven context-economy levers (`[general.optimizer]`, all on by default since 2027-01-25 — uncheck any in Settings → Savings): outline-first reads of big files, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, cache-safe lean-output nudges, and recall delta (a repeat auto-recall renders as a compact reference instead of re-sending the memory snippet) — each writing a `savings_events` row. Settable in **Settings → Savings**. |
-| **Desktop shell** | Tauri 2 desktop app, embedded WebView2 browser tab (Windows), MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns (the warning retracts once the other instance exits; the instance marker is cleaned up on exit). |
+| **Safety first** | Approval gates on mutations, git merge and push always gated, a path sandbox, and `.coding/` state protected from the file tools. |
+| **Token-optimizer levers** | Seven context-economy levers, on by default (Settings → Savings): outline-first reads, command-output compression with credential redaction, archive and expand, compaction survival, a context-quality score, lean-output nudges and recall delta. The Savings card on the Cost tab shows what they saved. |
+| **Desktop shell** | Tauri 2 app for Windows and macOS: lead chat, Team (mission control), Cost, Graph and Plans tabs, a side panel (Browser, Diff, Plan, Files, Git, Trace, Graph, Memory) and MCP servers. The Browser pane is WebView2 on Windows. |
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
 
@@ -74,56 +75,73 @@ internals.
 
 ---
 
-## The enforced workflow
+## How a task flows
 
-<p align="center">
-  <img src="assets/workflow.svg" alt="Mnemo workflow: Planning → Executing → Reviewing → Complete, with back-edges for review findings and abandoning a plan">
-</p>
+1. **Plan.** The lead searches project memory, then writes a plan on the board: goal, context, acceptance scenarios and a detailed spec for each step.
+2. **Dispatch.** Each step goes to a worker on the cheapest tier that fits (Laya can choose in Auto mode). The worker receives the plan and its step, works in its own branch and checkout, runs the checks and commits.
+3. **Review.** The lead reads the diff before the worker's summary, runs the checks on the worker's exact commit and records a review with evidence: intent, execution, integration, test quality and residual risk. Every finding is fixed or closed with a written reason; high-risk work also needs an independent read-only audit.
+4. **Merge.** The reviewed worker merges `--no-ff` into the lead branch, and Mnemo2 removes its branch and checkout. The plan closes with a review report in `.coding/reviews/`.
+5. **Land.** The lead opens a pull request into `main`; CI must pass before it merges.
 
-1. **Planning** — read tools only. The agent explores the codebase and must call `create_plan` (a goal, context, and ordered steps) before it can touch anything.
-2. **Executing** — all tools available, one step at a time; sub-plans stack and pop back exactly where they left off.
-3. **Reviewing** — implementation plans get a read-only reviewer agent that audits the diff, carrying a harness-rendered contract (verdict format, constitution checks, `.coding/**` bookkeeping rule); from round 2 the app scopes it to `git diff <base>` — only what changed since the round before. Every finding must be fixed or justified.
-4. **Complete** — the change lands on a working branch with the review report in the repo.
-
-That's the whole trick: **a tool-schema guardrail, not a suggestion**. The agent physically cannot write code without a plan on disk — which is what makes a smaller executor model viable.
+Workers cannot plan, merge, push or ask the user, and the lead cannot merge work that has not passed review. Those rails are what make cheaper worker models viable. The full policy is in [docs/REVIEW-POLICY.md](docs/REVIEW-POLICY.md).
 
 ---
 
 ## How the repository works
 
 ```
-src/                  the `mnemo` library — the harness core (no Tauri)
-  agent/                turn loop, approval gates, context construction, plan dispatch
-  workflow/             the plan-first state machine
+src/                  the `mnemo` library — the engine (no Tauri)
+  agent/                turn loop, approval gates, context construction
+  app/                  the plan-first workflow, the plan board, backlog
+  headless/             the public engine surface: Engine, AgentSession, Setup
+  host/  runtime/       session hosting and the multi-agent runtime
   memory/               four-tier store: consolidation, embedder, knowledge files, strength decay
   codegraph/            tree-sitter extraction → SQLite graph: query, walk, watcher
   tool/                 tool implementations: files, shell, git, memory, browser, agent
   safety_rules/         the constitution the agent cannot ignore
   provider/             model endpoints: OpenAI/Anthropic-compatible + local
-  model_resolver.rs     per-state model routing + effort resolution
+  model_resolver.rs     model and effort resolution
   mcp/                  Model Context Protocol client (stdio + remote, OAuth)
-  backlog.rs            the Run-All queue
-src-tauri/            the Mnemo2 host library (`mnemo-app`) and the Mnemo2 app (`mnemo2-app`)
-  src/                  the host: webview_udf, instance markers, watchdog, mnemo2/
+mnemo2/               the Mnemo2 UI (Svelte 5, Vite)
+  plugin/               the `mnemo` Claude Code plugin (Claude Code as the lead)
+src-tauri/            the Mnemo2 host library (`mnemo-app`)
+  src/mnemo2/           lead, team, plan board, review and merge gate, MCP server
+  mnemo2-app/           the app package: the `mnemo2` and `mnemo2-mcp` binaries
   tests/                source-contract tests guarding the vendored wry patches
 tests/integration/    cross-boundary integration tests
+examples/             second_consumer.rs, the lean-kernel proof
 scripts/              maintenance scripts
 vendor/               patched wry — with a PATCHES.md, wired via [patch.crates-io]
-assets/               diagrams (workflow.svg)
-agent.md              the project constitution — loaded before every agent turn
+.github/workflows/    ci.yml (every pull request), build.yml (release installers), codeql.yml
+.claude-plugin/       the plugin marketplace entry for Claude Code
+rust-toolchain.toml   the pinned Rust toolchain
+agent.md              the project constitution — read by the lead and every worker
 PLAN.md               the technical-decisions log
-.coding/              the agent's own state, versioned with the repo (see below)
+.coding/              the agents' own state, versioned with the repo (see below)
 ```
 
-**The lib/app split.** `mnemo` is a plain Rust library — the state machine, memory, graph, and tools all work headless. `mnemo-app` is the library that hosts the Tauri 2 Mnemo2 app (the `mnemo2-app` crate embeds it), always selecting the heavier optional features (embedded browser, embeddings).
+**The lib/app split.** `mnemo` is a plain Rust library: memory, graph, tools and the engine all work headless. `mnemo-app` (`src-tauri/`) hosts the Tauri 2 Mnemo2 app, which the `mnemo2-app` package builds; it always selects the heavier optional features (embedded browser, embeddings).
 
-**`.coding/` is the memory the repo carries.** Plans, review reports, knowledge files, and the backlog travel in git and merge across machines; the SQLite caches (`memory.db`, `codegraph.db`) are rebuildable and gitignored. A fresh clone of Mnemo's own repo arrives with its development history already loaded. Creating a project seeds those ignore rules (and the backlog's union-merge attribute) into the new project's `.gitignore`/`.gitattributes`, appending only what is missing — existing user lines are never touched.
+**`.coding/` is the memory the repo carries.** Plans, review reports, knowledge files, and the backlog travel in git and merge across machines; the SQLite caches (`memory.db`, `codegraph.db`) are rebuildable and gitignored. A fresh clone of Mnemo's own repo arrives with its development history already loaded. Creating a project seeds those ignore rules (and the backlog's union-merge attribute) into the new project's `.gitignore`/`.gitattributes`, appending only what is missing — existing user lines are never touched. Mnemo2's own per-project state (the lead transcript, the worker ledger, preferences) lives in `.coding/mnemo2/`, which ignores itself and never enters git.
 
 **Vendored patches.** `vendor/` carries small, documented patches to `wry` (OS-account SSO + hard-reload for the embedded browser), guarded by source-contract tests in `src-tauri/tests/`; the lock pin itself is guarded by `cargo_lock_keeps_the_vendored_patches` (`tests/integration/ci_workflow.rs`), which fails if a `[[patch.unused]]` entry appears or `wry` stops resolving from the vendored path. (`tao` used to be vendored for its Windows IME self-deadlock fix; tauri 2.12 moved the app to tao 0.37.x, which carries that upstream fix natively — the backport and its guard were dropped with it.)
 
 ---
 
-## Quickstart — clone & build
+## Quickstart
+
+### Install a release
+
+Download the installer for your platform from the [releases page](https://github.com/chessIthaca/Mnemo/releases): the `.msi` or `-setup.exe` for Windows, the `.dmg` for macOS on Apple silicon.
+
+### First run
+
+1. **Settings → Endpoints**: add an OpenAI-compatible, Anthropic-compatible or local endpoint (Ollama, LM Studio) and its models. API keys are stored with user-only permissions.
+2. **Settings → Tiers**: put a model on each tier you want to use. An empty tier falls back to the nearest cheaper tier that has a model.
+3. **Settings → Models**: download the local embedding model, so memory search is semantic.
+4. Open a project folder from the start screen, choose the lead's model in the composer, and describe what you want.
+
+### Build from source
 
 **Prerequisites — Windows 10/11:**
 
@@ -152,54 +170,47 @@ npm run dev:mnemo2            # Vite dev server (browser-only preview)
 npm run dev:mnemo2:native    # Tauri host + real lead and team (run dev:mnemo2 first)
 ```
 
+To lead from Claude Code instead of Mnemo2's lead chat, install the plugin as described in [mnemo2/plugin/README.md](mnemo2/plugin/README.md).
+
 ---
 
 ## Development & tests
 
+Run what CI runs (`.github/workflows/ci.yml`) before you open a pull request:
+
 ```bash
-cargo test                 # the mnemo library crate
+npm ci
+npm run build:mnemo2
+npm test --workspace mnemo2
+cargo clippy --workspace --all-targets
+cargo clippy -p mnemo-app --all-targets --features mnemo2
+cargo test --workspace --no-fail-fast
+cargo test -p mnemo-app --features mnemo2 --lib
 ```
 
-The Mnemo2 Phase 4 workspace is a separate Svelte 5 cockpit. In its native Tauri
-host the lead conversation and the worker team are real — one shared
-headless-engine `Engine` backs one streaming lead session and every worker
-session, each worker gets its own `wt/agent-*` branch and linked git worktree,
-and messages route both ways. The workbench shows actual lead plans, real Git
-diffs, and a native WebView2 browser; state and preferences are isolated per
-project. The browser-only Vite session has no engine behind
-it and says so instead of simulating. The interface is conversation-first: each
-task has its own lead-enforced workflow, and lead/worker model identities are
-visible in the UI. Durable reviews, exact-tip checks, finding resolution, local
-merge/revert, idempotent worker dispatch, and cumulative usage telemetry are
-enforced in the native host; workers have no cumulative token/cost budget, and
-nothing pushes or merges into `main`:
+Other scripts:
 
 ```bash
-npm run dev:mnemo2         # http://127.0.0.1:5180 — browser (no engine)
-npm run dev:mnemo2:native  # Tauri host + real lead and team (run dev:mnemo2 first)
-npm run check:mnemo2       # svelte-check
-npm run test:mnemo2        # Vitest interaction + adapter + reducer tests
-npm run build:mnemo2       # -> target/mnemo2-dist
+npm run dev:mnemo2          # http://127.0.0.1:5180 — browser preview, no engine behind it
+npm run dev:mnemo2:native   # Tauri host + real lead and team (run dev:mnemo2 first)
+npm run check:mnemo2        # svelte-check
 npm run build:mnemo2:native
 ```
 
-Two heavyweight optional cargo features exist on the library — `browser` (headless-browser tooling) and `embeddings` (local ONNX memory search) — plus a dev-only `test-support` feature for cross-crate test factories. The two heavyweight ones are off by default for light builds; the app always selects both.
+Two heavyweight optional cargo features exist on the library — `browser` (headless-browser tooling) and `embeddings` (local ONNX memory search) — plus a dev-only `test-support` feature for cross-crate test factories. The two heavyweight ones are off in a plain `cargo build -p mnemo`; the app always selects both, so `cargo test --workspace` compiles them.
 
-## A few configs you should check right away
+## Settings worth checking
 
-In the config dialog download a semantic model that runs locally on your machine for the memory to be most effective and reindex after that.
-
-If you want in browser debugging you have to enable it in the advanced section of the config dialog.
-
-If you want fast, calibrated "System 1" decisions (opt-in, off by default), open Settings → Classifier and enable it: Mnemo downloads a self-contained Laya runtime (uv + virtualenv + `laya[serve]` + the English checkpoint — roughly 0.8–1 GB plus the checkpoint) with a live progress bar, then automatically starts, monitors, and stops the local `laya-serve` sidecar on 127.0.0.1. No command line, no Python prerequisites, and nothing to point at an endpoint.
+- Download the local embedding model in **Settings → Models**, then rebuild the memory index (Memory tab → Diagnostics → Memory upkeep → **Rebuild index**) so recall is semantic.
+- For Laya tier routing, open **Settings → Tiers** and choose whether Laya watches, suggests or picks each worker's tier. Laya is off by default; turning it on downloads a self-contained runtime (roughly 0.8–1 GB plus the checkpoint), and Mnemo starts and stops the local `laya-serve` on 127.0.0.1 itself.
+- In **Settings → Appearance**, choose what closing the window does: quit, hide to the tray, or automatic.
 
 ### Context economy — the `[general.optimizer]` levers
 
 Seven independent context-economy levers, all **on by default** (2027-01-25 —
 saving tokens is the expected behaviour, not an opt-in); a flag turned off is
 byte-identical to pre-lever behaviour. Uncheck a lever in **Settings → Savings**
-(each toggle takes effect on the next tool call — no restart; the Dashboard view
-meters what they save, per project). A `config.toml` that never wrote the
+(each toggle takes effect on the next tool call — no restart; the Savings card on the Cost tab shows what they save, per project). A `config.toml` that never wrote the
 `[general.optimizer]` section runs every lever — the section appears only once
 you opt out of one (or move a knob), and an explicit `false` there is honoured
 as written:
@@ -224,11 +235,9 @@ compress_extra_commands = [] # extra command prefixes to compress
 
 Every lever writes a row to the `savings_events` ledger, so its cost/benefit is
 auditable. The always-advertised `expand_result` tool retrieves any archived
-result by id or keyword. The Dashboard view (right panel, immediately before
-Memory) reads the ledger back per project: metered tokens saved, per-kind and
+result by id or keyword. The **Savings** card on the **Cost** tab reads the ledger back per project: metered tokens saved, per-kind and
 per-day breakdowns, the recent events, and a prompt-cache section whose dollar
-figures are labelled ESTIMATED. It re-reads the ledger every 2 s while the tab
-is open (and on window focus), so new savings appear without reopening it.
+figures are labelled ESTIMATED.
 
 Have fun and let me know where we can improve things.
 Pull requests gratefully considered.
@@ -237,16 +246,18 @@ Pull requests gratefully considered.
 
 ## Where the detail lives
 
-- [docs/FEATURES.md](docs/FEATURES.md) — the exhaustive feature reference (memory tiers, graph, tools, workflow mechanics)
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — providers, models, effort routing, MCP servers, per-project state
-- [PLAN.md](PLAN.md) — technical decisions and provider strategy
-- [agent.md](agent.md) — the project constitution the agent loads every turn
+- [mnemo2/README.md](mnemo2/README.md) — the Mnemo2 app: lead, team, workbench, review and merge
+- [mnemo2/plugin/README.md](mnemo2/plugin/README.md) — Claude Code as the lead
+- [docs/REVIEW-POLICY.md](docs/REVIEW-POLICY.md) — the review and merge gate
+- [docs/FEATURES.md](docs/FEATURES.md) — the engine feature reference (memory, graph, tools, providers)
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — config files, endpoints, tiers, MCP servers, per-project state
+- [CHANGELOG.md](CHANGELOG.md) — releases
+- [PLAN.md](PLAN.md) — the technical-decisions log
+- [agent.md](agent.md) — the project constitution the lead and workers load
 - [vendor/wry/PATCHES.md](vendor/wry/PATCHES.md) — what is patched upstream and why
-- `.coding/` — the agent's own working state (plans, reviews, knowledge, backlog)
+- `.coding/` — the agents' own working state (plans, reviews, knowledge, backlog)
 
 ---
-
-
 
 ## License
 

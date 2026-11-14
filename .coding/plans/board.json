@@ -2468,6 +2468,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Internal save-time validation in the headless setup; no capability under .coding/openspec/specs describes the refusal, and the UI and wire shapes do not change."
+    },
+    {
+      "id": "5b0f2394",
+      "status": "closed",
+      "created_at_ms": 1794677927562,
+      "closed_at_ms": 1794678959493,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5b0f2394-20261114-175559.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Documentation and the constitution only, plus one pin test of agent.md; no runtime behaviour or specified capability changes."
     }
   ]
 }

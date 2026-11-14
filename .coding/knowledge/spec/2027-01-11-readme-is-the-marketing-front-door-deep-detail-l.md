@@ -1,6 +1,7 @@
 +++
 title = "README is the marketing front door — deep detail lives in docs/FEATURES.md + docs/CONFIGURATION.md"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 As of 2026-09-12 (commit 4d4a709, branch wt/mnemo, plan 2c19aca0) the repo's front door is split:

@@ -4,8 +4,8 @@ All notable changes to Mnemo are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each release also
 gets GitHub release notes; the installers are built by
-`.github/workflows/build.yml` when a `v*` tag is pushed (procedure:
-`.coding/skills/new_release.toml`).
+`.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
+`.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
 ## [2.3.0] — 2026-11-12
 

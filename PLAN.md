@@ -1,5 +1,15 @@
 # Mnemo — Build Plan
 
+## Current status (2026-11-14)
+
+Mnemo2 is the only Mnemo app since 2.3.0 (2026-11-12): a Svelte 5 UI (`mnemo2/`) on a Tauri 2 host (`src-tauri/`, packaged by `src-tauri/mnemo2-app`) over the headless engine in `src/`. A lead plans on a plan board and dispatches workers on five model tiers, each in its own `wt/agent-*` branch and checkout; the lead reviews and merges locally, and work reaches `main` through a pull request gated by CI (`.github/workflows/ci.yml`).
+
+The app is described in [mnemo2/README.md](mnemo2/README.md), Claude Code as the lead in [mnemo2/plugin/README.md](mnemo2/plugin/README.md).
+
+The rest of this file is the build history up to Mnemo1's retirement. Sections about the React GUI (`frontend/`), `src-tauri/src/ipc/`, Run-All or the single-agent plan-first workflow describe code that no longer ships; the kernel decisions (provider model, memory, sandbox, context management, MCP) still apply.
+
+## Original design
+
 A coding-first agentic harness in Rust: a full GUI agentic loop optimized for
 OpenAI-compatible models, with local models (Ollama) as a capability-degraded
 fallback. **One app instance works on exactly one project** — a directory whose
@@ -18,7 +28,7 @@ are intentionally global. Structured file tools are primary; shell / grep-glob /
 coding workflow. Every mutating action goes through an approve-each-action gate,
 with **diff-based approval** for file edits.
 
-## Current status (2026-09-29)
+## Status at 2026-09-29 (history)
 
 The brain **and** the Tauri + React/TS GUI are built, tested, and working.
 The original Ratatui TUI was replaced by a Tauri 2 + React 19 + TypeScript +

@@ -796,25 +796,40 @@ fn build_workflow_bundles_the_mnemo2_mcp_helper() {
         );
     }
 
-    // Both crates in the workspace run `tauri_build` — the app package
-    // (src-tauri/mnemo2-app) and the host library mnemo-app (src-tauri) —
-    // and the Tauri CLI hands the merged config (with `externalBin`) to
-    // every one of those build scripts, each resolving `binaries/...`
-    // relative to its own manifest dir. With only the app package's copy
-    // staged, the library's build script fails with
-    // `resource path binaries\mnemo2-mcp-<triple>[.exe] doesn't exist`
-    // (build.yml run 43645076288 died on both platforms).
+    // The helper is staged for the app package alone. Both crates in the
+    // workspace run `tauri_build` — the app package (src-tauri/mnemo2-app)
+    // and the host library mnemo-app (src-tauri) — and the Tauri CLI hands
+    // the merged config (with `externalBin`) to every one of those build
+    // scripts in TAURI_CONFIG. Only the app package may copy the sidecar:
+    // two build scripts copying it into target/<profile>/ at once raced on
+    // Windows (os error 32, build.yml run 43648972717), so the host library's
+    // build.rs strips externalBin before calling tauri_build.
+    assert!(
+        script.contains("join(root, \"src-tauri\", \"mnemo2-app\", \"binaries\")"),
+        "{script_rel} no longer stages the helper into \
+         src-tauri/mnemo2-app/binaries/ — the app package resolves \
+         externalBin from its own manifest dir"
+    );
+    assert!(
+        !script.contains("join(root, \"src-tauri\", \"binaries\")"),
+        "{script_rel} must not stage the helper for the host library mnemo-app \
+         (src-tauri/binaries/): only the app package may copy the sidecar; two \
+         build scripts copying it race on Windows (os error 32, run \
+         43648972717)"
+    );
+    let build_rs_rel = "src-tauri/build.rs";
+    let build_rs = std::fs::read_to_string(format!("{root}/{build_rs_rel}"))
+        .unwrap_or_else(|e| panic!("{build_rs_rel} readable: {e}"));
     for needle in [
-        "join(root, \"src-tauri\", \"mnemo2-app\", \"binaries\")",
-        "join(root, \"src-tauri\", \"binaries\")",
+        "TAURI_CONFIG",
+        "externalBin",
+        "strip_external_bin_from_tauri_config();",
     ] {
         assert!(
-            script.contains(needle),
-            "{script_rel} no longer contains {needle} — it must stage the \
-             helper for BOTH crates that run tauri_build (the app package \
-             src-tauri/mnemo2-app and the host library mnemo-app in \
-             src-tauri), because each resolves externalBin from its own \
-             manifest dir (regression: build.yml run 43645076288)"
+            build_rs.contains(needle),
+            "{build_rs_rel} no longer contains {needle:?} — only the app \
+             package may copy the sidecar: two build scripts copying it race on \
+             Windows (os error 32, run 43648972717)"
         );
     }
 }

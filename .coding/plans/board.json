@@ -2490,6 +2490,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Wires an existing diagnostic log into one more caller; no specified capability, UI or wire shape changes."
+    },
+    {
+      "id": "71866ea3",
+      "status": "closed",
+      "created_at_ms": 1794683591966,
+      "closed_at_ms": 1794684624599,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-71866ea3-20261114-193024.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Version bump, changelog and README text only; no runtime behaviour or specified capability changes."
     }
   ]
 }

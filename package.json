@@ -11,7 +11,7 @@
     "build:mnemo2": "npm run build --workspace mnemo2",
     "dev:mnemo2:native": "cargo run -p mnemo2-app --bin mnemo2",
     "build:mnemo2:native": "npm run build:mnemo2 && cargo build -p mnemo2-app --features custom-protocol --bins --release && node scripts/install-mnemo2-mcp.mjs",
-    "bundle:mnemo2": "npm run build:mnemo2 && cd src-tauri/mnemo2-app && npx tauri build",
+    "bundle:mnemo2": "npm run build:mnemo2 && node scripts/stage-mnemo2-mcp-sidecar.mjs && cd src-tauri/mnemo2-app && npx tauri build --config tauri.bundle.conf.json",
     "rebuild:mnemo2": "node scripts/rebuild-mnemo2.mjs",
     "test:mnemo2": "npm test --workspace mnemo2",
     "test:mnemo2:native": "cargo test --manifest-path src-tauri/Cargo.toml -p mnemo-app --features mnemo2 --lib",

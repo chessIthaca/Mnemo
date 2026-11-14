@@ -651,6 +651,152 @@ fn build_workflow_tauri_cli_is_declared_and_locked() {
     );
 }
 
+/// The release installers must carry the Claude Code helper: the `mnemo`
+/// plugin runs `bin/mnemo2-mcp`, which only a source build used to create
+/// (`scripts/install-mnemo2-mcp.mjs`), so an installed Mnemo2 could not lead
+/// with Claude Code. Both platform jobs therefore build the helper from its
+/// own package and stage it as `binaries/mnemo2-mcp-<target triple>[.exe]`
+/// before bundling, and the bundle merges `tauri.bundle.conf.json` in —
+/// never `tauri.conf.json`, whose `bundle.externalBin` would make tauri's
+/// build script refuse to compile every plain `cargo build`/`cargo test`
+/// while the staged file is absent.
+///
+/// Regression: the released installers shipped without `mnemo2-mcp`, so the
+/// bundled plugin's MCP server could not start on a user's machine.
+#[test]
+fn build_workflow_bundles_the_mnemo2_mcp_helper() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let workflow = std::fs::read_to_string(format!("{root}/.github/workflows/build.yml"))
+        .expect("build.yml readable");
+
+    // Commands, not prose: the workflow header names `npx tauri build` in a
+    // comment, which is no bundle call.
+    const STAGE: &str = "node scripts/stage-mnemo2-mcp-sidecar.mjs";
+    let mut tauri_builds: Vec<(usize, &str)> = Vec::new();
+    let mut stage_calls: Vec<(usize, &str)> = Vec::new();
+    let mut offset = 0;
+    for line in workflow.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let at = offset + (line.len() - line.trim_start().len());
+        if !trimmed.starts_with('#') && trimmed.contains("npx tauri build") {
+            tauri_builds.push((at, trimmed));
+        }
+        if !trimmed.starts_with('#') && trimmed.contains(STAGE) {
+            stage_calls.push((at, trimmed));
+        }
+        offset += line.len();
+    }
+
+    // a. Exactly one bundle call per platform job, both merging the sidecar
+    // config in.
+    let commands: Vec<&str> = tauri_builds.iter().map(|(_, line)| *line).collect();
+    assert_eq!(
+        tauri_builds.len(),
+        2,
+        "build.yml must run `npx tauri build` exactly once per platform job, \
+         got {commands:?}"
+    );
+    for command in &commands {
+        assert!(
+            command.contains("--config tauri.bundle.conf.json"),
+            "`{command}` does not pass `--config tauri.bundle.conf.json`, so \
+             the installers ship without the mnemo2-mcp sidecar"
+        );
+    }
+
+    // b. Each bundle is preceded by its own staging step — the helper is
+    // built from the same package, so it has to exist before tauri bundles
+    // it, and each job stages its own target's copy.
+    assert!(
+        stage_calls.len() >= 2,
+        "build.yml runs `{STAGE}` {} time(s) — both platform jobs must stage \
+         the helper before bundling it",
+        stage_calls.len()
+    );
+    let (first_stage, _) = stage_calls[0];
+    let (second_stage, _) = stage_calls[1];
+    let (first_build, _) = tauri_builds[0];
+    let (second_build, _) = tauri_builds[1];
+    assert!(
+        first_stage < first_build,
+        "the windows job must stage the mnemo2-mcp helper (`{STAGE}`) before \
+         `npx tauri build` bundles it"
+    );
+    assert!(
+        first_build < second_stage,
+        "the second `{STAGE}` call comes before the windows `npx tauri build`: \
+         the first staging step belongs to the windows job, the second to the \
+         macos job"
+    );
+    assert!(
+        second_stage < second_build,
+        "the macos job must stage the mnemo2-mcp helper (`{STAGE} --target \
+         aarch64-apple-darwin`) before `npx tauri build` bundles it"
+    );
+
+    // c. Each build is followed by a check that the produced installer
+    // really carries the helper — a staged file that never reaches the
+    // bundle would otherwise fail silently.
+    for step in [
+        "Check the installers carry mnemo2-mcp",
+        "Check the app bundle carries mnemo2-mcp",
+    ] {
+        assert!(
+            workflow.contains(step),
+            "build.yml has no `{step}` step — nothing then proves the built \
+             installers carry the helper"
+        );
+    }
+
+    // d. The sidecar declaration lives in the release-only bundle config.
+    let bundle_rel = "src-tauri/mnemo2-app/tauri.bundle.conf.json";
+    let bundle_text = std::fs::read_to_string(format!("{root}/{bundle_rel}"))
+        .unwrap_or_else(|e| panic!("{bundle_rel} readable: {e}"));
+    let bundle: serde_json::Value = serde_json::from_str(&bundle_text)
+        .unwrap_or_else(|e| panic!("{bundle_rel} is valid JSON: {e}"));
+    let external_bin: Vec<&str> = bundle["bundle"]["externalBin"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{bundle_rel} declares no `bundle.externalBin` array"))
+        .iter()
+        .map(|entry| entry.as_str().expect("every externalBin entry is a string"))
+        .collect();
+    assert_eq!(
+        external_bin,
+        vec!["binaries/mnemo2-mcp"],
+        "{bundle_rel} must bundle the staged helper (`binaries/mnemo2-mcp` + \
+         `-<target triple>[.exe]`): tauri then installs it next to the app \
+         binary"
+    );
+
+    // e. The plain config must stay free of externalBin: tauri's build script
+    // refuses to compile when a configured sidecar file is missing, which
+    // would break every plain cargo build and `cargo test --workspace`.
+    let base_rel = "src-tauri/mnemo2-app/tauri.conf.json";
+    let base_text = std::fs::read_to_string(format!("{root}/{base_rel}"))
+        .unwrap_or_else(|e| panic!("{base_rel} readable: {e}"));
+    let base: serde_json::Value = serde_json::from_str(&base_text)
+        .unwrap_or_else(|e| panic!("{base_rel} is valid JSON: {e}"));
+    assert!(
+        base["bundle"].get("externalBin").is_none(),
+        "{base_rel} must not declare `bundle.externalBin` — that would make \
+         every plain `cargo build`/`cargo test` need the staged sidecar; the \
+         release build passes tauri.bundle.conf.json instead"
+    );
+
+    // f. The staging script builds the helper binary and stages it under
+    // src-tauri/mnemo2-app/binaries/.
+    let script_rel = "scripts/stage-mnemo2-mcp-sidecar.mjs";
+    let script = std::fs::read_to_string(format!("{root}/{script_rel}"))
+        .unwrap_or_else(|e| panic!("{script_rel} readable: {e}"));
+    for needle in ["--bin mnemo2-mcp", "binaries"] {
+        assert!(
+            script.contains(needle),
+            "{script_rel} no longer contains {needle:?} — it must build the \
+             helper binary and stage it into src-tauri/mnemo2-app/binaries/"
+        );
+    }
+}
+
 // Failure text for the vendored-patch lock guard below.
 const UNUSED_PATCH_MSG: &str = "Cargo.lock carries a [[patch.unused]] entry: a [patch.crates-io] override (the wry path patch in Cargo.toml) no longer applies to the resolved version, so the registry crate would ship instead of the vendored build — losing the WebView2 OS-account SSO + hard-reload patches. Re-pin tauri / tauri-runtime-wry by hand together with vendor/wry (see vendor/wry/PATCHES.md and the .github/dependabot.yml ignore list), then re-run this guard";
 

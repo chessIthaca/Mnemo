@@ -75,9 +75,23 @@ jobs:
       # root target/ bundle dirs.
       - name: Build the Mnemo2 frontend
         run: npm run build:mnemo2
+      # The helper is built from the same package, so it is staged first and
+      # bundled through tauri.bundle.conf.json (never tauri.conf.json, which
+      # would break plain cargo builds).
+      - name: Stage the mnemo2-mcp helper for the installers
+        run: node scripts/stage-mnemo2-mcp-sidecar.mjs
       - name: Tauri build Mnemo2 (unsigned installers)
-        run: npx tauri build
+        run: npx tauri build --config tauri.bundle.conf.json
         working-directory: src-tauri/mnemo2-app
+      - name: Check the installers carry mnemo2-mcp
+        shell: pwsh
+        run: |
+          $hits = Get-ChildItem target/release -Recurse -Include installer.nsi,main.wxs | Select-String -SimpleMatch 'mnemo2-mcp.exe'
+          $files = $hits | ForEach-Object { Split-Path $_.Path -Leaf } | Sort-Object -Unique
+          if (-not ($files -contains 'installer.nsi' -and $files -contains 'main.wxs')) {
+            Write-Error "mnemo2-mcp.exe is missing from the installers (found in: $($files -join ', '))"
+            exit 1
+          }
       - name: Upload Windows installers
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -214,9 +228,16 @@ jobs:
       # dirs under Mnemo2_* names.
       - name: Build the Mnemo2 frontend
         run: npm run build:mnemo2
+      # The helper is built from the same package, so it is staged first and
+      # bundled through tauri.bundle.conf.json (never tauri.conf.json, which
+      # would break plain cargo builds).
+      - name: Stage the mnemo2-mcp helper for the installers
+        run: node scripts/stage-mnemo2-mcp-sidecar.mjs --target aarch64-apple-darwin
       - name: Tauri build Mnemo2 (.app + .dmg, aarch64)
-        run: npx tauri build --target aarch64-apple-darwin
+        run: npx tauri build --target aarch64-apple-darwin --config tauri.bundle.conf.json
         working-directory: src-tauri/mnemo2-app
+      - name: Check the app bundle carries mnemo2-mcp
+        run: test -x target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app/Contents/MacOS/mnemo2-mcp
       # upload-artifact@v4 does not preserve file permissions (the Mach-O
       # exec bit) or symlinks, so a raw .app would not launch after download
       # (review F2). ditto preserves both — zip the .app and upload the zip

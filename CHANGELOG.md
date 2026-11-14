@@ -7,6 +7,21 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
 `.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
+## [2.3.1] — 2026-11-14
+
+The documentation describes Mnemo2 only, plus two fixes.
+
+### Changed
+
+- The README, `docs/FEATURES.md`, `docs/CONFIGURATION.md`, `docs/REVIEW-POLICY.md` and `mnemo2/README.md` describe Mnemo2 only; the README adds install-from-release and first-run steps (#127).
+- The README's first-run steps cover choosing the semantic-search model and the optional Laya install.
+- `agent.md`: the repository's test and review rules now reach Mnemo2's lead and workers, and the landing rules name the current `main` rulesets (#127).
+
+### Fixed
+
+- Removing an endpoint's model that is the configured default no longer fails: the default moves to the endpoint's next model (#126).
+- When Claude Code leads, `search` and `search_read` record stale-index repairs in `index-staleness.jsonl` (#128).
+
 ## [2.3.0] — 2026-11-12
 
 Mnemo2 is now the only Mnemo app. Mnemo1, the original desktop app, is retired: its code is gone and its installers no longer ship.

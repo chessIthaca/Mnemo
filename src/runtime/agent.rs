@@ -7183,6 +7183,31 @@ mod tests {
         }
     }
 
+    /// Wait for the `idle_compaction` savings row (tokens_before > tokens_after).
+    /// The row is written by a `tokio::spawn`ed task that hops to a
+    /// `spawn_blocking` SQLite thread, so under paused tokio time only a
+    /// real-time bound is safe: a fixed count of yields raced the blocking
+    /// pool on a loaded CI runner. Returns `None` after 10 real seconds.
+    async fn wait_for_idle_compaction_row(
+        store: &MemoryStore,
+    ) -> Option<crate::memory::SavingsEvent> {
+        use crate::memory::MemoryStoreTrait;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let row = store
+                .savings_events_rows(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.kind == "idle_compaction" && r.tokens_before > r.tokens_after);
+            if row.is_some() || std::time::Instant::now() >= deadline {
+                return row;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Build the idle-compaction test task: `MockProvider` ("mock") as the
     /// agent's provider, a context manager large enough that the fill-rate
     /// compaction never fires, an optional memory store (without one the
@@ -7890,8 +7915,6 @@ mod tests {
     /// "original kept" stop note may appear, the savings row must persist, and
     /// closing the inbox must let the task exit.
     async fn committed_cut_scenario(context: Option<(usize, f64)>, fanin_capacity: usize) {
-        use crate::memory::MemoryStoreTrait;
-
         let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
         let store = Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
         // Disable only the checkpoint lever: its archive await could let the
@@ -8009,17 +8032,7 @@ mod tests {
             "a committed summary must not claim the original was kept"
         );
 
-        let mut savings = None;
-        for _ in 0..100 {
-            let rows = store.savings_events_rows(None).await.unwrap();
-            savings = rows.into_iter().find(|row| {
-                row.kind == "idle_compaction" && row.tokens_before > row.tokens_after
-            });
-            if savings.is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let savings = wait_for_idle_compaction_row(&store).await;
         assert!(
             savings.is_some(),
             "a committed summary must record its idle_compaction savings row"
@@ -8222,19 +8235,9 @@ mod tests {
             start.elapsed()
         );
 
-        // The savings row persists in the store — written by a spawned task,
-        // so yield until the write lands.
-        let mut row: Option<crate::memory::SavingsEvent> = None;
-        for _ in 0..100 {
-            let rows = store.savings_events_rows(None).await.unwrap();
-            row = rows
-                .into_iter()
-                .find(|r| r.kind == "idle_compaction" && r.tokens_before > r.tokens_after);
-            if row.is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        // The savings row persists in the store — written by a spawned task on
+        // a blocking thread, so wait for it with a real-time bound.
+        let row = wait_for_idle_compaction_row(&store).await;
         assert!(
             row.is_some(),
             "the idle compaction must persist an idle_compaction savings row"

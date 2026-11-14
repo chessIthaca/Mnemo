@@ -30,3 +30,5 @@ Before tagging a Mnemo release:
 The bump is a routine-tier Mnemo worker step, as v2.3.0's plan 28eff481 did.
 
 Note: deepmerge (a low alert, via vite-plugin-svelte) had no fixed version in November 2026.
+
+Amended 2026-11-14: Pre-tag CLI check: run `npm ci` at the repo root first, then `npx --no-install tauri --version` in src-tauri/mnemo2-app (expect tauri-cli 2.12.x). A local node_modules older than the lockfile has no @tauri-apps/cli and the check fails falsely with "could not determine executable to run"; build.yml always runs `npm ci`, so only the fresh install is representative. Since 2.3.0 the release is a two-step Mnemo plan (manifests+lockfiles+CHANGELOG on one worker, any doc change on another), then PR with auto-merge, then the annotated tag on merged main.

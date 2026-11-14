@@ -191,9 +191,9 @@ cargo test -p mnemo-app --features mnemo2 --lib
 Other scripts:
 
 ```bash
-npm run dev:mnemo2 # http://127.0.0.1:5180 — browser preview, no engine behind it
-npm run dev:mnemo2:native # Tauri host + real lead and team (run dev:mnemo2 first)
-npm run check:mnemo2 # svelte-check
+npm run dev:mnemo2          # http://127.0.0.1:5180 — browser preview, no engine behind it
+npm run dev:mnemo2:native   # Tauri host + real lead and team (run dev:mnemo2 first)
+npm run check:mnemo2        # svelte-check
 npm run build:mnemo2:native
 ```
 

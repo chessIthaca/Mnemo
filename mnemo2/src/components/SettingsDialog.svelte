@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { createAboutTransport } from "../lib/about";
+  import { createClaudeCodeTransport } from "../lib/claudeCode";
   import { createLayaTransport } from "../lib/layaSettings";
   import { createMcpTransport } from "../lib/mcpSettings";
   import { createModelSettingsTransport } from "../lib/modelSettings";
@@ -13,6 +14,7 @@
   import { provideUnsavedRegistry } from "../lib/unsavedEdits";
   import AboutPage from "./AboutPage.svelte";
   import AppearancePage from "./AppearancePage.svelte";
+  import ClaudeCodePage from "./ClaudeCodePage.svelte";
   import EndpointsPage from "./EndpointsPage.svelte";
   import InlineConfirm from "./InlineConfirm.svelte";
   import McpPage from "./McpPage.svelte";
@@ -33,6 +35,7 @@
     | "savings"
     | "safety"
     | "mcp"
+    | "claude"
     | "appearance"
     | "about";
 
@@ -52,6 +55,7 @@
         { id: "savings", label: "Savings" },
         { id: "safety", label: "Safety" },
         { id: "mcp", label: "MCP" },
+        { id: "claude", label: "Claude Code" },
         { id: "appearance", label: "Appearance" },
       ],
     },
@@ -140,6 +144,7 @@
   const layaTransport = $derived(open ? createLayaTransport() : null);
   const safetyTransport = $derived(open ? createSafetyTransport() : null);
   const mcpTransport = $derived(open ? createMcpTransport() : null);
+  const claudeTransport = $derived(open ? createClaudeCodeTransport() : null);
   const appearanceTransport = $derived(open ? createAppearanceTransport() : null);
   const specsTransport = $derived(open ? createSpecsTransport() : null);
   // About talks to the shell directly, so it is ready whether or not the
@@ -235,6 +240,12 @@
             <McpPage transport={mcpTransport} />
           {:else}
             <p class="settings-empty">MCP server settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "claude"}
+          {#if claudeTransport}
+            <ClaudeCodePage transport={claudeTransport} />
+          {:else}
+            <p class="settings-empty">Claude Code setup is available in the desktop app.</p>
           {/if}
         {:else if page === "appearance"}
           {#if appearanceTransport}

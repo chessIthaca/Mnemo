@@ -127,6 +127,11 @@ pub mod mcp_settings;
 /// Appearance page (plan f1bd54e5).
 pub mod appearance_settings;
 
+/// The Claude Code plugin and its helper: the copy the app writes into
+/// `<config>/claude-plugin` at every start, and the Settings → Claude Code
+/// commands that connect it to Claude Code (plan 5b9975c1).
+pub mod claude_code;
+
 /// The Specs settings commands (OpenSpec schema list/resolve/add/fork,
 /// artifact templates and instructions, the project `config.yaml`, the
 /// plan preview, the specs status and the optional `openspec validate`)
@@ -624,6 +629,27 @@ pub fn run() {
             // the main thread.
             hang::start(app.handle());
             start_endpoint(app.handle());
+            // Ship the Claude Code plugin and its helper into <config>, off the
+            // main thread so a slow disk never delays the window.
+            let plugin_config = config_dir.clone();
+            std::thread::spawn(move || match std::env::current_exe() {
+                Ok(exe) => match claude_code::install_bundled(&plugin_config, &exe) {
+                    Ok(report) => {
+                        if report.helper_found && report.helper_updated {
+                            eprintln!(
+                                "mnemo2: updated the Claude Code helper in {}",
+                                report.plugin_dir.display()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("mnemo2: could not install the Claude Code plugin: {error}")
+                    }
+                },
+                Err(error) => {
+                    eprintln!("mnemo2: could not install the Claude Code plugin: {error}")
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -670,6 +696,8 @@ pub fn run() {
             mcp_settings::mcp_settings_get,
             mcp_settings::mcp_settings_save,
             mcp_settings::mcp_settings_test,
+            claude_code::claude_code_status,
+            claude_code::claude_code_connect,
             appearance_settings::appearance_settings_get,
             appearance_settings::appearance_settings_save,
             ipc::lead_snapshot,

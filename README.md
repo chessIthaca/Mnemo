@@ -138,8 +138,9 @@ Download the installer for your platform from the [releases page](https://github
 
 1. **Settings → Endpoints**: add an OpenAI-compatible, Anthropic-compatible or local endpoint (Ollama, LM Studio) and its models. API keys are stored with user-only permissions.
 2. **Settings → Tiers**: put a model on each tier you want to use. An empty tier falls back to the nearest cheaper tier that has a model.
-3. **Settings → Models**: download the local embedding model, so memory search is semantic.
-4. Open a project folder from the start screen, choose the lead's model in the composer, and describe what you want.
+3. **Settings → Models → Code indexing**: choose the model that embeds your code and memory for semantic search, click **Install** to download it, then **Save indexing**. The choices, smallest first: MiniLM L6 v2 (fast, 90 MB), BGE Small EN v1.5 (balanced, 130 MB), BGE Base EN v1.5 (higher quality, 410 MB) and Nomic Embed Text v1.5 (best quality, 280 MB). **Keyword only** skips the download and matches on keywords instead. The choice takes effect the next time you open a project.
+4. *Optional:* **Settings → Tiers → Does Laya help pick the tier?**: click **Install Laya** to download the local Laya classifier (roughly 0.8–1 GB with its checkpoint; Mnemo starts and stops it on 127.0.0.1 itself), then choose **Watch only**, **Suggest** or **Auto**. Without Laya the lead picks every worker's tier.
+5. Open a project folder from the start screen, choose the lead's model in the composer, and describe what you want.
 
 ### Build from source
 
@@ -201,9 +202,9 @@ Two heavyweight optional cargo features exist on the library — `browser` (head
 
 ## Settings worth checking
 
-- Download the local embedding model in **Settings → Models**, then rebuild the memory index (Memory tab → Diagnostics → Memory upkeep → **Rebuild index**) so recall is semantic.
-- For Laya tier routing, open **Settings → Tiers** and choose whether Laya watches, suggests or picks each worker's tier. Laya is off by default; turning it on downloads a self-contained runtime (roughly 0.8–1 GB plus the checkpoint), and Mnemo starts and stops the local `laya-serve` on 127.0.0.1 itself.
+- If memory recall still matches only keywords after you installed an indexing model, reopen the project or rebuild the index: Memory tab → Diagnostics → Memory upkeep → **Rebuild index**.
 - In **Settings → Appearance**, choose what closing the window does: quit, hide to the tray, or automatic.
+- Every setting and file is described in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ### Context economy — the `[general.optimizer]` levers
 

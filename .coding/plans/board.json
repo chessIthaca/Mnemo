@@ -2512,6 +2512,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Test-only change: makes two existing tests wait deterministically; no product behaviour changes."
+    },
+    {
+      "id": "260dbc60",
+      "status": "closed",
+      "created_at_ms": 1794688183130,
+      "closed_at_ms": 1794688282636,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-260dbc60-20261114-203122.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "README text only; no runtime behaviour or specified capability changes."
     }
   ]
 }

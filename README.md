@@ -132,7 +132,7 @@ PLAN.md               the technical-decisions log
 
 ### Install a release
 
-Download the installer for your platform from the [releases page](https://github.com/chessIthaca/Mnemo/releases): the `.msi` or `-setup.exe` for Windows, the `.dmg` for macOS on Apple silicon.
+Download the installer for your platform from the [releases page](https://github.com/chessIthaca/Mnemo/releases): the `.msi` or `-setup.exe` for Windows, the `.dmg` for macOS on Apple silicon. Leading with Claude Code needs a build from source for now; see [Lead with Claude Code](#lead-with-claude-code).
 
 ### First run
 
@@ -171,7 +171,26 @@ npm run dev:mnemo2            # Vite dev server (browser-only preview)
 npm run dev:mnemo2:native    # Tauri host + real lead and team (run dev:mnemo2 first)
 ```
 
-To lead from Claude Code instead of Mnemo2's lead chat, install the plugin as described in [mnemo2/plugin/README.md](mnemo2/plugin/README.md).
+### Lead with Claude Code
+
+Claude Code (the CLI or the Claude Desktop Code tab) can lead a Mnemo2 project instead of the built-in lead chat, through the `mnemo` plugin in `mnemo2/plugin/`. It plans, dispatches, reviews and merges; the workers still run on your own endpoints and tiers, and only the lead uses your Claude subscription.
+
+For now this needs Mnemo2 built from source: the plugin's `mnemo2-mcp` helper comes from that build and is not in the release installers.
+
+1. Build Mnemo2 from source as above. The build also installs the helper into `mnemo2/plugin/bin/` and `~/.mnemo/bin/`.
+2. Open your project in Mnemo2 once, so it is registered.
+3. Install the plugin from your clone. In Claude Desktop: Code tab → **+** → **Add plugins**, add a marketplace from the clone's folder, then install `mnemo`. With the CLI:
+
+   ```bash
+   claude plugin marketplace add <path to your clone>
+   claude plugin install mnemo@mnemo
+   ```
+
+4. Start Claude Code in the project folder (or any folder inside it) and describe what you want. Mnemo2 starts in the tray if it is not running, and mission control shows "Lead: Claude Code (external)".
+
+On first use Claude offers to allow the Mnemo tools, so the lead does not stall on permission prompts.
+
+Permissions, notices and troubleshooting are in [mnemo2/plugin/README.md](mnemo2/plugin/README.md).
 
 ---
 

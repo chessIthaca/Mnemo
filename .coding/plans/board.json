@@ -2459,6 +2459,17 @@
       "no_spec_impact": "Test-only change: makes an existing test deterministic; no product behavior changes."
     },
     {
+      "id": "2261ac6b",
+      "status": "closed",
+      "created_at_ms": 1794573930826,
+      "closed_at_ms": 1794574334501,
+      "report_path": "C:\\mnemo\\.coding\\reviews\\team-2261ac6b-20261113-125214.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Internal save-time validation in the headless setup; no capability under .coding/openspec/specs describes the refusal, and the UI and wire shapes do not change."
+    },
+    {
       "id": "5b0f2394",
       "status": "closed",
       "created_at_ms": 1794677927562,

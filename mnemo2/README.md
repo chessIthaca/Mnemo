@@ -7,12 +7,11 @@ headless-engine `Engine` backs every session, each worker gets its own
 browser-only Vite session has no engine behind it, so it shows an explicit
 native-shell-required state instead of simulating anything.
 
-The product shape is unchanged from Phase 0b: the lead owns a workflow for each
-task, tasks are independent, and lead and worker models are visible wherever an
-agent appears. Native Phase 3 adds durable reviews/findings, exact-tip checks,
-tiny review fixes and tracked fixer routing, serialized local merge/revert, and
-cumulative worker telemetry without per-agent token or cost budgets. No review
-or merge result is simulated.
+The lead owns a workflow for each task, tasks are independent, and lead and
+worker models are visible wherever an agent appears. Reviews and findings are
+durable, checks bind to the exact worker commit, merges are serialized and
+local, and worker cost is telemetry, not a budget. No review or merge result is
+simulated.
 
 ## Run
 
@@ -198,9 +197,8 @@ only the app.
   `spawn_agent` is removed from the advertised lead registry and denied as a
   fallback. Workers get `message_parent`, whose messages land in the lead
   conversation and are forwarded as attributed lead notices.
-- **State.** `team.json` in the project's app-owned state directory is the
-  app-owned worker ledger and stores the live-worker cap across restarts. Only
-  TeamManager mutates that state.
+- **State.** `team.json` in `.coding/mnemo2/` is the worker ledger and stores
+  the live-worker cap across restarts. Only TeamManager mutates it.
 - **Deleting workers.** **Delete** in a worker's detail, or **Delete old** in
   Mission Control (merged, cancelled, stopped, interrupted, and failed workers),
   first shows a `team_delete_preview` of what goes: the record, transcript,
@@ -231,11 +229,10 @@ only the app.
   path. Other platforms
   offer an external-open fallback. Worker screenshot chips open actual sandbox
   PNG previews, and chat links open the Browser pane.
-- **Persistence** isolates state by a hash of the canonical project path.
-  Transcripts carry project identity and timestamps; worker slots and
-  workbench preferences survive restart with backup recovery. The older shared
-  `lead/` directory is left untouched. Its records have no project identity,
-  so ambiguous legacy state is not automatically assigned to another project.
+- **Persistence** keeps each project's state in its own `.coding/mnemo2/` (see
+  **State** under Native lead). Transcripts carry project identity and
+  timestamps; worker slots and workbench preferences survive restart with
+  backup recovery.
 - **Lifecycle** includes real Git/session metadata, New project, Resume,
   Review, and Clean. Opening a second live instance on one project requires
   confirmation. Closing active work asks before stopping it. Cleanup removes
@@ -285,75 +282,13 @@ only the app.
 
 ## Review and merge policy
 
-`src/lib/review.ts` mirrors the native merge-eligibility gate.
-
-**Acceptance scenarios first.** A plan that will dispatch `review_risk: "high"`
-carries a `## Acceptance scenarios` section with at least one observable bullet
-(a command, a persistence state, a concurrency outcome, a security property, or
-a UI behavior) written before implementation: `plan_create`
-`acceptance_scenarios`, or `plan_update` `add_acceptance_scenarios`. Other plans
-are encouraged to include it. `team_dispatch` rejects a high-risk dispatch whose
-plan has none, workers receive the scenarios with their plan, and the lead
-re-checks them on the integrated tree before the plan closes.
-
-**Unanchored pass, then evidence.** The lead reads the target diff first
-(`git_read` op `diff`/`show`, the **Diff** tab, or `git diff <base>..<tip>`) and
-forms an opinion *before* reading the worker's summary, findings, or test
-claims. It then records one evidence object per review:
-
-```text
-evidence: {
-  unanchored_pass: boolean,
-  intent: string,
-  execution: string,
-  integration: string,
-  test_quality: string,
-  residual_risk: string,
-  independent_reviewer_id?: string | null,
-  audit_adjudication?: string | null
-}
-```
-
-`intent` says what the change was meant to do and whether the diff matches the
-plan; `execution` covers the real changed call sites and error paths;
-`integration` covers contracts, persistence, concurrency, and neighbouring
-modules; `test_quality` asks whether tests genuinely exercise the change
-(including a red-before/green-after regression test for a defect fix);
-`residual_risk` names what remains unverified or assumed. A **standard** review
-requires `unanchored_pass: true` and all five assessment strings nonempty. A
-no-findings result still needs a substantive rationale — "looks good" or a
-restated summary fails the gate.
-
-**Risk and independent audit.** The lead marks shared contracts, persistence,
-concurrency, security, and large or cross-cutting changes
-`review_risk: "high"`. A high-risk worker cannot merge on lead review alone.
-`team_audit_dispatch { worker_id, reviewer_id, model?, reasoning_effort?, brief? }`
-creates a fresh read-only audit worker against the implementation worker's
-branch/tip and plan context, with no plan step and **without** the
-implementation worker's summary or conclusions. The audit worker cannot edit
-files, commit, merge, spawn, ask the user, or tick a plan step; its completion
-notice asks the lead to adjudicate the target review, not merge the reviewer.
-Fresh context is required for independence; a different model is preferred when
-available but not required. The lead links the completed audit as
-`independent_reviewer_id` and writes `audit_adjudication` — what was accepted or
-rejected and why. The host validates kind, target, exact tip, and terminal
-non-failed state at review and merge.
-
-**Staleness and legacy records.** A fix commit (`review_fix`, a worker fix, or a
-routed fixer) invalidates the prior lead review and makes the previous audit tip
-stale; evidence and any audit must be repeated at the new tip. Worker records
-carry `kind` (`"implementation"`/`"audit"`, default implementation),
-`review_risk`, and optional `audit_target`/`audit_tip`. Legacy ledger records
-deserialize as implementation/standard with no evidence, so they need a fresh
-review — and an audit where high risk — before merge.
-
-**Merge eligibility.** The worker must be in review; every finding must be fixed
-or `wontfix` with a written justification; the structured review evidence must be
-complete for the current tip; a high-risk worker must have a completed audit
-linked to that same tip and a nonempty adjudication; and every branch-tip check
-must have passed. A fix or fixer commit replaces the check result and must be
-re-run before merge. The lead is the reviewer of record and remains accountable
-for the adjudication. This is Mnemo2's policy.
+A worker merges only after the lead's review of its exact commit: structured
+evidence from an unanchored diff pass, every check recorded on that commit and
+passed, every finding fixed or closed with a written reason, and, for
+`review_risk: "high"` work, an independent read-only audit at the same commit
+with the lead's adjudication. `src/lib/review.ts` mirrors the native
+merge-eligibility gate. The full policy is in
+[docs/REVIEW-POLICY.md](../docs/REVIEW-POLICY.md).
 
 ## Claude Code as the lead
 
@@ -486,19 +421,6 @@ all live. Setup and day-to-day use are in
   worker vanishes from a sync.
 - The team peek is anchored over the chat side.
 
-## Roadmap status
+## Design
 
-See `.coding/design/mnemo2.md` for the full design and acceptance criteria:
-
-1. **Lead engine + model registry** — complete: one real streaming lead session,
-   config-backed model picker, project lead model.
-2. **Parallel team runtime** — complete: shared engine, per-task
-   branches/worktrees/briefs/models, worker messaging, slots, restart recovery.
-3. **Review, merge, recovery, cost** — complete: durable findings, tiny-work
-   fixes, tracked fixer routing, exact-tip checks, serialized local merge/revert,
-   conflict and crash recovery, idempotent lifecycle controls, real compaction,
-   cumulative usage telemetry, and pricing-aware cost.
-4. **Native shell + workbench + persistence** — complete: real Diff/Plan tabs,
-   native browser, isolated per-project state and preferences, safe recovery,
-   notifications, accessibility, and narrow layouts. Remaining product choices
-   are recorded in the design's open-decisions section.
+The full design and its open decisions are in `.coding/design/mnemo2.md`.

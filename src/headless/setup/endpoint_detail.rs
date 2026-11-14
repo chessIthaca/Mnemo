@@ -428,7 +428,8 @@ impl Setup {
             }
         }
 
-        // Defaults follow a rename; a vanished default model is refused.
+        // Defaults follow a rename; a vanished default model re-points to
+        // the endpoint's first remaining model.
         let mut default_provider = current.general.general.default_provider.clone();
         let mut default_model = current.general.general.default_model.clone();
         let hosts_default = default_provider.as_deref() == Some(prev_name.as_str())
@@ -444,10 +445,7 @@ impl Setup {
                 } else if prev_ep.as_ref().is_some_and(|p| p.has_model(&dm))
                     && !endpoint.has_model(&dm)
                 {
-                    return Err(err(format!(
-                        "'{dm}' is the configured default model of '{prev_name}'; \
-                         change the default model before removing it"
-                    )));
+                    default_model = endpoint.models.first().map(|m| m.id.clone());
                 }
             }
         }
@@ -874,12 +872,31 @@ simple = ["a/m2"]
     }
 
     #[tokio::test]
-    async fn default_model_removal_is_refused() {
-        let (_dir, setup) = setup_with(BASE);
+    async fn default_model_removal_repoints_the_global_default() {
+        let (dir, setup) = setup_with(BASE);
         let mut dto = setup.endpoints_detail().unwrap().remove(0);
         dto.models.retain(|m| m.id != "m1");
+        setup.upsert_endpoint_detail(dto, None).await.unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.general.general.default_provider.as_deref(), Some("a"));
+        assert_eq!(cfg.general.general.default_model.as_deref(), Some("m2"));
+    }
+
+    #[tokio::test]
+    async fn removing_the_only_model_of_the_default_endpoint_still_errors() {
+        let toml = &BASE
+            .replace("models = [\"m1\", \"m2\"]", "models = [\"m1\"]")
+            .replace("simple = [\"a/m2\"]", "simple = [\"b/x\"]");
+        let (dir, setup) = setup_with(toml);
+        let before = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let mut dto = setup.endpoints_detail().unwrap().remove(0);
+        dto.models.clear();
         let e = setup.upsert_endpoint_detail(dto, None).await.unwrap_err();
-        assert!(e.to_string().contains("default model"), "{e}");
+        assert!(e.to_string().contains("has no models"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+            before
+        );
     }
 }
 

@@ -4,8 +4,9 @@
 // Mnemo2 must carry that helper: otherwise leading with Claude Code needs a
 // source build (`scripts/install-mnemo2-mcp.mjs`). Tauri ships it as a
 // sidecar (`externalBin`), so it has to exist as
-// `src-tauri/mnemo2-app/binaries/mnemo2-mcp-<target triple>[.exe]` before
-// `npx tauri build` runs.
+// `binaries/mnemo2-mcp-<target triple>[.exe]` under both crates' manifest
+// dirs (`src-tauri/mnemo2-app/` and `src-tauri/`) before `npx tauri build`
+// runs.
 //
 // The helper is built from the same package as the app, and tauri's build
 // script refuses to compile when a configured sidecar file is missing — so
@@ -16,7 +17,9 @@
 //
 // It builds `cargo build -p mnemo2-app --bin mnemo2-mcp --release --features
 // custom-protocol` (plus `--target <triple>` when asked) and copies the
-// result to `src-tauri/mnemo2-app/binaries/mnemo2-mcp-<triple>[.exe]`.
+// result to `src-tauri/mnemo2-app/binaries/` and `src-tauri/binaries/` as
+// `mnemo2-mcp-<triple>[.exe]`, for both crates that run `tauri_build` — each
+// resolves `externalBin` from its own manifest dir.
 //
 // Tauri then installs the staged file next to the main executable (Windows:
 // the install folder; macOS: Mnemo2.app/Contents/MacOS/mnemo2-mcp), where the
@@ -89,8 +92,17 @@ if (!existsSync(helper)) {
   process.exit(1);
 }
 
-const binDir = join(root, "src-tauri", "mnemo2-app", "binaries");
-const dest = join(binDir, `mnemo2-mcp-${triple}${exe}`);
-mkdirSync(binDir, { recursive: true });
-copyFileSync(helper, dest);
-console.log(`stage-mnemo2-mcp-sidecar: ${dest}`);
+// Both crates that run tauri_build resolve externalBin relative to their own
+// manifest dir, and the Tauri CLI hands the merged config (with externalBin)
+// to both build scripts: the app package (src-tauri/mnemo2-app) and the host
+// library mnemo-app (src-tauri). Stage the helper for each.
+const binDirs = [
+  join(root, "src-tauri", "mnemo2-app", "binaries"),
+  join(root, "src-tauri", "binaries"),
+];
+for (const binDir of binDirs) {
+  const dest = join(binDir, `mnemo2-mcp-${triple}${exe}`);
+  mkdirSync(binDir, { recursive: true });
+  copyFileSync(helper, dest);
+  console.log(`stage-mnemo2-mcp-sidecar: ${dest}`);
+}

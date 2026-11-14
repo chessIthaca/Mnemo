@@ -13,7 +13,8 @@ How to configure Mnemo2: the global files in `~/.mnemo/` (or `$MNEMO_HOME`), end
 | `projects.toml` | registered projects |
 | `mnemo2.toml` | Mnemo2-only settings: `[routing]` and `[window]` |
 | `state-owner-id` | this machine's id, which stamps each project's `.coding/mnemo2/` |
-| `bin/mnemo2-mcp` | the Claude Code plugin's helper, installed by the build |
+| `bin/mnemo2-mcp` | the Claude Code plugin's helper; Mnemo2 installs it at every start (a source build installs it too) |
+| `claude-plugin/` | the Claude Code plugin as a local marketplace (`.claude-plugin/marketplace.json` plus `plugin/` with the helper in `plugin/bin/`), rewritten at every start; Settings → Claude Code connects it |
 | `run/` | one `mnemo2-<pid>.json` per running Mnemo2 (port, token, open project), read by the helper |
 | `index-staleness.jsonl` | the index-repair log (last section) |
 | `laya/training/` | Laya training logs |

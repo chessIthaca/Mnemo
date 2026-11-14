@@ -499,14 +499,20 @@ mod tests {
     fn real_agent_md_scopes_for_team() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/agent.md");
         let text = std::fs::read_to_string(path).unwrap();
+        // The retired plan-first workflow has no rules left in this file.
+        assert!(!text.contains("<!-- mnemo:classic -->"), "classic-only block left");
+        for retired in ["merge_to_main", "update_plan", "23755694", "Run-All", "run-all"] {
+            assert!(!text.contains(retired), "retired rule left: {retired}");
+        }
         let c = Constitution { global: String::new(), project: text };
         let team = c.scoped(ConstitutionScope::Team).project;
         let classic = c.scoped(ConstitutionScope::Classic).project;
-        assert!(!team.contains("update_plan"), "classic-only rule leaked");
-        assert!(!team.contains("Review expectations"));
+        // Mnemo2's lead and workers receive the repository rules.
         assert!(team.contains("File mutation policy"), "universal rule lost");
+        assert!(team.contains("## Review expectations"));
+        assert!(team.contains("cargo test --workspace"));
         assert!(team.contains("### Mnemo2 team merge policy"));
-        assert!(classic.contains("Review expectations"));
+        // The classic scope still drops the team section.
         assert!(!classic.contains("### Mnemo2 team merge policy"));
         assert!(!team.contains("mnemo:") && !classic.contains("mnemo:"));
     }

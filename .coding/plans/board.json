@@ -2501,6 +2501,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Version bump, changelog and README text only; no runtime behaviour or specified capability changes."
+    },
+    {
+      "id": "01295839",
+      "status": "closed",
+      "created_at_ms": 1794685780832,
+      "closed_at_ms": 1794686304992,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-01295839-20261114-195824.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only change: makes two existing tests wait deterministically; no product behaviour changes."
     }
   ]
 }

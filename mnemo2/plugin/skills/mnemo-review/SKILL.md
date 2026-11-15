@@ -47,6 +47,8 @@ Afterwards run `git status` in the worktree. If the checks left tracked changes 
 - `findings`: the complete list. Each has `title`, `detail` (why it matters), `file`, `line` and `severity` high or low. Open findings block the merge regardless of severity, so do not use findings for taste; use them for things that must change. Reuse the same ids when re-reviewing.
 - `evidence`: `unanchored_pass` true, plus your own substantive `intent`, `execution`, `integration`, `test_quality` and `residual_risk`. These are what you checked and what you accept, not a paraphrase of the worker's summary.
 
+A change is light when its risk is not high and either every changed file is a test or documentation file, or the diff has at most 60 changed lines in total. A light review still reads the diff and runs at least one check, and its evidence needs only `unanchored_pass` true and `intent`; every other change needs all five evidence fields. Mnemo2 decides; the `team_review` result says which.
+
 ## 5. Close findings
 
 - Tiny and exact: `review_fix`. Then re-run the checks and re-review, since it moves the tip.

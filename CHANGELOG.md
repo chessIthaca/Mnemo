@@ -7,10 +7,12 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
 `.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
-## [Unreleased]
+## [2.5.0] — 2026-11-15
+
+Mnemo2 keeps itself up to date. Installs of 2.4.0 or older need this release once by hand; from 2.5.0 on, updates arrive on their own.
 
 ### Added
-- Mnemo2 updates itself: it checks for a new release at start and every 6 hours, downloads it in the background and installs it when you click **Restart now**. Releases publish signed update files and `latest.json`.
+- Mnemo2 updates itself: it checks for a new release at start and every 6 hours, downloads it in the background and installs it when you click **Restart now**. Releases publish signed update files and `latest.json`. (#133)
 
 ## [2.4.0] — 2026-11-15
 

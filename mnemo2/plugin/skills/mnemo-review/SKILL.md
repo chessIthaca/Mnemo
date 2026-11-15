@@ -45,9 +45,9 @@ Afterwards run `git status` in the worktree. If the checks left tracked changes 
 
 - `summary`: your verdict in a few sentences.
 - `findings`: the complete list. Each has `title`, `detail` (why it matters), `file`, `line` and `severity` high or low. Open findings block the merge regardless of severity, so do not use findings for taste; use them for things that must change. Reuse the same ids when re-reviewing.
-- `evidence`: `unanchored_pass` true, plus your own substantive `intent`, `execution`, `integration`, `test_quality` and `residual_risk`. These are what you checked and what you accept, not a paraphrase of the worker's summary.
+- `evidence`: `unanchored_pass` true, plus your own substantive `intent`, `execution`, `integration`, `test_quality` and `residual_risk`. These are what you checked and what you accept, not a paraphrase of the worker's summary. A light change needs only `unanchored_pass` and `intent` (below).
 
-A change is light when its risk is not high and either every changed file is a test or documentation file, or the diff has at most 60 changed lines in total. A light review still reads the diff and runs at least one check, and its evidence needs only `unanchored_pass` true and `intent`; every other change needs all five evidence fields. Mnemo2 decides; the `team_review` result says which.
+A change is light when it is not high risk and either it changes at most 60 lines in total, or every changed file is Markdown (`.md`) or a test file (a `tests` folder, or `.test.`, `.spec.`, `_test.` or `_tests.` in the file name). A test module inside a normal source file does not make it a test file. Mnemo2 decides from the diff, and the `team_review` result says whether the light or the full rule applied. A light review still reads the whole diff and records at least one check; only the four other evidence fields become optional.
 
 ## 5. Close findings
 

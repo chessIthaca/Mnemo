@@ -420,14 +420,21 @@ pub(crate) fn now_ms() -> u64 {
 /// The release feed this build checks: the plugin's GitHub feed with the
 /// updater compiled in, otherwise the no-op source of a source build.
 fn update_source(app: &tauri::AppHandle) -> Box<dyn UpdateSource> {
-    #[cfg(feature = "auto-update")] {
+    #[cfg(feature = "auto-update")]
+    {
         Box::new(plugin::PluginSource { app: app.clone() })
     }
-    #[cfg(not(feature = "auto-update"))] {
+    #[cfg(not(feature = "auto-update"))]
+    {
         let _ = app;
         Box::new(SourceBuild)
     }
 }
+
+/// Start the background loop: check [`FIRST_CHECK_DELAY`] after start, then
+/// every [`CHECK_INTERVAL`] while no update is ready. A source build starts
+/// `disabled`, so its loop ends before the first check and nothing is ever
+/// fetched.
 pub(crate) fn start(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         use tauri::Manager as _;

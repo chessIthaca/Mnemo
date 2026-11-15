@@ -1874,11 +1874,14 @@ mod tests {
     /// Windows-only (user decision 2026-09-20): this test launches a real
     /// headless Chromium and polls 15s for the profile dir's removal — on
     /// the macOS CI leg (run 35521221353) the dir outlives the poll, and
-    /// the root cause is not diagnosable from a Windows host. Gated
-    /// rather than deadline-widened; Windows, where the app ships, keeps
-    /// the coverage.
+    /// the root cause is not diagnosable from a Windows host. Also ignored,
+    /// like the module's other real-Chromium tests: a slow CI runner times
+    /// out starting Chromium. The Chromium-free tests below cover the
+    /// removal loop and close's profile release; run this one locally with
+    /// `cargo test -- --ignored` to check kill-before-removal end to end.
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore = "integration: spawns a headless Chromium process; run with `cargo test -- --ignored`"]
     async fn profile_dir_is_removed_on_close() {
         let manager = BrowserManager::new();
         manager
@@ -1905,6 +1908,89 @@ mod tests {
         assert!(
             !profile_path.exists(),
             "profile dir should be removed on close (Review B1)"
+        );
+    }
+
+    /// The removal loop keeps retrying while a file in the profile is locked
+    /// (as a dying Chromium's crashpad or an AV scan does) and removes the dir
+    /// once the lock goes away.
+    #[cfg(windows)]
+    #[test]
+    fn profile_removal_retries_until_a_lock_is_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let locked = path.join("Default").join("Lock");
+        std::fs::create_dir_all(locked.parent().unwrap()).unwrap();
+        std::fs::write(&locked, b"x").unwrap();
+        // share_mode(0): no other handle may read, write or delete it.
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+
+        BrowserManager::schedule_profile_removal(dir);
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        assert!(
+            path.exists(),
+            "a locked profile must survive the first attempts"
+        );
+
+        drop(handle);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            !path.exists(),
+            "the loop must remove the dir once the lock is released"
+        );
+    }
+
+    /// An unlocked profile dir (a nested file included) is removed by the
+    /// background loop — the Chromium-free half of `schedule_profile_removal`.
+    #[test]
+    fn profile_removal_removes_an_unlocked_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let nested = path.join("Default").join("Preferences");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"{}").unwrap();
+
+        BrowserManager::schedule_profile_removal(dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!path.exists(), "an unlocked profile dir must be removed");
+    }
+
+    /// `close` with no browser attached still releases the profile it owns:
+    /// take the `TempDir` out of the state, unregister the live profile, and
+    /// drop the dir.
+    #[tokio::test]
+    async fn close_without_a_browser_releases_the_profile() {
+        let manager = BrowserManager::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        register_live_profile(&path);
+        manager.state.lock().await.profile = Some(dir);
+
+        manager.close().await.expect("close");
+
+        assert!(
+            !LIVE_PROFILES.lock().unwrap().contains(&path),
+            "close must unregister the profile"
+        );
+        assert!(
+            !path.exists(),
+            "with no browser attached, close drops the TempDir and the dir goes"
+        );
+        assert!(
+            manager.state.lock().await.profile.is_none(),
+            "close must take the profile out of the state"
         );
     }
 

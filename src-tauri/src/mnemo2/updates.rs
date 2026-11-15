@@ -497,8 +497,9 @@ pub async fn update_restart(
 
 /// Install the update the user asked to restart into, if any.
 ///
-/// `true` when an install was attempted and failed (the caller then exits
-/// normally); on success the app restarts and this never returns.
+/// `false` when nothing was armed or the install failed; the caller then
+/// performs the normal exit. On success the app restarts and this never
+/// returns.
 pub(crate) fn install_if_requested(app: &tauri::AppHandle) -> bool {
     use tauri::Manager as _;
 

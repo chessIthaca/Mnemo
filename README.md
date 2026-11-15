@@ -134,6 +134,8 @@ PLAN.md               the technical-decisions log
 
 Download the installer for your platform from the [releases page](https://github.com/chessIthaca/Mnemo/releases): the `.msi` or `-setup.exe` for Windows, the `.dmg` for macOS on Apple silicon. Mnemo2 also sets up the Claude Code plugin; see [Lead with Claude Code](#lead-with-claude-code).
 
+Mnemo2 keeps itself up to date: about 30 seconds after it starts, and every 6 hours while it runs, it checks GitHub for a newer release and downloads it in the background. When it is ready, a note offers **Restart now**; Settings → About shows the update state and has **Check now**. Builds from source never update themselves.
+
 ### First run
 
 1. **Settings → Endpoints**: add an OpenAI-compatible, Anthropic-compatible or local endpoint (Ollama, LM Studio) and its models. API keys are stored with user-only permissions.

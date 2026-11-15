@@ -436,6 +436,105 @@ fn build_workflow_stages_each_macos_dmg() {
     );
 }
 
+/// Every release publishes Tauri's auto-update files: both platform builds
+/// sign their installers (`--features auto-update` plus the
+/// `tauri.updater.conf.json` overlay turn on `createUpdaterArtifacts`), and the
+/// release job runs `scripts/updater-manifest.mjs` over the downloaded
+/// artifacts to write `latest.json` before the release step attaches it.
+///
+/// A v* tag build without the `TAURI_SIGNING_PRIVATE_KEY` secret must fail: it
+/// can produce no `.sig` files, and a release without `latest.json` would leave
+/// every installed Mnemo2 unable to update itself. Branch builds without the
+/// secret only skip the updater artifacts.
+#[test]
+fn build_workflow_publishes_the_auto_update_manifest() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let workflow = std::fs::read_to_string(format!("{root}/.github/workflows/build.yml"))
+        .expect("build.yml readable");
+
+    // a. Both platform builds sign the installers: the `auto-update` feature
+    // and the createUpdaterArtifacts overlay.
+    let builds = [
+        ("windows", "Tauri build Mnemo2 (unsigned installers)"),
+        ("macos", "Tauri build Mnemo2 (.app + .dmg, aarch64)"),
+    ];
+    for (job, step_name) in builds {
+        let block = job_block(&workflow, job);
+        let step = step_named(&block, step_name);
+        for needle in [
+            "--features auto-update",
+            "--config tauri.updater.conf.json",
+        ] {
+            assert!(
+                step.contains(needle),
+                "the {job} job's `{step_name}` step does not pass {needle:?} — \
+                 tauri then writes no signed updater artifacts and the release \
+                 ships no auto-update files: {step}"
+            );
+        }
+    }
+
+    // b. The signing key reaches the builds, and a tag without it is an error.
+    for needle in [
+        "TAURI_SIGNING_PRIVATE_KEY",
+        "Release tags need the TAURI_SIGNING_PRIVATE_KEY secret",
+    ] {
+        assert!(
+            workflow.contains(needle),
+            "build.yml no longer mentions {needle:?} — the update signing key \
+             is what makes the published updater artifacts verifiable, and a \
+             release without it must fail instead of shipping no latest.json"
+        );
+    }
+
+    // c. The release job writes latest.json BEFORE the release step attaches it
+    // (the repo's releases are immutable once published, so every asset — the
+    // manifest included — goes up while the release is still a draft).
+    let release = job_block(&workflow, "release");
+    let manifest_step = step_named(&release, "Write the auto-update manifest");
+    assert!(
+        manifest_step.contains("scripts/updater-manifest.mjs"),
+        "the release job's `Write the auto-update manifest` step must run \
+         `scripts/updater-manifest.mjs`: {manifest_step}"
+    );
+    assert!(
+        step_offset(&release, "Write the auto-update manifest")
+            < step_offset(&release, "Create GitHub release with installers"),
+        "the release job must write latest.json BEFORE `Create GitHub release \
+         with installers` attaches it — a published release is immutable"
+    );
+    let upload = step_named(&release, "Create GitHub release with installers");
+    assert!(
+        upload.lines().any(|line| line.trim() == "dist/latest.json"),
+        "the release step's files: list must upload `dist/latest.json`, so \
+         releases/latest/download/latest.json resolves for installed apps: \
+         {upload}"
+    );
+
+    // d. The overlay is what makes tauri write the artifacts and their .sig
+    // files; the installed app only accepts updates signed with the private
+    // key whose public half sits in tauri.conf.json `plugins.updater`.
+    let overlay_rel = "src-tauri/mnemo2-app/tauri.updater.conf.json";
+    let overlay_text = std::fs::read_to_string(format!("{root}/{overlay_rel}"))
+        .unwrap_or_else(|e| panic!("{overlay_rel} readable: {e}"));
+    let overlay: serde_json::Value = serde_json::from_str(&overlay_text)
+        .unwrap_or_else(|e| panic!("{overlay_rel} is valid JSON: {e}"));
+    assert_eq!(
+        overlay["bundle"]["createUpdaterArtifacts"],
+        serde_json::Value::Bool(true),
+        "{overlay_rel} must set `bundle.createUpdaterArtifacts` to true — \
+         without it tauri writes no updater artifacts and no .sig files"
+    );
+
+    // e. The manifest writer the release job calls.
+    let script_rel = "scripts/updater-manifest.mjs";
+    assert!(
+        std::path::Path::new(root).join(script_rel).exists(),
+        "{script_rel} is missing — the release job's `Write the auto-update \
+         manifest` step then fails on every tag"
+    );
+}
+
 /// Every `uses:` in this repo's workflows must be pinned to a full 40-hex
 /// commit SHA, with the human version in a trailing `# vN` comment so
 /// Dependabot can keep it current.

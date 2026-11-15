@@ -153,7 +153,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_review".to_string(),
-                description: "Persist your review of the current worker tip and its complete finding list. Review more than the worker's summary: read the diff unanchored first, then record substantive evidence — intent, execution path, integration, test quality, and residual risk. A passing test count alone is not a review. Re-review after every fix. Example finding: {\"title\":\"main.js uses a default import\",\"detail\":\"game.js exports Game as a named export, so the page fails to load\",\"file\":\"src/main.js\",\"line\":1,\"severity\":\"high\"}.".to_string(),
+                description: "Persist your review of the current worker tip and its complete finding list. Review more than the worker's summary: read the diff unanchored first, then record substantive evidence — intent, and, unless Mnemo2 finds the change light, also execution path, integration, test quality, and residual risk. Light means not high risk and either at most 60 changed lines, or only Markdown (.md) and test files changed; the answer says which rule applied. A passing test count alone is not a review. Re-review after every fix. Example finding: {\"title\":\"main.js uses a default import\",\"detail\":\"game.js exports Game as a named export, so the page fails to load\",\"file\":\"src/main.js\",\"line\":1,\"severity\":\"high\"}.".to_string(),
                 parameters: json!({"type":"object","properties":{
                     "worker_id":{"type":"string"},
                     "summary":{"type":"string"},
@@ -172,16 +172,16 @@ impl TeamRuntime {
                         },
                         "required":["title","detail","file","severity"]
                     }},
-                    "evidence":{"type":"object","properties":{
+                    "evidence":{"type":"object","description":"Structured review evidence for the exact tip. A light change (test or documentation files only, or at most 60 changed lines) records only unanchored_pass and intent; every other change also requires execution, integration, test_quality, and residual_risk.","properties":{
                         "unanchored_pass":{"type":"boolean"},
                         "intent":{"type":"string"},
-                        "execution":{"type":"string"},
-                        "integration":{"type":"string"},
-                        "test_quality":{"type":"string"},
-                        "residual_risk":{"type":"string"},
+                        "execution":{"type":"string","description":"Required unless the change is light (test or documentation files only, or at most 60 changed lines)."},
+                        "integration":{"type":"string","description":"Required unless the change is light (test or documentation files only, or at most 60 changed lines)."},
+                        "test_quality":{"type":"string","description":"Required unless the change is light (test or documentation files only, or at most 60 changed lines)."},
+                        "residual_risk":{"type":"string","description":"Required unless the change is light (test or documentation files only, or at most 60 changed lines)."},
                         "independent_reviewer_id":{"type":"string"},
                         "audit_adjudication":{"type":"string"}
-                    },"required":["unanchored_pass","intent","execution","integration","test_quality","residual_risk"]}
+                    },"required":["unanchored_pass","intent"]}
                 },"required":["worker_id","summary","findings","evidence"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
@@ -472,7 +472,7 @@ impl TeamRuntime {
                     .get("evidence")
                     .cloned()
                     .ok_or_else(|| {
-                        "team_review requires a complete 'evidence' object with unanchored_pass, intent, execution, integration, test_quality, and residual_risk"
+                        "team_review requires a complete 'evidence' object with unanchored_pass and intent; execution, integration, test_quality, and residual_risk are also required unless the change is light (test or documentation files only, or at most 60 changed lines)"
                             .to_string()
                     })
                     .and_then(|value| {
@@ -793,10 +793,16 @@ pub(super) fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
         view["routing"] = json!(routing);
     }
     if let Some(review) = &worker.review {
-        view["review"] = json!({
+        let mut review_view = json!({
             "summary": review.summary,
             "tip": tip_prefix(&review.tip),
         });
+        if let Some(lane) = &review.lane {
+            // Which lane accepted this review — "light review: …" or
+            // "full review: …" — so the lead knows which evidence applied.
+            review_view["lane"] = json!(lane);
+        }
+        view["review"] = review_view;
     }
     if let Some(merge) = &worker.merge {
         view["merge"] = json!({ "commit": merge.commit });

@@ -8,7 +8,7 @@ use mnemo::tool::{SafetyLevel, ToolResult};
 use serde_json::{json, Value};
 
 use crate::mnemo2::dispatch_routing::{outcome_label, DispatchRoutingRow, RoutingMode};
-use crate::mnemo2::phase3::{Finding, MergeRecord, ReviewEvidence, ReviewRecord};
+use crate::mnemo2::phase3::{Finding, MergeRecord, ReviewEvidence, ReviewLane, ReviewRecord};
 
 use super::control::recover_worker;
 use super::deletion::{
@@ -2223,6 +2223,7 @@ async fn merge_close_error_returns_to_review_and_retries_cleanup() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     spawn_live_worker(&team, &worker).await;
@@ -2286,6 +2287,7 @@ async fn merge_closes_a_live_session_before_finishing_its_checkout() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let session = team
@@ -2365,6 +2367,7 @@ async fn merge_deletes_the_merged_branch_and_keeps_the_work() {
         tip: tip.clone(),
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     assert!(branch_exists(root.path(), &worker.branch).await);
@@ -2477,6 +2480,7 @@ async fn a_later_merge_sweeps_an_earlier_merged_workers_leftover_branch() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team =
         open_test_team(root.path(), state.path(), vec![early.clone(), worker.clone()]).await;
@@ -2541,6 +2545,7 @@ async fn the_sweep_keeps_reverted_held_and_unmerged_branches() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(
         root.path(),
@@ -2593,6 +2598,7 @@ async fn ready_to_merge(root: &std::path::Path, id: &str) -> WorkerRecord {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     worker
 }
@@ -2954,6 +2960,30 @@ fn evidence() -> ReviewEvidence {
     }
 }
 
+/// Intent-only evidence — what a light review records: the unanchored pass
+/// and the intent alone.
+fn light_evidence() -> ReviewEvidence {
+    ReviewEvidence {
+        unanchored_pass: true,
+        intent: "the diff only pins the reviewed behavior".into(),
+        execution: String::new(),
+        integration: String::new(),
+        test_quality: String::new(),
+        residual_risk: String::new(),
+        independent_reviewer_id: None,
+        audit_adjudication: None,
+    }
+}
+
+/// The full review lane for the merge-gate fixtures: a diff that is not
+/// light, so the gate demands the complete evidence.
+fn full_lane() -> ReviewLane {
+    ReviewLane {
+        light: false,
+        reason: "62 changed lines in 3 non-test files".to_string(),
+    }
+}
+
 /// A worker parked in review at one exact tip with passing checks.
 fn in_review_worker(evidence: Option<ReviewEvidence>) -> WorkerRecord {
     let mut worker = cleanup_worker(
@@ -2973,6 +3003,7 @@ fn in_review_worker(evidence: Option<ReviewEvidence>) -> WorkerRecord {
         tip: "tip0001".into(),
         reviewed_at_ms: 1,
         evidence,
+        lane: None,
     });
     worker
 }
@@ -2998,26 +3029,26 @@ fn merge_gate_requires_substantive_review_evidence() {
     // A summary plus passing checks alone can no longer merge: the
     // legacy-shaped review (evidence absent) is rejected.
     let unevidenced = in_review_worker(None);
-    let error = validate_merge(&unevidenced, "tip0001", &[])
+    let error = validate_merge(&unevidenced, "tip0001", &[], &full_lane())
         .expect_err("a legacy review must not merge without fresh evidence");
     assert!(error.contains("structured evidence"), "{error}");
 
     // An anchored-only pass is not substantive either.
     let mut unanchored = evidence();
     unanchored.unanchored_pass = false;
-    let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[])
+    let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[], &full_lane())
         .expect_err("unanchored evidence must not merge");
     assert!(rejected.contains("unanchored"), "{rejected}");
 
     // Empty assessments are rejected.
     let mut empty_intent = evidence();
     empty_intent.intent = "  ".into();
-    let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[])
+    let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[], &full_lane())
         .expect_err("empty intent must not merge");
     assert!(empty.contains("intent"), "{empty}");
 
     // Complete evidence passes the gate for standard-risk work.
-    validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[])
+    validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[], &full_lane())
         .expect("complete evidence merges");
 }
 
@@ -3089,7 +3120,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
     // High-risk work cannot merge on the lead's evidence alone.
     let mut high = in_review_worker(Some(evidence()));
     high.review_risk = "high".into();
-    let missing = validate_merge(&high, "tip0001", &records_empty)
+    let missing = validate_merge(&high, "tip0001", &records_empty, &full_lane())
         .expect_err("high-risk work needs an independent audit");
     assert!(
         missing.contains("high-risk reviews require an independent reviewer"),
@@ -3102,7 +3133,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
     untracked_evidence.audit_adjudication = Some("accepted".into());
     let mut untracked_worker = in_review_worker(Some(untracked_evidence));
     untracked_worker.review_risk = "high".into();
-    let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty)
+    let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty, &full_lane())
         .expect_err("the linked reviewer must be a tracked worker");
     assert!(untracked.contains("not a tracked worker"), "{untracked}");
 
@@ -3115,26 +3146,26 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         WorkerStatus::Completed,
     );
     implementer.kind = "implementation".into();
-    let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer])
+    let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer], &full_lane())
         .expect_err("an implementation worker is not an independent audit");
     assert!(wrong_kind.contains("not a read-only audit worker"), "{wrong_kind}");
 
     // An audit still working cannot be linked.
     let mut live = audit_worker(WorkerStatus::Working, "evidence0001", "tip0001");
     live.status = WorkerStatus::Working;
-    let incomplete = validate_merge(&untracked_worker, "tip0001", &[live])
+    let incomplete = validate_merge(&untracked_worker, "tip0001", &[live], &full_lane())
         .expect_err("an unfinished audit must not merge");
     assert!(incomplete.contains("not completed"), "{incomplete}");
 
     // An audit of another worker is refused.
     let foreign = audit_worker(WorkerStatus::Completed, "other0001", "tip0001");
-    let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign])
+    let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign], &full_lane())
         .expect_err("a foreign audit must not link");
     assert!(mismatched.contains("reviews 'other0001'"), "{mismatched}");
 
     // An audit at an older tip is stale after a fix commit moved it.
     let stale = audit_worker(WorkerStatus::Completed, "evidence0001", "tip0000");
-    let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale])
+    let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale], &full_lane())
         .expect_err("a stale audit must block the merge");
     assert!(stale_error.contains("stale"), "{stale_error}");
 
@@ -3148,6 +3179,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         &standard,
         "tip0001",
         &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
+        &full_lane(),
     )
     .expect_err("linking an audit requires an adjudication");
     assert!(
@@ -3166,8 +3198,172 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         &reviewed,
         "tip0001",
         &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
+        &full_lane(),
     )
     .expect("a fresh completed audit with an adjudication merges");
+}
+
+/// A team whose worker branch carries one commit with `changes` relative to
+/// the lead branch, so a review of the worker sees exactly that diff.
+async fn lane_fixture(
+    id: &str,
+    changes: &[(&str, String)],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    TeamRuntime,
+    WorkerRecord,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    // A merge refuses main, so the fixture reviews and merges on a real
+    // lead branch.
+    run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+    let record = worker(root.path(), id);
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        record.id.clone(),
+        "wt/lead".to_string(),
+    )
+    .await
+    .expect("provision the worker worktree");
+    for (path, contents) in changes {
+        let file = record.worktree.join(path);
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).expect("change directory");
+        }
+        std::fs::write(&file, contents).expect("write the change");
+    }
+    run_git(&record.worktree, &["add", "."]);
+    run_git(&record.worktree, &["commit", "-m", "worker change"]);
+    let team = open_test_team(root.path(), state.path(), vec![record.clone()]).await;
+    (root, state, team, record)
+}
+
+#[tokio::test]
+async fn light_change_accepts_intent_only_evidence() {
+    // A diff that only touches a *.test.ts file reviews on the unanchored
+    // pass and the intent alone, and the answer says the light lane applied.
+    let (_root, _state, team, record) = lane_fixture(
+        "lightlane0001",
+        &[("src/app.test.ts", "it('works', () => {});\n".to_string())],
+    )
+    .await;
+
+    let reviewed = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": record.id,
+                "summary": "test-only change",
+                "findings": [],
+                "evidence": {
+                    "unanchored_pass": true,
+                    "intent": "the diff only pins the reviewed behavior"
+                }
+            }),
+        )
+        .await;
+    assert!(reviewed.success, "{}", reviewed.output);
+    assert!(
+        reviewed.output.contains("light review"),
+        "the answer says which lane applied: {}",
+        reviewed.output
+    );
+
+    let persisted = team.worker(&record.id).await.expect("the reviewed worker");
+    let review = persisted.review.as_ref().expect("the review record");
+    assert_eq!(
+        review.lane.as_deref(),
+        Some("light review: test-only change"),
+        "{persisted:?}"
+    );
+    // The light review persisted the intent alone: the four optional fields
+    // stay empty and the record still decodes.
+    let evidence = review.evidence.as_ref().expect("the evidence");
+    assert_eq!(evidence.execution, "");
+    assert_eq!(evidence.residual_risk, "");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn large_change_requires_full_evidence() {
+    // A 200-line source change with the same intent-only evidence is
+    // refused: the error names the changed-line count and the four fields
+    // the full lane still requires.
+    let (_root, _state, team, record) = lane_fixture(
+        "lightlane0002",
+        &[("src/lib.rs", "pub fn changed() {}\n".repeat(200))],
+    )
+    .await;
+
+    let refused = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": record.id,
+                "summary": "large change",
+                "findings": [],
+                "evidence": {
+                    "unanchored_pass": true,
+                    "intent": "the diff only pins the reviewed behavior"
+                }
+            }),
+        )
+        .await;
+    assert!(!refused.success);
+    let error = refused.output;
+    assert!(error.contains("not light"), "{error}");
+    assert!(error.contains("200"), "{error}");
+    for field in ["execution", "integration", "test_quality", "residual_risk"] {
+        assert!(error.contains(field), "{error}");
+    }
+    // Nothing was recorded: the worker never entered review.
+    let untouched = team.worker(&record.id).await.expect("the worker");
+    assert_eq!(untouched.status, WorkerStatus::Completed);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn merge_gate_accepts_a_light_review() {
+    // A light review records the unanchored pass and the intent alone, and
+    // the merge gate — re-deciding lightness at the same tip — lets it
+    // merge without the four optional assessments.
+    let (_root, _state, team, record) = lane_fixture(
+        "lightlane0003",
+        &[("src/app.spec.ts", "it('works', () => {});\n".to_string())],
+    )
+    .await;
+
+    let reviewed = team
+        .review(
+            &record.id,
+            "test-only change".into(),
+            Vec::new(),
+            light_evidence(),
+        )
+        .await
+        .expect("the light review records");
+    assert_eq!(reviewed.status, WorkerStatus::InReview);
+    assert_eq!(
+        reviewed
+            .review
+            .as_ref()
+            .and_then(|review| review.lane.clone()),
+        Some("light review: test-only change".to_string())
+    );
+
+    team.record_check(&record.id, "cargo test".into(), "passed".into(), None)
+        .await
+        .expect("record the check");
+    let merged = team
+        .merge(&record.id)
+        .await
+        .expect("a light review merges");
+    assert_eq!(merged.status, WorkerStatus::Merged);
+    assert!(merged.merge.is_some());
+    team.shutdown().await;
 }
 
 #[test]
@@ -3291,6 +3487,7 @@ fn reviewed_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
             independent_reviewer_id: None,
             audit_adjudication: None,
         }),
+        lane: None,
     });
     worker
 }
@@ -6060,6 +6257,7 @@ async fn ignored_nudge_is_logged_at_merge() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -6835,6 +7033,7 @@ async fn merge_appends_an_outcome_with_the_derived_label() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -6935,6 +7134,7 @@ async fn a_merge_refreshes_the_project_learnings() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -7021,6 +7221,7 @@ async fn a_merge_without_the_folder_writes_no_learnings() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -7237,6 +7438,7 @@ async fn off_mode_unrerouted_merge_writes_no_outcome_row() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -7301,6 +7503,7 @@ async fn off_mode_rerouted_merge_writes_the_outcome_row() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");

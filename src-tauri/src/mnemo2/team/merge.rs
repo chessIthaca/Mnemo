@@ -194,7 +194,16 @@ fn merge_outcome_line(number: usize, worker: &WorkerRecord) -> String {
 }
 
 /// Enforce every source/evidence precondition while the merge lock is held.
-pub(super) fn validate_merge(worker: &WorkerRecord, tip: &str, records: &[WorkerRecord]) -> Result<(), String> {
+///
+/// `lane` re-decides lightness for this exact tip — the same decision the
+/// review ran — so a light review can merge, while a tip that grew past the
+/// light lane since the review needs the full evidence.
+pub(super) fn validate_merge(
+    worker: &WorkerRecord,
+    tip: &str,
+    records: &[WorkerRecord],
+    lane: &phase3::ReviewLane,
+) -> Result<(), String> {
     if worker.status != WorkerStatus::InReview {
         return Err(format!("worker is {:?}, not in review", worker.status));
     }
@@ -206,8 +215,9 @@ pub(super) fn validate_merge(worker: &WorkerRecord, tip: &str, records: &[Worker
         return Err("the review is stale; review the current worker tip".to_string());
     }
     // A summary plus passing checks alone cannot merge: every review of the
-    // merge-time tip must carry complete structured evidence. Legacy reviews
-    // decoded without evidence fail here, so old records need a fresh review.
+    // merge-time tip must carry the structured evidence its lane requires.
+    // Legacy reviews decoded without evidence fail here, so old records need
+    // a fresh review.
     let evidence = review.evidence.as_ref().ok_or_else(|| {
         "the review predates structured evidence; re-review the current worker tip with a complete evidence object"
             .to_string()
@@ -217,7 +227,7 @@ pub(super) fn validate_merge(worker: &WorkerRecord, tip: &str, records: &[Worker
     // fix commit moved the tip and made the previous audit stale — this gate
     // blocks the merge until a fresh audit ran at the new tip.
     let require_audit = worker.review_risk == "high";
-    phase3::validate_review_evidence(evidence, require_audit)?;
+    phase3::validate_review_evidence(evidence, require_audit, lane)?;
     validate_audit_linkage(records, evidence, &worker.id, tip)?;
     if let Some(finding) = worker
         .findings
@@ -282,8 +292,12 @@ impl TeamRuntime {
         phase3::require_clean_lead(&self.workspace_root, "lead").await?;
         phase3::require_clean(&worker.worktree, "worker").await?;
         let tip = phase3::tip(&worker.worktree).await?;
+        // The same light decision the review ran decides which evidence the
+        // merge-time tip requires: a light review merges, and a tip that grew
+        // past the light lane since the review needs the full evidence.
+        let lane = self.review_lane(&tip, &worker.review_risk).await?;
         let records = self.records.lock().await.clone();
-        validate_merge(&worker, &tip, &records)?;
+        validate_merge(&worker, &tip, &records, &lane)?;
         let previous = worker.clone();
         self.update_worker(worker_id, |worker| worker.status = WorkerStatus::Merging)
             .await;

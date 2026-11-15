@@ -893,9 +893,6 @@ mod tests {
         )
     }
 
-    /// A thin step (under 60 words combined with context) but the context has
-    /// a test and a done checklist — no notes for those items.
-
     #[tokio::test]
     async fn the_board_tools_create_update_show_and_list() {
         let dir = tempfile::tempdir().unwrap();

@@ -2611,6 +2611,50 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Tests only; no production code changes."
+    },
+    {
+      "id": "9a6cffc1",
+      "status": "closed",
+      "created_at_ms": 1794780859494,
+      "closed_at_ms": 1794783322208,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-9a6cffc1-20261115-225522.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Worker host-tool behaviour in pump.rs; no OpenSpec capability governs it."
+    },
+    {
+      "id": "1c7cf0a6",
+      "status": "closed",
+      "created_at_ms": 1794780885434,
+      "closed_at_ms": 1794784273848,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-1c7cf0a6-20261115-231113.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Review-gate rules live in code and docs/REVIEW-POLICY.md; no OpenSpec capability governs them."
+    },
+    {
+      "id": "5e27b61b",
+      "status": "closed",
+      "created_at_ms": 1794780916248,
+      "closed_at_ms": 1794782985026,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5e27b61b-20261115-224945.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Guidance text and an advisory note; no OpenSpec capability governs them."
+    },
+    {
+      "id": "9e9c474c",
+      "status": "closed",
+      "created_at_ms": 1794781598131,
+      "closed_at_ms": 1794784014930,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-9e9c474c-20261115-230654.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Escalation trigger internals; no OpenSpec capability governs them."
     }
   ]
 }

@@ -307,6 +307,14 @@ pub struct WorkerRecord {
     /// Review rounds: `team_review` calls recorded on this worker.
     #[serde(default)]
     pub review_rounds: u32,
+    /// The worker's completed-turn count captured when the latest review was
+    /// recorded. A finding only counts as "stayed open" between two reviews
+    /// when this count has grown in between: a lead `review_fix` round never
+    /// runs a worker turn, so it must not read as a failed worker round.
+    /// `None` on records written before this was tracked (and before any
+    /// review): unknown, and the repeat rule never fires on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_turns: Option<u32>,
     /// Fix rounds: `route_fix` and `review_fix` applications on this worker.
     #[serde(default)]
     pub fix_rounds: u32,

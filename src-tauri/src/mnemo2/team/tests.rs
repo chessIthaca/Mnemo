@@ -4,11 +4,12 @@ use std::collections::VecDeque;
 
 use mnemo::app::worktrees::{agent_branch, agent_short_id, provision_agent_worktree};
 use mnemo::headless::{GateVerdict, Transcript};
+use mnemo::SerializableAgentEvent;
 use mnemo::tool::{SafetyLevel, ToolResult};
 use serde_json::{json, Value};
 
 use crate::mnemo2::dispatch_routing::{outcome_label, DispatchRoutingRow, RoutingMode};
-use crate::mnemo2::phase3::{Finding, MergeRecord, ReviewEvidence, ReviewRecord};
+use crate::mnemo2::phase3::{Finding, MergeRecord, ReviewEvidence, ReviewLane, ReviewRecord};
 
 use super::control::recover_worker;
 use super::deletion::{
@@ -1605,6 +1606,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         findings: Vec::new(),
         review: None,
         review_rounds: 0,
+        review_turns: None,
         fix_rounds: 0,
         audits: 0,
         models_used: Vec::new(),
@@ -2223,6 +2225,7 @@ async fn merge_close_error_returns_to_review_and_retries_cleanup() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     spawn_live_worker(&team, &worker).await;
@@ -2286,6 +2289,7 @@ async fn merge_closes_a_live_session_before_finishing_its_checkout() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let session = team
@@ -2365,6 +2369,7 @@ async fn merge_deletes_the_merged_branch_and_keeps_the_work() {
         tip: tip.clone(),
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     assert!(branch_exists(root.path(), &worker.branch).await);
@@ -2477,6 +2482,7 @@ async fn a_later_merge_sweeps_an_earlier_merged_workers_leftover_branch() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team =
         open_test_team(root.path(), state.path(), vec![early.clone(), worker.clone()]).await;
@@ -2541,6 +2547,7 @@ async fn the_sweep_keeps_reverted_held_and_unmerged_branches() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(
         root.path(),
@@ -2593,6 +2600,7 @@ async fn ready_to_merge(root: &std::path::Path, id: &str) -> WorkerRecord {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     worker
 }
@@ -2954,6 +2962,30 @@ fn evidence() -> ReviewEvidence {
     }
 }
 
+/// Intent-only evidence — what a light review records: the unanchored pass
+/// and the intent alone.
+fn light_evidence() -> ReviewEvidence {
+    ReviewEvidence {
+        unanchored_pass: true,
+        intent: "the diff only pins the reviewed behavior".into(),
+        execution: String::new(),
+        integration: String::new(),
+        test_quality: String::new(),
+        residual_risk: String::new(),
+        independent_reviewer_id: None,
+        audit_adjudication: None,
+    }
+}
+
+/// The full review lane for the merge-gate fixtures: a diff that is not
+/// light, so the gate demands the complete evidence.
+fn full_lane() -> ReviewLane {
+    ReviewLane {
+        light: false,
+        reason: "62 changed lines in 3 non-test files".to_string(),
+    }
+}
+
 /// A worker parked in review at one exact tip with passing checks.
 fn in_review_worker(evidence: Option<ReviewEvidence>) -> WorkerRecord {
     let mut worker = cleanup_worker(
@@ -2973,6 +3005,7 @@ fn in_review_worker(evidence: Option<ReviewEvidence>) -> WorkerRecord {
         tip: "tip0001".into(),
         reviewed_at_ms: 1,
         evidence,
+        lane: None,
     });
     worker
 }
@@ -2998,26 +3031,26 @@ fn merge_gate_requires_substantive_review_evidence() {
     // A summary plus passing checks alone can no longer merge: the
     // legacy-shaped review (evidence absent) is rejected.
     let unevidenced = in_review_worker(None);
-    let error = validate_merge(&unevidenced, "tip0001", &[])
+    let error = validate_merge(&unevidenced, "tip0001", &[], &full_lane())
         .expect_err("a legacy review must not merge without fresh evidence");
     assert!(error.contains("structured evidence"), "{error}");
 
     // An anchored-only pass is not substantive either.
     let mut unanchored = evidence();
     unanchored.unanchored_pass = false;
-    let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[])
+    let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[], &full_lane())
         .expect_err("unanchored evidence must not merge");
     assert!(rejected.contains("unanchored"), "{rejected}");
 
     // Empty assessments are rejected.
     let mut empty_intent = evidence();
     empty_intent.intent = "  ".into();
-    let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[])
+    let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[], &full_lane())
         .expect_err("empty intent must not merge");
     assert!(empty.contains("intent"), "{empty}");
 
     // Complete evidence passes the gate for standard-risk work.
-    validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[])
+    validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[], &full_lane())
         .expect("complete evidence merges");
 }
 
@@ -3089,7 +3122,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
     // High-risk work cannot merge on the lead's evidence alone.
     let mut high = in_review_worker(Some(evidence()));
     high.review_risk = "high".into();
-    let missing = validate_merge(&high, "tip0001", &records_empty)
+    let missing = validate_merge(&high, "tip0001", &records_empty, &full_lane())
         .expect_err("high-risk work needs an independent audit");
     assert!(
         missing.contains("high-risk reviews require an independent reviewer"),
@@ -3102,7 +3135,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
     untracked_evidence.audit_adjudication = Some("accepted".into());
     let mut untracked_worker = in_review_worker(Some(untracked_evidence));
     untracked_worker.review_risk = "high".into();
-    let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty)
+    let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty, &full_lane())
         .expect_err("the linked reviewer must be a tracked worker");
     assert!(untracked.contains("not a tracked worker"), "{untracked}");
 
@@ -3115,26 +3148,26 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         WorkerStatus::Completed,
     );
     implementer.kind = "implementation".into();
-    let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer])
+    let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer], &full_lane())
         .expect_err("an implementation worker is not an independent audit");
     assert!(wrong_kind.contains("not a read-only audit worker"), "{wrong_kind}");
 
     // An audit still working cannot be linked.
     let mut live = audit_worker(WorkerStatus::Working, "evidence0001", "tip0001");
     live.status = WorkerStatus::Working;
-    let incomplete = validate_merge(&untracked_worker, "tip0001", &[live])
+    let incomplete = validate_merge(&untracked_worker, "tip0001", &[live], &full_lane())
         .expect_err("an unfinished audit must not merge");
     assert!(incomplete.contains("not completed"), "{incomplete}");
 
     // An audit of another worker is refused.
     let foreign = audit_worker(WorkerStatus::Completed, "other0001", "tip0001");
-    let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign])
+    let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign], &full_lane())
         .expect_err("a foreign audit must not link");
     assert!(mismatched.contains("reviews 'other0001'"), "{mismatched}");
 
     // An audit at an older tip is stale after a fix commit moved it.
     let stale = audit_worker(WorkerStatus::Completed, "evidence0001", "tip0000");
-    let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale])
+    let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale], &full_lane())
         .expect_err("a stale audit must block the merge");
     assert!(stale_error.contains("stale"), "{stale_error}");
 
@@ -3148,6 +3181,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         &standard,
         "tip0001",
         &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
+        &full_lane(),
     )
     .expect_err("linking an audit requires an adjudication");
     assert!(
@@ -3166,8 +3200,172 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         &reviewed,
         "tip0001",
         &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
+        &full_lane(),
     )
     .expect("a fresh completed audit with an adjudication merges");
+}
+
+/// A team whose worker branch carries one commit with `changes` relative to
+/// the lead branch, so a review of the worker sees exactly that diff.
+async fn lane_fixture(
+    id: &str,
+    changes: &[(&str, String)],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    TeamRuntime,
+    WorkerRecord,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    // A merge refuses main, so the fixture reviews and merges on a real
+    // lead branch.
+    run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+    let record = worker(root.path(), id);
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        record.id.clone(),
+        "wt/lead".to_string(),
+    )
+    .await
+    .expect("provision the worker worktree");
+    for (path, contents) in changes {
+        let file = record.worktree.join(path);
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).expect("change directory");
+        }
+        std::fs::write(&file, contents).expect("write the change");
+    }
+    run_git(&record.worktree, &["add", "."]);
+    run_git(&record.worktree, &["commit", "-m", "worker change"]);
+    let team = open_test_team(root.path(), state.path(), vec![record.clone()]).await;
+    (root, state, team, record)
+}
+
+#[tokio::test]
+async fn light_change_accepts_intent_only_evidence() {
+    // A diff that only touches a *.test.ts file reviews on the unanchored
+    // pass and the intent alone, and the answer says the light lane applied.
+    let (_root, _state, team, record) = lane_fixture(
+        "lightlane0001",
+        &[("src/app.test.ts", "it('works', () => {});\n".to_string())],
+    )
+    .await;
+
+    let reviewed = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": record.id,
+                "summary": "test-only change",
+                "findings": [],
+                "evidence": {
+                    "unanchored_pass": true,
+                    "intent": "the diff only pins the reviewed behavior"
+                }
+            }),
+        )
+        .await;
+    assert!(reviewed.success, "{}", reviewed.output);
+    assert!(
+        reviewed.output.contains("light review"),
+        "the answer says which lane applied: {}",
+        reviewed.output
+    );
+
+    let persisted = team.worker(&record.id).await.expect("the reviewed worker");
+    let review = persisted.review.as_ref().expect("the review record");
+    assert_eq!(
+        review.lane.as_deref(),
+        Some("light review: test-only change"),
+        "{persisted:?}"
+    );
+    // The light review persisted the intent alone: the four optional fields
+    // stay empty and the record still decodes.
+    let evidence = review.evidence.as_ref().expect("the evidence");
+    assert_eq!(evidence.execution, "");
+    assert_eq!(evidence.residual_risk, "");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn large_change_requires_full_evidence() {
+    // A 200-line source change with the same intent-only evidence is
+    // refused: the error names the changed-line count and the four fields
+    // the full lane still requires.
+    let (_root, _state, team, record) = lane_fixture(
+        "lightlane0002",
+        &[("src/lib.rs", "pub fn changed() {}\n".repeat(200))],
+    )
+    .await;
+
+    let refused = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": record.id,
+                "summary": "large change",
+                "findings": [],
+                "evidence": {
+                    "unanchored_pass": true,
+                    "intent": "the diff only pins the reviewed behavior"
+                }
+            }),
+        )
+        .await;
+    assert!(!refused.success);
+    let error = refused.output;
+    assert!(error.contains("not light"), "{error}");
+    assert!(error.contains("200"), "{error}");
+    for field in ["execution", "integration", "test_quality", "residual_risk"] {
+        assert!(error.contains(field), "{error}");
+    }
+    // Nothing was recorded: the worker never entered review.
+    let untouched = team.worker(&record.id).await.expect("the worker");
+    assert_eq!(untouched.status, WorkerStatus::Completed);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn merge_gate_accepts_a_light_review() {
+    // A light review records the unanchored pass and the intent alone, and
+    // the merge gate — re-deciding lightness at the same tip — lets it
+    // merge without the four optional assessments.
+    let (_root, _state, team, record) = lane_fixture(
+        "lightlane0003",
+        &[("src/app.spec.ts", "it('works', () => {});\n".to_string())],
+    )
+    .await;
+
+    let reviewed = team
+        .review(
+            &record.id,
+            "test-only change".into(),
+            Vec::new(),
+            light_evidence(),
+        )
+        .await
+        .expect("the light review records");
+    assert_eq!(reviewed.status, WorkerStatus::InReview);
+    assert_eq!(
+        reviewed
+            .review
+            .as_ref()
+            .and_then(|review| review.lane.clone()),
+        Some("light review: test-only change".to_string())
+    );
+
+    team.record_check(&record.id, "cargo test".into(), "passed".into(), None)
+        .await
+        .expect("record the check");
+    let merged = team
+        .merge(&record.id)
+        .await
+        .expect("a light review merges");
+    assert_eq!(merged.status, WorkerStatus::Merged);
+    assert!(merged.merge.is_some());
+    team.shutdown().await;
 }
 
 #[test]
@@ -3291,6 +3489,7 @@ fn reviewed_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
             independent_reviewer_id: None,
             audit_adjudication: None,
         }),
+        lane: None,
     });
     worker
 }
@@ -4570,6 +4769,386 @@ fn tool_call_batch(call_id: &str, name: &str, args: &str) -> Vec<mnemo::provider
             reason: mnemo::provider::FinishReason::ToolCalls,
         },
     ]
+}
+
+/// A team whose engine serves scripted LLM batches (plan 9a6cffc1's
+/// report-streak tests): a dispatched worker runs real turns and makes
+/// real `message_parent` host-tool calls, which the pump answers. When
+/// the scripted batches run out, the LLM serves a plain "done" text
+/// turn, so a turn the host does not cut short ends naturally. Returns
+/// the team plus a `TeamEvent` subscription taken before any dispatch,
+/// so a test sees exactly what the pump forwards.
+async fn report_streak_team(
+    responses: Vec<Vec<mnemo::provider::LlmEvent>>,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    TeamRuntime,
+    broadcast::Receiver<TeamEvent>,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    std::fs::write(
+        config.path().join("config.toml"),
+        "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
+    )
+    .expect("config.toml");
+    std::fs::write(
+        config.path().join("endpoints.toml"),
+        "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"scripted-a\", \"scripted-b\"]\n",
+    )
+    .expect("endpoints.toml");
+    TeamPersistence::new(state.path())
+        .save(&PersistedTeam {
+            workers: Vec::new(),
+            slots: Some(2),
+            usage: ProjectUsage::default(),
+        })
+        .expect("save the team ledger");
+    let engine = mnemo::headless::EngineBuilder::new(mnemo::headless::EngineOptions {
+        workspace: mnemo::workspace::Workspace::new(root.path()),
+        config_dir: Some(config.path().to_path_buf()),
+        permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+        memory: mnemo::headless::MemoryBackend::Disabled,
+        index_codegraph: false,
+        require_git: true,
+        auto_install_embedder: false,
+    })
+    .provider(Arc::new(ScriptedLlm::new(responses)))
+    .start()
+    .await
+    .expect("start the scripted engine");
+    let team = TeamRuntime::open(TeamRuntimeOptions {
+        engine: Arc::new(engine),
+        workspace_root: root.path().to_path_buf(),
+        state_dir: state.path().to_path_buf(),
+        config_dir: config.path().to_path_buf(),
+        classifier: None,
+        routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+        slots: Some(2),
+        models: Vec::new(),
+        pricing: Vec::new(),
+    })
+    .await
+    .expect("open the team");
+    let events = team.subscribe();
+    (root, state, config, team, events)
+}
+
+/// The events the pump has forwarded so far (plan 9a6cffc1): the raw
+/// event bodies, in order, tolerating lag. What is missing from this
+/// list never reaches the runtime — so it never becomes a lead notice.
+async fn forwarded_events(
+    events: &mut broadcast::Receiver<TeamEvent>,
+) -> Vec<SerializableAgentEvent> {
+    let mut forwarded = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(event) => forwarded.push(event.event.event),
+            Err(broadcast::error::TryRecvError::Empty) => return forwarded,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Closed) => return forwarded,
+        }
+    }
+}
+
+/// How many `message_parent` host-tool calls the pump forwarded (plan
+/// 9a6cffc1) — one forwarded call is one potential lead notice.
+fn forwarded_report_calls(forwarded: &[SerializableAgentEvent]) -> usize {
+    forwarded
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SerializableAgentEvent::HostToolCall { name, .. }
+                    if name.as_str() == "message_parent"
+            )
+        })
+        .count()
+}
+
+/// Poll the worker record until `want` holds (plan 9a6cffc1), then
+/// return it; panic with the last record after ~10s. The sleep before
+/// the caller reads the event stream covers the pump's own forwarding
+/// step, which runs after the record update the wait observes. The
+/// record's transcript lands via a detached snapshot task a few ms
+/// after the turn ends (the pump's post-turn refresh), so a `want`
+/// that needs transcript content polls for it here instead of
+/// trusting a single read.
+async fn wait_for_worker_record(
+    team: &TeamRuntime,
+    worker_id: &str,
+    want: impl Fn(&WorkerRecord) -> bool,
+) -> WorkerRecord {
+    let mut last = None;
+    for _ in 0..400 {
+        let record = team.worker(worker_id).await.expect("worker record");
+        if want(&record) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            return team.worker(worker_id).await.expect("worker record");
+        }
+        last = Some(record);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for the worker record: {last:?}");
+}
+
+/// Plan 9a6cffc1: the first report in a turn keeps today's behaviour —
+/// recorded in the lead's inbox, forwarded as a TeamEvent (what the
+/// runtime turns into the lead's `reports:` notice), and answered with
+/// the byte-identical result text.
+#[tokio::test]
+async fn first_report_is_unchanged() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"task complete"}"#),
+        tool_call_batch("c2", "message_parent", r#"{"text":"task complete, again"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let record = wait_for_worker_record(&team, &worker.id, |record| {
+        record.status == WorkerStatus::Completed
+            && record.pending.is_none()
+            && record
+                .transcript
+                .messages
+                .iter()
+                .any(|message| {
+                    message.name.as_deref() == Some("message_parent")
+                        && message.content.as_text()
+                            == "message sent to the lead. A reply, if any, arrives later as a new message that starts with a [From …] header; do not assume or invent a reply — continue your task or end your turn."
+                })
+    })
+    .await;
+    // The inbox holds the report verbatim.
+    let messages = team.messages().await;
+    assert_eq!(messages.len(), 1, "exactly one TeamMessage: {messages:?}");
+    assert_eq!(messages[0].worker_id, worker.id);
+    assert_eq!(messages[0].text, "task complete");
+    // The call was forwarded — exactly once — so the lead sees the notice.
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        1,
+        "the first report's call was forwarded: {forwarded:?}"
+    );
+    // And the result the worker saw is byte-identical to today's.
+    let reported = record
+        .transcript
+        .messages
+        .iter()
+        .find(|message| message.name.as_deref() == Some("message_parent"))
+        .cloned()
+        .expect("the report's tool result in the transcript");
+    assert!(!reported.tool_is_error);
+    assert_eq!(
+        reported.content.as_text(),
+        "message sent to the lead. A reply, if any, arrives later as a new message that starts with a [From …] header; do not assume or invent a reply — continue your task or end your turn."
+    );
+    team.shutdown().await;
+}
+
+/// Plan 9a6cffc1: the 2nd `message_parent` call in a row — no other
+/// tool call in between — is refused: not recorded as a TeamMessage and
+/// not forwarded as a TeamEvent, so the runtime never turns it into a
+/// lead notice. The refusal tells the worker to end its turn now, with
+/// no further tool calls.
+#[tokio::test]
+async fn second_report_in_a_row_is_not_forwarded() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"task complete"}"#),
+        tool_call_batch("c2", "message_parent", r#"{"text":"task complete — please review"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let record = wait_for_worker_record(&team, &worker.id, |record| {
+        let reports: Vec<_> = record
+            .transcript
+            .messages
+            .iter()
+            .filter(|message| message.name.as_deref() == Some("message_parent"))
+            .collect();
+        record.status == WorkerStatus::Completed
+            && record.pending.is_none()
+            && reports.len() == 2
+            && reports[1].content.as_text()
+                == "not sent to the lead: this report already reached it. End your turn now, with no further tool calls, so the lead can review your work."
+    })
+    .await;
+    // Only the first report reached the inbox.
+    let messages = team.messages().await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "the repeat is not recorded as a TeamMessage: {messages:?}"
+    );
+    assert_eq!(messages[0].text, "task complete");
+    // And only the first report's call was forwarded — the repeat never
+    // becomes a lead notice.
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        1,
+        "the repeat is not forwarded as a TeamEvent: {forwarded:?}"
+    );
+    // The repeat's answer names what to do next: end the turn now, with
+    // no further tool calls.
+    let reports: Vec<_> = record
+        .transcript
+        .messages
+        .iter()
+        .filter(|message| message.name.as_deref() == Some("message_parent"))
+        .collect();
+    assert_eq!(reports.len(), 2, "both calls are answered: {reports:?}");
+    assert!(!reports[1].tool_is_error, "the refusal is not an error");
+    assert_eq!(
+        reports[1].content.as_text(),
+        "not sent to the lead: this report already reached it. End your turn now, with no further tool calls, so the lead can review your work."
+    );
+    team.shutdown().await;
+}
+
+/// Plan 9a6cffc1: an ordinary tool call between two reports breaks the
+/// run of back-to-back reports — the second report is forwarded like a
+/// first one (the acceptance scenario: report, read a file, report
+/// again produces two report notices).
+#[tokio::test]
+async fn other_tool_call_resets_the_report_streak() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"halfway there"}"#),
+        tool_call_batch("c2", "read_files", r#"{"files":["README.md"]}"#),
+        tool_call_batch("c3", "message_parent", r#"{"text":"task complete"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let _record = wait_for_worker_record(&team, &worker.id, |record| {
+        record.status == WorkerStatus::Completed && record.pending.is_none()
+    })
+    .await;
+    let messages = team.messages().await;
+    assert_eq!(
+        messages.len(),
+        2,
+        "both reports are recorded: {messages:?}"
+    );
+    assert_eq!(messages[0].text, "halfway there");
+    assert_eq!(messages[1].text, "task complete");
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        2,
+        "both reports' calls are forwarded: {forwarded:?}"
+    );
+    team.shutdown().await;
+}
+
+/// Plan 9a6cffc1: a `memory_*` call between two reports is not progress
+/// — the second report still counts as a repeat and is refused.
+#[tokio::test]
+async fn memory_writes_do_not_reset_the_report_streak() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"task complete"}"#),
+        tool_call_batch(
+            "c2",
+            "memory_write",
+            r#"{"tier":"semantic","title":"t","content":"c"}"#,
+        ),
+        tool_call_batch("c3", "message_parent", r#"{"text":"task complete — see memory"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let _record = wait_for_worker_record(&team, &worker.id, |record| {
+        record.status == WorkerStatus::Completed && record.pending.is_none()
+    })
+    .await;
+    let messages = team.messages().await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "the memory write did not reset the streak: {messages:?}"
+    );
+    assert_eq!(messages[0].text, "task complete");
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        1,
+        "the post-memory repeat is refused: {forwarded:?}"
+    );
+    team.shutdown().await;
+}
+
+/// Plan 9a6cffc1: the 3rd report in a row is refused and the host ends
+/// the worker's turn for it. The interrupt lands in the normal
+/// `Finished` path, so the lead gets the ordinary "finished its turn"
+/// flow and the worker is left idle for review. Proof the turn was cut
+/// short for the worker: the scripted queue is empty from the 3rd call
+/// on, so an uninterrupted turn would stream a fallback text "done"
+/// turn before finishing — no text delta may appear.
+#[tokio::test]
+async fn third_report_in_a_row_ends_the_turn() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"task complete"}"#),
+        tool_call_batch("c2", "message_parent", r#"{"text":"task complete (repeat)"}"#),
+        tool_call_batch("c3", "message_parent", r#"{"text":"task complete (again)"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let record = wait_for_worker_record(&team, &worker.id, |record| {
+        record.status == WorkerStatus::Completed && record.pending.is_none()
+    })
+    .await;
+    // The worker ends up idle for review: completed, nothing pending.
+    assert_eq!(record.status, WorkerStatus::Completed);
+    assert!(record.pending.is_none(), "idle: {record:?}");
+    // One report recorded, one report call forwarded — the 2nd and 3rd
+    // were refused.
+    let messages = team.messages().await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "only the first report is recorded: {messages:?}"
+    );
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        1,
+        "only the first report is forwarded: {forwarded:?}"
+    );
+    // The turn was ended for the worker at the third report: the next
+    // provider call — which would stream the fallback text turn — never
+    // streamed a single delta.
+    assert!(
+        !forwarded
+            .iter()
+            .any(|event| matches!(event, SerializableAgentEvent::TextDelta { .. })),
+        "the turn was cut before any further LLM output: {forwarded:?}"
+    );
+    // And it ended through the ordinary Finished path, which the lead
+    // turns into the "finished its turn" notice.
+    assert!(
+        forwarded
+            .iter()
+            .any(|event| matches!(event, SerializableAgentEvent::Finished { .. })),
+        "the ended turn finished normally: {forwarded:?}"
+    );
+    team.shutdown().await;
 }
 
 /// The nudge fixture with a stub classifier that answers `answer` after
@@ -5896,9 +6475,10 @@ fn drift_check_skips_generated_messages_and_the_read_back_answer() {
     assert!(!message_can_show_drift(&read_back, MessageSender::Mnemo));
 }
 
-/// The deterministic review nudge: a second review round that still
-/// records a high finding nudges the lead to the next tier up, in
-/// every mode except off (design §4.6).
+/// The deterministic review nudge: a second review round, after the
+/// worker's own turn, that still records a high finding nudges the lead to
+/// the next tier up, in every mode except off (design §4.6). A lead-only
+/// review round never nudges.
 #[tokio::test]
 async fn second_high_finding_review_nudges() {
     use crate::mnemo2::dispatch_routing::{save_routing_settings, RoutingSettings, RoutingMode};
@@ -5975,6 +6555,10 @@ async fn second_high_finding_review_nudges() {
     team.stop_inner(&record.id)
         .await
         .expect("stop the fixer session");
+    // The fixer's completed turn: a round with no worker turn in between is
+    // the lead's own review_fix work, and must never escalate.
+    team.update_worker(&record.id, |worker| worker.turns += 1)
+        .await;
     let second = team
         .review(&record.id, "second pass".into(), vec![open_finding("finding1")], evidence())
         .await
@@ -6060,6 +6644,7 @@ async fn ignored_nudge_is_logged_at_merge() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -6835,6 +7420,7 @@ async fn merge_appends_an_outcome_with_the_derived_label() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -6935,6 +7521,7 @@ async fn a_merge_refreshes_the_project_learnings() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -7021,6 +7608,7 @@ async fn a_merge_without_the_folder_writes_no_learnings() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -7237,6 +7825,7 @@ async fn off_mode_unrerouted_merge_writes_no_outcome_row() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -7301,6 +7890,7 @@ async fn off_mode_rerouted_merge_writes_the_outcome_row() {
         tip,
         reviewed_at_ms: 1,
         evidence: Some(evidence()),
+        lane: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
     let merged = team.merge(&worker.id).await.expect("merge the worker");
@@ -9118,5 +9708,256 @@ async fn session_search_is_a_lead_tool_and_answers() {
     assert!(one.output.starts_with("agent-abc #1 user"), "{}", one.output);
     assert!(one.output.contains("flaked"), "{}", one.output);
 
+    team.shutdown().await;
+}
+
+/// An open high finding on the file the test worker checkout seeds, so a
+/// `review_fix` can edit exactly the finding's source file.
+fn readme_finding(id: &str) -> Finding {
+    Finding {
+        file: "README.md".to_string(),
+        line: 1,
+        ..open_finding(id)
+    }
+}
+
+/// A record-based team with one routine-tier worker and no live session, for
+/// the repeated-finding escalation: nothing but the test itself can bump the
+/// worker's turn count.
+async fn repeated_finding_fixture(mode: RoutingMode, id: &str) -> ReviewFixture {
+    use crate::mnemo2::dispatch_routing::{save_routing_settings, RoutingSettings};
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    save_routing_settings(
+        config.path(),
+        &RoutingSettings {
+            mode,
+            ..RoutingSettings::default()
+        },
+    )
+    .expect("save routing settings");
+    let mut record = worker(root.path(), id);
+    record.tier = Some("routine".to_string());
+    record.model = Some("test/scripted-simple".to_string());
+    record.routing = Some(WorkerRouting {
+        laya_tier: Some("routine".to_string()),
+        confidence: Some(0.62),
+        cleared: true,
+        lead_tier: Some("routine".to_string()),
+        routed_by: "lead".to_string(),
+        ran_tier: Some("routine".to_string()),
+        nudged: None,
+    });
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        record.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision the worker checkout");
+    let team =
+        open_test_team_with_config(root.path(), state.path(), vec![record.clone()], config.path())
+            .await;
+    team.set_catalog(
+        vec![
+            lead_model("scripted-difficult"),
+            lead_model("scripted-average"),
+            lead_model("scripted-simple"),
+        ],
+        tiers_dto! {
+            difficult: vec!["test/scripted-difficult".into()],
+            average: vec!["test/scripted-average".into()],
+            simple: vec!["test/scripted-simple".into()],
+        },
+        Vec::new(),
+    );
+    ReviewFixture {
+        _root: root,
+        state,
+        _config: config,
+        team,
+        record,
+    }
+}
+
+/// A lead `review_fix` round is the lead's own edit, not a failed worker
+/// round: with no worker turn between the two reviews, a finding that is
+/// still open must not escalate, and Auto mode must leave the worker's tier
+/// and model alone (bug report 2026-11-15 on worker lightDocs01).
+#[tokio::test]
+async fn lead_review_fix_rounds_do_not_escalate() {
+    let fixture = repeated_finding_fixture(RoutingMode::Auto, "reviewfix001").await;
+    let team = &fixture.team;
+    let first = team
+        .review(
+            &fixture.record.id,
+            "first pass".into(),
+            vec![readme_finding("finding1"), open_finding("finding2")],
+            evidence(),
+        )
+        .await
+        .expect("first review");
+    assert_eq!(first.review_rounds, 1, "{first:?}");
+    let fixed = team
+        .review_fix(&fixture.record.id, "finding1", "README.md", "seed", "fixed")
+        .await
+        .expect("the lead fixes the wording finding itself");
+    assert_eq!(fixed.fix_rounds, 1, "{fixed:?}");
+    assert_eq!(fixed.turns, 0, "review_fix never runs a worker turn");
+    let second = team
+        .review(
+            &fixture.record.id,
+            "second pass".into(),
+            vec![open_finding("finding2")],
+            evidence(),
+        )
+        .await
+        .expect("second review");
+    assert_eq!(second.review_rounds, 2, "{second:?}");
+    assert!(
+        second
+            .routing
+            .as_ref()
+            .expect("routed worker")
+            .nudged
+            .is_none(),
+        "a lead-only review round never nudges: {second:?}"
+    );
+    assert_eq!(second.tier.as_deref(), Some("routine"), "{second:?}");
+    assert_eq!(
+        second.model.as_deref(),
+        Some("test/scripted-simple"),
+        "{second:?}"
+    );
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| matches!(row, DispatchRoutingRow::Nudge { .. })),
+        "no nudge row: {:?}",
+        fixture.rows()
+    );
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| matches!(row, DispatchRoutingRow::LeadReroute { .. })),
+        "no auto switch: {:?}",
+        fixture.rows()
+    );
+    team.shutdown().await;
+}
+
+/// The repeated-finding escalation still fires when the worker really did
+/// take a turn between the two reviews and left the high finding open.
+#[tokio::test]
+async fn finding_open_after_a_worker_turn_still_escalates() {
+    let fixture = repeated_finding_fixture(RoutingMode::Shadow, "reviewturn01").await;
+    let team = &fixture.team;
+    team.review(
+        &fixture.record.id,
+        "first pass".into(),
+        vec![open_finding("finding1")],
+        evidence(),
+    )
+    .await
+    .expect("first review");
+    // A finished worker turn, exactly as the pump records one.
+    team.update_worker(&fixture.record.id, |worker| worker.turns += 1)
+        .await;
+    let second = team
+        .review(
+            &fixture.record.id,
+            "second pass".into(),
+            vec![open_finding("finding1")],
+            evidence(),
+        )
+        .await
+        .expect("second review");
+    assert_eq!(second.review_rounds, 2, "{second:?}");
+    assert_eq!(second.turns, 1, "{second:?}");
+    assert_eq!(
+        second
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.nudged.as_deref()),
+        Some("high"),
+        "{second:?}"
+    );
+    assert!(
+        fixture.rows().iter().any(|row| matches!(
+            row,
+            DispatchRoutingRow::Nudge { reason, to_tier, .. }
+                if reason == "review" && to_tier == "high"
+        )),
+        "a review nudge row: {:?}",
+        fixture.rows()
+    );
+    team.shutdown().await;
+}
+
+/// A record persisted before the review turn count existed decodes with the
+/// unknown value, and the repeat rule never fires on that unknown — even
+/// when the worker has since taken a turn.
+#[tokio::test]
+async fn legacy_review_rounds_without_a_turn_count_never_escalate() {
+    let fixture = repeated_finding_fixture(RoutingMode::Auto, "reviewlegacy1").await;
+    let team = &fixture.team;
+    team.review(
+        &fixture.record.id,
+        "first pass".into(),
+        vec![open_finding("finding1")],
+        evidence(),
+    )
+    .await
+    .expect("first review");
+    let stored = team.worker(&fixture.record.id).await.expect("stored worker");
+    let mut legacy = serde_json::to_value(&stored).expect("the record as json");
+    assert!(
+        legacy
+            .as_object_mut()
+            .expect("record object")
+            .remove("review_turns")
+            .is_some(),
+        "a recorded review carries its turn count"
+    );
+    let decoded: WorkerRecord =
+        serde_json::from_value(legacy).expect("a record written before the field decodes");
+    assert_eq!(decoded.review_rounds, 1, "{decoded:?}");
+    assert_eq!(decoded.review_turns, None, "a missing turn count is unknown");
+    // Back to the legacy shape, with a worker turn since: unknown must never
+    // escalate on the repeat rule.
+    team.update_worker(&fixture.record.id, |worker| {
+        worker.review_turns = None;
+        worker.turns += 1;
+    })
+    .await;
+    let second = team
+        .review(
+            &fixture.record.id,
+            "second pass".into(),
+            vec![open_finding("finding1")],
+            evidence(),
+        )
+        .await
+        .expect("second review");
+    assert_eq!(second.review_rounds, 2, "{second:?}");
+    assert!(
+        second
+            .routing
+            .as_ref()
+            .expect("routed worker")
+            .nudged
+            .is_none(),
+        "an unknown turn count never escalates: {second:?}"
+    );
+    assert_eq!(second.tier.as_deref(), Some("routine"), "{second:?}");
+    assert_eq!(
+        second.model.as_deref(),
+        Some("test/scripted-simple"),
+        "{second:?}"
+    );
     team.shutdown().await;
 }

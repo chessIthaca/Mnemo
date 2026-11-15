@@ -42,19 +42,32 @@ pub struct Finding {
 /// Structured lead-review evidence: the lead's own unanchored read of the
 /// change plus the substantive assessments it must author itself, beyond the
 /// worker's summary and test counts.
+///
+/// Every field carries a serde default so light reviews — which record only
+/// the unanchored pass and the intent — and older records still decode.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewEvidence {
     /// The lead read the change itself first, unanchored to worker claims.
+    #[serde(default)]
     pub unanchored_pass: bool,
     /// Why the work exists and what it was meant to achieve.
+    #[serde(default)]
     pub intent: String,
-    /// How the implementation actually reaches that goal.
+    /// How the implementation actually reaches that goal. Required unless
+    /// the change is light.
+    #[serde(default)]
     pub execution: String,
     /// How the change fits the surrounding contracts, modules, and callers.
+    /// Required unless the change is light.
+    #[serde(default)]
     pub integration: String,
-    /// How well the tests genuinely exercise the change.
+    /// How well the tests genuinely exercise the change. Required unless
+    /// the change is light.
+    #[serde(default)]
     pub test_quality: String,
-    /// Residual risk the lead explicitly accepts.
+    /// Residual risk the lead explicitly accepts. Required unless the
+    /// change is light.
+    #[serde(default)]
     pub residual_risk: String,
     /// The independent audit worker linked to the same reviewed tip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,11 +79,16 @@ pub struct ReviewEvidence {
 
 /// Require complete, substantive evidence for a lead review or merge gate.
 ///
-/// `require_audit` additionally demands the independent-audit linkage fields;
-/// high-risk reviews pass it once `team_audit_dispatch` exists (plan step 4).
+/// A light lane (`lane.light`: a test or documentation-only diff, or at
+/// most 60 changed lines, and never high-risk work) accepts the unanchored
+/// diff pass and the intent alone; every other change keeps the full five
+/// assessments, and the refusal says why the change is not light and names
+/// the missing fields. `require_audit` additionally demands the
+/// independent-audit linkage fields.
 pub fn validate_review_evidence(
     evidence: &ReviewEvidence,
     require_audit: bool,
+    lane: &ReviewLane,
 ) -> Result<(), String> {
     if !evidence.unanchored_pass {
         return Err(
@@ -78,16 +96,27 @@ pub fn validate_review_evidence(
                 .to_string(),
         );
     }
-    for (field, value) in [
-        ("intent", &evidence.intent),
-        ("execution", &evidence.execution),
-        ("integration", &evidence.integration),
-        ("test_quality", &evidence.test_quality),
-        ("residual_risk", &evidence.residual_risk),
-    ] {
-        if value.trim().is_empty() {
+    if evidence.intent.trim().is_empty() {
+        return Err(
+            "review evidence 'intent' is empty; record a substantive assessment".to_string(),
+        );
+    }
+    if !lane.light {
+        let missing: Vec<&str> = [
+            ("execution", &evidence.execution),
+            ("integration", &evidence.integration),
+            ("test_quality", &evidence.test_quality),
+            ("residual_risk", &evidence.residual_risk),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.trim().is_empty())
+        .map(|(field, _)| field)
+        .collect();
+        if !missing.is_empty() {
             return Err(format!(
-                "review evidence '{field}' is empty; record a substantive assessment"
+                "this change is not light ({}); record the missing evidence fields: {}",
+                lane.reason,
+                missing.join(", ")
             ));
         }
     }
@@ -132,6 +161,143 @@ pub struct ReviewRecord {
     /// Structured review evidence; legacy records decode without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<ReviewEvidence>,
+    /// Which review lane accepted this review — `light review: …` when the
+    /// change was light and `full review: …` otherwise, each with its
+    /// reason. Reviews written before the lanes exist decode without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+}
+
+/// The most changed lines (added plus deleted, by `git diff --numstat`) a
+/// diff may carry and still review on the light lane.
+const LIGHT_REVIEW_MAX_LINES: u64 = 60;
+
+/// The review lane a diff lands in: a light change records the unanchored
+/// diff pass and the intent alone; every other change keeps the full
+/// five-part evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewLane {
+    /// Whether the light lane applies.
+    pub light: bool,
+    /// Why the lane applies — the reason the review answer and the refusal
+    /// error name.
+    pub reason: String,
+}
+
+impl ReviewLane {
+    /// The phrase the team_review answer reports: which lane applied and why.
+    pub fn answer(&self) -> String {
+        if self.light {
+            format!("light review: {}", self.reason)
+        } else {
+            format!("full review: {}", self.reason)
+        }
+    }
+}
+
+/// Whether a diff path counts as a test file for the light lane — the
+/// codegraph finish gate's `is_test_file` rule (private there): a `tests`
+/// path component, or a file name containing `.test.` `.spec.` `_test.` or
+/// `_tests.`.
+fn lane_test_file(rel: &str) -> bool {
+    let lower = rel.replace('\\', "/").to_ascii_lowercase();
+    if lower.split('/').any(|component| component == "tests") {
+        return true;
+    }
+    lower.rsplit('/').next().is_some_and(|name| {
+        [".test.", ".spec.", "_test.", "_tests."]
+            .iter()
+            .any(|suffix| name.contains(suffix))
+    })
+}
+
+/// Decide the review lane for the diff `base..tip` in the repository at
+/// `root`: light when the review risk is not `high` and every changed file
+/// is a test or documentation file, or the diff carries at most 60 changed
+/// lines in total. Binary files are never light.
+pub async fn review_lane(
+    root: &Path,
+    base: &str,
+    tip: &str,
+    review_risk: &str,
+) -> Result<ReviewLane, String> {
+    if review_risk == "high" {
+        return Ok(ReviewLane {
+            light: false,
+            reason: "high-risk work is never light".to_string(),
+        });
+    }
+    let numstat = git_value(root, &["diff", "--numstat", base, tip]).await?;
+    let mut files = 0u64;
+    let mut test_files = 0u64;
+    let mut doc_files = 0u64;
+    let mut non_test_files = 0u64;
+    let mut binary_files = 0u64;
+    let mut changed_lines = 0u64;
+    for line in numstat.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut columns = line.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (columns.next(), columns.next(), columns.next())
+        else {
+            continue;
+        };
+        files += 1;
+        let lower = path.to_ascii_lowercase();
+        if lane_test_file(&lower) {
+            test_files += 1;
+        } else if lower.ends_with(".md") {
+            doc_files += 1;
+        } else {
+            non_test_files += 1;
+        }
+        match (added.parse::<u64>(), deleted.parse::<u64>()) {
+            (Ok(added), Ok(deleted)) => changed_lines += added.saturating_add(deleted),
+            // `--numstat` prints `-` for binary files: they are never light.
+            _ => binary_files += 1,
+        }
+    }
+    if files == 0 {
+        return Ok(ReviewLane {
+            light: true,
+            reason: "no changes since the diff base".to_string(),
+        });
+    }
+    if binary_files > 0 {
+        return Ok(ReviewLane {
+            light: false,
+            reason: format!(
+                "the diff touches {binary_files} binary file(s); binary changes are never light"
+            ),
+        });
+    }
+    if non_test_files == 0 {
+        let reason = if doc_files == 0 {
+            "test-only change"
+        } else if test_files == 0 {
+            "documentation-only change"
+        } else {
+            "test and documentation change"
+        };
+        return Ok(ReviewLane {
+            light: true,
+            reason: reason.to_string(),
+        });
+    }
+    if changed_lines <= LIGHT_REVIEW_MAX_LINES {
+        let lines = if changed_lines == 1 { "line" } else { "lines" };
+        return Ok(ReviewLane {
+            light: true,
+            reason: format!("small change ({changed_lines} changed {lines})"),
+        });
+    }
+    let files_noun = if non_test_files == 1 { "file" } else { "files" };
+    Ok(ReviewLane {
+        light: false,
+        reason: format!("{changed_lines} changed lines in {non_test_files} non-test {files_noun}"),
+    })
 }
 
 /// A successful local merge and its optional later revert.
@@ -737,6 +903,7 @@ mod tests {
         .expect("legacy review decodes");
         assert_eq!(review.summary, "old-style review");
         assert!(review.evidence.is_none());
+        assert!(review.lane.is_none());
     }
 
     #[test]
@@ -746,6 +913,7 @@ mod tests {
             tip: "abc123".into(),
             reviewed_at_ms: 7,
             evidence: Some(evidence()),
+            lane: Some("light review: test-only change".into()),
         };
         let value = serde_json::to_value(&review).expect("review JSON");
         assert!(value.get("evidence").is_some());
@@ -770,43 +938,172 @@ mod tests {
         assert!(merged.review_evidence.is_none());
     }
 
+    /// A lane for the gate tests: a diff too large for the light lane.
+    fn full_lane() -> ReviewLane {
+        ReviewLane {
+            light: false,
+            reason: "62 changed lines in 3 non-test files".to_string(),
+        }
+    }
+
+    /// A lane for the gate tests: a test-only diff.
+    fn light_lane() -> ReviewLane {
+        ReviewLane {
+            light: true,
+            reason: "test-only change".to_string(),
+        }
+    }
+
     #[test]
     fn unanchored_or_empty_evidence_is_rejected() {
         let mut missing_pass = evidence();
         missing_pass.unanchored_pass = false;
-        assert!(validate_review_evidence(&missing_pass, false)
+        assert!(validate_review_evidence(&missing_pass, false, &full_lane())
             .expect_err("an anchored-only review is not substantive")
             .contains("unanchored"));
 
         let mut empty_intent = evidence();
         empty_intent.intent = "   ".into();
-        assert!(validate_review_evidence(&empty_intent, false)
+        // Intent is required on both lanes.
+        assert!(validate_review_evidence(&empty_intent, false, &light_lane())
             .expect_err("empty intent is not substantive")
             .contains("intent"));
 
         let mut empty_risk = evidence();
         empty_risk.residual_risk = String::new();
-        assert!(validate_review_evidence(&empty_risk, false)
+        assert!(validate_review_evidence(&empty_risk, false, &full_lane())
             .expect_err("empty residual risk is not substantive")
             .contains("residual_risk"));
 
-        validate_review_evidence(&evidence(), false).expect("complete evidence passes");
+        // Complete evidence passes on both lanes.
+        validate_review_evidence(&evidence(), false, &full_lane())
+            .expect("complete evidence passes");
+        validate_review_evidence(&evidence(), false, &light_lane())
+            .expect("complete evidence also passes on the light lane");
     }
 
     #[test]
     fn high_risk_evidence_requires_an_audit_linkage_when_demanded() {
-        assert!(validate_review_evidence(&evidence(), true)
+        assert!(validate_review_evidence(&evidence(), true, &full_lane())
             .expect_err("an unlinked review is incomplete")
             .contains("independent reviewer"));
         let mut linked = evidence();
         linked.independent_reviewer_id = Some("audit0001".into());
-        assert!(validate_review_evidence(&linked, true)
+        assert!(validate_review_evidence(&linked, true, &full_lane())
             .expect_err("an unadjudicated audit is incomplete")
             .contains("adjudication"));
         linked.audit_adjudication = Some("the audit confirmed the reviewed tip".into());
-        validate_review_evidence(&linked, true).expect("audited evidence passes");
+        validate_review_evidence(&linked, true, &full_lane()).expect("audited evidence passes");
         // The base contract never demands the audit fields.
-        validate_review_evidence(&evidence(), false).expect("standard evidence passes");
+        validate_review_evidence(&evidence(), false, &full_lane())
+            .expect("standard evidence passes");
+    }
+
+    /// `git` for the lane fixtures, without the phase-3 error mapping.
+    async fn run_git(root: &Path, args: &[&str]) {
+        let output = git(root, args).await.expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A tiny repository whose diff `base..tip` is exactly one commit of
+    /// `changes`, so the light-lane decision sees a known diff.
+    async fn lane_repo(changes: &[(&str, String)]) -> (tempfile::TempDir, String, String) {
+        let root = tempfile::tempdir().expect("repo");
+        run_git(root.path(), &["init", "-b", "main"]).await;
+        run_git(root.path(), &["config", "user.name", "Lane Test"]).await;
+        run_git(root.path(), &["config", "user.email", "lane@example.invalid"]).await;
+        std::fs::write(root.path().join("seed.md"), "seed\n").expect("seed file");
+        run_git(root.path(), &["add", "seed.md"]).await;
+        run_git(root.path(), &["commit", "-m", "seed"]).await;
+        let base = git_value(root.path(), &["rev-parse", "HEAD"])
+            .await
+            .expect("diff base");
+        for (path, contents) in changes {
+            let file = root.path().join(path);
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir).expect("change directory");
+            }
+            std::fs::write(&file, contents).expect("write the change");
+        }
+        run_git(root.path(), &["add", "."]).await;
+        run_git(root.path(), &["commit", "-m", "change"]).await;
+        let tip = git_value(root.path(), &["rev-parse", "HEAD"])
+            .await
+            .expect("diff tip");
+        (root, base, tip)
+    }
+
+    #[tokio::test]
+    async fn small_change_is_light() {
+        // A source file with 60 changed lines — the light-lane maximum — is
+        // still a small change, and the answer says which lane applied.
+        let (root, base, tip) =
+            lane_repo(&[("src/lib.rs", "pub fn small() {}\n".repeat(60))]).await;
+        let lane = review_lane(root.path(), &base, &tip, "standard")
+            .await
+            .expect("decide the lane");
+        assert!(lane.light, "{}", lane.reason);
+        assert_eq!(lane.reason, "small change (60 changed lines)");
+        assert_eq!(
+            lane.answer(),
+            "light review: small change (60 changed lines)"
+        );
+    }
+
+    #[tokio::test]
+    async fn high_risk_is_never_light() {
+        // The same test-only diff: light at standard risk, never at high.
+        let (root, base, tip) =
+            lane_repo(&[("src/app.test.ts", "it('works', () => {});\n".to_string())]).await;
+        let standard = review_lane(root.path(), &base, &tip, "standard")
+            .await
+            .expect("decide the standard lane");
+        assert!(standard.light, "{}", standard.reason);
+        assert_eq!(standard.reason, "test-only change");
+        let high = review_lane(root.path(), &base, &tip, "high")
+            .await
+            .expect("decide the high-risk lane");
+        assert!(!high.light, "{}", high.reason);
+        assert!(high.reason.contains("high-risk"), "{}", high.reason);
+        assert!(high.answer().starts_with("full review: "), "{}", high.answer());
+    }
+
+    #[test]
+    fn light_evidence_decodes_without_the_optional_fields() {
+        // A light review persists only the unanchored pass and the intent;
+        // the record must still decode, and the gate must accept it.
+        let light: ReviewEvidence = serde_json::from_value(serde_json::json!({
+            "unanchored_pass": true,
+            "intent": "the diff only pins the fixed behavior"
+        }))
+        .expect("light evidence decodes");
+        assert_eq!(light.execution, "");
+        assert_eq!(light.residual_risk, "");
+        validate_review_evidence(&light, false, &light_lane())
+            .expect("the light lane accepts the unanchored pass and the intent alone");
+        // The four assessments stay required on the full lane, and the
+        // refusal says why the change is not light and names what is missing.
+        let full = validate_review_evidence(&light, false, &full_lane())
+            .expect_err("a non-light change needs the full evidence");
+        assert!(full.contains("62"), "{full}");
+        assert!(full.contains("non-test"), "{full}");
+        for field in ["execution", "integration", "test_quality", "residual_risk"] {
+            assert!(full.contains(field), "{full}");
+        }
+    }
+
+    #[test]
+    fn missing_unanchored_pass_is_refused_even_when_light() {
+        // The unanchored diff pass is the one requirement the light lane keeps.
+        let mut no_pass = evidence();
+        no_pass.unanchored_pass = false;
+        let refused = validate_review_evidence(&no_pass, false, &light_lane())
+            .expect_err("the light lane still needs the unanchored pass");
+        assert!(refused.contains("unanchored"), "{refused}");
     }
 
     #[test]

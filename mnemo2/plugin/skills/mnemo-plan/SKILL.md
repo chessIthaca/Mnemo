@@ -47,7 +47,7 @@ Mnemo exists so that cheap models do the implementing. A cheap model follows ins
 - **Done checklist.** The commands to run and the observable result that means the step is finished.
 - **Don't touch.** Files that other steps or parallel plans own.
 
-You, the lead, write these specs yourself. Read the code they touch, so the names, signatures and line anchors are real. Prefer long specs with every detail needed to implement faithfully over short ones. There is no length to stay under. Put everything specific to the step in the step text, not only in the dispatch `brief`: the brief is not saved in the plan, so a worker that is resumed, compacted or switched to another model loses it.
+You, the lead, write these specs yourself. Read the code they touch, so the names, signatures and line anchors are real. Put everything specific to the step in the step text, not only in the dispatch `brief`: the brief is not saved in the plan, so a worker that is resumed, compacted or switched to another model loses it.
 
 First plan, then implement: write every step's spec before the first dispatch, not step by step as workers finish.
 

@@ -97,6 +97,8 @@ pub struct BoardPlan {
     /// Structured OpenSpec changes, also rendered into the plan markdown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spec_deltas: Vec<Delta>,
+    /// The plan's context paragraph (why, constraints, intent).
+    pub context: String,
     /// OpenSpec schema reference captured when the plan was created.
     pub schema: String,
     /// Additional schema artifacts keyed by artifact id.
@@ -1665,6 +1667,7 @@ fn board_plan(entry: &BoardEntry, plan: &PlanFile) -> BoardPlan {
         closed_at_ms: entry.closed_at_ms,
         report_path: entry.report_path.clone(),
         spec_deltas: entry.spec_deltas.clone(),
+        context: plan.context.clone(),
         schema: entry.schema.clone(),
         sections: entry.sections.clone(),
         no_spec_impact: entry.no_spec_impact.clone(),

@@ -2545,6 +2545,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Version bump and changelog only; no behaviour changes."
+    },
+    {
+      "id": "f3d43b57",
+      "status": "closed",
+      "created_at_ms": 1794761419474,
+      "closed_at_ms": 1794770771435,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f3d43b57-20261115-192611.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "New feature outside any OpenSpec-governed capability; acceptance scenarios carry the contract."
     }
   ]
 }

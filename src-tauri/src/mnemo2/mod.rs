@@ -132,6 +132,10 @@ pub mod appearance_settings;
 /// commands that connect it to Claude Code (plan 5b9975c1).
 pub mod claude_code;
 
+/// Mnemo2's self-update: the background check against the GitHub release
+/// feed, the quiet download, and the install at restart (plan f3d43b57).
+pub mod updates;
+
 /// The Specs settings commands (OpenSpec schema list/resolve/add/fork,
 /// artifact templates and instructions, the project `config.yaml`, the
 /// plan preview, the specs status and the optional `openspec validate`)
@@ -600,11 +604,14 @@ pub fn run() {
     }));
     let hidden = args.hidden;
     let exit_phase = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EXIT_RUNNING));
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(state)
-        .manage(browser::BrowserController::default())
+        .manage(browser::BrowserController::default());
+    #[cfg(feature = "auto-update")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    builder
         .setup(move |app| {
             use tauri::Manager as _;
 
@@ -629,6 +636,19 @@ pub fn run() {
             // the main thread.
             hang::start(app.handle());
             start_endpoint(app.handle());
+            // The updater's state, its event channel and its background loop;
+            // the first check runs FIRST_CHECK_DELAY from now.
+            {
+                use tauri::{Emitter as _, Manager as _};
+                let emitter = app.handle().clone();
+                app.manage(std::sync::Arc::new(updates::UpdateService::new(
+                    updates::initial_state(),
+                    move |state| {
+                        let _ = emitter.emit(updates::UPDATE_STATE_CHANNEL, state);
+                    },
+                )));
+                updates::start(app.handle().clone());
+            }
             // Ship the Claude Code plugin and its helper into <config>, off the
             // main thread so a slow disk never delays the window.
             let plugin_config = config_dir.clone();
@@ -698,6 +718,9 @@ pub fn run() {
             mcp_settings::mcp_settings_test,
             claude_code::claude_code_status,
             claude_code::claude_code_connect,
+            updates::update_state,
+            updates::update_check,
+            updates::update_restart,
             appearance_settings::appearance_settings_get,
             appearance_settings::appearance_settings_save,
             ipc::lead_snapshot,
@@ -861,6 +884,9 @@ pub fn run() {
                     shutdown,
                     move || {
                         exit_phase.store(EXIT_READY, Ordering::Release);
+                        if updates::install_if_requested(&exit_app) {
+                            return;
+                        }
                         exit_app.exit(code.unwrap_or(0));
                     },
                     progress,

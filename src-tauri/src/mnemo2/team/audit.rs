@@ -387,6 +387,7 @@ impl TeamRuntime {
             report_delivered: false,
             reasoning_effort,
             review_rounds: 0,
+            review_turns: None,
             fix_rounds: 0,
             audits: 0,
             models_used: Vec::new(),

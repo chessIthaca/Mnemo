@@ -181,6 +181,7 @@ impl TeamRuntime {
             review_risk,
             review: None,
             review_rounds: 0,
+            review_turns: None,
             fix_rounds: 0,
             audits: 0,
             models_used: Vec::new(),

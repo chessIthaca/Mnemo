@@ -1606,6 +1606,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         findings: Vec::new(),
         review: None,
         review_rounds: 0,
+        review_turns: None,
         fix_rounds: 0,
         audits: 0,
         models_used: Vec::new(),
@@ -6474,9 +6475,10 @@ fn drift_check_skips_generated_messages_and_the_read_back_answer() {
     assert!(!message_can_show_drift(&read_back, MessageSender::Mnemo));
 }
 
-/// The deterministic review nudge: a second review round that still
-/// records a high finding nudges the lead to the next tier up, in
-/// every mode except off (design §4.6).
+/// The deterministic review nudge: a second review round, after the
+/// worker's own turn, that still records a high finding nudges the lead to
+/// the next tier up, in every mode except off (design §4.6). A lead-only
+/// review round never nudges.
 #[tokio::test]
 async fn second_high_finding_review_nudges() {
     use crate::mnemo2::dispatch_routing::{save_routing_settings, RoutingSettings, RoutingMode};
@@ -6553,6 +6555,10 @@ async fn second_high_finding_review_nudges() {
     team.stop_inner(&record.id)
         .await
         .expect("stop the fixer session");
+    // The fixer's completed turn: a round with no worker turn in between is
+    // the lead's own review_fix work, and must never escalate.
+    team.update_worker(&record.id, |worker| worker.turns += 1)
+        .await;
     let second = team
         .review(&record.id, "second pass".into(), vec![open_finding("finding1")], evidence())
         .await
@@ -9702,5 +9708,256 @@ async fn session_search_is_a_lead_tool_and_answers() {
     assert!(one.output.starts_with("agent-abc #1 user"), "{}", one.output);
     assert!(one.output.contains("flaked"), "{}", one.output);
 
+    team.shutdown().await;
+}
+
+/// An open high finding on the file the test worker checkout seeds, so a
+/// `review_fix` can edit exactly the finding's source file.
+fn readme_finding(id: &str) -> Finding {
+    Finding {
+        file: "README.md".to_string(),
+        line: 1,
+        ..open_finding(id)
+    }
+}
+
+/// A record-based team with one routine-tier worker and no live session, for
+/// the repeated-finding escalation: nothing but the test itself can bump the
+/// worker's turn count.
+async fn repeated_finding_fixture(mode: RoutingMode, id: &str) -> ReviewFixture {
+    use crate::mnemo2::dispatch_routing::{save_routing_settings, RoutingSettings};
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    save_routing_settings(
+        config.path(),
+        &RoutingSettings {
+            mode,
+            ..RoutingSettings::default()
+        },
+    )
+    .expect("save routing settings");
+    let mut record = worker(root.path(), id);
+    record.tier = Some("routine".to_string());
+    record.model = Some("test/scripted-simple".to_string());
+    record.routing = Some(WorkerRouting {
+        laya_tier: Some("routine".to_string()),
+        confidence: Some(0.62),
+        cleared: true,
+        lead_tier: Some("routine".to_string()),
+        routed_by: "lead".to_string(),
+        ran_tier: Some("routine".to_string()),
+        nudged: None,
+    });
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        record.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision the worker checkout");
+    let team =
+        open_test_team_with_config(root.path(), state.path(), vec![record.clone()], config.path())
+            .await;
+    team.set_catalog(
+        vec![
+            lead_model("scripted-difficult"),
+            lead_model("scripted-average"),
+            lead_model("scripted-simple"),
+        ],
+        tiers_dto! {
+            difficult: vec!["test/scripted-difficult".into()],
+            average: vec!["test/scripted-average".into()],
+            simple: vec!["test/scripted-simple".into()],
+        },
+        Vec::new(),
+    );
+    ReviewFixture {
+        _root: root,
+        state,
+        _config: config,
+        team,
+        record,
+    }
+}
+
+/// A lead `review_fix` round is the lead's own edit, not a failed worker
+/// round: with no worker turn between the two reviews, a finding that is
+/// still open must not escalate, and Auto mode must leave the worker's tier
+/// and model alone (bug report 2026-11-15 on worker lightDocs01).
+#[tokio::test]
+async fn lead_review_fix_rounds_do_not_escalate() {
+    let fixture = repeated_finding_fixture(RoutingMode::Auto, "reviewfix001").await;
+    let team = &fixture.team;
+    let first = team
+        .review(
+            &fixture.record.id,
+            "first pass".into(),
+            vec![readme_finding("finding1"), open_finding("finding2")],
+            evidence(),
+        )
+        .await
+        .expect("first review");
+    assert_eq!(first.review_rounds, 1, "{first:?}");
+    let fixed = team
+        .review_fix(&fixture.record.id, "finding1", "README.md", "seed", "fixed")
+        .await
+        .expect("the lead fixes the wording finding itself");
+    assert_eq!(fixed.fix_rounds, 1, "{fixed:?}");
+    assert_eq!(fixed.turns, 0, "review_fix never runs a worker turn");
+    let second = team
+        .review(
+            &fixture.record.id,
+            "second pass".into(),
+            vec![open_finding("finding2")],
+            evidence(),
+        )
+        .await
+        .expect("second review");
+    assert_eq!(second.review_rounds, 2, "{second:?}");
+    assert!(
+        second
+            .routing
+            .as_ref()
+            .expect("routed worker")
+            .nudged
+            .is_none(),
+        "a lead-only review round never nudges: {second:?}"
+    );
+    assert_eq!(second.tier.as_deref(), Some("routine"), "{second:?}");
+    assert_eq!(
+        second.model.as_deref(),
+        Some("test/scripted-simple"),
+        "{second:?}"
+    );
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| matches!(row, DispatchRoutingRow::Nudge { .. })),
+        "no nudge row: {:?}",
+        fixture.rows()
+    );
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| matches!(row, DispatchRoutingRow::LeadReroute { .. })),
+        "no auto switch: {:?}",
+        fixture.rows()
+    );
+    team.shutdown().await;
+}
+
+/// The repeated-finding escalation still fires when the worker really did
+/// take a turn between the two reviews and left the high finding open.
+#[tokio::test]
+async fn finding_open_after_a_worker_turn_still_escalates() {
+    let fixture = repeated_finding_fixture(RoutingMode::Shadow, "reviewturn01").await;
+    let team = &fixture.team;
+    team.review(
+        &fixture.record.id,
+        "first pass".into(),
+        vec![open_finding("finding1")],
+        evidence(),
+    )
+    .await
+    .expect("first review");
+    // A finished worker turn, exactly as the pump records one.
+    team.update_worker(&fixture.record.id, |worker| worker.turns += 1)
+        .await;
+    let second = team
+        .review(
+            &fixture.record.id,
+            "second pass".into(),
+            vec![open_finding("finding1")],
+            evidence(),
+        )
+        .await
+        .expect("second review");
+    assert_eq!(second.review_rounds, 2, "{second:?}");
+    assert_eq!(second.turns, 1, "{second:?}");
+    assert_eq!(
+        second
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.nudged.as_deref()),
+        Some("high"),
+        "{second:?}"
+    );
+    assert!(
+        fixture.rows().iter().any(|row| matches!(
+            row,
+            DispatchRoutingRow::Nudge { reason, to_tier, .. }
+                if reason == "review" && to_tier == "high"
+        )),
+        "a review nudge row: {:?}",
+        fixture.rows()
+    );
+    team.shutdown().await;
+}
+
+/// A record persisted before the review turn count existed decodes with the
+/// unknown value, and the repeat rule never fires on that unknown — even
+/// when the worker has since taken a turn.
+#[tokio::test]
+async fn legacy_review_rounds_without_a_turn_count_never_escalate() {
+    let fixture = repeated_finding_fixture(RoutingMode::Auto, "reviewlegacy1").await;
+    let team = &fixture.team;
+    team.review(
+        &fixture.record.id,
+        "first pass".into(),
+        vec![open_finding("finding1")],
+        evidence(),
+    )
+    .await
+    .expect("first review");
+    let stored = team.worker(&fixture.record.id).await.expect("stored worker");
+    let mut legacy = serde_json::to_value(&stored).expect("the record as json");
+    assert!(
+        legacy
+            .as_object_mut()
+            .expect("record object")
+            .remove("review_turns")
+            .is_some(),
+        "a recorded review carries its turn count"
+    );
+    let decoded: WorkerRecord =
+        serde_json::from_value(legacy).expect("a record written before the field decodes");
+    assert_eq!(decoded.review_rounds, 1, "{decoded:?}");
+    assert_eq!(decoded.review_turns, None, "a missing turn count is unknown");
+    // Back to the legacy shape, with a worker turn since: unknown must never
+    // escalate on the repeat rule.
+    team.update_worker(&fixture.record.id, |worker| {
+        worker.review_turns = None;
+        worker.turns += 1;
+    })
+    .await;
+    let second = team
+        .review(
+            &fixture.record.id,
+            "second pass".into(),
+            vec![open_finding("finding1")],
+            evidence(),
+        )
+        .await
+        .expect("second review");
+    assert_eq!(second.review_rounds, 2, "{second:?}");
+    assert!(
+        second
+            .routing
+            .as_ref()
+            .expect("routed worker")
+            .nudged
+            .is_none(),
+        "an unknown turn count never escalates: {second:?}"
+    );
+    assert_eq!(second.tier.as_deref(), Some("routine"), "{second:?}");
+    assert_eq!(
+        second.model.as_deref(),
+        Some("test/scripted-simple"),
+        "{second:?}"
+    );
     team.shutdown().await;
 }

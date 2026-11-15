@@ -2534,6 +2534,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Packaging, a new Settings page and its commands; no OpenSpec capability under .coding/openspec/specs governs installers, the plugin files or Settings → Claude Code."
+    },
+    {
+      "id": "aae43b2b",
+      "status": "closed",
+      "created_at_ms": 1794737119586,
+      "closed_at_ms": 1794737707526,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-aae43b2b-20261115-101507.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Version bump and changelog only; no behaviour changes."
     }
   ]
 }

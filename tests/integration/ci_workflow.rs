@@ -651,6 +651,134 @@ fn build_workflow_tauri_cli_is_declared_and_locked() {
     );
 }
 
+/// The release installers must carry the Claude Code helper: the `mnemo`
+/// plugin runs `bin/mnemo2-mcp`, which only a source build used to create
+/// (`scripts/install-mnemo2-mcp.mjs`), so an installed Mnemo2 could not lead
+/// with Claude Code. Tauri's bundler ships every `[[bin]]` of the app package
+/// on its own (`src-tauri/mnemo2-app` declares `mnemo2-mcp`), so each
+/// platform job bundles normally and then checks that the produced installer
+/// really carries the helper — no `bundle.externalBin` sidecar anywhere.
+///
+/// Regression: the released installers shipped without `mnemo2-mcp`, so the
+/// bundled plugin's MCP server could not start on a user's machine. A second
+/// attempt declared the helper as an explicit `bundle.externalBin` sidecar
+/// instead; that duplicated the auto-bundled bin in the Windows MSI, where
+/// WiX `light.exe` failed with ICE30 — the same `mnemo2-mcp.exe` installed
+/// by two different components (CI run 43652392587) — so the sidecar
+/// machinery is gone for good.
+#[test]
+fn build_workflow_bundles_the_mnemo2_mcp_helper() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let workflow = std::fs::read_to_string(format!("{root}/.github/workflows/build.yml"))
+        .expect("build.yml readable");
+
+    // a. Each job keeps its post-build check that the produced installer
+    // really carries the helper: the installer sources on Windows, the built
+    // app bundle on macOS.
+    let checks = [
+        (
+            "windows",
+            "Check the installers carry mnemo2-mcp",
+            ["installer.nsi", "main.wxs", "mnemo2-mcp.exe"].as_slice(),
+        ),
+        (
+            "macos",
+            "Check the app bundle carries mnemo2-mcp",
+            ["Contents/MacOS/mnemo2-mcp"].as_slice(),
+        ),
+    ];
+    for (job, check, needles) in checks {
+        let block = job_block(&workflow, job);
+        assert!(
+            block.contains(&format!("- name: {check}")),
+            "the {job} job has no `{check}` step — nothing then proves the \
+             built installers carry the helper"
+        );
+        let step = step_named(&block, check);
+        for needle in needles {
+            assert!(
+                step.contains(needle),
+                "the {job} job's `{check}` step no longer looks for {needle:?} \
+                 — nothing then proves the built installers carry the \
+                 mnemo2-mcp helper: {step}"
+            );
+        }
+
+        // b. The check runs after the job's own bundle, never before it.
+        // Commands, not prose: a comment naming `npx tauri build` is no
+        // bundle call.
+        let mut bundle_at: Option<usize> = None;
+        let mut offset = 0;
+        for line in block.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('#') && trimmed.contains("npx tauri build") {
+                bundle_at = Some(offset + (line.len() - line.trim_start().len()));
+                break;
+            }
+            offset += line.len();
+        }
+        let bundle_at =
+            bundle_at.unwrap_or_else(|| panic!("the {job} job runs no `npx tauri build`"));
+        assert!(
+            bundle_at < step_offset(&block, check),
+            "the {job} job's `{check}` step runs before `npx tauri build`, so \
+             it inspects no installer at all"
+        );
+    }
+
+    // c. The helper reaches the installers because tauri bundles every
+    // `[[bin]]` of the app package by itself.
+    let manifest_rel = "src-tauri/mnemo2-app/Cargo.toml";
+    let manifest = std::fs::read_to_string(format!("{root}/{manifest_rel}"))
+        .unwrap_or_else(|e| panic!("{manifest_rel} readable: {e}"));
+    let declares_helper_bin = manifest.split("[[bin]]").skip(1).any(|bin| {
+        bin.lines()
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .any(|line| line.trim() == "name = \"mnemo2-mcp\"")
+    });
+    assert!(
+        declares_helper_bin,
+        "{manifest_rel} declares no `[[bin]]` named `mnemo2-mcp` — tauri then \
+         bundles no helper and the installers ship without the Claude Code one"
+    );
+
+    // d. No config may declare `bundle.externalBin`: tauri already bundles
+    // the bin (a sidecar duplicated it in the installers, MSI ICE30 above),
+    // and tauri's build script refuses to compile while a configured sidecar
+    // file is missing — breaking every plain `cargo build`/`cargo test`.
+    for conf_rel in [
+        "src-tauri/mnemo2-app/tauri.conf.json",
+        "src-tauri/tauri.conf.json",
+    ] {
+        let conf_text = std::fs::read_to_string(format!("{root}/{conf_rel}"))
+            .unwrap_or_else(|e| panic!("{conf_rel} readable: {e}"));
+        let conf: serde_json::Value = serde_json::from_str(&conf_text)
+            .unwrap_or_else(|e| panic!("{conf_rel} is valid JSON: {e}"));
+        assert!(
+            conf["bundle"].get("externalBin").is_none(),
+            "{conf_rel} declares `bundle.externalBin` — tauri already bundles \
+             the mnemo2-mcp `[[bin]]`, so a sidecar duplicates it in the \
+             installers (MSI ICE30, CI run 43652392587)"
+        );
+    }
+    let bundle_conf_rel = "src-tauri/mnemo2-app/tauri.bundle.conf.json";
+    assert!(
+        !std::path::Path::new(root).join(bundle_conf_rel).exists(),
+        "{bundle_conf_rel} exists again — the externalBin sidecar duplicates \
+         the auto-bundled mnemo2-mcp bin (MSI ICE30, CI run 43652392587)"
+    );
+
+    // e. The workflow carries none of the sidecar machinery either.
+    for needle in ["--config tauri.bundle.conf.json", "stage-mnemo2-mcp-sidecar"] {
+        assert!(
+            !workflow.contains(needle),
+            "build.yml mentions {needle:?} again — that externalBin sidecar \
+             path duplicates the mnemo2-mcp bin tauri already bundles (MSI \
+             ICE30, CI run 43652392587)"
+        );
+    }
+}
+
 // Failure text for the vendored-patch lock guard below.
 const UNUSED_PATCH_MSG: &str = "Cargo.lock carries a [[patch.unused]] entry: a [patch.crates-io] override (the wry path patch in Cargo.toml) no longer applies to the resolved version, so the registry crate would ship instead of the vendored build — losing the WebView2 OS-account SSO + hard-reload patches. Re-pin tauri / tauri-runtime-wry by hand together with vendor/wry (see vendor/wry/PATCHES.md and the .github/dependabot.yml ignore list), then re-run this guard";
 

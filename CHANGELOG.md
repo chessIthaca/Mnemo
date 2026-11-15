@@ -7,6 +7,10 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
 `.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
+## [Unreleased]
+### Added
+- The installers ship the Claude Code plugin's `mnemo2-mcp` helper. Mnemo2 installs the plugin and helper into `~/.mnemo/claude-plugin` at every start, and **Settings → Claude Code → Connect Claude Code** registers the plugin with Claude Code in one click, so leading with Claude Code no longer needs a source build.
+
 ## [2.3.1] — 2026-11-14
 
 The documentation describes Mnemo2 only, plus two fixes.

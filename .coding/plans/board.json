@@ -2523,6 +2523,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "README text only; no runtime behaviour or specified capability changes."
+    },
+    {
+      "id": "5b9975c1",
+      "status": "closed",
+      "created_at_ms": 1794691105573,
+      "closed_at_ms": 1794701829275,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5b9975c1-20261115-001709.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Packaging, a new Settings page and its commands; no OpenSpec capability under .coding/openspec/specs governs installers, the plugin files or Settings → Claude Code."
     }
   ]
 }

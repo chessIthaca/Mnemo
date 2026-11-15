@@ -132,7 +132,7 @@ PLAN.md               the technical-decisions log
 
 ### Install a release
 
-Download the installer for your platform from the [releases page](https://github.com/chessIthaca/Mnemo/releases): the `.msi` or `-setup.exe` for Windows, the `.dmg` for macOS on Apple silicon. Leading with Claude Code needs a build from source for now; see [Lead with Claude Code](#lead-with-claude-code).
+Download the installer for your platform from the [releases page](https://github.com/chessIthaca/Mnemo/releases): the `.msi` or `-setup.exe` for Windows, the `.dmg` for macOS on Apple silicon. Mnemo2 also sets up the Claude Code plugin; see [Lead with Claude Code](#lead-with-claude-code).
 
 ### First run
 
@@ -173,20 +173,19 @@ npm run dev:mnemo2:native    # Tauri host + real lead and team (run dev:mnemo2 f
 
 ### Lead with Claude Code
 
-Claude Code (the CLI or the Claude Desktop Code tab) can lead a Mnemo2 project instead of the built-in lead chat, through the `mnemo` plugin in `mnemo2/plugin/`. It plans, dispatches, reviews and merges; the workers still run on your own endpoints and tiers, and only the lead uses your Claude subscription.
+Claude Code (the CLI or the Claude Desktop Code tab) can lead a Mnemo2 project instead of the built-in lead chat, through the `mnemo` plugin. It plans, dispatches, reviews and merges; the workers still run on your own endpoints and tiers, and only the lead uses your Claude subscription.
 
-For now this needs Mnemo2 built from source: the plugin's `mnemo2-mcp` helper comes from that build and is not in the release installers.
+Mnemo2 installs the plugin and its `mnemo2-mcp` helper itself, at every start, into `~/.mnemo/claude-plugin` (Windows: `%USERPROFILE%\.mnemo\claude-plugin`). That works from a release installer and from a source build alike.
 
-1. Build Mnemo2 from source as above. The build also installs the helper into `mnemo2/plugin/bin/` and `~/.mnemo/bin/`.
-2. Open your project in Mnemo2 once, so it is registered.
-3. Install the plugin from your clone. In Claude Desktop: Code tab → **+** → **Add plugins**, add a marketplace from the clone's folder, then install `mnemo`. With the CLI:
+1. Open your project in Mnemo2 once, so it is registered.
+2. **Settings → Claude Code → Connect Claude Code.** Mnemo2 runs `claude plugin marketplace add` and `claude plugin install mnemo@mnemo` for you and shows what happened. Without the `claude` CLI, use Claude Desktop instead: Code tab → **+** → **Add plugins**, add a marketplace from the `claude-plugin` folder above, then install `mnemo`. Or run the commands yourself:
 
    ```bash
-   claude plugin marketplace add <path to your clone>
+   claude plugin marketplace add ~/.mnemo/claude-plugin
    claude plugin install mnemo@mnemo
    ```
 
-4. Start Claude Code in the project folder (or any folder inside it) and describe what you want. Mnemo2 starts in the tray if it is not running, and mission control shows "Lead: Claude Code (external)".
+3. Start Claude Code in the project folder (or any folder inside it) and describe what you want. Mnemo2 starts in the tray if it is not running, and mission control shows "Lead: Claude Code (external)".
 
 On first use Claude offers to allow the Mnemo tools, so the lead does not stall on permission prompts.
 

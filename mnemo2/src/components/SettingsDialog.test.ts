@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   layaTransport: null as unknown,
   safetyTransport: null as unknown,
   mcpTransport: null as unknown,
+  claudeTransport: null as unknown,
   specsTransport: null as unknown,
   aboutTransport: null as unknown,
 }));
@@ -42,6 +43,11 @@ vi.mock("../lib/safetySettings", async (importOriginal) => {
 vi.mock("../lib/mcpSettings", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/mcpSettings")>();
   return { ...original, createMcpTransport: () => mocks.mcpTransport };
+});
+
+vi.mock("../lib/claudeCode", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/claudeCode")>();
+  return { ...original, createClaudeCodeTransport: () => mocks.claudeTransport };
 });
 
 vi.mock("../lib/specsSettings", async (importOriginal) => {
@@ -149,6 +155,22 @@ function makeMcpTransport() {
   };
 }
 
+function makeClaudeTransport() {
+  mocks.claudeTransport = {
+    status: vi.fn(async () => ({
+      helper_path: "C:\\Users\\me\\.mnemo\\bin\\mnemo2-mcp.exe",
+      plugin_dir: "C:\\Users\\me\\.mnemo\\claude-plugin",
+      cli_path: "C:\\Users\\me\\AppData\\Local\\Programs\\claude\\claude.exe",
+      marketplace: "missing",
+      marketplace_path: null,
+      plugin_installed: false,
+      plugin_version: null,
+      error: null,
+    })),
+    connect: vi.fn(async () => ({ ok: true, message: "The mnemo plugin is ready.", steps: [] })),
+  };
+}
+
 /** A ready Laya transport whose routing wire carries NO `effort` key —
  * exactly what the real backend sends. The old test fixtures added one,
  * which is what hid the page's false save prompt for so long. */
@@ -220,6 +242,7 @@ describe("SettingsDialog", () => {
     mocks.layaTransport = null;
     mocks.safetyTransport = null;
     mocks.mcpTransport = null;
+    mocks.claudeTransport = null;
     mocks.specsTransport = null;
     mocks.aboutTransport = null;
     app.set(fixtureState());
@@ -597,6 +620,18 @@ describe("SettingsDialog", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Source code" }));
     expect(aboutTransport.open).toHaveBeenCalledWith("https://github.com/chessIthaca/Mnemo");
   });
+
+  it("opens the Claude Code page from the rail", async () => {
+    makeTransport();
+    makeClaudeTransport();
+    await openDialog();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Claude Code" }));
+
+    expect(await screen.findByRole("region", { name: "Claude Code" })).toBeTruthy();
+    const connect = screen.getByRole("button", { name: "Connect Claude Code" }) as HTMLButtonElement;
+    expect(connect.disabled).toBe(false);
+  });
 });
 
 /**
@@ -610,6 +645,7 @@ describe("unsaved edits", () => {
     mocks.layaTransport = null;
     mocks.safetyTransport = null;
     mocks.mcpTransport = null;
+    mocks.claudeTransport = null;
     mocks.specsTransport = null;
     mocks.aboutTransport = null;
     app.set(fixtureState());

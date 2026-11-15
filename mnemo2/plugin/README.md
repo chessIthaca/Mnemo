@@ -20,11 +20,15 @@ While Claude Code is the attached lead, the MCP server enforces the same memory 
 
 ## Requirements
 
-- Mnemo2 built from this repository: `npm run build:mnemo2:native` at the repository root. It builds `mnemo2` and `mnemo2-mcp`, then copies `mnemo2-mcp` into `mnemo2/plugin/bin/` and records where `mnemo2` lives (`bin/mnemo2-path.txt`) so the helper can start it.
+- Mnemo2, installed from a release or built from this repository. Mnemo2 writes this plugin, with its helper in `bin/`, to `<config>/claude-plugin/` (`~/.mnemo/claude-plugin`, or under `$MNEMO_HOME`) at every start; a source build (`npm run build:mnemo2:native`) also copies the helper into `mnemo2/plugin/bin/` here.
 - Claude Code, tested with 2.1.138. The plugin relies on plugin MCP servers, skills, and command hooks in exec form (`command` plus `args`).
 - The project must be registered in Mnemo2 (open it there once). The helper serves Mnemo tools only for a working directory inside a registered project.
 
 ## Install
+
+From an installed Mnemo2: open **Settings → Claude Code** and click **Connect Claude Code**. It adds `<config>/claude-plugin` as the `mnemo` marketplace and installs `mnemo@mnemo` (or updates both), and shows the commands it ran. Without the CLI, add that folder as a marketplace in Claude Desktop (Code tab, + then Add plugins) or run `claude plugin marketplace add <config>/claude-plugin` and `claude plugin install mnemo@mnemo`. If Claude Code already has a `mnemo` marketplace from a source checkout, Connect leaves it as it is.
+
+From a source checkout (to work on the plugin):
 
 The repository root contains the marketplace file `.claude-plugin/marketplace.json`, so the marketplace is the repository itself.
 
@@ -111,7 +115,7 @@ Mnemo2 started on demand keeps running in the system tray, and Windows locks a r
 ## Troubleshooting
 
 - No Mnemo tools in the session: the folder is probably not inside a registered Mnemo2 project. Open it in Mnemo2, then restart the Claude session. Run `/mcp` to see whether the `mnemo` server is connected.
-- The `mnemo` server fails to start: `bin/mnemo2-mcp` is missing from the installed copy. Run `npm run build:mnemo2:native` first, then reinstall the plugin (see Install). Nothing under `bin/` is checked in.
+- The `mnemo` server fails to start: the helper is missing from the installed copy. Restart Mnemo2 (it reinstalls the helper into `<config>/claude-plugin/plugin/bin/`) and click Connect again; for a source-checkout marketplace run `npm run build:mnemo2:native` first, then reinstall the plugin (see Install).
 - Mnemo2 does not start on demand: start it yourself and open the project. If you moved the build, rerun the native build so `bin/mnemo2-path.txt` points to the right `mnemo2`.
 - Connection lost after Mnemo2 restarted: the helper retries the lookup once and tells Claude in plain text if it still cannot connect. Restart the Claude session in that case. Stale run files in `~/.mnemo/run/` (dead process or no answer) are ignored and removed.
 - No notices while idle: check that the waiter is running (the lead starts it with Bash in the background). `mnemo2-mcp wait` run by hand prints a notice or "no events".

@@ -1,0 +1,7 @@
++++
+title = "a source build in a worker worktree needs <repo>/target/mnemo2-dist, not $CARGO_TARGET_DIR"
+created = "2026-11-14"
+evidence = "Plan 5b9975c1 step 6, wt/agent-stageBot commit 3479ed49: `CARGO_TARGET_DIR=C:\\Mnemo\\target node scripts/stage-mnemo2-mcp-sidecar.mjs` first died at src-tauri/src/mnemo2/mod.rs:807 (generate_context!) with frontendDist missing, then succeeded (exit 0, 1m56s) after copying C:\\Mnemo\\target\\mnemo2-dist into the worktree."
++++
+
+A source (release-profile) build of the Mnemo2 app/helper in a fresh worker worktree needs `<worktree>/target/mnemo2-dist` even when CARGO_TARGET_DIR points at a shared warm dir. `src-tauri/mnemo2-app/tauri.conf.json` sets `"frontendDist": "../../target/mnemo2-dist"`, which resolves relative to the config dir to `<repo>/target/mnemo2-dist` — NOT `$CARGO_TARGET_DIR` — so `tauri::generate_context!` in src-tauri/src/mnemo2/mod.rs aborts with "The `frontendDist` configuration is set to \"../../target/mnemo2-dist\" but this path doesn't exist" before the helper links. Cheap fix for a check-only run: copy the 1.6 MB dir from C:\Mnemo\target\mnemo2-dist into the worktree's gitignored target/mnemo2-dist instead of npm ci + npm run build:mnemo2. Also note the warm-release-cache assumption is only partly true across worktrees: vendored path deps (vendor/wry, src-tauri, src-tauri/mnemo2-app) fingerprint by source dir, so wry/mnemo-app/mnemo2-app recompile (~2 min).

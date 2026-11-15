@@ -78,6 +78,16 @@ jobs:
       - name: Tauri build Mnemo2 (unsigned installers)
         run: npx tauri build
         working-directory: src-tauri/mnemo2-app
+      # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp included; fail if that ever stops.
+      - name: Check the installers carry mnemo2-mcp
+        shell: pwsh
+        run: |
+          $hits = Get-ChildItem target/release -Recurse -Include installer.nsi,main.wxs | Select-String -SimpleMatch 'mnemo2-mcp.exe'
+          $files = $hits | ForEach-Object { Split-Path $_.Path -Leaf } | Sort-Object -Unique
+          if (-not ($files -contains 'installer.nsi' -and $files -contains 'main.wxs')) {
+            Write-Error "mnemo2-mcp.exe is missing from the installers (found in: $($files -join ', '))"
+            exit 1
+          }
       - name: Upload Windows installers
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -217,6 +227,9 @@ jobs:
       - name: Tauri build Mnemo2 (.app + .dmg, aarch64)
         run: npx tauri build --target aarch64-apple-darwin
         working-directory: src-tauri/mnemo2-app
+      # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp included; fail if that ever stops.
+      - name: Check the app bundle carries mnemo2-mcp
+        run: test -x target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app/Contents/MacOS/mnemo2-mcp
       # upload-artifact@v4 does not preserve file permissions (the Mach-O
       # exec bit) or symlinks, so a raw .app would not launch after download
       # (review F2). ditto preserves both — zip the .app and upload the zip

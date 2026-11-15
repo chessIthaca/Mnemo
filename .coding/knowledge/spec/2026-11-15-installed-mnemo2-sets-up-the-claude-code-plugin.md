@@ -1,0 +1,9 @@
++++
+title = "installed Mnemo2 sets up the Claude Code plugin itself; Tauri bundles the mnemo2-mcp bin, never add it as externalBin"
+supersedes = "2026-11-14-leading-with-claude-code-needs-a-source-build-th"
+created = "2026-11-15"
+evidence = "build.yml dispatch run 43655294144 on wt/mnemo: both installer checks passed; run 43652392587 failed the MSI with ICE30 while externalBin was set; claude_code tests (11) and the ci_workflow guard pass."
++++
+
+The installers carry `mnemo2-mcp` because Tauri's bundler ships every `[[bin]]` of src-tauri/mnemo2-app (Windows MSI/NSIS next to mnemo2.exe, macOS Mnemo2.app/Contents/MacOS/). Do NOT also declare it as `bundle.externalBin`: that duplicates the file and the MSI fails with WiX ICE30 ("installed ... by two different components"), and the sidecar's build-script copy races cargo on Windows (os error 32). build.yml's post-build steps `Check the installers carry mnemo2-mcp` / `Check the app bundle carries mnemo2-mcp` and the guard test `build_workflow_bundles_the_mnemo2_mcp_helper` (tests/integration/ci_workflow.rs) keep this true.
+At every start Mnemo2 (src-tauri/src/mnemo2/claude_code.rs `install_bundled`) writes the plugin files compiled in with include_str! as a local marketplace at `<config>/claude-plugin/` (marketplace `mnemo`, plugin source `./plugin`), copies the sibling helper to `<config>/bin/` and `<config>/claude-plugin/plugin/bin/` when missing or older (keeping mtime, so plugin-cache copies keep delegating), and writes mnemo2-path.txt beside both. Settings → Claude Code → Connect Claude Code runs `claude plugin marketplace add|update` and `claude plugin install|update mnemo@mnemo`; a `mnemo` marketplace pointing elsewhere (a source checkout) is left alone. A new plugin file must be added to PLUGIN_FILES (guarded by embedded_plugin_covers_every_plugin_file).

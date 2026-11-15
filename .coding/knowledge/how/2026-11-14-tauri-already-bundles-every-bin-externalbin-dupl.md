@@ -1,0 +1,7 @@
++++
+title = "Tauri already bundles every [[bin]] — externalBin duplicates it (MSI ICE30)"
+created = "2026-11-14"
+evidence = "CI run 43652392587 (MSI ICE30 with the externalBin sidecar) and commit 5ad92875 on wt/agent-dropSide; tests/integration/ci_workflow.rs::build_workflow_bundles_the_mnemo2_mcp_helper passes and fails with the sidecar conf/--config needle back."
++++
+
+Tauri's bundler already ships every `[[bin]]` of an app package into its installers: `src-tauri/mnemo2-app/Cargo.toml` declares `mnemo2-mcp`, so `mnemo2-mcp[.exe]` lands next to the app exe (Windows install folder; `Mnemo2.app/Contents/MacOS/`) with no extra config. Adding it as `bundle.externalBin` duplicates the same file and the Windows MSI fails in WiX `light.exe` with `ICE30` ("installed by two different components", CI run 43652392587). Also, Tauri's build script refuses to compile when a configured `externalBin` file is missing, so an `externalBin` in `tauri.conf.json` breaks plain `cargo build`/`cargo test`. The sidecar machinery was therefore removed in commit 5ad92875; `.github/workflows/build.yml` keeps only the post-build checks (`.nsi`/`main.wxs` grep, `test -x .../Contents/MacOS/mnemo2-mcp`), guarded by `build_workflow_bundles_the_mnemo2_mcp_helper` in `tests/integration/ci_workflow.rs`. What installed users lacked for the Claude Code plugin was never the binary — it was the plugin files, the `~/.mnemo` install and Connect.

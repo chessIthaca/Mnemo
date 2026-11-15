@@ -45,13 +45,33 @@ impl TeamRuntime {
         phase3::tip(&worker.worktree).await
     }
 
+    /// Decide the review lane for a worker diff at `tip`: light (test or
+    /// documentation files only, or at most 60 changed lines) when the
+    /// review risk is not high. The diff base is the merge-base of the lead
+    /// HEAD and the worker tip — the same base an audit brief uses.
+    pub(super) async fn review_lane(
+        &self,
+        tip: &str,
+        review_risk: &str,
+    ) -> Result<phase3::ReviewLane, String> {
+        let base = phase3::git_value(&self.workspace_root, &["merge-base", "HEAD", tip])
+            .await
+            .map_err(|err| format!("could not compute the review's diff base: {err}"))?;
+        phase3::review_lane(&self.workspace_root, &base, tip, review_risk)
+            .await
+            .map_err(|err| format!("could not decide the review lane: {err}"))
+    }
+
     /// Persist a lead review against the current worker commit.
     ///
-    /// Every new review carries complete structured evidence: an unanchored
-    /// diff pass plus substantive intent, execution, integration, test-quality,
-    /// and residual-risk assessments. High-risk reviews additionally require a
-    /// completed fresh independent audit (`independent_reviewer_id` plus a
-    /// written `audit_adjudication`) linked at the exact reviewed tip.
+    /// Every new review carries structured evidence: an unanchored diff
+    /// pass plus substantive intent, and — unless the change is light
+    /// (test or documentation files only, or a small diff) — execution,
+    /// integration, test-quality, and residual-risk assessments. High-risk
+    /// reviews additionally require a completed fresh independent audit
+    /// (`independent_reviewer_id` plus a written `audit_adjudication`)
+    /// linked at the exact reviewed tip. The answer reports which lane the
+    /// change landed in.
     pub async fn review(
         &self,
         worker_id: &str,
@@ -69,11 +89,6 @@ impl TeamRuntime {
                 "an audit worker is a read-only reviewer and is not reviewed; adjudicate it by recording team_review on its implementation worker with independent_reviewer_id".to_string(),
             );
         }
-        // High-risk reviews require a completed, fresh independent audit at
-        // the exact reviewed tip; every linked reviewer is validated against
-        // the live ledger so a stale or foreign audit can never be attached.
-        let require_audit = worker.review_risk == "high";
-        phase3::validate_review_evidence(&evidence, require_audit)?;
         phase3::validate_findings(&findings)?;
         if matches!(worker.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be reviewed again".to_string());
@@ -85,6 +100,15 @@ impl TeamRuntime {
             return Err("the worker must be idle before review".to_string());
         }
         let tip = self.worker_tip(&worker).await?;
+        // The diff decides which evidence the review must carry: a light
+        // change records the unanchored pass and the intent alone, and every
+        // other change keeps the full five-part evidence. High-risk reviews
+        // require a completed, fresh independent audit at the exact
+        // reviewed tip; every linked reviewer is validated against the live
+        // ledger so a stale or foreign audit can never be attached.
+        let lane = self.review_lane(&tip, &worker.review_risk).await?;
+        let require_audit = worker.review_risk == "high";
+        phase3::validate_review_evidence(&evidence, require_audit, &lane)?;
         let records = self.records.lock().await.clone();
         validate_audit_linkage(&records, &evidence, worker_id, &tip)?;
         let was_cancelled = worker.status == WorkerStatus::Cancelled;
@@ -134,6 +158,7 @@ impl TeamRuntime {
                 tip,
                 reviewed_at_ms: phase3::now_ms(),
                 evidence: Some(evidence),
+                lane: Some(lane.answer()),
             });
             worker.findings = findings;
             worker.review_rounds += 1;

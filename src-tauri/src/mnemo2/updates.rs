@@ -37,6 +37,9 @@ pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// many downloaded bytes.
 const UNKNOWN_TOTAL_STEP: u64 = 1024 * 1024;
 
+/// What `request_install` and `update_restart` answer when nothing is downloaded.
+const NOT_READY: &str = "No update is ready to install.";
+
 /// What the host reports about its update cycle.
 ///
 /// Serialized with a snake_case `phase` tag — the wire shape of the frontend's
@@ -302,7 +305,7 @@ impl UpdateService {
             self.install_requested.store(true, Ordering::SeqCst);
             Ok(())
         } else {
-            Err("No update is ready to install.".to_string())
+            Err(NOT_READY.to_string())
         }
     }
 
@@ -414,6 +417,20 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The release feed this build checks: the plugin's GitHub feed with the
+/// updater compiled in, otherwise the no-op source of a source build.
+fn update_source(app: &tauri::AppHandle) -> Box<dyn UpdateSource> {
+    #[cfg(feature = "auto-update")]
+    {
+        Box::new(plugin::PluginSource { app: app.clone() })
+    }
+    #[cfg(not(feature = "auto-update"))]
+    {
+        let _ = app;
+        Box::new(SourceBuild)
+    }
+}
+
 /// Start the background loop: check [`FIRST_CHECK_DELAY`] after start, then
 /// every [`CHECK_INTERVAL`] while no update is ready. A source build starts
 /// `disabled`, so its loop ends before the first check and nothing is ever
@@ -430,11 +447,7 @@ pub(crate) fn start(app: tauri::AppHandle) {
         loop {
             let service = app.state::<Arc<UpdateService>>().inner().clone();
             if service.begin_check() {
-                #[cfg(feature = "auto-update")]
-                let source = plugin::PluginSource { app: app.clone() };
-                #[cfg(not(feature = "auto-update"))]
-                let source = SourceBuild;
-                service.run_check(&source, now_ms()).await;
+                service.run_check(update_source(&app).as_ref(), now_ms()).await;
             }
             if matches!(service.state(), UpdateState::Ready { .. }) {
                 break;
@@ -460,13 +473,10 @@ pub async fn update_check(app: tauri::AppHandle) -> Result<UpdateState, String> 
 
     let service = app.state::<Arc<UpdateService>>().inner().clone();
     if service.begin_check() {
-        #[cfg(feature = "auto-update")]
-        let source = plugin::PluginSource { app: app.clone() };
-        #[cfg(not(feature = "auto-update"))]
-        let source = SourceBuild;
+        let source = update_source(&app);
         let running = Arc::clone(&service);
         tauri::async_runtime::spawn(async move {
-            running.run_check(&source, now_ms()).await;
+            running.run_check(source.as_ref(), now_ms()).await;
         });
     }
     Ok(service.state())
@@ -482,7 +492,7 @@ pub async fn update_restart(
 
     let service = app.state::<Arc<UpdateService>>().inner().clone();
     if !matches!(service.state(), UpdateState::Ready { .. }) {
-        return Err("No update is ready to install.".to_string());
+        return Err(NOT_READY.to_string());
     }
     if !force {
         let count = super::running_workers(&app).await;

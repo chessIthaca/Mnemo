@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 use mnemo::app::worktrees::{agent_branch, agent_short_id, provision_agent_worktree};
 use mnemo::headless::{GateVerdict, Transcript};
+use mnemo::SerializableAgentEvent;
 use mnemo::tool::{SafetyLevel, ToolResult};
 use serde_json::{json, Value};
 
@@ -4570,6 +4571,386 @@ fn tool_call_batch(call_id: &str, name: &str, args: &str) -> Vec<mnemo::provider
             reason: mnemo::provider::FinishReason::ToolCalls,
         },
     ]
+}
+
+/// A team whose engine serves scripted LLM batches (plan 9a6cffc1's
+/// report-streak tests): a dispatched worker runs real turns and makes
+/// real `message_parent` host-tool calls, which the pump answers. When
+/// the scripted batches run out, the LLM serves a plain "done" text
+/// turn, so a turn the host does not cut short ends naturally. Returns
+/// the team plus a `TeamEvent` subscription taken before any dispatch,
+/// so a test sees exactly what the pump forwards.
+async fn report_streak_team(
+    responses: Vec<Vec<mnemo::provider::LlmEvent>>,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    TeamRuntime,
+    broadcast::Receiver<TeamEvent>,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    std::fs::write(
+        config.path().join("config.toml"),
+        "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
+    )
+    .expect("config.toml");
+    std::fs::write(
+        config.path().join("endpoints.toml"),
+        "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"scripted-a\", \"scripted-b\"]\n",
+    )
+    .expect("endpoints.toml");
+    TeamPersistence::new(state.path())
+        .save(&PersistedTeam {
+            workers: Vec::new(),
+            slots: Some(2),
+            usage: ProjectUsage::default(),
+        })
+        .expect("save the team ledger");
+    let engine = mnemo::headless::EngineBuilder::new(mnemo::headless::EngineOptions {
+        workspace: mnemo::workspace::Workspace::new(root.path()),
+        config_dir: Some(config.path().to_path_buf()),
+        permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+        memory: mnemo::headless::MemoryBackend::Disabled,
+        index_codegraph: false,
+        require_git: true,
+        auto_install_embedder: false,
+    })
+    .provider(Arc::new(ScriptedLlm::new(responses)))
+    .start()
+    .await
+    .expect("start the scripted engine");
+    let team = TeamRuntime::open(TeamRuntimeOptions {
+        engine: Arc::new(engine),
+        workspace_root: root.path().to_path_buf(),
+        state_dir: state.path().to_path_buf(),
+        config_dir: config.path().to_path_buf(),
+        classifier: None,
+        routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+        slots: Some(2),
+        models: Vec::new(),
+        pricing: Vec::new(),
+    })
+    .await
+    .expect("open the team");
+    let events = team.subscribe();
+    (root, state, config, team, events)
+}
+
+/// The events the pump has forwarded so far (plan 9a6cffc1): the raw
+/// event bodies, in order, tolerating lag. What is missing from this
+/// list never reaches the runtime — so it never becomes a lead notice.
+async fn forwarded_events(
+    events: &mut broadcast::Receiver<TeamEvent>,
+) -> Vec<SerializableAgentEvent> {
+    let mut forwarded = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(event) => forwarded.push(event.event.event),
+            Err(broadcast::error::TryRecvError::Empty) => return forwarded,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Closed) => return forwarded,
+        }
+    }
+}
+
+/// How many `message_parent` host-tool calls the pump forwarded (plan
+/// 9a6cffc1) — one forwarded call is one potential lead notice.
+fn forwarded_report_calls(forwarded: &[SerializableAgentEvent]) -> usize {
+    forwarded
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SerializableAgentEvent::HostToolCall { name, .. }
+                    if name.as_str() == "message_parent"
+            )
+        })
+        .count()
+}
+
+/// Poll the worker record until `want` holds (plan 9a6cffc1), then
+/// return it; panic with the last record after ~10s. The sleep before
+/// the caller reads the event stream covers the pump's own forwarding
+/// step, which runs after the record update the wait observes. The
+/// record's transcript lands via a detached snapshot task a few ms
+/// after the turn ends (the pump's post-turn refresh), so a `want`
+/// that needs transcript content polls for it here instead of
+/// trusting a single read.
+async fn wait_for_worker_record(
+    team: &TeamRuntime,
+    worker_id: &str,
+    want: impl Fn(&WorkerRecord) -> bool,
+) -> WorkerRecord {
+    let mut last = None;
+    for _ in 0..400 {
+        let record = team.worker(worker_id).await.expect("worker record");
+        if want(&record) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            return team.worker(worker_id).await.expect("worker record");
+        }
+        last = Some(record);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for the worker record: {last:?}");
+}
+
+/// Plan 9a6cffc1: the first report in a turn keeps today's behaviour —
+/// recorded in the lead's inbox, forwarded as a TeamEvent (what the
+/// runtime turns into the lead's `reports:` notice), and answered with
+/// the byte-identical result text.
+#[tokio::test]
+async fn first_report_is_unchanged() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"task complete"}"#),
+        tool_call_batch("c2", "message_parent", r#"{"text":"task complete, again"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let record = wait_for_worker_record(&team, &worker.id, |record| {
+        record.status == WorkerStatus::Completed
+            && record.pending.is_none()
+            && record
+                .transcript
+                .messages
+                .iter()
+                .any(|message| {
+                    message.name.as_deref() == Some("message_parent")
+                        && message.content.as_text()
+                            == "message sent to the lead. A reply, if any, arrives later as a new message that starts with a [From …] header; do not assume or invent a reply — continue your task or end your turn."
+                })
+    })
+    .await;
+    // The inbox holds the report verbatim.
+    let messages = team.messages().await;
+    assert_eq!(messages.len(), 1, "exactly one TeamMessage: {messages:?}");
+    assert_eq!(messages[0].worker_id, worker.id);
+    assert_eq!(messages[0].text, "task complete");
+    // The call was forwarded — exactly once — so the lead sees the notice.
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        1,
+        "the first report's call was forwarded: {forwarded:?}"
+    );
+    // And the result the worker saw is byte-identical to today's.
+    let reported = record
+        .transcript
+        .messages
+        .iter()
+        .find(|message| message.name.as_deref() == Some("message_parent"))
+        .cloned()
+        .expect("the report's tool result in the transcript");
+    assert!(!reported.tool_is_error);
+    assert_eq!(
+        reported.content.as_text(),
+        "message sent to the lead. A reply, if any, arrives later as a new message that starts with a [From …] header; do not assume or invent a reply — continue your task or end your turn."
+    );
+    team.shutdown().await;
+}
+
+/// Plan 9a6cffc1: the 2nd `message_parent` call in a row — no other
+/// tool call in between — is refused: not recorded as a TeamMessage and
+/// not forwarded as a TeamEvent, so the runtime never turns it into a
+/// lead notice. The refusal tells the worker to end its turn now, with
+/// no further tool calls.
+#[tokio::test]
+async fn second_report_in_a_row_is_not_forwarded() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"task complete"}"#),
+        tool_call_batch("c2", "message_parent", r#"{"text":"task complete — please review"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let record = wait_for_worker_record(&team, &worker.id, |record| {
+        let reports: Vec<_> = record
+            .transcript
+            .messages
+            .iter()
+            .filter(|message| message.name.as_deref() == Some("message_parent"))
+            .collect();
+        record.status == WorkerStatus::Completed
+            && record.pending.is_none()
+            && reports.len() == 2
+            && reports[1].content.as_text()
+                == "not sent to the lead: this report already reached it. End your turn now, with no further tool calls, so the lead can review your work."
+    })
+    .await;
+    // Only the first report reached the inbox.
+    let messages = team.messages().await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "the repeat is not recorded as a TeamMessage: {messages:?}"
+    );
+    assert_eq!(messages[0].text, "task complete");
+    // And only the first report's call was forwarded — the repeat never
+    // becomes a lead notice.
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        1,
+        "the repeat is not forwarded as a TeamEvent: {forwarded:?}"
+    );
+    // The repeat's answer names what to do next: end the turn now, with
+    // no further tool calls.
+    let reports: Vec<_> = record
+        .transcript
+        .messages
+        .iter()
+        .filter(|message| message.name.as_deref() == Some("message_parent"))
+        .collect();
+    assert_eq!(reports.len(), 2, "both calls are answered: {reports:?}");
+    assert!(!reports[1].tool_is_error, "the refusal is not an error");
+    assert_eq!(
+        reports[1].content.as_text(),
+        "not sent to the lead: this report already reached it. End your turn now, with no further tool calls, so the lead can review your work."
+    );
+    team.shutdown().await;
+}
+
+/// Plan 9a6cffc1: an ordinary tool call between two reports breaks the
+/// run of back-to-back reports — the second report is forwarded like a
+/// first one (the acceptance scenario: report, read a file, report
+/// again produces two report notices).
+#[tokio::test]
+async fn other_tool_call_resets_the_report_streak() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"halfway there"}"#),
+        tool_call_batch("c2", "read_files", r#"{"files":["README.md"]}"#),
+        tool_call_batch("c3", "message_parent", r#"{"text":"task complete"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let _record = wait_for_worker_record(&team, &worker.id, |record| {
+        record.status == WorkerStatus::Completed && record.pending.is_none()
+    })
+    .await;
+    let messages = team.messages().await;
+    assert_eq!(
+        messages.len(),
+        2,
+        "both reports are recorded: {messages:?}"
+    );
+    assert_eq!(messages[0].text, "halfway there");
+    assert_eq!(messages[1].text, "task complete");
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        2,
+        "both reports' calls are forwarded: {forwarded:?}"
+    );
+    team.shutdown().await;
+}
+
+/// Plan 9a6cffc1: a `memory_*` call between two reports is not progress
+/// — the second report still counts as a repeat and is refused.
+#[tokio::test]
+async fn memory_writes_do_not_reset_the_report_streak() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"task complete"}"#),
+        tool_call_batch(
+            "c2",
+            "memory_write",
+            r#"{"tier":"semantic","title":"t","content":"c"}"#,
+        ),
+        tool_call_batch("c3", "message_parent", r#"{"text":"task complete — see memory"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let _record = wait_for_worker_record(&team, &worker.id, |record| {
+        record.status == WorkerStatus::Completed && record.pending.is_none()
+    })
+    .await;
+    let messages = team.messages().await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "the memory write did not reset the streak: {messages:?}"
+    );
+    assert_eq!(messages[0].text, "task complete");
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        1,
+        "the post-memory repeat is refused: {forwarded:?}"
+    );
+    team.shutdown().await;
+}
+
+/// Plan 9a6cffc1: the 3rd report in a row is refused and the host ends
+/// the worker's turn for it. The interrupt lands in the normal
+/// `Finished` path, so the lead gets the ordinary "finished its turn"
+/// flow and the worker is left idle for review. Proof the turn was cut
+/// short for the worker: the scripted queue is empty from the 3rd call
+/// on, so an uninterrupted turn would stream a fallback text "done"
+/// turn before finishing — no text delta may appear.
+#[tokio::test]
+async fn third_report_in_a_row_ends_the_turn() {
+    let (_root, _state, _config, team, mut events) = report_streak_team(vec![
+        tool_call_batch("c1", "message_parent", r#"{"text":"task complete"}"#),
+        tool_call_batch("c2", "message_parent", r#"{"text":"task complete (repeat)"}"#),
+        tool_call_batch("c3", "message_parent", r#"{"text":"task complete (again)"}"#),
+    ])
+    .await;
+    let worker = team
+        .dispatch("do the work".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    let record = wait_for_worker_record(&team, &worker.id, |record| {
+        record.status == WorkerStatus::Completed && record.pending.is_none()
+    })
+    .await;
+    // The worker ends up idle for review: completed, nothing pending.
+    assert_eq!(record.status, WorkerStatus::Completed);
+    assert!(record.pending.is_none(), "idle: {record:?}");
+    // One report recorded, one report call forwarded — the 2nd and 3rd
+    // were refused.
+    let messages = team.messages().await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "only the first report is recorded: {messages:?}"
+    );
+    let forwarded = forwarded_events(&mut events).await;
+    assert_eq!(
+        forwarded_report_calls(&forwarded),
+        1,
+        "only the first report is forwarded: {forwarded:?}"
+    );
+    // The turn was ended for the worker at the third report: the next
+    // provider call — which would stream the fallback text turn — never
+    // streamed a single delta.
+    assert!(
+        !forwarded
+            .iter()
+            .any(|event| matches!(event, SerializableAgentEvent::TextDelta { .. })),
+        "the turn was cut before any further LLM output: {forwarded:?}"
+    );
+    // And it ended through the ordinary Finished path, which the lead
+    // turns into the "finished its turn" notice.
+    assert!(
+        forwarded
+            .iter()
+            .any(|event| matches!(event, SerializableAgentEvent::Finished { .. })),
+        "the ended turn finished normally: {forwarded:?}"
+    );
+    team.shutdown().await;
 }
 
 /// The nudge fixture with a stub classifier that answers `answer` after

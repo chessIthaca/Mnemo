@@ -106,6 +106,13 @@ pub(super) async fn worker_host_tool_result(
     )
 }
 
+/// The result a repeated `message_parent` report gets (plan 9a6cffc1):
+/// the first report already reached the lead, so this copy is neither
+/// recorded nor forwarded. It names the required next action — end the
+/// turn now, with no further tool calls.
+const REPEATED_REPORT_REFUSED: &str =
+    "not sent to the lead: this report already reached it. End your turn now, with no further tool calls, so the lead can review your work.";
+
 /// Send a host-tool result back to the worker session.
 async fn send_worker_host_result(
     engine: &Arc<Engine>,
@@ -250,6 +257,13 @@ pub(super) async fn pump_worker(
     let mut call_ids: HashMap<u32, String> = HashMap::new();
     let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut previous_signature: Option<String> = None;
+    // The report streak (plan 9a6cffc1): consecutive `message_parent`
+    // calls with no other tool call in between, within one worker turn.
+    // The 2nd report in a row is refused — not recorded, no lead notice
+    // — and the 3rd is refused and the worker's turn is ended for it.
+    // Any other tool call resets it, except `memory_*` calls; a new turn
+    // (`Started`) starts it over.
+    let mut report_streak: usize = 0;
     loop {
         // While a steered turn end waits for its follow-up, the receive is
         // bounded by an absolute deadline: the bus is engine-wide, so another
@@ -335,7 +349,14 @@ pub(super) async fn pump_worker(
             steer_pending.store(false, Ordering::SeqCst);
             follow_up_deadline = None;
             held_finished = None;
+            report_streak = 0;
         }
+        // A suppressed repeated report (plan 9a6cffc1): answered with
+        // [`REPEATED_REPORT_REFUSED`] below, and kept so the TeamEvent
+        // forward at the bottom of this iteration skips it — one source
+        // of truth for "suppressed", before the runtime could ever turn
+        // the call into a lead notice.
+        let mut suppressed_report = false;
         if let SerializableAgentEvent::HostToolCall {
             call_id,
             name,
@@ -345,29 +366,76 @@ pub(super) async fn pump_worker(
             if name == "plan_read" {
                 plan_stamp = worker_plan_stamp(&records, &worker_id).await;
             }
-            let result = worker_host_tool_result(
-                &messages,
-                &worker_id,
-                name,
-                args,
-                board.as_ref(),
-                plan_stamp.as_ref(),
-            )
-            .await;
-            send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
-            // An audit's report is the message_parent call that delivered
-            // it (plan 5779641): mark the record the moment the message is
-            // recorded, so the turn's Finished event below can end the
-            // session and free the slot it holds.
             if name == "message_parent" {
-                let mut records = records.lock().await;
-                if let Some(worker) = records.iter_mut().find(|worker| {
-                    worker.id == worker_id
-                        && (worker.generation == 0 || worker.generation == generation)
-                        && worker.kind == "audit"
-                }) {
-                    worker.report_delivered = true;
+                report_streak += 1;
+                if report_streak == 1 {
+                    // The first report in a turn is forwarded unchanged
+                    // (plan 9a6cffc1): recorded as a TeamMessage, forwarded
+                    // as a TeamEvent, normal result text.
+                    let result = worker_host_tool_result(
+                        &messages,
+                        &worker_id,
+                        name,
+                        args,
+                        board.as_ref(),
+                        plan_stamp.as_ref(),
+                    )
+                    .await;
+                    send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
+                    // An audit's report is the message_parent call that
+                    // delivered it (plan 5779641): mark the record the
+                    // moment the message is recorded, so the turn's
+                    // Finished event below can end the session and free
+                    // the slot it holds.
+                    let mut records = records.lock().await;
+                    if let Some(worker) = records.iter_mut().find(|worker| {
+                        worker.id == worker_id
+                            && (worker.generation == 0 || worker.generation == generation)
+                            && worker.kind == "audit"
+                    }) {
+                        worker.report_delivered = true;
+                    }
+                } else {
+                    // A repeated report (plan 9a6cffc1): the first one
+                    // already reached the lead, so this copy is neither
+                    // recorded nor forwarded — no TeamMessage, no lead
+                    // notice. The worker is told to end its turn now.
+                    suppressed_report = true;
+                    send_worker_host_result(
+                        &engine,
+                        session_id,
+                        call_id.clone(),
+                        ToolResult::success(REPEATED_REPORT_REFUSED),
+                    )
+                    .await;
+                    if report_streak >= 3 {
+                        // The third report in a row: the worker keeps
+                        // re-reporting after being told to stop, so the
+                        // host ends the turn for it. The interrupt stops
+                        // the turn at its next break (the provider
+                        // request or an in-flight wait), which lands in
+                        // the normal `Finished` path below — the lead's
+                        // "finished its turn" notice, and the worker
+                        // left idle for review.
+                        if let Some(session) = engine.session(&session_id).await {
+                            let _ = session.send(SessionCommand::Interrupt).await;
+                        }
+                    }
                 }
+            } else {
+                // Another host tool (plan_read) is a tool call like any
+                // other (plan 9a6cffc1): it resets the report streak.
+                report_streak = 0;
+                let result = worker_host_tool_result(
+                    &messages,
+                    &worker_id,
+                    name,
+                    args,
+                    board.as_ref(),
+                    plan_stamp.as_ref(),
+                )
+                .await;
+                send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
             }
         }
         // The nudge strike counter (design §4.6): fingerprint every finished
@@ -390,6 +458,13 @@ pub(super) async fn pump_worker(
                     pending_calls.remove(&superseded);
                 }
                 pending_calls.insert(id.clone(), (name.clone(), String::new()));
+                // The report streak (plan 9a6cffc1): a `message_parent`
+                // call starts with this event too, so it must not reset its
+                // own streak, and a `memory_*` call is not progress between
+                // reports — every other tool call resets it.
+                if name != "message_parent" && !name.starts_with("memory_") {
+                    report_streak = 0;
+                }
             }
             SerializableAgentEvent::ToolCallArgDelta { index, fragment } => {
                 if let Some(id) = call_ids.get(index) {
@@ -833,11 +908,17 @@ pub(super) async fn pump_worker(
                 }
             }
         }
-        let _ = events.send(TeamEvent {
-            worker_id: worker_id.clone(),
-            generation,
-            event,
-        });
+        // A suppressed repeated report is not forwarded (plan 9a6cffc1):
+        // no TeamEvent means the runtime never turns it into a lead
+        // notice — the pump is the single source of truth for the
+        // suppression.
+        if !suppressed_report {
+            let _ = events.send(TeamEvent {
+                worker_id: worker_id.clone(),
+                generation,
+                event,
+            });
+        }
         if terminal || changed {
             let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
         } else if telemetry {

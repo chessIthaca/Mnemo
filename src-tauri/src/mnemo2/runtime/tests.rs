@@ -7755,15 +7755,19 @@ fn stub_unknown_tool_turn() -> String {
     ])
 }
 
-/// An SSE turn calling the worker's `message_parent` host tool — a
-/// SUCCESSFUL tool interaction (the team answers it), so each iteration
-/// grows the conversation by a call + a result without tripping the
-/// consecutive-tool-error cap that ends a turn after three failures.
-fn stub_message_parent_turn(index: usize) -> String {
-    let arguments = format!("{{\"text\":\"progress {index}\"}}");
+/// An SSE turn calling the worker's `read_files` tool on the seeded
+/// README.md — a SUCCESSFUL tool interaction (the file exists in the
+/// worker's worktree), so each iteration grows the conversation by a
+/// call + a result without tripping the consecutive-tool-error cap
+/// that ends a turn after three failures. These turns used to call the
+/// `message_parent` host tool; plan 9a6cffc1 refuses repeated reports
+/// and ends the turn on the third in a row, so a report can no longer
+/// serve as the conversation-growing vehicle.
+fn stub_read_files_turn(index: usize) -> String {
+    let arguments = "{\"files\":[\"README.md\"]}".to_string();
     stub_sse(&[
         serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
-        serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("call_{index}"),"type":"function","function":{"name":"message_parent","arguments":arguments}}]},"finish_reason":null}]}),
+        serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("call_{index}"),"type":"function","function":{"name":"read_files","arguments":arguments}}]},"finish_reason":null}]}),
         serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
         serde_json::json!({"id":"1","object":"chat.completion.chunk","model":"stub","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens_details":{"cached_tokens":0}},"choices":[]}),
     ])
@@ -7998,7 +8002,7 @@ async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker
     let (release_summary, gate_summary) = tokio::sync::oneshot::channel();
     let (release_last, gate_last) = tokio::sync::oneshot::channel();
     let mut turns = vec![StubTurn {
-        body: stub_message_parent_turn(1),
+        body: stub_read_files_turn(1),
         gate: Some(gate1),
     }];
     // Three more SUCCESSFUL tool turns grow the conversation past
@@ -8007,12 +8011,12 @@ async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker
     // window). A successful call never trips the consecutive-error cap.
     for index in 2..=3 {
         turns.push(StubTurn {
-            body: stub_message_parent_turn(index),
+            body: stub_read_files_turn(index),
             gate: None,
         });
     }
     turns.push(StubTurn {
-        body: stub_message_parent_turn(4),
+        body: stub_read_files_turn(4),
         gate: Some(gate4),
     });
     // The deferred swap's summarization call, served by the OLD model.

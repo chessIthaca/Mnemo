@@ -11,6 +11,7 @@
   import TeamPeek from "./components/TeamPeek.svelte";
   import Toast from "./components/Toast.svelte";
   import TopBar from "./components/TopBar.svelte";
+  import UpdateBanner from "./components/UpdateBanner.svelte";
   import WorkerPanel from "./components/WorkerPanel.svelte";
   import Workbench from "./components/Workbench.svelte";
   import WorkerDeleteSheet from "./components/WorkerDeleteSheet.svelte";
@@ -55,6 +56,7 @@
     <FirstIndexOverlay />
   </div>
 {/if}
+<UpdateBanner />
 <Toast />
 
 <style>

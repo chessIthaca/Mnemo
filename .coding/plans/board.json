@@ -2556,6 +2556,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "New feature outside any OpenSpec-governed capability; acceptance scenarios carry the contract."
+    },
+    {
+      "id": "da362653",
+      "status": "closed",
+      "created_at_ms": 1794771614047,
+      "closed_at_ms": 1794772559922,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-da362653-20261115-195559.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Version bump and changelog only; no behaviour changes."
     }
   ]
 }

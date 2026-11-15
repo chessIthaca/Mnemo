@@ -2578,6 +2578,28 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Tests only; no behaviour change."
+    },
+    {
+      "id": "5ff07c82",
+      "status": "closed",
+      "created_at_ms": 1794778242977,
+      "closed_at_ms": 1794779094868,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5ff07c82-20261115-214454.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Pure refactor inside one module; no behaviour change."
+    },
+    {
+      "id": "b7239e6a",
+      "status": "closed",
+      "created_at_ms": 1794778482637,
+      "closed_at_ms": 1794778994706,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-b7239e6a-20261115-214314.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Small presentation change in one component; no spec governs the thread header."
     }
   ]
 }

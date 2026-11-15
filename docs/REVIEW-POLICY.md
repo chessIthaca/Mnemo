@@ -41,8 +41,14 @@ plan; `execution` covers the real changed call sites and error paths;
 `integration` covers contracts, persistence, concurrency, and neighbouring
 modules; `test_quality` asks whether tests genuinely exercise the change
 (including a red-before/green-after regression test for a defect fix);
-`residual_risk` names what remains unverified or assumed. A **standard** review
-requires `unanchored_pass: true` and all five assessment strings nonempty. A
+`residual_risk` names what remains unverified or assumed. A change is **light**
+when it is not high risk and either it changes at most 60 lines in total
+(added plus deleted), or every changed file is Markdown (`.md`) or a test file
+(a `tests` folder, or `.test.`, `.spec.`, `_test.` or `_tests.` in the file
+name; a test module inside a normal source file does not count). Mnemo2 decides
+from the diff. A light review still reads the whole diff and records at least
+one check, and requires only `unanchored_pass: true` and a nonempty `intent`. Every other review requires
+`unanchored_pass: true` and all five assessment strings nonempty. A
 no-findings result still needs a substantive rationale — "looks good" or a
 restated summary fails the gate.
 

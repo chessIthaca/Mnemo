@@ -2567,6 +2567,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Version bump and changelog only; no behaviour changes."
+    },
+    {
+      "id": "d5dcf617",
+      "status": "closed",
+      "created_at_ms": 1794777184010,
+      "closed_at_ms": 1794778079106,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d5dcf617-20261115-212759.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Tests only; no behaviour change."
     }
   ]
 }

@@ -153,7 +153,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_review".to_string(),
-                description: "Persist your review of the current worker tip and its complete finding list. Review more than the worker's summary: read the diff unanchored first, then record substantive evidence — intent, and, unless the change is light (test or documentation files only, or a small diff), also execution path, integration, test quality, and residual risk. A passing test count alone is not a review. Re-review after every fix. Example finding: {\"title\":\"main.js uses a default import\",\"detail\":\"game.js exports Game as a named export, so the page fails to load\",\"file\":\"src/main.js\",\"line\":1,\"severity\":\"high\"}.".to_string(),
+                description: "Persist your review of the current worker tip and its complete finding list. Review more than the worker's summary: read the diff unanchored first, then record substantive evidence — intent, and, unless Mnemo2 finds the change light, also execution path, integration, test quality, and residual risk. Light means not high risk and either at most 60 changed lines, or only Markdown (.md) and test files changed; the answer says which rule applied. A passing test count alone is not a review. Re-review after every fix. Example finding: {\"title\":\"main.js uses a default import\",\"detail\":\"game.js exports Game as a named export, so the page fails to load\",\"file\":\"src/main.js\",\"line\":1,\"severity\":\"high\"}.".to_string(),
                 parameters: json!({"type":"object","properties":{
                     "worker_id":{"type":"string"},
                     "summary":{"type":"string"},

@@ -1,0 +1,7 @@
++++
+title = "feature-gated module stays dead_code-clean in both builds under deny(warnings)"
+created = "2026-11-15"
+evidence = "Both builds exit 0 with zero warnings; earlier shapes failed with \"constant is never used\" (feature on) and \"variant is never constructed\" (feature off)."
++++
+
+In a Rust crate with `#![deny(warnings)]`, a module that must compile both with and without a Cargo feature trips dead_code on one side of a plain `#[cfg]` split. Working shape, no `#[allow]` (the repo forbids allow-lints): (1) keep the core machinery always compiled and *referenced* in both builds — give the feature-off build a real no-op implementation of the source trait (e.g. a `SourceBuild` whose check returns Ok(None)) and pass it where the feature-on build passes the real source, so the machinery stays "used"; (2) keep the background-loop function body always compiled and let it exit early on the state that only the feature-off build produces, so its cadence constants are used in every build; (3) a wire enum variant constructed in only one configuration (e.g. a `Disabled` state) is only spared the dead_code lint if the module is exported (`pub mod x;`) — `pub(crate) mod x;` keeps it crate-private and the variant is flagged; (4) a private const used in only one cfg branch must be inlined — a string literal is never dead code. Verified on src-tauri/src/mnemo2/updates.rs: `cargo build -p mnemo2-app` (feature off) and `cargo check -p mnemo2-app --features auto-update` both exit 0.

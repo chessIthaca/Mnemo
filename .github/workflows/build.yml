@@ -75,8 +75,25 @@ jobs:
       # root target/ bundle dirs.
       - name: Build the Mnemo2 frontend
         run: npm run build:mnemo2
+      # Auto-update: signed updater files only when the signing secret exists; a v* tag without it fails.
       - name: Tauri build Mnemo2 (unsigned installers)
-        run: npx tauri build
+        env:
+          UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          UPDATER_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          IS_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        run: |
+          if ($env:UPDATER_KEY) {
+            $env:TAURI_SIGNING_PRIVATE_KEY = $env:UPDATER_KEY
+            $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $env:UPDATER_KEY_PASSWORD
+            npx tauri build --features auto-update --config tauri.updater.conf.json
+          } elseif ($env:IS_RELEASE_TAG -eq 'true') {
+            Write-Error 'Release tags need the TAURI_SIGNING_PRIVATE_KEY secret: without it the release has no auto-update files.'
+            exit 1
+          } else {
+            npx tauri build --features auto-update
+          }
+          exit $LASTEXITCODE
         working-directory: src-tauri/mnemo2-app
       # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp included; fail if that ever stops.
       - name: Check the installers carry mnemo2-mcp
@@ -94,7 +111,9 @@ jobs:
           name: windows-installers
           path: |
             target/release/bundle/msi/*.msi
+            target/release/bundle/msi/*.msi.sig
             target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.exe.sig
           if-no-files-found: error
 
   macos:
@@ -224,8 +243,23 @@ jobs:
       # dirs under Mnemo2_* names.
       - name: Build the Mnemo2 frontend
         run: npm run build:mnemo2
+      # Auto-update: signed updater files only when the signing secret exists; a v* tag without it fails.
       - name: Tauri build Mnemo2 (.app + .dmg, aarch64)
-        run: npx tauri build --target aarch64-apple-darwin
+        env:
+          UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          UPDATER_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          IS_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        run: |
+          if [ -n "$UPDATER_KEY" ]; then
+            export TAURI_SIGNING_PRIVATE_KEY="$UPDATER_KEY" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$UPDATER_KEY_PASSWORD"
+            npx tauri build --target aarch64-apple-darwin --features auto-update --config tauri.updater.conf.json
+          elif [ "$IS_RELEASE_TAG" = "true" ]; then
+            echo '::error::Release tags need the TAURI_SIGNING_PRIVATE_KEY secret: without it the release has no auto-update files.'
+            exit 1
+          else
+            npx tauri build --target aarch64-apple-darwin --features auto-update
+          fi
         working-directory: src-tauri/mnemo2-app
       # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp included; fail if that ever stops.
       - name: Check the app bundle carries mnemo2-mcp
@@ -237,6 +271,7 @@ jobs:
       - name: Stage the Mnemo2 bundles
         run: |
           mkdir -p dist-macos && cp target/aarch64-apple-darwin/release/bundle/dmg/Mnemo2_*.dmg dist-macos/ && ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app dist-macos/mnemo2.app.zip
+          for f in target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app.tar.gz target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app.tar.gz.sig; do if [ -f "$f" ]; then cp "$f" dist-macos/; fi; done
       # Same root-target layout note as the Windows job (review F1). The
       # upload ships the staging dir: Mnemo2's dmg + .app.zip were copied
       # there right after the build.
@@ -260,6 +295,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Node script tests
+        run: node --test scripts/updater-manifest.test.mjs
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -294,14 +331,20 @@ jobs:
         with:
           name: macos-bundles-aarch64
           path: dist/macos
+      - name: Write the auto-update manifest
+        run: node scripts/updater-manifest.mjs --tag "${{ github.ref_name }}" --repo "${{ github.repository }}" --dist dist --changelog CHANGELOG.md --out dist/latest.json
       - name: Create GitHub release with installers
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           files: |
             dist/windows/**/*.msi
             dist/windows/**/*.exe
+            dist/windows/**/*.sig
             dist/macos/**/*.dmg
             dist/macos/**/*.zip
+            dist/macos/**/*.tar.gz
+            dist/macos/**/*.sig
+            dist/latest.json
           generate_release_notes: true
           fail_on_unmatched_files: true
           # DRAFT first, publish after the upload (see the next step).

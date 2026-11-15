@@ -1,17 +1,28 @@
 <script lang="ts">
   import { ABOUT_GROUPS, APP_LICENSE_URL, REPOSITORY_URL, type AboutTransport } from "../lib/about";
+  import { actions } from "../lib/store";
+  import {
+    canCheck,
+    describeUpdateState,
+    updates,
+    type UpdateState,
+    type UpdatesClient,
+  } from "../lib/updates";
 
   /**
-   * The About page: the running version, Mnemo's license and source code, and
-   * the open-source projects Mnemo2 is built on — every entry credited with
-   * its license and a link to both.
+   * The About page: the running version, the update cycle's one-line state,
+   * Mnemo's license and source code, and the open-source projects Mnemo2 is
+   * built on — every entry credited with its license and a link to both.
    *
    * The version arrives from the desktop shell once the page mounts; a failed
    * read simply leaves the version chip out — the page never shows an error.
    * Links open in the system browser through the shell transport; outside the
    * desktop app the page opens them itself.
    */
-  let { transport }: { transport: AboutTransport | null } = $props();
+  let {
+    transport,
+    updatesClient = updates,
+  }: { transport: AboutTransport | null; updatesClient?: UpdatesClient } = $props();
 
   /** The running app's version; empty until the shell answers, and then hidden. */
   let version = $state("");
@@ -33,6 +44,49 @@
     };
   });
 
+  /** The auto-update state; null until the first answer arrives. */
+  let updateState = $state<UpdateState | null>(null);
+  /** The clock the "checked …" age is measured against. */
+  let now = $state(Date.now());
+
+  /** Take a freshly reported state; its arrival also restarts the age clock. */
+  function accept(next: UpdateState): void {
+    updateState = next;
+    now = Date.now();
+  }
+
+  $effect(() => {
+    const client = updatesClient;
+    let cancelled = false;
+    let unsubscribe: (() => void) | null = null;
+    void client.state().then(accept, () => {
+      // Without a first state the Updates row stays out; the event may still arrive.
+    });
+    void client.onState(accept).then(
+      (stop) => {
+        unsubscribe = stop;
+        if (cancelled) stop();
+      },
+      () => {
+        // Without the event listener the row just misses live state changes.
+      },
+    );
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  });
+
+  /** Ask for a check right now; the button appears only while one can run. */
+  async function checkNow(): Promise<void> {
+    if (updateState === null || !canCheck(updateState)) return;
+    try {
+      accept(await updatesClient.check());
+    } catch (error) {
+      actions.showToast(error instanceof Error ? error.message : String(error), "error");
+    }
+  }
+
   /** Open a link in the system browser (the page opens it outside the desktop app). */
   function open(url: string): void {
     if (transport) void transport.open(url);
@@ -48,6 +102,20 @@
         <span class="version-chip">v{version}</span>
       {/if}
     </header>
+
+    {#if updateState !== null}
+      <section class="updates-row" aria-label="Updates">
+        <span class="updates-text">{describeUpdateState(updateState, now)}</span>
+        {#if updateState.phase !== "disabled"}
+          <button
+            class="check-now"
+            type="button"
+            disabled={!canCheck(updateState)}
+            onclick={() => void checkNow()}
+          >Check now</button>
+        {/if}
+      </section>
+    {/if}
 
     <p class="intro">
       Mnemo2 is the team cockpit of Mnemo. It is free software under the
@@ -115,4 +183,10 @@
     cursor: pointer;
   }
   .license-chip:hover { color: var(--accent-strong); }
+
+  .updates-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .updates-text { color: var(--ink-soft); font-size: var(--text-body); line-height: 1.5; }
+  .check-now { flex-shrink: 0; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 620; cursor: pointer; }
+  .check-now:hover:not(:disabled) { border-color: var(--accent-line); color: var(--accent-strong); }
+  .check-now:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>

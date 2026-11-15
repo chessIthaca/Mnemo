@@ -23,6 +23,9 @@ uuid = { version = "1", features = ["v4"] }
 
 [features]
 custom-protocol = ["mnemo-app/custom-protocol"]
+# Installed Mnemo2 builds update themselves (mnemo-app's `auto-update`);
+# build.yml passes it on every release build, a source build leaves it off.
+auto-update = ["mnemo-app/auto-update"]
 
 [[bin]]
 name = "mnemo2"

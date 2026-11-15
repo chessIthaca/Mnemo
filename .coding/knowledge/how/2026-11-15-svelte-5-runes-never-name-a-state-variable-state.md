@@ -1,0 +1,7 @@
++++
+title = "Svelte 5 runes — never name a $state variable \"state\", and give fire-and-forget event chains a rejection handler"
+created = "2026-11-15"
+evidence = "svelte-check on a new Svelte 5 banner component: 7 errors at the `let state = $state<...>` line and every generic $state in the file, all gone after renaming to updateState; full vitest run exited 1 with 23 unhandled TypeError rejections until the onState promise chain got its rejection handler."
++++
+
+In a Svelte 5 runes component (svelte 5.57.x / svelte-check 4.7.x, the mnemo2 stack), `let state = $state<T>(...)` fails svelte-check: a variable literally named `state` makes the `$state` rune read as that variable's store subscription — "'state' implicitly has type 'any' … referenced in its own initializer", "Block-scoped variable '$state' used before its declaration", then "Untyped function calls may not accept type arguments" on EVERY generic `$state<T>()` in the same file. Rename the variable (e.g. `updateState`); generic `$state<T>(init)` works once no component variable collides with a rune name ($state/$derived/$effect/$props). Rule: never name a rune-backed variable after the rune. Companion lesson: fire-and-forget subscription chains (`void client.onState(handler).then(...)`) need a rejection handler, or vitest fails the whole suite on unhandled rejections whenever a test mocks isTauriRuntime true but the real @tauri-apps/api listen still rejects in jsdom (`window.__TAURI_INTERNALS__` undefined).

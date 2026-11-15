@@ -15,6 +15,12 @@ tauri = { version = "2", features = ["unstable", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
+# Mnemo2's self-update (mnemo2/updates.rs): the GitHub release feed, the
+# download, and the install at restart. Optional behind `auto-update` —
+# release builds compile it in (build.yml passes the feature), while a source
+# build leaves it off and reports the updater `disabled` (reason
+# `source_build`) instead of ever contacting GitHub.
+tauri-plugin-updater = { version = "2", optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -53,6 +59,11 @@ toml = "1"
 custom-protocol = ["tauri/custom-protocol"]
 # Gates the Mnemo2 host (`src/mnemo2`); the `mnemo2-app` package enables it.
 mnemo2 = []
+# Mnemo2 updates itself in installed builds: check GitHub 30 s after start and
+# every 6 h, download quietly, install at restart (mnemo2/updates.rs).
+# build.yml passes it on every Tauri build; `npm run rebuild:mnemo2` and local
+# cargo builds do not, so a source build never updates itself.
+auto-update = ["mnemo2", "dep:tauri-plugin-updater"]
 
 [dev-dependencies]
 tempfile = "3"

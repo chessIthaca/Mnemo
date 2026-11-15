@@ -115,7 +115,15 @@ impl TeamRuntime {
         // Capture every escalation trigger before this review replaces the
         // previous finding set and clears the routed-finding marker.
         let rounds = worker.review_rounds.saturating_add(1);
-        let repeated = (rounds >= 2)
+        // A finding has only "stayed open" when the worker itself had a turn
+        // since the previous review: a lead review_fix round (or a
+        // back-to-back review) is the lead's own work, never a failed worker
+        // round. Records written before that turn count was captured carry
+        // no value; unknown never escalates on the repeat rule.
+        let worker_turned = worker
+            .review_turns
+            .is_some_and(|reviewed_turns| worker.turns > reviewed_turns);
+        let repeated = (rounds >= 2 && worker_turned)
             .then(|| {
                 findings.iter().find(|finding| {
                     finding.status == "open"
@@ -162,6 +170,9 @@ impl TeamRuntime {
             });
             worker.findings = findings;
             worker.review_rounds += 1;
+            // Remember the worker's turn count with this review, so the next
+            // one can tell a worker round from a lead review_fix round.
+            worker.review_turns = Some(worker.turns);
             worker.fixer_finding_id = None;
             worker.error = None;
         })

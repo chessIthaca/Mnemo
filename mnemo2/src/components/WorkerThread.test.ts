@@ -120,6 +120,32 @@ describe("WorkerThread", () => {
     expect(done.querySelector(".thread-failure")).toBeNull();
   });
 
+  it("own_messages_have_no_name_line", () => {
+    const entries: WorkerThreadEntry[] = [
+      { id: "w1", from: "worker", body: "worker says hi", time: "now" },
+      { id: "l1", from: "lead", body: "lead says go", time: "now" },
+      { id: "h1", from: "harness", body: "note", time: "now" },
+    ];
+    const { container } = render(WorkerThread, {
+      worker: worker({ id: "own-1", name: "qcoderEdit01", status: "working", error: null, messages: entries }),
+    });
+
+    // The thread is this worker's own: only the body shows, with no gap where
+    // the name/time line used to be.
+    const own = container.querySelector<HTMLElement>(".thread-message.from-worker");
+    if (!own) throw new Error("the worker's own message did not render");
+    expect(own.textContent).toContain("worker says hi");
+    expect(own.textContent).not.toContain("QCODEREDIT01");
+    const body = own.querySelector<HTMLElement>(".thread-message-body");
+    if (!body) throw new Error("worker message body missing");
+    expect(getComputedStyle(body).marginTop).toBe("0px");
+
+    // Messages written by someone else keep their header, so it stays clear who spoke.
+    expect(screen.queryByText("QCODEREDIT01 · now")).toBeNull();
+    expect(screen.getByText("LEAD · now")).toBeTruthy();
+    expect(screen.getByText("HARNESS NOTE · now")).toBeTruthy();
+  });
+
   it("renders a live final error in danger and a retrying one as a muted note", () => {
     const entries: WorkerThreadEntry[] = [
       { id: "note", kind: "error", time: "now", body: "429 usage limit", retrying: true },

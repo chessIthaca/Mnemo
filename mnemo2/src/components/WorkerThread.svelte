@@ -118,8 +118,9 @@
     {:else if entry.kind === "model_switch"}
       <div class="thread-model-note" role="status">{entry.body}</div>
     {:else}
-      <div class="thread-message" class:from-lead={entry.from === "lead"} class:from-harness={entry.from === "harness"}>
-        <span>{entry.from === "lead" ? "LEAD" : entry.from === "harness" ? "HARNESS NOTE" : worker.name.toUpperCase()} · {entry.time}</span>
+      <div class="thread-message" class:from-lead={entry.from === "lead"} class:from-harness={entry.from === "harness"} class:from-worker={entry.from === "worker"}>
+        <!-- The thread is the worker's own: its messages carry no name/time line. -->
+        {#if entry.from !== "worker"}<span>{entry.from === "lead" ? "LEAD" : "HARNESS NOTE"} · {entry.time}</span>{/if}
         <div class="thread-message-body"><Collapsible maxHeight={160} label="message"><Markdown source={entry.body} onOpenLink={actions.openBrowser} /></Collapsible></div>
       </div>
     {/if}
@@ -198,6 +199,8 @@
   .thread-message.from-lead > span { display: block; text-align: right; }
   .thread-message.from-lead .thread-message-body { border-radius: 12px 12px 4px 12px; background: var(--accent-soft); }
   .thread-message.from-harness .thread-message-body { border: 1px dashed var(--line-strong); background: transparent; color: var(--muted); }
+  /* No header above a worker's own message, so no gap where it used to be. */
+  .thread-message.from-worker .thread-message-body { margin-top: 0; }
   .thread-message + .thread-message, .thread-tool + .thread-message { margin-top: 12px; }
   .thread-tool { min-width: 0; margin: 4px 0; }
   .thread-error { margin-top: 12px; padding: 12px 14px; border: 1px solid var(--danger-tint-line); border-radius: 12px; background: var(--danger-tint); }

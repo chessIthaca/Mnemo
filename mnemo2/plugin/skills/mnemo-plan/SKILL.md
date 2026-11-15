@@ -37,15 +37,17 @@ The board also refuses a plan that is too thin to resume from.
 
 ### Write each step as a spec
 
-Mnemo exists so that cheap models do the implementing. A cheap model follows instructions well but cannot fill design gaps, so the design has to be in the plan. A step that names only the outcome ("add a loading state", "fix the cite bug") leaves the worker to design it, and the result comes back for several review rounds. Write every step so a worker can implement it without making a design decision:
+Mnemo exists so that cheap models do the implementing. A cheap model follows instructions well but fills design gaps badly, so the plan makes the design decisions. It does not write the code. A step that names only the outcome ("add a loading state", "fix the cite bug") leaves the design to the worker and comes back for several review rounds. A step that spells out every line turns the worker into a typist and costs you as much as writing the code. Write the decisions:
 
-- **Files and symbols.** Every file the step changes, and in each the functions, types or components to add or change, with their signatures (parameters, return type, error type). Mark new code as new, for example "new: `fn conversation_needs_compaction(&self, cm: &ContextManager, messages: &[Message]) -> bool` in `src/agent/loop_impl.rs`". Name things exactly even before they exist; a precise design is the point.
-- **Data shapes.** New fields, structs, events or wire types with their exact names and types, and who reads and writes them.
-- **Behaviour rules.** The rules the code must follow, as a list, including the edge cases: empty input, zero, a resumed session, concurrency, a failure halfway, what must stay unchanged.
-- **Order of edits.** When the order matters (a test first, a type before its users, a migration before code), say it.
-- **Tests.** Each test by name, with its setup, the action and the exact assertions. For a bug, the regression test comes first and must fail on today's code.
+- **Intent.** Why the step exists and what must be true when it is done.
+- **Files and contracts.** Every file the step changes. Any new or changed contract with its exact shape: a public function's signature, a struct or wire type, an event name, an error message other code matches on. Name new things exactly, even before they exist.
+- **Rules and edge cases.** What the code must do and must not do, as a list: empty input, zero, a resumed session, concurrency, a failure halfway, what must stay unchanged.
+- **Traps.** What you know will go wrong: a lint the crate denies, a feature gate, a lock order, a file another plan is editing.
+- **Tests.** Each test by name and what it must prove. For a bug, the regression test comes first and must fail on today's code.
 - **Done checklist.** The commands to run and the observable result that means the step is finished.
 - **Don't touch.** Files that other steps or parallel plans own.
+
+Leave function bodies and test code to the worker. Spell out code only where the right choice is subtle and easy to get wrong. Detail that several steps share goes once into the plan `context`, and the steps refer to it.
 
 You, the lead, write these specs yourself. Read the code they touch, so the names, signatures and line anchors are real. Put everything specific to the step in the step text, not only in the dispatch `brief`: the brief is not saved in the plan, so a worker that is resumed, compacted or switched to another model loses it.
 

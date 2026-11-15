@@ -3,12 +3,22 @@
 // network or a real release.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
 import { buildManifest, changelogNotes, findSignatures } from "./updater-manifest.mjs";
+
+const SCRIPT = fileURLToPath(new URL("./updater-manifest.mjs", import.meta.url));
+
+/** Run the CLI with `args`; returns { status, stdout, stderr }. */
+function runCli(args) {
+  const result = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
 
 /** A throwaway directory, removed when the test ends. */
 function tempDir(t) {
@@ -154,4 +164,52 @@ test("changelog_section_is_extracted", () => {
   );
   // A version the release notes never covered.
   assert.equal(changelogNotes(changelog, "9.9.9"), null);
+});
+
+test("cli_writes_the_manifest", (t) => {
+  const dir = tempDir(t);
+  writeFiles(dir, {
+    "dist/windows/nsis/Mnemo2_2.5.0_x64-setup.exe": "x",
+    "dist/windows/nsis/Mnemo2_2.5.0_x64-setup.exe.sig": "sig-nsis\n",
+    "dist/windows/msi/Mnemo2_2.5.0_x64_en-US.msi": "x",
+    "dist/windows/msi/Mnemo2_2.5.0_x64_en-US.msi.sig": "sig-msi\n",
+    "dist/macos/Mnemo2.app.tar.gz": "x",
+    "dist/macos/Mnemo2.app.tar.gz.sig": "sig-app\n",
+    "CHANGELOG.md": "# Changelog\n\n## [2.5.0] — 2026-11-15\n\nUpdates itself.\n\n## [2.4.0] — 2026-11-14\n\nOlder.\n",
+  });
+  const out = join(dir, "latest.json");
+  const result = runCli([
+    "--tag", "v2.5.0",
+    "--repo", "chessIthaca/Mnemo",
+    "--dist", join(dir, "dist"),
+    "--changelog", join(dir, "CHANGELOG.md"),
+    "--out", out
+  ]);
+  assert.equal(result.status, 0);
+  assert.ok(result.stdout.includes("wrote") && result.stdout.includes("2.5.0"));
+  const manifest = JSON.parse(readFileSync(out, "utf8"));
+  assert.equal(manifest.version, "2.5.0");
+  assert.equal(manifest.notes, "Updates itself.");
+  assert.equal(manifest.platforms["darwin-aarch64"].signature, "sig-app");
+  assert.equal(manifest.platforms["windows-x86_64-msi"].url, "https://github.com/chessIthaca/Mnemo/releases/download/v2.5.0/Mnemo2_2.5.0_x64_en-US.msi");
+  assert.ok(readFileSync(out, "utf8").endsWith("\n"));
+});
+
+test("cli_rejects_a_tag_without_a_version", (t) => {
+  const dir = tempDir(t);
+  const result = runCli([
+    "--tag", "latest",
+    "--repo", "chessIthaca/Mnemo",
+    "--dist", join(dir, "dist"),
+    "--changelog", join(dir, "CHANGELOG.md"),
+    "--out", join(dir, "latest.json")
+  ]);
+  assert.equal(result.status, 1);
+  assert.ok(result.stderr.includes("updater-manifest:") && result.stderr.includes("--tag must look like vX.Y.Z"));
+});
+
+test("cli_names_a_missing_flag", () => {
+  const result = runCli(["--tag", "v2.5.0"]);
+  assert.equal(result.status, 1);
+  assert.ok(result.stderr.includes("missing --repo"));
 });

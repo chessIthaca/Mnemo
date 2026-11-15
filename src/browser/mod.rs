@@ -1874,10 +1874,11 @@ mod tests {
     /// Windows-only (user decision 2026-09-20): this test launches a real
     /// headless Chromium and polls 15s for the profile dir's removal — on
     /// the macOS CI leg (run 35521221353) the dir outlives the poll, and
-    /// the root cause is not diagnosable from a Windows host. Gated
-    /// rather than deadline-widened; Windows, where the app ships, keeps
-    /// the coverage.
-    /// Ignored in CI like the module's other real-Chromium tests: a slow runner times out starting Chromium; the Chromium-free tests below cover the removal loop and close's profile release.
+    /// the root cause is not diagnosable from a Windows host. Also ignored,
+    /// like the module's other real-Chromium tests: a slow CI runner times
+    /// out starting Chromium. The Chromium-free tests below cover the
+    /// removal loop and close's profile release; run this one locally with
+    /// `cargo test -- --ignored` to check kill-before-removal end to end.
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "integration: spawns a headless Chromium process; run with `cargo test -- --ignored`"]

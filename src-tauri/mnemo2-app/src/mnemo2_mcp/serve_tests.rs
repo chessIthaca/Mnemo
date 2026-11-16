@@ -650,6 +650,43 @@ fn init_registers_and_goes_live_without_reload() {
     assert_eq!(answered["result"]["content"][0]["text"], "done", "{answered}");
 }
 
+/// One session leads the project its own folder belongs to: registering a
+/// folder elsewhere must not take this session there, because the hooks and
+/// the waiter keep resolving by the session folder.
+#[test]
+fn init_of_another_folder_registers_without_switching() {
+    let sandbox = Sandbox::new();
+    let other = sandbox.dir.path().join("other");
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    let (env, starts, _) = stub_env(&sandbox);
+    let (bridge, out) = test_bridge(env);
+
+    process(&bridge, &initialize(1));
+    let arguments = json!({ "path": other.to_string_lossy() });
+    process(&bridge, &call(2, "mnemo_init_project", arguments));
+    let answer = out.messages().into_iter().find(|message| message["id"] == 2).expect("answer");
+    assert_eq!(answer["result"]["isError"], false, "{answer}");
+    let text = result_text(&answer);
+    assert!(text.contains(&other.to_string_lossy().into_owned()), "names the folder: {text}");
+    assert!(text.contains("Start a Claude Code session in that folder"), "{text}");
+
+    // The registry gained it, but nothing started and nothing was announced ...
+    let registered = mnemo_app::mnemo2::project::list(Some(sandbox.config_dir.clone())).unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(canonical(Path::new(&registered[0].path)), canonical(&other));
+    assert_eq!(starts.load(Ordering::SeqCst), 0, "another folder is not started here");
+    assert!(
+        out.messages().iter().all(|message| message["method"] != "notifications/tools/list_changed"),
+        "{:?}",
+        out.messages()
+    );
+
+    // ... and the session stays on the stub.
+    process(&bridge, &request(3, "tools/list"));
+    let listed = out.messages().into_iter().find(|message| message["id"] == 3).expect("answer");
+    assert_eq!(tool_names(&listed), vec!["mnemo_projects", "mnemo_init_project"]);
+}
+
 #[test]
 fn init_refuses_a_registered_or_nested_folder() {
     let sandbox = Sandbox::new();

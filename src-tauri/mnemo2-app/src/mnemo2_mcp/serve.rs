@@ -37,8 +37,8 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Response};
 use crate::instance::{
-    canonical, find_instance, projects, registered_conflict, registered_root, resolve, root_body,
-    Env, Instance, Resolution,
+    canonical, contains, find_instance, projects, registered_conflict, registered_root, resolve,
+    root_body, Env, Instance, Resolution,
 };
 use crate::permissions::{self, Offer};
 
@@ -713,9 +713,10 @@ impl Bridge {
         Ok(text)
     }
 
-    /// The `mnemo_init_project` answer: register the folder, start its Mnemo2
-    /// and switch this session over. A start that fails keeps the registration,
-    /// so the next request finds the project.
+    /// The `mnemo_init_project` answer: register the folder and, when it is the
+    /// folder this session belongs to, start its Mnemo2 and switch over. A
+    /// start that fails keeps the registration, so the next request finds the
+    /// project.
     fn init_project(self: &Arc<Self>, arguments: Option<&Value>) -> Result<String, String> {
         let asked = arguments
             .and_then(|arguments| arguments.get("path"))
@@ -746,6 +747,16 @@ impl Bridge {
             ));
         }
         let record = mnemo_app::mnemo2::project::add(Some(self.env.config_dir.clone()), &folder)?;
+        // One session leads the project its own folder belongs to: registering
+        // another folder must not take this session there, because the hooks
+        // and the waiter keep resolving by the session folder.
+        if !contains(&folder, &self.cwd) {
+            return Ok(format!(
+                "Registered the Mnemo project \"{}\" at {}. Start a Claude Code session in that \
+                 folder to lead it.",
+                record.name, record.path
+            ));
+        }
         match resolve(&self.env, &folder) {
             Resolution::Live(instance) => {
                 self.go_live(instance);
@@ -782,10 +793,12 @@ fn project_tools() -> Value {
         },
         {
             "name": "mnemo_init_project",
-            "description": "Turn a git folder into a Mnemo project and open it. The team tools \
-                            (team_status, team_dispatch, ...) become available in this session \
-                            right away, without a reload. It does not run `git init`: if the \
-                            folder is not a repository yet, run `git init` there first.",
+            "description": "Turn a git folder into a Mnemo project. When it is this session's own \
+                            folder, its Mnemo2 opens and the team tools (team_status, \
+                            team_dispatch, ...) are available here right away, without a reload. \
+                            Any other folder is only registered: lead it from a session started \
+                            there. It does not run `git init`: if the folder is not a repository \
+                            yet, run `git init` there first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

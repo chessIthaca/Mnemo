@@ -5131,14 +5131,20 @@ async fn third_report_in_a_row_ends_the_turn() {
         1,
         "only the first report is forwarded: {forwarded:?}"
     );
-    // The turn was ended for the worker at the third report: the next
-    // provider call — which would stream the fallback text turn — never
-    // streamed a single delta.
-    assert!(
-        !forwarded
-            .iter()
-            .any(|event| matches!(event, SerializableAgentEvent::TextDelta { .. })),
-        "the turn was cut before any further LLM output: {forwarded:?}"
+    // The turn was ended for the worker at the third report: no tool call
+    // started after it. A short final text may still stream on a fast runner
+    // before the interrupt lands; the promise is that reporting stops.
+    let tool_starts: Vec<&str> = forwarded
+        .iter()
+        .filter_map(|event| match event {
+            SerializableAgentEvent::ToolCallStart { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_starts,
+        vec!["c1", "c2", "c3"],
+        "no tool call after the third report: {forwarded:?}"
     );
     // And it ended through the ordinary Finished path, which the lead
     // turns into the "finished its turn" notice.

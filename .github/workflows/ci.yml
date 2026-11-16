@@ -42,11 +42,10 @@ jobs:
         run: npm run build:mnemo2
       - name: Mnemo2 unit tests
         run: npm test --workspace mnemo2
+      # --workspace already lints and tests the Mnemo2 host because
+      # mnemo2-app turns on mnemo-app's mnemo2 feature; a separate
+      # `-p`-prefixed run targeting just that package with `--features` would repeat them.
       - name: Clippy for the workspace
         run: cargo clippy --workspace --all-targets
-      - name: Clippy for the Mnemo2 host
-        run: cargo clippy -p mnemo-app --all-targets --features mnemo2
       - name: Rust tests for the workspace
         run: cargo test --workspace --no-fail-fast
-      - name: Rust tests for the Mnemo2 host
-        run: cargo test -p mnemo-app --features mnemo2 --lib

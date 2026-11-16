@@ -17,7 +17,7 @@ use mnemo::headless::{AgentSession, SessionCommand, SpawnOptions, Transcript};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::{PermissionPolicy, route_question};
 
-use mnemo::tool::agent::shell::normalize_check_command;
+use mnemo::tool::agent::shell::validated_check_command;
 use serde::Deserialize;
 
 use crate::mnemo2::phase3;
@@ -68,8 +68,15 @@ pub(super) fn load_check_commands(workspace_root: &Path) -> Arc<Vec<String>> {
             config
                 .commands
                 .into_iter()
-                .map(|command| normalize_check_command(&command))
-                .filter(|command| !command.is_empty())
+                .filter_map(|command| match validated_check_command(&command) {
+                    Some(command) => Some(command.to_string()),
+                    None => {
+                        eprintln!(
+                            "Mnemo2: ignoring invalid automatic check command {command:?}"
+                        );
+                        None
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default();

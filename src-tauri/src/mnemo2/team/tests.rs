@@ -1735,7 +1735,7 @@ fn shell_result(exit_code: i64, tree_before: Option<&str>, tree_after: Option<&s
     ToolResult::success("command ran").with_data(data)
 }
 
-/// The repository's own allow-list, as `load_check_commands` normalizes it.
+/// The repository's own allow-list, as `load_check_commands` trims it.
 fn allow_list() -> Vec<String> {
     vec![
         "cargo test --workspace".to_string(),
@@ -1783,13 +1783,60 @@ fn check_allow_list_comes_only_from_valid_lead_root_config() {
     std::fs::create_dir_all(lead.path().join(".coding")).expect("lead coding dir");
     std::fs::write(
         lead.path().join(".coding/checks.toml"),
-        "commands = [\"  cargo   test --workspace  \"]\n",
+        "commands = [\"  cargo test --workspace  \"]\n",
     )
     .expect("lead allow-list");
     assert_eq!(
         super::spawn::load_check_commands(lead.path()).as_slice(),
         ["cargo test --workspace".to_string()]
     );
+
+    let invalid_commands = [
+        "",
+        "   ",
+        "cargo test --workspace; echo no",
+        "cargo test --workspace | Select-String x",
+        "cargo test --workspace && echo no",
+        "cargo test --workspace > log.txt",
+        "cargo test --workspace < input.txt",
+        "cargo test --workspace `echo no`",
+        "cargo test --workspace $(echo no)",
+        "cargo\ntest --workspace",
+        "cargo\rtest --workspace",
+        "cargo\ttest --workspace",
+    ];
+    let encoded = invalid_commands
+        .iter()
+        .map(|command| format!("{command:?}"))
+        .chain([r#""cargo test --workspace""#.to_string()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        lead.path().join(".coding/checks.toml"),
+        format!("commands = [{encoded}]\n"),
+    )
+    .expect("compound lead allow-list");
+    let commands = super::spawn::load_check_commands(lead.path());
+    assert_eq!(
+        commands.as_slice(),
+        ["cargo test --workspace".to_string()],
+        "every empty, compound, or control-character entry is dropped"
+    );
+    let checkout = tempfile::tempdir().expect("checkout");
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    for command in invalid_commands {
+        assert_eq!(
+            counted_check(
+                "shell",
+                &json!({ "command": command }),
+                &shell_result(0, Some(tree), Some(tree)),
+                checkout.path(),
+                &commands,
+            ),
+            None,
+            "invalid allow-list entry {command:?} must never count"
+        );
+    }
 
     std::fs::write(lead.path().join(".coding/checks.toml"), "commands = 42\n")
         .expect("malformed lead allow-list");
@@ -1818,17 +1865,30 @@ fn counted_check_accepts_only_allow_listed_unchanging_runs() {
         ),
         Some(("cargo test --workspace".to_string(), tree.to_string()))
     );
-    // Whitespace runs collapse before the exact membership test.
+    // Only leading and trailing whitespace is trimmed; internal bytes matter.
     assert_eq!(
         counted_check(
             "shell",
-            &json!({ "command": "  cargo   test --workspace  " }),
+            &json!({ "command": "  cargo test --workspace  " }),
             &shell_result(0, Some(tree), Some(tree)),
             checkout,
             &allowed,
         ),
         Some(("cargo test --workspace".to_string(), tree.to_string()))
     );
+    for command in ["cargo\ntest --workspace", "cargo  test --workspace"] {
+        assert_eq!(
+            counted_check(
+                "shell",
+                &json!({ "command": command }),
+                &shell_result(0, Some(tree), Some(tree)),
+                checkout,
+                &allowed,
+            ),
+            None,
+            "{command:?} must not count"
+        );
+    }
     // A cwd that canonicalizes to the checkout root still counts.
     assert_eq!(
         counted_check(

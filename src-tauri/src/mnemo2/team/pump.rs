@@ -18,7 +18,7 @@ use mnemo::headless::{
     SessionId, Transcript,
 };
 use mnemo::tool::ToolResult;
-use mnemo::tool::agent::shell::normalize_check_command;
+use mnemo::tool::agent::shell::validated_check_command;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast};
 
@@ -217,10 +217,8 @@ pub(super) fn counted_check(
     if data.get("exit_code")?.as_i64()? != 0 {
         return None;
     }
-    let command = normalize_check_command(args.get("command")?.as_str()?);
-    if command.is_empty()
-        || !check_commands.iter().any(|allowed| allowed == &command)
-    {
+    let command = validated_check_command(args.get("command")?.as_str()?)?;
+    if !check_commands.iter().any(|allowed| allowed == command) {
         return None;
     }
     let checkout = checkout.canonicalize().ok()?;
@@ -243,7 +241,7 @@ pub(super) fn counted_check(
     if tree_before.is_empty() || tree_before != tree_after {
         return None;
     }
-    Some((command, tree_before.to_string()))
+    Some((command.to_string(), tree_before.to_string()))
 }
 
 async fn record_turn_checks(

@@ -333,9 +333,21 @@ struct ShellArgs {
     purpose: String,
 }
 
-/// Normalize a command for exact membership in the worker check allow-list.
-pub fn normalize_check_command(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Trim a safe worker check command for exact allow-list membership.
+///
+/// Internal whitespace is preserved. Control characters and shell chaining,
+/// piping, redirection, or substitution syntax make the command ineligible.
+pub fn validated_check_command(command: &str) -> Option<&str> {
+    if command.contains("$(")
+        || command.chars().any(|character| {
+            character.is_control()
+                || matches!(character, ';' | '|' | '&' | '>' | '<' | '`')
+        })
+    {
+        return None;
+    }
+    let command = command.trim();
+    (!command.is_empty()).then_some(command)
 }
 
 /// The `shell` tool.
@@ -390,12 +402,11 @@ impl ShellTool {
         self
     }
 
-    /// Measure before/after trees only for these exact normalized commands.
+    /// Measure before/after trees only for these exact validated commands.
     pub fn with_check_commands(mut self, commands: Vec<String>) -> Self {
         self.check_commands = commands
             .into_iter()
-            .map(|command| normalize_check_command(&command))
-            .filter(|command| !command.is_empty())
+            .filter_map(|command| validated_check_command(&command).map(str::to_string))
             .collect();
         self
     }
@@ -410,8 +421,10 @@ impl ShellTool {
         if cwd != root {
             return false;
         }
-        let command = normalize_check_command(command);
-        self.check_commands.iter().any(|allowed| allowed == &command)
+        let Some(command) = validated_check_command(command) else {
+            return false;
+        };
+        self.check_commands.iter().any(|allowed| allowed == command)
     }
 
     /// Wire the shared core-operation list (mirrors
@@ -1137,6 +1150,33 @@ mod tests {
 
     fn tool_in(dir: &std::path::Path) -> ShellTool {
         ShellTool::new(Sandbox::new(dir).unwrap())
+    }
+
+    #[test]
+    fn check_measurement_requires_an_exact_safe_command() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path())
+            .with_check_commands(vec!["cargo test --workspace".to_string()]);
+        assert!(tool.measures_check("  cargo test --workspace  ", dir.path()));
+        for command in [
+            "cargo\ntest --workspace",
+            "\ncargo test --workspace",
+            "cargo  test --workspace",
+            "cargo\ttest --workspace",
+            "cargo\u{7}test --workspace",
+            "cargo test --workspace; echo no",
+            "cargo test --workspace | Select-String x",
+            "cargo test --workspace && echo no",
+            "cargo test --workspace > log.txt",
+            "cargo test --workspace < input.txt",
+            "cargo test --workspace `echo no`",
+            "cargo test --workspace $(echo no)",
+        ] {
+            assert!(
+                !tool.measures_check(command, dir.path()),
+                "{command:?} must not be measured"
+            );
+        }
     }
 
     /// A command printing 40 identical lines. The shell filter's repeat

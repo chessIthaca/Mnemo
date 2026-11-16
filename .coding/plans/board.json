@@ -2655,6 +2655,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Escalation trigger internals; no OpenSpec capability governs them."
+    },
+    {
+      "id": "2a1d609e",
+      "status": "closed",
+      "created_at_ms": 1794817108252,
+      "closed_at_ms": 1794818777019,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-2a1d609e-20261116-084617.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Bridge behaviour outside registered projects only; the external-lead requirements (attach on first tools/call for a project) are unchanged."
     }
   ]
 }

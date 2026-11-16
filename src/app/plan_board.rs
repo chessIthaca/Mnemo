@@ -693,6 +693,30 @@ impl PlanBoard {
         crate::app::openspec::read_capability_spec(&self.openspec_dir(), capability)
     }
 
+    /// List the known OpenSpec capability names (the folder names under the
+    /// `.coding/openspec/specs/` directory), sorted alphabetically.
+    /// When the specs directory does not exist, returns an empty vec.
+    pub fn capability_names(&self) -> Result<Vec<String>, String> {
+        let specs_dir = self.specs_dir();
+        if !specs_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&specs_dir)
+            .map_err(|e| format!("read specs dir: {e}"))?
+        {
+            let entry = entry.map_err(|e| format!("read entry in specs dir: {e}"))?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     fn header_text(
         &self,
         id: &str,
@@ -3570,6 +3594,30 @@ mod tests {
             panic!("a bug_fixing plan closes");
         };
         assert!(!knowledge_nudge, "bug_fixing plans are exempt");
+    }
+
+    #[test]
+    fn capability_names_lists_sorted_folders_and_ignores_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board(dir.path());
+
+        // No specs directory yet: no names, not an error.
+        assert!(board.capability_names().unwrap().is_empty());
+
+        let specs = dir.path().join("openspec/specs");
+        std::fs::create_dir_all(specs.join("tier-ladder")).unwrap();
+        std::fs::create_dir_all(specs.join("dispatch-routing")).unwrap();
+        std::fs::create_dir_all(specs.join("plan-board")).unwrap();
+        std::fs::write(specs.join("README.md"), "not a capability\n").unwrap();
+
+        assert_eq!(
+            board.capability_names().unwrap(),
+            vec![
+                "dispatch-routing".to_string(),
+                "plan-board".to_string(),
+                "tier-ladder".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

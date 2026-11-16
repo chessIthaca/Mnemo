@@ -10011,6 +10011,8 @@ async fn plan_read_reads_a_capability_spec() {
     assert!(current.success, "{}", current.output);
     assert_eq!(current.output, "# Tier ladder\n");
 
+    // An unknown name is an error naming the real capabilities, never a
+    // success that reads as "nothing to see".
     let missing = worker_host_tool_result(
         &messages,
         "planreader",
@@ -10020,10 +10022,10 @@ async fn plan_read_reads_a_capability_spec() {
         None,
     )
     .await;
-    assert!(missing.success, "{}", missing.output);
+    assert!(!missing.success, "{}", missing.output);
     assert_eq!(
         missing.output,
-        "No current spec for 'not-a-capability' yet."
+        "There is no OpenSpec capability named 'not-a-capability'. Known capabilities: tier-ladder. To re-read your plan, call plan_read with no arguments."
     );
 
     let invalid = worker_host_tool_result(
@@ -10037,6 +10039,115 @@ async fn plan_read_reads_a_capability_spec() {
     .await;
     assert!(!invalid.success);
     assert!(invalid.output.contains("invalid capability"), "{}", invalid.output);
+}
+
+/// Regression: an unknown capability name must fail with the list of real
+/// capabilities and directions to call plan_read without a capability.
+/// Bug root cause: PlanBoard::capability_spec returns success("No current
+/// spec for '<x>' yet.") even when '<x>' is not a known capability, so
+/// workers loop indefinitely on invented names (2026-11-16, oneRun01).
+#[tokio::test]
+async fn plan_read_with_an_unknown_capability_names_the_real_ones() {
+    let root = tempfile::tempdir().expect("workspace");
+    init_git(root.path());
+
+    // Create a known capability so we have real names to list.
+    std::fs::create_dir_all(root.path().join(".coding/openspec/specs/tier-ladder"))
+        .expect("create tier-ladder dir");
+    std::fs::write(
+        root.path().join(".coding/openspec/specs/tier-ladder/spec.md"),
+        "# Tier ladder\n",
+    )
+    .expect("spec file");
+
+    let board = PlanBoard::new(
+        root.path().join(".coding/plans"),
+        root.path().join(".coding/reviews"),
+    );
+    let board = Arc::new(board);
+    let messages = Arc::new(Mutex::new(Vec::new()));
+
+    // Calling with an unknown capability MUST return failure, listing the
+    // real capabilities and telling the worker to call plan_read without args.
+    let unknown = worker_host_tool_result(
+        &messages,
+        "planreader",
+        "plan_read",
+        &json!({"capability": "worker-checks-current-plan"}),
+        Some(&board),
+        None,
+    )
+    .await;
+
+    // THIS FAILS ON TODAY'S CODE: it returns success == true with
+    // "No current spec for 'worker-checks-current-plan' yet."
+    assert!(
+        !unknown.success,
+        "expected failure for unknown capability, got success: {}",
+        unknown.output
+    );
+    assert!(
+        unknown.output.contains("Known capabilities: tier-ladder"),
+        "expected 'Known capabilities: tier-ladder', got: {}",
+        unknown.output
+    );
+    assert!(
+        unknown.output.contains("call plan_read with no arguments"),
+        "expected direction to call plan_read without args, got: {}",
+        unknown.output
+    );
+}
+
+/// A real capability folder whose spec.md does not exist yet stays a success
+/// answer, and it too points the worker back at its plan.
+#[tokio::test]
+async fn plan_read_known_capability_without_a_spec_points_back_at_the_plan() {
+    let root = tempfile::tempdir().expect("workspace");
+    init_git(root.path());
+    std::fs::create_dir_all(root.path().join(".coding/openspec/specs/empty-capability"))
+        .expect("capability dir");
+    let board = Arc::new(PlanBoard::new(
+        root.path().join(".coding/plans"),
+        root.path().join(".coding/reviews"),
+    ));
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let current = worker_host_tool_result(
+        &messages,
+        "planreader",
+        "plan_read",
+        &json!({"capability": "empty-capability"}),
+        Some(&board),
+        None,
+    )
+    .await;
+    assert!(current.success, "{}", current.output);
+    assert_eq!(
+        current.output,
+        "No current spec for 'empty-capability' yet. To re-read your plan, call plan_read with no arguments."
+    );
+
+    // No capability folders at all: the error says "none" rather than an
+    // empty list.
+    let bare_root = tempfile::tempdir().expect("bare workspace");
+    init_git(bare_root.path());
+    let bare_board = Arc::new(PlanBoard::new(
+        bare_root.path().join(".coding/plans"),
+        bare_root.path().join(".coding/reviews"),
+    ));
+    let none = worker_host_tool_result(
+        &messages,
+        "planreader",
+        "plan_read",
+        &json!({"capability": "invented"}),
+        Some(&bare_board),
+        None,
+    )
+    .await;
+    assert!(!none.success, "{}", none.output);
+    assert_eq!(
+        none.output,
+        "There is no OpenSpec capability named 'invented'. Known capabilities: none. To re-read your plan, call plan_read with no arguments."
+    );
 }
 
 #[tokio::test]

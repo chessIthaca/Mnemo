@@ -10508,3 +10508,120 @@ async fn a_missing_held_pool_still_reserves_its_index() {
     assert!(!held.worktree.exists(), "the held missing pool is not recreated");
     team.shutdown().await;
 }
+
+
+async fn assert_detached_pool_can_be_deleted(dirty: bool) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let worker_id = if dirty { "detachdirty1" } else { "detachclean1" };
+    let failed = provision_pool_worker(&team, worker_id).await;
+    team.update_worker(&failed.id, |worker| worker.status = WorkerStatus::Failed)
+        .await;
+    let pool = failed.worktree.clone();
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), failed.branch.clone())
+        .await
+        .expect("detach before the lost deletion save");
+    if dirty {
+        std::fs::write(pool.join("dirty.txt"), "discard\n").expect("dirty detached pool");
+    }
+
+    let preview = team
+        .deletion_preview(std::slice::from_ref(&failed.id))
+        .await
+        .expect("detached pool preview");
+    assert!(preview[0].pool);
+    assert!(preview[0].blocked.is_none(), "{:?}", preview[0].blocked);
+    assert_eq!(preview[0].uncommitted, dirty);
+    let outcome = team
+        .delete_workers(std::slice::from_ref(&failed.id), true)
+        .await
+        .expect("delete detached pool worker");
+    assert!(outcome.results[0].error.is_none(), "{:?}", outcome.results[0].error);
+    assert!(team.worker(&failed.id).await.is_err());
+    assert!(!branch_exists(root.path(), &failed.branch).await);
+    assert!(pool.exists());
+    assert!(!pool.join("dirty.txt").exists());
+    let saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load after deletion")
+        .expect("saved team");
+    assert!(saved.workers.iter().all(|worker| worker.id != failed.id));
+
+    let next_id = if dirty { "detachednext2" } else { "detachednext1" };
+    let next = provision_pool_worker(&team, next_id).await;
+    assert_eq!(next.worktree, pool);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn detached_failed_worker_pools_can_be_deleted_clean_or_dirty_and_reused() {
+    assert_detached_pool_can_be_deleted(false).await;
+    assert_detached_pool_can_be_deleted(true).await;
+}
+
+
+#[tokio::test]
+async fn retry_save_failure_is_best_effort_for_the_merge_caller() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let mut stale = worker(root.path(), "retrysave02");
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &stale.branch,
+            pool.to_str().expect("pool path"),
+            "main",
+        ],
+    );
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), stale.branch.clone())
+        .await
+        .expect("detach the retry candidate");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Merged;
+    stale.error = Some(format!("{WORKTREE_CLEANUP_ERROR}: retry save failure"));
+    let mut just_merged = worker(root.path(), "justmerge01");
+    just_merged.status = WorkerStatus::Merged;
+    team.records.lock().await.push(stale.clone());
+    team.records.lock().await.push(just_merged.clone());
+    team.persist().await.expect("save before the injected failure");
+
+    let transcript = state
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join(format!("{}.json", stale.id));
+    std::fs::create_dir(&transcript).expect("make the transcript rename fail");
+
+    // Unit contract for the cleanup retry used after a merge: this other
+    // worker's save failure cannot become an error after the just-merged
+    // worker's own required save.
+    team.retry_leftover_cleanups().await;
+
+    let retried = team.worker(&stale.id).await.expect("retried worker");
+    assert!(retried.worktree.as_os_str().is_empty());
+    assert!(retried.error.is_none());
+    let merged = team
+        .worker(&just_merged.id)
+        .await
+        .expect("the merge caller still has its merged record");
+    assert_eq!(merged.status, WorkerStatus::Merged);
+    std::fs::remove_dir(&transcript).expect("unblock the transcript path");
+    let saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load the old ledger")
+        .expect("old ledger");
+    let saved_stale = saved
+        .workers
+        .iter()
+        .find(|worker| worker.id == stale.id)
+        .expect("stale worker on disk");
+    assert_eq!(saved_stale.worktree, pool, "the injected save really failed");
+    team.shutdown().await;
+}

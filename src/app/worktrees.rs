@@ -644,12 +644,16 @@ fn discard_and_release_pool_checkout_impl(
     branch: &str,
 ) -> Result<(), String> {
     ensure_pool_checkout(main_root, checkout)?;
-    let current = current_branch(checkout)?;
-    if current != branch {
+    let current = git_raw(checkout, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let current = current.trim();
+    if current != "HEAD" && current != branch {
         return Err(format!(
             "checkout is on an unexpected branch; retained (expected {branch}, found {current})"
         ));
     }
+    // A detached pool was already released before a lost ledger save. The
+    // confirmed discard still resets tracked and untracked work; the final
+    // release is idempotent and leaves HEAD detached.
     git_raw(checkout, &["reset", "--hard"])?;
     git_raw(checkout, &["clean", "-ffd"])?;
     release_pool_checkout_impl(main_root, checkout, branch)

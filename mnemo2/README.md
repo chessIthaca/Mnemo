@@ -149,10 +149,11 @@ only the app.
 
 - **One engine.** `TeamRuntime` spawns workers on the *same* `Arc<Engine>` as the
   lead — never a second engine.
-- **Worktrees.** Each worker gets `wt/agent-<id8>` at
-  `<project>/.worktrees/agent-<id8>`, forked from the lead's current branch tip
-  (not `main`). The branch name is unique per worker; provisioning fails loudly
-  on a collision.
+- **Worktrees.** Each new worker or audit gets `wt/agent-<id8>` at a reusable
+  `<project>/.worktrees/pool-<n>` checkout, forked from the lead's current
+  branch tip (not `main`). The branch name is unique per worker; provisioning
+  fails loudly on a collision. `.worktrees/agent-<id8>` folders belong only to
+  workers dispatched before pool checkouts were introduced.
 - **Executor surface.** Workers use a dedicated Mnemo2 executor prompt, not the
   original Mnemo workflow's read-only reviewer profile. They run with
   `ToolSelection::all()` minus `create_plan`, `update_plan`, `finish`,

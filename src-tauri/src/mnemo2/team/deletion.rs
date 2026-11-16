@@ -183,13 +183,23 @@ async fn registered_checkouts(root: &Path) -> Result<Vec<PathBuf>, String> {
 /// descending into untracked directories (`--untracked-files=normal`): the
 /// preview only needs to know that *something* is uncommitted, not
 /// enumerate a `node_modules` tree.
-async fn inspect_checkout(checkout: PathBuf, branch: String) -> Result<CheckoutCheck, String> {
+async fn inspect_checkout(
+    checkout: PathBuf,
+    branch: String,
+    pool: bool,
+) -> Result<CheckoutCheck, String> {
     let current = checkout_branch(&checkout).await?;
-    if current != branch {
-        return Ok(CheckoutCheck {
-            uncommitted: false,
-            blocked: Some(format!("its checkout is on '{current}', not {branch}")),
-        });
+    match current {
+        Some(current) if current != branch => {
+            return Ok(CheckoutCheck {
+                uncommitted: false,
+                blocked: Some(format!("its checkout is on '{current}', not {branch}")),
+            });
+        }
+        // A detached pool is already released; only its dirty state matters.
+        None if pool => {}
+        None => return Err("the checkout is on a detached HEAD".to_string()),
+        Some(_) => {}
     }
     let status = phase3::git_value(
         &checkout,
@@ -204,13 +214,13 @@ async fn inspect_checkout(checkout: PathBuf, branch: String) -> Result<CheckoutC
 
 /// A checkout's current branch, without blocking the async executor (the
 /// shared [`current_branch`] helper runs Git synchronously).
-async fn checkout_branch(checkout: &Path) -> Result<String, String> {
+async fn checkout_branch(checkout: &Path) -> Result<Option<String>, String> {
     let branch = phase3::git_value(checkout, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
     let branch = branch.trim().to_string();
     if branch.is_empty() || branch == "HEAD" {
-        return Err("the checkout is on a detached HEAD".to_string());
+        return Ok(None);
     }
-    Ok(branch)
+    Ok(Some(branch))
 }
 
 /// Whether Git's main-checkout worktree registry still lists this exact path.
@@ -968,7 +978,7 @@ impl TeamRuntime {
         let mut pending = Vec::new();
         for (index, core) in cores.iter().enumerate() {
             if core.needs_check {
-                pending.push((index, core.checkout.clone(), core.branch.clone()));
+                pending.push((index, core.checkout.clone(), core.branch.clone(), core.pool));
             }
         }
         // The Git-heavy half runs as one task per worker, bounded: every
@@ -977,10 +987,10 @@ impl TeamRuntime {
         // check lands.
         for chunk in pending.chunks(DELETION_CHECK_CONCURRENCY) {
             let mut handles = Vec::with_capacity(chunk.len());
-            for (index, checkout, branch) in chunk {
+            for (index, checkout, branch, pool) in chunk {
                 handles.push((
                     *index,
-                    tokio::spawn(inspect_checkout(checkout.clone(), branch.clone())),
+                    tokio::spawn(inspect_checkout(checkout.clone(), branch.clone(), *pool)),
                 ));
             }
             for (index, handle) in handles {

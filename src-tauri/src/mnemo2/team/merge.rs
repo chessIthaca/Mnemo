@@ -479,7 +479,7 @@ impl TeamRuntime {
                 }
             }
         }
-        self.retry_checkout_cleanups_locked(worker_id).await?;
+        self.retry_checkout_cleanups_locked(worker_id).await;
         self.sweep_merged_branches(worker_id).await;
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Merged {
@@ -521,7 +521,7 @@ impl TeamRuntime {
     /// that works (or finds the folder already gone) clears the note; one
     /// that still fails leaves the record as it was. Deleting the branch of a
     /// worker whose checkout is now gone is `sweep_merged_branches`'s job.
-    async fn retry_checkout_cleanups_locked(&self, skip: &str) -> Result<(), String> {
+    async fn retry_checkout_cleanups_locked(&self, skip: &str) {
         let candidates: Vec<WorkerRecord> = {
             let records = self.records.lock().await;
             records
@@ -537,7 +537,6 @@ impl TeamRuntime {
                 .cloned()
                 .collect()
         };
-        let mut cleared = false;
         for candidate in candidates {
             let pool = matches!(
                 worker_checkout(&self.workspace_root, &candidate),
@@ -563,24 +562,21 @@ impl TeamRuntime {
                 }
             })
             .await;
-            if pool {
-                self.persist().await?;
+            if let Err(error) = self.persist().await {
+                eprintln!(
+                    "mnemo2: could not persist checkout cleanup retry for worker '{}': {error}",
+                    candidate.id
+                );
             }
-            cleared = true;
         }
-        if cleared {
-            self.persist().await?;
-        }
-        Ok(())
     }
 
     /// App start: retry earlier stuck checkout removals, then the branch
     /// deletes they were blocking. Takes the merge lock itself.
-    pub(super) async fn retry_leftover_cleanups(&self) -> Result<(), String> {
+    pub(super) async fn retry_leftover_cleanups(&self) {
         let _guard = self.merge_lock.lock().await;
-        self.retry_checkout_cleanups_locked("").await?;
+        self.retry_checkout_cleanups_locked("").await;
         self.sweep_merged_branches("").await;
-        Ok(())
     }
 
     /// Retry the branch delete for earlier merged workers. Runs inside

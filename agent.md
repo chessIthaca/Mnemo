@@ -10,19 +10,7 @@ Mnemo2 reads this file into the prompt of its lead and of every worker. Their ro
   shell commands, never Linux paths or bash syntax in the `shell` tool. The
   project root is the folder the session opened.
 - Never commit to `main`. Work happens on the lead branch (`wt/mnemo`) and on worker branches (`wt/agent-*`); **Branch policy** says how work reaches `main`.
-- **Do not pipe a command through a cmdlet and then trust the reported exit
-  code** — it's the *pipe's* code, not the command's, and can read `1` even
-  when the command succeeded. To check whether a command actually failed,
-  run it unpiped and read `$LASTEXITCODE` directly:
-
-  ```powershell
-  cargo test
-  "exit=$LASTEXITCODE"
-  ```
-
-  …or, if you must filter noise, rely on the command's own `test result:` /
-  `error:` lines rather than the exit code. A non-zero code from a piped
-  invocation is **not** by itself evidence of failure.
+- **Read the exit code the shell tool reports.** Every shell result ends with `[exit code: N]`, the exit code of the whole command line. Run a command whose exit code matters alone on its line, with nothing after it: piped through a cmdlet, the code is the pipe's and can read `1` although the command succeeded; followed by `; "exit=$LASTEXITCODE"` or any other statement, the code is that statement's, usually `0`, although the command failed. The commands in `.coding/checks.toml` count as your checks only when run exactly like that. If you must filter noise, rely on the command's own `test result:` / `error:` lines rather than the exit code.
 
 ## Code style
 

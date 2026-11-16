@@ -16,6 +16,8 @@
 //! GUI app is running.
 
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -47,6 +49,65 @@ pub(crate) fn git_raw(root: &Path, args: &[&str]) -> Result<String, String> {
     } else {
         Err(format!(
             "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Hash a checkout's full content tree without touching its real index.
+///
+/// Git receives a temporary copy of the checkout's own index for `add -A` and
+/// `write-tree`. The temporary directory is removed on every return path.
+pub async fn content_tree(checkout: &Path) -> Result<String, String> {
+    let checkout = checkout.to_path_buf();
+    tokio::task::spawn_blocking(move || content_tree_blocking(&checkout))
+        .await
+        .map_err(|err| format!("content tree task failed: {err}"))?
+}
+
+fn content_tree_blocking(checkout: &Path) -> Result<String, String> {
+    let index = git_raw(checkout, &["rev-parse", "--git-path", "index"])?;
+    let index = PathBuf::from(index.trim());
+    let index = if index.is_absolute() {
+        index
+    } else {
+        checkout.join(index)
+    };
+    let temporary = tempfile::tempdir()
+        .map_err(|err| format!("could not create a temporary Git index directory: {err}"))?;
+    let temporary_index = temporary.path().join("index");
+    std::fs::copy(&index, &temporary_index).map_err(|err| {
+        format!(
+            "could not copy {} to {}: {err}",
+            index.display(),
+            temporary_index.display()
+        )
+    })?;
+    git_with_index(checkout, &temporary_index, &["add", "-A"])?;
+    git_with_index(checkout, &temporary_index, &["write-tree"]).map(|tree| tree.trim().to_string())
+}
+
+fn git_with_index(root: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(root)
+        .env("GIT_INDEX_FILE", index);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("could not run git in {}: {err}", root.display()))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            root.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }

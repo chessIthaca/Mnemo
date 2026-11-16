@@ -7520,6 +7520,7 @@ async fn executor_profile_uses_mnemo2_tools_not_mnemo_workflow_reviewer() {
             kind: "implementation".to_string(),
             trace_identity: super::trace_tests::worker_identity("Executor test"),
             pinned_task: None,
+            check_commands: std::sync::Arc::new(Vec::new()),
         })
         .await
         .expect("spawn executor");
@@ -7565,6 +7566,7 @@ async fn executor_profile_uses_mnemo2_tools_not_mnemo_workflow_reviewer() {
             kind: "audit".to_string(),
             trace_identity: super::trace_tests::worker_identity("Audit test"),
             pinned_task: None,
+            check_commands: std::sync::Arc::new(Vec::new()),
         })
         .await
         .expect("spawn audit");

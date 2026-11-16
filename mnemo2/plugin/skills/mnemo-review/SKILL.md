@@ -33,7 +33,7 @@ Look for:
 
 Run the verification commands from the plan and the brief inside the worker's `worktree`, so the exact tip is tested. Add the project's usual build, test and lint commands when the brief did not name them.
 
-Checks the worker ran on its final tree arrive already recorded (their detail says so); do not rerun them unless you doubt them. Record each command you really ran with `team_check`: a short `name` (for example "cargo test"), `status` passed or failed, and the relevant output in `detail`. Never record a command you did not run. A failed check goes in as failed, and its failure becomes a finding or goes back to the worker. Checks belong to the tip; after any new commit run them again.
+Checks the worker ran from `.coding/checks.toml` on its final tree arrive already recorded (their detail says so); do not rerun them unless you doubt them. Record each command you really ran with `team_check`: a short `name` (for example "cargo test"), `status` passed or failed, and the relevant output in `detail`. Never record a command you did not run. A failed check goes in as failed, and its failure becomes a finding or goes back to the worker. Checks belong to the tip; after any new commit run them again.
 
 If the change is user-visible, exercise it as well (run it, call it, open it) and say so in the evidence.
 

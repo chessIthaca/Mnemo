@@ -7,7 +7,7 @@
 //! releases a finished audit.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,6 +18,7 @@ use mnemo::headless::{
     SessionId, Transcript,
 };
 use mnemo::tool::ToolResult;
+use mnemo::tool::agent::shell::normalize_check_command;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast};
 
@@ -201,66 +202,48 @@ async fn worker_lacks_model_id(
         .is_some_and(|worker| worker.model_id.is_none())
 }
 
-/// Return a plain passing check command observed through the shell tool.
+/// Return an allow-listed passing shell command and its unchanged tree.
 pub(super) fn counted_check(
     tool: &str,
     args: &Value,
     result: &ToolResult,
-) -> Option<String> {
-    if tool != "shell"
-        || !result.success
-        || result.data.as_ref()?.get("exit_code")?.as_i64()? != 0
-    {
+    checkout: &Path,
+    check_commands: &[String],
+) -> Option<(String, String)> {
+    if tool != "shell" || !result.success {
         return None;
     }
-    let command = args.get("command")?.as_str()?.trim();
+    let data = result.data.as_ref()?;
+    if data.get("exit_code")?.as_i64()? != 0 {
+        return None;
+    }
+    let command = normalize_check_command(args.get("command")?.as_str()?);
     if command.is_empty()
-        || command.contains("$(")
-        || command.chars().any(|character| {
-            matches!(
-                character,
-                ';' | '|' | '&' | '>' | '<' | '`' | '\n' | '\r'
-            )
-        })
+        || !check_commands.iter().any(|allowed| allowed == &command)
     {
         return None;
     }
-    let executable = command.split_whitespace().next()?.to_ascii_lowercase();
-    let executable = executable
-        .strip_suffix(".exe")
-        .or_else(|| executable.strip_suffix(".cmd"))
-        .unwrap_or(&executable);
-    if !matches!(
-        executable,
-        "cargo"
-            | "npm"
-            | "npx"
-            | "pnpm"
-            | "yarn"
-            | "node"
-            | "python"
-            | "py"
-            | "pytest"
-            | "uv"
-            | "go"
-            | "dotnet"
-            | "mvn"
-            | "gradle"
-            | "gradlew"
-            | "make"
-            | "just"
-            | "ctest"
-    ) {
+    let checkout = checkout.canonicalize().ok()?;
+    if let Some(cwd) = args.get("cwd") {
+        let cwd = cwd.as_str()?.trim();
+        if !cwd.is_empty() {
+            let cwd = Path::new(cwd);
+            let cwd = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                checkout.join(cwd)
+            };
+            if cwd.canonicalize().ok()? != checkout {
+                return None;
+            }
+        }
+    }
+    let tree_before = data.get("tree_before")?.as_str()?;
+    let tree_after = data.get("tree_after")?.as_str()?;
+    if tree_before.is_empty() || tree_before != tree_after {
         return None;
     }
-    command
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .any(|word| {
-            ["test", "clippy", "check", "lint", "build", "vet"]
-                .iter()
-                .any(|candidate| word.eq_ignore_ascii_case(candidate))
-        })
-        .then(|| command.to_string())
+    Some((command, tree_before.to_string()))
 }
 
 async fn record_turn_checks(
@@ -305,6 +288,7 @@ pub(super) async fn pump_worker(
     save_lock: Arc<Mutex<()>>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     merge_lock: Arc<Mutex<()>>,
+    check_commands: Arc<Vec<String>>,
     persistence: TeamPersistence,
     routing_log_path: PathBuf,
     routing: Arc<std::sync::RwLock<RoutingSettings>>,
@@ -583,22 +567,26 @@ pub(super) async fn pump_worker(
                         strike_fired = Some(repeated);
                     }
                     tool_outcome = Some((name.clone(), result.success, result.output.clone()));
-                    if let Some(check) = counted_check(&name, &parsed, result) {
-                        let checkout = {
-                            let records = records.lock().await;
-                            records
-                                .iter()
-                                .find(|worker| {
-                                    worker.id == worker_id
-                                        && (worker.generation == 0
-                                            || worker.generation == generation)
-                                })
-                                .map(|worker| worker.worktree.clone())
-                        };
-                        if let Some(checkout) = checkout {
-                            if let Ok(tree) = phase3::content_tree(&checkout).await {
-                                check_observations.insert(check, tree);
-                            }
+                    let checkout = {
+                        let records = records.lock().await;
+                        records
+                            .iter()
+                            .find(|worker| {
+                                worker.id == worker_id
+                                    && (worker.generation == 0
+                                        || worker.generation == generation)
+                            })
+                            .map(|worker| worker.worktree.clone())
+                    };
+                    if let Some(checkout) = checkout {
+                        if let Some((check, tree)) = counted_check(
+                            &name,
+                            &parsed,
+                            result,
+                            &checkout,
+                            check_commands.as_slice(),
+                        ) {
+                            check_observations.insert(check, tree);
                         }
                     }
                 }

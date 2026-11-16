@@ -65,6 +65,7 @@ fn public_types_serde_roundtrip() {
         model: Some("local/m2".into()),
         reasoning_effort: Some("high".into()),
         worktree: Some("/tmp/wt".into()),
+        check_commands: Vec::new(),
         permissions: Some(PermissionPolicy::OverridePermissions),
         policy: Some("mnemo.workflow".into()),
         resume: Some(Transcript {

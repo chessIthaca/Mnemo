@@ -217,6 +217,30 @@ fn workers_label(running: usize) -> String {
     format!("Workers: {running} running")
 }
 
+/// The title shown on the main window (the Windows taskbar button) and the
+/// tray tooltip, so instances running on different projects can be told apart.
+fn window_title(project: Option<&std::path::Path>) -> String {
+    match project {
+        None => "Mnemo2".to_string(),
+        Some(root) => format!("Mnemo2 - {}", root.display()),
+    }
+}
+
+/// Update the main window title and tray icon tooltip to reflect the current
+/// open project (or lack thereof).  Failures are ignored on purpose — they
+/// must never fail an open or close.
+pub(crate) fn show_open_project(app: &tauri::AppHandle, project: Option<&std::path::Path>) {
+    use tauri::Manager as _;
+
+    let title = window_title(project);
+    if let Some(window) = app.get_window("main") {
+        let _ = window.set_title(&title); // ignores failure on purpose
+    }
+    if let Some(tray) = app.tray_by_id("mnemo2") {
+        let _ = tray.set_tooltip(Some(&title)); // ignores failure on purpose
+    }
+}
+
 /// How many worker turns are running on the open project. Also what the
 /// external lead's `/app/quit` route reports and refuses on.
 pub(crate) async fn running_workers(app: &tauri::AppHandle) -> usize {
@@ -271,7 +295,7 @@ fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &workers, &quit])?;
     let mut tray = TrayIconBuilder::with_id("mnemo2")
-        .tooltip("Mnemo2")
+        .tooltip(window_title(None))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -380,7 +404,7 @@ fn install_shell(
     // is applied before the shell exists, so restoring never flashes the
     // default centred 1440x900 first.
     let window = WindowBuilder::new(app, "main")
-        .title("Mnemo2")
+        .title(window_title(None))
         .inner_size(1440.0, 900.0)
         .min_inner_size(360.0, 540.0)
         .center()
@@ -1288,4 +1312,23 @@ mod tests {
             .collect();
         assert_eq!(found, vec!["a.ts", "c.svelte", "sub/d.ts"]);
     }
+
+    #[test]
+    fn window_title_without_a_project_is_the_app_name() {
+        assert_eq!(window_title(None), "Mnemo2");
+    }
+
+    #[test]
+    fn window_title_names_the_open_project_folder() {
+        #[cfg(windows)]
+        assert_eq!(
+            window_title(Some(std::path::Path::new(r"C:\FactoryGame"))),
+            r"Mnemo2 - C:\FactoryGame"
+        );
+        assert_eq!(
+            window_title(Some(std::path::Path::new("/work/app"))),
+            "Mnemo2 - /work/app"
+        );
+    }
+
 }

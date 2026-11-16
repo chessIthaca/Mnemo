@@ -9,7 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use mnemo::app::worktrees::{agent_branch, agent_short_id, provision_agent_worktree};
+use mnemo::app::worktrees::{
+    agent_branch, agent_short_id, provision_agent_checkout, rollback_agent_checkout,
+};
 
 use crate::mnemo2::phase3;
 use crate::mnemo2::phase3::ReviewEvidence;
@@ -343,10 +345,16 @@ impl TeamRuntime {
         }
         // The audit worktree checks out the audited branch itself so the
         // reviewer reads the exact tree it is auditing.
-        let (worktree, branch_created) =
-            provision_agent_worktree(self.workspace_root.clone(), reviewer_id.to_string(), target.branch.clone())
-                .await
-                .map_err(|err| format!("could not provision the audit worktree: {err}"))?;
+        let _checkout_pool_guard = self.checkout_pool_lock.lock().await;
+        let held = self.held_checkouts().await;
+        let (worktree, branch_created) = provision_agent_checkout(
+            self.workspace_root.clone(),
+            reviewer_id.to_string(),
+            target.branch.clone(),
+            held,
+        )
+        .await
+        .map_err(|err| format!("could not provision the audit worktree: {err}"))?;
         let base_tip = phase3::tip(&worktree).await?;
         let millis = phase3::now_ms();
         let record = WorkerRecord {
@@ -424,9 +432,10 @@ impl TeamRuntime {
         self.records.lock().await.push(record.clone());
         if let Err(err) = self.persist().await {
             self.records.lock().await.retain(|worker| worker.id != id);
-            let rollback = mnemo::app::worktrees::rollback_agent_worktree(
+            let rollback = rollback_agent_checkout(
                 self.workspace_root.clone(),
                 id.clone(),
+                record.worktree.clone(),
                 base_tip,
             )
             .await;

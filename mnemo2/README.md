@@ -149,10 +149,14 @@ only the app.
 
 - **One engine.** `TeamRuntime` spawns workers on the *same* `Arc<Engine>` as the
   lead — never a second engine.
-- **Worktrees.** Each worker gets `wt/agent-<id8>` at
-  `<project>/.worktrees/agent-<id8>`, forked from the lead's current branch tip
-  (not `main`). The branch name is unique per worker; provisioning fails loudly
-  on a collision.
+- **Worktrees.** Each new worker or audit gets `wt/agent-<id8>` at a reusable
+  `<project>/.worktrees/pool-<n>` checkout, forked from the lead's current
+  branch tip (not `main`). The branch name is unique per worker; provisioning
+  fails loudly on a collision. `.worktrees/agent-<id8>` folders belong only to
+  workers dispatched before pool checkouts were introduced. Cross-instance
+  reuse is coordinated with `.worktrees/pool-<n>.claim`: a fresh claim skips
+  that pool, while a claim older than ten minutes is stale only when its
+  recorded owner process is no longer alive and may then be reclaimed.
 - **Executor surface.** Workers use a dedicated Mnemo2 executor prompt, not the
   original Mnemo workflow's read-only reviewer profile. They run with
   `ToolSelection::all()` minus `create_plan`, `update_plan`, `finish`,
@@ -199,15 +203,21 @@ only the app.
   conversation and are forwarded as attributed lead notices.
 - **State.** `team.json` in `.coding/mnemo2/` is the worker ledger and stores
   the live-worker cap across restarts. Only TeamManager mutates it.
+- **Worker checkouts.** New workers and audits use reusable
+  `.worktrees/pool-<n>` checkouts. Merge and delete release them with a
+  detached HEAD, keeping `target/`, `node_modules/` and the code graph warm for
+  the next worker, and delete the worker branch. Legacy `.worktrees/agent-<id>`
+  folders from before pooling are still removed during cleanup.
 - **Deleting workers.** **Delete** in a worker's detail, or **Delete old** in
   Mission Control (merged, cancelled, stopped, interrupted, and failed workers),
   first shows a `team_delete_preview` of what goes: the record, transcript,
   telemetry, review, inbox messages, checkout, and `wt/agent-*` branch. A live
   session is stopped first; a merge in progress blocks deletion. Unmerged
   commits and uncommitted changes are discarded only when the confirmation
-  says so (`team_delete` with `discard_work`). A branch that another worker
-  record still uses (legacy ids sharing an 8-character prefix) is kept until
-  its last record is deleted. The lead has no delete tool.
+  says so (`team_delete` with `discard_work`). Deletion releases a pool checkout
+  instead of removing its folder. A branch that another worker record still
+  uses (legacy ids sharing an 8-character prefix) is kept until its last record
+  is deleted. The lead has no delete tool.
 
 ## Native workbench and project lifecycle
 
@@ -354,13 +364,14 @@ all live. Setup and day-to-day use are in
   return to the tracked worker. Merge is
   serialized into the local non-`main` lead branch, aborts verified conflict-only
   merges without auto-resolution, never pushes, and supports guarded revert
-  before landing. Successful merge closes the worker session, removes a verified
-  clean worktree (a worktree with new dirty work is retained) and deletes the
-  merged branch with a safe `git branch -d` (a branch that is not fully merged
-  is kept). The merge commit keeps the worker tip as its second parent for audit.
-  A checkout that could not be removed because something still held it is
-  retried at every later merge and at every Mnemo2 start; the worker's note
-  clears when the folder is gone, and its branch is deleted then.
+  before landing. Successful merge closes the worker session and releases a
+  verified clean checkout: a reusable pool stays detached with its build caches,
+  while a legacy `agent-<id>` folder is removed (a worktree with new dirty work
+  is retained). Merge deletes the worker branch with a safe `git branch -d` (a
+  branch that is not fully merged is kept). The merge commit keeps the worker
+  tip as its second parent for audit. Checkout release or removal is retried at
+  every later merge and at every Mnemo2 start; the worker's note clears when the
+  checkout is released or gone, and its branch is deleted then.
 - **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`).
   There is no per-lead-turn delegation cap (removed by user decision 2026-10-31)
   and no cumulative worker token or cost budget. Worker sessions have no

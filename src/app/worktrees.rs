@@ -33,6 +33,7 @@
 //! (a linked worktree is a real directory with a real checkout + `.git`
 //! file), which the in-memory `MockGit` cannot represent.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::project::git_ops::git_raw;
@@ -320,6 +321,119 @@ fn registered_worktrees(main_root: &Path) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
+/// A held pool claim; dropping it releases the cross-instance reservation.
+struct PoolClaim {
+    path: PathBuf,
+}
+
+impl Drop for PoolClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Whether a claim's recorded process is still alive. An unreadable claim is
+/// an error (and therefore skipped); an absent or malformed pid has no live
+/// owner to protect and can become stale by age.
+fn claim_owner_alive(claim: &Path) -> Result<bool, String> {
+    let contents = std::fs::read_to_string(claim)
+        .map_err(|error| format!("cannot read {}: {error}", claim.display()))?;
+    let Some(pid) = contents
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+    else {
+        return Ok(false);
+    };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: fixed query flags, no handle inheritance; close every handle.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // Only "no such process" proves the owner is gone; any other
+            // refusal (access denied, ...) fails closed and counts as live.
+            // SAFETY: reads this thread's last-error value, set by OpenProcess.
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Ok(error != windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        }
+        let mut exit_code = 0;
+        // SAFETY: the handle is valid and outlives this query.
+        let probed = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: the handle is no longer used.
+        unsafe { CloseHandle(handle) };
+        // A failed query also fails closed; only a real exit code means gone.
+        Ok(probed == 0 || exit_code == STILL_ACTIVE as u32)
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .map_err(|error| format!("cannot probe claim owner {pid}: {error}"))
+    }
+}
+
+/// Claim a free pool across Mnemo instances. Only a claim older than ten
+/// minutes whose recorded owner is no longer alive is stale; a fresh claim,
+/// a live owner, or an unreadable/future-dated claim skips the pool. A stale
+/// claim is removed and creation retried exactly once.
+fn acquire_pool_claim(pool: &Path) -> Result<Option<PoolClaim>, String> {
+    let claim = pool.with_file_name(format!(
+        "{}.claim",
+        pool.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("{} has no pool file name", pool.display()))?
+    ));
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&claim)
+        {
+            Ok(mut file) => {
+                if let Err(error) = writeln!(file, "{}", std::process::id()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&claim);
+                    return Err(format!("cannot write {}: {error}", claim.display()));
+                }
+                return Ok(Some(PoolClaim { path: claim }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = if attempt == 0 {
+                    let modified = std::fs::metadata(&claim)
+                        .and_then(|metadata| metadata.modified())
+                        .map_err(|error| format!("cannot inspect {}: {error}", claim.display()))?;
+                    let aged = modified
+                        .elapsed()
+                        .map(|age| age > std::time::Duration::from_secs(600))
+                        .unwrap_or(false);
+                    aged && !claim_owner_alive(&claim)?
+                } else {
+                    false
+                };
+                if !stale {
+                    return Ok(None);
+                }
+                std::fs::remove_file(&claim)
+                    .map_err(|error| format!("cannot remove stale {}: {error}", claim.display()))?;
+            }
+            Err(error) => {
+                return Err(format!("cannot create {}: {error}", claim.display()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Every `.worktrees` entry named `pool-<n>`, ascending by index, with
 /// whether it is a directory. An entry that merely exists but is not a
 /// usable worktree still RESERVES its index — the next pool is `max+1`, so
@@ -399,9 +513,27 @@ fn provision_pool_checkout_impl(
     // stale metadata would make `git worktree add` refuse to create the
     // next pool folder (same hygiene as `remove_worktree_only_impl`).
     let _ = git_raw(main_root, &["worktree", "prune"]);
-    let registered = registered_worktrees(main_root)?;
+    let free = |pool: &Path| -> Result<(), String> {
+        ensure_registered_pool_checkout(main_root, pool)?;
+        let head = git_raw(pool, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        if head.trim() != "HEAD" {
+            return Err(format!("pool is on branch {}", head.trim()));
+        }
+        let dirty = git_raw(pool, &["status", "--porcelain", "-uall"])?;
+        if !dirty.trim().is_empty() {
+            return Err("pool has uncommitted work".to_string());
+        }
+        Ok(())
+    };
     let pools = existing_pool_entries(main_root)?;
     for (_, pool, is_dir) in &pools {
+        if let Err(error) = ensure_pool_checkout(main_root, pool) {
+            eprintln!(
+                "mnemo: pool checkout {} failed its safety guard: {error}; skipped",
+                pool.display()
+            );
+            continue;
+        }
         if !is_dir {
             eprintln!("mnemo: pool checkout {} is not a directory; skipped", pool.display());
             continue;
@@ -409,72 +541,98 @@ fn provision_pool_checkout_impl(
         if held.iter().any(|held_path| same_checkout_path(held_path, pool)) {
             continue; // held by a live worker record — the expected case
         }
-        if !registered.iter().any(|known| same_checkout_path(known, pool)) {
+        if let Err(error) = free(pool) {
             eprintln!(
-                "mnemo: pool checkout {} is not a registered worktree; skipped",
+                "mnemo: pool checkout {} is not free: {error}; skipped",
                 pool.display()
             );
             continue;
         }
-        let head = match git_raw(pool, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-            Ok(head) => head,
+        let _claim = match acquire_pool_claim(pool) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                eprintln!(
+                    "mnemo: pool checkout {} has a live claim; skipped",
+                    pool.display()
+                );
+                continue;
+            }
             Err(error) => {
                 eprintln!(
-                    "mnemo: pool checkout {} is unusable: {error}; skipped",
+                    "mnemo: could not claim pool checkout {}: {error}; skipped",
                     pool.display()
                 );
                 continue;
             }
         };
-        let head = head.trim();
-        if head != "HEAD" {
+        // Another instance may have changed the checkout before our claim.
+        if let Err(error) = free(pool) {
             eprintln!(
-                "mnemo: pool checkout {} is on branch {head}; skipped",
+                "mnemo: pool checkout {} changed after claiming: {error}; skipped",
                 pool.display()
             );
             continue;
         }
-        let dirty = match git_raw(pool, &["status", "--porcelain", "-uall"]) {
-            Ok(dirty) => dirty,
-            Err(error) => {
-                eprintln!(
-                    "mnemo: pool checkout {} is unusable: {error}; skipped",
-                    pool.display()
-                );
-                continue;
-            }
-        };
-        if !dirty.trim().is_empty() {
-            eprintln!(
-                "mnemo: pool checkout {} has uncommitted work; skipped",
-                pool.display()
-            );
-            continue;
-        }
-        if let Err(error) = reuse_pool_checkout(pool, branch, base_ref) {
+        if let Err(error) = reuse_pool_checkout(main_root, pool, branch, base_ref) {
             eprintln!(
                 "mnemo: reusing pool checkout {} failed: {error}; skipped",
                 pool.display()
             );
-            // Leave the pool detached, whatever step failed.
-            let _ = git_raw(pool, &["switch", "--detach"]);
             continue;
         }
         return Ok(pool.to_path_buf());
     }
-    // No free pool: create the next one. Every existing `pool-<n>` reserved
-    // its index — usable or not — so max+1 never collides.
-    let next = pools
-        .last()
-        .map_or(1, |(index, _, _)| index.saturating_add(1));
-    provision_worktree_impl(main_root, &pool_checkout_name(next), branch, base_ref)
+    // Existing folders and held paths both reserve their indices, even when
+    // a held folder is temporarily missing, so max+1 can never equal a hold.
+    let highest = pools
+        .iter()
+        .map(|(index, _, _)| *index)
+        .chain(held.iter().filter_map(|path| pool_index(path)))
+        .max();
+    let mut next = match highest {
+        Some(index) => index
+            .checked_add(1)
+            .ok_or_else(|| "no pool checkout indices remain".to_string())?,
+        None => 1,
+    };
+    let mut last_error = None;
+    for _ in 0..5 {
+        let name = pool_checkout_name(next);
+        let path = worktrees_dir(main_root).join(&name);
+        match provision_worktree_impl(main_root, &name, branch, base_ref) {
+            Ok(checkout) => return Ok(checkout),
+            Err(error) => {
+                if std::fs::symlink_metadata(&path).is_err() {
+                    return Err(error);
+                }
+                eprintln!(
+                    "mnemo: pool checkout {} appeared during provisioning; trying the next index",
+                    path.display()
+                );
+                last_error = Some(error);
+                next = next
+                    .checked_add(1)
+                    .ok_or_else(|| "no pool checkout indices remain".to_string())?;
+            }
+        }
+    }
+    Err(format!(
+        "could not allocate a new pool checkout after 5 attempts: {}",
+        last_error.unwrap_or_else(|| "pool paths kept appearing".to_string())
+    ))
 }
 
 /// Reuse one free pool for a new worker: re-point its detached HEAD at
 /// `base_ref`, sweep the previous worker's ignored leftovers (keeping the
 /// warm caches) and create `branch` there. The caller has already checked
 /// the pool is free.
-fn reuse_pool_checkout(pool: &Path, branch: &str, base_ref: &str) -> Result<(), String> {
+fn reuse_pool_checkout(
+    main_root: &Path,
+    pool: &Path,
+    branch: &str,
+    base_ref: &str,
+) -> Result<(), String> {
+    ensure_registered_pool_checkout(main_root, pool)?;
     git_raw(pool, &["switch", "--detach", base_ref])?;
     git_raw(
         pool,
@@ -552,12 +710,57 @@ fn ensure_pool_checkout(main_root: &Path, checkout: &Path) -> Result<(), String>
     Ok(())
 }
 
+/// Filesystem, registration, and self-resolution guards for a pool. Git must
+/// register this exact path, and `rev-parse --show-toplevel` inside it must
+/// canonicalize back to itself rather than to the main checkout or another
+/// worktree. The registry check always precedes the pool-local Git command.
+fn ensure_registered_pool_checkout(main_root: &Path, checkout: &Path) -> Result<(), String> {
+    ensure_pool_checkout(main_root, checkout)?;
+    let registered = registered_worktrees(main_root)?;
+    if !registered
+        .iter()
+        .any(|known| same_checkout_path(known, checkout))
+    {
+        return Err(format!(
+            "refusing to operate on {}: it is not a registered worktree",
+            checkout.display()
+        ));
+    }
+    let top = git_raw(checkout, &["rev-parse", "--show-toplevel"])?;
+    let canonical_top = std::fs::canonicalize(top.trim())
+        .map_err(|error| format!("cannot resolve the checkout top level: {error}"))?;
+    let canonical_checkout = std::fs::canonicalize(checkout)
+        .map_err(|error| format!("cannot resolve {}: {error}", checkout.display()))?;
+    if !same_checkout_path(&canonical_top, &canonical_checkout) {
+        return Err(format!(
+            "refusing to operate on {}: its Git top level is not the pool itself",
+            checkout.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Run the complete pool registration/self-resolution guard on the blocking
+/// thread pool before an asynchronous caller issues any other pool Git command.
+pub async fn ensure_pool_checkout_registered(
+    main_root: PathBuf,
+    checkout: PathBuf,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        ensure_registered_pool_checkout(&main_root, &checkout)
+    })
+    .await
+    .map_err(|error| format!("pool checkout guard task failed: {error}"))?
+}
+
 /// Release a finished worker's pool checkout back to the pool WITHOUT
 /// deleting it: the folder's `target/`, `node_modules/` and code graph are
 /// the warm cache the next worker builds on. The checkout must be on the
 /// worker's `branch` and have no uncommitted work; it is then switched to a
-/// detached HEAD, which frees the branch for `git branch -d`. Every
-/// refusal leaves the checkout and its branch exactly as they were.
+/// detached HEAD, which frees the branch for `git branch -d`. A clean checkout
+/// whose HEAD is already detached is already released and returns `Ok(())`
+/// unchanged, so retrying after a lost ledger save is safe. Detached but dirty
+/// still refuses. Every refusal leaves the checkout and branch as they were.
 ///
 /// Runs the blocking git subprocesses on the blocking thread pool (see the
 /// module doc). Owns its arguments so the closure is `'static + Send`.
@@ -577,9 +780,11 @@ fn release_pool_checkout_impl(
     checkout: &Path,
     branch: &str,
 ) -> Result<(), String> {
-    ensure_pool_checkout(main_root, checkout)?;
-    let current = current_branch(checkout)?;
-    if current != branch {
+    ensure_registered_pool_checkout(main_root, checkout)?;
+    let current = git_raw(checkout, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let current = current.trim();
+    let already_detached = current == "HEAD";
+    if !already_detached && current != branch {
         return Err(format!(
             "checkout is on an unexpected branch; retained (expected {branch}, found {current})"
         ));
@@ -590,6 +795,9 @@ fn release_pool_checkout_impl(
             "uncommitted work is retained in the pool checkout {}",
             checkout.display()
         ));
+    }
+    if already_detached {
+        return Ok(());
     }
     git_raw(checkout, &["switch", "--detach"]).map(|_| ())
 }
@@ -621,13 +829,17 @@ fn discard_and_release_pool_checkout_impl(
     checkout: &Path,
     branch: &str,
 ) -> Result<(), String> {
-    ensure_pool_checkout(main_root, checkout)?;
-    let current = current_branch(checkout)?;
-    if current != branch {
+    ensure_registered_pool_checkout(main_root, checkout)?;
+    let current = git_raw(checkout, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let current = current.trim();
+    if current != "HEAD" && current != branch {
         return Err(format!(
             "checkout is on an unexpected branch; retained (expected {branch}, found {current})"
         ));
     }
+    // A detached pool was already released before a lost ledger save. The
+    // confirmed discard still resets tracked and untracked work; the final
+    // release is idempotent and leaves HEAD detached.
     git_raw(checkout, &["reset", "--hard"])?;
     git_raw(checkout, &["clean", "-ffd"])?;
     release_pool_checkout_impl(main_root, checkout, branch)
@@ -668,7 +880,7 @@ fn rollback_agent_checkout_impl(
         return Err("invalid worker identity; branch retained".to_string());
     }
     let branch = agent_branch(agent_id);
-    ensure_pool_checkout(main_root, checkout)?;
+    ensure_registered_pool_checkout(main_root, checkout)?;
     if current_branch(checkout)? != branch {
         return Err("worker checkout is on an unexpected branch; branch retained".to_string());
     }
@@ -719,6 +931,50 @@ mod tests {
         git_raw(dir.path(), &["add", "-A"]).unwrap();
         git_raw(dir.path(), &["commit", "-m", "init"]).unwrap();
         dir
+    }
+
+    fn exited_process_id() -> u32 {
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap short-lived child");
+        pid
+    }
+
+    fn create_directory_link(link: &Path, target: &Path) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            let link = link.to_string_lossy().replace('/', "\\");
+            let target = target.to_string_lossy().replace('/', "\\");
+            let output = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).into_owned())
+            }
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).map_err(|error| error.to_string())
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = (link, target);
+            Err("directory links are unsupported on this platform".to_string())
+        }
     }
 
     /// `init_repo` plus a committed `.gitignore` that ignores the pool build
@@ -1056,6 +1312,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_linked_pool_is_skipped_without_touching_its_target() {
+        let repo = init_repo();
+        let pool = repo.path().join(".worktrees/pool-1");
+        git_raw(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                pool.to_str().expect("pool path"),
+                "main",
+            ],
+        )
+        .expect("register detached pool");
+        let target = repo.path().join("linked-checkout");
+        std::fs::rename(&pool, &target).expect("move the real checkout aside");
+        if let Err(error) = create_directory_link(&pool, &target) {
+            eprintln!("cannot create the pool directory link ({error}); skipping this test");
+            return;
+        }
+        std::fs::write(target.join("marker.txt"), "untouched\n").expect("target marker");
+
+        let checkout = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-linked".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision past the linked pool");
+
+        assert_eq!(pool_index(&checkout), Some(2));
+        assert_eq!(
+            std::fs::read_to_string(target.join("marker.txt")).expect("marker survives"),
+            "untouched\n"
+        );
+        assert_eq!(
+            git_raw(&target, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .expect("target HEAD")
+                .trim(),
+            "HEAD",
+            "no switch runs through the link"
+        );
+        let metadata = std::fs::symlink_metadata(&pool).expect("linked pool metadata");
+        assert!(is_link_or_junction(&metadata), "the link itself is left in place");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_claim_skips_the_pool_and_creates_the_next_index() {
+        let repo = init_repo();
+        let pool = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-old".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision pool-1");
+        release_pool_checkout(repo.path().to_path_buf(), pool.clone(), "wt/agent-old".to_string())
+            .await
+            .expect("release pool-1");
+        let claim = pool.with_file_name("pool-1.claim");
+        std::fs::write(&claim, "12345\n").expect("fresh claim");
+        let checkout = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-new".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision past a fresh claim");
+        assert_eq!(pool_index(&checkout), Some(2));
+        assert!(claim.exists(), "another instance's fresh claim remains");
+    }
+
+    #[tokio::test]
+    async fn a_stale_claim_is_taken_over_and_removed() {
+        let repo = init_repo();
+        let pool = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-old".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision pool-1");
+        release_pool_checkout(repo.path().to_path_buf(), pool.clone(), "wt/agent-old".to_string())
+            .await
+            .expect("release pool-1");
+        let claim = pool.with_file_name("pool-1.claim");
+        std::fs::write(&claim, exited_process_id().to_string()).expect("stale claim");
+        let file = std::fs::File::options().write(true).open(&claim).expect("claim file");
+        file.set_modified(
+            std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(601))
+                .expect("stale timestamp"),
+        )
+        .expect("age the claim");
+        let checkout = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-new".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("take over a stale claim");
+        assert_eq!(checkout, pool);
+        assert!(!claim.exists(), "the owned claim is dropped after provisioning");
+    }
+
+    #[tokio::test]
+    async fn an_old_claim_with_a_live_owner_is_never_taken_over() {
+        let repo = init_repo();
+        let pool = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-old".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision pool-1");
+        release_pool_checkout(repo.path().to_path_buf(), pool.clone(), "wt/agent-old".to_string())
+            .await
+            .expect("release pool-1");
+        let claim = pool.with_file_name("pool-1.claim");
+        std::fs::write(&claim, format!("{}\n", std::process::id())).expect("live claim");
+        let file = std::fs::File::options().write(true).open(&claim).expect("claim file");
+        file.set_modified(
+            std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(601))
+                .expect("old timestamp"),
+        )
+        .expect("age the live claim");
+
+        let checkout = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-new".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision past a live claim");
+        assert_eq!(pool_index(&checkout), Some(2));
+        assert!(claim.exists(), "the live owner's old claim remains");
+    }
+
+    #[tokio::test]
+    async fn a_claim_file_does_not_reserve_a_pool_index() {
+        let repo = init_repo();
+        let worktrees = repo.path().join(".worktrees");
+        std::fs::create_dir_all(&worktrees).expect("worktrees folder");
+        std::fs::write(worktrees.join("pool-9.claim"), "12345\n").expect("orphan claim");
+        let checkout = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-new".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("claim files are not pools");
+        assert_eq!(pool_index(&checkout), Some(1));
+        assert!(worktrees.join("pool-9.claim").exists());
+    }
+
+    #[tokio::test]
     async fn an_unregistered_pool_folder_reserves_its_index() {
         let repo = init_repo();
         let worktrees = repo.path().join(".worktrees");
@@ -1157,6 +1578,39 @@ mod tests {
                 .expect("worktree list")
                 .contains("pool-1"),
             "the pool stays registered as a worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_is_idempotent_only_when_the_detached_pool_is_clean() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let (pool, branch) = provision_agent_checkout(
+            main.clone(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision");
+        release_pool_checkout(main.clone(), pool.clone(), branch.clone())
+            .await
+            .expect("first release");
+        let released_head = git_raw(&pool, &["rev-parse", "HEAD"]).expect("released HEAD");
+
+        std::fs::write(pool.join("a.txt"), "dirty\n").expect("dirty detached pool");
+        let error = release_pool_checkout(main.clone(), pool.clone(), branch.clone())
+            .await
+            .expect_err("a dirty detached pool is not released");
+        assert!(error.contains("uncommitted"), "{error}");
+        git_raw(&pool, &["restore", "a.txt"]).expect("restore clean detached pool");
+
+        release_pool_checkout(main, pool.clone(), branch)
+            .await
+            .expect("a clean detached pool is already released");
+        assert_eq!(
+            git_raw(&pool, &["rev-parse", "HEAD"]).expect("unchanged HEAD"),
+            released_head
         );
     }
 

@@ -6,11 +6,12 @@
 //! resume, model changes and compaction - everything that drives a live
 //! worker session from the outside.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mnemo::route_question;
-use mnemo::app::worktrees::current_branch;
+use mnemo::app::worktrees::{current_branch, ensure_pool_checkout_registered};
 use mnemo::headless::{SessionCommand, Transcript};
 use mnemo::headless::session::ModelSwitch;
 use tokio::sync::Mutex;
@@ -20,6 +21,7 @@ use crate::mnemo2::dispatch_routing::{
     DispatchRoutingRow, RoutingMode, TEXT_MAX_CHARS, classify_dispatch,
 };
 
+use super::deletion::{CheckoutKind, validated_checkout, worker_checkout};
 use super::{
     LiveWorker, RECOVERED_WORKTREE_CLEANUP_ERROR, TeamRuntime, WorkerSessionSpec,
     cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key,
@@ -804,7 +806,11 @@ impl TeamRuntime {
         self.worker(worker_id).await
     }
 }
-pub(super) async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Result<(), String> {
+pub(super) async fn recover_worker(
+    root: &std::path::Path,
+    worker: &mut WorkerRecord,
+    other_worktrees: &[PathBuf],
+) -> Result<(), String> {
     worker.brief_sent = true;
     worker.compacting = false;
     let legacy_budget_pause = worker.error.as_deref().is_some_and(|error| {
@@ -826,6 +832,42 @@ pub(super) async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRe
     if worker.total_tokens == 0 && worker.used_tokens > 0 {
         worker.total_tokens = worker.used_tokens as u64;
         worker.prompt_tokens = worker.used_tokens as u64;
+    }
+    // A crash between detaching a merged pool and saving its cleared record
+    // leaves a stale path on disk. The pool is already free; clear the record
+    // during recovery and let TeamRuntime::open's existing persist save it.
+    if worker.status == WorkerStatus::Merged && worker.error.is_none() {
+        let detached_pool = match worker_checkout(root, worker) {
+            Some(CheckoutKind::Pool(_)) => match validated_checkout(root, worker, other_worktrees) {
+                Ok(Some(CheckoutKind::Pool(canonical))) => {
+                    ensure_pool_checkout_registered(
+                        root.to_path_buf(),
+                        canonical.clone(),
+                    )
+                    .await
+                    .is_ok()
+                        && phase3::git_value(
+                        &canonical,
+                        &["rev-parse", "--abbrev-ref", "HEAD"],
+                    )
+                    .await
+                    .ok()
+                    .is_some_and(|head| head.trim() == "HEAD")
+                        && phase3::git_value(
+                            &canonical,
+                            &["status", "--porcelain", "-uall"],
+                        )
+                        .await
+                        .ok()
+                        .is_some_and(|status| status.trim().is_empty())
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if detached_pool {
+            worker.worktree = PathBuf::new();
+        }
     }
     if worker.status == WorkerStatus::Merging {
         let merge_head = phase3::git(root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;
@@ -855,8 +897,13 @@ pub(super) async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRe
             worker.status = WorkerStatus::Merged;
             worker.merge = Some(record);
             worker.error = None;
-            if let Err(err) = cleanup_agent_worktree(root, worker).await {
-                worker.error = Some(format!("{RECOVERED_WORKTREE_CLEANUP_ERROR}: {err}"));
+            let pool = matches!(worker_checkout(root, worker), Some(CheckoutKind::Pool(_)));
+            match cleanup_agent_worktree(root, worker, other_worktrees).await {
+                Ok(()) if pool => worker.worktree = PathBuf::new(),
+                Ok(()) => {}
+                Err(err) => {
+                    worker.error = Some(format!("{RECOVERED_WORKTREE_CLEANUP_ERROR}: {err}"));
+                }
             }
             return Ok(());
         }

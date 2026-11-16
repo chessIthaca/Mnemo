@@ -180,8 +180,10 @@ export interface WorkerDeletionPreview {
   branch: string;
   /** The session is live; deleting stops it first. */
   live: boolean;
-  /** The checkout still exists and will be removed. */
+  /** The checkout still exists and will be removed or released. */
   checkout: boolean;
+  /** A pool checkout is freed for reuse instead of removing its folder. */
+  pool: boolean;
   /** That checkout has uncommitted changes. */
   uncommitted: boolean;
   /** Commits on the branch that the lead branch does not contain. */

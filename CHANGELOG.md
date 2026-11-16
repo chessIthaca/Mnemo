@@ -7,6 +7,25 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
 `.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
+## [2.6.0] — 2026-11-16
+
+Workers build faster, and the lead stops running every test suite twice.
+
+### Added
+- Workers and audits reuse checkout folders (`.worktrees/pool-<n>`), so their build caches stay warm and a new worker's builds are incremental instead of starting from scratch.
+- A worker's own passing runs of the commands listed in `.coding/checks.toml`, run exactly as written in its checkout on the code it then commits, count as merge checks; the lead no longer reruns them.
+- **Settings → Claude Code → Connect** also installs `mnemo-workers`, the band that lists the running workers above the prompt in Claude Desktop.
+
+### Changed
+- Shell results show stderr before stdout, so an error stays visible when a long output is shortened.
+- The worker check list and CI drop the `-p mnemo-app --features mnemo2` runs that only repeated the workspace runs.
+- Dependency updates: rusqlite 0.42, fastembed 7.7, vite 8.3.8 and smaller patch releases.
+
+### Fixed
+- An audit that has not reported yet can switch its model from mission control.
+- `plan_read` with an unknown capability names the real ones and points the worker back to its plan.
+- An audit that ends with its findings as plain text still delivers them as its report and frees its worker slot.
+
 ## [2.5.0] — 2026-11-15
 
 Mnemo2 keeps itself up to date. Installs of 2.4.0 or older need this release once by hand; from 2.5.0 on, updates arrive on their own.

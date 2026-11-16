@@ -766,10 +766,20 @@ impl Tool for ShellTool {
                 } else {
                     (raw_stdout.clone(), raw_stderr.clone())
                 };
+                // Plan 75b41222: stderr LEADS the model-facing text. Both
+                // lossy surfaces downstream — cap_tool_output (keeps the
+                // first 100 KiB) and the archive preview (keeps a 1,500-char
+                // head) — preserve the FRONT, so an error after a long
+                // stdout was the first thing cut and the agent had to
+                // expand the archive just to find it. A clean run (empty
+                // stderr) keeps the exact pre-change shape; the `[stdout]`
+                // label rides only when stdout has something to show.
                 let mut combined = if stderr.is_empty() {
                     stdout.clone()
+                } else if stdout.is_empty() {
+                    format!("[stderr]\n{stderr}")
                 } else {
-                    format!("{stdout}\n[stderr]\n{stderr}")
+                    format!("[stderr]\n{stderr}\n[stdout]\n{stdout}")
                 };
                 // Token-optimizer lever 2 (backlog e4a50d22): semantic
                 // command-output compression. Runs AFTER the shell_filter
@@ -1545,6 +1555,58 @@ mod tests {
         let result = tool.execute(json!({"command": cmd, "purpose": "stderr capture"})).await;
         // The stderr text should appear somewhere in the output.
         assert!(result.output.to_lowercase().contains("oops"));
+    }
+
+    /// Plan 75b41222: the lossy surfaces downstream — the 100 KiB cap and
+    /// the archive preview's 1,500-char head — keep the FRONT of the model
+    /// text, so the shell tool leads with stderr: an error must never sit
+    /// behind a long stdout again.
+    #[tokio::test]
+    async fn stderr_comes_before_stdout_in_the_model_text() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            "Write-Output 'OUT-LINE'; [Console]::Error.WriteLine('ERR-LINE')"
+        } else {
+            "echo OUT-LINE; echo ERR-LINE 1>&2"
+        };
+        let result = tool.execute(json!({"command": cmd, "purpose": "stderr first"})).await;
+        assert!(result.success, "output: {}", result.output);
+        let err_tag = result.output.find("[stderr]").expect("a [stderr] section");
+        let err_line = result.output.find("ERR-LINE").expect("the stderr line");
+        let out_tag = result.output.find("[stdout]").expect("a [stdout] section");
+        let out_line = result.output.find("OUT-LINE").expect("the stdout line");
+        assert!(
+            err_tag < err_line && err_line < out_tag && out_tag < out_line,
+            "stderr must lead stdout in the model text: {}",
+            result.output
+        );
+        assert!(
+            result.output.ends_with("[exit code: 0]"),
+            "the exit-code line must close the text: {}",
+            result.output
+        );
+    }
+
+    /// Plan 75b41222: a clean run reads exactly as before — plain stdout
+    /// and the exit-code line, no stream labels.
+    #[tokio::test]
+    async fn a_clean_run_reads_as_before() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            "Write-Output hello"
+        } else {
+            "echo hello"
+        };
+        let result = tool.execute(json!({"command": cmd, "purpose": "clean run"})).await;
+        assert!(result.success, "output: {}", result.output);
+        assert_eq!(result.output, "hello\n[exit code: 0]");
+        assert!(
+            !result.output.contains("[stderr]") && !result.output.contains("[stdout]"),
+            "a clean run carries no stream labels: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

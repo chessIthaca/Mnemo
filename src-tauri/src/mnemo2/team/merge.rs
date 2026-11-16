@@ -12,7 +12,8 @@ use std::sync::atomic::Ordering;
 use mnemo::app::plan_board::{CloseOutcome, NO_DURABLE_RECORD_NUDGE};
 use mnemo::app::team_ledger::TeamLedger;
 use mnemo::app::worktrees::{
-    agent_branch, current_branch, release_pool_checkout, remove_agent_worktree,
+    agent_branch, current_branch, ensure_pool_checkout_registered, release_pool_checkout,
+    remove_agent_worktree,
 };
 
 use crate::mnemo2::ledger::{self, RecordsLedger};
@@ -316,6 +317,31 @@ impl TeamRuntime {
         phase3::require_clean_lead(&self.workspace_root, "lead").await?;
         phase3::require_clean(&worker.worktree, "worker").await?;
         let tip = phase3::tip(&worker.worktree).await?;
+        if matches!(
+            worker_checkout(&self.workspace_root, &worker),
+            Some(CheckoutKind::Pool(_))
+        ) {
+            let on_branch = ensure_pool_checkout_registered(
+                self.workspace_root.clone(),
+                worker.worktree.clone(),
+            )
+            .await
+            .is_ok()
+                && current_branch(&worker.worktree)
+                    .is_ok_and(|branch| branch == worker.branch)
+                && phase3::git_value(
+                    &worker.worktree,
+                    &["rev-parse", &format!("refs/heads/{}", worker.branch)],
+                )
+                .await
+                .ok()
+                .is_some_and(|branch_tip| branch_tip.trim() == tip.as_str());
+            if !on_branch {
+                return Err(
+                    "the worker checkout is not on its branch; refusing to merge".to_string()
+                );
+            }
+        }
         // The same light decision the review ran decides which evidence the
         // merge-time tip requires: a light review merges, and a tip that grew
         // past the light lane since the review needs the full evidence.

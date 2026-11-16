@@ -153,7 +153,9 @@ only the app.
   `<project>/.worktrees/pool-<n>` checkout, forked from the lead's current
   branch tip (not `main`). The branch name is unique per worker; provisioning
   fails loudly on a collision. `.worktrees/agent-<id8>` folders belong only to
-  workers dispatched before pool checkouts were introduced.
+  workers dispatched before pool checkouts were introduced. Cross-instance
+  reuse is coordinated with `.worktrees/pool-<n>.claim`: a fresh claim skips
+  that pool, while a claim older than ten minutes is stale and may be reclaimed.
 - **Executor surface.** Workers use a dedicated Mnemo2 executor prompt, not the
   original Mnemo workflow's read-only reviewer profile. They run with
   `ToolSelection::all()` minus `create_plan`, `update_plan`, `finish`,

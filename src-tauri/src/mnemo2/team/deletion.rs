@@ -1176,6 +1176,11 @@ impl TeamRuntime {
         let other_worktrees = self.other_held_checkouts(&worker.id).await;
         let canonical = match validated_checkout(&self.workspace_root, worker, &other_worktrees)? {
             Some(CheckoutKind::Pool(canonical)) => {
+                if !checkout_is_registered(&self.workspace_root, &canonical).await? {
+                    // An unregistered folder is not this record's worktree.
+                    // Leave it untouched and never let Git walk up to the lead.
+                    return Ok(());
+                }
                 return discard_and_release_pool_checkout(
                     self.workspace_root.clone(),
                     canonical,

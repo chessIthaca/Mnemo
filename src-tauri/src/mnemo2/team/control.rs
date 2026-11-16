@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mnemo::route_question;
-use mnemo::app::worktrees::current_branch;
+use mnemo::app::worktrees::{current_branch, ensure_pool_checkout_registered};
 use mnemo::headless::{SessionCommand, Transcript};
 use mnemo::headless::session::ModelSwitch;
 use tokio::sync::Mutex;
@@ -838,14 +838,19 @@ pub(super) async fn recover_worker(
         let detached_pool = match worker_checkout(root, worker) {
             Some(CheckoutKind::Pool(_)) => match validated_checkout(root, worker, other_worktrees) {
                 Ok(Some(CheckoutKind::Pool(canonical))) => {
-                    let detached = phase3::git_value(
+                    ensure_pool_checkout_registered(
+                        root.to_path_buf(),
+                        canonical.clone(),
+                    )
+                    .await
+                    .is_ok()
+                        && phase3::git_value(
                         &canonical,
                         &["rev-parse", "--abbrev-ref", "HEAD"],
                     )
                     .await
                     .ok()
-                    .is_some_and(|head| head.trim() == "HEAD");
-                    detached
+                    .is_some_and(|head| head.trim() == "HEAD")
                         && phase3::git_value(
                             &canonical,
                             &["status", "--porcelain", "-uall"],

@@ -3,7 +3,8 @@ use super::*;
 use std::collections::VecDeque;
 
 use mnemo::app::worktrees::{
-    agent_branch, agent_short_id, provision_agent_worktree, release_pool_checkout,
+    agent_branch, agent_short_id, discard_and_release_pool_checkout, provision_agent_worktree,
+    release_pool_checkout,
 };
 use mnemo::headless::{GateVerdict, Transcript};
 use mnemo::SerializableAgentEvent;
@@ -10623,5 +10624,112 @@ async fn retry_save_failure_is_best_effort_for_the_merge_caller() {
         .find(|worker| worker.id == stale.id)
         .expect("stale worker on disk");
     assert_eq!(saved_stale.worktree, pool, "the injected save really failed");
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn an_unregistered_pool_is_left_alone_and_never_touches_the_lead_edit() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let pool = root.path().join(".worktrees/pool-1");
+    std::fs::create_dir_all(&pool).expect("plain unregistered pool");
+    std::fs::write(pool.join("marker.txt"), "keep\n").expect("pool marker");
+    let mut failed = worker(root.path(), "unregpool01");
+    failed.worktree = pool.clone();
+    failed.status = WorkerStatus::Failed;
+    run_git(root.path(), &["branch", &failed.branch]);
+    std::fs::write(root.path().join("README.md"), "uncommitted lead edit\n")
+        .expect("lead edit");
+    let team = open_test_team(root.path(), state.path(), vec![failed.clone()]).await;
+
+    let preview = team
+        .deletion_preview(std::slice::from_ref(&failed.id))
+        .await
+        .expect("unregistered pool preview");
+    assert!(preview[0].blocked.is_none());
+    assert!(preview[0].pool && preview[0].checkout);
+    let release = release_pool_checkout(
+        root.path().to_path_buf(),
+        pool.clone(),
+        failed.branch.clone(),
+    )
+    .await
+    .expect_err("unregistered release refuses");
+    assert!(release.contains("registered"), "{release}");
+    let discard = discard_and_release_pool_checkout(
+        root.path().to_path_buf(),
+        pool.clone(),
+        failed.branch.clone(),
+    )
+    .await
+    .expect_err("unregistered discard refuses");
+    assert!(discard.contains("registered"), "{discard}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("README.md")).expect("lead edit survives"),
+        "uncommitted lead edit\n"
+    );
+
+    let outcome = team
+        .delete_workers(std::slice::from_ref(&failed.id), true)
+        .await
+        .expect("delete unregistered pool record");
+    assert!(outcome.results[0].error.is_none());
+    assert!(team.worker(&failed.id).await.is_err());
+    assert!(!branch_exists(root.path(), &failed.branch).await);
+    assert_eq!(
+        std::fs::read_to_string(pool.join("marker.txt")).expect("unregistered folder remains"),
+        "keep\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("README.md")).expect("lead edit remains"),
+        "uncommitted lead edit\n"
+    );
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn a_detached_pool_behind_its_branch_refuses_to_merge() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let worker = provision_pool_worker(&team, "mergeguard1").await;
+    make_worker_reviewable(&team, &worker).await;
+    let reviewed_tip = phase3::tip(&worker.worktree).await.expect("reviewed tip A");
+    std::fs::write(worker.worktree.join("branch-b.txt"), "B\n").expect("branch B change");
+    run_git(&worker.worktree, &["add", "branch-b.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "branch advances to B"]);
+    let branch_tip = phase3::tip(&worker.worktree).await.expect("branch tip B");
+    assert_ne!(reviewed_tip, branch_tip);
+    run_git(
+        &worker.worktree,
+        &["switch", "--detach", &reviewed_tip],
+    );
+    let lead_tip = phase3::tip(root.path()).await.expect("lead tip before refusal");
+
+    let error = team.merge(&worker.id).await.expect_err("detached A cannot merge B");
+
+    assert_eq!(
+        error,
+        "the worker checkout is not on its branch; refusing to merge"
+    );
+    assert_eq!(
+        phase3::tip(root.path()).await.expect("lead tip after refusal"),
+        lead_tip
+    );
+    assert_eq!(
+        team.worker(&worker.id).await.expect("worker after refusal").status,
+        WorkerStatus::InReview
+    );
+    assert_eq!(
+        phase3::git_value(root.path(), &["rev-parse", &worker.branch])
+            .await
+            .expect("branch tip after refusal"),
+        branch_tip
+    );
     team.shutdown().await;
 }

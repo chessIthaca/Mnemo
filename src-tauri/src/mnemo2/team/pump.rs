@@ -7,7 +7,7 @@
 //! releases a finished audit.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,6 +18,7 @@ use mnemo::headless::{
     SessionId, Transcript,
 };
 use mnemo::tool::ToolResult;
+use mnemo::tool::agent::shell::validated_check_command;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast};
 
@@ -27,12 +28,14 @@ use crate::mnemo2::pricing::usage_model_key;
 use crate::mnemo2::runtime::LeadModel;
 use crate::mnemo2::usage::{ProjectUsage, event_session};
 
-use super::{BoardSignal, LiveWorker, TeamEvent, TeamMessage};
+use super::{BoardSignal, LiveWorker, TeamEvent, TeamMessage, now_key};
 use super::escalation::{AutoEscalation, auto_escalate_idle};
 use super::nudge::{StrikeNudges, note_tool_outcome, try_strike_nudge};
 use super::persistence::{LEDGER_FLUSH_DELAY, PersistedTeam, TeamPersistence};
-use super::record::{WorkerRecord, WorkerStatus, kickoff_message};
-use super::review::clear_review_for_a_newer_tip;
+use super::record::{
+    InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox, kickoff_message,
+};
+use super::review::{CheckRecorder, clear_review_for_a_newer_tip};
 use super::routing::{logs_label, outcome_row};
 
 /// The plan coordinate a worker may read: its own plan, or for an audit the
@@ -54,6 +57,13 @@ async fn worker_plan_stamp(
 
 /// Handle a worker's host-tool call (`message_parent`, `plan_read`) and return
 /// its result.
+///
+/// `plan_read` with no `capability` returns the worker's current plan view.
+/// With `capability`, it returns that OpenSpec capability's spec; a capability
+/// name that is not one of [`PlanBoard::capability_names`] is an error naming
+/// the real capabilities, because a success answer ("No current spec for …")
+/// reads as "nothing to see" and sends the worker back to re-reading invented
+/// names instead of its plan.
 pub(super) async fn worker_host_tool_result(
     messages: &Arc<Mutex<Vec<TeamMessage>>>,
     worker_id: &str,
@@ -72,9 +82,17 @@ pub(super) async fn worker_host_tool_result(
             };
             return match board.capability_spec(capability) {
                 Ok(Some(text)) => ToolResult::success(text),
-                Ok(None) => {
-                    ToolResult::success(format!("No current spec for '{capability}' yet."))
-                }
+                Ok(None) => match board.capability_names() {
+                    // A real capability folder whose spec.md does not exist
+                    // yet keeps a success answer, now pointing back at the plan.
+                    Ok(names) if names.iter().any(|name| name == capability) => {
+                        ToolResult::success(format!(
+                            "No current spec for '{capability}' yet. To re-read your plan, call plan_read with no arguments."
+                        ))
+                    }
+                    Ok(names) => ToolResult::error(unknown_capability_error(capability, &names)),
+                    Err(error) => ToolResult::error(error),
+                },
                 Err(error) => ToolResult::error(error),
             };
         }
@@ -106,6 +124,20 @@ pub(super) async fn worker_host_tool_result(
     )
 }
 
+/// The error a `plan_read` capability that names no OpenSpec capability gets:
+/// it lists the real capabilities (or "none") and sends the worker back to its
+/// plan, so an invented name cannot read as "there is nothing to read".
+fn unknown_capability_error(capability: &str, known: &[String]) -> String {
+    let list = if known.is_empty() {
+        "none".to_string()
+    } else {
+        known.join(", ")
+    };
+    format!(
+        "There is no OpenSpec capability named '{capability}'. Known capabilities: {list}. To re-read your plan, call plan_read with no arguments."
+    )
+}
+
 /// The result a repeated `message_parent` report gets (plan 9a6cffc1):
 /// the first report already reached the lead, so this copy is neither
 /// recorded nor forwarded. It names the required next action — end the
@@ -129,6 +161,107 @@ async fn send_worker_host_result(
             })
             .await;
     }
+}
+
+/// Record an audit's final assistant text as its report (bug 2026-11-16):
+/// the `TeamMessage` a `message_parent` call records, the forwarded call the
+/// lead's "<name> reports: …" notice comes from, and `report_delivered` on
+/// the record — so the caller releases the audit in the same pass. Returns
+/// whether the record was marked, i.e. whether the audit may be released.
+async fn deliver_plain_text_report(
+    messages: &Arc<Mutex<Vec<TeamMessage>>>,
+    worker_id: &str,
+    generation: u64,
+    session_id: SessionId,
+    text: &str,
+    events: &broadcast::Sender<TeamEvent>,
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+) -> bool {
+    let args = serde_json::json!({ "text": text });
+    let _ = worker_host_tool_result(messages, worker_id, "message_parent", &args, None, None).await;
+    // The same forwarded call a worker's own message_parent makes: the
+    // runtime turns it into the lead's report notice.
+    let _ = events.send(TeamEvent {
+        worker_id: worker_id.to_string(),
+        generation,
+        event: SessionEvent {
+            agent: session_id.agent_id(),
+            event: SerializableAgentEvent::HostToolCall {
+                call_id: format!("{worker_id}:{generation}:plain-text-report"),
+                name: "message_parent".to_string(),
+                args,
+            },
+            rates: None,
+        },
+    });
+    let mut records = records.lock().await;
+    let Some(worker) = records.iter_mut().find(|worker| {
+        worker.id == worker_id && (worker.generation == 0 || worker.generation == generation)
+    }) else {
+        return false;
+    };
+    worker.report_delivered = true;
+    true
+}
+
+/// Ask an audit that ended its turn with no text for its report (bug
+/// 2026-11-16): one automatic host message, delivered like any other message
+/// — an inbox receipt plus the prompt that starts a new turn — so the audit
+/// stays live and available to answer. Returns whether the ask was sent.
+async fn ask_audit_for_its_report(
+    engine: &Arc<Engine>,
+    session_id: SessionId,
+    worker_id: &str,
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    busy: &Arc<AtomicBool>,
+) -> bool {
+    let ask = "Your audit report did not reach the lead. Send your complete findings with message_parent now, then end your turn.";
+    let Some(session) = engine.session(&session_id).await else {
+        return false;
+    };
+    {
+        let mut records = records.lock().await;
+        let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
+            return false;
+        };
+        append_inbox(
+            worker,
+            InboxEntry {
+                sender: MessageSender::Mnemo,
+                kind: InboxKind::Prompt,
+                text: ask.to_string(),
+                at_ms: now_key(),
+            },
+        );
+        worker.status = WorkerStatus::Working;
+        worker.pending = None;
+        worker.error = None;
+    }
+    busy.store(true, Ordering::SeqCst);
+    let text = format!("{}\n{ask}", MessageSender::Mnemo.header());
+    if session
+        .send(SessionCommand::Prompt {
+            text,
+            images: Vec::new(),
+        })
+        .await
+        .is_err()
+    {
+        // The ask never reached the session: put the finished status back, so
+        // the silent audit reads finished instead of running a turn that does
+        // not exist.
+        busy.store(false, Ordering::SeqCst);
+        if let Some(worker) = records
+            .lock()
+            .await
+            .iter_mut()
+            .find(|worker| worker.id == worker_id)
+        {
+            worker.status = WorkerStatus::Completed;
+        }
+        return false;
+    }
+    true
 }
 
 pub(super) fn snapshot_model(snapshot: &mnemo::headless::SessionSnapshot) -> Option<String> {
@@ -201,6 +334,64 @@ async fn worker_lacks_model_id(
         .is_some_and(|worker| worker.model_id.is_none())
 }
 
+/// Return an allow-listed passing shell command and its unchanged tree.
+pub(super) fn counted_check(
+    tool: &str,
+    args: &Value,
+    result: &ToolResult,
+    checkout: &Path,
+    check_commands: &[String],
+) -> Option<(String, String)> {
+    if tool != "shell" || !result.success {
+        return None;
+    }
+    let data = result.data.as_ref()?;
+    if data.get("exit_code")?.as_i64()? != 0 {
+        return None;
+    }
+    let command = validated_check_command(args.get("command")?.as_str()?)?;
+    if !check_commands.iter().any(|allowed| allowed == command) {
+        return None;
+    }
+    let checkout = checkout.canonicalize().ok()?;
+    if let Some(cwd) = args.get("cwd") {
+        let cwd = cwd.as_str()?.trim();
+        if !cwd.is_empty() {
+            let cwd = Path::new(cwd);
+            let cwd = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                checkout.join(cwd)
+            };
+            if cwd.canonicalize().ok()? != checkout {
+                return None;
+            }
+        }
+    }
+    let tree_before = data.get("tree_before")?.as_str()?;
+    let tree_after = data.get("tree_after")?.as_str()?;
+    if tree_before.is_empty() || tree_before != tree_after {
+        return None;
+    }
+    Some((command.to_string(), tree_before.to_string()))
+}
+
+async fn record_turn_checks(
+    worker_id: &str,
+    generation: u64,
+    observations: &mut HashMap<String, String>,
+    ledger: &PumpLedger,
+) {
+    CheckRecorder::new(
+        &ledger.records,
+        &ledger.usage,
+        &ledger.save_lock,
+        &ledger.persistence,
+    )
+    .record_worker_checks(&ledger.merge_lock, worker_id, generation, observations)
+    .await;
+}
+
 /// Forward one worker session's events, update its durable record, and refresh
 /// the transcript when the turn ends.
 /// How long a steered turn end waits for its follow-up turn before it counts
@@ -226,6 +417,8 @@ pub(super) async fn pump_worker(
     usage: Arc<Mutex<ProjectUsage>>,
     save_lock: Arc<Mutex<()>>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
+    merge_lock: Arc<Mutex<()>>,
+    check_commands: Arc<Vec<String>>,
     persistence: TeamPersistence,
     routing_log_path: PathBuf,
     routing: Arc<std::sync::RwLock<RoutingSettings>>,
@@ -257,6 +450,14 @@ pub(super) async fn pump_worker(
     let mut call_ids: HashMap<u32, String> = HashMap::new();
     let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut previous_signature: Option<String> = None;
+    let mut check_observations: HashMap<String, String> = HashMap::new();
+    let ledger = PumpLedger {
+        records: records.clone(),
+        usage: usage.clone(),
+        save_lock: save_lock.clone(),
+        persistence: persistence.clone(),
+        merge_lock,
+    };
     // The report streak (plan 9a6cffc1): consecutive `message_parent`
     // calls with no other tool call in between, within one worker turn.
     // The 2nd report in a row is refused — not recorded, no lead notice
@@ -264,6 +465,14 @@ pub(super) async fn pump_worker(
     // Any other tool call resets it, except `memory_*` calls; a new turn
     // (`Started`) starts it over.
     let mut report_streak: usize = 0;
+    // The audit turn already answered with the automatic "send your report"
+    // ask (bug 2026-11-16): one ask per turn, never a second for the same
+    // turn's finish.
+    let mut silent_audit_asked_turn: Option<u32> = None;
+    // The assistant text streamed in the worker's current turn (bug
+    // 2026-11-16): an audit's silent plain-text end is decided on this, never
+    // on the transcript, whose repaired empty turn reads "(no output)".
+    let mut turn_text = String::new();
     loop {
         // While a steered turn end waits for its follow-up, the receive is
         // bounded by an absolute deadline: the bus is engine-wide, so another
@@ -312,6 +521,15 @@ pub(super) async fn pump_worker(
                         continue;
                     }
                     busy.store(false, Ordering::SeqCst);
+                    if held.is_some() {
+                        record_turn_checks(
+                            &worker_id,
+                            generation,
+                            &mut check_observations,
+                            &ledger,
+                        )
+                        .await;
+                    }
                     if completed {
                         let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
                     }
@@ -350,6 +568,8 @@ pub(super) async fn pump_worker(
             follow_up_deadline = None;
             held_finished = None;
             report_streak = 0;
+            check_observations.clear();
+            turn_text.clear();
         }
         // A suppressed repeated report (plan 9a6cffc1): answered with
         // [`REPEATED_REPORT_REFUSED`] below, and kept so the TeamEvent
@@ -446,12 +666,21 @@ pub(super) async fn pump_worker(
         // The cost alert this event owes the lead (plan 06f1a204): filled
         // inside the record block below, sent once that lock is released.
         let mut cost_notice: Option<(String, String)> = None;
+        // The audit turn that ended with no message_parent report (bug
+        // 2026-11-16): its final assistant text is delivered as the report
+        // once the record block below releases its lock, before the turn's
+        // Finished event is forwarded.
+        let mut plain_text_audit_turn: Option<u32> = None;
         // The finished tool call this event (if any) carries, captured beside
         // the strike counter so the record block below can fold it into the
         // worker's current failing streak.
         let mut tool_outcome: Option<(String, bool, String)> = None;
         match &event.event {
             SerializableAgentEvent::ToolCallStart { index, id, name } => {
+                // The text collected so far belongs to the assistant message
+                // that calls this tool, not to the turn's last message (bug
+                // 2026-11-16): the audit report fallback keeps the last one.
+                turn_text.clear();
                 // A provider may supersede an unexecuted call at the same
                 // index; drop the old entry so the buffers stay bounded.
                 if let Some(superseded) = call_ids.insert(*index, id.clone()) {
@@ -486,7 +715,35 @@ pub(super) async fn pump_worker(
                         strike_fired = Some(repeated);
                     }
                     tool_outcome = Some((name.clone(), result.success, result.output.clone()));
+                    let checkout = {
+                        let records = records.lock().await;
+                        records
+                            .iter()
+                            .find(|worker| {
+                                worker.id == worker_id
+                                    && (worker.generation == 0
+                                        || worker.generation == generation)
+                            })
+                            .map(|worker| worker.worktree.clone())
+                    };
+                    if let Some(checkout) = checkout {
+                        if let Some((check, tree)) = counted_check(
+                            &name,
+                            &parsed,
+                            result,
+                            &checkout,
+                            check_commands.as_slice(),
+                        ) {
+                            check_observations.insert(check, tree);
+                        }
+                    }
                 }
+            }
+            // The audit report fallback (bug 2026-11-16) reads the turn's
+            // streamed assistant text, not the transcript: a silent turn's
+            // repaired history reads "(no output)" instead of empty.
+            SerializableAgentEvent::TextDelta { text } => {
+                turn_text.push_str(text);
             }
             _ => {}
         }
@@ -763,6 +1020,18 @@ pub(super) async fn pump_worker(
                             worker.status = WorkerStatus::Completed;
                             worker.turns = worker.turns.saturating_add(1);
                         }
+                        // An audit that ended its turn without calling
+                        // message_parent keeps its findings as the turn's
+                        // final assistant text (bug 2026-11-16): remember
+                        // the turn, so that text is delivered as its report
+                        // — or the audit is asked for the report — once this
+                        // record block releases its lock.
+                        if worker.kind == "audit"
+                            && !worker.report_delivered
+                            && matches!(worker.status, WorkerStatus::Completed)
+                        {
+                            plain_text_audit_turn = Some(worker.turns);
+                        }
                         // An audit that reported ends its own job: its
                         // session is released below so it stops holding a
                         // worker slot. A turn that ended without a report
@@ -908,6 +1177,50 @@ pub(super) async fn pump_worker(
                 }
             }
         }
+        // An audit that ended its turn without a message_parent report (bug
+        // 2026-11-16): its findings are the turn's final assistant text.
+        // Deliver that text exactly as a report — the recorded TeamMessage,
+        // the call the lead's "<name> reports: …" notice comes from, and
+        // `report_delivered` — before the turn's Finished event below is
+        // forwarded, so the lead reads the report before the adjudication
+        // notice and the released audit frees its slot in this same pass.
+        // Text that is empty after trimming has nothing to deliver: the
+        // audit is asked for its report, once, and keeps its session.
+        if let Some(turn) = plain_text_audit_turn {
+            let text = turn_text.trim().to_string();
+            if text.is_empty() {
+                // One ask per audit session: the ask itself starts a new
+                // turn, so a per-turn guard would ask a silent audit forever.
+                if silent_audit_asked_turn.is_none()
+                    && ask_audit_for_its_report(&engine, session_id, &worker_id, &records, &busy)
+                        .await
+                {
+                    silent_audit_asked_turn = Some(turn);
+                }
+            } else {
+                audit_release = deliver_plain_text_report(
+                    &messages,
+                    &worker_id,
+                    generation,
+                    session_id,
+                    &text,
+                    &events,
+                    &records,
+                )
+                .await;
+            }
+        }
+        if (terminal && matches!(&event.event, SerializableAgentEvent::Finished { .. }))
+            || settled_parked_finish.is_some()
+        {
+            record_turn_checks(
+                &worker_id,
+                generation,
+                &mut check_observations,
+                &ledger,
+            )
+            .await;
+        }
         // A suppressed repeated report is not forwarded (plan 9a6cffc1):
         // no TeamEvent means the runtime never turns it into a lead
         // notice — the pump is the single source of truth for the
@@ -944,12 +1257,7 @@ pub(super) async fn pump_worker(
                 &worker_id,
                 generation,
                 &live,
-                PumpLedger {
-                    records: records.clone(),
-                    usage: usage.clone(),
-                    save_lock: save_lock.clone(),
-                    persistence,
-                },
+                ledger.clone(),
                 &fail_next_close,
             )
             .await;
@@ -1077,11 +1385,13 @@ pub(super) async fn close_worker_session(
 /// The shared ledger handles a worker pump holds: the record store plus
 /// everything [`save_workers`] needs. [`release_finished_audit`] takes
 /// them as one group because the pump hands them over on its way out.
+#[derive(Clone)]
 struct PumpLedger {
     records: Arc<Mutex<Vec<WorkerRecord>>>,
     usage: Arc<Mutex<ProjectUsage>>,
     save_lock: Arc<Mutex<()>>,
     persistence: TeamPersistence,
+    merge_lock: Arc<Mutex<()>>,
 }
 
 /// End a finished audit's live session from inside its own pump (plan

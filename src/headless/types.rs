@@ -118,6 +118,9 @@ pub struct SpawnOptions {
     pub reasoning_effort: Option<String>,
     /// A worktree binding (the agent's root override).
     pub worktree: Option<PathBuf>,
+    /// Exact shell commands whose before/after trees certify worker checks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_commands: Vec<String>,
     /// A per-session permission override of the engine default (§5.4).
     pub permissions: Option<PermissionPolicy>,
     /// A registered policy name (§5.9.6 tier 1 — the app passes

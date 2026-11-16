@@ -216,7 +216,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_merge".to_string(),
-                description: "Merge one reviewed worker only after exact-tip checks and findings close; never targets main and never pushes. After a clean merge Mnemo2 closes the worker's session, removes its checkout and deletes its branch (a safe delete: a branch that is not fully merged is kept), so never delete worker branches yourself; the merge commit keeps the worker's tip as its second parent.".to_string(),
+                description: "Merge one reviewed worker only after exact-tip checks and findings close; never targets main and never pushes. After a clean merge Mnemo2 closes the worker's session, releases its checkout (legacy folders are removed; pool folders stay detached for reuse) and deletes its branch (a safe delete: a branch that is not fully merged is kept), so never delete worker branches yourself; the merge commit keeps the worker's tip as its second parent.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(120_000),
@@ -255,8 +255,8 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "plan_read".to_string(),
-                description: "Re-read your plan as it stands now (decisions and interfaces the lead added after you started), or with capability, that capability's current OpenSpec spec.".to_string(),
-                parameters: json!({"type":"object","properties":{"capability":{"type":"string","description":"Optional kebab-case capability name, e.g. tier-ladder"}}}),
+                description: "Re-read your plan as it stands now, including decisions and interfaces the lead added after you started: call it with no arguments. Pass `capability` only to read one OpenSpec capability's current spec (the folder names under .coding/openspec/specs, e.g. tier-ladder).".to_string(),
+                parameters: json!({"type":"object","properties":{"capability":{"type":"string","description":"Only to read an OpenSpec capability's spec instead of your plan; omit it to read your plan."}}}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },

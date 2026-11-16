@@ -9,16 +9,18 @@
 //!
 //! The plugin's files are compiled into the app (`include_str!`), so every
 //! start writes `<config>/claude-plugin/` as a ready local marketplace:
-//! `.claude-plugin/marketplace.json` names the marketplace `mnemo` and points
-//! at `./plugin`, which holds the plugin itself plus the `mnemo2-mcp` helper
-//! its MCP server and hooks run. The helper is copied from beside the running
-//! app, so an installed Mnemo2 carries it without a source build. The copy
-//! keeps the source's mtime, which is what the helper's delegate rule reads:
-//! a copy that is not older than another one takes over from it.
+//! `.claude-plugin/marketplace.json` names the marketplace `mnemo` and lists
+//! two plugins: `mnemo` from `./plugin`, which holds the plugin itself plus
+//! the `mnemo2-mcp` helper its MCP server and hooks run, and `mnemo-workers`
+//! from `./mnemo-workers`, the Claude Desktop mod that shows the running
+//! workers above the prompt in its Code tab. The helper is copied from beside
+//! the running app, so an installed Mnemo2 carries it without a source build.
+//! The copy keeps the source's mtime, which is what the helper's delegate
+//! rule reads: a copy that is not older than another one takes over from it.
 //!
 //! The Settings → Claude Code page (step 3 of the plan) calls
 //! [`claude_code_status`] for the snapshot and [`claude_code_connect`] to
-//! register the marketplace and install the plugin through the `claude` CLI.
+//! register the marketplace and install the plugins through the `claude` CLI.
 //! A `mnemo` marketplace that points at a source checkout is left alone:
 //! developers keep their own.
 
@@ -65,8 +67,37 @@ const PLUGIN_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The local marketplace Claude Code registers: one plugin, `mnemo`, sourced
-/// from the `plugin/` folder written beside this file.
+/// The mnemo-workers mod's shipped files compiled into the app: (path
+/// inside the mod folder, text). The mod's tests are not shipped, so they
+/// stay out.
+const WORKERS_MOD_FILES: &[(&str, &str)] = &[
+    (
+        ".claude-plugin/plugin.json",
+        include_str!(
+            "../../../mnemo2/claude-desktop-mod/mnemo-workers/.claude-plugin/plugin.json"
+        ),
+    ),
+    (
+        "hooks/hooks.json",
+        include_str!("../../../mnemo2/claude-desktop-mod/mnemo-workers/hooks/hooks.json"),
+    ),
+    (
+        "hooks/register.tsx",
+        include_str!("../../../mnemo2/claude-desktop-mod/mnemo-workers/hooks/register.tsx"),
+    ),
+    (
+        "types/index.d.ts",
+        include_str!("../../../mnemo2/claude-desktop-mod/mnemo-workers/types/index.d.ts"),
+    ),
+    (
+        "README.md",
+        include_str!("../../../mnemo2/claude-desktop-mod/mnemo-workers/README.md"),
+    ),
+];
+
+/// The local marketplace Claude Code registers: two plugins, `mnemo` and
+/// `mnemo-workers`, sourced from the `plugin/` and `mnemo-workers/` folders
+/// written beside this file.
 const MARKETPLACE_JSON: &str = r#"{
   "name": "mnemo",
   "owner": {
@@ -80,6 +111,11 @@ const MARKETPLACE_JSON: &str = r#"{
       "name": "mnemo",
       "source": "./plugin",
       "description": "Lead a Mnemo2 team from Claude Code: plan, dispatch workers by tier, review and merge through Mnemo2's team tools."
+    },
+    {
+      "name": "mnemo-workers",
+      "source": "./mnemo-workers",
+      "description": "Shows the running Mnemo2 workers and their models above the prompt in Claude Desktop's Code tab; click a worker to open it in mission control."
     }
   ]
 }
@@ -203,8 +239,8 @@ pub(crate) struct InstallReport {
     pub helper_updated: bool,
 }
 
-/// Write the embedded plugin as a ready local marketplace and install the
-/// running app's sibling helper beside it and in `<config>/bin`.
+/// Write the embedded plugin and mod as a ready local marketplace and
+/// install the running app's sibling helper beside it and in `<config>/bin`.
 ///
 /// Files are written only when they differ, so a second start writes nothing.
 /// Both helper folders are attempted even when one fails (a running helper can
@@ -221,6 +257,12 @@ pub(crate) fn install_bundled(
     let plugin_root = root.join("plugin");
     for (relative, contents) in PLUGIN_FILES {
         let path = plugin_root.join(relative);
+        write_if_changed(&path, contents)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    }
+    let mod_root = root.join("mnemo-workers");
+    for (relative, contents) in WORKERS_MOD_FILES {
+        let path = mod_root.join(relative);
         write_if_changed(&path, contents)
             .map_err(|error| format!("could not write {}: {error}", path.display()))?;
     }
@@ -337,6 +379,8 @@ pub struct ClaudeCodeStatus {
     pub plugin_installed: bool,
     /// The installed plugin's version, when Claude Code reports one.
     pub plugin_version: Option<String>,
+    /// Whether `mnemo-workers@mnemo` is installed.
+    pub workers_installed: bool,
     /// The CLI call that failed, when one did; the rest keep their defaults.
     pub error: Option<String>,
 }
@@ -426,15 +470,15 @@ fn normalized_dir(path: &Path) -> String {
     }
 }
 
-/// What Claude Code's `plugin list --json` says about `mnemo@mnemo`.
-fn plugin_state(list_json: &str) -> Result<(bool, Option<String>), String> {
+/// What Claude Code's `plugin list --json` says about one plugin id.
+fn plugin_state(list_json: &str, id: &str) -> Result<(bool, Option<String>), String> {
     let list: serde_json::Value = serde_json::from_str(list_json)
         .map_err(|error| format!("unreadable plugin list: {error}"))?;
     let entries = list
         .as_array()
         .ok_or_else(|| "the plugin list is not an array".to_string())?;
     for entry in entries {
-        if entry.get("id").and_then(|id| id.as_str()) != Some("mnemo@mnemo") {
+        if entry.get("id").and_then(|found| found.as_str()) != Some(id) {
             continue;
         }
         let version = entry
@@ -453,6 +497,7 @@ fn plugin_state(list_json: &str) -> Result<(bool, Option<String>), String> {
 fn connect_plan(
     marketplace: MarketplaceState,
     plugin_installed: bool,
+    workers_installed: bool,
     plugin_dir: &Path,
 ) -> Vec<Vec<String>> {
     let mut plan = Vec::new();
@@ -466,12 +511,18 @@ fn connect_plan(
             plan.push(args(&["plugin", "marketplace", "update", "mnemo"]));
         }
     }
-    if plugin_installed {
-        plan.push(args(&["plugin", "update", "mnemo@mnemo"]));
-    } else {
-        plan.push(args(&["plugin", "install", "mnemo@mnemo"]));
-    }
+    plan.push(install_or_update(plugin_installed, "mnemo@mnemo"));
+    plan.push(install_or_update(workers_installed, "mnemo-workers@mnemo"));
     plan
+}
+
+/// The `claude` command that installs or updates one plugin id.
+fn install_or_update(installed: bool, id: &str) -> Vec<String> {
+    if installed {
+        args(&["plugin", "update", id])
+    } else {
+        args(&["plugin", "install", id])
+    }
 }
 
 /// A `claude` argument list as owned strings, for [`run_claude`].
@@ -557,6 +608,7 @@ async fn status_with(config_dir: &Path, cli: Option<PathBuf>) -> ClaudeCodeStatu
         marketplace_path: None,
         plugin_installed: false,
         plugin_version: None,
+        workers_installed: false,
         error: None,
     };
     let Some(cli) = cli else {
@@ -576,11 +628,19 @@ async fn status_with(config_dir: &Path, cli: Option<PathBuf>) -> ClaudeCodeStatu
     }
     let plugins = run_claude(&cli, &args(&["plugin", "list", "--json"])).await;
     if plugins.ok {
-        match plugin_state(&plugins.output) {
+        match plugin_state(&plugins.output, "mnemo@mnemo") {
             Ok((installed, version)) => {
                 status.plugin_installed = installed;
                 status.plugin_version = version;
             }
+            Err(reason) => {
+                status
+                    .error
+                    .get_or_insert_with(|| format!("{}: {reason}", plugins.command));
+            }
+        }
+        match plugin_state(&plugins.output, "mnemo-workers@mnemo") {
+            Ok((installed, _)) => status.workers_installed = installed,
             Err(reason) => {
                 status
                     .error
@@ -595,7 +655,8 @@ async fn status_with(config_dir: &Path, cli: Option<PathBuf>) -> ClaudeCodeStatu
     status
 }
 
-/// Register the local marketplace and install (or update) the `mnemo` plugin.
+/// Register the local marketplace and install (or update) the `mnemo` and
+/// `mnemo-workers` plugins.
 ///
 /// A marketplace named `mnemo` that points at another folder is a developer's
 /// source checkout: Connect leaves it untouched and says so. A missing helper
@@ -631,7 +692,12 @@ async fn connect_with(config_dir: &Path, cli: &Path) -> ClaudeConnectResult {
         };
     }
     let mut steps = Vec::new();
-    for args in connect_plan(status.marketplace, status.plugin_installed, &root) {
+    for args in connect_plan(
+        status.marketplace,
+        status.plugin_installed,
+        status.workers_installed,
+        &root,
+    ) {
         let step = run_claude(cli, &args).await;
         let failed = (!step.ok).then(|| step.command.clone());
         steps.push(step);
@@ -695,12 +761,20 @@ mod tests {
                 .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
             assert_eq!(&written, contents, "{} differs", path.display());
         }
+        for (relative, contents) in WORKERS_MOD_FILES {
+            let path = root.join("mnemo-workers").join(relative);
+            let written = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            assert_eq!(&written, contents, "{} differs", path.display());
+        }
         let marketplace =
             std::fs::read_to_string(root.join(".claude-plugin").join("marketplace.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&marketplace).unwrap();
         assert_eq!(parsed["name"], "mnemo");
         assert_eq!(parsed["plugins"][0]["name"], "mnemo");
         assert_eq!(parsed["plugins"][0]["source"], "./plugin");
+        assert_eq!(parsed["plugins"][1]["name"], "mnemo-workers");
+        assert_eq!(parsed["plugins"][1]["source"], "./mnemo-workers");
         assert_eq!(report.plugin_dir, root);
         assert!(!report.helper_found);
         assert!(!config.path().join("bin").exists());
@@ -795,6 +869,11 @@ mod tests {
             .iter()
             .map(|(relative, _)| root.join("plugin").join(relative))
             .collect();
+        watched.extend(
+            WORKERS_MOD_FILES
+                .iter()
+                .map(|(relative, _)| root.join("mnemo-workers").join(relative)),
+        );
         watched.push(root.join(".claude-plugin").join("marketplace.json"));
         let before: Vec<(PathBuf, Option<SystemTime>)> = watched
             .into_iter()
@@ -814,7 +893,7 @@ mod tests {
     fn embedded_plugin_covers_every_plugin_file() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mnemo2/plugin");
         let mut found = Vec::new();
-        walk_plugin(&root, Path::new(""), &mut found);
+        walk_shipped(&root, Path::new(""), "bin", &mut found);
         found.sort();
         let mut embedded: Vec<String> = PLUGIN_FILES
             .iter()
@@ -827,9 +906,28 @@ mod tests {
         );
     }
 
-    /// Every regular file under `dir`, relative with `/`; the top-level `bin`
-    /// folder holds an installed helper, not a plugin file.
-    fn walk_plugin(dir: &Path, prefix: &Path, found: &mut Vec<String>) {
+    #[test]
+    fn embedded_mod_covers_every_mod_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../mnemo2/claude-desktop-mod/mnemo-workers");
+        let mut found = Vec::new();
+        walk_shipped(&root, Path::new(""), "tests", &mut found);
+        found.sort();
+        let mut embedded: Vec<String> = WORKERS_MOD_FILES
+            .iter()
+            .map(|(relative, _)| (*relative).to_string())
+            .collect();
+        embedded.sort();
+        assert_eq!(
+            found, embedded,
+            "a file under mnemo-workers is missing from WORKERS_MOD_FILES"
+        );
+    }
+
+    /// Every regular file under `dir`, relative with `/`; the top-level
+    /// folder named `skip` stays out (an installed helper, the mod's tests —
+    /// nothing the app ships).
+    fn walk_shipped(dir: &Path, prefix: &Path, skip: &str, found: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -844,10 +942,10 @@ mod tests {
                 .unwrap_or_default();
             let relative = prefix.join(&name);
             if path.is_dir() {
-                if prefix.as_os_str().is_empty() && name == "bin" {
+                if prefix.as_os_str().is_empty() && name == skip {
                     continue;
                 }
-                walk_plugin(&path, &relative, found);
+                walk_shipped(&path, &relative, skip, found);
                 continue;
             }
             found.push(relative.to_string_lossy().replace('\\', "/"));
@@ -914,36 +1012,102 @@ mod tests {
 
     #[test]
     fn plugin_state_reads_the_list() {
+        let list = serde_json::json!([
+            {"id": "mnemo@mnemo", "version": "2.3.1"},
+            {"id": "mnemo-workers@mnemo", "version": "0.1.0"},
+            {"id": "other@elsewhere", "version": "1"},
+        ])
+        .to_string();
         assert_eq!(
-            plugin_state(r#"[{"id":"mnemo@mnemo","version":"2.3.1"}]"#),
+            plugin_state(&list, "mnemo@mnemo"),
             Ok((true, Some("2.3.1".to_string())))
         );
-        assert_eq!(plugin_state("[]"), Ok((false, None)));
         assert_eq!(
-            plugin_state(r#"[{"id":"other@elsewhere","version":"1"}]"#),
-            Ok((false, None))
+            plugin_state(&list, "mnemo-workers@mnemo"),
+            Ok((true, Some("0.1.0".to_string())))
         );
-        assert!(plugin_state("not json").is_err());
+        assert_eq!(plugin_state(&list, "missing@mnemo"), Ok((false, None)));
+        assert_eq!(plugin_state("[]", "mnemo@mnemo"), Ok((false, None)));
+        assert!(plugin_state("not json", "mnemo@mnemo").is_err());
     }
 
     #[test]
     fn connect_plan_adds_or_updates() {
         let dir = PathBuf::from("claude-plugin-dir");
         assert_eq!(
-            connect_plan(MarketplaceState::Missing, false, &dir),
+            connect_plan(MarketplaceState::Missing, false, false, &dir),
             vec![
                 args(&["plugin", "marketplace", "add", "claude-plugin-dir"]),
                 args(&["plugin", "install", "mnemo@mnemo"]),
+                args(&["plugin", "install", "mnemo-workers@mnemo"]),
             ]
         );
         assert_eq!(
-            connect_plan(MarketplaceState::Mnemo2, true, &dir),
+            connect_plan(MarketplaceState::Mnemo2, true, true, &dir),
             vec![
                 args(&["plugin", "marketplace", "update", "mnemo"]),
                 args(&["plugin", "update", "mnemo@mnemo"]),
+                args(&["plugin", "update", "mnemo-workers@mnemo"]),
             ]
         );
-        assert!(connect_plan(MarketplaceState::Other, true, &dir).is_empty());
-        assert!(connect_plan(MarketplaceState::Other, false, &dir).is_empty());
+        // Each plugin installs or updates on its own.
+        assert_eq!(
+            connect_plan(MarketplaceState::Missing, true, false, &dir),
+            vec![
+                args(&["plugin", "marketplace", "add", "claude-plugin-dir"]),
+                args(&["plugin", "update", "mnemo@mnemo"]),
+                args(&["plugin", "install", "mnemo-workers@mnemo"]),
+            ]
+        );
+        assert!(connect_plan(MarketplaceState::Other, true, true, &dir).is_empty());
+        assert!(connect_plan(MarketplaceState::Other, false, false, &dir).is_empty());
     }
+
+    #[test]
+    fn both_marketplaces_list_both_plugins_with_existing_sources() {
+        // The generated marketplace: a fresh install holds every folder its
+        // two plugin sources point at.
+        let config = tempfile::tempdir().unwrap();
+        let app = tempfile::tempdir().unwrap();
+        let exe = app.path().join("mnemo2");
+        install_bundled(config.path(), &exe).expect("install");
+        let root = plugin_dir(config.path());
+        let generated: serde_json::Value = serde_json::from_str(MARKETPLACE_JSON).unwrap();
+        let plugins = generated["plugins"].as_array().unwrap();
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(generated["plugins"][0]["name"], "mnemo");
+        assert_eq!(generated["plugins"][1]["name"], "mnemo-workers");
+        for plugin in plugins {
+            let name = plugin["name"].as_str().unwrap();
+            let source = plugin["source"].as_str().unwrap();
+            let dir = root.join(source.strip_prefix("./").unwrap_or(source));
+            assert!(
+                dir.is_dir(),
+                "{name}'s source {source} is missing under {}",
+                root.display()
+            );
+        }
+
+        // The repository's marketplace: every source folder exists in the
+        // checkout and holds a plugin manifest.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let text = std::fs::read_to_string(repo.join(".claude-plugin").join("marketplace.json"))
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let plugins = listed["plugins"].as_array().unwrap();
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(listed["plugins"][0]["name"], "mnemo");
+        assert_eq!(listed["plugins"][1]["name"], "mnemo-workers");
+        for plugin in plugins {
+            let name = plugin["name"].as_str().unwrap();
+            let source = plugin["source"].as_str().unwrap();
+            let dir = repo.join(source.strip_prefix("./").unwrap_or(source));
+            let manifest = dir.join(".claude-plugin").join("plugin.json");
+            assert!(
+                manifest.is_file(),
+                "{name}'s source {source} has no .claude-plugin/plugin.json"
+            );
+        }
+    }
+
 }

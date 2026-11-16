@@ -59,6 +59,7 @@ use crate::process_tree::KillOnCloseJob;
 use crate::provider::ToolSchema;
 use crate::tool::agent::read_files::truncate_to_boundary;
 use crate::tool::agent::sandbox::Sandbox;
+use crate::project::git_ops::content_tree;
 use crate::tool::agent::tool_contract;
 use crate::tool::{OutputSink, SafetyLevel, Tool, ToolCategory, ToolOutputStream, ToolResult};
 
@@ -332,6 +333,23 @@ struct ShellArgs {
     purpose: String,
 }
 
+/// Trim a safe worker check command for exact allow-list membership.
+///
+/// Internal whitespace is preserved. Control characters and shell chaining,
+/// piping, redirection, or substitution syntax make the command ineligible.
+pub fn validated_check_command(command: &str) -> Option<&str> {
+    if command.contains("$(")
+        || command.chars().any(|character| {
+            character.is_control()
+                || matches!(character, ';' | '|' | '&' | '>' | '<' | '`')
+        })
+    {
+        return None;
+    }
+    let command = command.trim();
+    (!command.is_empty()).then_some(command)
+}
+
 /// The `shell` tool.
 pub struct ShellTool {
     sandbox: Sandbox,
@@ -352,6 +370,8 @@ pub struct ShellTool {
     /// shared with every ShellTool, so a config save is observed on the next
     /// command without a registry rebuild. Defaults to all-off.
     optimizer: Arc<RwLock<OptimizerConfig>>,
+    /// Exact commands whose before/after content trees are measured.
+    check_commands: Vec<String>,
 }
 
 impl ShellTool {
@@ -363,6 +383,7 @@ impl ShellTool {
             filter_config: Arc::new(RwLock::new(ShellFilterConfig::default())),
             core_operations: Arc::new(RwLock::new(vec!["merge".to_string(), "push".to_string()])),
             optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
+            check_commands: Vec::new(),
         }
     }
 
@@ -379,6 +400,31 @@ impl ShellTool {
     pub fn with_filter_config(mut self, cfg: Arc<RwLock<ShellFilterConfig>>) -> Self {
         self.filter_config = cfg;
         self
+    }
+
+    /// Measure before/after trees only for these exact validated commands.
+    pub fn with_check_commands(mut self, commands: Vec<String>) -> Self {
+        self.check_commands = commands
+            .into_iter()
+            .filter_map(|command| validated_check_command(&command).map(str::to_string))
+            .collect();
+        self
+    }
+
+    fn measures_check(&self, command: &str, cwd: &Path) -> bool {
+        let Ok(root) = self.sandbox.root().canonicalize() else {
+            return false;
+        };
+        let Ok(cwd) = cwd.canonicalize() else {
+            return false;
+        };
+        if cwd != root {
+            return false;
+        }
+        let Some(command) = validated_check_command(command) else {
+            return false;
+        };
+        self.check_commands.iter().any(|allowed| allowed == command)
     }
 
     /// Wire the shared core-operation list (mirrors
@@ -557,6 +603,12 @@ impl Tool for ShellTool {
             cmd.process_group(0);
         }
 
+        let measure_tree = self.measures_check(&args.command, &cwd);
+        let tree_before = if measure_tree {
+            content_tree(&cwd).await.ok()
+        } else {
+            None
+        };
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("failed to execute command: {e}")),
@@ -644,6 +696,12 @@ impl Tool for ShellTool {
                 }
             };
 
+        let tree_after = if measure_tree {
+            content_tree(&cwd).await.ok()
+        } else {
+            None
+        };
+
         // Join both readers BEFORE returning the result, so on this path every
         // delta lands on the fan-in channel ahead of the ToolResult (same FIFO
         // channel). That ordering is a property of a call that COMPLETES here: a
@@ -708,10 +766,20 @@ impl Tool for ShellTool {
                 } else {
                     (raw_stdout.clone(), raw_stderr.clone())
                 };
+                // Plan 75b41222: stderr LEADS the model-facing text. Both
+                // lossy surfaces downstream — cap_tool_output (keeps the
+                // first 100 KiB) and the archive preview (keeps a 1,500-char
+                // head) — preserve the FRONT, so an error after a long
+                // stdout was the first thing cut and the agent had to
+                // expand the archive just to find it. A clean run (empty
+                // stderr) keeps the exact pre-change shape; the `[stdout]`
+                // label rides only when stdout has something to show.
                 let mut combined = if stderr.is_empty() {
                     stdout.clone()
+                } else if stdout.is_empty() {
+                    format!("[stderr]\n{stderr}")
                 } else {
-                    format!("{stdout}\n[stderr]\n{stderr}")
+                    format!("[stderr]\n{stderr}\n[stdout]\n{stdout}")
                 };
                 // Token-optimizer lever 2 (backlog e4a50d22): semantic
                 // command-output compression. Runs AFTER the shell_filter
@@ -789,6 +857,12 @@ impl Tool for ShellTool {
                     "stdout": raw_stdout,
                     "stderr": raw_stderr
                 });
+                if let Some(tree) = tree_before {
+                    result_data["tree_before"] = json!(tree);
+                }
+                if let Some(tree) = tree_after {
+                    result_data["tree_after"] = json!(tree);
+                }
                 if let Some(event) = savings {
                     // Lever 2's before/after counts ride `data.savings`; the
                     // turn loop records each as a savings_events ledger row.
@@ -1086,6 +1160,33 @@ mod tests {
 
     fn tool_in(dir: &std::path::Path) -> ShellTool {
         ShellTool::new(Sandbox::new(dir).unwrap())
+    }
+
+    #[test]
+    fn check_measurement_requires_an_exact_safe_command() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path())
+            .with_check_commands(vec!["cargo test --workspace".to_string()]);
+        assert!(tool.measures_check("  cargo test --workspace  ", dir.path()));
+        for command in [
+            "cargo\ntest --workspace",
+            "\ncargo test --workspace",
+            "cargo  test --workspace",
+            "cargo\ttest --workspace",
+            "cargo\u{7}test --workspace",
+            "cargo test --workspace; echo no",
+            "cargo test --workspace | Select-String x",
+            "cargo test --workspace && echo no",
+            "cargo test --workspace > log.txt",
+            "cargo test --workspace < input.txt",
+            "cargo test --workspace `echo no`",
+            "cargo test --workspace $(echo no)",
+        ] {
+            assert!(
+                !tool.measures_check(command, dir.path()),
+                "{command:?} must not be measured"
+            );
+        }
     }
 
     /// A command printing 40 identical lines. The shell filter's repeat
@@ -1454,6 +1555,58 @@ mod tests {
         let result = tool.execute(json!({"command": cmd, "purpose": "stderr capture"})).await;
         // The stderr text should appear somewhere in the output.
         assert!(result.output.to_lowercase().contains("oops"));
+    }
+
+    /// Plan 75b41222: the lossy surfaces downstream — the 100 KiB cap and
+    /// the archive preview's 1,500-char head — keep the FRONT of the model
+    /// text, so the shell tool leads with stderr: an error must never sit
+    /// behind a long stdout again.
+    #[tokio::test]
+    async fn stderr_comes_before_stdout_in_the_model_text() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            "Write-Output 'OUT-LINE'; [Console]::Error.WriteLine('ERR-LINE')"
+        } else {
+            "echo OUT-LINE; echo ERR-LINE 1>&2"
+        };
+        let result = tool.execute(json!({"command": cmd, "purpose": "stderr first"})).await;
+        assert!(result.success, "output: {}", result.output);
+        let err_tag = result.output.find("[stderr]").expect("a [stderr] section");
+        let err_line = result.output.find("ERR-LINE").expect("the stderr line");
+        let out_tag = result.output.find("[stdout]").expect("a [stdout] section");
+        let out_line = result.output.find("OUT-LINE").expect("the stdout line");
+        assert!(
+            err_tag < err_line && err_line < out_tag && out_tag < out_line,
+            "stderr must lead stdout in the model text: {}",
+            result.output
+        );
+        assert!(
+            result.output.ends_with("[exit code: 0]"),
+            "the exit-code line must close the text: {}",
+            result.output
+        );
+    }
+
+    /// Plan 75b41222: a clean run reads exactly as before — plain stdout
+    /// and the exit-code line, no stream labels.
+    #[tokio::test]
+    async fn a_clean_run_reads_as_before() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            "Write-Output hello"
+        } else {
+            "echo hello"
+        };
+        let result = tool.execute(json!({"command": cmd, "purpose": "clean run"})).await;
+        assert!(result.success, "output: {}", result.output);
+        assert_eq!(result.output, "hello\n[exit code: 0]");
+        assert!(
+            !result.output.contains("[stderr]") && !result.output.contains("[stdout]"),
+            "a clean run carries no stream labels: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -2200,5 +2353,107 @@ mod tests {
             .parse()
             .expect("the pid file holds the grandchild's pid");
         assert_eventually_dead(pid).await;
+    }
+
+    /// Seed a real git repository, so `content_tree` has an index to copy.
+    fn git_repo(dir: &std::path::Path) {
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "Mnemo Test"],
+            vec!["config", "user.email", "mnemo@example.invalid"],
+            vec!["add", "README.md", "tracked.txt"],
+            vec!["commit", "-m", "seed"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {:?}", args);
+            if args[0] == "init" {
+                std::fs::write(dir.join("README.md"), "seed\n").expect("seed file");
+                std::fs::write(dir.join("tracked.txt"), "value = seed\n")
+                    .expect("tracked file");
+            }
+        }
+    }
+
+    /// A configured command that leaves the checkout unchanged records the
+    /// same content tree before and after the run (worker checks, plan
+    /// 3b8f715a): the pair is what certifies the tested tree.
+    #[tokio::test]
+    async fn configured_unchanging_command_records_equal_trees() {
+        let dir = tempdir().unwrap();
+        git_repo(dir.path());
+        let tool = tool_in(dir.path())
+            .with_check_commands(vec!["git status".to_string()]);
+        let result = tool
+            .execute(json!({"command": "git status", "purpose": "measure the tree"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.expect("data");
+        assert_eq!(data["exit_code"].as_i64(), Some(0), "{data}");
+        let before = data["tree_before"].as_str().expect("tree_before");
+        let after = data["tree_after"].as_str().expect("tree_after");
+        assert!(!before.is_empty(), "{data}");
+        assert_eq!(before, after, "{data}");
+    }
+
+    /// A configured command that edits a tracked file records different
+    /// trees (worker checks, plan 3b8f715a): a run that changed the tree it
+    /// tested can never certify a later commit.
+    #[tokio::test]
+    async fn configured_editing_command_records_different_trees() {
+        let dir = tempdir().unwrap();
+        git_repo(dir.path());
+        let command = "git config --file tracked.txt test.value changed";
+        let tool = tool_in(dir.path()).with_check_commands(vec![command.to_string()]);
+        let result = tool
+            .execute(json!({"command": command, "purpose": "change the tree"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.expect("data");
+        assert_eq!(data["exit_code"].as_i64(), Some(0), "{data}");
+        let before = data["tree_before"].as_str().expect("tree_before");
+        let after = data["tree_after"].as_str().expect("tree_after");
+        assert_ne!(before, after, "{data}");
+    }
+
+    /// A command outside the allow-list is never measured: no tree fields
+    /// ride the result, so the pump cannot count it.
+    #[tokio::test]
+    async fn unconfigured_command_records_no_trees() {
+        let dir = tempdir().unwrap();
+        git_repo(dir.path());
+        let tool = tool_in(dir.path());
+        let result = tool
+            .execute(json!({"command": "git status", "purpose": "not measured"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.expect("data");
+        assert!(data.get("tree_before").is_none(), "{data}");
+        assert!(data.get("tree_after").is_none(), "{data}");
+    }
+
+    /// A configured command run from a directory other than the checkout
+    /// root is never measured: only the root run can certify the tree.
+    #[tokio::test]
+    async fn configured_command_from_a_subdirectory_records_no_trees() {
+        let dir = tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::create_dir(dir.path().join("sub")).expect("subdirectory");
+        let command = "git status";
+        let tool = tool_in(dir.path()).with_check_commands(vec![command.to_string()]);
+        let result = tool
+            .execute(json!({
+                "command": command,
+                "cwd": "sub",
+                "purpose": "not the checkout root"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.expect("data");
+        assert!(data.get("tree_before").is_none(), "{data}");
+        assert!(data.get("tree_after").is_none(), "{data}");
     }
 }

@@ -731,20 +731,29 @@ export function shellCallFromArgs(
 /**
  * Split a shell tool call's display output into its human-readable parts.
  *
- * The shell tool builds the display output as
- * `stdout + "\n[stderr]\n" + stderr + "\n[exit code: N]"`
- * (`src/tool/agent/shell.rs`), with output-filter notes (grep nudges,
- * redirect notes) riding at the very top of the stdout section. This helper
- * separates those machine-formatted markers so the ToolCard can render the
- * content readably: stdout as the main block, stderr as a labeled section,
- * and the exit code as a chip.
+ * The shell tool builds the display output in one of two shapes
+ * (`src/tool/agent/shell.rs`), both closed by a trailing
+ * "\n[exit code: N]" line:
+ *
+ * - current (plan 75b41222, stderr first so an error survives the 100 KiB
+ *   cap and the archive preview's head): optional output-filter notes
+ *   (grep nudges, redirect notes), then a `[stderr]` section, then — only
+ *   when stdout is non-empty — a `[stdout]` section with the stdout body;
+ * - historical (persisted transcripts): plain stdout, then a
+ *   `\n[stderr]\n` marker, then stderr.
+ *
+ * The shape is told apart by which marker comes first: a `[stdout]`
+ * section marker AFTER the `[stderr]` one means the new order. Without
+ * it, the text before `[stderr]` is the stdout (in the new order that is
+ * just the notes area, in the old order it is stdout itself), so filter
+ * notes keep riding at the top of the rendered stdout block either way.
  *
  * Strictness: the exit code is extracted ONLY when the final line matches
  * `[exit code: <int>]` exactly — a command whose own output happens to end
- * with such a line mid-text is left untouched (the shell tool always appends
- * the trailer as the very last line). The stderr marker splits on its FIRST
- * occurrence (the tool emits at most one). Trailing-newline residue left by
- * the trailer extraction is trimmed.
+ * with such a line mid-text is left untouched (the shell tool always
+ * appends the trailer as the very last line). Section markers match on
+ * their first occurrence (the tool emits at most one of each).
+ * Trailing-newline residue left by the trailer extraction is trimmed.
  */
 export function parseShellOutput(output: string): {
   stdout: string;
@@ -764,12 +773,41 @@ export function parseShellOutput(output: string): {
       .replace(/\r?\n$/, "")
       .replace(/\r$/, "");
   }
-  const marker = "\n[stderr]\n";
-  const idx = rest.indexOf(marker);
-  if (idx === -1) {
+  // A [stderr] marker is a line of its own: the text either opens with it
+  // (new order, no notes) or it follows a newline (new order after notes /
+  // historical order after stdout).
+  const stderrMarker = "[stderr]\n";
+  let stderrStart = -1;
+  let prefixEnd = 0;
+  if (rest.startsWith(stderrMarker)) {
+    stderrStart = 0;
+  } else {
+    const mid = rest.indexOf("\n" + stderrMarker);
+    if (mid !== -1) {
+      stderrStart = mid + 1;
+      prefixEnd = mid;
+    }
+  }
+  if (stderrStart === -1) {
     return { stdout: rest, stderr: null, exitCode };
   }
-  return { stdout: rest.slice(0, idx), stderr: rest.slice(idx + marker.length), exitCode };
+  const stderrEnd = stderrStart + stderrMarker.length;
+  // New order: the stdout body rides in its own [stdout] section after the
+  // stderr one; the historical order has no such marker.
+  const stdoutMarker = "\n[stdout]\n";
+  const stdoutIdx = rest.indexOf(stdoutMarker, stderrEnd);
+  if (stdoutIdx !== -1) {
+    return {
+      stdout: rest.slice(0, stderrStart) + rest.slice(stdoutIdx + stdoutMarker.length),
+      stderr: rest.slice(stderrEnd, stdoutIdx),
+      exitCode,
+    };
+  }
+  return {
+    stdout: rest.slice(0, prefixEnd),
+    stderr: rest.slice(stderrEnd),
+    exitCode,
+  };
 }
 
 /**

@@ -192,7 +192,10 @@ impl EngineBuilder {
 /// worktree checkout plus its own code graph. A missing worktree is a spawn
 /// error (never a silent fallback to the engine's root, which would let two
 /// workers edit one tree).
-fn worktree_binding(root: std::path::PathBuf) -> Result<WorktreeBinding, EngineError> {
+fn worktree_binding(
+    root: std::path::PathBuf,
+    check_commands: Vec<String>,
+) -> Result<WorktreeBinding, EngineError> {
     let worktree = std::fs::canonicalize(&root)
         .map_err(|e| EngineError::spawn_failed(format!("worktree '{}': {e}", root.display())))?;
     let coding_dir = worktree.join(".coding");
@@ -204,6 +207,7 @@ fn worktree_binding(root: std::path::PathBuf) -> Result<WorktreeBinding, EngineE
     Ok(WorktreeBinding {
         worktree,
         codegraph,
+        check_commands,
     })
 }
 
@@ -368,7 +372,7 @@ impl Engine {
         // dir, and code graph all resolve there, so concurrent workers never
         // share a working tree.
         let worktree = match opts.worktree {
-            Some(root) => Some(worktree_binding(root)?),
+            Some(root) => Some(worktree_binding(root, opts.check_commands.clone())?),
             None => None,
         };
         // 3c/G2 (§5.9.2): the session's host tools — engine-registered
@@ -1192,7 +1196,7 @@ mod tests {
     #[test]
     fn worktree_binding_uses_the_worktree_checkout() {
         let dir = tempfile::tempdir().expect("workspace");
-        let binding = worktree_binding(dir.path().to_path_buf()).expect("binding");
+        let binding = worktree_binding(dir.path().to_path_buf(), Vec::new()).expect("binding");
         assert_eq!(
             binding.worktree,
             std::fs::canonicalize(dir.path()).expect("canonical")
@@ -1206,7 +1210,7 @@ mod tests {
     #[test]
     fn worktree_binding_rejects_a_missing_worktree() {
         let dir = tempfile::tempdir().expect("workspace");
-        let err = match worktree_binding(dir.path().join("missing")) {
+        let err = match worktree_binding(dir.path().join("missing"), Vec::new()) {
             Ok(_) => panic!("a missing worktree must fail the spawn"),
             Err(err) => err,
         };

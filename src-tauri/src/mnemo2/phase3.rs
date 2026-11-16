@@ -394,6 +394,11 @@ pub async fn git_value(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Hash the checkout's full content tree without touching its real index.
+pub async fn content_tree(checkout: &Path) -> Result<String, String> {
+    mnemo::project::git_ops::content_tree(checkout).await
+}
+
 /// Read the exact current commit of a checkout.
 pub async fn tip(root: &Path) -> Result<String, String> {
     git_value(root, &["rev-parse", "HEAD"]).await

@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use mnemo::app::worktrees::{
-    agent_branch, agent_short_id, current_branch, remove_agent_worktree,
+    agent_branch, agent_short_id, current_branch, discard_and_release_pool_checkout,
+    is_pool_checkout, release_pool_checkout, remove_agent_worktree,
 };
 use serde::Serialize;
 
@@ -25,10 +26,35 @@ use super::record::{WorkerRecord, WorkerStatus};
 use super::routing::{logs_label, logs_routing, outcome_row};
 use super::{TeamRuntime, TeamSnapshot};
 
-/// The worker's registered checkout path inside the project.
-pub(super) fn worker_checkout(root: &Path, worker_id: &str) -> PathBuf {
-    root.join(".worktrees")
-        .join(format!("agent-{}", agent_short_id(worker_id)))
+/// A worker's checkout, classified from the path recorded on its record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CheckoutKind {
+    /// A pre-pool `.worktrees/agent-<id8>` checkout, removed on cleanup.
+    Legacy(PathBuf),
+    /// A reusable `.worktrees/pool-<n>` checkout, detached on cleanup.
+    Pool(PathBuf),
+}
+
+impl CheckoutKind {
+    pub(super) fn path(&self) -> &Path {
+        match self {
+            Self::Legacy(checkout) | Self::Pool(checkout) => checkout,
+        }
+    }
+}
+
+/// Resolve the checkout from the record; an empty path means none is held.
+pub(super) fn worker_checkout(root: &Path, worker: &WorkerRecord) -> Option<CheckoutKind> {
+    if worker.worktree.as_os_str().is_empty() {
+        None
+    } else if is_pool_checkout(&worker.worktree) {
+        Some(CheckoutKind::Pool(worker.worktree.clone()))
+    } else {
+        Some(CheckoutKind::Legacy(
+            root.join(".worktrees")
+                .join(format!("agent-{}", agent_short_id(&worker.id))),
+        ))
+    }
 }
 
 pub(super) async fn branch_exists(root: &Path, branch: &str) -> bool {
@@ -58,6 +84,8 @@ struct DeletionCore {
     checkout: PathBuf,
     /// The checkout still exists at that path.
     checkout_exists: bool,
+    /// The recorded checkout is a reusable pool checkout.
+    pool: bool,
     /// The merged worker that landed this record's plan step through its
     /// own commits, when the ledger knows one.
     superseded_by: Option<String>,
@@ -155,13 +183,23 @@ async fn registered_checkouts(root: &Path) -> Result<Vec<PathBuf>, String> {
 /// descending into untracked directories (`--untracked-files=normal`): the
 /// preview only needs to know that *something* is uncommitted, not
 /// enumerate a `node_modules` tree.
-async fn inspect_checkout(checkout: PathBuf, branch: String) -> Result<CheckoutCheck, String> {
+async fn inspect_checkout(
+    checkout: PathBuf,
+    branch: String,
+    pool: bool,
+) -> Result<CheckoutCheck, String> {
     let current = checkout_branch(&checkout).await?;
-    if current != branch {
-        return Ok(CheckoutCheck {
-            uncommitted: false,
-            blocked: Some(format!("its checkout is on '{current}', not {branch}")),
-        });
+    match current {
+        Some(current) if current != branch => {
+            return Ok(CheckoutCheck {
+                uncommitted: false,
+                blocked: Some(format!("its checkout is on '{current}', not {branch}")),
+            });
+        }
+        // A detached pool is already released; only its dirty state matters.
+        None if pool => {}
+        None => return Err("the checkout is on a detached HEAD".to_string()),
+        Some(_) => {}
     }
     let status = phase3::git_value(
         &checkout,
@@ -176,13 +214,13 @@ async fn inspect_checkout(checkout: PathBuf, branch: String) -> Result<CheckoutC
 
 /// A checkout's current branch, without blocking the async executor (the
 /// shared [`current_branch`] helper runs Git synchronously).
-async fn checkout_branch(checkout: &Path) -> Result<String, String> {
+async fn checkout_branch(checkout: &Path) -> Result<Option<String>, String> {
     let branch = phase3::git_value(checkout, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
     let branch = branch.trim().to_string();
     if branch.is_empty() || branch == "HEAD" {
-        return Err("the checkout is on a detached HEAD".to_string());
+        return Ok(None);
     }
-    Ok(branch)
+    Ok(Some(branch))
 }
 
 /// Whether Git's main-checkout worktree registry still lists this exact path.
@@ -266,15 +304,33 @@ fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-/// The checkout path after every ownership guard passes: the worker's own
-/// direct-child folder of the canonical `.worktrees`, never a link or
-/// junction, never anything else. `None` when it no longer exists.
-pub(super) fn validated_checkout(root: &Path, worker: &WorkerRecord) -> Result<Option<PathBuf>, String> {
+/// The checkout path after every ownership guard passes: a legacy worker's
+/// own folder or a canonical direct-child pool folder, never a link or
+/// junction. Pool mutations also refuse paths another record holds. `None`
+/// means the record holds no checkout or a legacy folder no longer exists.
+pub(super) fn validated_checkout(
+    root: &Path,
+    worker: &WorkerRecord,
+    other_worktrees: &[PathBuf],
+) -> Result<Option<CheckoutKind>, String> {
     if !owns_its_branch(worker) {
         return Err("refusing to remove a checkout for an invalid worker identity".to_string());
     }
-    let checkout = worker_checkout(root, &worker.id);
-    let metadata = match std::fs::symlink_metadata(&checkout) {
+    let Some(kind) = worker_checkout(root, worker) else {
+        return Ok(None);
+    };
+    let checkout = kind.path();
+    if matches!(&kind, CheckoutKind::Pool(_))
+        && other_worktrees
+            .iter()
+            .any(|other| same_checkout_path(other, checkout))
+    {
+        return Err(format!(
+            "refusing to change {}: another worker record holds this pool checkout",
+            checkout.display()
+        ));
+    }
+    let metadata = match std::fs::symlink_metadata(checkout) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
@@ -301,26 +357,52 @@ pub(super) fn validated_checkout(root: &Path, worker: &WorkerRecord) -> Result<O
             checkout.display()
         ));
     }
-    let canonical = dunce::canonicalize(&checkout).map_err(|error| error.to_string())?;
-    let expected = canonical_worktrees.join(format!("agent-{}", agent_short_id(&worker.id)));
-    if !same_checkout_path(&canonical, &expected)
-        || canonical.parent() != Some(canonical_worktrees.as_path())
-        || canonical.file_name() != expected.file_name()
-    {
+    let canonical = dunce::canonicalize(checkout).map_err(|error| error.to_string())?;
+    if canonical.parent() != Some(canonical_worktrees.as_path()) {
         return Err(format!(
-            "refusing to remove {}: it is not the worker's own checkout",
+            "refusing to remove {}: it is not a direct child of .worktrees",
             checkout.display()
         ));
     }
-    Ok(Some(canonical))
+    match kind {
+        CheckoutKind::Legacy(_) => {
+            let expected =
+                canonical_worktrees.join(format!("agent-{}", agent_short_id(&worker.id)));
+            if !same_checkout_path(&canonical, &expected)
+                || canonical.file_name() != expected.file_name()
+            {
+                return Err(format!(
+                    "refusing to remove {}: it is not the worker's own checkout",
+                    checkout.display()
+                ));
+            }
+            Ok(Some(CheckoutKind::Legacy(canonical)))
+        }
+        CheckoutKind::Pool(_) => {
+            if !is_pool_checkout(&canonical) {
+                return Err(format!(
+                    "refusing to change {}: it is not a pool checkout",
+                    checkout.display()
+                ));
+            }
+            Ok(Some(CheckoutKind::Pool(canonical)))
+        }
+    }
 }
 
 /// Remove an unregistered checkout with filesystem operations only. The
 /// canonical path must remain the expected direct child of this repository's
 /// `.worktrees`; links and junctions are refused rather than traversed.
 pub(super) async fn remove_leftover_checkout(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
-    let Some(canonical) = validated_checkout(root, worker)? else {
-        return Ok(());
+    let canonical = match validated_checkout(root, worker, &[])? {
+        Some(CheckoutKind::Legacy(canonical)) => canonical,
+        Some(CheckoutKind::Pool(checkout)) => {
+            return Err(format!(
+                "refusing to remove reusable pool checkout {}",
+                checkout.display()
+            ));
+        }
+        None => return Ok(()),
     };
 
     let mut last_error = String::new();
@@ -454,8 +536,11 @@ pub struct WorkerDeletion {
     pub branch: String,
     /// The worker's session is live; deleting stops it first.
     pub live: bool,
-    /// The worker's checkout still exists and will be removed.
+    /// The worker's checkout still exists and will be removed or released.
     pub checkout: bool,
+    /// The checkout is a reused pool checkout: deleting frees it for the next
+    /// worker (detached, caches kept) instead of removing the folder.
+    pub pool: bool,
     /// That checkout has uncommitted changes.
     pub uncommitted: bool,
     /// Commits on the branch that the lead branch does not contain.
@@ -553,6 +638,12 @@ pub async fn cleanup_workspace(
         return Ok(CleanupReport::default());
     };
     let mut report = CleanupReport::default();
+    let held: Vec<(String, PathBuf)> = ledger
+        .workers
+        .iter()
+        .filter(|worker| !worker.worktree.as_os_str().is_empty())
+        .map(|worker| (worker.id.clone(), worker.worktree.clone()))
+        .collect();
     for index in 0..ledger.workers.len() {
         let worker = &mut ledger.workers[index];
         if worker.merge.is_some()
@@ -580,28 +671,47 @@ pub async fn cleanup_workspace(
                 .push(format!("{branch}: invalid worker identity"));
             continue;
         }
-        let checkout = root
-            .join(".worktrees")
-            .join(format!("agent-{}", agent_short_id(&id)));
-        let recorded = match dunce::canonicalize(&worker.worktree) {
-            Ok(path) => path,
-            Err(_) if !worker.worktree.exists() => checkout.clone(),
-            Err(error) => {
-                report.skipped.push(format!("{branch}: {error}"));
+        let Some(kind) = worker_checkout(root, worker) else {
+            continue;
+        };
+        let pool = matches!(&kind, CheckoutKind::Pool(_));
+        let other_worktrees: Vec<PathBuf> = held
+            .iter()
+            .filter(|(other_id, _)| other_id != &id)
+            .map(|(_, checkout)| checkout.clone())
+            .collect();
+        let checkout = if pool {
+            match validated_checkout(root, worker, &other_worktrees) {
+                Ok(Some(CheckoutKind::Pool(canonical))) => canonical,
+                Ok(_) => kind.path().to_path_buf(),
+                Err(error) => {
+                    report.skipped.push(format!("{branch}: {error}"));
+                    continue;
+                }
+            }
+        } else {
+            let checkout = kind.path().to_path_buf();
+            let recorded = match dunce::canonicalize(&worker.worktree) {
+                Ok(path) => path,
+                Err(_) if !worker.worktree.exists() => checkout.clone(),
+                Err(error) => {
+                    report.skipped.push(format!("{branch}: {error}"));
+                    continue;
+                }
+            };
+            let expected = if std::fs::symlink_metadata(&checkout).is_ok() {
+                dunce::canonicalize(&checkout).map_err(|err| err.to_string())?
+            } else {
+                checkout.clone()
+            };
+            if recorded != expected {
+                report.skipped.push(format!(
+                    "{branch}: checkout is outside its registered worktree"
+                ));
                 continue;
             }
+            checkout
         };
-        let expected = if std::fs::symlink_metadata(&checkout).is_ok() {
-            dunce::canonicalize(&checkout).map_err(|err| err.to_string())?
-        } else {
-            checkout.clone()
-        };
-        if recorded != expected {
-            report.skipped.push(format!(
-                "{branch}: checkout is outside its registered worktree"
-            ));
-            continue;
-        }
         let revision = format!("refs/heads/{branch}^{{commit}}");
         if let Err(error) = phase3::git_value(root, &["rev-parse", "--verify", &revision]).await {
             report.skipped.push(format!(
@@ -628,11 +738,34 @@ pub async fn cleanup_workspace(
                         continue;
                     }
                 }
-                if let Err(error) = remove_agent_worktree(root.to_path_buf(), id.clone()).await {
+                let result = if pool {
+                    release_pool_checkout(
+                        root.to_path_buf(),
+                        checkout.clone(),
+                        branch.clone(),
+                    )
+                    .await
+                } else {
+                    remove_agent_worktree(root.to_path_buf(), id.clone()).await
+                };
+                if let Err(error) = result {
                     removal_error = Some(error);
                 }
             }
-            if std::fs::symlink_metadata(&checkout).is_ok() {
+            if pool {
+                if !registered {
+                    report.skipped.push(format!(
+                        "{branch}: cleanup failed: the pool checkout is not registered"
+                    ));
+                    continue;
+                }
+                if let Some(error) = removal_error {
+                    report
+                        .skipped
+                        .push(format!("{branch}: cleanup failed: {error}"));
+                    continue;
+                }
+            } else if std::fs::symlink_metadata(&checkout).is_ok() {
                 if checkout_is_registered(root, &checkout).await? {
                     report.skipped.push(format!(
                         "{branch}: cleanup failed: {}",
@@ -845,7 +978,7 @@ impl TeamRuntime {
         let mut pending = Vec::new();
         for (index, core) in cores.iter().enumerate() {
             if core.needs_check {
-                pending.push((index, core.checkout.clone(), core.branch.clone()));
+                pending.push((index, core.checkout.clone(), core.branch.clone(), core.pool));
             }
         }
         // The Git-heavy half runs as one task per worker, bounded: every
@@ -854,10 +987,10 @@ impl TeamRuntime {
         // check lands.
         for chunk in pending.chunks(DELETION_CHECK_CONCURRENCY) {
             let mut handles = Vec::with_capacity(chunk.len());
-            for (index, checkout, branch) in chunk {
+            for (index, checkout, branch, pool) in chunk {
                 handles.push((
                     *index,
-                    tokio::spawn(inspect_checkout(checkout.clone(), branch.clone())),
+                    tokio::spawn(inspect_checkout(checkout.clone(), branch.clone(), *pool)),
                 ));
             }
             for (index, handle) in handles {
@@ -906,13 +1039,19 @@ impl TeamRuntime {
             let records = self.records.lock().await;
             landing_worker_name(&records, &record)
         };
+        let checkout = worker_checkout(&self.workspace_root, &record);
+        let pool = matches!(&checkout, Some(CheckoutKind::Pool(_)));
         let mut core = DeletionCore {
             worker_id: record.id.clone(),
             name: record.name.clone(),
             branch: record.branch.clone(),
             live: self.live.lock().await.contains_key(worker_id),
-            checkout: worker_checkout(&self.workspace_root, &record.id),
+            checkout: checkout
+                .as_ref()
+                .map(|checkout| checkout.path().to_path_buf())
+                .unwrap_or_default(),
             checkout_exists: false,
+            pool,
             superseded_by,
             shared_branch,
             blocked: None,
@@ -929,6 +1068,20 @@ impl TeamRuntime {
             return Ok(core);
         }
         core.checkout_exists = std::fs::symlink_metadata(&core.checkout).is_ok();
+        if core.pool && core.checkout_exists {
+            let other_worktrees = self.other_held_checkouts(&record.id).await;
+            match validated_checkout(&self.workspace_root, &record, &other_worktrees) {
+                Ok(Some(CheckoutKind::Pool(canonical))) => core.checkout = canonical,
+                Ok(_) => {
+                    core.checkout_exists = false;
+                    return Ok(core);
+                }
+                Err(error) => {
+                    core.blocked = Some(error);
+                    return Ok(core);
+                }
+            }
+        }
         // Never probe an unregistered folder with Git: without its own
         // `.git`, Git walks up and answers for the main checkout instead.
         core.needs_check = core.checkout_exists && facts.lists(&core.checkout);
@@ -972,6 +1125,7 @@ impl TeamRuntime {
             branch: core.branch.clone(),
             live: core.live,
             checkout: core.checkout_exists,
+            pool: core.pool && core.checkout_exists,
             uncommitted,
             unmerged_commits,
             superseded_by: core.superseded_by.clone(),
@@ -1015,16 +1169,27 @@ impl TeamRuntime {
         self.persist().await
     }
 
-    /// Remove the worker's checkout folder from `.worktrees` and deregister
-    /// its worktree. The folder is first renamed into `.worktrees/.trash/`
-    /// with one cheap filesystem move — the user never waits for the slow
-    /// file-by-file delete of a large checkout; the trash folder is
-    /// removed in the background instead. When the rename is refused (on
-    /// Windows: something holds the folder or a file in it), the removal
-    /// falls back to the foreground retry path, which names the holder.
+    /// Release a pool checkout in place, or rename a legacy checkout into
+    /// `.worktrees/.trash/` and deregister it. Pool folders and their caches
+    /// are never removed; confirmed deletion alone may discard their changes.
     async fn remove_checkout(&self, worker: &WorkerRecord) -> Result<(), String> {
-        let Some(canonical) = validated_checkout(&self.workspace_root, worker)? else {
-            return Ok(());
+        let other_worktrees = self.other_held_checkouts(&worker.id).await;
+        let canonical = match validated_checkout(&self.workspace_root, worker, &other_worktrees)? {
+            Some(CheckoutKind::Pool(canonical)) => {
+                if !checkout_is_registered(&self.workspace_root, &canonical).await? {
+                    // An unregistered folder is not this record's worktree.
+                    // Leave it untouched and never let Git walk up to the lead.
+                    return Ok(());
+                }
+                return discard_and_release_pool_checkout(
+                    self.workspace_root.clone(),
+                    canonical,
+                    worker.branch.clone(),
+                )
+                .await;
+            }
+            Some(CheckoutKind::Legacy(canonical)) => canonical,
+            None => return Ok(()),
         };
         match move_checkout_to_trash(&self.workspace_root, &canonical).await {
             Ok(()) => {

@@ -33,6 +33,7 @@ use crate::tool::agent::{
 use crate::tool::memory::retrieval::MemorySearchTool;
 use crate::tool::memory::MemoryWriteTool;
 use crate::app::tool::workflow::plan::{CompleteStepTool, CreatePlanTool};
+use crate::tool::Tool;
 use crate::tool::ToolRegistry;
 use crate::app::workflow::Workflow;
 use async_trait::async_trait;
@@ -3881,6 +3882,51 @@ async fn other_tools_are_still_archived() {
     assert!(out.contains("expand_result id="), "{out}");
     let rows = wait_for_savings_row(&store, |r| r.kind == "archive", std::time::Duration::from_secs(5)).await;
     assert_eq!(rows.iter().filter(|r| r.kind == "archive").count(), 1);
+}
+
+#[tokio::test]
+async fn shell_stderr_stays_in_the_archive_preview_head() {
+    // Plan 75b41222: a failing command with 30,000 chars of stdout and a
+    // short stderr error — the shell tool leads the model text with
+    // stderr, so the error rides the archive preview's 1,500-char head
+    // instead of hiding behind the stdout the preview drops.
+    let dir = tempdir().unwrap();
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    let agent = agent_over_store(dir.path(), &store);
+
+    let cmd = if cfg!(target_os = "windows") {
+        "Write-Output ('x' * 30000); [Console]::Error.WriteLine('ERR-LINE'); exit 1"
+    } else {
+        "head -c 30000 /dev/zero | tr '\\0' 'x'; echo ERR-LINE 1>&2; exit 1"
+    };
+    let tool = crate::tool::agent::shell::ShellTool::new(Sandbox::new(dir.path()).unwrap());
+    let result = tool
+        .execute(serde_json::json!({"command": cmd, "purpose": "archive preview head"}))
+        .await;
+    assert!(result.success, "output: {}", result.output);
+    assert!(
+        result.output.chars().count() >= 20_000,
+        "the result must be archive-sized, got {} chars",
+        result.output.chars().count()
+    );
+
+    let preview = agent
+        .ingest_tool_output(None, "shell", Some(cmd), &result.output)
+        .await;
+    let pos = preview
+        .find("ERR-LINE")
+        .expect("the stderr line must survive into the preview");
+    assert!(
+        pos < 1_500,
+        "the error must lead the 1,500-char preview head, not trail the stdout: {}",
+        preview.chars().take(200).collect::<String>()
+    );
+    assert!(
+        preview.chars().count() < result.output.chars().count(),
+        "the preview must be the bounded stand-in, not the full result"
+    );
 }
 
 #[tokio::test]

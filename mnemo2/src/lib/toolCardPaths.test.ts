@@ -654,7 +654,7 @@ describe("parseShellOutput", () => {
     });
   });
 
-  it("splits stderr before extracting the trailer (full shell.rs contract shape)", () => {
+  it("historical shell.rs contract shape (persisted transcripts)", () => {
     expect(parseShellOutput("out\n[stderr]\nerr\n[exit code: 3]")).toEqual({
       stdout: "out",
       stderr: "err",
@@ -667,6 +667,47 @@ describe("parseShellOutput", () => {
     expect(parts.stdout).toBe("TIP: use the search tool\nreal output");
     expect(parts.stderr).toBeNull();
     expect(parts.exitCode).toBe(0);
+  });
+
+  it("new order (plan 75b41222): [stderr] section first, [stdout] section after", () => {
+    // Mirrors the exact text the Rust-side test
+    // stderr_comes_before_stdout_in_the_model_text (src/tool/agent/shell.rs)
+    // proves the shell tool now produces for a command writing both streams.
+    expect(parseShellOutput("[stderr]\nERR-LINE\n[stdout]\nOUT-LINE\n[exit code: 0]")).toEqual({
+      stdout: "OUT-LINE",
+      stderr: "ERR-LINE",
+      exitCode: 0,
+    });
+  });
+
+  it("new order with a prepended note: the note rides on top of stdout", () => {
+    expect(
+      parseShellOutput(
+        "TIP: use the search tool\n[stderr]\nERR-LINE\n[stdout]\nOUT-LINE\n[exit code: 1]",
+      ),
+    ).toEqual({
+      stdout: "TIP: use the search tool\nOUT-LINE",
+      stderr: "ERR-LINE",
+      exitCode: 1,
+    });
+  });
+
+  it("new order, stderr only: empty stdout, no [stdout] marker", () => {
+    expect(parseShellOutput("[stderr]\nERR-LINE\n[exit code: 1]")).toEqual({
+      stdout: "",
+      stderr: "ERR-LINE",
+      exitCode: 1,
+    });
+  });
+
+  it("new order, stderr only, with a note: the note stays in the stdout area", () => {
+    expect(
+      parseShellOutput("TIP: use the search tool\n[stderr]\nERR-LINE\n[exit code: 0]"),
+    ).toEqual({
+      stdout: "TIP: use the search tool",
+      stderr: "ERR-LINE",
+      exitCode: 0,
+    });
   });
 
   it("empty output", () => {

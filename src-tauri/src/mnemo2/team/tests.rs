@@ -2,7 +2,10 @@ use super::*;
 
 use std::collections::VecDeque;
 
-use mnemo::app::worktrees::{agent_branch, agent_short_id, provision_agent_worktree};
+use mnemo::app::worktrees::{
+    agent_branch, agent_short_id, discard_and_release_pool_checkout, provision_agent_worktree,
+    release_pool_checkout,
+};
 use mnemo::headless::{GateVerdict, Transcript};
 use mnemo::SerializableAgentEvent;
 use mnemo::tool::{SafetyLevel, ToolResult};
@@ -14,19 +17,20 @@ use crate::mnemo2::phase3::{Finding, MergeRecord, ReviewEvidence, ReviewLane, Re
 use super::control::recover_worker;
 use super::deletion::{
     branch_exists, checkout_is_registered, move_checkout_to_trash, sweep_trash, trash_entries,
-    validated_checkout, worker_checkout, worktree_list_paths,
+    validated_checkout, worktree_list_paths,
 };
 use super::dispatch::{
     dispatch_routing_line, require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
 };
 use super::guardrails::executor_guardrails;
 use super::lead_tools::worker_status_view;
-use super::merge::{delete_merged_branch, validate_merge, WORKTREE_CLEANUP_ERROR};
+use super::merge::{delete_merged_branch, merge_tip, validate_merge, WORKTREE_CLEANUP_ERROR};
 use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
 use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
 };
-use super::pump::{cost_notice_due, usage_cost_micros, worker_host_tool_result};
+use super::pump::{counted_check, cost_notice_due, usage_cost_micros, worker_host_tool_result};
+use super::review::CheckRecorder;
 use super::record::{append_inbox, audit_finished, WORKER_INBOX_LIMIT};
 use super::review::clear_review_for_a_newer_tip;
 use super::routing::final_tier;
@@ -88,7 +92,7 @@ async fn phase_two_ledgers_load_with_phase_three_defaults() {
     assert!(worker.inbox.is_empty());
     // Legacy ledgers predate review risk: they decode as standard.
     assert_eq!(worker.review_risk, "standard");
-    recover_worker(std::path::Path::new("unused"), &mut persisted.workers[0])
+    recover_worker(std::path::Path::new("unused"), &mut persisted.workers[0], &[])
         .await
         .expect("legacy recovery");
     assert!(persisted.workers[0].error.is_none());
@@ -1575,7 +1579,9 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         model_id: None,
         reasoning_effort: None,
         branch,
-        worktree: worker_checkout(root, id),
+        worktree: root
+            .join(".worktrees")
+            .join(format!("agent-{}", agent_short_id(id))),
         status: WorkerStatus::Completed,
         generation: 0,
         transcript: Arc::default(),
@@ -1694,6 +1700,517 @@ models = [\"scripted-a\", \"scripted-b\"]
     .expect("open the test team")
 }
 
+async fn worker_check_fixture(
+    id: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    TeamRuntime,
+    WorkerRecord,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let worker = worker(root.path(), id);
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        id.to_string(),
+        "wt/mnemo".to_string(),
+    )
+    .await
+    .expect("provision the worker worktree");
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+    (root, state, team, worker)
+}
+
+fn shell_result(exit_code: i64, tree_before: Option<&str>, tree_after: Option<&str>) -> ToolResult {
+    let mut data = json!({ "exit_code": exit_code });
+    if let Some(tree) = tree_before {
+        data["tree_before"] = json!(tree);
+    }
+    if let Some(tree) = tree_after {
+        data["tree_after"] = json!(tree);
+    }
+    ToolResult::success("command ran").with_data(data)
+}
+
+/// The repository's own allow-list, as `load_check_commands` trims it.
+fn allow_list() -> Vec<String> {
+    vec![
+        "cargo test --workspace".to_string(),
+        "cargo clippy --workspace --all-targets".to_string(),
+        "npm test --workspace mnemo2".to_string(),
+        "npm run check --workspace mnemo2".to_string(),
+    ]
+}
+
+async fn finish_worker_checks(
+    team: &TeamRuntime,
+    worker: &WorkerRecord,
+    mut observations: HashMap<String, String>,
+) {
+    CheckRecorder::new(
+        &team.records,
+        &team.usage,
+        &team.save_lock,
+        &team.persistence,
+    )
+    .record_worker_checks(
+        &team.merge_lock,
+        &worker.id,
+        worker.generation,
+        &mut observations,
+    )
+    .await;
+}
+
+#[test]
+fn check_allow_list_comes_only_from_valid_lead_root_config() {
+    let lead = tempfile::tempdir().expect("lead root");
+    let worker = tempfile::tempdir().expect("worker checkout");
+    std::fs::create_dir_all(worker.path().join(".coding")).expect("worker coding dir");
+    std::fs::write(
+        worker.path().join(".coding/checks.toml"),
+        "commands = [\"cargo test --workspace\"]\n",
+    )
+    .expect("worker allow-list");
+    assert!(
+        super::spawn::load_check_commands(lead.path()).is_empty(),
+        "a worker-local file must not enable automatic checks"
+    );
+
+    std::fs::create_dir_all(lead.path().join(".coding")).expect("lead coding dir");
+    std::fs::write(
+        lead.path().join(".coding/checks.toml"),
+        "commands = [\"  cargo test --workspace  \"]\n",
+    )
+    .expect("lead allow-list");
+    assert_eq!(
+        super::spawn::load_check_commands(lead.path()).as_slice(),
+        ["cargo test --workspace".to_string()]
+    );
+
+    let invalid_commands = [
+        "",
+        "   ",
+        "cargo test --workspace; echo no",
+        "cargo test --workspace | Select-String x",
+        "cargo test --workspace && echo no",
+        "cargo test --workspace > log.txt",
+        "cargo test --workspace < input.txt",
+        "cargo test --workspace `echo no`",
+        "cargo test --workspace $(echo no)",
+        "cargo\ntest --workspace",
+        "cargo\rtest --workspace",
+        "cargo\ttest --workspace",
+    ];
+    let encoded = invalid_commands
+        .iter()
+        .map(|command| format!("{command:?}"))
+        .chain([r#""cargo test --workspace""#.to_string()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        lead.path().join(".coding/checks.toml"),
+        format!("commands = [{encoded}]\n"),
+    )
+    .expect("compound lead allow-list");
+    let commands = super::spawn::load_check_commands(lead.path());
+    assert_eq!(
+        commands.as_slice(),
+        ["cargo test --workspace".to_string()],
+        "every empty, compound, or control-character entry is dropped"
+    );
+    let checkout = tempfile::tempdir().expect("checkout");
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    for command in invalid_commands {
+        assert_eq!(
+            counted_check(
+                "shell",
+                &json!({ "command": command }),
+                &shell_result(0, Some(tree), Some(tree)),
+                checkout.path(),
+                &commands,
+            ),
+            None,
+            "invalid allow-list entry {command:?} must never count"
+        );
+    }
+
+    std::fs::write(lead.path().join(".coding/checks.toml"), "commands = 42\n")
+        .expect("malformed lead allow-list");
+    assert!(
+        super::spawn::load_check_commands(lead.path()).is_empty(),
+        "a malformed file disables automatic checks"
+    );
+}
+
+#[test]
+fn counted_check_accepts_only_allow_listed_unchanging_runs() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let checkout = checkout.path();
+    let foreign = tempfile::tempdir().expect("foreign cwd");
+    let allowed = allow_list();
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    let listed = json!({ "command": "cargo test --workspace" });
+    // An allow-listed command, exit 0, no cwd, equal trees: counted.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        Some(("cargo test --workspace".to_string(), tree.to_string()))
+    );
+    // Only leading and trailing whitespace is trimmed; internal bytes matter.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "  cargo test --workspace  " }),
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        Some(("cargo test --workspace".to_string(), tree.to_string()))
+    );
+    for command in ["cargo\ntest --workspace", "cargo  test --workspace"] {
+        assert_eq!(
+            counted_check(
+                "shell",
+                &json!({ "command": command }),
+                &shell_result(0, Some(tree), Some(tree)),
+                checkout,
+                &allowed,
+            ),
+            None,
+            "{command:?} must not count"
+        );
+    }
+    // A cwd that canonicalizes to the checkout root still counts.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace", "cwd": checkout.display().to_string() }),
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        Some(("cargo test --workspace".to_string(), tree.to_string()))
+    );
+    // Not on the allow-list.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace --no-run" }),
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // A foreign cwd is never the worker's checkout.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace", "cwd": foreign.path().display().to_string() }),
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // Missing tree fields — the run was not measured.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &shell_result(0, None, None),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // The tree changed while the command ran.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &shell_result(0, Some(tree), Some("fedcba9876543210")),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // A non-zero exit code.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &shell_result(1, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // A failed tool result.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &ToolResult::error("tool failed")
+                .with_data(json!({ "exit_code": 0, "tree_before": tree, "tree_after": tree })),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // Another tool never counts.
+    assert_eq!(
+        counted_check(
+            "file_read",
+            &listed,
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_worker_run_check_on_the_committed_tree_is_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck1").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "checked\n").expect("worker edit");
+    let index = phase3::git_value(&worker.worktree, &["rev-parse", "--git-path", "index"])
+        .await
+        .expect("locate the real index");
+    let index = std::path::PathBuf::from(index);
+    let index = if index.is_absolute() {
+        index
+    } else {
+        worker.worktree.join(index)
+    };
+    let index_before = std::fs::read(&index).expect("read the real index");
+    let tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the worker content");
+    assert_eq!(
+        std::fs::read(&index).expect("reread the real index"),
+        index_before,
+        "content_tree must not change the worker's real index"
+    );
+    let allowed = allow_list();
+    let (name, observed_tree) = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &shell_result(0, Some(&tree), Some(&tree)),
+        &worker.worktree,
+        &allowed,
+    )
+    .expect("the measured passing command counts");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+
+    finish_worker_checks(&team, &worker, HashMap::from([(name, observed_tree)])).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert_eq!(recorded.checks.len(), 1);
+    let check = &recorded.checks[0];
+    assert_eq!(check.name, "cargo test --workspace");
+    assert_eq!(check.status, "passed");
+    assert_eq!(check.tip, tip);
+    let detail = check.detail.as_deref().expect("worker detail");
+    assert!(detail.contains("run by the worker"), "{detail}");
+    assert!(detail.contains(&tip[..7]), "{detail}");
+    let persisted = team
+        .persistence
+        .load()
+        .expect("load the persisted team")
+        .expect("persisted team");
+    let persisted_worker = persisted
+        .workers
+        .iter()
+        .find(|record| record.id == worker.id)
+        .expect("persisted worker");
+    assert_eq!(persisted_worker.checks.len(), 1);
+    assert_eq!(persisted_worker.checks[0].tip, tip);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_check_run_before_a_later_edit_is_not_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck2").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "tested\n").expect("tested edit");
+    let tested_tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the tested tree");
+    let allowed = allow_list();
+    let (name, observed_tree) = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &shell_result(0, Some(&tested_tree), Some(&tested_tree)),
+        &worker.worktree,
+        &allowed,
+    )
+    .expect("the measured passing command counts");
+    std::fs::write(worker.worktree.join("checked.txt"), "edited later\n")
+        .expect("edit after the test");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "commit the later edit"]);
+
+    finish_worker_checks(&team, &worker, HashMap::from([(name, observed_tree)])).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert!(
+        recorded.checks.is_empty(),
+        "a different committed tree must not inherit the earlier run: {:?}",
+        recorded.checks
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_foreign_or_unmeasured_run_is_not_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck3").await;
+    let foreign = tempfile::tempdir().expect("foreign cwd");
+    std::fs::write(worker.worktree.join("checked.txt"), "committed\n").expect("worker edit");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the committed tree");
+    let allowed = allow_list();
+    let cases = [
+        (
+            json!({ "command": "cargo test --workspace" }),
+            shell_result(1, Some(&tree), Some(&tree)),
+        ),
+        (
+            json!({
+                "command": "cargo test --workspace",
+                "cwd": foreign.path().display().to_string(),
+            }),
+            shell_result(0, Some(&tree), Some(&tree)),
+        ),
+        (
+            json!({ "command": "cargo test --workspace" }),
+            shell_result(0, None, None),
+        ),
+        (
+            json!({ "command": "cargo test --workspace --no-run" }),
+            shell_result(0, Some(&tree), Some(&tree)),
+        ),
+        (
+            json!({ "command": "cargo test --workspace" }),
+            shell_result(0, Some(&tree), Some("fedcba9876543210")),
+        ),
+    ];
+    let mut observations = HashMap::new();
+    for (args, result) in &cases {
+        if let Some((name, observed_tree)) =
+            counted_check("shell", args, result, &worker.worktree, &allowed)
+        {
+            observations.insert(name, observed_tree);
+        }
+    }
+
+    finish_worker_checks(&team, &worker, observations).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert!(recorded.checks.is_empty(), "{:?}", recorded.checks);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lead_check_with_the_same_name_still_replaces_it() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck4").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "committed\n").expect("worker edit");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the committed tree");
+    let allowed = allow_list();
+    let (name, observed_tree) = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &shell_result(0, Some(&tree), Some(&tree)),
+        &worker.worktree,
+        &allowed,
+    )
+    .expect("the measured passing command counts");
+    finish_worker_checks(&team, &worker, HashMap::from([(name.clone(), observed_tree)])).await;
+
+    let recorded = team
+        .record_check(
+            &worker.id,
+            name,
+            "passed".to_string(),
+            Some("recorded by the lead".to_string()),
+        )
+        .await
+        .expect("the lead check replaces the worker observation");
+
+    assert_eq!(recorded.checks.len(), 1);
+    assert_eq!(recorded.checks[0].name, "cargo test --workspace");
+    assert_eq!(
+        recorded.checks[0].detail.as_deref(),
+        Some("recorded by the lead")
+    );
+    team.shutdown().await;
+}
+
+/// A real `shell` tool call with equal `tree_before`/`tree_after` fields rides
+/// the whole pump path: the worker session executes the command for real, the
+/// pump keeps the observation, and the finished turn records the check bound
+/// to the committed tip.
+#[tokio::test]
+async fn a_real_shell_check_run_records_a_check_at_turn_end() {
+    let (root, _state, _config, team, mut events) = report_streak_team(vec![tool_call_batch(
+        "check-1",
+        "shell",
+        r#"{"command":"git status","purpose":"verify the checkout"}"#,
+    )])
+    .await;
+    std::fs::create_dir_all(root.path().join(".coding")).expect("checks dir");
+    std::fs::write(
+        root.path().join(".coding/checks.toml"),
+        "commands = [\"git status\"]\n",
+    )
+    .expect("checks.toml");
+    let worker = team
+        .dispatch("run the allowed check".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    // The pump records the checks BEFORE it forwards `Finished` — waiting for
+    // that event, not for the `Completed` status, proves the ordering.
+    loop {
+        let forwarded = forwarded_events(&mut events).await;
+        if forwarded
+            .iter()
+            .any(|event| matches!(event, SerializableAgentEvent::Finished { .. }))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let finished = team.worker(&worker.id).await.expect("worker record");
+
+    assert_eq!(finished.checks.len(), 1, "{:?}", finished.checks);
+    let check = &finished.checks[0];
+    assert_eq!(check.name, "git status");
+    assert_eq!(check.status, "passed");
+    let tip = phase3::tip(&finished.worktree).await.expect("worker tip");
+    assert_eq!(check.tip, tip);
+    let detail = check.detail.as_deref().expect("worker detail");
+    assert!(detail.contains("run by the worker"), "{detail}");
+    team.shutdown().await;
+}
+
 async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
     let session = team
         .spawn_worker_session(WorkerSessionSpec {
@@ -1704,6 +2221,7 @@ async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
             kind: "implementation".to_string(),
             trace_identity: TeamRuntime::worker_trace_identity(worker),
             pinned_task: None,
+            check_commands: std::sync::Arc::new(Vec::new()),
         })
         .await
         .expect("spawn worker session");
@@ -1755,7 +2273,7 @@ async fn a_half_removed_checkout_is_finished_after_merge() {
     deregister_worktree(root.path(), &worker.id);
     assert!(worker.worktree.join(".git").is_file());
 
-    cleanup_agent_worktree(root.path(), &worker)
+    cleanup_agent_worktree(root.path(), &worker, &[])
         .await
         .expect("finish removing the half-removed checkout");
 
@@ -1797,6 +2315,7 @@ async fn a_leftover_checkout_does_not_block_deleting_its_worker() {
                 kind: "implementation".to_string(),
                 trace_identity: TeamRuntime::worker_trace_identity(worker),
                 pinned_task: None,
+                check_commands: std::sync::Arc::new(Vec::new()),
             })
             .await
             .expect("open a worktree-bound session and its code graph");
@@ -1937,9 +2456,11 @@ async fn the_trash_sweep_removes_renamed_checkouts() {
     let record = worker(root.path(), "00000001000000000001");
     std::fs::create_dir_all(&record.worktree).expect("checkout folder");
     std::fs::write(record.worktree.join("note.txt"), "left\n").expect("checkout file");
-    let canonical = validated_checkout(root.path(), &record)
+    let canonical = validated_checkout(root.path(), &record, &[])
         .expect("the checkout validates")
-        .expect("it exists");
+        .expect("it exists")
+        .path()
+        .to_path_buf();
 
     move_checkout_to_trash(root.path(), &canonical)
         .await
@@ -2060,7 +2581,7 @@ async fn leftover_removal_never_leaves_the_worker_folder() {
     let main_marker = root.path().join("README.md");
     let original_main = std::fs::read(&main_marker).expect("main checkout marker");
 
-    cleanup_agent_worktree(root.path(), &leftover)
+    cleanup_agent_worktree(root.path(), &leftover, &[])
         .await
         .expect("remove only the leftover checkout");
     assert!(!leftover.worktree.exists());
@@ -2074,7 +2595,7 @@ async fn leftover_removal_never_leaves_the_worker_folder() {
     let outside_marker = outside.path().join("keep.txt");
     std::fs::write(&outside_marker, "outside\n").expect("outside marker");
     create_directory_link(&linked.worktree, outside.path());
-    let error = cleanup_agent_worktree(root.path(), &linked)
+    let error = cleanup_agent_worktree(root.path(), &linked, &[])
         .await
         .expect_err("a junction or symlink at the checkout path is refused");
     assert!(error.contains("refus"), "unexpected error: {error}");
@@ -2301,6 +2822,7 @@ async fn merge_closes_a_live_session_before_finishing_its_checkout() {
             kind: "implementation".to_string(),
             trace_identity: TeamRuntime::worker_trace_identity(&worker),
             pinned_task: None,
+            check_commands: std::sync::Arc::new(Vec::new()),
         })
         .await
         .expect("open a worktree-bound session and its code graph");
@@ -4219,6 +4741,191 @@ async fn finished_audit_releases_its_slot() {
     team.audit_dispatch(&target.id, "audittwo001", None, None, None)
         .await
         .expect("the released slot dispatches a fresh audit");
+    team.shutdown().await;
+}
+
+/// An audit that wrote its findings as its final message instead of calling
+/// `message_parent` still delivers a report (bug 2026-11-16): the pump takes
+/// the turn's final assistant text, records it as the report — the same
+/// `TeamMessage` and the same forwarded `message_parent` call — before the
+/// turn's `Finished` event, so the lead reads the report notice first and the
+/// audit frees its slot in the same pass.
+#[tokio::test]
+async fn an_audit_ending_with_plain_text_delivers_it_as_its_report() {
+    const FINDINGS: &str = "Audit findings: none.";
+    let (fixture, _notices) = nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings::default(),
+        None,
+        std::time::Duration::ZERO,
+        vec![vec![
+            // The audit writes its findings and ends its turn: it never
+            // calls message_parent (the fourthAud1 case).
+            mnemo::provider::LlmEvent::TextDelta {
+                text: FINDINGS.to_string(),
+            },
+            mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            },
+        ]],
+    )
+    .await;
+    let team = &fixture.team;
+    // The forwarded event stream: its order is the order of the lead's
+    // notices.
+    let mut events = team.subscribe();
+    // One slot: the audit itself is the only worker that may hold it.
+    team.persistence.slots.store(1, Ordering::SeqCst);
+    let mut target = worker(fixture._root.path(), "target00001");
+    target.plan_id = Some(fixture.plan_id.clone());
+    target.plan_step = Some(0);
+    provision_agent_worktree(
+        fixture._root.path().to_path_buf(),
+        target.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision the target checkout");
+    team.records.lock().await.push(target.clone());
+
+    let (audit, reused) = team
+        .audit_dispatch(&target.id, "auditworker1", None, None, None)
+        .await
+        .expect("dispatch the audit into the one slot");
+    assert!(!reused, "a fresh audit is not a reuse");
+    let audit_id = audit.id.clone();
+    let finished = eventually(|| async {
+        let record = team.worker(&audit_id).await.ok()?;
+        (record.status == WorkerStatus::Completed && record.report_delivered)
+            .then_some(record)
+    })
+    .await;
+    // The plain-text turn delivered a report, exactly as a message_parent
+    // call would have.
+    assert!(finished.report_delivered, "{finished:?}");
+    let reports: Vec<_> = team
+        .messages()
+        .await
+        .into_iter()
+        .filter(|message| message.worker_id == audit_id)
+        .collect();
+    assert_eq!(
+        reports.len(),
+        1,
+        "one report, not an empty or repeated one: {reports:?}"
+    );
+    assert_eq!(reports[0].text, FINDINGS, "{reports:?}");
+    // The report notice precedes the adjudication notice: the pump forwards
+    // the report as a `message_parent` call before the turn's `Finished`
+    // event.
+    let forwarded = forwarded_events(&mut events).await;
+    let report_at = forwarded
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                SerializableAgentEvent::HostToolCall { name, .. }
+                    if name.as_str() == "message_parent"
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("the report is forwarded as a message_parent call: {forwarded:?}")
+        });
+    let finished_at = forwarded
+        .iter()
+        .position(|event| matches!(event, SerializableAgentEvent::Finished { .. }))
+        .unwrap_or_else(|| panic!("the turn's finish is forwarded: {forwarded:?}"));
+    assert!(
+        report_at < finished_at,
+        "the report notice precedes the adjudication notice: {forwarded:?}"
+    );
+    // The reported audit released its session in the same pass.
+    eventually(|| async { (team.live.lock().await.is_empty()).then_some(()) }).await;
+    // The freed slot dispatches a fresh audit with no manual stop.
+    team.audit_dispatch(&target.id, "audittwo001", None, None, None)
+        .await
+        .expect("the released slot dispatches a fresh audit");
+    team.shutdown().await;
+}
+
+/// An audit that ends its turn with no text at all is asked for its report
+/// (bug 2026-11-16): one automatic host message tells it to send its findings
+/// through `message_parent`, and its session stays available to answer
+/// instead of being released with nothing delivered.
+#[tokio::test]
+async fn an_audit_ending_silently_is_asked_for_its_report_once() {
+    const ASK: &str = "Your audit report did not reach the lead. Send your complete findings with message_parent now, then end your turn.";
+    let (fixture, _notices) = nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings::default(),
+        None,
+        std::time::Duration::ZERO,
+        vec![
+            // The audit's first turn ends with no text and no report.
+            vec![mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            }],
+        ],
+    )
+    .await;
+    let team = &fixture.team;
+    team.persistence.slots.store(1, Ordering::SeqCst);
+    let mut target = worker(fixture._root.path(), "target00001");
+    target.plan_id = Some(fixture.plan_id.clone());
+    target.plan_step = Some(0);
+    provision_agent_worktree(
+        fixture._root.path().to_path_buf(),
+        target.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision the target checkout");
+    team.records.lock().await.push(target.clone());
+
+    let (audit, _reused) = team
+        .audit_dispatch(&target.id, "auditworker1", None, None, None)
+        .await
+        .expect("dispatch the audit into the one slot");
+    let audit_id = audit.id.clone();
+    let asked = eventually(|| async {
+        let record = team.worker(&audit_id).await.ok()?;
+        (!record.inbox.is_empty()).then_some(record)
+    })
+    .await;
+    // One automatic message, from the host, with the decided words.
+    assert_eq!(asked.inbox.len(), 1, "one automatic ask: {asked:?}");
+    assert_eq!(asked.inbox[0].sender, MessageSender::Mnemo, "{asked:?}");
+    assert_eq!(asked.inbox[0].kind, InboxKind::Prompt, "{asked:?}");
+    assert_eq!(asked.inbox[0].text, ASK, "{asked:?}");
+    // The silent turn delivered no empty report, and its session was not
+    // released: the ask's follow-up turn (the scripted default "done" text)
+    // is what carries the report and frees the slot.
+    let finished = eventually(|| async {
+        let record = team.worker(&audit_id).await.ok()?;
+        (record.status == WorkerStatus::Completed && record.report_delivered)
+            .then_some(record)
+    })
+    .await;
+    assert!(finished.report_delivered, "{finished:?}");
+    let reports: Vec<_> = team
+        .messages()
+        .await
+        .into_iter()
+        .filter(|message| message.worker_id == audit_id)
+        .collect();
+    assert_eq!(
+        reports.len(),
+        1,
+        "the silent turn delivered no report: {reports:?}"
+    );
+    assert_eq!(
+        reports[0].text, "done",
+        "the ask's follow-up turn carried the report: {reports:?}"
+    );
+    let final_record = team.worker(&audit_id).await.expect("the audit record");
+    assert_eq!(
+        final_record.inbox.len(),
+        1,
+        "exactly one ask, never a second: {final_record:?}"
+    );
     team.shutdown().await;
 }
 
@@ -9489,6 +10196,8 @@ async fn plan_read_reads_a_capability_spec() {
     assert!(current.success, "{}", current.output);
     assert_eq!(current.output, "# Tier ladder\n");
 
+    // An unknown name is an error naming the real capabilities, never a
+    // success that reads as "nothing to see".
     let missing = worker_host_tool_result(
         &messages,
         "planreader",
@@ -9498,10 +10207,10 @@ async fn plan_read_reads_a_capability_spec() {
         None,
     )
     .await;
-    assert!(missing.success, "{}", missing.output);
+    assert!(!missing.success, "{}", missing.output);
     assert_eq!(
         missing.output,
-        "No current spec for 'not-a-capability' yet."
+        "There is no OpenSpec capability named 'not-a-capability'. Known capabilities: tier-ladder. To re-read your plan, call plan_read with no arguments."
     );
 
     let invalid = worker_host_tool_result(
@@ -9515,6 +10224,115 @@ async fn plan_read_reads_a_capability_spec() {
     .await;
     assert!(!invalid.success);
     assert!(invalid.output.contains("invalid capability"), "{}", invalid.output);
+}
+
+/// Regression: an unknown capability name must fail with the list of real
+/// capabilities and directions to call plan_read without a capability.
+/// Bug root cause: PlanBoard::capability_spec returns success("No current
+/// spec for '<x>' yet.") even when '<x>' is not a known capability, so
+/// workers loop indefinitely on invented names (2026-11-16, oneRun01).
+#[tokio::test]
+async fn plan_read_with_an_unknown_capability_names_the_real_ones() {
+    let root = tempfile::tempdir().expect("workspace");
+    init_git(root.path());
+
+    // Create a known capability so we have real names to list.
+    std::fs::create_dir_all(root.path().join(".coding/openspec/specs/tier-ladder"))
+        .expect("create tier-ladder dir");
+    std::fs::write(
+        root.path().join(".coding/openspec/specs/tier-ladder/spec.md"),
+        "# Tier ladder\n",
+    )
+    .expect("spec file");
+
+    let board = PlanBoard::new(
+        root.path().join(".coding/plans"),
+        root.path().join(".coding/reviews"),
+    );
+    let board = Arc::new(board);
+    let messages = Arc::new(Mutex::new(Vec::new()));
+
+    // Calling with an unknown capability MUST return failure, listing the
+    // real capabilities and telling the worker to call plan_read without args.
+    let unknown = worker_host_tool_result(
+        &messages,
+        "planreader",
+        "plan_read",
+        &json!({"capability": "worker-checks-current-plan"}),
+        Some(&board),
+        None,
+    )
+    .await;
+
+    // THIS FAILS ON TODAY'S CODE: it returns success == true with
+    // "No current spec for 'worker-checks-current-plan' yet."
+    assert!(
+        !unknown.success,
+        "expected failure for unknown capability, got success: {}",
+        unknown.output
+    );
+    assert!(
+        unknown.output.contains("Known capabilities: tier-ladder"),
+        "expected 'Known capabilities: tier-ladder', got: {}",
+        unknown.output
+    );
+    assert!(
+        unknown.output.contains("call plan_read with no arguments"),
+        "expected direction to call plan_read without args, got: {}",
+        unknown.output
+    );
+}
+
+/// A real capability folder whose spec.md does not exist yet stays a success
+/// answer, and it too points the worker back at its plan.
+#[tokio::test]
+async fn plan_read_known_capability_without_a_spec_points_back_at_the_plan() {
+    let root = tempfile::tempdir().expect("workspace");
+    init_git(root.path());
+    std::fs::create_dir_all(root.path().join(".coding/openspec/specs/empty-capability"))
+        .expect("capability dir");
+    let board = Arc::new(PlanBoard::new(
+        root.path().join(".coding/plans"),
+        root.path().join(".coding/reviews"),
+    ));
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let current = worker_host_tool_result(
+        &messages,
+        "planreader",
+        "plan_read",
+        &json!({"capability": "empty-capability"}),
+        Some(&board),
+        None,
+    )
+    .await;
+    assert!(current.success, "{}", current.output);
+    assert_eq!(
+        current.output,
+        "No current spec for 'empty-capability' yet. To re-read your plan, call plan_read with no arguments."
+    );
+
+    // No capability folders at all: the error says "none" rather than an
+    // empty list.
+    let bare_root = tempfile::tempdir().expect("bare workspace");
+    init_git(bare_root.path());
+    let bare_board = Arc::new(PlanBoard::new(
+        bare_root.path().join(".coding/plans"),
+        bare_root.path().join(".coding/reviews"),
+    ));
+    let none = worker_host_tool_result(
+        &messages,
+        "planreader",
+        "plan_read",
+        &json!({"capability": "invented"}),
+        Some(&bare_board),
+        None,
+    )
+    .await;
+    assert!(!none.success, "{}", none.output);
+    assert_eq!(
+        none.output,
+        "There is no OpenSpec capability named 'invented'. Known capabilities: none. To re-read your plan, call plan_read with no arguments."
+    );
 }
 
 #[tokio::test]
@@ -9964,6 +10782,843 @@ async fn legacy_review_rounds_without_a_turn_count_never_escalate() {
         second.model.as_deref(),
         Some("test/scripted-simple"),
         "{second:?}"
+    );
+    team.shutdown().await;
+}
+
+
+async fn provision_pool_worker(team: &TeamRuntime, id: &str) -> WorkerRecord {
+    team.provision_worker(
+        "pool test worker".to_string(),
+        None,
+        None,
+        None,
+        Some(id.to_string()),
+        "standard".to_string(),
+        None,
+        None,
+    )
+    .await
+    .expect("provision pool worker")
+}
+
+async fn make_worker_reviewable(team: &TeamRuntime, worker: &WorkerRecord) {
+    let file = format!("merged-{}.txt", worker.id);
+    std::fs::write(worker.worktree.join(&file), "merged\n").expect("worker change");
+    run_git(&worker.worktree, &["add", &file]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+    team.update_worker(&worker.id, |current| {
+        current.status = WorkerStatus::InReview;
+        current.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        current.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip: tip.clone(),
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+            lane: None,
+        });
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn two_live_workers_get_different_pool_checkouts() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    let first = provision_pool_worker(&team, "poola0001").await;
+    let second = provision_pool_worker(&team, "poolb0001").await;
+    let third = provision_pool_worker(&team, "poolc0001").await;
+
+    for (worker, name) in [(&first, "pool-1"), (&second, "pool-2"), (&third, "pool-3")] {
+        assert_eq!(worker.worktree.file_name().and_then(|name| name.to_str()), Some(name));
+        assert!(worker.worktree.join(".git").is_file());
+    }
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_dispatches_never_share_a_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    let (first, second) = tokio::join!(
+        provision_pool_worker(&team, "conca0001"),
+        provision_pool_worker(&team, "concb0001"),
+    );
+
+    assert_ne!(first.worktree, second.worktree);
+    assert!(first.worktree.join(".git").is_file());
+    assert!(second.worktree.join(".git").is_file());
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn a_merged_workers_pool_is_reused_by_the_next_dispatch() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    std::fs::write(root.path().join(".git/info/exclude"), "target/\nnode_modules/\n")
+        .expect("ignore build caches");
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let first = provision_pool_worker(&team, "mergea0001").await;
+    let pool = first.worktree.clone();
+    std::fs::create_dir_all(pool.join("target")).expect("target cache");
+    std::fs::write(pool.join("target/warm.txt"), "warm\n").expect("warm cache");
+    std::fs::create_dir_all(pool.join(".coding/tmp")).expect("leftover dir");
+    std::fs::write(pool.join(".coding/tmp/stale.txt"), "stale\n").expect("ignored leftover");
+    make_worker_reviewable(&team, &first).await;
+
+    let merged = team.merge(&first.id).await.expect("merge pool worker");
+    assert!(merged.worktree.as_os_str().is_empty());
+    assert!(pool.exists());
+    let detached = phase3::git(&pool, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .expect("detached pool HEAD");
+    assert!(detached.status.success());
+    assert_eq!(String::from_utf8_lossy(&detached.stdout).trim(), "HEAD");
+    assert_eq!(
+        std::fs::read_to_string(pool.join("target/warm.txt")).expect("cache survives"),
+        "warm\n"
+    );
+    let branches = phase3::git(root.path(), &["branch", "--list", &first.branch])
+        .await
+        .expect("list worker branch");
+    assert!(branches.status.success());
+    assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
+
+    let mut saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load merged ledger")
+        .expect("saved ledger");
+    assert!(
+        saved
+            .workers
+            .iter()
+            .find(|worker| worker.id == first.id)
+            .expect("merged record on disk")
+            .worktree
+            .as_os_str()
+            .is_empty(),
+        "clearing the pool path is persisted before the next operation"
+    );
+    team.shutdown().await;
+
+    // Simulate the crash window fixed by startup repair: the checkout is
+    // detached but the old ledger still says this Merged record holds it.
+    saved
+        .workers
+        .iter_mut()
+        .find(|worker| worker.id == first.id)
+        .expect("merged record")
+        .worktree = pool.clone();
+    TeamPersistence::new(state.path())
+        .save(&saved)
+        .expect("save stale pool record");
+    let team = open_test_team(root.path(), state.path(), saved.workers.clone()).await;
+    assert!(
+        team.worker(&first.id)
+            .await
+            .expect("reloaded merged worker")
+            .worktree
+            .as_os_str()
+            .is_empty(),
+        "startup repairs the detached pool record"
+    );
+    let repaired = TeamPersistence::new(state.path())
+        .load()
+        .expect("load repaired ledger")
+        .expect("repaired ledger");
+    assert!(
+        repaired.workers[0].worktree.as_os_str().is_empty(),
+        "startup repair is persisted"
+    );
+
+    let second = provision_pool_worker(&team, "mergeb0001").await;
+    assert_eq!(second.worktree, pool);
+    assert_eq!(second.branch, agent_branch(&second.id));
+    assert_eq!(
+        std::fs::read_to_string(pool.join("target/warm.txt")).expect("cache remains warm"),
+        "warm\n"
+    );
+    assert!(!pool.join(".coding/tmp/stale.txt").exists());
+    assert_eq!(
+        mnemo::app::worktrees::current_branch(&pool).expect("reused pool branch"),
+        second.branch
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn deleting_a_failed_worker_discards_and_frees_its_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    std::fs::write(root.path().join(".git/info/exclude"), "target/\n")
+        .expect("ignore build cache");
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let failed = provision_pool_worker(&team, "deletea001").await;
+    team.update_worker(&failed.id, |worker| worker.status = WorkerStatus::Failed)
+        .await;
+    std::fs::write(failed.worktree.join("README.md"), "dirty\n").expect("dirty checkout");
+    std::fs::write(failed.worktree.join("untracked.txt"), "discard\n")
+        .expect("untracked change");
+    std::fs::create_dir_all(failed.worktree.join("target")).expect("target cache");
+    std::fs::write(failed.worktree.join("target/warm.txt"), "warm\n")
+        .expect("warm cache");
+
+    let preview = team
+        .deletion_preview(std::slice::from_ref(&failed.id))
+        .await
+        .expect("pool deletion preview");
+    assert!(preview[0].pool);
+    assert!(preview[0].checkout);
+    assert!(preview[0].uncommitted);
+    team.delete_workers(std::slice::from_ref(&failed.id), true)
+        .await
+        .expect("delete failed worker");
+    assert!(failed.worktree.exists());
+    assert_eq!(
+        std::fs::read_to_string(failed.worktree.join("README.md"))
+            .expect("reset tracked file")
+            .trim(),
+        "seed"
+    );
+    assert!(!failed.worktree.join("untracked.txt").exists());
+    assert!(failed.worktree.join("target/warm.txt").exists());
+
+    let next = provision_pool_worker(&team, "deleteb001").await;
+    assert_eq!(next.worktree, failed.worktree);
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn legacy_agent_checkouts_still_merge_and_delete() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mergeable = worker(root.path(), "legacya0001");
+    let failed = worker(root.path(), "legacyb0001");
+    for worker in [&mergeable, &failed] {
+        run_git(
+            root.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &worker.branch,
+                worker.worktree.to_str().expect("checkout path"),
+                "wt/mnemo",
+            ],
+        );
+    }
+    let team = open_test_team(
+        root.path(),
+        state.path(),
+        vec![mergeable.clone(), failed.clone()],
+    )
+    .await;
+    make_worker_reviewable(&team, &mergeable).await;
+    team.update_worker(&failed.id, |worker| worker.status = WorkerStatus::Failed)
+        .await;
+
+    team.merge(&mergeable.id).await.expect("merge legacy worker");
+    team.delete_workers(std::slice::from_ref(&failed.id), false)
+        .await
+        .expect("delete legacy worker");
+
+    assert!(!mergeable.worktree.exists());
+    assert!(!failed.worktree.exists());
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn a_dirty_free_pool_is_never_reused() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let dirty = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            dirty.to_str().expect("dirty pool path"),
+            "main",
+        ],
+    );
+    std::fs::write(dirty.join("uncommitted.txt"), "keep\n").expect("dirty pool change");
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    let worker = provision_pool_worker(&team, "dirtya0001").await;
+
+    assert_eq!(worker.worktree.file_name().and_then(|name| name.to_str()), Some("pool-2"));
+    assert_eq!(
+        std::fs::read_to_string(dirty.join("uncommitted.txt")).expect("dirty pool is untouched"),
+        "keep\n"
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pool_held_by_another_record_is_blocked_in_preview_and_deletion() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let first = provision_pool_worker(&team, "shareda01").await;
+    team.update_worker(&first.id, |worker| worker.status = WorkerStatus::Failed)
+        .await;
+    let mut second = first.clone();
+    second.id = "sharedb01".to_string();
+    second.name = second.id.clone();
+    second.branch = agent_branch(&second.id);
+    team.records.lock().await.push(second);
+
+    let preview = team
+        .deletion_preview(std::slice::from_ref(&first.id))
+        .await
+        .expect("pool deletion preview");
+    let blocked = preview[0].blocked.as_deref().expect("preview is blocked");
+    assert!(blocked.contains("another worker record holds"), "{blocked}");
+
+    let outcome = team
+        .delete_workers(std::slice::from_ref(&first.id), true)
+        .await
+        .expect("the batch reports the guard failure");
+    let error = outcome.results[0].error.as_deref().expect("deletion refused");
+    assert!(error.contains("another worker record holds"), "{error}");
+    assert!(team.worker(&first.id).await.is_ok());
+    assert!(branch_exists(root.path(), &first.branch).await);
+    assert_eq!(
+        mnemo::app::worktrees::current_branch(&first.worktree).expect("unchanged pool branch"),
+        first.branch
+    );
+    team.shutdown().await;
+}
+
+
+fn assert_saved_worktree_empty(state: &std::path::Path, worker_id: &str) {
+    let saved = TeamPersistence::new(state)
+        .load()
+        .expect("load saved team")
+        .expect("saved team");
+    let worker = saved
+        .workers
+        .iter()
+        .find(|worker| worker.id == worker_id)
+        .expect("saved worker");
+    assert!(worker.worktree.as_os_str().is_empty(), "saved worktree for {worker_id}");
+}
+
+#[tokio::test]
+async fn retry_after_a_lost_detach_save_persists_and_reuses_the_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let mut stale = worker(root.path(), "retrysave01");
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &stale.branch,
+            pool.to_str().expect("pool path"),
+            "main",
+        ],
+    );
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), stale.branch.clone())
+        .await
+        .expect("detach before the lost save");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Merged;
+    stale.error = Some(format!("{WORKTREE_CLEANUP_ERROR}: simulated lost save"));
+
+    let team = open_test_team(root.path(), state.path(), vec![stale.clone()]).await;
+
+    assert!(team.worker(&stale.id).await.expect("retried worker").worktree.as_os_str().is_empty());
+    assert_saved_worktree_empty(state.path(), &stale.id);
+    let next = provision_pool_worker(&team, "retrynext01").await;
+    assert_eq!(next.worktree, pool);
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn merging_recovery_after_a_lost_detach_save_persists_and_reuses_the_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mut stale = worker(root.path(), "recovsave01");
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &stale.branch,
+            pool.to_str().expect("pool path"),
+            "wt/mnemo",
+        ],
+    );
+    std::fs::write(pool.join("merged.txt"), "merged\n").expect("worker change");
+    run_git(&pool, &["add", "merged.txt"]);
+    run_git(&pool, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&pool).await.expect("worker tip");
+    run_git(
+        root.path(),
+        &["merge", "--no-ff", &stale.branch, "-m", "merge worker"],
+    );
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), stale.branch.clone())
+        .await
+        .expect("detach before the lost save");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Merging;
+    stale.review = Some(ReviewRecord {
+        summary: "reviewed before recovery".into(),
+        tip: tip.clone(),
+        reviewed_at_ms: 1,
+        evidence: Some(evidence()),
+        lane: None,
+    });
+    stale.checks = vec![WorkerCheck {
+        name: "cargo test --workspace".into(),
+        status: "passed".into(),
+        detail: None,
+        tip,
+    }];
+
+    let team = open_test_team(root.path(), state.path(), vec![stale.clone()]).await;
+
+    let recovered = team.worker(&stale.id).await.expect("recovered worker");
+    assert_eq!(recovered.status, WorkerStatus::Merged);
+    assert!(recovered.worktree.as_os_str().is_empty());
+    assert_saved_worktree_empty(state.path(), &stale.id);
+    let next = provision_pool_worker(&team, "recovnext01").await;
+    assert_eq!(next.worktree, pool);
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn workspace_cleanup_after_a_lost_detach_save_persists_and_reuses_the_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let mut stale = worker(root.path(), "cleansave01");
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &stale.branch,
+            pool.to_str().expect("pool path"),
+            "main",
+        ],
+    );
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), stale.branch.clone())
+        .await
+        .expect("detach before the lost save");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Stopped;
+    let persistence = TeamPersistence::new(state.path());
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![stale.clone()],
+            slots: Some(2),
+            usage: ProjectUsage::default(),
+        })
+        .expect("save stale cleanup record");
+
+    let report = cleanup_workspace(
+        root.path(),
+        state.path(),
+        &state.path().join("dispatch_routing.jsonl"),
+    )
+    .await
+    .expect("retry workspace cleanup");
+
+    assert_eq!(report.removed, vec![stale.branch.clone()]);
+    assert_saved_worktree_empty(state.path(), &stale.id);
+    let saved = persistence.load().expect("load cleaned team").expect("cleaned team");
+    let team = open_test_team(root.path(), state.path(), saved.workers).await;
+    let next = provision_pool_worker(&team, "cleannext01").await;
+    assert_eq!(next.worktree, pool);
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn a_dirty_detached_pool_keeps_its_merged_record() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            pool.to_str().expect("pool path"),
+            "main",
+        ],
+    );
+    std::fs::write(pool.join("dirty.txt"), "keep\n").expect("dirty detached pool");
+    let mut stale = worker(root.path(), "dirtyrepair1");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Merged;
+
+    let team = open_test_team(root.path(), state.path(), vec![stale.clone()]).await;
+
+    assert_eq!(team.worker(&stale.id).await.expect("dirty worker").worktree, pool);
+    let saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load dirty team")
+        .expect("dirty team");
+    assert_eq!(saved.workers[0].worktree, pool);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_missing_held_pool_still_reserves_its_index() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    std::fs::create_dir_all(root.path().join(".worktrees/pool-1")).expect("pool-1 folder");
+    let mut held = worker(root.path(), "heldpool01");
+    held.worktree = root.path().join(".worktrees/pool-2");
+    held.status = WorkerStatus::Failed;
+    assert!(!held.worktree.exists());
+    let team = open_test_team(root.path(), state.path(), vec![held.clone()]).await;
+
+    let next = provision_pool_worker(&team, "nextpool01").await;
+
+    assert_eq!(next.worktree, root.path().join(".worktrees/pool-3"));
+    assert!(!held.worktree.exists(), "the held missing pool is not recreated");
+    team.shutdown().await;
+}
+
+
+async fn assert_detached_pool_can_be_deleted(dirty: bool) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let worker_id = if dirty { "detachdirty1" } else { "detachclean1" };
+    let failed = provision_pool_worker(&team, worker_id).await;
+    team.update_worker(&failed.id, |worker| worker.status = WorkerStatus::Failed)
+        .await;
+    let pool = failed.worktree.clone();
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), failed.branch.clone())
+        .await
+        .expect("detach before the lost deletion save");
+    if dirty {
+        std::fs::write(pool.join("dirty.txt"), "discard\n").expect("dirty detached pool");
+    }
+
+    let preview = team
+        .deletion_preview(std::slice::from_ref(&failed.id))
+        .await
+        .expect("detached pool preview");
+    assert!(preview[0].pool);
+    assert!(preview[0].blocked.is_none(), "{:?}", preview[0].blocked);
+    assert_eq!(preview[0].uncommitted, dirty);
+    let outcome = team
+        .delete_workers(std::slice::from_ref(&failed.id), true)
+        .await
+        .expect("delete detached pool worker");
+    assert!(outcome.results[0].error.is_none(), "{:?}", outcome.results[0].error);
+    assert!(team.worker(&failed.id).await.is_err());
+    assert!(!branch_exists(root.path(), &failed.branch).await);
+    assert!(pool.exists());
+    assert!(!pool.join("dirty.txt").exists());
+    let saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load after deletion")
+        .expect("saved team");
+    assert!(saved.workers.iter().all(|worker| worker.id != failed.id));
+
+    let next_id = if dirty { "detachednext2" } else { "detachednext1" };
+    let next = provision_pool_worker(&team, next_id).await;
+    assert_eq!(next.worktree, pool);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn detached_failed_worker_pools_can_be_deleted_clean_or_dirty_and_reused() {
+    assert_detached_pool_can_be_deleted(false).await;
+    assert_detached_pool_can_be_deleted(true).await;
+}
+
+
+#[tokio::test]
+async fn retry_save_failure_is_best_effort_for_the_merge_caller() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let mut stale = worker(root.path(), "retrysave02");
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &stale.branch,
+            pool.to_str().expect("pool path"),
+            "main",
+        ],
+    );
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), stale.branch.clone())
+        .await
+        .expect("detach the retry candidate");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Merged;
+    stale.error = Some(format!("{WORKTREE_CLEANUP_ERROR}: retry save failure"));
+    let mut just_merged = worker(root.path(), "justmerge01");
+    just_merged.status = WorkerStatus::Merged;
+    team.records.lock().await.push(stale.clone());
+    team.records.lock().await.push(just_merged.clone());
+    team.persist().await.expect("save before the injected failure");
+
+    let transcript = state
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join(format!("{}.json", stale.id));
+    std::fs::create_dir(&transcript).expect("make the transcript rename fail");
+
+    // Unit contract for the cleanup retry used after a merge: this other
+    // worker's save failure cannot become an error after the just-merged
+    // worker's own required save.
+    team.retry_leftover_cleanups().await;
+
+    let retried = team.worker(&stale.id).await.expect("retried worker");
+    assert!(retried.worktree.as_os_str().is_empty());
+    assert!(retried.error.is_none());
+    let merged = team
+        .worker(&just_merged.id)
+        .await
+        .expect("the merge caller still has its merged record");
+    assert_eq!(merged.status, WorkerStatus::Merged);
+    std::fs::remove_dir(&transcript).expect("unblock the transcript path");
+    let saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load the old ledger")
+        .expect("old ledger");
+    let saved_stale = saved
+        .workers
+        .iter()
+        .find(|worker| worker.id == stale.id)
+        .expect("stale worker on disk");
+    assert_eq!(saved_stale.worktree, pool, "the injected save really failed");
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn an_unregistered_pool_is_left_alone_and_never_touches_the_lead_edit() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let pool = root.path().join(".worktrees/pool-1");
+    std::fs::create_dir_all(&pool).expect("plain unregistered pool");
+    std::fs::write(pool.join("marker.txt"), "keep\n").expect("pool marker");
+    let mut failed = worker(root.path(), "unregpool01");
+    failed.worktree = pool.clone();
+    failed.status = WorkerStatus::Failed;
+    run_git(root.path(), &["branch", &failed.branch]);
+    std::fs::write(root.path().join("README.md"), "uncommitted lead edit\n")
+        .expect("lead edit");
+    let team = open_test_team(root.path(), state.path(), vec![failed.clone()]).await;
+
+    let preview = team
+        .deletion_preview(std::slice::from_ref(&failed.id))
+        .await
+        .expect("unregistered pool preview");
+    assert!(preview[0].blocked.is_none());
+    assert!(preview[0].pool && preview[0].checkout);
+    let release = release_pool_checkout(
+        root.path().to_path_buf(),
+        pool.clone(),
+        failed.branch.clone(),
+    )
+    .await
+    .expect_err("unregistered release refuses");
+    assert!(release.contains("registered"), "{release}");
+    let discard = discard_and_release_pool_checkout(
+        root.path().to_path_buf(),
+        pool.clone(),
+        failed.branch.clone(),
+    )
+    .await
+    .expect_err("unregistered discard refuses");
+    assert!(discard.contains("registered"), "{discard}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("README.md")).expect("lead edit survives"),
+        "uncommitted lead edit\n"
+    );
+
+    let outcome = team
+        .delete_workers(std::slice::from_ref(&failed.id), true)
+        .await
+        .expect("delete unregistered pool record");
+    assert!(outcome.results[0].error.is_none());
+    assert!(team.worker(&failed.id).await.is_err());
+    assert!(!branch_exists(root.path(), &failed.branch).await);
+    assert_eq!(
+        std::fs::read_to_string(pool.join("marker.txt")).expect("unregistered folder remains"),
+        "keep\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("README.md")).expect("lead edit remains"),
+        "uncommitted lead edit\n"
+    );
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn a_detached_pool_behind_its_branch_refuses_to_merge() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let worker = provision_pool_worker(&team, "mergeguard1").await;
+    make_worker_reviewable(&team, &worker).await;
+    let reviewed_tip = phase3::tip(&worker.worktree).await.expect("reviewed tip A");
+    std::fs::write(worker.worktree.join("branch-b.txt"), "B\n").expect("branch B change");
+    run_git(&worker.worktree, &["add", "branch-b.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "branch advances to B"]);
+    let branch_tip = phase3::tip(&worker.worktree).await.expect("branch tip B");
+    assert_ne!(reviewed_tip, branch_tip);
+    run_git(
+        &worker.worktree,
+        &["switch", "--detach", &reviewed_tip],
+    );
+    let lead_tip = phase3::tip(root.path()).await.expect("lead tip before refusal");
+
+    let error = team.merge(&worker.id).await.expect_err("detached A cannot merge B");
+
+    assert_eq!(
+        error,
+        "the worker checkout is not on its branch; refusing to merge"
+    );
+    assert_eq!(
+        phase3::tip(root.path()).await.expect("lead tip after refusal"),
+        lead_tip
+    );
+    assert_eq!(
+        team.worker(&worker.id).await.expect("worker after refusal").status,
+        WorkerStatus::InReview
+    );
+    assert_eq!(
+        phase3::git_value(root.path(), &["rev-parse", &worker.branch])
+            .await
+            .expect("branch tip after refusal"),
+        branch_tip
+    );
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn merge_tip_pins_the_reviewed_commit_after_the_branch_advances() {
+    let root = tempfile::tempdir().expect("workspace");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let checkout = root.path().join(".worktrees/tip-worker");
+    let branch = "wt/agent-immutable01";
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            checkout.to_str().expect("worker checkout"),
+            "wt/mnemo",
+        ],
+    );
+    std::fs::write(checkout.join("a.txt"), "reviewed A\n").expect("reviewed change");
+    run_git(&checkout, &["add", "a.txt"]);
+    run_git(&checkout, &["commit", "-m", "reviewed A"]);
+    let reviewed = phase3::tip(&checkout).await.expect("reviewed tip");
+    std::fs::write(checkout.join("b.txt"), "later B\n").expect("later change");
+    run_git(&checkout, &["add", "b.txt"]);
+    run_git(&checkout, &["commit", "-m", "later B"]);
+    let later = phase3::tip(&checkout).await.expect("later branch tip");
+
+    let output = merge_tip(root.path(), &reviewed, "merge exact reviewed tip")
+        .await
+        .expect("run exact-tip merge");
+    assert!(output.status.success(), "{}", phase3::git_error(&["merge"], &output));
+
+    assert_eq!(
+        phase3::git_value(root.path(), &["rev-parse", "HEAD^2"])
+            .await
+            .expect("merge second parent"),
+        reviewed
+    );
+    assert_eq!(
+        phase3::git_value(root.path(), &["rev-parse", branch])
+            .await
+            .expect("advanced branch remains"),
+        later
+    );
+    assert!(!root.path().join("b.txt").exists(), "later B is not merged");
+}
+
+
+#[tokio::test]
+async fn unregistered_pool_is_rejected_before_worker_cleanliness_or_tip_probes() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mut worker = worker(root.path(), "guardorder1");
+    worker.worktree = root.path().join(".worktrees/pool-1");
+    worker.status = WorkerStatus::InReview;
+    std::fs::create_dir_all(&worker.worktree).expect("plain pool folder");
+    // If merge probes this folder before checking registration, Git fails on
+    // this malformed gitfile instead of returning the registration refusal.
+    std::fs::write(worker.worktree.join(".git"), "not a gitfile\n").expect("invalid gitfile");
+    run_git(root.path(), &["branch", &worker.branch]);
+    let lead_tip = phase3::tip(root.path()).await.expect("lead tip");
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+
+    let error = team.merge(&worker.id).await.expect_err("unregistered pool refused");
+
+    assert!(error.contains("not a registered worktree"), "{error}");
+    assert!(!error.contains("gitfile"), "worker Git was probed first: {error}");
+    assert_eq!(phase3::tip(root.path()).await.expect("unchanged lead"), lead_tip);
+    assert_eq!(
+        team.worker(&worker.id).await.expect("unchanged worker").status,
+        WorkerStatus::InReview
     );
     team.shutdown().await;
 }

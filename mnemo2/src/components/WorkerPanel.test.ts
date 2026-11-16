@@ -138,6 +138,7 @@ function makeTeamTransport(records: TeamWorkerRecord[]): TeamTransport & { emit:
         branch: current.find((worker) => worker.id === id)?.branch ?? `wt/agent-${id}`,
         live: false,
         checkout: true,
+        pool: false,
         uncommitted: false,
         unmerged_commits: 0,
         shared_branch: false,

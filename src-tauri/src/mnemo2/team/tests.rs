@@ -10085,6 +10085,53 @@ async fn a_merged_workers_pool_is_reused_by_the_next_dispatch() {
     assert!(branches.status.success());
     assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
 
+    let mut saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load merged ledger")
+        .expect("saved ledger");
+    assert!(
+        saved
+            .workers
+            .iter()
+            .find(|worker| worker.id == first.id)
+            .expect("merged record on disk")
+            .worktree
+            .as_os_str()
+            .is_empty(),
+        "clearing the pool path is persisted before the next operation"
+    );
+    team.shutdown().await;
+
+    // Simulate the crash window fixed by startup repair: the checkout is
+    // detached but the old ledger still says this Merged record holds it.
+    saved
+        .workers
+        .iter_mut()
+        .find(|worker| worker.id == first.id)
+        .expect("merged record")
+        .worktree = pool.clone();
+    TeamPersistence::new(state.path())
+        .save(&saved)
+        .expect("save stale pool record");
+    let team = open_test_team(root.path(), state.path(), saved.workers.clone()).await;
+    assert!(
+        team.worker(&first.id)
+            .await
+            .expect("reloaded merged worker")
+            .worktree
+            .as_os_str()
+            .is_empty(),
+        "startup repairs the detached pool record"
+    );
+    let repaired = TeamPersistence::new(state.path())
+        .load()
+        .expect("load repaired ledger")
+        .expect("repaired ledger");
+    assert!(
+        repaired.workers[0].worktree.as_os_str().is_empty(),
+        "startup repair is persisted"
+    );
+
     let second = provision_pool_worker(&team, "mergeb0001").await;
     assert_eq!(second.worktree, pool);
     assert_eq!(second.branch, agent_branch(&second.id));
@@ -10216,7 +10263,7 @@ async fn a_dirty_free_pool_is_never_reused() {
 }
 
 #[tokio::test]
-async fn a_pool_held_by_another_record_cannot_be_discarded() {
+async fn a_pool_held_by_another_record_is_blocked_in_preview_and_deletion() {
     let root = tempfile::tempdir().expect("workspace");
     let state = tempfile::tempdir().expect("state");
     init_git(root.path());
@@ -10229,6 +10276,13 @@ async fn a_pool_held_by_another_record_cannot_be_discarded() {
     second.name = second.id.clone();
     second.branch = agent_branch(&second.id);
     team.records.lock().await.push(second);
+
+    let preview = team
+        .deletion_preview(std::slice::from_ref(&first.id))
+        .await
+        .expect("pool deletion preview");
+    let blocked = preview[0].blocked.as_deref().expect("preview is blocked");
+    assert!(blocked.contains("another worker record holds"), "{blocked}");
 
     let outcome = team
         .delete_workers(std::slice::from_ref(&first.id), true)

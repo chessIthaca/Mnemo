@@ -457,6 +457,7 @@ impl TeamRuntime {
                         worker.worktree = PathBuf::new();
                     })
                     .await;
+                    self.persist().await?;
                 }
                 // The checkout no longer holds the branch. The
                 // merge commit keeps the worker's tip as its second parent, so
@@ -562,6 +563,9 @@ impl TeamRuntime {
                 }
             })
             .await;
+            if pool {
+                let _ = self.persist().await;
+            }
             cleared = true;
         }
         if cleared {

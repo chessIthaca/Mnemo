@@ -402,6 +402,13 @@ fn provision_pool_checkout_impl(
     let registered = registered_worktrees(main_root)?;
     let pools = existing_pool_entries(main_root)?;
     for (_, pool, is_dir) in &pools {
+        if let Err(error) = ensure_pool_checkout(main_root, pool) {
+            eprintln!(
+                "mnemo: pool checkout {} failed its safety guard: {error}; skipped",
+                pool.display()
+            );
+            continue;
+        }
         if !is_dir {
             eprintln!("mnemo: pool checkout {} is not a directory; skipped", pool.display());
             continue;
@@ -719,6 +726,34 @@ mod tests {
         git_raw(dir.path(), &["add", "-A"]).unwrap();
         git_raw(dir.path(), &["commit", "-m", "init"]).unwrap();
         dir
+    }
+
+    fn create_directory_link(link: &Path, target: &Path) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            let link = link.to_string_lossy().replace('/', "\\");
+            let target = target.to_string_lossy().replace('/', "\\");
+            let output = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).into_owned())
+            }
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).map_err(|error| error.to_string())
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = (link, target);
+            Err("directory links are unsupported on this platform".to_string())
+        }
     }
 
     /// `init_repo` plus a committed `.gitignore` that ignores the pool build
@@ -1053,6 +1088,54 @@ mod tests {
             "the attached pool keeps its branch"
         );
         assert_eq!(current_branch(&pool_c).expect("branch c"), branch_c);
+    }
+
+    #[tokio::test]
+    async fn a_linked_pool_is_skipped_without_touching_its_target() {
+        let repo = init_repo();
+        let pool = repo.path().join(".worktrees/pool-1");
+        git_raw(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                pool.to_str().expect("pool path"),
+                "main",
+            ],
+        )
+        .expect("register detached pool");
+        let target = repo.path().join("linked-checkout");
+        std::fs::rename(&pool, &target).expect("move the real checkout aside");
+        if let Err(error) = create_directory_link(&pool, &target) {
+            eprintln!("cannot create the pool directory link ({error}); skipping this test");
+            return;
+        }
+        std::fs::write(target.join("marker.txt"), "untouched\n").expect("target marker");
+
+        let checkout = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-linked".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision past the linked pool");
+
+        assert_eq!(pool_index(&checkout), Some(2));
+        assert_eq!(
+            std::fs::read_to_string(target.join("marker.txt")).expect("marker survives"),
+            "untouched\n"
+        );
+        assert_eq!(
+            git_raw(&target, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .expect("target HEAD")
+                .trim(),
+            "HEAD",
+            "no switch runs through the link"
+        );
+        let metadata = std::fs::symlink_metadata(&pool).expect("linked pool metadata");
+        assert!(is_link_or_junction(&metadata), "the link itself is left in place");
     }
 
     #[tokio::test]

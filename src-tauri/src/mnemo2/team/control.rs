@@ -21,7 +21,7 @@ use crate::mnemo2::dispatch_routing::{
     DispatchRoutingRow, RoutingMode, TEXT_MAX_CHARS, classify_dispatch,
 };
 
-use super::deletion::{CheckoutKind, worker_checkout};
+use super::deletion::{CheckoutKind, validated_checkout, worker_checkout};
 use super::{
     LiveWorker, RECOVERED_WORKTREE_CLEANUP_ERROR, TeamRuntime, WorkerSessionSpec,
     cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key,
@@ -830,6 +830,27 @@ pub(super) async fn recover_worker(
     if worker.total_tokens == 0 && worker.used_tokens > 0 {
         worker.total_tokens = worker.used_tokens as u64;
         worker.prompt_tokens = worker.used_tokens as u64;
+    }
+    // A crash between detaching a merged pool and saving its cleared record
+    // leaves a stale path on disk. The pool is already free; clear the record
+    // during recovery and let TeamRuntime::open's existing persist save it.
+    if worker.status == WorkerStatus::Merged && worker.error.is_none() {
+        let detached_pool = match worker_checkout(root, worker) {
+            Some(CheckoutKind::Pool(_)) => match validated_checkout(root, worker, other_worktrees) {
+                Ok(Some(CheckoutKind::Pool(canonical))) => phase3::git_value(
+                    &canonical,
+                    &["rev-parse", "--abbrev-ref", "HEAD"],
+                )
+                .await
+                .ok()
+                .is_some_and(|head| head.trim() == "HEAD"),
+                _ => false,
+            },
+            _ => false,
+        };
+        if detached_pool {
+            worker.worktree = PathBuf::new();
+        }
     }
     if worker.status == WorkerStatus::Merging {
         let merge_head = phase3::git(root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;

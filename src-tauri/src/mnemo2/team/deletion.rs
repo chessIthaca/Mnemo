@@ -1059,7 +1059,8 @@ impl TeamRuntime {
         }
         core.checkout_exists = std::fs::symlink_metadata(&core.checkout).is_ok();
         if core.pool && core.checkout_exists {
-            match validated_checkout(&self.workspace_root, &record, &[]) {
+            let other_worktrees = self.other_held_checkouts(&record.id).await;
+            match validated_checkout(&self.workspace_root, &record, &other_worktrees) {
                 Ok(Some(CheckoutKind::Pool(canonical))) => core.checkout = canonical,
                 Ok(_) => {
                     core.checkout_exists = false;

@@ -29,7 +29,8 @@ use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, T
 use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
 };
-use super::pump::{cost_notice_due, usage_cost_micros, worker_host_tool_result};
+use super::pump::{counted_check, cost_notice_due, usage_cost_micros, worker_host_tool_result};
+use super::review::CheckRecorder;
 use super::record::{append_inbox, audit_finished, WORKER_INBOX_LIMIT};
 use super::review::clear_review_for_a_newer_tip;
 use super::routing::final_tier;
@@ -1697,6 +1698,287 @@ models = [\"scripted-a\", \"scripted-b\"]
     })
     .await
     .expect("open the test team")
+}
+
+async fn worker_check_fixture(
+    id: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    TeamRuntime,
+    WorkerRecord,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let worker = worker(root.path(), id);
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        id.to_string(),
+        "wt/mnemo".to_string(),
+    )
+    .await
+    .expect("provision the worker worktree");
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+    (root, state, team, worker)
+}
+
+fn shell_check_result(exit_code: i64) -> ToolResult {
+    ToolResult::success("command ran").with_data(json!({ "exit_code": exit_code }))
+}
+
+async fn finish_worker_checks(
+    team: &TeamRuntime,
+    worker: &WorkerRecord,
+    mut observations: HashMap<String, String>,
+) {
+    CheckRecorder::new(
+        &team.records,
+        &team.usage,
+        &team.save_lock,
+        &team.persistence,
+    )
+    .record_worker_checks(
+        &team.merge_lock,
+        &worker.id,
+        worker.generation,
+        &mut observations,
+    )
+    .await;
+}
+
+#[test]
+fn counted_check_accepts_only_plain_passing_check_commands() {
+    let passing = shell_check_result(0);
+    for command in [
+        "cargo test --workspace",
+        "cargo clippy --workspace --all-targets",
+        "npm test --workspace mnemo2",
+        "CARGO.EXE test",
+    ] {
+        assert_eq!(
+            counted_check("shell", &json!({ "command": command }), &passing).as_deref(),
+            Some(command),
+            "{command}"
+        );
+    }
+    for command in [
+        "cargo test --workspace *> log.txt",
+        "cargo test; echo hi",
+        "cargo test | Select-String x",
+        "cd x && cargo test",
+        "git status",
+        "Remove-Item target",
+        "cargo fmt",
+        "cargo pretest",
+        "cargo test_all",
+        "cargo test `whoami`",
+        "cargo test $(whoami)",
+        "cargo test\necho hi",
+    ] {
+        assert_eq!(
+            counted_check("shell", &json!({ "command": command }), &passing),
+            None,
+            "{command}"
+        );
+    }
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "  cargo test --workspace  " }),
+            &passing,
+        )
+        .as_deref(),
+        Some("cargo test --workspace")
+    );
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace" }),
+            &shell_check_result(1),
+        ),
+        None
+    );
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace" }),
+            &ToolResult::success("missing exit code"),
+        ),
+        None
+    );
+    assert_eq!(
+        counted_check(
+            "file_read",
+            &json!({ "command": "cargo test --workspace" }),
+            &passing,
+        ),
+        None
+    );
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace" }),
+            &ToolResult::error("tool failed").with_data(json!({ "exit_code": 0 })),
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_worker_run_check_on_the_committed_tree_is_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck1").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "checked\n").expect("worker edit");
+    let index = phase3::git_value(&worker.worktree, &["rev-parse", "--git-path", "index"])
+        .await
+        .expect("locate the real index");
+    let index = std::path::PathBuf::from(index);
+    let index = if index.is_absolute() {
+        index
+    } else {
+        worker.worktree.join(index)
+    };
+    let index_before = std::fs::read(&index).expect("read the real index");
+    let result = shell_check_result(0);
+    let name = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &result,
+    )
+    .expect("the plain passing command counts");
+    let tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the worker content");
+    assert_eq!(
+        std::fs::read(&index).expect("reread the real index"),
+        index_before,
+        "content_tree must not change the worker's real index"
+    );
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+
+    finish_worker_checks(&team, &worker, HashMap::from([(name, tree)])).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert_eq!(recorded.checks.len(), 1);
+    let check = &recorded.checks[0];
+    assert_eq!(check.name, "cargo test --workspace");
+    assert_eq!(check.status, "passed");
+    assert_eq!(check.tip, tip);
+    let detail = check.detail.as_deref().expect("worker detail");
+    assert!(detail.contains("run by the worker"), "{detail}");
+    assert!(detail.contains(&tip[..7]), "{detail}");
+    let persisted = team
+        .persistence
+        .load()
+        .expect("load the persisted team")
+        .expect("persisted team");
+    let persisted_worker = persisted
+        .workers
+        .iter()
+        .find(|record| record.id == worker.id)
+        .expect("persisted worker");
+    assert_eq!(persisted_worker.checks.len(), 1);
+    assert_eq!(persisted_worker.checks[0].tip, tip);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_check_run_before_a_later_edit_is_not_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck2").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "tested\n").expect("tested edit");
+    let name = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &shell_check_result(0),
+    )
+    .expect("the passing command counts");
+    let tested_tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the tested tree");
+    std::fs::write(worker.worktree.join("checked.txt"), "edited later\n")
+        .expect("edit after the test");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "commit the later edit"]);
+
+    finish_worker_checks(&team, &worker, HashMap::from([(name, tested_tree)])).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert!(
+        recorded.checks.is_empty(),
+        "a different committed tree must not inherit the earlier run: {:?}",
+        recorded.checks
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_or_piped_run_is_not_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck3").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "committed\n").expect("worker edit");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let mut observations = HashMap::new();
+    for (command, exit_code) in [
+        ("cargo test --workspace", 1),
+        ("cargo test --workspace | Select-String x", 0),
+        ("cargo clippy --workspace --all-targets *> log.txt", 0),
+    ] {
+        if let Some(name) = counted_check(
+            "shell",
+            &json!({ "command": command }),
+            &shell_check_result(exit_code),
+        ) {
+            let tree = phase3::content_tree(&worker.worktree)
+                .await
+                .expect("hash the committed tree");
+            observations.insert(name, tree);
+        }
+    }
+
+    finish_worker_checks(&team, &worker, observations).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert!(recorded.checks.is_empty(), "{:?}", recorded.checks);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lead_check_with_the_same_name_still_replaces_it() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck4").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "committed\n").expect("worker edit");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let name = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &shell_check_result(0),
+    )
+    .expect("the passing command counts");
+    let tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the committed tree");
+    finish_worker_checks(&team, &worker, HashMap::from([(name.clone(), tree)])).await;
+
+    let recorded = team
+        .record_check(
+            &worker.id,
+            name,
+            "passed".to_string(),
+            Some("recorded by the lead".to_string()),
+        )
+        .await
+        .expect("the lead check replaces the worker observation");
+
+    assert_eq!(recorded.checks.len(), 1);
+    assert_eq!(recorded.checks[0].name, "cargo test --workspace");
+    assert_eq!(
+        recorded.checks[0].detail.as_deref(),
+        Some("recorded by the lead")
+    );
+    team.shutdown().await;
 }
 
 async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {

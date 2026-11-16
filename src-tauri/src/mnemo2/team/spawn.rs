@@ -303,6 +303,7 @@ impl TeamRuntime {
             self.usage.clone(),
             self.save_lock.clone(),
             self.pricing.clone(),
+            self.merge_lock.clone(),
             self.persistence.clone(),
             self.routing_log_path.clone(),
             self.routing.clone(),

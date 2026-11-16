@@ -394,6 +394,59 @@ pub async fn git_value(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run Git with a temporary index while preserving the normal diagnostics.
+async fn git_with_index(root: &Path, index: &Path, args: &[&str]) -> Result<Output, String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(args)
+        .current_dir(root)
+        .env("GIT_INDEX_FILE", index);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+        .output()
+        .await
+        .map_err(|err| format!("could not run git in {}: {err}", root.display()))
+}
+
+/// Hash the checkout's full content tree without ever touching its real index.
+///
+/// A temporary copy of the index receives `git add -A`; `git write-tree` then
+/// hashes that copy. The temporary directory is removed on every return path.
+pub async fn content_tree(checkout: &Path) -> Result<String, String> {
+    let index = git_value(checkout, &["rev-parse", "--git-path", "index"]).await?;
+    let index = PathBuf::from(index);
+    let index = if index.is_absolute() {
+        index
+    } else {
+        checkout.join(index)
+    };
+    let temporary = tempfile::tempdir()
+        .map_err(|err| format!("could not create a temporary Git index directory: {err}"))?;
+    let temporary_index = temporary.path().join("index");
+    tokio::fs::copy(&index, &temporary_index)
+        .await
+        .map_err(|err| {
+            format!(
+                "could not copy {} to {}: {err}",
+                index.display(),
+                temporary_index.display()
+            )
+        })?;
+    let add = git_with_index(checkout, &temporary_index, &["add", "-A"]).await?;
+    if !add.status.success() {
+        return Err(git_error(&["add", "-A"], &add));
+    }
+    let written = git_with_index(checkout, &temporary_index, &["write-tree"]).await?;
+    if !written.status.success() {
+        return Err(git_error(&["write-tree"], &written));
+    }
+    Ok(String::from_utf8_lossy(&written.stdout).trim().to_string())
+}
+
 /// Read the exact current commit of a checkout.
 pub async fn tip(root: &Path) -> Result<String, String> {
     git_value(root, &["rev-parse", "HEAD"]).await

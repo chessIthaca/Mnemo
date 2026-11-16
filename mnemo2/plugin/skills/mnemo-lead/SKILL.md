@@ -80,7 +80,7 @@ A worker's turn ends with a "finished its turn" notice. Then:
 
 1. `team_status` with the exact `worker_id`: status, `branch`, `worktree`, findings, checks.
 2. Read the diff yourself before the worker's summary.
-3. Run the verification commands in the worker's worktree, so the exact tip is tested. Record each command you really ran with `team_check` (`name`, `status` passed or failed, `detail`). Checks are bound to the tip; any later commit invalidates them.
+3. Check what the worker already proved. When a worker ran its test, lint or build commands as plain commands and committed exactly the tree it tested, Mnemo2 records them as passed checks on that tip (their detail says the worker ran them). Run only what is missing, what the change needs beyond them, or what you doubt, in the worker's worktree, and record each command you really ran with `team_check` (`name`, `status` passed or failed, `detail`). Checks are bound to the tip; any later commit invalidates them.
 4. `team_review` with `summary`, the complete `findings` list and `evidence`.
    - `evidence` needs `unanchored_pass` true and non-empty `intent`, `execution`, `integration`, `test_quality` and `residual_risk`.
    - Exception, a light change: `unanchored_pass` true and `intent` are enough. Mnemo2 decides from the diff and the `team_review` result says which applied. A change is light when it is not high risk and either it changes at most 60 lines in total, or every changed file is Markdown (`.md`) or a test file (a `tests` folder, or `.test.`, `.spec.`, `_test.` or `_tests.` in the file name). A test module inside a normal source file does not make it a test file. A light review still reads the diff and records at least one check.

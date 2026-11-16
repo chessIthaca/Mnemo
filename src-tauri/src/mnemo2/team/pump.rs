@@ -1189,7 +1189,9 @@ pub(super) async fn pump_worker(
         if let Some(turn) = plain_text_audit_turn {
             let text = turn_text.trim().to_string();
             if text.is_empty() {
-                if silent_audit_asked_turn != Some(turn)
+                // One ask per audit session: the ask itself starts a new
+                // turn, so a per-turn guard would ask a silent audit forever.
+                if silent_audit_asked_turn.is_none()
                     && ask_audit_for_its_report(&engine, session_id, &worker_id, &records, &busy)
                         .await
                 {

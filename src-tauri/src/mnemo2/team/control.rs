@@ -558,8 +558,10 @@ impl TeamRuntime {
     /// Move a worker to another model (and reasoning effort), keeping its
     /// transcript, branch, and worktree. A WORKING worker switches live at
     /// its next request: the call in flight finishes on the old model, the
-    /// next one serves on the new one — no stop, no restart. An audit
-    /// worker's model is never switchable. An idle live session is
+    /// next one serves on the new one — no stop, no restart. An audit that
+    /// delivered its report is locked; an audit that has not reported
+    /// switches like any worker (its switches are never routing training
+    /// labels). An idle live session is
     /// restarted on the new model; a stopped, interrupted, or failed one
     /// is resumed on it; a worker whose brief never reached a session is
     /// started with it.

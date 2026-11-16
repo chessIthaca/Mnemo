@@ -51,9 +51,23 @@ describe("worker model", () => {
     expect(screen.getByTitle("This worker's task is over, so its model cannot change")).toBeTruthy();
   });
 
-  it("keeps an audit worker's model read-only, even mid-run", () => {
-    render(WorkerDetail, { worker: { ...worker("working"), kind: "audit", auditTarget: "ana" } });
+  it("lets an audit that has not reported switch its model", async () => {
+    const setWorkerModel = vi.spyOn(actions, "setWorkerModel").mockResolvedValue();
+    render(WorkerDetail, {
+      worker: { ...worker("working"), kind: "audit", auditTarget: "ana", reportDelivered: false },
+    });
+    const select = screen.getByRole("combobox", { name: /model$/ }) as HTMLSelectElement;
+    expect(select.value).toBe("test/fast");
+    await fireEvent.change(select, { target: { value: "test/deep" } });
+    expect(setWorkerModel).toHaveBeenCalledWith(createWorkers()[0].id, "test/deep", null);
+    setWorkerModel.mockRestore();
+  });
+
+  it("keeps an audit that reported read-only", () => {
+    render(WorkerDetail, {
+      worker: { ...worker("completed"), kind: "audit", auditTarget: "ana", reportDelivered: true },
+    });
     expect(screen.queryByRole("combobox", { name: /model$/ })).toBeNull();
-    expect(screen.getByTitle("An audit worker's model is not user-switchable")).toBeTruthy();
+    expect(screen.getByTitle("This audit has reported, so its model cannot change")).toBeTruthy();
   });
 });

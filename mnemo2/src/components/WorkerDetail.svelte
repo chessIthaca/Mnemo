@@ -62,12 +62,13 @@
     worker.modelSpec ?? models.find((model) => model.is_default)?.spec ?? "",
   );
   /**
-   * A worker can move to another model unless its task is over or it only
-   * reviews (an audit's model is never user-switchable). A worker mid-run
-   * switches live: the current call finishes, the next one uses the new model.
+   * A worker can move to another model unless its task is over. An audit
+   * moves like any worker until it delivers its report; once it has
+   * reported it is locked. A worker mid-run switches live: the current
+   * call finishes, the next one uses the new model.
    */
   const modelChangeable = $derived(
-    !audit &&
+    (!audit || !auditFinished) &&
       models.some((model) => model.spec === modelSpec) &&
       !["merging", "merged", "cancelled"].includes(worker.status),
   );
@@ -155,7 +156,7 @@
               {:else}
                 <span
                   class="model-locked"
-                  title={audit ? "An audit worker's model is not user-switchable" : "This worker's task is over, so its model cannot change"}
+                  title={auditFinished ? "This audit has reported, so its model cannot change" : "This worker's task is over, so its model cannot change"}
                 ><ModelBadge model={worker.model} /></span>
               {/if}
             </span>

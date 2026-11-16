@@ -7,7 +7,12 @@
 //! Claude Code speaks newline-delimited JSON-RPC on stdin/stdout; Mnemo2 speaks
 //! the same messages over its loopback HTTP endpoint. Stdout carries protocol
 //! lines only (logs go to stderr). Directories outside every registered project
-//! get an inert stub so the plugin stays quiet there.
+//! get a stub that offers two tools: list the registered projects, and turn
+//! this folder into one. Registering it starts that project's Mnemo2 and
+//! switches the session over, so the team tools appear without a reload. While
+//! the bridge is on the stub it re-reads the registry on every tool request, so
+//! a folder registered meanwhile (another session, the Mnemo2 window) is picked
+//! up the same way.
 //!
 //! Inside a registered project `initialize` is answered here, at once: Claude
 //! Code gives an MCP server about 30 s to connect and a cold Mnemo2 start can
@@ -32,7 +37,8 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Response};
 use crate::instance::{
-    canonical, find_instance, registered_root, resolve, root_body, Env, Instance, Resolution,
+    canonical, find_instance, projects, registered_conflict, registered_root, resolve, root_body,
+    Env, Instance, Resolution,
 };
 use crate::permissions::{self, Offer};
 
@@ -87,8 +93,8 @@ struct Bridge {
     /// The cwd is in a registered project: answer `initialize` locally.
     local_initialize: bool,
     /// Claude Code holds an out-of-date tool list (an empty or failed
-    /// `tools/list` while Mnemo2 was starting or down): announce the change
-    /// once there is an instance.
+    /// `tools/list` while Mnemo2 was starting or down, or the stub's two
+    /// project tools): announce the change once there is an instance.
     stale_list: AtomicBool,
     /// A thread is looking for an instance after a failed start.
     watching: AtomicBool,
@@ -281,8 +287,20 @@ impl Bridge {
                 Err(message) => return id.map(|id| rpc_error(&id, SERVER_ERROR, &message)),
             };
             let instance = match target {
-                Target::Stub => return stub_answer(msg, id.as_ref()),
                 Target::Live(instance) => instance,
+                // Outside a project: the folder may have become one since the
+                // stub was cached (an earlier `mnemo_init_project`, another
+                // session, the Mnemo2 window), so read the registry again.
+                // Only tool requests look: a notification runs on the reader
+                // thread and must not sit through a cold start.
+                Target::Stub if !matches!(method, "tools/list" | "tools/call") => {
+                    return self.stub_answer(msg, id.as_ref())
+                }
+                Target::Stub => match self.adopt_registered() {
+                    Ok(Some(instance)) => instance,
+                    Ok(None) => return self.stub_answer(msg, id.as_ref()),
+                    Err(message) => return id.map(|id| rpc_error(&id, SERVER_ERROR, &message)),
+                },
             };
             if method == "tools/call" {
                 // The server attaches the external lead on a tool call. Set
@@ -369,7 +387,12 @@ impl Bridge {
         slot.generation += 1;
         let result = match resolution {
             Resolution::Live(instance) => Ok(Target::Live(instance)),
-            Resolution::Unregistered => Ok(Target::Stub),
+            // A lookup that read the registry before the folder became a
+            // project must not undo the switch another request already made.
+            Resolution::Unregistered => match slot.target.clone() {
+                Some(target @ Target::Live(_)) => Ok(target),
+                _ => Ok(Target::Stub),
+            },
             Resolution::Failed(message) => Err(message),
         };
         match &result {
@@ -440,6 +463,44 @@ impl Bridge {
             let bridge = Arc::downgrade(self);
             std::thread::spawn(move || watch(bridge));
         }
+    }
+
+    /// The folder became a registered project while this session ran: resolve
+    /// it and switch over, so the request is answered by its instance.
+    ///
+    /// Cheap while the folder is still unregistered: one read of
+    /// `projects.toml` and no Mnemo2 start.
+    fn adopt_registered(self: &Arc<Self>) -> Result<Option<Instance>, String> {
+        match registered_root(&self.env, &self.cwd) {
+            Ok(None) => return Ok(None),
+            Ok(Some(_)) => {}
+            // An unreadable registry is no reason to hide behind the stub.
+            Err(err) => {
+                eprintln!("mnemo2-mcp: could not read the project registry: {err}");
+                return Ok(None);
+            }
+        }
+        match resolve(&self.env, &self.cwd) {
+            Resolution::Live(instance) => {
+                self.go_live(instance.clone());
+                Ok(Some(instance))
+            }
+            Resolution::Unregistered => Ok(None),
+            Resolution::Failed(message) => Err(message),
+        }
+    }
+
+    /// Make `instance` this session's target from now on: published through the
+    /// slot, so requests queued behind a lookup pick it up, and the tool list
+    /// is announced as changed once the answer is out.
+    fn go_live(self: &Arc<Self>, instance: Instance) {
+        let mut slot = self.lock_slot();
+        slot.target = Some(Target::Live(instance));
+        slot.last_error = None;
+        slot.generation += 1;
+        drop(slot);
+        self.resolved.notify_all();
+        self.stale_list.store(true, Ordering::SeqCst);
     }
 
     /// Use an instance found outside a lookup (by the watcher).
@@ -564,13 +625,11 @@ fn reply_from(id: Option<&Value>, response: Response) -> Option<String> {
 }
 
 /// The `initialize` answer: the client's protocol version echoed, tools only,
-/// and the lead brief when there is one (the inert stub has none). The bridge
-/// that gives the brief also announces tool-list changes; the stub never does.
+/// and the lead brief when there is one (the stub has none). Both servers
+/// announce tool-list changes — the instance when Mnemo2 comes up, the stub
+/// when its folder becomes a project — so `listChanged` is always declared.
 fn initialize_reply(msg: &Value, id: &Value, instructions: Option<&str>) -> String {
-    let tools = match instructions {
-        Some(_) => json!({ "listChanged": true }),
-        None => json!({}),
-    };
+    let tools = json!({ "listChanged": true });
     let mut result = json!({
         "protocolVersion": msg
             .pointer("/params/protocolVersion")
@@ -585,24 +644,174 @@ fn initialize_reply(msg: &Value, id: &Value, instructions: Option<&str>) -> Stri
     json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
 
-/// The inert server for directories outside every registered project.
-fn stub_answer(msg: &Value, id: Option<&Value>) -> Option<String> {
-    let id = id?;
-    let result = match method_of(msg) {
-        "initialize" => return Some(initialize_reply(msg, id, None)),
-        "ping" => json!({}),
-        "tools/list" => json!({ "tools": [] }),
-        method => {
-            return Some(rpc_error(
-                id,
-                METHOD_NOT_FOUND,
-                &format!(
-                    "Mnemo is inactive here: this folder is not inside a registered Mnemo2 project ({method} is unavailable)."
-                ),
-            ))
+// The stub's own answers: outside every registered project there is no
+// instance to talk to, so these carry the session until a folder is one.
+impl Bridge {
+    /// What the stub answers: the handshake, and the two project tools that
+    /// tell Claude where the projects are and turn this folder into one.
+    /// Everything else is refused.
+    fn stub_answer(self: &Arc<Self>, msg: &Value, id: Option<&Value>) -> Option<String> {
+        let id = id?;
+        let result = match method_of(msg) {
+            "initialize" => return Some(initialize_reply(msg, id, None)),
+            "ping" => json!({}),
+            "tools/list" => json!({ "tools": project_tools() }),
+            "tools/call" => return Some(self.stub_tool_call(msg, id)),
+            method => {
+                return Some(rpc_error(
+                    id,
+                    METHOD_NOT_FOUND,
+                    &format!(
+                        "Mnemo is inactive here: this folder is not a registered Mnemo project ({method} is unavailable). Call mnemo_init_project to make it one, or mnemo_projects to see the projects that exist."
+                    ),
+                ))
+            }
+        };
+        Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string())
+    }
+
+    /// A tool call the stub answers itself: the two project tools. Anything
+    /// else is a tool result error, so Claude reads what to call instead.
+    fn stub_tool_call(self: &Arc<Self>, msg: &Value, id: &Value) -> String {
+        let arguments = msg.pointer("/params/arguments");
+        let answer = match msg.pointer("/params/name").and_then(Value::as_str) {
+            Some("mnemo_projects") => self.projects_text(),
+            Some("mnemo_init_project") => self.init_project(arguments),
+            _ => Err("Only the project tools exist here: call mnemo_projects to see the \
+                      registered projects, or mnemo_init_project to make this folder one."
+                .to_string()),
+        };
+        match answer {
+            Ok(text) => tool_result(id, &text, false),
+            Err(text) => tool_result(id, &text, true),
         }
-    };
-    Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string())
+    }
+
+    /// The `mnemo_projects` answer: one line per project, then what to do with
+    /// them. A session leads one project, so the next step is another session.
+    fn projects_text(&self) -> Result<String, String> {
+        let projects = projects(&self.env)?;
+        if projects.is_empty() {
+            return Ok(
+                "No Mnemo projects yet. Call mnemo_init_project to make this folder one."
+                    .to_string(),
+            );
+        }
+        let mut text = String::from("Mnemo projects:\n");
+        for project in projects {
+            text.push_str(&format!(
+                "- {}: {} ({}, {})\n",
+                project.name,
+                project.path,
+                if project.running { "Mnemo2 running" } else { "Mnemo2 not running" },
+                if project.initialized { "opened before" } else { "never opened" },
+            ));
+        }
+        text.push_str(
+            "One session leads one project: start Claude Code in the folder you want to lead.",
+        );
+        Ok(text)
+    }
+
+    /// The `mnemo_init_project` answer: register the folder, start its Mnemo2
+    /// and switch this session over. A start that fails keeps the registration,
+    /// so the next request finds the project.
+    fn init_project(self: &Arc<Self>, arguments: Option<&Value>) -> Result<String, String> {
+        let asked = arguments
+            .and_then(|arguments| arguments.get("path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        let folder = canonical(&asked.map_or_else(|| self.cwd.clone(), PathBuf::from));
+        if !folder.is_dir() {
+            return Err(format!(
+                "{} is not a folder. Check the path and call mnemo_init_project again.",
+                folder.display()
+            ));
+        }
+        if let Some(existing) = registered_conflict(&self.env, &folder)? {
+            return Err(format!(
+                "{} already belongs to the Mnemo project \"{}\" ({}), and two projects cannot \
+                 share folders. Start a Claude Code session in that folder to lead it.",
+                folder.display(),
+                existing.name,
+                existing.path
+            ));
+        }
+        if !folder.join(".git").exists() {
+            return Err(format!(
+                "{} is not a git repository. Run `git init` there first, then call \
+                 mnemo_init_project again.",
+                folder.display()
+            ));
+        }
+        let record = mnemo_app::mnemo2::project::add(Some(self.env.config_dir.clone()), &folder)?;
+        match resolve(&self.env, &folder) {
+            Resolution::Live(instance) => {
+                self.go_live(instance);
+                Ok(format!(
+                    "Registered the Mnemo project \"{}\" at {}. Team tools are now available in \
+                     this session: call team_status to see the team.",
+                    record.name, record.path
+                ))
+            }
+            Resolution::Failed(message) => Err(format!(
+                "Registered the Mnemo project \"{}\" at {}, but Mnemo2 did not start: {message}",
+                record.name, record.path
+            )),
+            Resolution::Unregistered => Err(format!(
+                "Registered the Mnemo project \"{}\" at {}, but it could not be opened. Call \
+                 mnemo_init_project again.",
+                record.name, record.path
+            )),
+        }
+    }
+}
+
+/// The two tools the stub offers: which projects exist, and turning this folder
+/// into one. Claude reads these texts, so each says what to do next.
+fn project_tools() -> Value {
+    json!([
+        {
+            "name": "mnemo_projects",
+            "description": "List the folders that are already Mnemo projects, with whether Mnemo2 \
+                            is running for each and whether it was opened before. One Claude Code \
+                            session leads one project, so start a session in the folder you want \
+                            to lead.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        },
+        {
+            "name": "mnemo_init_project",
+            "description": "Turn a git folder into a Mnemo project and open it. The team tools \
+                            (team_status, team_dispatch, ...) become available in this session \
+                            right away, without a reload. It does not run `git init`: if the \
+                            folder is not a repository yet, run `git init` there first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The folder to register. Defaults to the folder this \
+                                        session runs in.",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        },
+    ])
+}
+
+/// A tool result for Claude: one text block, flagged when the call failed.
+fn tool_result(id: &Value, text: &str, failed: bool) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "isError": failed,
+        },
+    })
+    .to_string()
 }
 
 #[cfg(test)]

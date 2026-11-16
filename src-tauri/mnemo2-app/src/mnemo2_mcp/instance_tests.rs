@@ -203,6 +203,29 @@ fn registered_root_is_none_outside_every_project_or_without_a_registry() {
 }
 
 #[test]
+fn projects_lists_running_and_initialized_state() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project, &sandbox.elsewhere]);
+    // Mnemo2 opened the first project before; the second never was opened.
+    std::fs::create_dir_all(sandbox.project.join(".coding")).unwrap();
+    // A live instance for the first; a run file a crashed one left for the second.
+    sandbox.write_run(std::process::id(), 802, "tok", Some(&sandbox.project_str()));
+    let dead = sandbox.elsewhere.to_string_lossy().into_owned();
+    sandbox.write_run(dead_pid(), 803, "tok", Some(&dead));
+
+    let listed = projects(&sandbox.env()).expect("projects");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].name, "p0");
+    assert_eq!(canonical(Path::new(&listed[0].path)), sandbox.project);
+    assert!(listed[0].running, "this test process is alive and serves it");
+    assert!(listed[0].initialized, "its .coding folder is there");
+    assert_eq!(listed[1].name, "p1");
+    assert_eq!(canonical(Path::new(&listed[1].path)), sandbox.elsewhere);
+    assert!(!listed[1].running, "a run file of a dead process counts for nothing");
+    assert!(!listed[1].initialized, "never opened");
+}
+
+#[test]
 fn resolve_without_a_registered_project_is_the_stub() {
     let sandbox = Sandbox::new();
     assert!(matches!(resolve(&sandbox.env(), &sandbox.deep), Resolution::Unregistered));

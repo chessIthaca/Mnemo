@@ -55,6 +55,13 @@ async fn worker_plan_stamp(
 
 /// Handle a worker's host-tool call (`message_parent`, `plan_read`) and return
 /// its result.
+///
+/// `plan_read` with no `capability` returns the worker's current plan view.
+/// With `capability`, it returns that OpenSpec capability's spec; a capability
+/// name that is not one of [`PlanBoard::capability_names`] is an error naming
+/// the real capabilities, because a success answer ("No current spec for …")
+/// reads as "nothing to see" and sends the worker back to re-reading invented
+/// names instead of its plan.
 pub(super) async fn worker_host_tool_result(
     messages: &Arc<Mutex<Vec<TeamMessage>>>,
     worker_id: &str,
@@ -73,9 +80,17 @@ pub(super) async fn worker_host_tool_result(
             };
             return match board.capability_spec(capability) {
                 Ok(Some(text)) => ToolResult::success(text),
-                Ok(None) => {
-                    ToolResult::success(format!("No current spec for '{capability}' yet."))
-                }
+                Ok(None) => match board.capability_names() {
+                    // A real capability folder whose spec.md does not exist
+                    // yet keeps a success answer, now pointing back at the plan.
+                    Ok(names) if names.iter().any(|name| name == capability) => {
+                        ToolResult::success(format!(
+                            "No current spec for '{capability}' yet. To re-read your plan, call plan_read with no arguments."
+                        ))
+                    }
+                    Ok(names) => ToolResult::error(unknown_capability_error(capability, &names)),
+                    Err(error) => ToolResult::error(error),
+                },
                 Err(error) => ToolResult::error(error),
             };
         }
@@ -104,6 +119,20 @@ pub(super) async fn worker_host_tool_result(
     });
     ToolResult::success(
         "message sent to the lead. A reply, if any, arrives later as a new message that starts with a [From …] header; do not assume or invent a reply — continue your task or end your turn.",
+    )
+}
+
+/// The error a `plan_read` capability that names no OpenSpec capability gets:
+/// it lists the real capabilities (or "none") and sends the worker back to its
+/// plan, so an invented name cannot read as "there is nothing to read".
+fn unknown_capability_error(capability: &str, known: &[String]) -> String {
+    let list = if known.is_empty() {
+        "none".to_string()
+    } else {
+        known.join(", ")
+    };
+    format!(
+        "There is no OpenSpec capability named '{capability}'. Known capabilities: {list}. To re-read your plan, call plan_read with no arguments."
     )
 }
 

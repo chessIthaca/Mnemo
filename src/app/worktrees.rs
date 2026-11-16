@@ -355,14 +355,19 @@ fn claim_owner_alive(claim: &Path) -> Result<bool, String> {
         // SAFETY: fixed query flags, no handle inheritance; close every handle.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
-            return Ok(false);
+            // Only "no such process" proves the owner is gone; any other
+            // refusal (access denied, ...) fails closed and counts as live.
+            // SAFETY: reads this thread's last-error value, set by OpenProcess.
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Ok(error != windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
         }
         let mut exit_code = 0;
         // SAFETY: the handle is valid and outlives this query.
         let probed = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
         // SAFETY: the handle is no longer used.
         unsafe { CloseHandle(handle) };
-        Ok(probed != 0 && exit_code == STILL_ACTIVE as u32)
+        // A failed query also fails closed; only a real exit code means gone.
+        Ok(probed == 0 || exit_code == STILL_ACTIVE as u32)
     }
     #[cfg(not(windows))]
     {

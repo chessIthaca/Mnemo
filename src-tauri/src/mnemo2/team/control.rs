@@ -30,6 +30,7 @@ use super::nudge::{
     NUDGE_STRIKE_LIMIT, claim_nudge, deliver_nudge, message_can_show_drift, nudge_ignored_row,
 };
 use super::pump::{pump_worker, snapshot_model};
+use super::spawn::load_check_commands;
 use super::record::{
     ChangeSource, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox,
     audit_finished, audit_finished_error, kickoff_message, note_model, session_model_spec,
@@ -486,6 +487,7 @@ impl TeamRuntime {
             ));
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let check_commands = load_check_commands(&self.workspace_root);
         let session = self
             .spawn_worker_session(WorkerSessionSpec {
                 model: record.model.clone(),
@@ -500,6 +502,7 @@ impl TeamRuntime {
                         .clone()
                         .unwrap_or_else(|| record.brief.clone()),
                 ),
+                check_commands: check_commands.clone(),
             })
             .await?;
         let session_id = session.id();
@@ -520,6 +523,8 @@ impl TeamRuntime {
             self.usage.clone(),
             self.save_lock.clone(),
             self.pricing.clone(),
+            self.merge_lock.clone(),
+            check_commands,
             self.persistence.clone(),
             self.routing_log_path.clone(),
             self.routing.clone(),

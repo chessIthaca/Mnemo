@@ -29,7 +29,8 @@ use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, T
 use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
 };
-use super::pump::{cost_notice_due, usage_cost_micros, worker_host_tool_result};
+use super::pump::{counted_check, cost_notice_due, usage_cost_micros, worker_host_tool_result};
+use super::review::CheckRecorder;
 use super::record::{append_inbox, audit_finished, WORKER_INBOX_LIMIT};
 use super::review::clear_review_for_a_newer_tip;
 use super::routing::final_tier;
@@ -1699,6 +1700,517 @@ models = [\"scripted-a\", \"scripted-b\"]
     .expect("open the test team")
 }
 
+async fn worker_check_fixture(
+    id: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    TeamRuntime,
+    WorkerRecord,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let worker = worker(root.path(), id);
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        id.to_string(),
+        "wt/mnemo".to_string(),
+    )
+    .await
+    .expect("provision the worker worktree");
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+    (root, state, team, worker)
+}
+
+fn shell_result(exit_code: i64, tree_before: Option<&str>, tree_after: Option<&str>) -> ToolResult {
+    let mut data = json!({ "exit_code": exit_code });
+    if let Some(tree) = tree_before {
+        data["tree_before"] = json!(tree);
+    }
+    if let Some(tree) = tree_after {
+        data["tree_after"] = json!(tree);
+    }
+    ToolResult::success("command ran").with_data(data)
+}
+
+/// The repository's own allow-list, as `load_check_commands` trims it.
+fn allow_list() -> Vec<String> {
+    vec![
+        "cargo test --workspace".to_string(),
+        "cargo clippy --workspace --all-targets".to_string(),
+        "npm test --workspace mnemo2".to_string(),
+        "npm run check --workspace mnemo2".to_string(),
+    ]
+}
+
+async fn finish_worker_checks(
+    team: &TeamRuntime,
+    worker: &WorkerRecord,
+    mut observations: HashMap<String, String>,
+) {
+    CheckRecorder::new(
+        &team.records,
+        &team.usage,
+        &team.save_lock,
+        &team.persistence,
+    )
+    .record_worker_checks(
+        &team.merge_lock,
+        &worker.id,
+        worker.generation,
+        &mut observations,
+    )
+    .await;
+}
+
+#[test]
+fn check_allow_list_comes_only_from_valid_lead_root_config() {
+    let lead = tempfile::tempdir().expect("lead root");
+    let worker = tempfile::tempdir().expect("worker checkout");
+    std::fs::create_dir_all(worker.path().join(".coding")).expect("worker coding dir");
+    std::fs::write(
+        worker.path().join(".coding/checks.toml"),
+        "commands = [\"cargo test --workspace\"]\n",
+    )
+    .expect("worker allow-list");
+    assert!(
+        super::spawn::load_check_commands(lead.path()).is_empty(),
+        "a worker-local file must not enable automatic checks"
+    );
+
+    std::fs::create_dir_all(lead.path().join(".coding")).expect("lead coding dir");
+    std::fs::write(
+        lead.path().join(".coding/checks.toml"),
+        "commands = [\"  cargo test --workspace  \"]\n",
+    )
+    .expect("lead allow-list");
+    assert_eq!(
+        super::spawn::load_check_commands(lead.path()).as_slice(),
+        ["cargo test --workspace".to_string()]
+    );
+
+    let invalid_commands = [
+        "",
+        "   ",
+        "cargo test --workspace; echo no",
+        "cargo test --workspace | Select-String x",
+        "cargo test --workspace && echo no",
+        "cargo test --workspace > log.txt",
+        "cargo test --workspace < input.txt",
+        "cargo test --workspace `echo no`",
+        "cargo test --workspace $(echo no)",
+        "cargo\ntest --workspace",
+        "cargo\rtest --workspace",
+        "cargo\ttest --workspace",
+    ];
+    let encoded = invalid_commands
+        .iter()
+        .map(|command| format!("{command:?}"))
+        .chain([r#""cargo test --workspace""#.to_string()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        lead.path().join(".coding/checks.toml"),
+        format!("commands = [{encoded}]\n"),
+    )
+    .expect("compound lead allow-list");
+    let commands = super::spawn::load_check_commands(lead.path());
+    assert_eq!(
+        commands.as_slice(),
+        ["cargo test --workspace".to_string()],
+        "every empty, compound, or control-character entry is dropped"
+    );
+    let checkout = tempfile::tempdir().expect("checkout");
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    for command in invalid_commands {
+        assert_eq!(
+            counted_check(
+                "shell",
+                &json!({ "command": command }),
+                &shell_result(0, Some(tree), Some(tree)),
+                checkout.path(),
+                &commands,
+            ),
+            None,
+            "invalid allow-list entry {command:?} must never count"
+        );
+    }
+
+    std::fs::write(lead.path().join(".coding/checks.toml"), "commands = 42\n")
+        .expect("malformed lead allow-list");
+    assert!(
+        super::spawn::load_check_commands(lead.path()).is_empty(),
+        "a malformed file disables automatic checks"
+    );
+}
+
+#[test]
+fn counted_check_accepts_only_allow_listed_unchanging_runs() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let checkout = checkout.path();
+    let foreign = tempfile::tempdir().expect("foreign cwd");
+    let allowed = allow_list();
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    let listed = json!({ "command": "cargo test --workspace" });
+    // An allow-listed command, exit 0, no cwd, equal trees: counted.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        Some(("cargo test --workspace".to_string(), tree.to_string()))
+    );
+    // Only leading and trailing whitespace is trimmed; internal bytes matter.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "  cargo test --workspace  " }),
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        Some(("cargo test --workspace".to_string(), tree.to_string()))
+    );
+    for command in ["cargo\ntest --workspace", "cargo  test --workspace"] {
+        assert_eq!(
+            counted_check(
+                "shell",
+                &json!({ "command": command }),
+                &shell_result(0, Some(tree), Some(tree)),
+                checkout,
+                &allowed,
+            ),
+            None,
+            "{command:?} must not count"
+        );
+    }
+    // A cwd that canonicalizes to the checkout root still counts.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace", "cwd": checkout.display().to_string() }),
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        Some(("cargo test --workspace".to_string(), tree.to_string()))
+    );
+    // Not on the allow-list.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace --no-run" }),
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // A foreign cwd is never the worker's checkout.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &json!({ "command": "cargo test --workspace", "cwd": foreign.path().display().to_string() }),
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // Missing tree fields — the run was not measured.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &shell_result(0, None, None),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // The tree changed while the command ran.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &shell_result(0, Some(tree), Some("fedcba9876543210")),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // A non-zero exit code.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &shell_result(1, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // A failed tool result.
+    assert_eq!(
+        counted_check(
+            "shell",
+            &listed,
+            &ToolResult::error("tool failed")
+                .with_data(json!({ "exit_code": 0, "tree_before": tree, "tree_after": tree })),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+    // Another tool never counts.
+    assert_eq!(
+        counted_check(
+            "file_read",
+            &listed,
+            &shell_result(0, Some(tree), Some(tree)),
+            checkout,
+            &allowed,
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_worker_run_check_on_the_committed_tree_is_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck1").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "checked\n").expect("worker edit");
+    let index = phase3::git_value(&worker.worktree, &["rev-parse", "--git-path", "index"])
+        .await
+        .expect("locate the real index");
+    let index = std::path::PathBuf::from(index);
+    let index = if index.is_absolute() {
+        index
+    } else {
+        worker.worktree.join(index)
+    };
+    let index_before = std::fs::read(&index).expect("read the real index");
+    let tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the worker content");
+    assert_eq!(
+        std::fs::read(&index).expect("reread the real index"),
+        index_before,
+        "content_tree must not change the worker's real index"
+    );
+    let allowed = allow_list();
+    let (name, observed_tree) = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &shell_result(0, Some(&tree), Some(&tree)),
+        &worker.worktree,
+        &allowed,
+    )
+    .expect("the measured passing command counts");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+
+    finish_worker_checks(&team, &worker, HashMap::from([(name, observed_tree)])).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert_eq!(recorded.checks.len(), 1);
+    let check = &recorded.checks[0];
+    assert_eq!(check.name, "cargo test --workspace");
+    assert_eq!(check.status, "passed");
+    assert_eq!(check.tip, tip);
+    let detail = check.detail.as_deref().expect("worker detail");
+    assert!(detail.contains("run by the worker"), "{detail}");
+    assert!(detail.contains(&tip[..7]), "{detail}");
+    let persisted = team
+        .persistence
+        .load()
+        .expect("load the persisted team")
+        .expect("persisted team");
+    let persisted_worker = persisted
+        .workers
+        .iter()
+        .find(|record| record.id == worker.id)
+        .expect("persisted worker");
+    assert_eq!(persisted_worker.checks.len(), 1);
+    assert_eq!(persisted_worker.checks[0].tip, tip);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_check_run_before_a_later_edit_is_not_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck2").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "tested\n").expect("tested edit");
+    let tested_tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the tested tree");
+    let allowed = allow_list();
+    let (name, observed_tree) = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &shell_result(0, Some(&tested_tree), Some(&tested_tree)),
+        &worker.worktree,
+        &allowed,
+    )
+    .expect("the measured passing command counts");
+    std::fs::write(worker.worktree.join("checked.txt"), "edited later\n")
+        .expect("edit after the test");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "commit the later edit"]);
+
+    finish_worker_checks(&team, &worker, HashMap::from([(name, observed_tree)])).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert!(
+        recorded.checks.is_empty(),
+        "a different committed tree must not inherit the earlier run: {:?}",
+        recorded.checks
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_foreign_or_unmeasured_run_is_not_recorded() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck3").await;
+    let foreign = tempfile::tempdir().expect("foreign cwd");
+    std::fs::write(worker.worktree.join("checked.txt"), "committed\n").expect("worker edit");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the committed tree");
+    let allowed = allow_list();
+    let cases = [
+        (
+            json!({ "command": "cargo test --workspace" }),
+            shell_result(1, Some(&tree), Some(&tree)),
+        ),
+        (
+            json!({
+                "command": "cargo test --workspace",
+                "cwd": foreign.path().display().to_string(),
+            }),
+            shell_result(0, Some(&tree), Some(&tree)),
+        ),
+        (
+            json!({ "command": "cargo test --workspace" }),
+            shell_result(0, None, None),
+        ),
+        (
+            json!({ "command": "cargo test --workspace --no-run" }),
+            shell_result(0, Some(&tree), Some(&tree)),
+        ),
+        (
+            json!({ "command": "cargo test --workspace" }),
+            shell_result(0, Some(&tree), Some("fedcba9876543210")),
+        ),
+    ];
+    let mut observations = HashMap::new();
+    for (args, result) in &cases {
+        if let Some((name, observed_tree)) =
+            counted_check("shell", args, result, &worker.worktree, &allowed)
+        {
+            observations.insert(name, observed_tree);
+        }
+    }
+
+    finish_worker_checks(&team, &worker, observations).await;
+
+    let recorded = team.worker(&worker.id).await.expect("worker record");
+    assert!(recorded.checks.is_empty(), "{:?}", recorded.checks);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lead_check_with_the_same_name_still_replaces_it() {
+    let (_root, _state, team, worker) = worker_check_fixture("workercheck4").await;
+    std::fs::write(worker.worktree.join("checked.txt"), "committed\n").expect("worker edit");
+    run_git(&worker.worktree, &["add", "checked.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tree = phase3::content_tree(&worker.worktree)
+        .await
+        .expect("hash the committed tree");
+    let allowed = allow_list();
+    let (name, observed_tree) = counted_check(
+        "shell",
+        &json!({ "command": "cargo test --workspace" }),
+        &shell_result(0, Some(&tree), Some(&tree)),
+        &worker.worktree,
+        &allowed,
+    )
+    .expect("the measured passing command counts");
+    finish_worker_checks(&team, &worker, HashMap::from([(name.clone(), observed_tree)])).await;
+
+    let recorded = team
+        .record_check(
+            &worker.id,
+            name,
+            "passed".to_string(),
+            Some("recorded by the lead".to_string()),
+        )
+        .await
+        .expect("the lead check replaces the worker observation");
+
+    assert_eq!(recorded.checks.len(), 1);
+    assert_eq!(recorded.checks[0].name, "cargo test --workspace");
+    assert_eq!(
+        recorded.checks[0].detail.as_deref(),
+        Some("recorded by the lead")
+    );
+    team.shutdown().await;
+}
+
+/// A real `shell` tool call with equal `tree_before`/`tree_after` fields rides
+/// the whole pump path: the worker session executes the command for real, the
+/// pump keeps the observation, and the finished turn records the check bound
+/// to the committed tip.
+#[tokio::test]
+async fn a_real_shell_check_run_records_a_check_at_turn_end() {
+    let (root, _state, _config, team, mut events) = report_streak_team(vec![tool_call_batch(
+        "check-1",
+        "shell",
+        r#"{"command":"git status","purpose":"verify the checkout"}"#,
+    )])
+    .await;
+    std::fs::create_dir_all(root.path().join(".coding")).expect("checks dir");
+    std::fs::write(
+        root.path().join(".coding/checks.toml"),
+        "commands = [\"git status\"]\n",
+    )
+    .expect("checks.toml");
+    let worker = team
+        .dispatch("run the allowed check".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    // The pump records the checks BEFORE it forwards `Finished` — waiting for
+    // that event, not for the `Completed` status, proves the ordering.
+    loop {
+        let forwarded = forwarded_events(&mut events).await;
+        if forwarded
+            .iter()
+            .any(|event| matches!(event, SerializableAgentEvent::Finished { .. }))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let finished = team.worker(&worker.id).await.expect("worker record");
+
+    assert_eq!(finished.checks.len(), 1, "{:?}", finished.checks);
+    let check = &finished.checks[0];
+    assert_eq!(check.name, "git status");
+    assert_eq!(check.status, "passed");
+    let tip = phase3::tip(&finished.worktree).await.expect("worker tip");
+    assert_eq!(check.tip, tip);
+    let detail = check.detail.as_deref().expect("worker detail");
+    assert!(detail.contains("run by the worker"), "{detail}");
+    team.shutdown().await;
+}
+
 async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
     let session = team
         .spawn_worker_session(WorkerSessionSpec {
@@ -1709,6 +2221,7 @@ async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
             kind: "implementation".to_string(),
             trace_identity: TeamRuntime::worker_trace_identity(worker),
             pinned_task: None,
+            check_commands: std::sync::Arc::new(Vec::new()),
         })
         .await
         .expect("spawn worker session");
@@ -1802,6 +2315,7 @@ async fn a_leftover_checkout_does_not_block_deleting_its_worker() {
                 kind: "implementation".to_string(),
                 trace_identity: TeamRuntime::worker_trace_identity(worker),
                 pinned_task: None,
+                check_commands: std::sync::Arc::new(Vec::new()),
             })
             .await
             .expect("open a worktree-bound session and its code graph");
@@ -2308,6 +2822,7 @@ async fn merge_closes_a_live_session_before_finishing_its_checkout() {
             kind: "implementation".to_string(),
             trace_identity: TeamRuntime::worker_trace_identity(&worker),
             pinned_task: None,
+            check_commands: std::sync::Arc::new(Vec::new()),
         })
         .await
         .expect("open a worktree-bound session and its code graph");

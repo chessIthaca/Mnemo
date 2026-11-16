@@ -303,7 +303,7 @@ pub struct TeamRuntime {
     /// so the audit release closes sessions exactly like `stop_inner`.
     fail_next_close: Arc<AtomicBool>,
     lead_session: Mutex<Option<SessionId>>,
-    merge_lock: Mutex<()>,
+    merge_lock: Arc<Mutex<()>>,
     /// Serializes pool selection through insertion of the new worker record.
     checkout_pool_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
@@ -433,7 +433,7 @@ impl TeamRuntime {
             lead_busy: AtomicBool::new(false),
             fail_next_close: Arc::new(AtomicBool::new(false)),
             lead_session: Mutex::new(None),
-            merge_lock: Mutex::new(()),
+            merge_lock: Arc::new(Mutex::new(())),
             checkout_pool_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
             config_dir: config_dir.clone(),

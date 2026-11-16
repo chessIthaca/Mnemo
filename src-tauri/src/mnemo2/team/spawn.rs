@@ -6,7 +6,7 @@
 //! worktree checkout, the guardrailed session spawn and failure
 //! recording.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,6 +16,9 @@ use mnemo::app::worktrees::{
 use mnemo::headless::{AgentSession, SessionCommand, SpawnOptions, Transcript};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::{PermissionPolicy, route_question};
+
+use mnemo::tool::agent::shell::validated_check_command;
+use serde::Deserialize;
 
 use crate::mnemo2::phase3;
 
@@ -47,6 +50,37 @@ pub(crate) struct WorkerSessionSpec {
     pub(crate) trace_identity: TraceIdentity,
     /// The task rendered into the system head for the session's whole life.
     pub(crate) pinned_task: Option<String>,
+    /// Exact commands measured and accepted for automatic worker checks.
+    pub(crate) check_commands: Arc<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct CheckCommandsConfig {
+    commands: Vec<String>,
+}
+
+/// Load the worker check allow-list from the lead's project root only.
+pub(super) fn load_check_commands(workspace_root: &Path) -> Arc<Vec<String>> {
+    let commands = std::fs::read_to_string(workspace_root.join(".coding/checks.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<CheckCommandsConfig>(&text).ok())
+        .map(|config| {
+            config
+                .commands
+                .into_iter()
+                .filter_map(|command| match validated_check_command(&command) {
+                    Some(command) => Some(command.to_string()),
+                    None => {
+                        eprintln!(
+                            "Mnemo2: ignoring invalid automatic check command {command:?}"
+                        );
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Arc::new(commands)
 }
 
 impl TeamRuntime {
@@ -259,6 +293,7 @@ impl TeamRuntime {
         })
         .await;
         self.persist().await?;
+        let check_commands = load_check_commands(&self.workspace_root);
         let session = match self
             .spawn_worker_session(WorkerSessionSpec {
                 model: record.model.clone(),
@@ -273,6 +308,7 @@ impl TeamRuntime {
                         .clone()
                         .unwrap_or_else(|| record.brief.clone()),
                 ),
+                check_commands: check_commands.clone(),
             })
             .await
         {
@@ -303,6 +339,8 @@ impl TeamRuntime {
             self.usage.clone(),
             self.save_lock.clone(),
             self.pricing.clone(),
+            self.merge_lock.clone(),
+            check_commands,
             self.persistence.clone(),
             self.routing_log_path.clone(),
             self.routing.clone(),
@@ -392,6 +430,7 @@ impl TeamRuntime {
             kind,
             trace_identity,
             pinned_task,
+            check_commands,
         } = spec;
         let name = trace_identity.agent_name.clone();
         self.engine
@@ -400,6 +439,7 @@ impl TeamRuntime {
                 model,
                 reasoning_effort,
                 worktree: Some(worktree),
+                check_commands: check_commands.as_ref().clone(),
                 permissions: Some(PermissionPolicy::OverridePermissions),
                 policy: None,
                 resume,

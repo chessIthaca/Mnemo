@@ -7,7 +7,7 @@
 //! releases a finished audit.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,6 +18,7 @@ use mnemo::headless::{
     SessionId, Transcript,
 };
 use mnemo::tool::ToolResult;
+use mnemo::tool::agent::shell::validated_check_command;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast};
 
@@ -32,7 +33,7 @@ use super::escalation::{AutoEscalation, auto_escalate_idle};
 use super::nudge::{StrikeNudges, note_tool_outcome, try_strike_nudge};
 use super::persistence::{LEDGER_FLUSH_DELAY, PersistedTeam, TeamPersistence};
 use super::record::{WorkerRecord, WorkerStatus, kickoff_message};
-use super::review::clear_review_for_a_newer_tip;
+use super::review::{CheckRecorder, clear_review_for_a_newer_tip};
 use super::routing::{logs_label, outcome_row};
 
 /// The plan coordinate a worker may read: its own plan, or for an audit the
@@ -201,6 +202,64 @@ async fn worker_lacks_model_id(
         .is_some_and(|worker| worker.model_id.is_none())
 }
 
+/// Return an allow-listed passing shell command and its unchanged tree.
+pub(super) fn counted_check(
+    tool: &str,
+    args: &Value,
+    result: &ToolResult,
+    checkout: &Path,
+    check_commands: &[String],
+) -> Option<(String, String)> {
+    if tool != "shell" || !result.success {
+        return None;
+    }
+    let data = result.data.as_ref()?;
+    if data.get("exit_code")?.as_i64()? != 0 {
+        return None;
+    }
+    let command = validated_check_command(args.get("command")?.as_str()?)?;
+    if !check_commands.iter().any(|allowed| allowed == command) {
+        return None;
+    }
+    let checkout = checkout.canonicalize().ok()?;
+    if let Some(cwd) = args.get("cwd") {
+        let cwd = cwd.as_str()?.trim();
+        if !cwd.is_empty() {
+            let cwd = Path::new(cwd);
+            let cwd = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                checkout.join(cwd)
+            };
+            if cwd.canonicalize().ok()? != checkout {
+                return None;
+            }
+        }
+    }
+    let tree_before = data.get("tree_before")?.as_str()?;
+    let tree_after = data.get("tree_after")?.as_str()?;
+    if tree_before.is_empty() || tree_before != tree_after {
+        return None;
+    }
+    Some((command.to_string(), tree_before.to_string()))
+}
+
+async fn record_turn_checks(
+    worker_id: &str,
+    generation: u64,
+    observations: &mut HashMap<String, String>,
+    ledger: &PumpLedger,
+) {
+    CheckRecorder::new(
+        &ledger.records,
+        &ledger.usage,
+        &ledger.save_lock,
+        &ledger.persistence,
+    )
+    .record_worker_checks(&ledger.merge_lock, worker_id, generation, observations)
+    .await;
+}
+
 /// Forward one worker session's events, update its durable record, and refresh
 /// the transcript when the turn ends.
 /// How long a steered turn end waits for its follow-up turn before it counts
@@ -226,6 +285,8 @@ pub(super) async fn pump_worker(
     usage: Arc<Mutex<ProjectUsage>>,
     save_lock: Arc<Mutex<()>>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
+    merge_lock: Arc<Mutex<()>>,
+    check_commands: Arc<Vec<String>>,
     persistence: TeamPersistence,
     routing_log_path: PathBuf,
     routing: Arc<std::sync::RwLock<RoutingSettings>>,
@@ -257,6 +318,14 @@ pub(super) async fn pump_worker(
     let mut call_ids: HashMap<u32, String> = HashMap::new();
     let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut previous_signature: Option<String> = None;
+    let mut check_observations: HashMap<String, String> = HashMap::new();
+    let ledger = PumpLedger {
+        records: records.clone(),
+        usage: usage.clone(),
+        save_lock: save_lock.clone(),
+        persistence: persistence.clone(),
+        merge_lock,
+    };
     // The report streak (plan 9a6cffc1): consecutive `message_parent`
     // calls with no other tool call in between, within one worker turn.
     // The 2nd report in a row is refused — not recorded, no lead notice
@@ -312,6 +381,15 @@ pub(super) async fn pump_worker(
                         continue;
                     }
                     busy.store(false, Ordering::SeqCst);
+                    if held.is_some() {
+                        record_turn_checks(
+                            &worker_id,
+                            generation,
+                            &mut check_observations,
+                            &ledger,
+                        )
+                        .await;
+                    }
                     if completed {
                         let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
                     }
@@ -350,6 +428,7 @@ pub(super) async fn pump_worker(
             follow_up_deadline = None;
             held_finished = None;
             report_streak = 0;
+            check_observations.clear();
         }
         // A suppressed repeated report (plan 9a6cffc1): answered with
         // [`REPEATED_REPORT_REFUSED`] below, and kept so the TeamEvent
@@ -486,6 +565,28 @@ pub(super) async fn pump_worker(
                         strike_fired = Some(repeated);
                     }
                     tool_outcome = Some((name.clone(), result.success, result.output.clone()));
+                    let checkout = {
+                        let records = records.lock().await;
+                        records
+                            .iter()
+                            .find(|worker| {
+                                worker.id == worker_id
+                                    && (worker.generation == 0
+                                        || worker.generation == generation)
+                            })
+                            .map(|worker| worker.worktree.clone())
+                    };
+                    if let Some(checkout) = checkout {
+                        if let Some((check, tree)) = counted_check(
+                            &name,
+                            &parsed,
+                            result,
+                            &checkout,
+                            check_commands.as_slice(),
+                        ) {
+                            check_observations.insert(check, tree);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -908,6 +1009,17 @@ pub(super) async fn pump_worker(
                 }
             }
         }
+        if (terminal && matches!(&event.event, SerializableAgentEvent::Finished { .. }))
+            || settled_parked_finish.is_some()
+        {
+            record_turn_checks(
+                &worker_id,
+                generation,
+                &mut check_observations,
+                &ledger,
+            )
+            .await;
+        }
         // A suppressed repeated report is not forwarded (plan 9a6cffc1):
         // no TeamEvent means the runtime never turns it into a lead
         // notice — the pump is the single source of truth for the
@@ -944,12 +1056,7 @@ pub(super) async fn pump_worker(
                 &worker_id,
                 generation,
                 &live,
-                PumpLedger {
-                    records: records.clone(),
-                    usage: usage.clone(),
-                    save_lock: save_lock.clone(),
-                    persistence,
-                },
+                ledger.clone(),
                 &fail_next_close,
             )
             .await;
@@ -1077,11 +1184,13 @@ pub(super) async fn close_worker_session(
 /// The shared ledger handles a worker pump holds: the record store plus
 /// everything [`save_workers`] needs. [`release_finished_audit`] takes
 /// them as one group because the pump hands them over on its way out.
+#[derive(Clone)]
 struct PumpLedger {
     records: Arc<Mutex<Vec<WorkerRecord>>>,
     usage: Arc<Mutex<ProjectUsage>>,
     save_lock: Arc<Mutex<()>>,
     persistence: TeamPersistence,
+    merge_lock: Arc<Mutex<()>>,
 }
 
 /// End a finished audit's live session from inside its own pump (plan

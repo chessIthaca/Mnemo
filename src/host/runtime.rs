@@ -37,6 +37,8 @@ pub struct WorktreeBinding {
     /// `graph_*` tools are omitted for that agent, same as a main-tree
     /// open failure.
     pub codegraph: Option<std::sync::Arc<crate::codegraph::CodeGraph>>,
+    /// Exact shell commands measured for worker check certification.
+    pub check_commands: Vec<String>,
 }
 
 /// The parent's per-agent root binding for subagent inheritance
@@ -279,6 +281,7 @@ async fn spawn_agent_shared_inner(
                 .map_err(|e| format!("worktree sandbox: {e}"))?,
             project_root: binding.worktree.clone(),
             codegraph: binding.codegraph,
+            check_commands: binding.check_commands,
         };
         factory.build_with_root_spec(agent_id, plans_dir, spec)
     } else if own_plans_dir {
@@ -1281,6 +1284,7 @@ mod tests {
             sandbox: crate::tool::agent::sandbox::Sandbox::new(&worktree_root).unwrap(),
             project_root: worktree_root.clone(),
             codegraph: None,
+            check_commands: Vec::new(),
         };
         // Build a parent loop the way build_with_root_spec does: the spec
         // stamped on the loop + the worktree plans dir.
@@ -1740,6 +1744,7 @@ mod tests {
                 sandbox: crate::tool::agent::sandbox::Sandbox::new(&worktree_root).unwrap(),
                 project_root: worktree_root.clone(),
                 codegraph: None,
+                check_commands: Vec::new(),
             },
         );
         agent_loops.lock().await.insert(7, parent);

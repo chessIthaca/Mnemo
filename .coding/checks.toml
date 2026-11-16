@@ -1,0 +1,3 @@
+# Exact commands only: run them as written in the checkout root.
+# Nothing else may appear on the line — no chaining, piping, or redirection.
+commands = ["cargo test --workspace", "cargo clippy --workspace --all-targets", "npm test --workspace mnemo2", "npm run check --workspace mnemo2"]

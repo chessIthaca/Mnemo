@@ -5,7 +5,11 @@
 //! The review and fix path: worker tips, review records, checks,
 //! findings, and the fix dispatch that routes a fix back to a worker.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+use tokio::sync::Mutex;
 
 use mnemo::app::worktrees::agent_branch;
 
@@ -15,14 +19,117 @@ use crate::mnemo2::dispatch_routing::{
 };
 use crate::mnemo2::phase3::{Finding, ReviewEvidence, ReviewRecord};
 use crate::mnemo2::runtime::LeadModel;
+use crate::mnemo2::usage::ProjectUsage;
 
 use super::{TeamRuntime, unix_ms};
 use super::audit::validate_audit_linkage;
 use super::nudge::{claim_nudge, deliver_nudge, pending_fix_downshift, route_fix_brief};
+use super::persistence::TeamPersistence;
+use super::pump::save_workers;
 use super::record::{
     ChangeSource, InboxKind, MessageSender, WorkerCheck, WorkerRecord, WorkerStatus,
 };
 use super::routing::NUDGE_LADDER;
+
+/// The ledger handles shared by lead-recorded and worker-observed checks.
+pub(super) struct CheckRecorder<'a> {
+    records: &'a Arc<Mutex<Vec<WorkerRecord>>>,
+    usage: &'a Arc<Mutex<ProjectUsage>>,
+    save_lock: &'a Arc<Mutex<()>>,
+    persistence: &'a TeamPersistence,
+}
+
+impl<'a> CheckRecorder<'a> {
+    /// Borrow the ledger handles used by the existing check record path.
+    pub(super) fn new(
+        records: &'a Arc<Mutex<Vec<WorkerRecord>>>,
+        usage: &'a Arc<Mutex<ProjectUsage>>,
+        save_lock: &'a Arc<Mutex<()>>,
+        persistence: &'a TeamPersistence,
+    ) -> Self {
+        Self {
+            records,
+            usage,
+            save_lock,
+            persistence,
+        }
+    }
+
+    async fn record_at_tip(&self, worker_id: &str, check: WorkerCheck) -> Result<(), String> {
+        let mut records = self.records.lock().await;
+        let worker = records
+            .iter_mut()
+            .find(|worker| worker.id == worker_id)
+            .ok_or_else(|| format!("unknown worker '{worker_id}'"))?;
+        if matches!(worker.status, WorkerStatus::Merging | WorkerStatus::Merged) {
+            return Err("checks cannot be added during or after merge".to_string());
+        }
+        worker.checks.retain(|existing| existing.name != check.name);
+        worker.checks.push(check);
+        Ok(())
+    }
+
+    /// Record this turn's passing observations that match the committed tip.
+    pub(super) async fn record_worker_checks(
+        &self,
+        merge_lock: &Arc<Mutex<()>>,
+        worker_id: &str,
+        generation: u64,
+        observations: &mut HashMap<String, String>,
+    ) {
+        let observations = std::mem::take(observations);
+        if observations.is_empty() {
+            return;
+        }
+        let _guard = merge_lock.lock().await;
+        let worker = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .find(|worker| {
+                worker.id == worker_id
+                    && (worker.generation == 0 || worker.generation == generation)
+            })
+            .cloned();
+        let Some(worker) = worker else {
+            return;
+        };
+        if matches!(worker.status, WorkerStatus::Merging | WorkerStatus::Merged) {
+            return;
+        }
+        // Probe Git after dropping the records lock, just like worker_tip.
+        let Ok(tip) = phase3::tip(&worker.worktree).await else {
+            return;
+        };
+        let revision = format!("{tip}^{{tree}}");
+        let Ok(tree) = phase3::git_value(&worker.worktree, &["rev-parse", &revision]).await
+        else {
+            return;
+        };
+        let short_tip = tip.get(..7).unwrap_or(tip.as_str());
+        let mut recorded = false;
+        for (name, observed_tree) in observations {
+            if observed_tree != tree {
+                continue;
+            }
+            let check = WorkerCheck {
+                name,
+                status: "passed".to_string(),
+                detail: Some(format!(
+                    "run by the worker; Mnemo2 saw exit code 0 on this exact tree (tip {short_tip})"
+                )),
+                tip: tip.clone(),
+            };
+            if self.record_at_tip(worker_id, check).await.is_ok() {
+                recorded = true;
+            }
+        }
+        if recorded {
+            let _ = save_workers(self.records, self.usage, self.save_lock, self.persistence).await;
+        }
+    }
+}
 
 impl TeamRuntime {
     pub(super) async fn worker_tip(&self, worker: &WorkerRecord) -> Result<String, String> {
@@ -251,16 +358,14 @@ impl TeamRuntime {
             return Err("checks cannot be added during or after merge".to_string());
         }
         let tip = self.worker_tip(&worker).await?;
-        self.update_worker(worker_id, |worker| {
-            worker.checks.retain(|check| check.name != name);
-            worker.checks.push(WorkerCheck {
-                name,
-                status,
-                detail,
-                tip,
-            });
-        })
-        .await;
+        CheckRecorder::new(
+            &self.records,
+            &self.usage,
+            &self.save_lock,
+            &self.persistence,
+        )
+        .record_at_tip(worker_id, WorkerCheck { name, status, detail, tip })
+        .await?;
         self.persist().await?;
         self.worker(worker_id).await
     }

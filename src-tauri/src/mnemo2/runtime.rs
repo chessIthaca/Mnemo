@@ -1235,6 +1235,7 @@ impl LeadRuntime {
                 model: spawn_model.clone(),
                 reasoning_effort: reasoning_effort.clone(),
                 worktree: None,
+                check_commands: Vec::new(),
                 permissions: None,
                 policy: self.policy.clone(),
                 resume: Some(resume),

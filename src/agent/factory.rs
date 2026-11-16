@@ -102,6 +102,8 @@ pub struct AgentRootSpec {
     /// optional graph (indexing disabled); the worktree spawn path builds a
     /// fresh graph over the worktree's `.coding/codegraph.db`.
     pub codegraph: Option<Arc<crate::codegraph::CodeGraph>>,
+    /// Exact shell commands measured for worker check certification.
+    pub check_commands: Vec<String>,
 }
 
 /// Builds per-agent [`AgentLoop`]s, each with its own workflow + tool registry.
@@ -1574,6 +1576,10 @@ impl AgentLoopFactory {
         if want(ToolGroup::Shell, "shell") {
             registry.register(Box::new(
                 ShellTool::new(sandbox.clone())
+                    .with_check_commands(
+                        root.map(|spec| spec.check_commands.clone())
+                            .unwrap_or_default(),
+                    )
                     .with_filter_config(Arc::clone(&self.shell_filter))
                     // Same handle as GitTool: `shell git merge|push` must raise the
                     // always-on core-operation prompt too (follow-up A, 2027-01-11).
@@ -4118,6 +4124,7 @@ mod tests {
             sandbox: Sandbox::new(&worktree_root).unwrap(),
             project_root: worktree_root.clone(),
             codegraph: None,
+            check_commands: Vec::new(),
         };
 
         let agent = factory.build_with_root_spec(42, plans_dir.clone(), spec.clone());

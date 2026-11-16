@@ -304,6 +304,8 @@ pub struct TeamRuntime {
     fail_next_close: Arc<AtomicBool>,
     lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
+    /// Serializes pool selection through insertion of the new worker record.
+    checkout_pool_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     config_dir: PathBuf,
     /// The dispatch-routing settings, shared with every worker pump so a
@@ -344,6 +346,28 @@ pub struct TeamRuntime {
 pub const MAX_WORKER_SLOTS: usize = 32;
 
 impl TeamRuntime {
+    /// Every checkout currently held by a worker record.
+    async fn held_checkouts(&self) -> Vec<PathBuf> {
+        self.records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| !worker.worktree.as_os_str().is_empty())
+            .map(|worker| worker.worktree.clone())
+            .collect()
+    }
+
+    /// Every checkout held by a record other than `worker_id`.
+    async fn other_held_checkouts(&self, worker_id: &str) -> Vec<PathBuf> {
+        self.records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| worker.id != worker_id && !worker.worktree.as_os_str().is_empty())
+            .map(|worker| worker.worktree.clone())
+            .collect()
+    }
+
     async fn close_session_for_cleanup(&self, session: &AgentSession) -> Result<(), String> {
         close_worker_session(session, &self.fail_next_close).await
     }
@@ -370,8 +394,18 @@ impl TeamRuntime {
             .map(|team| team.usage.clone())
             .unwrap_or_default();
         let mut workers = persisted.map(|team| team.workers).unwrap_or_default();
+        let held: Vec<(String, PathBuf)> = workers
+            .iter()
+            .filter(|worker| !worker.worktree.as_os_str().is_empty())
+            .map(|worker| (worker.id.clone(), worker.worktree.clone()))
+            .collect();
         for worker in &mut workers {
-            recover_worker(&options.workspace_root, worker).await?;
+            let other_worktrees: Vec<PathBuf> = held
+                .iter()
+                .filter(|(id, _)| id != &worker.id)
+                .map(|(_, checkout)| checkout.clone())
+                .collect();
+            recover_worker(&options.workspace_root, worker, &other_worktrees).await?;
         }
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (signals, _) = broadcast::channel(EVENT_BUFFER);
@@ -400,6 +434,7 @@ impl TeamRuntime {
             fail_next_close: Arc::new(AtomicBool::new(false)),
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
+            checkout_pool_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
             config_dir: config_dir.clone(),
             routing: Arc::new(std::sync::RwLock::new(load_routing_settings(&config_dir))),

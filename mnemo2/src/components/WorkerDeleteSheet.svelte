@@ -55,7 +55,9 @@
     if (preview.shared_branch) {
       parts.push(`keeps ${preview.branch}, which another worker still uses`);
     } else {
-      if (preview.checkout) parts.push("removes its checkout");
+      if (preview.checkout) {
+        parts.push(preview.pool ? "frees its checkout for the next worker" : "removes its checkout");
+      }
       parts.push(`deletes ${preview.branch}`);
     }
     return parts.join(" · ");

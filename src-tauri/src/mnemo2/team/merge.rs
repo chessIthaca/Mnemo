@@ -6,19 +6,22 @@
 //! the merge lock, the lead's branch and worktree cleanups with their retries,
 //! and the board notices a merge or a revert posts back to the plan.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use mnemo::app::plan_board::{CloseOutcome, NO_DURABLE_RECORD_NUDGE};
 use mnemo::app::team_ledger::TeamLedger;
-use mnemo::app::worktrees::{agent_branch, current_branch, remove_agent_worktree};
+use mnemo::app::worktrees::{
+    agent_branch, current_branch, release_pool_checkout, remove_agent_worktree,
+};
 
 use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::phase3::{self, MergeRecord};
 
 use super::audit::validate_audit_linkage;
 use super::deletion::{
-    branch_exists, checkout_is_registered, remove_leftover_checkout, worker_checkout,
+    CheckoutKind, branch_exists, checkout_is_registered, remove_leftover_checkout,
+    validated_checkout, worker_checkout,
 };
 use super::external_lead::EXTERNAL_LEAD_MEMORY_REMINDER;
 use super::nudge::nudge_ignored_row;
@@ -76,9 +79,30 @@ fn is_worktree_cleanup_error(error: &str) -> bool {
         || error.starts_with(RECOVERED_WORKTREE_CLEANUP_ERROR)
 }
 
-pub(super) async fn cleanup_agent_worktree(root: &Path, worker: &WorkerRecord) -> Result<(), String> {
+pub(super) async fn cleanup_agent_worktree(
+    root: &Path,
+    worker: &WorkerRecord,
+    other_worktrees: &[PathBuf],
+) -> Result<(), String> {
     validate_worker_id(&worker.id)?;
-    let worktree = worker_checkout(root, &worker.id);
+    let worktree = match worker_checkout(root, worker) {
+        Some(CheckoutKind::Pool(_)) => {
+            return match validated_checkout(root, worker, other_worktrees)? {
+                Some(CheckoutKind::Pool(canonical)) => {
+                    release_pool_checkout(
+                        root.to_path_buf(),
+                        canonical,
+                        worker.branch.clone(),
+                    )
+                    .await
+                }
+                Some(CheckoutKind::Legacy(_)) => unreachable!("pool record changed kind"),
+                None => Ok(()),
+            };
+        }
+        Some(CheckoutKind::Legacy(worktree)) => worktree,
+        None => return Ok(()),
+    };
     match std::fs::symlink_metadata(&worktree) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -414,7 +438,12 @@ impl TeamRuntime {
                 return self.worker(worker_id).await;
             }
         }
-        match cleanup_agent_worktree(&self.workspace_root, &worker).await {
+        let pool = matches!(
+            worker_checkout(&self.workspace_root, &worker),
+            Some(CheckoutKind::Pool(_))
+        );
+        let other_worktrees = self.other_held_checkouts(&worker.id).await;
+        match cleanup_agent_worktree(&self.workspace_root, &worker, &other_worktrees).await {
             Err(err) => {
                 self.update_worker(worker_id, |worker| {
                     worker.error = Some(format!("{WORKTREE_CLEANUP_ERROR}: {err}"));
@@ -423,7 +452,13 @@ impl TeamRuntime {
                 self.persist().await?;
             }
             Ok(()) => {
-                // The checkout is gone, so Git no longer holds the branch. The
+                if pool {
+                    self.update_worker(worker_id, |worker| {
+                        worker.worktree = PathBuf::new();
+                    })
+                    .await;
+                }
+                // The checkout no longer holds the branch. The
                 // merge commit keeps the worker's tip as its second parent, so
                 // deleting the branch loses no work.
                 let shared = self
@@ -503,13 +538,21 @@ impl TeamRuntime {
         };
         let mut cleared = false;
         for candidate in candidates {
-            if cleanup_agent_worktree(&self.workspace_root, &candidate)
+            let pool = matches!(
+                worker_checkout(&self.workspace_root, &candidate),
+                Some(CheckoutKind::Pool(_))
+            );
+            let other_worktrees = self.other_held_checkouts(&candidate.id).await;
+            if cleanup_agent_worktree(&self.workspace_root, &candidate, &other_worktrees)
                 .await
                 .is_err()
             {
                 continue;
             }
             self.update_worker(&candidate.id, |worker| {
+                if pool {
+                    worker.worktree = PathBuf::new();
+                }
                 if worker
                     .error
                     .as_deref()
@@ -557,8 +600,8 @@ impl TeamRuntime {
         for candidate in candidates {
             // A checkout folder that is still there means its cleanup failed;
             // leave the whole worker alone.
-            if std::fs::symlink_metadata(worker_checkout(&self.workspace_root, &candidate.id))
-                .is_ok()
+            if worker_checkout(&self.workspace_root, &candidate)
+                .is_some_and(|checkout| std::fs::symlink_metadata(checkout.path()).is_ok())
             {
                 continue;
             }

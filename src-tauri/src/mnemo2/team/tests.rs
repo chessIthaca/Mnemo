@@ -14,7 +14,7 @@ use crate::mnemo2::phase3::{Finding, MergeRecord, ReviewEvidence, ReviewLane, Re
 use super::control::recover_worker;
 use super::deletion::{
     branch_exists, checkout_is_registered, move_checkout_to_trash, sweep_trash, trash_entries,
-    validated_checkout, worker_checkout, worktree_list_paths,
+    validated_checkout, worktree_list_paths,
 };
 use super::dispatch::{
     dispatch_routing_line, require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
@@ -88,7 +88,7 @@ async fn phase_two_ledgers_load_with_phase_three_defaults() {
     assert!(worker.inbox.is_empty());
     // Legacy ledgers predate review risk: they decode as standard.
     assert_eq!(worker.review_risk, "standard");
-    recover_worker(std::path::Path::new("unused"), &mut persisted.workers[0])
+    recover_worker(std::path::Path::new("unused"), &mut persisted.workers[0], &[])
         .await
         .expect("legacy recovery");
     assert!(persisted.workers[0].error.is_none());
@@ -1575,7 +1575,9 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         model_id: None,
         reasoning_effort: None,
         branch,
-        worktree: worker_checkout(root, id),
+        worktree: root
+            .join(".worktrees")
+            .join(format!("agent-{}", agent_short_id(id))),
         status: WorkerStatus::Completed,
         generation: 0,
         transcript: Arc::default(),
@@ -1755,7 +1757,7 @@ async fn a_half_removed_checkout_is_finished_after_merge() {
     deregister_worktree(root.path(), &worker.id);
     assert!(worker.worktree.join(".git").is_file());
 
-    cleanup_agent_worktree(root.path(), &worker)
+    cleanup_agent_worktree(root.path(), &worker, &[])
         .await
         .expect("finish removing the half-removed checkout");
 
@@ -1937,9 +1939,11 @@ async fn the_trash_sweep_removes_renamed_checkouts() {
     let record = worker(root.path(), "00000001000000000001");
     std::fs::create_dir_all(&record.worktree).expect("checkout folder");
     std::fs::write(record.worktree.join("note.txt"), "left\n").expect("checkout file");
-    let canonical = validated_checkout(root.path(), &record)
+    let canonical = validated_checkout(root.path(), &record, &[])
         .expect("the checkout validates")
-        .expect("it exists");
+        .expect("it exists")
+        .path()
+        .to_path_buf();
 
     move_checkout_to_trash(root.path(), &canonical)
         .await
@@ -2060,7 +2064,7 @@ async fn leftover_removal_never_leaves_the_worker_folder() {
     let main_marker = root.path().join("README.md");
     let original_main = std::fs::read(&main_marker).expect("main checkout marker");
 
-    cleanup_agent_worktree(root.path(), &leftover)
+    cleanup_agent_worktree(root.path(), &leftover, &[])
         .await
         .expect("remove only the leftover checkout");
     assert!(!leftover.worktree.exists());
@@ -2074,7 +2078,7 @@ async fn leftover_removal_never_leaves_the_worker_folder() {
     let outside_marker = outside.path().join("keep.txt");
     std::fs::write(&outside_marker, "outside\n").expect("outside marker");
     create_directory_link(&linked.worktree, outside.path());
-    let error = cleanup_agent_worktree(root.path(), &linked)
+    let error = cleanup_agent_worktree(root.path(), &linked, &[])
         .await
         .expect_err("a junction or symlink at the checkout path is refused");
     assert!(error.contains("refus"), "unexpected error: {error}");
@@ -9964,6 +9968,279 @@ async fn legacy_review_rounds_without_a_turn_count_never_escalate() {
         second.model.as_deref(),
         Some("test/scripted-simple"),
         "{second:?}"
+    );
+    team.shutdown().await;
+}
+
+
+async fn provision_pool_worker(team: &TeamRuntime, id: &str) -> WorkerRecord {
+    team.provision_worker(
+        "pool test worker".to_string(),
+        None,
+        None,
+        None,
+        Some(id.to_string()),
+        "standard".to_string(),
+        None,
+        None,
+    )
+    .await
+    .expect("provision pool worker")
+}
+
+async fn make_worker_reviewable(team: &TeamRuntime, worker: &WorkerRecord) {
+    let file = format!("merged-{}.txt", worker.id);
+    std::fs::write(worker.worktree.join(&file), "merged\n").expect("worker change");
+    run_git(&worker.worktree, &["add", &file]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+    team.update_worker(&worker.id, |current| {
+        current.status = WorkerStatus::InReview;
+        current.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: tip.clone(),
+        }];
+        current.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip: tip.clone(),
+            reviewed_at_ms: 1,
+            evidence: Some(evidence()),
+            lane: None,
+        });
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn two_live_workers_get_different_pool_checkouts() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    let first = provision_pool_worker(&team, "poola0001").await;
+    let second = provision_pool_worker(&team, "poolb0001").await;
+    let third = provision_pool_worker(&team, "poolc0001").await;
+
+    for (worker, name) in [(&first, "pool-1"), (&second, "pool-2"), (&third, "pool-3")] {
+        assert_eq!(worker.worktree.file_name().and_then(|name| name.to_str()), Some(name));
+        assert!(worker.worktree.join(".git").is_file());
+    }
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_dispatches_never_share_a_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    let (first, second) = tokio::join!(
+        provision_pool_worker(&team, "conca0001"),
+        provision_pool_worker(&team, "concb0001"),
+    );
+
+    assert_ne!(first.worktree, second.worktree);
+    assert!(first.worktree.join(".git").is_file());
+    assert!(second.worktree.join(".git").is_file());
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn a_merged_workers_pool_is_reused_by_the_next_dispatch() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    std::fs::write(root.path().join(".git/info/exclude"), "target/\nnode_modules/\n")
+        .expect("ignore build caches");
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let first = provision_pool_worker(&team, "mergea0001").await;
+    let pool = first.worktree.clone();
+    std::fs::create_dir_all(pool.join("target")).expect("target cache");
+    std::fs::write(pool.join("target/warm.txt"), "warm\n").expect("warm cache");
+    std::fs::create_dir_all(pool.join(".coding/tmp")).expect("leftover dir");
+    std::fs::write(pool.join(".coding/tmp/stale.txt"), "stale\n").expect("ignored leftover");
+    make_worker_reviewable(&team, &first).await;
+
+    let merged = team.merge(&first.id).await.expect("merge pool worker");
+    assert!(merged.worktree.as_os_str().is_empty());
+    assert!(pool.exists());
+    let detached = phase3::git(&pool, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .expect("detached pool HEAD");
+    assert!(detached.status.success());
+    assert_eq!(String::from_utf8_lossy(&detached.stdout).trim(), "HEAD");
+    assert_eq!(
+        std::fs::read_to_string(pool.join("target/warm.txt")).expect("cache survives"),
+        "warm\n"
+    );
+    let branches = phase3::git(root.path(), &["branch", "--list", &first.branch])
+        .await
+        .expect("list worker branch");
+    assert!(branches.status.success());
+    assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
+
+    let second = provision_pool_worker(&team, "mergeb0001").await;
+    assert_eq!(second.worktree, pool);
+    assert_eq!(second.branch, agent_branch(&second.id));
+    assert_eq!(
+        std::fs::read_to_string(pool.join("target/warm.txt")).expect("cache remains warm"),
+        "warm\n"
+    );
+    assert!(!pool.join(".coding/tmp/stale.txt").exists());
+    assert_eq!(
+        mnemo::app::worktrees::current_branch(&pool).expect("reused pool branch"),
+        second.branch
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn deleting_a_failed_worker_discards_and_frees_its_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    std::fs::write(root.path().join(".git/info/exclude"), "target/\n")
+        .expect("ignore build cache");
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let failed = provision_pool_worker(&team, "deletea001").await;
+    team.update_worker(&failed.id, |worker| worker.status = WorkerStatus::Failed)
+        .await;
+    std::fs::write(failed.worktree.join("README.md"), "dirty\n").expect("dirty checkout");
+    std::fs::write(failed.worktree.join("untracked.txt"), "discard\n")
+        .expect("untracked change");
+    std::fs::create_dir_all(failed.worktree.join("target")).expect("target cache");
+    std::fs::write(failed.worktree.join("target/warm.txt"), "warm\n")
+        .expect("warm cache");
+
+    let preview = team
+        .deletion_preview(std::slice::from_ref(&failed.id))
+        .await
+        .expect("pool deletion preview");
+    assert!(preview[0].pool);
+    assert!(preview[0].checkout);
+    assert!(preview[0].uncommitted);
+    team.delete_workers(std::slice::from_ref(&failed.id), true)
+        .await
+        .expect("delete failed worker");
+    assert!(failed.worktree.exists());
+    assert_eq!(
+        std::fs::read_to_string(failed.worktree.join("README.md"))
+            .expect("reset tracked file")
+            .trim(),
+        "seed"
+    );
+    assert!(!failed.worktree.join("untracked.txt").exists());
+    assert!(failed.worktree.join("target/warm.txt").exists());
+
+    let next = provision_pool_worker(&team, "deleteb001").await;
+    assert_eq!(next.worktree, failed.worktree);
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn legacy_agent_checkouts_still_merge_and_delete() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mergeable = worker(root.path(), "legacya0001");
+    let failed = worker(root.path(), "legacyb0001");
+    for worker in [&mergeable, &failed] {
+        run_git(
+            root.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &worker.branch,
+                worker.worktree.to_str().expect("checkout path"),
+                "wt/mnemo",
+            ],
+        );
+    }
+    let team = open_test_team(
+        root.path(),
+        state.path(),
+        vec![mergeable.clone(), failed.clone()],
+    )
+    .await;
+    make_worker_reviewable(&team, &mergeable).await;
+    team.update_worker(&failed.id, |worker| worker.status = WorkerStatus::Failed)
+        .await;
+
+    team.merge(&mergeable.id).await.expect("merge legacy worker");
+    team.delete_workers(std::slice::from_ref(&failed.id), false)
+        .await
+        .expect("delete legacy worker");
+
+    assert!(!mergeable.worktree.exists());
+    assert!(!failed.worktree.exists());
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn a_dirty_free_pool_is_never_reused() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let dirty = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            dirty.to_str().expect("dirty pool path"),
+            "main",
+        ],
+    );
+    std::fs::write(dirty.join("uncommitted.txt"), "keep\n").expect("dirty pool change");
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    let worker = provision_pool_worker(&team, "dirtya0001").await;
+
+    assert_eq!(worker.worktree.file_name().and_then(|name| name.to_str()), Some("pool-2"));
+    assert_eq!(
+        std::fs::read_to_string(dirty.join("uncommitted.txt")).expect("dirty pool is untouched"),
+        "keep\n"
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pool_held_by_another_record_cannot_be_discarded() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let first = provision_pool_worker(&team, "shareda01").await;
+    team.update_worker(&first.id, |worker| worker.status = WorkerStatus::Failed)
+        .await;
+    let mut second = first.clone();
+    second.id = "sharedb01".to_string();
+    second.name = second.id.clone();
+    second.branch = agent_branch(&second.id);
+    team.records.lock().await.push(second);
+
+    let outcome = team
+        .delete_workers(std::slice::from_ref(&first.id), true)
+        .await
+        .expect("the batch reports the guard failure");
+    let error = outcome.results[0].error.as_deref().expect("deletion refused");
+    assert!(error.contains("another worker record holds"), "{error}");
+    assert!(team.worker(&first.id).await.is_ok());
+    assert!(branch_exists(root.path(), &first.branch).await);
+    assert_eq!(
+        mnemo::app::worktrees::current_branch(&first.worktree).expect("unchanged pool branch"),
+        first.branch
     );
     team.shutdown().await;
 }

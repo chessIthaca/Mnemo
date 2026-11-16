@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mnemo::app::worktrees::{agent_short_id, current_branch, provision_agent_worktree};
+use mnemo::app::worktrees::{
+    agent_short_id, current_branch, provision_agent_checkout, rollback_agent_checkout,
+};
 use mnemo::headless::{AgentSession, SessionCommand, SpawnOptions, Transcript};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::{PermissionPolicy, route_question};
@@ -142,8 +144,15 @@ impl TeamRuntime {
             }
         };
         let millis = phase3::now_ms();
-        let (worktree, branch) =
-            provision_agent_worktree(self.workspace_root.clone(), id.clone(), base_ref).await?;
+        let _checkout_pool_guard = self.checkout_pool_lock.lock().await;
+        let held = self.held_checkouts().await;
+        let (worktree, branch) = provision_agent_checkout(
+            self.workspace_root.clone(),
+            id.clone(),
+            base_ref,
+            held,
+        )
+        .await?;
         let base_tip = phase3::tip(&worktree).await?;
         let record = WorkerRecord {
             id: id.clone(),
@@ -205,9 +214,10 @@ impl TeamRuntime {
         self.records.lock().await.push(record.clone());
         if let Err(err) = self.persist().await {
             self.records.lock().await.retain(|worker| worker.id != id);
-            let rollback = mnemo::app::worktrees::rollback_agent_worktree(
+            let rollback = rollback_agent_checkout(
                 self.workspace_root.clone(),
                 id.clone(),
+                record.worktree.clone(),
                 base_tip,
             )
             .await;

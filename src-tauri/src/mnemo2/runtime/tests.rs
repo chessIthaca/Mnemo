@@ -3451,7 +3451,8 @@ async fn merge_detaches_the_live_session_before_worktree_cleanup() {
     let merged = team.merge(&worker.id).await.expect("merge");
     assert_eq!(merged.status, WorkerStatus::Merged);
     assert_eq!(team.snapshot().await.active, 0);
-    assert!(!worker.worktree.exists());
+    assert!(worker.worktree.exists());
+    assert!(merged.worktree.as_os_str().is_empty());
     assert!(
         team.resume(&worker.id).await.is_err(),
         "merged workers stay closed"
@@ -3522,7 +3523,8 @@ async fn restart_reconstructs_a_completed_merge_from_git_evidence() {
         .expect("lead tip");
     assert_eq!(recovered.status, WorkerStatus::Merged);
     assert_eq!(recovered.merge.expect("merge record").commit, lead_tip);
-    assert!(!worker.worktree.exists());
+    assert!(worker.worktree.exists());
+    assert!(recovered.worktree.as_os_str().is_empty());
     crate::mnemo2::phase3::require_clean(root.path(), "lead")
         .await
         .expect("clean lead");
@@ -3923,10 +3925,11 @@ async fn merge_requires_tip_checks_and_supports_local_revert() {
         (1, 1, 0)
     );
     assert!(
-        !worker.worktree.exists(),
-        "successful merge removes the worktree: {:?}",
+        worker.worktree.exists(),
+        "successful merge retains the detached pool: {:?}",
         merged.error
     );
+    assert!(merged.worktree.as_os_str().is_empty());
     let merged_source = std::fs::read_to_string(root.path().join("feature.rs"))
         .expect("merged source")
         .replace("\r\n", "\n");
@@ -6936,8 +6939,16 @@ async fn cleaned_branch_can_be_reviewed_but_not_merged() {
     team.stop(&worker.id).await.expect("stop worker");
     let report = team.cleanup().await.expect("clean checkout");
     assert!(
-        !worker.worktree.exists(),
-        "cleanup did not remove the checkout: {report:?}"
+        worker.worktree.exists(),
+        "cleanup retains the detached pool: {report:?}"
+    );
+    assert!(
+        team.worker(&worker.id)
+            .await
+            .expect("cleaned record")
+            .worktree
+            .as_os_str()
+            .is_empty()
     );
     let reviewed = team
         .review(
@@ -6994,7 +7005,7 @@ fn branch_exists(root: &std::path::Path, branch: &str) -> bool {
 }
 
 #[tokio::test]
-async fn deleting_a_worker_stops_it_and_removes_its_record_checkout_and_branch() {
+async fn deleting_a_worker_stops_it_and_releases_its_record_checkout_and_deletes_its_branch() {
     use crate::mnemo2::team::WorkerStatus;
 
     let root = tempfile::tempdir().expect("workspace");
@@ -7026,7 +7037,7 @@ async fn deleting_a_worker_stops_it_and_removes_its_record_checkout_and_branch()
     let outcome = team.delete_workers(&ids, false).await.expect("delete");
     assert!(outcome.snapshot.workers.iter().all(|record| record.id != worker.id));
     assert!(team.worker(&worker.id).await.is_err());
-    assert!(!worker.worktree.exists(), "the checkout is removed");
+    assert!(worker.worktree.exists(), "the pool checkout is released");
     assert!(
         !branch_exists(root.path(), &worker.branch),
         "the branch is deleted"
@@ -7093,7 +7104,7 @@ async fn deleting_unmerged_worker_work_requires_confirmation() {
         confirmed.results
     );
     assert!(team.worker(&worker.id).await.is_err());
-    assert!(!worker.worktree.exists());
+    assert!(worker.worktree.exists());
     assert!(!branch_exists(root.path(), &worker.branch));
 
     team.shutdown().await;

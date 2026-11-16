@@ -9,7 +9,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
-use mnemo::app::worktrees::{agent_branch, agent_short_id, current_branch};
+use mnemo::app::worktrees::{agent_branch, agent_short_id, current_branch, is_pool_checkout};
 use serde::Serialize;
 
 use crate::mnemo2::phase3::{git_value, tip};
@@ -356,6 +356,21 @@ fn checkout_path(root: &Path, worker: &WorkerRecord) -> Result<PathBuf, String> 
     validate_worker_identity(worker)?;
     let root = dunce::canonicalize(root)
         .map_err(|err| format!("could not resolve the project root: {err}"))?;
+    if is_pool_checkout(&worker.worktree) {
+        let metadata = std::fs::symlink_metadata(&worker.worktree)
+            .map_err(|err| format!("worker checkout could not be resolved: {err}"))?;
+        if pool_is_link_or_junction(&metadata) || !metadata.is_dir() {
+            return Err("the worker pool checkout is not a real directory".to_string());
+        }
+        let recorded = dunce::canonicalize(&worker.worktree)
+            .map_err(|err| format!("worker checkout could not be resolved: {err}"))?;
+        let worktrees = dunce::canonicalize(root.join(".worktrees"))
+            .map_err(|err| format!("worker checkout could not be resolved: {err}"))?;
+        if recorded.parent() != Some(worktrees.as_path()) || !is_pool_checkout(&recorded) {
+            return Err("the worker checkout is outside its registered worktree".to_string());
+        }
+        return Ok(recorded);
+    }
     let expected = root
         .join(".worktrees")
         .join(format!("agent-{}", agent_short_id(&worker.id)));
@@ -367,6 +382,20 @@ fn checkout_path(root: &Path, worker: &WorkerRecord) -> Result<PathBuf, String> 
         return Err("the worker checkout is outside its registered worktree".to_string());
     }
     Ok(expected)
+}
+
+#[cfg(windows)]
+fn pool_is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn pool_is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 async fn read_diff(checkout: &Path, base: &str, tip: Option<&str>) -> Result<ParsedDiff, String> {
@@ -1012,5 +1041,16 @@ mod tests {
         let (_dir, root) = canonical_tempdir();
         std::fs::write(root.join("notes.txt"), b"text").expect("notes");
         assert!(read_tool_image(root, "notes.txt").await.is_err());
+    }
+    #[test]
+    fn checkout_path_accepts_a_recorded_pool_checkout() {
+        let root = tempfile::tempdir().expect("workspace");
+        let pool = root.path().join(".worktrees/pool-1");
+        std::fs::create_dir_all(&pool).expect("pool checkout");
+        let record = worker(root.path(), &pool);
+
+        let resolved = checkout_path(root.path(), &record).expect("pool checkout path");
+
+        assert_eq!(resolved, dunce::canonicalize(pool).expect("canonical pool"));
     }
 }

@@ -221,6 +221,7 @@ const SUPERSEDED_PREVIEW: WorkerDeletionPreview = {
   branch: "wt/agent-noa",
   live: false,
   checkout: true,
+  pool: false,
   uncommitted: false,
   unmerged_commits: 2,
   shared_branch: false,

@@ -12,6 +12,7 @@ function preview(overrides: Partial<WorkerDeletionPreview> = {}): WorkerDeletion
     branch: "wt/agent-w1",
     live: false,
     checkout: true,
+    pool: false,
     uncommitted: false,
     unmerged_commits: 0,
     shared_branch: false,
@@ -100,6 +101,13 @@ describe("WorkerDeleteSheet", () => {
     expect(screen.getAllByText("Checking…")).not.toHaveLength(0);
     const confirm = screen.getByRole("button", { name: "Checking…" });
     expect(confirm.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("describes releasing a pool checkout instead of removing its folder", () => {
+    open([preview({ pool: true })]);
+    render(WorkerDeleteSheet);
+    expect(screen.getByText(/frees its checkout for the next worker/)).toBeTruthy();
+    expect(screen.queryByText(/removes its checkout/)).toBeNull();
   });
 
   it("keeps a shared branch and lists blocked workers without deleting them", () => {

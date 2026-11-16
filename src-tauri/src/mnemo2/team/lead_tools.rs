@@ -216,7 +216,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_merge".to_string(),
-                description: "Merge one reviewed worker only after exact-tip checks and findings close; never targets main and never pushes. After a clean merge Mnemo2 closes the worker's session, removes its checkout and deletes its branch (a safe delete: a branch that is not fully merged is kept), so never delete worker branches yourself; the merge commit keeps the worker's tip as its second parent.".to_string(),
+                description: "Merge one reviewed worker only after exact-tip checks and findings close; never targets main and never pushes. After a clean merge Mnemo2 closes the worker's session, releases its checkout (legacy folders are removed; pool folders stay detached for reuse) and deletes its branch (a safe delete: a branch that is not fully merged is kept), so never delete worker branches yourself; the merge commit keeps the worker's tip as its second parent.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(120_000),

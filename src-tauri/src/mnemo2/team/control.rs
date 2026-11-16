@@ -6,6 +6,7 @@
 //! resume, model changes and compaction - everything that drives a live
 //! worker session from the outside.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,6 +21,7 @@ use crate::mnemo2::dispatch_routing::{
     DispatchRoutingRow, RoutingMode, TEXT_MAX_CHARS, classify_dispatch,
 };
 
+use super::deletion::{CheckoutKind, worker_checkout};
 use super::{
     LiveWorker, RECOVERED_WORKTREE_CLEANUP_ERROR, TeamRuntime, WorkerSessionSpec,
     cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key,
@@ -802,7 +804,11 @@ impl TeamRuntime {
         self.worker(worker_id).await
     }
 }
-pub(super) async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Result<(), String> {
+pub(super) async fn recover_worker(
+    root: &std::path::Path,
+    worker: &mut WorkerRecord,
+    other_worktrees: &[PathBuf],
+) -> Result<(), String> {
     worker.brief_sent = true;
     worker.compacting = false;
     let legacy_budget_pause = worker.error.as_deref().is_some_and(|error| {
@@ -853,8 +859,13 @@ pub(super) async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRe
             worker.status = WorkerStatus::Merged;
             worker.merge = Some(record);
             worker.error = None;
-            if let Err(err) = cleanup_agent_worktree(root, worker).await {
-                worker.error = Some(format!("{RECOVERED_WORKTREE_CLEANUP_ERROR}: {err}"));
+            let pool = matches!(worker_checkout(root, worker), Some(CheckoutKind::Pool(_)));
+            match cleanup_agent_worktree(root, worker, other_worktrees).await {
+                Ok(()) if pool => worker.worktree = PathBuf::new(),
+                Ok(()) => {}
+                Err(err) => {
+                    worker.error = Some(format!("{RECOVERED_WORKTREE_CLEANUP_ERROR}: {err}"));
+                }
             }
             return Ok(());
         }

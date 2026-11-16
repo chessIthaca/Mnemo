@@ -332,9 +332,55 @@ impl Drop for PoolClaim {
     }
 }
 
+/// Whether a claim's recorded process is still alive. An unreadable claim is
+/// an error (and therefore skipped); an absent or malformed pid has no live
+/// owner to protect and can become stale by age.
+fn claim_owner_alive(claim: &Path) -> Result<bool, String> {
+    let contents = std::fs::read_to_string(claim)
+        .map_err(|error| format!("cannot read {}: {error}", claim.display()))?;
+    let Some(pid) = contents
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+    else {
+        return Ok(false);
+    };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: fixed query flags, no handle inheritance; close every handle.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Ok(false);
+        }
+        let mut exit_code = 0;
+        // SAFETY: the handle is valid and outlives this query.
+        let probed = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: the handle is no longer used.
+        unsafe { CloseHandle(handle) };
+        Ok(probed != 0 && exit_code == STILL_ACTIVE as u32)
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .map_err(|error| format!("cannot probe claim owner {pid}: {error}"))
+    }
+}
+
 /// Claim a free pool across Mnemo instances. Only a claim older than ten
-/// minutes is stale; a fresh claim or an unreadable/future-dated one skips the
-/// pool. A stale claim is removed and creation retried exactly once.
+/// minutes whose recorded owner is no longer alive is stale; a fresh claim,
+/// a live owner, or an unreadable/future-dated claim skips the pool. A stale
+/// claim is removed and creation retried exactly once.
 fn acquire_pool_claim(pool: &Path) -> Result<Option<PoolClaim>, String> {
     let claim = pool.with_file_name(format!(
         "{}.claim",
@@ -361,10 +407,11 @@ fn acquire_pool_claim(pool: &Path) -> Result<Option<PoolClaim>, String> {
                     let modified = std::fs::metadata(&claim)
                         .and_then(|metadata| metadata.modified())
                         .map_err(|error| format!("cannot inspect {}: {error}", claim.display()))?;
-                    modified
+                    let aged = modified
                         .elapsed()
                         .map(|age| age > std::time::Duration::from_secs(600))
-                        .unwrap_or(false)
+                        .unwrap_or(false);
+                    aged && !claim_owner_alive(&claim)?
                 } else {
                     false
                 };
@@ -881,6 +928,22 @@ mod tests {
         dir
     }
 
+    fn exited_process_id() -> u32 {
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap short-lived child");
+        pid
+    }
+
     fn create_directory_link(link: &Path, target: &Path) -> Result<(), String> {
         #[cfg(windows)]
         {
@@ -1334,7 +1397,7 @@ mod tests {
             .await
             .expect("release pool-1");
         let claim = pool.with_file_name("pool-1.claim");
-        std::fs::write(&claim, "12345\n").expect("stale claim");
+        std::fs::write(&claim, exited_process_id().to_string()).expect("stale claim");
         let file = std::fs::File::options().write(true).open(&claim).expect("claim file");
         file.set_modified(
             std::time::SystemTime::now()
@@ -1352,6 +1415,42 @@ mod tests {
         .expect("take over a stale claim");
         assert_eq!(checkout, pool);
         assert!(!claim.exists(), "the owned claim is dropped after provisioning");
+    }
+
+    #[tokio::test]
+    async fn an_old_claim_with_a_live_owner_is_never_taken_over() {
+        let repo = init_repo();
+        let pool = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-old".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision pool-1");
+        release_pool_checkout(repo.path().to_path_buf(), pool.clone(), "wt/agent-old".to_string())
+            .await
+            .expect("release pool-1");
+        let claim = pool.with_file_name("pool-1.claim");
+        std::fs::write(&claim, format!("{}\n", std::process::id())).expect("live claim");
+        let file = std::fs::File::options().write(true).open(&claim).expect("claim file");
+        file.set_modified(
+            std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(601))
+                .expect("old timestamp"),
+        )
+        .expect("age the live claim");
+
+        let checkout = provision_pool_checkout(
+            repo.path().to_path_buf(),
+            "wt/agent-new".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision past a live claim");
+        assert_eq!(pool_index(&checkout), Some(2));
+        assert!(claim.exists(), "the live owner's old claim remains");
     }
 
     #[tokio::test]

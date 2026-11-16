@@ -24,7 +24,7 @@ use super::dispatch::{
 };
 use super::guardrails::executor_guardrails;
 use super::lead_tools::worker_status_view;
-use super::merge::{delete_merged_branch, validate_merge, WORKTREE_CLEANUP_ERROR};
+use super::merge::{delete_merged_branch, merge_tip, validate_merge, WORKTREE_CLEANUP_ERROR};
 use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
 use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
@@ -10730,6 +10730,84 @@ async fn a_detached_pool_behind_its_branch_refuses_to_merge() {
             .await
             .expect("branch tip after refusal"),
         branch_tip
+    );
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn merge_tip_pins_the_reviewed_commit_after_the_branch_advances() {
+    let root = tempfile::tempdir().expect("workspace");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let checkout = root.path().join(".worktrees/tip-worker");
+    let branch = "wt/agent-immutable01";
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            checkout.to_str().expect("worker checkout"),
+            "wt/mnemo",
+        ],
+    );
+    std::fs::write(checkout.join("a.txt"), "reviewed A\n").expect("reviewed change");
+    run_git(&checkout, &["add", "a.txt"]);
+    run_git(&checkout, &["commit", "-m", "reviewed A"]);
+    let reviewed = phase3::tip(&checkout).await.expect("reviewed tip");
+    std::fs::write(checkout.join("b.txt"), "later B\n").expect("later change");
+    run_git(&checkout, &["add", "b.txt"]);
+    run_git(&checkout, &["commit", "-m", "later B"]);
+    let later = phase3::tip(&checkout).await.expect("later branch tip");
+
+    let output = merge_tip(root.path(), &reviewed, "merge exact reviewed tip")
+        .await
+        .expect("run exact-tip merge");
+    assert!(output.status.success(), "{}", phase3::git_error(&["merge"], &output));
+
+    assert_eq!(
+        phase3::git_value(root.path(), &["rev-parse", "HEAD^2"])
+            .await
+            .expect("merge second parent"),
+        reviewed
+    );
+    assert_eq!(
+        phase3::git_value(root.path(), &["rev-parse", branch])
+            .await
+            .expect("advanced branch remains"),
+        later
+    );
+    assert!(!root.path().join("b.txt").exists(), "later B is not merged");
+}
+
+
+#[tokio::test]
+async fn unregistered_pool_is_rejected_before_worker_cleanliness_or_tip_probes() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mut worker = worker(root.path(), "guardorder1");
+    worker.worktree = root.path().join(".worktrees/pool-1");
+    worker.status = WorkerStatus::InReview;
+    std::fs::create_dir_all(&worker.worktree).expect("plain pool folder");
+    // If merge probes this folder before checking registration, Git fails on
+    // this malformed gitfile instead of returning the registration refusal.
+    std::fs::write(worker.worktree.join(".git"), "not a gitfile\n").expect("invalid gitfile");
+    run_git(root.path(), &["branch", &worker.branch]);
+    let lead_tip = phase3::tip(root.path()).await.expect("lead tip");
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+
+    let error = team.merge(&worker.id).await.expect_err("unregistered pool refused");
+
+    assert!(error.contains("not a registered worktree"), "{error}");
+    assert!(!error.contains("gitfile"), "worker Git was probed first: {error}");
+    assert_eq!(phase3::tip(root.path()).await.expect("unchanged lead"), lead_tip);
+    assert_eq!(
+        team.worker(&worker.id).await.expect("unchanged worker").status,
+        WorkerStatus::InReview
     );
     team.shutdown().await;
 }

@@ -278,6 +278,16 @@ pub(super) fn validate_merge(
     Ok(())
 }
 
+/// Merge the exact reviewed commit, never a mutable branch name that could
+/// advance between validation and this Git invocation.
+pub(super) async fn merge_tip(
+    root: &Path,
+    tip: &str,
+    message: &str,
+) -> Result<std::process::Output, String> {
+    phase3::git(root, &["merge", "--no-ff", tip, "-m", message]).await
+}
+
 impl TeamRuntime {
     /// Merge one reviewed worker into the clean, idle, non-main lead branch.
     pub async fn merge(&self, worker_id: &str) -> Result<WorkerRecord, String> {
@@ -315,20 +325,24 @@ impl TeamRuntime {
             return Err("Mnemo2 never merges a worker directly into main".to_string());
         }
         phase3::require_clean_lead(&self.workspace_root, "lead").await?;
-        phase3::require_clean(&worker.worktree, "worker").await?;
-        let tip = phase3::tip(&worker.worktree).await?;
-        if matches!(
+        let pool = matches!(
             worker_checkout(&self.workspace_root, &worker),
             Some(CheckoutKind::Pool(_))
-        ) {
-            let on_branch = ensure_pool_checkout_registered(
+        );
+        if pool {
+            // This must precede require_clean/tip: an unregistered folder can
+            // otherwise make those probes walk up and operate on the lead.
+            ensure_pool_checkout_registered(
                 self.workspace_root.clone(),
                 worker.worktree.clone(),
             )
-            .await
-            .is_ok()
-                && current_branch(&worker.worktree)
-                    .is_ok_and(|branch| branch == worker.branch)
+            .await?;
+        }
+        phase3::require_clean(&worker.worktree, "worker").await?;
+        let tip = phase3::tip(&worker.worktree).await?;
+        if pool {
+            let on_branch = current_branch(&worker.worktree)
+                .is_ok_and(|branch| branch == worker.branch)
                 && phase3::git_value(
                     &worker.worktree,
                     &["rev-parse", &format!("refs/heads/{}", worker.branch)],
@@ -358,11 +372,7 @@ impl TeamRuntime {
             return Err(err);
         }
         let message = format!("team: merge {} ({})", worker.name, worker.id);
-        let output = match phase3::git(
-            &self.workspace_root,
-            &["merge", "--no-ff", &worker.branch, "-m", &message],
-        )
-        .await
+        let output = match merge_tip(&self.workspace_root, &tip, &message).await
         {
             Ok(output) => output,
             Err(err) => {
@@ -374,7 +384,7 @@ impl TeamRuntime {
         };
         if !output.status.success() {
             let diagnostic = phase3::git_error(
-                &["merge", "--no-ff", &worker.branch, "-m", &message],
+                &["merge", "--no-ff", &tip, "-m", &message],
                 &output,
             );
             let merge_head = phase3::git(

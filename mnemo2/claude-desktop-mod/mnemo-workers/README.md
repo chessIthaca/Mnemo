@@ -15,9 +15,12 @@ project the band stays hidden.
 
 ## Install
 
-Load the folder as a plugin directory, for example by adding it to
-`CLAUDE_CODE_PLUGIN_DIRS`, or start Claude Code with
-`--plugin-dir <path>/mnemo2/claude-desktop-mod/mnemo-workers`.
+Mnemo2's Settings → Claude Code → Connect installs this mod together with the
+`mnemo` plugin. From a source checkout whose `mnemo` marketplace points at
+this repository, run `claude plugin install mnemo-workers@mnemo` once. The
+band only appears in a new or restarted Claude Code session. For development,
+load the folder as a plugin directory: add it to `CLAUDE_CODE_PLUGIN_DIRS`, or
+start Claude Code with `--plugin-dir <path>/mnemo2/claude-desktop-mod/mnemo-workers`.
 
 ## Check
 

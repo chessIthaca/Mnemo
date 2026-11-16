@@ -11,6 +11,11 @@
       "name": "mnemo",
       "source": "./mnemo2/plugin",
       "description": "Lead a Mnemo2 team from Claude Code: plan, dispatch workers by tier, review and merge through Mnemo2's team tools."
+    },
+    {
+      "name": "mnemo-workers",
+      "source": "./mnemo2/claude-desktop-mod/mnemo-workers",
+      "description": "Shows the running Mnemo2 workers and their models above the prompt in Claude Desktop's Code tab; click a worker to open it in mission control."
     }
   ]
 }

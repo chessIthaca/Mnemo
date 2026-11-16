@@ -2699,6 +2699,83 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Where a worker's checkout folder lives and whether it is reused is not specified by any capability (dispatch-routing, external-lead, plan-board, worker-brief, tier-ladder, settings-dialog, llm-trace); routing, external-lead and review/merge behavior are unchanged."
+    },
+    {
+      "id": "a209ed0a",
+      "status": "closed",
+      "created_at_ms": 1794831362793,
+      "closed_at_ms": 1794832562236,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-a209ed0a-20261116-123602.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Packaging of the Claude Code plugin marketplace; no specified capability (routing, external lead, board, worker brief, tiers, settings dialog, trace) changes."
+    },
+    {
+      "id": "3b8f715a",
+      "status": "closed",
+      "created_at_ms": 1794831484809,
+      "closed_at_ms": 1794859275491,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3b8f715a-20261116-200115.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds an automatic source for the existing per-tip checks; the merge gate, review evidence and dispatch routing requirements are unchanged, and no capability spec names who records checks."
+    },
+    {
+      "id": "e1529a36",
+      "status": "open",
+      "created_at_ms": 1794833540411,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "UI now exposes what change_model already allows for unreported audits; routing training rows still exclude audits; no capability requirement changes."
+    },
+    {
+      "id": "41cd8251",
+      "status": "closed",
+      "created_at_ms": 1794854921126,
+      "closed_at_ms": 1794862053571,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-41cd8251-20261116-204733.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Error text and tool description of a worker host tool; worker-brief and plan-board requirements are unchanged."
+    },
+    {
+      "id": "ebaac2a3",
+      "status": "closed",
+      "created_at_ms": 1794854963467,
+      "closed_at_ms": 1794864811466,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-ebaac2a3-20261116-213331.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Fallback delivery of an audit report already defined as its message_parent report; no capability requirement changes."
+    },
+    {
+      "id": "75b41222",
+      "status": "closed",
+      "created_at_ms": 1794856774920,
+      "closed_at_ms": 1794861375745,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-75b41222-20261116-203615.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Ordering of the shell tool's model-facing output text; no specified capability covers it."
+    },
+    {
+      "id": "320aaffc",
+      "status": "closed",
+      "created_at_ms": 1794864231433,
+      "closed_at_ms": 1794865627955,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-320aaffc-20261116-214707.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Version bump, dependency updates and changelog only."
     }
   ]
 }

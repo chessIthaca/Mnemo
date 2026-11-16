@@ -2,7 +2,9 @@ use super::*;
 
 use std::collections::VecDeque;
 
-use mnemo::app::worktrees::{agent_branch, agent_short_id, provision_agent_worktree};
+use mnemo::app::worktrees::{
+    agent_branch, agent_short_id, provision_agent_worktree, release_pool_checkout,
+};
 use mnemo::headless::{GateVerdict, Transcript};
 use mnemo::SerializableAgentEvent;
 use mnemo::tool::{SafetyLevel, ToolResult};
@@ -10296,5 +10298,213 @@ async fn a_pool_held_by_another_record_is_blocked_in_preview_and_deletion() {
         mnemo::app::worktrees::current_branch(&first.worktree).expect("unchanged pool branch"),
         first.branch
     );
+    team.shutdown().await;
+}
+
+
+fn assert_saved_worktree_empty(state: &std::path::Path, worker_id: &str) {
+    let saved = TeamPersistence::new(state)
+        .load()
+        .expect("load saved team")
+        .expect("saved team");
+    let worker = saved
+        .workers
+        .iter()
+        .find(|worker| worker.id == worker_id)
+        .expect("saved worker");
+    assert!(worker.worktree.as_os_str().is_empty(), "saved worktree for {worker_id}");
+}
+
+#[tokio::test]
+async fn retry_after_a_lost_detach_save_persists_and_reuses_the_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let mut stale = worker(root.path(), "retrysave01");
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &stale.branch,
+            pool.to_str().expect("pool path"),
+            "main",
+        ],
+    );
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), stale.branch.clone())
+        .await
+        .expect("detach before the lost save");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Merged;
+    stale.error = Some(format!("{WORKTREE_CLEANUP_ERROR}: simulated lost save"));
+
+    let team = open_test_team(root.path(), state.path(), vec![stale.clone()]).await;
+
+    assert!(team.worker(&stale.id).await.expect("retried worker").worktree.as_os_str().is_empty());
+    assert_saved_worktree_empty(state.path(), &stale.id);
+    let next = provision_pool_worker(&team, "retrynext01").await;
+    assert_eq!(next.worktree, pool);
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn merging_recovery_after_a_lost_detach_save_persists_and_reuses_the_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mut stale = worker(root.path(), "recovsave01");
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &stale.branch,
+            pool.to_str().expect("pool path"),
+            "wt/mnemo",
+        ],
+    );
+    std::fs::write(pool.join("merged.txt"), "merged\n").expect("worker change");
+    run_git(&pool, &["add", "merged.txt"]);
+    run_git(&pool, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&pool).await.expect("worker tip");
+    run_git(
+        root.path(),
+        &["merge", "--no-ff", &stale.branch, "-m", "merge worker"],
+    );
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), stale.branch.clone())
+        .await
+        .expect("detach before the lost save");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Merging;
+    stale.review = Some(ReviewRecord {
+        summary: "reviewed before recovery".into(),
+        tip: tip.clone(),
+        reviewed_at_ms: 1,
+        evidence: Some(evidence()),
+        lane: None,
+    });
+    stale.checks = vec![WorkerCheck {
+        name: "cargo test --workspace".into(),
+        status: "passed".into(),
+        detail: None,
+        tip,
+    }];
+
+    let team = open_test_team(root.path(), state.path(), vec![stale.clone()]).await;
+
+    let recovered = team.worker(&stale.id).await.expect("recovered worker");
+    assert_eq!(recovered.status, WorkerStatus::Merged);
+    assert!(recovered.worktree.as_os_str().is_empty());
+    assert_saved_worktree_empty(state.path(), &stale.id);
+    let next = provision_pool_worker(&team, "recovnext01").await;
+    assert_eq!(next.worktree, pool);
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn workspace_cleanup_after_a_lost_detach_save_persists_and_reuses_the_pool() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let mut stale = worker(root.path(), "cleansave01");
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &stale.branch,
+            pool.to_str().expect("pool path"),
+            "main",
+        ],
+    );
+    release_pool_checkout(root.path().to_path_buf(), pool.clone(), stale.branch.clone())
+        .await
+        .expect("detach before the lost save");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Stopped;
+    let persistence = TeamPersistence::new(state.path());
+    persistence
+        .save(&PersistedTeam {
+            workers: vec![stale.clone()],
+            slots: Some(2),
+            usage: ProjectUsage::default(),
+        })
+        .expect("save stale cleanup record");
+
+    let report = cleanup_workspace(
+        root.path(),
+        state.path(),
+        &state.path().join("dispatch_routing.jsonl"),
+    )
+    .await
+    .expect("retry workspace cleanup");
+
+    assert_eq!(report.removed, vec![stale.branch.clone()]);
+    assert_saved_worktree_empty(state.path(), &stale.id);
+    let saved = persistence.load().expect("load cleaned team").expect("cleaned team");
+    let team = open_test_team(root.path(), state.path(), saved.workers).await;
+    let next = provision_pool_worker(&team, "cleannext01").await;
+    assert_eq!(next.worktree, pool);
+    team.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn a_dirty_detached_pool_keeps_its_merged_record() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let pool = root.path().join(".worktrees/pool-1");
+    run_git(
+        root.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            pool.to_str().expect("pool path"),
+            "main",
+        ],
+    );
+    std::fs::write(pool.join("dirty.txt"), "keep\n").expect("dirty detached pool");
+    let mut stale = worker(root.path(), "dirtyrepair1");
+    stale.worktree = pool.clone();
+    stale.status = WorkerStatus::Merged;
+
+    let team = open_test_team(root.path(), state.path(), vec![stale.clone()]).await;
+
+    assert_eq!(team.worker(&stale.id).await.expect("dirty worker").worktree, pool);
+    let saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load dirty team")
+        .expect("dirty team");
+    assert_eq!(saved.workers[0].worktree, pool);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_missing_held_pool_still_reserves_its_index() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    std::fs::create_dir_all(root.path().join(".worktrees/pool-1")).expect("pool-1 folder");
+    let mut held = worker(root.path(), "heldpool01");
+    held.worktree = root.path().join(".worktrees/pool-2");
+    held.status = WorkerStatus::Failed;
+    assert!(!held.worktree.exists());
+    let team = open_test_team(root.path(), state.path(), vec![held.clone()]).await;
+
+    let next = provision_pool_worker(&team, "nextpool01").await;
+
+    assert_eq!(next.worktree, root.path().join(".worktrees/pool-3"));
+    assert!(!held.worktree.exists(), "the held missing pool is not recreated");
     team.shutdown().await;
 }

@@ -469,11 +469,19 @@ fn provision_pool_checkout_impl(
         }
         return Ok(pool.to_path_buf());
     }
-    // No free pool: create the next one. Every existing `pool-<n>` reserved
-    // its index — usable or not — so max+1 never collides.
-    let next = pools
-        .last()
-        .map_or(1, |(index, _, _)| index.saturating_add(1));
+    // Existing folders and held paths both reserve their indices, even when
+    // a held folder is temporarily missing, so max+1 can never equal a hold.
+    let highest = pools
+        .iter()
+        .map(|(index, _, _)| *index)
+        .chain(held.iter().filter_map(|path| pool_index(path)))
+        .max();
+    let next = match highest {
+        Some(index) => index
+            .checked_add(1)
+            .ok_or_else(|| "no pool checkout indices remain".to_string())?,
+        None => 1,
+    };
     provision_worktree_impl(main_root, &pool_checkout_name(next), branch, base_ref)
 }
 
@@ -563,8 +571,10 @@ fn ensure_pool_checkout(main_root: &Path, checkout: &Path) -> Result<(), String>
 /// deleting it: the folder's `target/`, `node_modules/` and code graph are
 /// the warm cache the next worker builds on. The checkout must be on the
 /// worker's `branch` and have no uncommitted work; it is then switched to a
-/// detached HEAD, which frees the branch for `git branch -d`. Every
-/// refusal leaves the checkout and its branch exactly as they were.
+/// detached HEAD, which frees the branch for `git branch -d`. A clean checkout
+/// whose HEAD is already detached is already released and returns `Ok(())`
+/// unchanged, so retrying after a lost ledger save is safe. Detached but dirty
+/// still refuses. Every refusal leaves the checkout and branch as they were.
 ///
 /// Runs the blocking git subprocesses on the blocking thread pool (see the
 /// module doc). Owns its arguments so the closure is `'static + Send`.
@@ -585,8 +595,10 @@ fn release_pool_checkout_impl(
     branch: &str,
 ) -> Result<(), String> {
     ensure_pool_checkout(main_root, checkout)?;
-    let current = current_branch(checkout)?;
-    if current != branch {
+    let current = git_raw(checkout, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let current = current.trim();
+    let already_detached = current == "HEAD";
+    if !already_detached && current != branch {
         return Err(format!(
             "checkout is on an unexpected branch; retained (expected {branch}, found {current})"
         ));
@@ -597,6 +609,9 @@ fn release_pool_checkout_impl(
             "uncommitted work is retained in the pool checkout {}",
             checkout.display()
         ));
+    }
+    if already_detached {
+        return Ok(());
     }
     git_raw(checkout, &["switch", "--detach"]).map(|_| ())
 }
@@ -1240,6 +1255,39 @@ mod tests {
                 .expect("worktree list")
                 .contains("pool-1"),
             "the pool stays registered as a worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_is_idempotent_only_when_the_detached_pool_is_clean() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let (pool, branch) = provision_agent_checkout(
+            main.clone(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision");
+        release_pool_checkout(main.clone(), pool.clone(), branch.clone())
+            .await
+            .expect("first release");
+        let released_head = git_raw(&pool, &["rev-parse", "HEAD"]).expect("released HEAD");
+
+        std::fs::write(pool.join("a.txt"), "dirty\n").expect("dirty detached pool");
+        let error = release_pool_checkout(main.clone(), pool.clone(), branch.clone())
+            .await
+            .expect_err("a dirty detached pool is not released");
+        assert!(error.contains("uncommitted"), "{error}");
+        git_raw(&pool, &["restore", "a.txt"]).expect("restore clean detached pool");
+
+        release_pool_checkout(main, pool.clone(), branch)
+            .await
+            .expect("a clean detached pool is already released");
+        assert_eq!(
+            git_raw(&pool, &["rev-parse", "HEAD"]).expect("unchanged HEAD"),
+            released_head
         );
     }
 

@@ -459,7 +459,7 @@ impl TeamRuntime {
         schedule_trash_sweep(&runtime.workspace_root);
         // App start: a checkout a previous run could not remove (something
         // held it) is retried now, and the branch it was blocking goes with it.
-        runtime.retry_leftover_cleanups().await;
+        runtime.retry_leftover_cleanups().await?;
         Ok(runtime)
     }
 

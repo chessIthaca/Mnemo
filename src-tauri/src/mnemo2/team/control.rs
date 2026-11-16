@@ -837,13 +837,23 @@ pub(super) async fn recover_worker(
     if worker.status == WorkerStatus::Merged && worker.error.is_none() {
         let detached_pool = match worker_checkout(root, worker) {
             Some(CheckoutKind::Pool(_)) => match validated_checkout(root, worker, other_worktrees) {
-                Ok(Some(CheckoutKind::Pool(canonical))) => phase3::git_value(
-                    &canonical,
-                    &["rev-parse", "--abbrev-ref", "HEAD"],
-                )
-                .await
-                .ok()
-                .is_some_and(|head| head.trim() == "HEAD"),
+                Ok(Some(CheckoutKind::Pool(canonical))) => {
+                    let detached = phase3::git_value(
+                        &canonical,
+                        &["rev-parse", "--abbrev-ref", "HEAD"],
+                    )
+                    .await
+                    .ok()
+                    .is_some_and(|head| head.trim() == "HEAD");
+                    detached
+                        && phase3::git_value(
+                            &canonical,
+                            &["status", "--porcelain", "-uall"],
+                        )
+                        .await
+                        .ok()
+                        .is_some_and(|status| status.trim().is_empty())
+                }
                 _ => false,
             },
             _ => false,

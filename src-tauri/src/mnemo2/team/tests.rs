@@ -5131,21 +5131,20 @@ async fn third_report_in_a_row_ends_the_turn() {
         1,
         "only the first report is forwarded: {forwarded:?}"
     );
-    // The turn was ended for the worker at the third report: no new tool call
-    // batch (which would indicate an additional provider call) appeared after
-    // c3. That check supersedes the former TextDelta assert — on fast CI
-    // runners the model can stream text before the interrupt arrives.
-    let tool_starts = forwarded
+    // The turn was ended for the worker at the third report: no tool call
+    // started after it. A short final text may still stream on a fast runner
+    // before the interrupt lands; the promise is that reporting stops.
+    let tool_starts: Vec<&str> = forwarded
         .iter()
         .filter_map(|event| match event {
-            SerializableAgentEvent::ToolCallStart { id, name, .. } => Some((id, name)),
+            SerializableAgentEvent::ToolCallStart { id, .. } => Some(id.as_str()),
             _ => None,
         })
-        .collect::<Vec<_>>();
-    assert!(
-        !tool_starts.iter().any(|(id, _)| id.as_str() > "c3"),
-        "no tool call after c3: {:?}",
-        forwarded
+        .collect();
+    assert_eq!(
+        tool_starts,
+        vec!["c1", "c2", "c3"],
+        "no tool call after the third report: {forwarded:?}"
     );
     // And it ended through the ordinary Finished path, which the lead
     // turns into the "finished its turn" notice.

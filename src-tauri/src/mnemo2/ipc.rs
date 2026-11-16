@@ -579,6 +579,7 @@ pub async fn lead_open(
         let old_root = old.workspace_root().to_path_buf();
         old.shutdown().await;
         state.sync_run_file(None);
+        crate::mnemo2::show_open_project(&app, None);
         if old_root != root {
             project::detach(&old_root);
             let _ = browser.close().await;
@@ -701,6 +702,8 @@ pub async fn lead_open(
     *state.board_forwarder.lock().await = Some(board_forwarder);
     *state.indexing_forwarder.lock().await = Some(indexing_forwarder);
     state.sync_run_file(Some(&root));
+    crate::mnemo2::show_open_project(&app, Some(&root));
+
     // The Laya learnings check rides along with the open: it runs off the open
     // path and its offers arrive on [`LAYA_LEARNINGS_CHANNEL`]. A failed check
     // never fails an open.
@@ -1373,6 +1376,7 @@ pub async fn lead_close(
 ) -> Result<(), String> {
     state.release_external_lead(&app).await;
     state.shutdown().await;
+    crate::mnemo2::show_open_project(&app, None);
     browser.close().await
 }
 

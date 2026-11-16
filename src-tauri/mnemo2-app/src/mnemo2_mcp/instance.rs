@@ -476,6 +476,56 @@ pub fn registered_root(env: &Env, cwd: &Path) -> Result<Option<String>, String> 
         .map(|path| path.to_string_lossy().into_owned()))
 }
 
+/// A registered project, as the stub's `mnemo_projects` tool reports it.
+pub struct ProjectEntry {
+    /// The display name the registry holds.
+    pub name: String,
+    /// The canonical folder, as the registry holds it.
+    pub path: String,
+    /// A Mnemo2 process is up for it: a run file names the folder and its pid
+    /// is alive (a run file a crashed instance left behind counts for nothing).
+    pub running: bool,
+    /// Mnemo2 has opened the folder before, so it seeded `.coding` there.
+    pub initialized: bool,
+}
+
+/// Every registered project with the state the stub reports, in registry order.
+///
+/// Local files only: no network call, so the stub can answer it on every
+/// request without slowing a session down.
+pub fn projects(env: &Env) -> Result<Vec<ProjectEntry>, String> {
+    let records = mnemo_app::mnemo2::project::list(Some(env.config_dir.clone()))?;
+    let live: Vec<PathBuf> = read_run_files(&env.run_dir)
+        .into_iter()
+        .filter(|(_, run)| mnemo_app::instance_marker::pid_alive(run.pid))
+        .filter_map(|(_, run)| run.project)
+        .map(PathBuf::from)
+        .collect();
+    Ok(records
+        .into_iter()
+        .map(|record| {
+            let root = canonical(Path::new(&record.path));
+            ProjectEntry {
+                running: live.iter().any(|project| same_path(project, &root)),
+                initialized: root.join(".coding").is_dir(),
+                name: record.name,
+                path: record.path,
+            }
+        })
+        .collect())
+}
+
+/// The registered project that overlaps `folder`: one that contains it or one
+/// inside it. Either would give the same files two projects, so the folder
+/// cannot be registered again.
+pub fn registered_conflict(env: &Env, folder: &Path) -> Result<Option<ProjectEntry>, String> {
+    let folder = canonical(folder);
+    Ok(projects(env)?.into_iter().find(|entry| {
+        let path = canonical(Path::new(&entry.path));
+        contains(&path, &folder) || contains(&folder, &path)
+    }))
+}
+
 /// What `serve` ends up talking to.
 pub enum Resolution {
     Live(Instance),

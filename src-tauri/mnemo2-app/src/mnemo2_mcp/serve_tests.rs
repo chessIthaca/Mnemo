@@ -462,10 +462,36 @@ fn serve_starts_mnemo2_when_the_project_is_registered_but_nothing_runs() {
     assert_eq!(messages[1]["result"]["tools"][0]["name"], "team_status");
 }
 
-// ---- the inert stub --------------------------------------------------------
+// ---- the stub outside every project -----------------------------------------
+
+/// The tool names of a `tools/list` answer.
+fn tool_names(message: &Value) -> Vec<String> {
+    message["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The text of a tool result, however the call ended.
+fn result_text(message: &Value) -> &str {
+    message["result"]["content"][0]["text"].as_str().expect("tool result text")
+}
+
+fn call(id: i64, tool: &str, arguments: Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments },
+    })
+    .to_string()
+}
 
 #[test]
-fn outside_a_registered_project_the_stub_answers_the_handshake_and_offers_nothing() {
+fn outside_a_registered_project_the_stub_answers_the_handshake_and_offers_the_project_tools() {
     let sandbox = Sandbox::new();
     sandbox.register(&[&sandbox.elsewhere]); // a project exists, just not this one
     let env = sandbox.env(); // its spawner would fail the test if used
@@ -487,16 +513,18 @@ fn outside_a_registered_project_the_stub_answers_the_handshake_and_offers_nothin
     let init = &messages[0];
     assert_eq!(init["id"], 1);
     assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
-    assert_eq!(init["result"]["capabilities"], json!({ "tools": {} }));
+    assert_eq!(init["result"]["capabilities"], json!({ "tools": { "listChanged": true } }));
     assert_eq!(init["result"]["serverInfo"]["name"], "mnemo");
     assert!(init["result"].get("instructions").is_none(), "the stub must not carry instructions");
 
-    assert_eq!(messages[1]["result"], json!({ "tools": [] }));
+    assert_eq!(tool_names(&messages[1]), vec!["mnemo_projects", "mnemo_init_project"]);
     assert_eq!(messages[2]["result"], json!({}));
-    for index in [3, 4] {
-        assert_eq!(messages[index]["error"]["code"], -32601, "{:?}", messages[index]);
-        assert!(messages[index]["error"]["message"].as_str().unwrap().contains("registered"));
-    }
+    // A tool call the stub cannot answer is a tool result error naming the two
+    // tools that exist, so Claude reads what to call instead.
+    assert_eq!(messages[3]["result"]["isError"], true, "{:?}", messages[3]);
+    assert!(result_text(&messages[3]).contains("mnemo_init_project"));
+    assert_eq!(messages[4]["error"]["code"], -32601, "{:?}", messages[4]);
+    assert!(messages[4]["error"]["message"].as_str().unwrap().contains("registered"));
 }
 
 #[test]
@@ -511,8 +539,12 @@ fn a_leading_byte_order_mark_is_ignored() {
 #[test]
 fn the_stub_does_not_need_a_registry_at_all() {
     let sandbox = Sandbox::new();
-    let (messages, _) = run_lines(&sandbox.env(), &[&request(1, "tools/list")]);
-    assert_eq!(messages[0]["result"], json!({ "tools": [] }));
+    let (messages, _) = run_lines(
+        &sandbox.env(),
+        &[&request(1, "tools/list"), &call(2, "mnemo_projects", json!({}))],
+    );
+    assert_eq!(tool_names(&messages[0]), vec!["mnemo_projects", "mnemo_init_project"]);
+    assert!(result_text(&messages[1]).contains("No Mnemo projects yet"), "{:?}", messages[1]);
 }
 
 #[test]
@@ -523,6 +555,226 @@ fn stdout_stays_protocol_only_for_every_answer() {
         let value: Value = serde_json::from_str(line).expect("protocol line");
         assert_eq!(value["jsonrpc"], "2.0");
     }
+}
+
+// ---- the project tools ------------------------------------------------------
+
+/// A spawner that brings a fake Mnemo2 up for the root it is asked to open,
+/// `delay` later, and keeps it alive in `keep`.
+fn starting_server(
+    sandbox: &Sandbox,
+    delay: Duration,
+    starts: Arc<AtomicUsize>,
+    keep: Arc<Mutex<Option<FakeServer>>>,
+) -> crate::instance::Spawner {
+    let run_dir = sandbox.run_dir.clone();
+    Arc::new(move |root: &Path| {
+        let (run_dir, root) = (run_dir.clone(), root.to_path_buf());
+        let (starts, keep) = (starts.clone(), keep.clone());
+        starts.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let project = root.to_string_lossy().into_owned();
+            let server = mcp_server_as(&project, 88);
+            write_run_file(&run_dir, 88, server.port, "tok", Some(&project), 1);
+            *keep.lock().unwrap() = Some(server);
+        });
+        Ok(None)
+    })
+}
+
+/// An `Env` whose session folder is `elsewhere` and whose spawner brings a
+/// fake Mnemo2 up for whatever root it is handed.
+fn stub_env(sandbox: &Sandbox) -> (Env, Arc<AtomicUsize>, Arc<Mutex<Option<FakeServer>>>) {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let keep = Arc::new(Mutex::new(None));
+    let mut env = sandbox.env();
+    env.process_cwd = sandbox.elsewhere.clone();
+    env.spawner = starting_server(sandbox, Duration::from_millis(100), starts.clone(), keep.clone());
+    (env, starts, keep)
+}
+
+#[test]
+fn stub_lists_the_project_tools() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.elsewhere]); // a project exists, just not this one
+    let (messages, _) = run_lines(&sandbox.env(), &[&initialize(1), &request(2, "tools/list")]);
+
+    let tools = messages[1]["result"]["tools"].as_array().expect("tools");
+    assert_eq!(tool_names(&messages[1]), vec!["mnemo_projects", "mnemo_init_project"]);
+    // `mnemo_projects` takes no arguments; `mnemo_init_project` one optional folder.
+    assert_eq!(tools[0]["inputSchema"]["properties"], json!({}));
+    assert_eq!(tools[1]["inputSchema"]["properties"]["path"]["type"], "string");
+    assert_eq!(tools[1]["inputSchema"]["required"], Value::Null);
+    for tool in tools {
+        assert_eq!(tool["inputSchema"]["type"], "object");
+        let description = tool["description"].as_str().expect("a description for Claude");
+        assert!(description.contains("mnemo_") || description.contains("folder"), "{description}");
+    }
+    // Claude reads the description before it calls: the git rule is in there.
+    assert!(tools[1]["description"].as_str().unwrap().contains("git init"), "{:?}", tools[1]);
+}
+
+#[test]
+fn init_registers_and_goes_live_without_reload() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.elsewhere.join(".git")).unwrap();
+    let (env, starts, keep) = stub_env(&sandbox);
+    let (bridge, out) = test_bridge(env);
+
+    process(&bridge, &initialize(1));
+    process(&bridge, &request(2, "tools/list"));
+    let listed = out.messages().into_iter().find(|message| message["id"] == 2).expect("answer");
+    assert_eq!(tool_names(&listed), vec!["mnemo_projects", "mnemo_init_project"]);
+
+    process(&bridge, &call(3, "mnemo_init_project", json!({})));
+    let done = out.messages().into_iter().find(|message| message["id"] == 3).expect("answer");
+    assert_eq!(done["result"]["isError"], false, "{done}");
+    let text = result_text(&done);
+    assert!(text.contains("Team tools are now available in this session"), "{text}");
+
+    // Registered under the folder's own name, at its canonical path.
+    let registered = mnemo_app::mnemo2::project::list(Some(sandbox.config_dir.clone())).unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].name, "elsewhere");
+    assert_eq!(canonical(Path::new(&registered[0].path)), sandbox.elsewhere);
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "it starts through the path resolve uses");
+    assert!(keep.lock().unwrap().is_some(), "the instance came up");
+
+    // The session is told the tool list changed, without a reload ...
+    wait_for_list_changed(&out, Duration::from_secs(3));
+
+    // ... and a later call is answered by the instance, not the stub.
+    process(&bridge, &call(4, "team_status", json!({})));
+    let answered = out.messages().into_iter().find(|message| message["id"] == 4).expect("answer");
+    assert_eq!(answered["result"]["content"][0]["text"], "done", "{answered}");
+}
+
+/// One session leads the project its own folder belongs to: registering a
+/// folder elsewhere must not take this session there, because the hooks and
+/// the waiter keep resolving by the session folder.
+#[test]
+fn init_of_another_folder_registers_without_switching() {
+    let sandbox = Sandbox::new();
+    let other = sandbox.dir.path().join("other");
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    let (env, starts, _) = stub_env(&sandbox);
+    let (bridge, out) = test_bridge(env);
+
+    process(&bridge, &initialize(1));
+    let arguments = json!({ "path": other.to_string_lossy() });
+    process(&bridge, &call(2, "mnemo_init_project", arguments));
+    let answer = out.messages().into_iter().find(|message| message["id"] == 2).expect("answer");
+    assert_eq!(answer["result"]["isError"], false, "{answer}");
+    let text = result_text(&answer);
+    let other_canon_str = canonical(&other).to_string_lossy().into_owned();
+    assert!(text.contains(&other_canon_str), "names the folder: {text}");
+    assert!(text.contains("Start a Claude Code session in that folder"), "{text}");
+
+    // The registry gained it, but nothing started and nothing was announced ...
+    let registered = mnemo_app::mnemo2::project::list(Some(sandbox.config_dir.clone())).unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(canonical(Path::new(&registered[0].path)), canonical(&other));
+    assert_eq!(starts.load(Ordering::SeqCst), 0, "another folder is not started here");
+    assert!(
+        out.messages().iter().all(|message| message["method"] != "notifications/tools/list_changed"),
+        "{:?}",
+        out.messages()
+    );
+
+    // ... and the session stays on the stub.
+    process(&bridge, &request(3, "tools/list"));
+    let listed = out.messages().into_iter().find(|message| message["id"] == 3).expect("answer");
+    assert_eq!(tool_names(&listed), vec!["mnemo_projects", "mnemo_init_project"]);
+}
+
+#[test]
+fn init_refuses_a_registered_or_nested_folder() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let (env, _, _) = stub_env(&sandbox);
+    let (bridge, out) = test_bridge(env);
+    process(&bridge, &initialize(1));
+
+    // The folder itself, a folder inside it, and a folder that contains it.
+    let folders = [
+        sandbox.project.clone(),
+        sandbox.deep.clone(),
+        sandbox.dir.path().to_path_buf(),
+    ];
+    for (index, folder) in folders.iter().enumerate() {
+        let id = index as i64 + 2;
+        let arguments = json!({ "path": folder.to_string_lossy() });
+        process(&bridge, &call(id, "mnemo_init_project", arguments));
+        let answer = out.messages().into_iter().find(|message| message["id"] == id).expect("answer");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        let text = result_text(&answer);
+        assert!(text.contains("\"p0\""), "the existing entry is named: {text}");
+        assert!(text.contains(&sandbox.project_str()), "{text}");
+        assert!(text.contains("Start a Claude Code session in that folder"), "{text}");
+    }
+
+    // Nothing was registered and nothing was started.
+    let registered = mnemo_app::mnemo2::project::list(Some(sandbox.config_dir.clone())).unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].name, "p0");
+}
+
+#[test]
+fn init_refuses_a_folder_without_git() {
+    let sandbox = Sandbox::new();
+    let (env, starts, _) = stub_env(&sandbox);
+    let (bridge, out) = test_bridge(env);
+    process(&bridge, &initialize(1));
+
+    // Not a git repository: the tool never runs `git init` itself.
+    process(&bridge, &call(2, "mnemo_init_project", json!({})));
+    let refused = out.messages().into_iter().find(|message| message["id"] == 2).expect("answer");
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    let text = result_text(&refused);
+    assert!(text.contains("not a git repository"), "{text}");
+    assert!(text.contains("git init"), "{text}");
+
+    // A folder that is not there is refused too.
+    let missing = sandbox.elsewhere.join("nope");
+    let arguments = json!({ "path": missing.to_string_lossy() });
+    process(&bridge, &call(3, "mnemo_init_project", arguments));
+    let refused = out.messages().into_iter().find(|message| message["id"] == 3).expect("answer");
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(result_text(&refused).contains("is not a folder"));
+
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert!(mnemo_app::mnemo2::project::list(Some(sandbox.config_dir.clone())).unwrap().is_empty());
+}
+
+/// A folder registered somewhere else — by another session's init, or by the
+/// Mnemo2 window — is picked up by the next tool request, not by a reload.
+#[test]
+fn stub_picks_up_a_project_registered_meanwhile() {
+    let sandbox = Sandbox::new();
+    let (env, starts, _) = stub_env(&sandbox);
+    let (bridge, out) = test_bridge(env);
+
+    process(&bridge, &initialize(1));
+    process(&bridge, &request(2, "tools/list"));
+    let listed = out.messages().into_iter().find(|message| message["id"] == 2).expect("answer");
+    assert_eq!(tool_names(&listed), vec!["mnemo_projects", "mnemo_init_project"]);
+    assert_eq!(starts.load(Ordering::SeqCst), 0, "the stub's re-check must not start Mnemo2");
+
+    // The Mnemo2 window registers this folder while the session runs.
+    mnemo_app::mnemo2::project::add(Some(sandbox.config_dir.clone()), &sandbox.elsewhere)
+        .expect("register");
+
+    // The next request re-reads the registry, starts Mnemo2 and goes live.
+    process(&bridge, &request(3, "tools/list"));
+    let listed = out.messages().into_iter().find(|message| message["id"] == 3).expect("answer");
+    assert_eq!(tool_names(&listed), vec!["team_status"]);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    wait_for_list_changed(&out, Duration::from_secs(3));
+
+    process(&bridge, &call(4, "team_status", json!({})));
+    let answered = out.messages().into_iter().find(|message| message["id"] == 4).expect("answer");
+    assert_eq!(answered["result"]["content"][0]["text"], "done", "{answered}");
 }
 
 // ---- the fast local handshake ---------------------------------------------

@@ -667,7 +667,8 @@ fn init_of_another_folder_registers_without_switching() {
     let answer = out.messages().into_iter().find(|message| message["id"] == 2).expect("answer");
     assert_eq!(answer["result"]["isError"], false, "{answer}");
     let text = result_text(&answer);
-    assert!(text.contains(&other.to_string_lossy().into_owned()), "names the folder: {text}");
+    let other_canon_str = canonical(&other).to_string_lossy().into_owned();
+    assert!(text.contains(&other_canon_str), "names the folder: {text}");
     assert!(text.contains("Start a Claude Code session in that folder"), "{text}");
 
     // The registry gained it, but nothing started and nothing was announced ...

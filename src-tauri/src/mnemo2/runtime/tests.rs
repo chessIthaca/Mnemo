@@ -6642,6 +6642,9 @@ async fn audit_completion_notice_asks_the_lead_to_adjudicate() {
     let mut notified = false;
     for _ in 0..100 {
         let snapshot = lead.snapshot().await.expect("lead snapshot");
+        // An audit that ends with its findings as plain text delivers them as
+        // a report too (bug 2026-11-16), so only the adjudication notice is
+        // this test's subject.
         let notices = snapshot
             .transcript
             .messages
@@ -6650,6 +6653,7 @@ async fn audit_completion_notice_asks_the_lead_to_adjudicate() {
                 let text = message.content.as_text();
                 text.starts_with(TEAM_NOTICE_PREFIX)
                     && text.contains("worker_id=auditnot01")
+                    && text.contains("Adjudicate the audit")
             })
             .count();
         // The implementer's own finish also wakes the lead, so the
@@ -6668,7 +6672,9 @@ async fn audit_completion_notice_asks_the_lead_to_adjudicate() {
         .iter()
         .find(|message| {
             let text = message.content.as_text();
-            text.starts_with(TEAM_NOTICE_PREFIX) && text.contains("worker_id=auditnot01")
+            text.starts_with(TEAM_NOTICE_PREFIX)
+                && text.contains("worker_id=auditnot01")
+                && text.contains("Adjudicate the audit")
         })
         .expect("TeamManager-attributed audit notice");
     let text = notice.content.as_text();

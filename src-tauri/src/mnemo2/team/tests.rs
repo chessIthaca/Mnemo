@@ -4744,6 +4744,191 @@ async fn finished_audit_releases_its_slot() {
     team.shutdown().await;
 }
 
+/// An audit that wrote its findings as its final message instead of calling
+/// `message_parent` still delivers a report (bug 2026-11-16): the pump takes
+/// the turn's final assistant text, records it as the report — the same
+/// `TeamMessage` and the same forwarded `message_parent` call — before the
+/// turn's `Finished` event, so the lead reads the report notice first and the
+/// audit frees its slot in the same pass.
+#[tokio::test]
+async fn an_audit_ending_with_plain_text_delivers_it_as_its_report() {
+    const FINDINGS: &str = "Audit findings: none.";
+    let (fixture, _notices) = nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings::default(),
+        None,
+        std::time::Duration::ZERO,
+        vec![vec![
+            // The audit writes its findings and ends its turn: it never
+            // calls message_parent (the fourthAud1 case).
+            mnemo::provider::LlmEvent::TextDelta {
+                text: FINDINGS.to_string(),
+            },
+            mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            },
+        ]],
+    )
+    .await;
+    let team = &fixture.team;
+    // The forwarded event stream: its order is the order of the lead's
+    // notices.
+    let mut events = team.subscribe();
+    // One slot: the audit itself is the only worker that may hold it.
+    team.persistence.slots.store(1, Ordering::SeqCst);
+    let mut target = worker(fixture._root.path(), "target00001");
+    target.plan_id = Some(fixture.plan_id.clone());
+    target.plan_step = Some(0);
+    provision_agent_worktree(
+        fixture._root.path().to_path_buf(),
+        target.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision the target checkout");
+    team.records.lock().await.push(target.clone());
+
+    let (audit, reused) = team
+        .audit_dispatch(&target.id, "auditworker1", None, None, None)
+        .await
+        .expect("dispatch the audit into the one slot");
+    assert!(!reused, "a fresh audit is not a reuse");
+    let audit_id = audit.id.clone();
+    let finished = eventually(|| async {
+        let record = team.worker(&audit_id).await.ok()?;
+        (record.status == WorkerStatus::Completed && record.report_delivered)
+            .then_some(record)
+    })
+    .await;
+    // The plain-text turn delivered a report, exactly as a message_parent
+    // call would have.
+    assert!(finished.report_delivered, "{finished:?}");
+    let reports: Vec<_> = team
+        .messages()
+        .await
+        .into_iter()
+        .filter(|message| message.worker_id == audit_id)
+        .collect();
+    assert_eq!(
+        reports.len(),
+        1,
+        "one report, not an empty or repeated one: {reports:?}"
+    );
+    assert_eq!(reports[0].text, FINDINGS, "{reports:?}");
+    // The report notice precedes the adjudication notice: the pump forwards
+    // the report as a `message_parent` call before the turn's `Finished`
+    // event.
+    let forwarded = forwarded_events(&mut events).await;
+    let report_at = forwarded
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                SerializableAgentEvent::HostToolCall { name, .. }
+                    if name.as_str() == "message_parent"
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("the report is forwarded as a message_parent call: {forwarded:?}")
+        });
+    let finished_at = forwarded
+        .iter()
+        .position(|event| matches!(event, SerializableAgentEvent::Finished { .. }))
+        .unwrap_or_else(|| panic!("the turn's finish is forwarded: {forwarded:?}"));
+    assert!(
+        report_at < finished_at,
+        "the report notice precedes the adjudication notice: {forwarded:?}"
+    );
+    // The reported audit released its session in the same pass.
+    eventually(|| async { (team.live.lock().await.is_empty()).then_some(()) }).await;
+    // The freed slot dispatches a fresh audit with no manual stop.
+    team.audit_dispatch(&target.id, "audittwo001", None, None, None)
+        .await
+        .expect("the released slot dispatches a fresh audit");
+    team.shutdown().await;
+}
+
+/// An audit that ends its turn with no text at all is asked for its report
+/// (bug 2026-11-16): one automatic host message tells it to send its findings
+/// through `message_parent`, and its session stays available to answer
+/// instead of being released with nothing delivered.
+#[tokio::test]
+async fn an_audit_ending_silently_is_asked_for_its_report_once() {
+    const ASK: &str = "Your audit report did not reach the lead. Send your complete findings with message_parent now, then end your turn.";
+    let (fixture, _notices) = nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings::default(),
+        None,
+        std::time::Duration::ZERO,
+        vec![
+            // The audit's first turn ends with no text and no report.
+            vec![mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            }],
+        ],
+    )
+    .await;
+    let team = &fixture.team;
+    team.persistence.slots.store(1, Ordering::SeqCst);
+    let mut target = worker(fixture._root.path(), "target00001");
+    target.plan_id = Some(fixture.plan_id.clone());
+    target.plan_step = Some(0);
+    provision_agent_worktree(
+        fixture._root.path().to_path_buf(),
+        target.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision the target checkout");
+    team.records.lock().await.push(target.clone());
+
+    let (audit, _reused) = team
+        .audit_dispatch(&target.id, "auditworker1", None, None, None)
+        .await
+        .expect("dispatch the audit into the one slot");
+    let audit_id = audit.id.clone();
+    let asked = eventually(|| async {
+        let record = team.worker(&audit_id).await.ok()?;
+        (!record.inbox.is_empty()).then_some(record)
+    })
+    .await;
+    // One automatic message, from the host, with the decided words.
+    assert_eq!(asked.inbox.len(), 1, "one automatic ask: {asked:?}");
+    assert_eq!(asked.inbox[0].sender, MessageSender::Mnemo, "{asked:?}");
+    assert_eq!(asked.inbox[0].kind, InboxKind::Prompt, "{asked:?}");
+    assert_eq!(asked.inbox[0].text, ASK, "{asked:?}");
+    // The silent turn delivered no empty report, and its session was not
+    // released: the ask's follow-up turn (the scripted default "done" text)
+    // is what carries the report and frees the slot.
+    let finished = eventually(|| async {
+        let record = team.worker(&audit_id).await.ok()?;
+        (record.status == WorkerStatus::Completed && record.report_delivered)
+            .then_some(record)
+    })
+    .await;
+    assert!(finished.report_delivered, "{finished:?}");
+    let reports: Vec<_> = team
+        .messages()
+        .await
+        .into_iter()
+        .filter(|message| message.worker_id == audit_id)
+        .collect();
+    assert_eq!(
+        reports.len(),
+        1,
+        "the silent turn delivered no report: {reports:?}"
+    );
+    assert_eq!(
+        reports[0].text, "done",
+        "the ask's follow-up turn carried the report: {reports:?}"
+    );
+    let final_record = team.worker(&audit_id).await.expect("the audit record");
+    assert_eq!(
+        final_record.inbox.len(),
+        1,
+        "exactly one ask, never a second: {final_record:?}"
+    );
+    team.shutdown().await;
+}
+
 /// A finished audit never comes back (plan 5779641): resume, compact,
 /// model change and message are all refused with the same words.
 #[tokio::test]

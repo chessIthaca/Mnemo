@@ -2666,6 +2666,39 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Bridge behaviour outside registered projects only; the external-lead requirements (attach on first tools/call for a project) are unchanged."
+    },
+    {
+      "id": "ac673a13",
+      "status": "closed",
+      "created_at_ms": 1794819688496,
+      "closed_at_ms": 1794823217576,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-ac673a13-20261116-100017.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Cosmetic window title and tray tooltip text; no specified behavior (routing, external lead, board, settings, trace, tiers, briefs) changes."
+    },
+    {
+      "id": "7c1b3121",
+      "status": "closed",
+      "created_at_ms": 1794820055275,
+      "closed_at_ms": 1794824243710,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-7c1b3121-20261116-101723.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only fixes; no behaviour change."
+    },
+    {
+      "id": "969cb173",
+      "status": "open",
+      "created_at_ms": 1794823873101,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Where a worker's checkout folder lives and whether it is reused is not specified by any capability (dispatch-routing, external-lead, plan-board, worker-brief, tier-ladder, settings-dialog, llm-trace); routing, external-lead and review/merge behavior are unchanged."
     }
   ]
 }

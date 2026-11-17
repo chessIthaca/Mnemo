@@ -23,6 +23,7 @@ use crate::mnemo2::usage::ProjectUsage;
 
 use super::{TeamRuntime, unix_ms};
 use super::audit::validate_audit_linkage;
+use super::findings_ledger;
 use super::nudge::{claim_nudge, deliver_nudge, pending_fix_downshift, route_fix_brief};
 use super::persistence::TeamPersistence;
 use super::pump::save_workers;
@@ -286,6 +287,12 @@ impl TeamRuntime {
         .await;
         self.persist().await?;
         let updated = self.worker(worker_id).await?;
+        // The findings ledger feeds the recurring-finding proposals, so a
+        // write failure is logged and never fails the review just recorded.
+        let logged = findings_ledger::append_new(&self.workspace_root, &updated, &updated.findings);
+        if let Err(err) = logged {
+            eprintln!("findings ledger: could not append rows for worker {worker_id}: {err}");
+        }
         let updated = match downshift {
             Some((row, closed)) => self.settle_fix_downshift(worker_id, row, closed).await?,
             None => updated,

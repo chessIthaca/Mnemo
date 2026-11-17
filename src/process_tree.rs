@@ -32,13 +32,13 @@ struct OwnedJobHandle(windows_sys::Win32::Foundation::HANDLE);
 unsafe impl Send for OwnedJobHandle {}
 
 impl KillOnCloseJob {
-    /// Create a job and assign the process behind `raw` (the child's raw
-    /// handle) to it. Return `None` when creation, configuration or assignment
-    /// fails (the caller falls back to killing the root only). The raw handle
-    /// is only a kernel-object reference: an invalid one fails the Win32 call,
-    /// so this safe crate-private function never dereferences it.
+    /// Create a job and assign the process behind `raw` (a child's raw handle)
+    /// to it. Return `None` when creation, configuration or assignment fails
+    /// (the caller falls back to killing the root only). The raw handle is only
+    /// a kernel-object reference: an invalid one fails the Win32 call, so this
+    /// safe crate-private function never dereferences it.
     #[cfg(windows)]
-    pub(crate) fn assign(raw: std::os::windows::io::RawHandle) -> Option<Self> {
+    pub(crate) fn assign_raw(raw: std::os::windows::io::RawHandle) -> Option<Self> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -75,6 +75,17 @@ impl KillOnCloseJob {
                 handle: OwnedJobHandle(job),
             })
         }
+    }
+
+    /// Create a job and assign a spawned child process to it, so the child and
+    /// every process it starts die with the returned guard. `None` means the
+    /// job could not be set up and the caller should fall back to killing the
+    /// root process only. Public for the app crate's Mnemo2 team, which owns the
+    /// process tree of a proof command; it takes a safe child handle, never a
+    /// raw pointer.
+    #[cfg(windows)]
+    pub fn assign_tokio_child(child: &tokio::process::Child) -> Option<Self> {
+        child.raw_handle().and_then(Self::assign_raw)
     }
 
     /// Terminate every process in the job now (`TerminateJobObject`), then
@@ -210,7 +221,7 @@ mod tests {
             .spawn()
             .expect("spawn cmd with a ping grandchild");
         let parent_pid = child.id();
-        let job = KillOnCloseJob::assign(child.as_raw_handle());
+        let job = KillOnCloseJob::assign_raw(child.as_raw_handle());
         let mut cleanup = TreeCleanup { child, job };
         assert!(
             cleanup.job.is_some(),
@@ -231,6 +242,6 @@ mod tests {
 
     #[test]
     fn assign_failure_returns_none() {
-        assert!(KillOnCloseJob::assign(std::ptr::null_mut()).is_none());
+        assert!(KillOnCloseJob::assign_raw(std::ptr::null_mut()).is_none());
     }
 }

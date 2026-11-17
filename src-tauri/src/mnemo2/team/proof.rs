@@ -26,7 +26,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use serde::Deserialize;
+
+#[cfg(windows)]
+use mnemo::process_tree::KillOnCloseJob;
 
 use crate::mnemo2::phase3::{git, git_error, git_value};
 
@@ -143,20 +149,30 @@ pub fn is_test_path(rel: &str) -> bool {
 /// whether it is a binary section Git reports without hunks.
 struct DiffSection {
     /// The `diff --git` line and the header lines it carries (modes, index,
-    /// `---`/`+++`, rename lines, a `Binary files ... differ` line).
+    /// `---`/`+++`, rename lines, a `Binary files ... differ` line), each with
+    /// its original line ending.
     header: Vec<String>,
     /// Each hunk: its `@@ ... @@` line and the body lines under it.
     hunks: Vec<Vec<String>>,
+    /// Whether the section is a binary change (`Binary files ... differ` or
+    /// `GIT binary patch`), which carries no hunks to split.
+    binary: bool,
 }
 
 /// Split a unified diff into its `diff --git` sections.
+///
+/// Every line keeps its original ending byte for byte: `str::lines()` would
+/// strip a CRLF project's `\r`, and `git apply -R` then rejects a patch whose
+/// added lines lost it, so the proof would never be more than inconclusive.
 fn diff_sections(diff: &str) -> Vec<DiffSection> {
     let mut sections: Vec<DiffSection> = Vec::new();
-    for line in diff.lines() {
-        if line.starts_with("diff --git ") {
+    for line in diff.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\r', '\n']);
+        if text.starts_with("diff --git ") {
             sections.push(DiffSection {
                 header: vec![line.to_string()],
                 hunks: Vec::new(),
+                binary: false,
             });
             continue;
         }
@@ -164,11 +180,14 @@ fn diff_sections(diff: &str) -> Vec<DiffSection> {
             // Anything before the first section is not a patch we can apply.
             continue;
         };
-        if line.starts_with("@@") {
+        if text.starts_with("@@") {
             section.hunks.push(vec![line.to_string()]);
         } else if let Some(hunk) = section.hunks.last_mut() {
             hunk.push(line.to_string());
         } else {
+            if text.starts_with("Binary files ") || text.starts_with("GIT binary patch") {
+                section.binary = true;
+            }
             section.header.push(line.to_string());
         }
     }
@@ -247,7 +266,8 @@ fn keep_hunk(boundary: Option<u32>, hunk: &[String]) -> bool {
 /// Reduce a `git diff --no-color --no-ext-diff -U0 <base> <tip>` to the source
 /// hunks only: test files are dropped whole, hunks of a file's inline test
 /// module (`#[cfg(test)]` and below in the tip file) are dropped, and binary
-/// sections are always kept as source.
+/// sections are dropped too — a binary change has no hunks to split and cannot
+/// be reverted hunk-wise, so keeping it would fail the whole reverse-apply.
 ///
 /// `tip_file` reads the tip's text for a repository-relative path so the
 /// boundary is measured on the file as it will be after the reverse-apply,
@@ -255,6 +275,9 @@ fn keep_hunk(boundary: Option<u32>, hunk: &[String]) -> bool {
 pub fn source_hunks_patch(diff: &str, tip_file: &dyn Fn(&str) -> Option<String>) -> String {
     let mut patch = String::new();
     for section in diff_sections(diff) {
+        if section.binary {
+            continue;
+        }
         let path = section_path(&section.header);
         if let Some(path) = path.as_deref() {
             if is_test_path(path) {
@@ -262,10 +285,9 @@ pub fn source_hunks_patch(diff: &str, tip_file: &dyn Fn(&str) -> Option<String>)
             }
         }
         if section.hunks.is_empty() {
-            // Binary sections and mode-only changes have nothing to split.
+            // A mode-only change has nothing to split: keep it whole.
             for line in &section.header {
                 patch.push_str(line);
-                patch.push('\n');
             }
             continue;
         }
@@ -284,12 +306,10 @@ pub fn source_hunks_patch(diff: &str, tip_file: &dyn Fn(&str) -> Option<String>)
         }
         for line in &section.header {
             patch.push_str(line);
-            patch.push('\n');
         }
         for hunk in kept {
             for line in hunk {
                 patch.push_str(line);
-                patch.push('\n');
             }
         }
     }
@@ -330,6 +350,9 @@ enum ShellRun {
 }
 
 /// The platform shell that runs one proof script.
+///
+/// Unix: the shell leads its own process group, so [`TreeKillGuard`] can end
+/// the whole group at once.
 fn shell_command(script: &str) -> tokio::process::Command {
     #[cfg(windows)]
     let command = {
@@ -343,14 +366,90 @@ fn shell_command(script: &str) -> tokio::process::Command {
     let command = {
         let mut command = tokio::process::Command::new("sh");
         command.args(["-c", script]);
+        command.process_group(0);
         command
     };
     command
 }
 
+/// Owns the process TREE a proof command starts, so nothing it started
+/// outlives the run: a leaked `cargo`, `rustc` or test binary keeps writing
+/// into the checkout after the proof restored it, or holds the checkout open
+/// and blocks the merge that deletes it.
+///
+/// Windows: the shell is assigned to a Job Object created with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (the `mnemo` crate's
+/// [`KillOnCloseJob`]) — descendants inherit the job, so closing the handle
+/// this guard owns terminates every process the command started. Unix: the
+/// shell leads its own process group (see [`shell_command`]) and the group is
+/// killed at drop.
+///
+/// The kill lives in [`Drop`] so it covers every exit: the finished run, the
+/// timeout, and a proof future cancelled before either. A guard that cannot
+/// own the tree (job setup failed, or the child was already reaped) falls back
+/// to `kill_on_drop` of the shell alone rather than failing the run.
+struct TreeKillGuard {
+    #[cfg(windows)]
+    job: Option<KillOnCloseJob>,
+    #[cfg(unix)]
+    pid: u32,
+}
+
+impl TreeKillGuard {
+    /// Attach to the freshly spawned shell; never fails the run.
+    fn attach(child: &tokio::process::Child) -> Self {
+        #[cfg(windows)]
+        {
+            // The raw handle exists only while the child is not reaped; right
+            // after spawn it is always present. If it is not, the process is
+            // already gone and there is nothing to own.
+            Self {
+                job: KillOnCloseJob::assign_tokio_child(child),
+            }
+        }
+        #[cfg(unix)]
+        {
+            // `process_group(0)` made the shell the leader of its own group,
+            // so the group id IS its pid (0 only if it is already gone).
+            Self {
+                pid: child.id().unwrap_or(0),
+            }
+        }
+    }
+}
+
+impl Drop for TreeKillGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            // Closing the last job handle terminates the job.
+            drop(self.job.take());
+        }
+        #[cfg(unix)]
+        {
+            if self.pid != 0 {
+                // The negative pid reaches the whole group. std has no signal
+                // API, so the POSIX `kill` utility does the group kill; a
+                // non-zero status (no such group) is the ordinary no-op case.
+                let group = format!("-{}", self.pid);
+                let _ = std::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(group)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
 /// Run one proof script in `cwd` through the platform shell, bounded by
-/// `limit`. A child that outlives the limit is killed, and its whole tree dies
-/// with the tool future that owns it.
+/// `limit`.
+///
+/// The command's whole process TREE is owned by a [`TreeKillGuard`], so a run
+/// that outlives `limit` — or a proof future dropped mid-run — leaves nothing
+/// behind in the checkout.
 async fn run_shell(script: &str, cwd: &Path, limit: Duration) -> Result<ShellRun, String> {
     let mut command = shell_command(script);
     command
@@ -362,7 +461,12 @@ async fn run_shell(script: &str, cwd: &Path, limit: Duration) -> Result<ShellRun
     let child = command
         .spawn()
         .map_err(|error| format!("could not run the proof command: {error}"))?;
-    match tokio::time::timeout(limit, child.wait_with_output()).await {
+    let tree = TreeKillGuard::attach(&child);
+    let waited = tokio::time::timeout(limit, child.wait_with_output()).await;
+    // End the tree before reporting, on every path: a finished run must not
+    // leave a background child behind either.
+    drop(tree);
+    match waited {
         Ok(Ok(output)) => {
             let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -412,12 +516,98 @@ async fn restore_checkout(checkout: &Path, tip: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The restore the drop path needs, synchronously: `git reset --hard <tip>`
+/// then `git clean -ffd` (never `-x`, so the ignored build cache survives).
+fn restore_now(checkout: &Path, tip: &str) -> Result<(), String> {
+    for args in [vec!["reset", "--hard", tip], vec!["clean", "-ffd"]] {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(&args)
+            .current_dir(checkout)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("git {} could not run: {error}", args.join(" ")))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Puts the checkout back when the proof future is dropped before its own
+/// restore ran.
+///
+/// The reverse-apply is followed by an await of up to [`REGRESSION_LIMIT`];
+/// if the task is aborted there (Mnemo2 closing, a cancelled turn), an armed
+/// guard's [`Drop`] restores the checkout synchronously, so a dropped proof
+/// never leaves a worker checkout reverse-applied. Disarmed once the caller
+/// restored and verified the checkout itself.
+struct RestoreGuard<'a> {
+    /// The checkout the proof owns.
+    checkout: &'a Path,
+    /// The commit the checkout must end up on.
+    tip: &'a str,
+    /// Whether a restore is still owed.
+    armed: bool,
+}
+
+impl<'a> RestoreGuard<'a> {
+    /// A disarmed guard over `checkout` at `tip`.
+    fn new(checkout: &'a Path, tip: &'a str) -> Self {
+        Self {
+            checkout,
+            tip,
+            armed: false,
+        }
+    }
+
+    /// Take ownership: from here a restore is owed until [`Self::disarm`].
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// The caller restored and verified the checkout itself.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RestoreGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop cannot await: restore synchronously, best effort, and leave a
+        // trace rather than failing silently.
+        if let Err(error) = restore_now(self.checkout, self.tip) {
+            eprintln!(
+                "Mnemo2: the cancelled proof could not restore {}: {error}",
+                self.checkout.display()
+            );
+        }
+    }
+}
+
 /// Prove the plan's regression test fails without the change's source hunks.
 ///
 /// The checkout must sit at `tip` with a clean status when the proof starts;
 /// anything else is [`RedOutcome::Inconclusive`] and the checkout is untouched.
-/// From the reverse-apply on, every path restores the checkout and verifies it,
-/// and a restore that cannot be verified is an `Err` the caller must surface.
+/// From the reverse-apply on, every path restores the checkout and verifies it
+/// — the normal paths through [`restore_checkout`], a dropped future through
+/// the armed [`RestoreGuard`] — and a restore that cannot be verified is an
+/// `Err` the caller must surface.
 pub async fn prove_regression(
     checkout: PathBuf,
     base: String,
@@ -503,7 +693,26 @@ pub async fn prove_regression(
         "--whitespace=nowarn",
         &patch_arg,
     ];
-    let applied = git(&checkout, &apply_args).await?;
+    // From here the checkout may be modified. The guard owes a restore until
+    // the verified one below disarms it, so a proof cancelled mid-run (its
+    // future dropped) still puts the checkout back.
+    let mut guard = RestoreGuard::new(&checkout, &tip);
+    guard.arm();
+    let applied = match git(&checkout, &apply_args).await {
+        Ok(applied) => applied,
+        Err(error) => {
+            // An apply that could not even run is not an error of the proof:
+            // the caller gets an outcome, restored like every other path.
+            let reason = format!("the source patch could not be reverse-applied: {error}");
+            return match restore_checkout(&checkout, &tip).await {
+                Ok(()) => {
+                    guard.disarm();
+                    Ok(RedOutcome::Inconclusive { reason })
+                }
+                Err(error) => Err(format!("checkout could not be restored: {error}")),
+            };
+        }
+    };
     let outcome: Result<RedOutcome, String> = if applied.status.success() {
         // 4. The test must now fail. A non-zero exit is the proof; a passing
         //    run is the finding; a passing run that no longer reports the test
@@ -541,7 +750,10 @@ pub async fn prove_regression(
     // 5. RESTORE ALWAYS, and only then report: a checkout that cannot be
     //    verified is an error the caller has to surface, not an outcome.
     match restore_checkout(&checkout, &tip).await {
-        Ok(()) => outcome,
+        Ok(()) => {
+            guard.disarm();
+            outcome
+        }
         Err(error) => Err(format!("checkout could not be restored: {error}")),
     }
 }
@@ -635,13 +847,32 @@ pub async fn run_mutation(
     cfg: MutationCfg,
     worker_id: String,
 ) -> Result<Vec<Mutant>, String> {
-    // 1. The diff the tool is limited to, in a folder this run owns.
+    // 1. The run lasts hours: refuse a checkout that is not exactly the tip, so
+    //    a stale or dirty tree is never mutated.
+    let head = git_value(&checkout, &["rev-parse", "HEAD"]).await?;
+    if head != tip {
+        return Err(format!(
+            "the mutation run needs the checkout at the tip {tip}, but it is at {head}"
+        ));
+    }
+    let status = git_value(&checkout, &["status", "--porcelain", "-uall"]).await?;
+    if !status.is_empty() {
+        return Err(format!(
+            "the mutation run needs a clean checkout: {}",
+            tail(&status, OUTPUT_TAIL)
+        ));
+    }
+
+    // 2. The diff the tool is limited to, in a folder this run owns.
     let out = main_root
         .join(".coding")
         .join("tmp")
         .join("mutation")
         .join(safe_component(&worker_id));
-    clear_dir(&out)?;
+    let prepare = out.clone();
+    tokio::task::spawn_blocking(move || clear_dir(&prepare))
+        .await
+        .map_err(|error| format!("the run folder could not be prepared: {error}"))??;
     let merge_base = git_value(&checkout, &["merge-base", &base, &tip]).await?;
     let diff_args = ["diff", "--no-color", &merge_base, &tip];
     let diff_output = git(&checkout, &diff_args).await?;
@@ -656,7 +887,7 @@ pub async fn run_mutation(
         .map_err(|error| format!("could not write {}: {error}", diff_file.display()))?
         .map_err(|error| format!("could not write {}: {error}", diff_file.display()))?;
 
-    // 2. Run the tool in the checkout: it copies the tree by default, so the
+    // 3. Run the tool in the checkout: it copies the tree by default, so the
     //    checkout itself is never mutated.
     let out_text = out.to_string_lossy().into_owned();
     let script = cfg
@@ -670,7 +901,7 @@ pub async fn run_mutation(
         ShellRun::TimedOut => "the run was killed after 3 hours".to_string(),
     };
 
-    // 3. Read the missed mutants.
+    // 4. Read the missed mutants.
     let missed = match &run {
         ShellRun::Finished { .. } => {
             let read_file = missed_file.clone();
@@ -688,7 +919,7 @@ pub async fn run_mutation(
         }
     };
 
-    // 4. The checkout must be exactly where it was: the tool copies the tree,
+    // 5. The checkout must be exactly where it was: the tool copies the tree,
     //    so anything else means the run reached outside its copy.
     let head = git_value(&checkout, &["rev-parse", "HEAD"]).await?;
     let status = git_value(&checkout, &["status", "--porcelain", "-uall"]).await?;
@@ -727,23 +958,64 @@ mod tests {
     /// A git repository whose base commit holds `broken` and whose tip fixes it
     /// and adds a regression test. Returns the base and tip commit ids.
     fn demo_repo(root: &Path) -> (String, String) {
+        demo_repo_with_eol(root, "\n")
+    }
+
+    /// [`demo_repo`] with an explicit line ending, so a CRLF project can be
+    /// reproduced byte for byte.
+    fn demo_repo_with_eol(root: &Path, eol: &str) -> (String, String) {
         git_in(root, &["init", "-b", "wt/demo"]);
         git_in(root, &["config", "user.name", "Proof Test"]);
         git_in(root, &["config", "user.email", "proof@example.invalid"]);
         // Deterministic bytes: the proof reverts worktree content verbatim.
         git_in(root, &["config", "core.autocrlf", "false"]);
-        std::fs::write(root.join(".gitignore"), "target/\n").expect("gitignore");
-        std::fs::write(root.join("src.txt"), "broken\n").expect("base source");
+        std::fs::write(root.join(".gitignore"), format!("target/{eol}")).expect("gitignore");
+        std::fs::write(root.join("src.txt"), format!("broken{eol}")).expect("base source");
         git_in(root, &["add", ".gitignore", "src.txt"]);
         git_in(root, &["commit", "-m", "base"]);
         let base = git_in(root, &["rev-parse", "HEAD"]);
-        std::fs::write(root.join("src.txt"), "fixed\n").expect("fixed source");
+        std::fs::write(root.join("src.txt"), format!("fixed{eol}")).expect("fixed source");
         std::fs::create_dir_all(root.join("tests")).expect("tests dir");
-        std::fs::write(root.join("tests/demo.txt"), "demo\n").expect("regression test");
+        std::fs::write(root.join("tests/demo.txt"), format!("demo{eol}")).expect("regression test");
         git_in(root, &["add", "src.txt", "tests/demo.txt"]);
         git_in(root, &["commit", "-m", "tip"]);
         let tip = git_in(root, &["rev-parse", "HEAD"]);
         (base, tip)
+    }
+
+    /// A git repository whose tip changes `lib.rs` both above `#[cfg(test)]`
+    /// and inside the test module. Returns the base and tip commit ids plus the
+    /// tip text.
+    fn mixed_repo(root: &Path) -> (String, String, String) {
+        git_in(root, &["init", "-b", "wt/demo"]);
+        git_in(root, &["config", "user.name", "Proof Test"]);
+        git_in(root, &["config", "user.email", "proof@example.invalid"]);
+        git_in(root, &["config", "core.autocrlf", "false"]);
+        let base_text = "pub fn value() -> u32 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    // marker-base\n}\n";
+        let tip_text = "pub fn value() -> u32 {\n    2\n}\n\n#[cfg(test)]\nmod tests {\n    // marker-tip\n}\n";
+        std::fs::write(root.join("lib.rs"), base_text).expect("base lib");
+        git_in(root, &["add", "lib.rs"]);
+        git_in(root, &["commit", "-m", "base"]);
+        let base = git_in(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("lib.rs"), tip_text).expect("tip lib");
+        git_in(root, &["add", "lib.rs"]);
+        git_in(root, &["commit", "-m", "tip"]);
+        let tip = git_in(root, &["rev-parse", "HEAD"]);
+        (base, tip, tip_text.to_string())
+    }
+
+    /// The regression script of [`mixed_repo`]: it passes when the source line
+    /// still holds the fix, or when the test module was clobbered (which is the
+    /// wrong split), and only fails when the source reverted and the added test
+    /// line survived — exactly what a correct source-only revert produces.
+    fn mixed_script() -> String {
+        if cfg!(windows) {
+            "$text = Get-Content lib.rs -Raw; if ($text -like '*marker-base*' -or $text -match '(?m)^\\s*2\\s*$') { 'demo ... ok' } else { 'demo ... FAILED'; exit 1 }"
+                .to_string()
+        } else {
+            "if grep -q 'marker-base' lib.rs || grep -qE '^[[:space:]]*2[[:space:]]*$' lib.rs; then echo 'demo ... ok'; else echo 'demo ... FAILED'; exit 1; fi"
+                .to_string()
+        }
     }
 
     /// The regression script: it passes only while `src.txt` holds the fix.
@@ -786,6 +1058,30 @@ mod tests {
                 .to_string()
         } else {
             "if [ \"$(cat src.txt)\" = fixed ]; then echo 'demo ... ok'; echo scribbled > src.txt; else echo 'demo ... FAILED'; exit 1; fi"
+                .to_string()
+        }
+    }
+
+    /// A regression script that hangs on its second run, so the proof is still
+    /// in flight when the caller drops its future.
+    fn slow_second_run_script() -> String {
+        if cfg!(windows) {
+            "if ((Get-Content src.txt) -eq 'fixed') { 'demo ... ok' } else { Start-Sleep -Seconds 60; 'demo ... FAILED'; exit 1 }"
+                .to_string()
+        } else {
+            "if [ \"$(cat src.txt)\" = fixed ]; then echo 'demo ... ok'; else sleep 60; echo 'demo ... FAILED'; exit 1; fi"
+                .to_string()
+        }
+    }
+
+    /// The regression script for a CRLF project: the Unix leg strips the `\r`
+    /// `cat` leaves behind, exactly as a real test would have to.
+    fn crlf_red_script() -> String {
+        if cfg!(windows) {
+            "if ((Get-Content src.txt) -eq 'fixed') { 'demo ... ok' } else { 'demo ... FAILED'; exit 1 }"
+                .to_string()
+        } else {
+            "if [ \"$(tr -d '\\r' < src.txt)\" = fixed ]; then echo 'demo ... ok'; else echo 'demo ... FAILED'; exit 1; fi"
                 .to_string()
         }
     }
@@ -844,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn source_patch_drops_test_files_keeps_binaries() {
+    fn source_patch_drops_test_files_and_binaries() {
         let diff = concat!(
             "diff --git a/src/memory/indexer/tests/openspec.rs ",
             "b/src/memory/indexer/tests/openspec.rs\n",
@@ -866,11 +1162,10 @@ mod tests {
         let patch = source_hunks_patch(diff, &|_| None);
         assert!(!patch.contains("openspec.rs"), "{patch}");
         assert!(!patch.contains("added_test"), "{patch}");
-        assert!(patch.contains("assets/logo.png"), "{patch}");
-        assert!(
-            patch.contains("Binary files a/assets/logo.png and b/assets/logo.png differ"),
-            "{patch}"
-        );
+        // A binary change has no hunks to split and cannot be reverted
+        // hunk-wise: keeping it would fail the whole reverse-apply.
+        assert!(!patch.contains("assets/logo.png"), "{patch}");
+        assert!(!patch.contains("Binary files"), "{patch}");
         assert!(patch.contains("+let source = 3;"), "{patch}");
     }
 
@@ -1045,6 +1340,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prove_regression_mixed_file_reverts_only_source() {
+        let dir = tempfile::tempdir().expect("repo");
+        let root = dir.path().to_path_buf();
+        let (base, tip, tip_text) = mixed_repo(&root);
+        let outcome = prove_regression(
+            root.clone(),
+            base,
+            tip.clone(),
+            cfg_for(mixed_script()),
+            "demo".to_string(),
+        )
+        .await
+        .expect("proof");
+        // Red only when the split was right: the source hunk was reverted AND
+        // the added test line survived. A proof that reverted the test hunk too
+        // (or dropped the source hunk) lands on NotRed and fails here.
+        match outcome {
+            RedOutcome::Red { output } => assert!(output.contains("FAILED"), "{output}"),
+            other => panic!("expected Red, got {other:?}"),
+        }
+        assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(git_in(&root, &["status", "--porcelain", "-uall"]), "");
+        assert_eq!(
+            std::fs::read_to_string(root.join("lib.rs")).expect("lib"),
+            tip_text
+        );
+    }
+
+    #[tokio::test]
+    async fn crlf_repo_proves_red() {
+        let dir = tempfile::tempdir().expect("repo");
+        let root = dir.path().to_path_buf();
+        let (base, tip) = demo_repo_with_eol(&root, "\r\n");
+        let outcome = prove_regression(
+            root.clone(),
+            base,
+            tip.clone(),
+            cfg_for(crlf_red_script()),
+            "demo".to_string(),
+        )
+        .await
+        .expect("proof");
+        // A patch that lost its `\r` cannot be reverse-applied, so the proof
+        // would stop at Inconclusive instead of proving red.
+        match outcome {
+            RedOutcome::Red { output } => assert!(output.contains("FAILED"), "{output}"),
+            other => panic!("expected Red, got {other:?}"),
+        }
+        assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(git_in(&root, &["status", "--porcelain", "-uall"]), "");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.txt")).expect("source"),
+            "fixed\r\n"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_checkout_restores_the_tip_and_keeps_ignored_files() {
         let dir = tempfile::tempdir().expect("repo");
         let root = dir.path().to_path_buf();
@@ -1064,6 +1416,111 @@ mod tests {
             root.join("target/warm.txt").exists(),
             "`clean` must not use -x"
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_proof_restores_the_checkout() {
+        let dir = tempfile::tempdir().expect("repo");
+        let root = dir.path().to_path_buf();
+        let (base, tip) = demo_repo(&root);
+        let proof = prove_regression(
+            root.clone(),
+            base,
+            tip.clone(),
+            cfg_for(slow_second_run_script()),
+            "demo".to_string(),
+        );
+        // The second run hangs, so the future is dropped while the checkout is
+        // reverse-applied: the guard's drop must put it back.
+        let waited = tokio::time::timeout(Duration::from_secs(5), proof).await;
+        assert!(
+            waited.is_err(),
+            "the proof must still be in flight when it is dropped"
+        );
+        assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(git_in(&root, &["status", "--porcelain", "-uall"]), "");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.txt")).expect("source"),
+            "fixed\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_proof_kills_child_tree() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().to_path_buf();
+        let marker = root.join("marker.txt");
+        // The command starts a CHILD process of its own that writes a marker
+        // after 3 s, then the command itself hangs: killing only the shell
+        // would let the child write the marker and leak past the run.
+        let script = if cfg!(windows) {
+            let child = root.join("child.ps1");
+            std::fs::write(
+                &child,
+                format!(
+                    "Start-Sleep -Seconds 3; Set-Content -Path '{}' -Value leaked",
+                    marker.display()
+                ),
+            )
+            .expect("child script");
+            format!(
+                "Start-Process -WindowStyle Hidden -FilePath powershell -ArgumentList '-NoProfile','-File','{}' | Out-Null; Start-Sleep -Seconds 60",
+                child.display()
+            )
+        } else {
+            let child = root.join("child.sh");
+            std::fs::write(
+                &child,
+                format!("sleep 3; echo leaked > '{}'", marker.display()),
+            )
+            .expect("child script");
+            format!("sh '{}' & sleep 60", child.display())
+        };
+        let run = run_shell(&script, &root, Duration::from_secs(1))
+            .await
+            .expect("run");
+        assert!(matches!(run, ShellRun::TimedOut), "the run must time out");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !marker.exists(),
+            "a timed-out proof left a child running that wrote {}",
+            marker.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_mutation_refuses_a_dirty_checkout() {
+        let dir = tempfile::tempdir().expect("repo");
+        let root = dir.path().to_path_buf();
+        let (base, tip) = demo_repo(&root);
+        // A command that would leave a trace if the run ever started.
+        let command = if cfg!(windows) {
+            "Set-Content ran.txt 'ran'"
+        } else {
+            "echo ran > ran.txt"
+        };
+        let cfg = MutationCfg {
+            command: command.to_string(),
+            missed: "{out}/mutants.out/missed.txt".to_string(),
+        };
+        std::fs::write(root.join("scratch.txt"), "work in progress\n").expect("untracked file");
+        let error = run_mutation(
+            root.clone(),
+            root.clone(),
+            base,
+            tip.clone(),
+            cfg,
+            "worker-1".to_string(),
+        )
+        .await
+        .expect_err("a dirty checkout must be refused");
+        assert!(error.contains("clean"), "{error}");
+        assert!(
+            !root.join(".coding/tmp/mutation/worker-1").exists(),
+            "nothing may be prepared for a refused run"
+        );
+        assert!(!root.join("ran.txt").exists(), "the tool must not have run");
+        assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
     }
 
     #[test]

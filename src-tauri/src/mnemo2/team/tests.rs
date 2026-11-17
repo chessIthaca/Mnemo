@@ -29,7 +29,9 @@ use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, T
 use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
 };
-use super::pump::{counted_check, cost_notice_due, usage_cost_micros, worker_host_tool_result};
+use super::pump::{
+    counted_check, cost_notice_due, usage_cost_micros, worker_host_tool_result, pump_worker,
+};
 use super::review::CheckRecorder;
 use super::record::{append_inbox, audit_finished, WORKER_INBOX_LIMIT};
 use super::review::clear_review_for_a_newer_tip;
@@ -1445,6 +1447,7 @@ async fn cleanup_keeps_branches_and_dirty_work_but_removes_clean_checkouts() {
         root,
         state.path(),
         &state.path().join("dispatch_routing.jsonl"),
+        &[],
     )
     .await
     .expect("cleanup");
@@ -3428,6 +3431,7 @@ async fn cleanup_never_touches_mnemo1_runall_worktrees() {
         root,
         state.path(),
         &state.path().join("dispatch_routing.jsonl"),
+        &[],
     )
     .await
     .expect("cleanup");
@@ -3553,26 +3557,26 @@ fn merge_gate_requires_substantive_review_evidence() {
     // A summary plus passing checks alone can no longer merge: the
     // legacy-shaped review (evidence absent) is rejected.
     let unevidenced = in_review_worker(None);
-    let error = validate_merge(&unevidenced, "tip0001", &[], &full_lane())
+    let error = validate_merge(&unevidenced, "tip0001", &[], &full_lane(), &proving::MergeProof::default())
         .expect_err("a legacy review must not merge without fresh evidence");
     assert!(error.contains("structured evidence"), "{error}");
 
     // An anchored-only pass is not substantive either.
     let mut unanchored = evidence();
     unanchored.unanchored_pass = false;
-    let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[], &full_lane())
+    let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[], &full_lane(), &proving::MergeProof::default())
         .expect_err("unanchored evidence must not merge");
     assert!(rejected.contains("unanchored"), "{rejected}");
 
     // Empty assessments are rejected.
     let mut empty_intent = evidence();
     empty_intent.intent = "  ".into();
-    let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[], &full_lane())
+    let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[], &full_lane(), &proving::MergeProof::default())
         .expect_err("empty intent must not merge");
     assert!(empty.contains("intent"), "{empty}");
 
     // Complete evidence passes the gate for standard-risk work.
-    validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[], &full_lane())
+    validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[], &full_lane(), &proving::MergeProof::default())
         .expect("complete evidence merges");
 }
 
@@ -3644,7 +3648,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
     // High-risk work cannot merge on the lead's evidence alone.
     let mut high = in_review_worker(Some(evidence()));
     high.review_risk = "high".into();
-    let missing = validate_merge(&high, "tip0001", &records_empty, &full_lane())
+    let missing = validate_merge(&high, "tip0001", &records_empty, &full_lane(), &proving::MergeProof::default())
         .expect_err("high-risk work needs an independent audit");
     assert!(
         missing.contains("high-risk reviews require an independent reviewer"),
@@ -3657,7 +3661,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
     untracked_evidence.audit_adjudication = Some("accepted".into());
     let mut untracked_worker = in_review_worker(Some(untracked_evidence));
     untracked_worker.review_risk = "high".into();
-    let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty, &full_lane())
+    let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty, &full_lane(), &proving::MergeProof::default())
         .expect_err("the linked reviewer must be a tracked worker");
     assert!(untracked.contains("not a tracked worker"), "{untracked}");
 
@@ -3670,26 +3674,26 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         WorkerStatus::Completed,
     );
     implementer.kind = "implementation".into();
-    let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer], &full_lane())
+    let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer], &full_lane(), &proving::MergeProof::default())
         .expect_err("an implementation worker is not an independent audit");
     assert!(wrong_kind.contains("not a read-only audit worker"), "{wrong_kind}");
 
     // An audit still working cannot be linked.
     let mut live = audit_worker(WorkerStatus::Working, "evidence0001", "tip0001");
     live.status = WorkerStatus::Working;
-    let incomplete = validate_merge(&untracked_worker, "tip0001", &[live], &full_lane())
+    let incomplete = validate_merge(&untracked_worker, "tip0001", &[live], &full_lane(), &proving::MergeProof::default())
         .expect_err("an unfinished audit must not merge");
     assert!(incomplete.contains("not completed"), "{incomplete}");
 
     // An audit of another worker is refused.
     let foreign = audit_worker(WorkerStatus::Completed, "other0001", "tip0001");
-    let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign], &full_lane())
+    let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign], &full_lane(), &proving::MergeProof::default())
         .expect_err("a foreign audit must not link");
     assert!(mismatched.contains("reviews 'other0001'"), "{mismatched}");
 
     // An audit at an older tip is stale after a fix commit moved it.
     let stale = audit_worker(WorkerStatus::Completed, "evidence0001", "tip0000");
-    let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale], &full_lane())
+    let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale], &full_lane(), &proving::MergeProof::default())
         .expect_err("a stale audit must block the merge");
     assert!(stale_error.contains("stale"), "{stale_error}");
 
@@ -3704,6 +3708,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         "tip0001",
         &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
         &full_lane(),
+        &proving::MergeProof::default(),
     )
     .expect_err("linking an audit requires an adjudication");
     assert!(
@@ -3723,6 +3728,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         "tip0001",
         &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
         &full_lane(),
+        &proving::MergeProof::default(),
     )
     .expect("a fresh completed audit with an adjudication merges");
 }
@@ -11574,6 +11580,7 @@ async fn workspace_cleanup_after_a_lost_detach_save_persists_and_reuses_the_pool
         root.path(),
         state.path(),
         &state.path().join("dispatch_routing.jsonl"),
+        &[],
     )
     .await
     .expect("retry workspace cleanup");
@@ -11937,6 +11944,1545 @@ async fn unregistered_pool_is_rejected_before_worker_cleanliness_or_tip_probes()
     assert_eq!(
         team.worker(&worker.id).await.expect("unchanged worker").status,
         WorkerStatus::InReview
+    );
+    team.shutdown().await;
+}
+
+// --- The two proofs of plan 970d8d66: the red check and the mutation check ---
+
+/// A proof runner that answers with one scripted outcome, so the recording and
+/// the notice are exercised without a real test build. The call counters
+/// cover the trigger paths: how many times each job really ran.
+struct ScriptedProofs {
+    outcome: proof::RedOutcome,
+    mutants: Vec<proof::Mutant>,
+    prove_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    mutate_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ScriptedProofs {
+    fn new(outcome: proof::RedOutcome) -> Self {
+        Self {
+            outcome,
+            mutants: Vec::new(),
+            prove_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mutate_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// A runner that also reports the given uncaught mutants.
+    fn with_mutants(mutants: Vec<proof::Mutant>) -> Self {
+        Self {
+            mutants,
+            ..Self::new(proof::RedOutcome::Red {
+                output: "test regression_proves_red ... FAILED".to_string(),
+            })
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl proving::ProofRunner for ScriptedProofs {
+    async fn prove(&self, _request: proving::ProveRequest) -> Result<proof::RedOutcome, String> {
+        self.prove_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.outcome.clone())
+    }
+
+    async fn mutate(&self, _request: proving::MutateRequest) -> Result<Vec<proof::Mutant>, String> {
+        self.mutate_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.mutants.clone())
+    }
+}
+
+/// Wait for one lead notice whose text contains `needle`.
+async fn drain_notice(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+) -> Option<String> {
+    for _ in 0..400 {
+        while let Ok(signal) = receiver.try_recv() {
+            if let BoardSignal::Notice { text, .. } = signal {
+                if text.contains(needle) {
+                    return Some(text);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    None
+}
+
+/// A team whose board holds a `bug_fixing` plan naming `regression_proves_red`
+/// as its regression test, with a provisioned worker whose checkout carries a
+/// commit that adds that name.
+async fn proof_fixture(
+    id: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<TeamRuntime>,
+    String,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    std::fs::create_dir_all(root.path().join(".coding")).expect("coding dir");
+    std::fs::write(
+        root.path().join(".coding/checks.toml"),
+        "[regression]\ncommand = \"cargo test -- {name}\"\nran = \"{name} ... \"\n\n[mutation]\ncommand = \"cargo mutants --in-diff {diff} --output {out}\"\nmissed = \"{out}/missed.txt\"\n",
+    )
+    .expect("checks.toml");
+    let plans_dir = root.path().join(".coding/plans");
+    std::fs::create_dir_all(&plans_dir).expect("plans dir");
+    let board = PlanBoard::new(&plans_dir, root.path().join(".coding/reviews"));
+    let plan = board
+        .create(mnemo::app::plan_board::PlanDraft {
+            title: "Prove the fix".to_string(),
+            goal: "The regression test fails without the fix".to_string(),
+            context: "verified: the proof wiring lives in src-tauri/src/mnemo2/team/proving.rs; verify with cargo test.".to_string(),
+            kind: mnemo::memory::plan_format::PlanKind::BugFixing,
+            bug: Some("a filter accepts everything".to_string()),
+            steps: vec![
+                "**Wire** the proof in src-tauri/src/mnemo2/team/proving.rs".to_string(),
+            ],
+            ..Default::default()
+        })
+        .expect("create the plan");
+    board
+        .update(
+            &plan.id,
+            mnemo::app::plan_board::PlanEdit {
+                regression_test: Some("regression_proves_red".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("record the regression test");
+    let team = Arc::new(open_test_team(root.path(), state.path(), Vec::new()).await);
+    team.attach_board(Arc::new(board));
+    let worker = provision_pool_worker(&team, id).await;
+    std::fs::write(
+        worker.worktree.join("fix.rs"),
+        "fn regression_proves_red() {}\n",
+    )
+    .expect("worker change");
+    run_git(&worker.worktree, &["add", "fix.rs"]);
+    run_git(
+        &worker.worktree,
+        &["commit", "-m", "add the regression test"],
+    );
+    team.update_worker(&worker.id, |current| {
+        current.plan_id = Some(plan.id.clone());
+        current.plan_step = Some(1);
+        // A finished worker reads Completed: the claim's idle test (F1)
+        // accepts only a settled worker.
+        current.status = WorkerStatus::Completed;
+    })
+    .await;
+    let record = team.worker(&worker.id).await.expect("worker");
+    assert!(
+        team.proof_ctx().worker_plan(&record).await.is_some(),
+        "the fixture's plan parses back from the board"
+    );
+    assert!(
+        proof::load_proof_config(root.path()).regression.is_some(),
+        "the fixture configures a regression command: {:?}",
+        std::fs::read_to_string(root.path().join(".coding/checks.toml"))
+    );
+    (root, state, team, worker.id)
+}
+
+/// While a proof runs, every entry point that would move the worker's checkout
+/// refuses with one message naming the proof, and the merge gate refuses even
+/// when it is reached directly.
+#[tokio::test]
+async fn merge_refuses_while_proving() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveBusy01").await;
+    assert!(team.proof_ctx().proving.hold_for_test(&worker_id));
+    let expected = proving::proving_error(&worker_id);
+    assert!(
+        expected.contains("is proving"),
+        "the refusal names the proof: {expected}"
+    );
+    assert_eq!(
+        team.message(&worker_id, "hello".to_string(), MessageSender::Lead)
+            .await
+            .expect_err("a message is refused while the proof runs"),
+        expected
+    );
+    assert_eq!(
+        team.merge_as(&worker_id, true)
+            .await
+            .expect_err("a merge is refused while the proof runs"),
+        expected
+    );
+    assert_eq!(
+        team.resume(&worker_id)
+            .await
+            .expect_err("a resume is refused while the proof runs"),
+        expected
+    );
+    assert_eq!(
+        team.route_fix(&worker_id, &proof_finding(&worker_id))
+            .await
+            .expect_err("a routed fix is refused while the proof runs"),
+        expected
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let running = proving::MergeProof {
+        running: true,
+        ..Default::default()
+    };
+    let error = validate_merge(&worker, "tip0001", &[], &full_lane(), &running)
+        .expect_err("the gate refuses a running proof");
+    assert_eq!(error, expected);
+    team.shutdown().await;
+}
+
+/// A resolved finding a routed fix would carry: the route is refused before the
+/// finding matters.
+fn proof_finding(worker_id: &str) -> String {
+    format!("{worker_id}-finding")
+}
+
+/// A bug-fix diff that adds the plan's regression test cannot merge until the
+/// tip carries the passed red check or the lead resolved the proof finding.
+#[tokio::test]
+async fn merge_requires_red_proof_for_bug_fix_adding_the_test() {
+    let worker = in_review_worker(Some(evidence()));
+    let required = proving::MergeProof {
+        regression_required: true,
+        ..Default::default()
+    };
+    let error = validate_merge(&worker, "tip0001", &[], &full_lane(), &required)
+        .expect_err("an unproven regression test blocks the merge");
+    assert_eq!(
+        error,
+        "the regression test has not been proven red at this tip; wait for the proof or run team_prove_regression"
+    );
+    let proven = proving::MergeProof {
+        regression_required: true,
+        regression_proven: true,
+        ..Default::default()
+    };
+    validate_merge(&worker, "tip0001", &[], &full_lane(), &proven)
+        .expect("a red check at the tip merges");
+    let waived = proving::MergeProof {
+        regression_required: true,
+        regression_waived: true,
+        ..Default::default()
+    };
+    validate_merge(&worker, "tip0001", &[], &full_lane(), &waived)
+        .expect("a resolved proof finding waives the red check");
+}
+
+/// A red outcome records the passed check at the proved tip and tells the lead.
+#[tokio::test]
+async fn red_outcome_records_a_passed_check_and_notice() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveRed01").await;
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED\nfailures:\n    regression_proves_red".to_string(),
+    });
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    let mut notices = team.subscribe_board();
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    team.prove_regression_tool(&worker_id)
+        .await
+        .expect("start the red proof");
+    let notice = drain_notice(&mut notices, "regression proof for")
+        .await
+        .expect("the proof finishes with a notice");
+    assert!(notice.contains("red (fails without the fix)"), "{notice}");
+    let check = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .checks
+                .into_iter()
+                .find(|check| check.name == proving::RED_CHECK)
+        })
+    })
+    .await;
+    assert_eq!(check.status, "passed");
+    assert_eq!(check.tip, tip);
+    let detail = check.detail.unwrap_or_default();
+    assert!(detail.contains("regression_proves_red"), "{detail}");
+    let proven = team.worker(&worker_id).await.expect("worker");
+    let inputs = team.proof_ctx().merge_inputs(&proven, &tip).await;
+    assert!(inputs.regression_required, "{inputs:?}");
+    assert!(inputs.regression_proven, "{inputs:?}");
+    team.shutdown().await;
+}
+
+/// A regression test that still passes without the fix opens the high finding
+/// naming the file, and the gate then refuses the merge.
+#[tokio::test]
+async fn not_red_outcome_opens_a_high_finding() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveNotRed01").await;
+    let proofs = ScriptedProofs::new(proof::RedOutcome::NotRed {
+        output: "test regression_proves_red ... ok".to_string(),
+    });
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    let mut notices = team.subscribe_board();
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    team.prove_regression_tool(&worker_id)
+        .await
+        .expect("start the red proof");
+    let notice = drain_notice(&mut notices, "regression proof for")
+        .await
+        .expect("the proof finishes with a notice");
+    assert!(
+        notice.contains("NOT red, finding regression-not-red opened"),
+        "{notice}"
+    );
+    let finding = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .into_iter()
+                .find(|finding| finding.id == proving::NOT_RED_ID)
+        })
+    })
+    .await;
+    assert_eq!(finding.severity, "high");
+    assert_eq!(finding.status, "open");
+    assert_eq!(finding.title, "The regression test passes without the fix");
+    assert_eq!(finding.file, "fix.rs");
+    assert!(
+        finding.detail.contains("the test does not reproduce the defect"),
+        "{}",
+        finding.detail
+    );
+    let inputs = team.proof_ctx().merge_inputs(&worker, &tip).await;
+    assert!(inputs.regression_required, "{inputs:?}");
+    assert!(!inputs.regression_proven, "{inputs:?}");
+    team.shutdown().await;
+}
+
+/// The mutation tool is refused with the configuration hint when the project
+/// configured no `[mutation]` table, and both proof tools are exposed.
+#[tokio::test]
+async fn mutation_tool_refuses_without_config() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let specs = team.lead_host_tools();
+    for name in ["team_prove_regression", "team_mutation_check"] {
+        assert!(
+            specs.iter().any(|spec| spec.name == name),
+            "{name} is exposed to the lead"
+        );
+    }
+    assert_eq!(
+        team.mutation_check_tool("mutationCfg01")
+            .await
+            .expect_err("no [mutation] table configured"),
+        "configure [mutation] in .coding/checks.toml"
+    );
+    team.shutdown().await;
+}
+
+// --- The review fixes: claimRace, secondJobDropped, deleteDuringProof,
+// parkedTrigger, steerTimeoutTrigger, proofPerTip, restartWhileProving,
+// auditKindFilter ---
+
+/// A claim for a worker whose turn just started is refused: no proof may run
+/// underneath a turn that edits the same checkout (finding claimRace). The
+/// refused claim leaves nothing behind — no claim, no marker.
+#[tokio::test]
+async fn claim_refuses_a_busy_worker() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveBusyRace1").await;
+    team.update_worker(&worker_id, |current| {
+        current.status = WorkerStatus::Working;
+    })
+    .await;
+    let error = team
+        .proof_ctx()
+        .spawn(&worker_id, &[proving::ProofJob::Regression])
+        .await
+        .expect_err("a turn that just started is refused");
+    assert!(error.contains("is busy"), "{error}");
+    assert!(
+        !team.proof_ctx().proving.is_active(&worker_id),
+        "the refused claim is released"
+    );
+    assert!(
+        !team.workspace_root.join(".coding/mnemo2/proving").join(format!("{worker_id}.json")).exists(),
+        "the refused claim writes no marker"
+    );
+    team.shutdown().await;
+}
+
+/// After a claim, the message entry point refuses under the merge lock: the
+/// claim and the turn start are serialized on it, so the guard cannot miss a
+/// claim that happened between the lock and the check (finding claimRace).
+#[tokio::test]
+async fn message_after_claim_is_refused_under_lock() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveClaimLock1").await;
+    assert!(team.proof_ctx().proving.hold_for_test(&worker_id));
+    assert_eq!(
+        team.message(&worker_id, "hello".to_string(), MessageSender::Lead)
+            .await
+            .expect_err("a message is refused while the proof runs"),
+        proving::proving_error(&worker_id)
+    );
+    team.shutdown().await;
+}
+
+/// One claim runs both jobs a high-risk turn owes, in order: regression first,
+/// then mutation — the second job is never dropped by the first claim (finding
+/// secondJobDropped). Each job records its own result.
+#[tokio::test]
+async fn turn_end_runs_both_owed_proofs() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveBothJobs1").await;
+    team.update_worker(&worker_id, |current| {
+        current.review_risk = "high".to_string();
+    })
+    .await;
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    });
+    let prove_calls = proofs.prove_calls.clone();
+    let mutate_calls = proofs.mutate_calls.clone();
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    proving::spawn_turn_proofs(&team.proof_ctx(), worker_id.clone()).await;
+    eventually(|| async {
+        (prove_calls.load(Ordering::SeqCst) == 1 && mutate_calls.load(Ordering::SeqCst) == 1)
+            .then_some(())
+    })
+    .await;
+    eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            let red = worker
+                .checks
+                .iter()
+                .any(|check| check.name == proving::RED_CHECK && check.status == "passed");
+            let clean = worker.checks.iter().any(|check| {
+                check.name == proving::MUTATION_CLEAN_CHECK && check.status == "passed"
+            });
+            (red && clean).then_some(())
+        })
+    })
+    .await;
+    // One claim, released when both jobs finished: the last record lands
+    // before the guard drops, so the release is awaited, not assumed.
+    eventually(|| async {
+        (!team.proof_ctx().proving.is_active(&worker_id)).then_some(())
+    })
+    .await;
+    team.shutdown().await;
+}
+
+/// Deleting a worker whose proof runs is refused with the proof's refusal
+/// text: the deletion would trash the checkout the proof is restoring (finding
+/// deleteDuringProof).
+#[tokio::test]
+async fn delete_refuses_while_proving() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveDelete1").await;
+    assert!(team.proof_ctx().proving.hold_for_test(&worker_id));
+    let outcome = team
+        .delete_workers(std::slice::from_ref(&worker_id), true)
+        .await
+        .expect("the deletion flow runs and reports per worker");
+    assert_eq!(outcome.results.len(), 1, "{:?}", outcome.results);
+    assert_eq!(
+        outcome.results[0].error.as_deref(),
+        Some(proving::proving_error(&worker_id).as_str()),
+        "the refused deletion names the proof"
+    );
+    team.worker(&worker_id)
+        .await
+        .expect("the proved worker is not deleted");
+    team.shutdown().await;
+}
+
+/// Only an implementation worker can be proven: an audit worker's checkout
+/// is the reviewer's, and its findings are the deliverable (finding
+/// auditKindFilter).
+#[tokio::test]
+async fn proof_tools_refuse_audit_workers() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveAuditKind1").await;
+    team.update_worker(&worker_id, |current| {
+        current.kind = "audit".to_string();
+    })
+    .await;
+    assert_eq!(
+        team.prove_regression_tool(&worker_id)
+            .await
+            .expect_err("an audit worker is not proven"),
+        "only implementation workers are proven"
+    );
+    assert_eq!(
+        team.mutation_check_tool(&worker_id)
+            .await
+            .expect_err("an audit worker is not mutated"),
+        "only implementation workers are proven"
+    );
+    team.shutdown().await;
+}
+
+/// A proof finding names its tip, so a worker that moves its tip is proven
+/// again: the open finding is updated in place, and a Red result closes it as
+/// fixed with the tip it was proven at (finding proofPerTip).
+#[tokio::test]
+async fn reproof_at_new_tip_runs_and_closes_old_finding() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveTipMove1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let first_tip = phase3::tip(&worker.worktree).await.expect("first tip");
+    let proofs = ScriptedProofs::new(proof::RedOutcome::NotRed {
+        output: "test regression_proves_red ... ok".to_string(),
+    });
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    team.prove_regression_tool(&worker_id)
+        .await
+        .expect("start the first proof");
+    let finding = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .into_iter()
+                .find(|finding| finding.id == proving::NOT_RED_ID && finding.status == "open")
+        })
+    })
+    .await;
+    assert_eq!(
+        finding.detail.lines().next(),
+        Some(format!("tip {first_tip}").as_str()),
+        "the finding names the tip it was proven at: {}",
+        finding.detail
+    );
+    // The worker commits again: the moved tip has no proof result, so the
+    // re-proof is due and updates the same finding in place.
+    std::fs::write(
+        worker.worktree.join("fix.rs"),
+        "fn regression_proves_red() {}\nfn more() {}\n",
+    )
+    .expect("the second worker change");
+    run_git(&worker.worktree, &["add", "fix.rs"]);
+    run_git(&worker.worktree, &["commit", "-m", "the second change"]);
+    let second_tip = phase3::tip(&worker.worktree).await.expect("second tip");
+    assert_ne!(first_tip, second_tip);
+    team.set_proof_runner_for_test(Arc::new(ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    })));
+    team.prove_regression_tool(&worker_id)
+        .await
+        .expect("start the re-proof");
+    let (closed, check_tip) = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            let closed = worker.findings.iter().find(|finding| {
+                finding.id == proving::NOT_RED_ID && finding.status == "fixed"
+            })?;
+            let tip = worker
+                .checks
+                .iter()
+                .find(|check| check.name == proving::RED_CHECK && check.status == "passed")?
+                .tip
+                .clone();
+            Some((closed.clone(), tip))
+        })
+    })
+    .await;
+    assert_eq!(
+        closed.evidence.as_deref(),
+        Some(format!("proven red at tip {second_tip}").as_str()),
+        "the closed finding carries the proof"
+    );
+    assert_eq!(check_tip, second_tip, "the red check is stamped at the new tip");
+    team.shutdown().await;
+}
+
+/// A finding closed `fixed` never waives the gate: fixed must be shown by the
+/// red check at the tip being merged. Only a wontfix — a written reason —
+/// waives (finding proofPerTip).
+#[tokio::test]
+async fn fixed_finding_does_not_waive_the_gate() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveFixedGate1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let detail = format!("tip {tip}\nthe test does not reproduce the defect");
+    team.update_worker(&worker_id, |current| {
+        current.findings.push(Finding {
+            id: proving::NOT_RED_ID.to_string(),
+            severity: "high".to_string(),
+            title: "The regression test passes without the fix".to_string(),
+            detail: detail.clone(),
+            file: "fix.rs".to_string(),
+            line: 0,
+            status: "fixed".to_string(),
+            fix_commit: Some(tip.clone()),
+            evidence: Some(format!("proven red at tip {tip}")),
+            justification: None,
+            category: None,
+            enforce: None,
+        });
+    })
+    .await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let fixed = team.proof_ctx().merge_inputs(&worker, &tip).await;
+    assert!(fixed.regression_required, "{fixed:?}");
+    assert!(!fixed.regression_proven, "{fixed:?}");
+    assert!(!fixed.regression_waived, "a fixed finding never waives: {fixed:?}");
+    let review = in_review_worker(Some(evidence()));
+    let error = validate_merge(&review, "tip0001", &[], &full_lane(), &fixed)
+        .expect_err("a fixed finding must not pass the gate");
+    assert!(
+        error.contains("not been proven red"),
+        "the gate names the missing proof: {error}"
+    );
+    // The same finding resolved wontfix — a written reason — is the only
+    // waiver.
+    team.update_worker(&worker_id, |current| {
+        if let Some(finding) = current
+            .findings
+            .iter_mut()
+            .find(|finding| finding.id == proving::NOT_RED_ID)
+        {
+            finding.status = "wontfix".to_string();
+            finding.justification =
+                Some("the harness cannot run this test red".to_string());
+        }
+    })
+    .await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let wontfix = team.proof_ctx().merge_inputs(&worker, &tip).await;
+    assert!(wontfix.regression_waived, "{wontfix:?}");
+    validate_merge(&review, "tip0001", &[], &full_lane(), &wontfix)
+        .expect("a wontfix with a written reason waives the gate");
+    team.shutdown().await;
+}
+
+/// A hard kill mid-proof leaves a claim marker; at open the same restore the
+/// proof itself uses repairs the checkout back to the marker's tip. A marker
+/// whose checkout moved past its tip is never touched (finding
+/// restartWhileProving).
+#[tokio::test]
+async fn startup_repairs_an_interrupted_proof() {
+    let (root, _state, team, worker_id) = proof_fixture("proveRepair1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    // An interrupted proof: the reverse-applied source never made it back.
+    std::fs::write(
+        worker.worktree.join("fix.rs"),
+        "the reverse-applied remnant\n",
+    )
+    .expect("the dirty remnant");
+    std::fs::write(worker.worktree.join("stray.txt"), "stray\n").expect("stray file");
+    let marker = root
+        .path()
+        .join(".coding/mnemo2/proving")
+        .join(format!("{worker_id}.json"));
+    std::fs::create_dir_all(marker.parent().expect("marker dir")).expect("marker dir");
+    std::fs::write(
+        &marker,
+        serde_json::json!({"tip": tip, "checkout": worker.worktree.to_string_lossy()})
+            .to_string(),
+    )
+    .expect("the claim marker");
+    let workers = vec![team.worker(&worker_id).await.expect("worker")];
+    proving::repair_interrupted_proofs(root.path(), &workers).await;
+    let status = phase3::git_value(&worker.worktree, &["status", "--porcelain", "-uall"])
+        .await
+        .expect("read the checkout status");
+    assert_eq!(status, "", "the interrupted proof is repaired to its tip");
+    assert!(!marker.exists(), "the processed marker is deleted");
+    // A marker whose checkout moved past its tip is never touched: the HEAD
+    // is some other commit's work, not an interrupted proof of this tip.
+    run_git(&worker.worktree, &["checkout", "--", "fix.rs"]);
+    run_git(
+        &worker.worktree,
+        &["commit", "--allow-empty", "-m", "past the marker"],
+    );
+    let moved_tip = phase3::tip(&worker.worktree).await.expect("moved tip");
+    std::fs::write(
+        &marker,
+        serde_json::json!({"tip": tip, "checkout": worker.worktree.to_string_lossy()})
+            .to_string(),
+    )
+    .expect("the stale marker");
+    std::fs::write(worker.worktree.join("stray.txt"), "stray\n").expect("stray file");
+    proving::repair_interrupted_proofs(root.path(), &workers).await;
+    let status = phase3::git_value(&worker.worktree, &["status", "--porcelain", "-uall"])
+        .await
+        .expect("read the checkout status");
+    assert!(
+        status.contains("stray.txt"),
+        "a checkout past the marker's tip ({moved_tip}) is never touched"
+    );
+    team.shutdown().await;
+}
+
+/// The proof fixture over the scripted engine: the same bug-fixing plan, proof
+/// configuration and provisioned worker as [`proof_fixture`], but the LLM is
+/// scripted, so a worker's real turn can be driven into the pump's settling
+/// paths (findings parkedTrigger and steerTimeoutTrigger).
+///
+/// The team's own session spawn sets no run limits and keeps its steer flag
+/// inside the pump, so the tests wire the session and the real pump themselves
+/// through [`manual_pump_worker`].
+async fn scripted_proof_fixture(
+    id: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<TeamRuntime>,
+    String,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    std::fs::create_dir_all(root.path().join(".coding")).expect("coding dir");
+    std::fs::write(
+        root.path().join(".coding/checks.toml"),
+        "[regression]\ncommand = \"cargo test -- {name}\"\nran = \"{name} ... \"\n\n[mutation]\ncommand = \"cargo mutants --in-diff {diff} --output {out}\"\nmissed = \"{out}/missed.txt\"\n",
+    )
+    .expect("checks.toml");
+    std::fs::write(
+        config.path().join("config.toml"),
+        "[general]\ndefault_provider = \"test\"\ndefault_model = \"scripted-a\"\n",
+    )
+    .expect("config.toml");
+    std::fs::write(
+        config.path().join("endpoints.toml"),
+        "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"scripted-a\"]\n",
+    )
+    .expect("endpoints.toml");
+    TeamPersistence::new(state.path())
+        .save(&PersistedTeam {
+            workers: Vec::new(),
+            slots: Some(2),
+            usage: ProjectUsage::default(),
+        })
+        .expect("save the team ledger");
+    let engine = mnemo::headless::EngineBuilder::new(mnemo::headless::EngineOptions {
+        workspace: mnemo::workspace::Workspace::new(root.path()),
+        config_dir: Some(config.path().to_path_buf()),
+        permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+        memory: mnemo::headless::MemoryBackend::Disabled,
+        index_codegraph: false,
+        require_git: true,
+        auto_install_embedder: false,
+    })
+    .provider(Arc::new(ScriptedLlm::new(Vec::new())))
+    .start()
+    .await
+    .expect("start the scripted engine");
+    let team = Arc::new(
+        TeamRuntime::open(TeamRuntimeOptions {
+            engine: Arc::new(engine),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            config_dir: config.path().to_path_buf(),
+            classifier: None,
+            routing_log_path: Some(state.path().join("dispatch_routing.jsonl")),
+            slots: Some(2),
+            models: Vec::new(),
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("open the scripted team"),
+    );
+    let plans_dir = root.path().join(".coding/plans");
+    std::fs::create_dir_all(&plans_dir).expect("plans dir");
+    let board = PlanBoard::new(&plans_dir, root.path().join(".coding/reviews"));
+    let plan = board
+        .create(mnemo::app::plan_board::PlanDraft {
+            title: "Prove the fix".to_string(),
+            goal: "The regression test fails without the fix".to_string(),
+            context: "verified: the proof wiring lives in src-tauri/src/mnemo2/team/proving.rs; verify with cargo test.".to_string(),
+            kind: mnemo::memory::plan_format::PlanKind::BugFixing,
+            bug: Some("a filter accepts everything".to_string()),
+            steps: vec![
+                "**Wire** the proof in src-tauri/src/mnemo2/team/proving.rs".to_string(),
+            ],
+            ..Default::default()
+        })
+        .expect("create the plan");
+    board
+        .update(
+            &plan.id,
+            mnemo::app::plan_board::PlanEdit {
+                regression_test: Some("regression_proves_red".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("record the regression test");
+    team.attach_board(Arc::new(board));
+    let worker = provision_pool_worker(&team, id).await;
+    std::fs::write(
+        worker.worktree.join("fix.rs"),
+        "fn regression_proves_red() {}\n",
+    )
+    .expect("worker change");
+    run_git(&worker.worktree, &["add", "fix.rs"]);
+    run_git(&worker.worktree, &["commit", "-m", "add the regression test"]);
+    team.update_worker(&worker.id, |current| {
+        current.plan_id = Some(plan.id.clone());
+        current.plan_step = Some(1);
+        current.status = WorkerStatus::Completed;
+    })
+    .await;
+    (root, state, config, team, worker.id)
+}
+
+/// Spawn one worker session directly on the scripted engine — with `limits`,
+/// which the team's own spawn path never sets — wire the REAL pump over it,
+/// with the pump's own steer flag preset, then prompt it. The handles are the
+/// team's own, exactly as `start_worker` wires them. The session stays with
+/// the team's live map: `AgentSession` has no `Clone`.
+async fn manual_pump_worker(
+    team: &Arc<TeamRuntime>,
+    worker: &WorkerRecord,
+    limits: Option<mnemo::headless::SessionLimits>,
+    steer_pending: bool,
+) {
+    let generation = team.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    team.update_worker(&worker.id, |current| {
+        current.generation = generation;
+    })
+    .await;
+    let session = team
+        .engine
+        .clone()
+        .spawn(mnemo::headless::SpawnOptions {
+            name: Some(worker.name.clone()),
+            model: None,
+            reasoning_effort: None,
+            worktree: Some(worker.worktree.clone()),
+            check_commands: Vec::new(),
+            permissions: Some(mnemo::agent::policy::PermissionPolicy::OverridePermissions),
+            policy: None,
+            resume: None,
+            limits,
+            host_tools: Vec::new(),
+            external_policy: None,
+            guardrails: None,
+            trace_identity: Some(TeamRuntime::worker_trace_identity(worker)),
+            pinned_task: None,
+            skip_turn_routing: true,
+        })
+        .await
+        .expect("spawn the scripted session");
+    let session_id = session.id();
+    let busy = Arc::new(AtomicBool::new(false));
+    let receiver = session.events();
+    let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
+    let steer = Arc::new(AtomicBool::new(steer_pending));
+    let pump = tokio::spawn(pump_worker(
+        worker.id.clone(),
+        generation,
+        team.engine.clone(),
+        session_id,
+        receiver,
+        team.events.clone(),
+        busy.clone(),
+        team.messages.clone(),
+        team.records.clone(),
+        team.usage.clone(),
+        team.save_lock.clone(),
+        team.pricing.clone(),
+        team.merge_lock.clone(),
+        Arc::new(Vec::new()),
+        team.persistence.clone(),
+        team.routing_log_path.clone(),
+        team.routing.clone(),
+        team.signals.clone(),
+        strikes.clone(),
+        steer.clone(),
+        team.models.clone(),
+        team.tiers.clone(),
+        team.live.clone(),
+        team.fail_next_close.clone(),
+        team.board(),
+        team.proof_ctx(),
+    ));
+    session
+        .send(mnemo::headless::SessionCommand::Prompt {
+            text: "do the work".to_string(),
+            images: Vec::new(),
+        })
+        .await
+        .expect("prompt the session");
+    team.live.lock().await.insert(
+        worker.id.clone(),
+        LiveWorker {
+            session,
+            pump,
+            cleanup_retry_only: false,
+            busy,
+            strikes,
+            steer_pending: steer,
+        },
+    );
+}
+
+/// A turn that parks on a run limit did not finish its work: no proof runs,
+/// even though the plan, the diff and the missing red check would owe one
+/// (finding parkedTrigger).
+#[tokio::test]
+async fn parked_turn_end_triggers_no_proof() {
+    let (_root, _state, _config, team, worker_id) =
+        scripted_proof_fixture("proveParkedEnd1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    });
+    let prove_calls = proofs.prove_calls.clone();
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    manual_pump_worker(
+        &team,
+        &worker,
+        Some(mnemo::headless::SessionLimits {
+            max_turns: Some(0),
+            ..Default::default()
+        }),
+        false,
+    )
+    .await;
+    // The park settles with the limit error; the turn never reads Completed.
+    eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("limit before finishing"))
+                .then_some(())
+        })
+    })
+    .await;
+    // Past the steer follow-up grace, so a wrongly parked trigger had its
+    // chance.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        prove_calls.load(Ordering::SeqCst),
+        0,
+        "a parked turn never triggered its proof"
+    );
+    assert!(
+        !team.proof_ctx().proving.is_active(&worker_id),
+        "no claim was taken"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(
+        !worker.checks.iter().any(|check| check.name == proving::RED_CHECK),
+        "the parked turn recorded no red check"
+    );
+    team.shutdown().await;
+}
+
+/// A steered turn end the follow-up deadline settles as Completed owes its
+/// proof like any other turn end — the deadline branch continues and never
+/// reaches the natural trigger below it (finding steerTimeoutTrigger).
+#[tokio::test]
+async fn steer_timeout_completion_triggers_proof() {
+    let (_root, _state, _config, team, worker_id) =
+        scripted_proof_fixture("proveSteerGrace1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    });
+    let prove_calls = proofs.prove_calls.clone();
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    manual_pump_worker(&team, &worker, None, true).await;
+    // The held finish settles through the deadline, which fires the trigger.
+    eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .checks
+                .iter()
+                .find(|check| {
+                    check.name == proving::RED_CHECK
+                        && check.status == "passed"
+                        && check.tip == tip
+                })
+                .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(prove_calls.load(Ordering::SeqCst), 1, "the proof ran once");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Completed, "{worker:?}");
+    team.shutdown().await;
+}
+
+// --- The delta review fixes: staleWaiver, mutantIds, cleanupDuringProof,
+// engineTurnUnderClaim, reviewDropsProofFindings, spdxHeader ---
+
+/// A wontfix waives the gate only for the tip its finding names: the same
+/// wontfix at an earlier tip does not cover a later one (finding staleWaiver).
+#[tokio::test]
+async fn waiver_is_scoped_to_its_tip() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveWaiverTip1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let detail =
+        "tip 0000000000000000000000000000000000000000\nthe harness cannot run this red".to_string();
+    team.update_worker(&worker_id, |current| {
+        current.findings.push(Finding {
+            id: proving::INCONCLUSIVE_ID.to_string(),
+            severity: "low".to_string(),
+            title: "The regression test could not be proven red".to_string(),
+            detail: detail.clone(),
+            file: "fix.rs".to_string(),
+            line: 0,
+            status: "wontfix".to_string(),
+            fix_commit: None,
+            evidence: None,
+            justification: Some("the harness cannot run this red".to_string()),
+            category: None,
+            enforce: None,
+        });
+    })
+    .await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let stale = team.proof_ctx().merge_inputs(&worker, &tip).await;
+    assert!(!stale.regression_waived, "a wontfix for an earlier tip does not waive: {stale:?}");
+    // The same wontfix, written for the tip being merged, waives.
+    team.update_worker(&worker_id, |current| {
+        if let Some(finding) = current
+            .findings
+            .iter_mut()
+            .find(|finding| finding.id == proving::INCONCLUSIVE_ID)
+        {
+            finding.detail = format!("tip {tip}\nthe harness cannot run this red");
+        }
+    })
+    .await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let current = team.proof_ctx().merge_inputs(&worker, &tip).await;
+    assert!(current.regression_waived, "a wontfix for this tip waives: {current:?}");
+    team.shutdown().await;
+}
+
+/// A NotRed proof at a new tip re-opens the proof finding the lead closed at
+/// the earlier tip: the closure described that tip, and the re-opened
+/// finding's detail names the new one (finding staleWaiver).
+#[tokio::test]
+async fn not_red_at_new_tip_reopens_closed_finding() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveReopen1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let first_tip = phase3::tip(&worker.worktree).await.expect("first tip");
+    let proofs = ScriptedProofs::new(proof::RedOutcome::NotRed {
+        output: "test regression_proves_red ... ok".to_string(),
+    });
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    team.prove_regression_tool(&worker_id)
+        .await
+        .expect("start the first proof");
+    eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| finding.id == proving::NOT_RED_ID && finding.status == "open")
+                .map(|_| ())
+        })
+    })
+    .await;
+    // The lead resolves it wontfix — for the first tip.
+    team.update_worker(&worker_id, |current| {
+        if let Some(finding) = current
+            .findings
+            .iter_mut()
+            .find(|finding| finding.id == proving::NOT_RED_ID)
+        {
+            finding.status = "wontfix".to_string();
+            finding.justification = Some("the harness cannot run this red".to_string());
+        }
+    })
+    .await;
+    std::fs::write(
+        worker.worktree.join("fix.rs"),
+        "fn regression_proves_red() {}\nfn more() {}\n",
+    )
+    .expect("the second worker change");
+    run_git(&worker.worktree, &["add", "fix.rs"]);
+    run_git(&worker.worktree, &["commit", "-m", "the second change"]);
+    let second_tip = phase3::tip(&worker.worktree).await.expect("second tip");
+    assert_ne!(first_tip, second_tip);
+    team.set_proof_runner_for_test(Arc::new(ScriptedProofs::new(
+        proof::RedOutcome::NotRed {
+            output: "test regression_proves_red ... ok".to_string(),
+        },
+    )));
+    team.prove_regression_tool(&worker_id)
+        .await
+        .expect("start the re-proof");
+    let reopened = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            let matches: Vec<_> = worker
+                .findings
+                .iter()
+                .filter(|finding| finding.id == proving::NOT_RED_ID)
+                .collect();
+            (matches.len() == 1
+                && matches[0].status == "open"
+                && matches[0].detail.lines().next() == Some(format!("tip {second_tip}").as_str()))
+                .then_some(matches[0].clone())
+        })
+    })
+    .await;
+    assert!(
+        reopened.justification.is_none() && reopened.evidence.is_none() && reopened.fix_commit.is_none(),
+        "the re-open clears the earlier tip's resolution: {reopened:?}"
+    );
+    team.shutdown().await;
+}
+
+/// A mutant finding's id is its content, not its position: the same uncaught
+/// change keeps one finding across runs, and a different change never reuses
+/// it (finding mutantIds).
+#[test]
+fn mutant_ids_are_stable_by_content() {
+    let same = proving::mutant_id("src/fix.rs", "x == 1");
+    assert_eq!(same, proving::mutant_id("src/fix.rs", "x == 1"));
+    assert_ne!(same, proving::mutant_id("src/fix.rs", "x == 2"));
+    assert_ne!(same, proving::mutant_id("src/other.rs", "x == 1"));
+    let suffix = same.strip_prefix("mutant-").expect("the id carries its prefix");
+    assert_eq!(suffix.len(), 8, "{same}");
+    assert!(
+        suffix.chars().all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase()),
+        "{same}"
+    );
+}
+
+/// A later mutation run opens the newly uncaught mutants and closes the ones
+/// it no longer reports; a mutant it reports again keeps its finding (finding
+/// mutantIds).
+#[tokio::test]
+async fn later_run_reports_new_mutant_and_closes_gone_one() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantIds1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let mutant = |line: u32, text: &str| proof::Mutant {
+        file: "src/fix.rs".to_string(),
+        line,
+        text: text.to_string(),
+    };
+    team.set_proof_runner_for_test(Arc::new(ScriptedProofs::with_mutants(vec![
+        mutant(1, "x == 1"),
+        mutant(2, "y == 2"),
+    ])));
+    team.mutation_check_tool(&worker_id)
+        .await
+        .expect("start the first mutation run");
+    eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            let open: Vec<_> = worker
+                .findings
+                .iter()
+                .filter(|finding| finding.id.starts_with("mutant-") && finding.status == "open")
+                .collect();
+            (open.len() == 2).then_some(())
+        })
+    })
+    .await;
+    // The first run's job still holds its claim while it records: wait for
+    // the release, so the second run's claim is not refused.
+    eventually(|| async {
+        (!team.proof_ctx().proving.is_active(&worker_id)).then_some(())
+    })
+    .await;
+    team.set_proof_runner_for_test(Arc::new(ScriptedProofs::with_mutants(vec![
+        mutant(2, "y == 2"),
+        mutant(3, "z == 3"),
+    ])));
+    team.mutation_check_tool(&worker_id)
+        .await
+        .expect("start the second mutation run");
+    let worker = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            let gone = worker.findings.iter().find(|finding| {
+                finding.title == "No test catches: x == 1" && finding.status == "fixed"
+            })?;
+            let kept = worker.findings.iter().find(|finding| {
+                finding.title == "No test catches: y == 2" && finding.status == "open"
+            })?;
+            let fresh = worker.findings.iter().find(|finding| {
+                finding.title == "No test catches: z == 3" && finding.status == "open"
+            })?;
+            Some((gone.clone(), kept.clone(), fresh.clone()))
+        })
+    })
+    .await;
+    assert_eq!(
+        worker.0.evidence.as_deref(),
+        Some(format!("not reported at tip {tip}").as_str()),
+        "the closed mutant names the tip it stopped being reported at"
+    );
+    assert!(
+        worker.2.detail.lines().next() == Some(format!("tip {tip}").as_str()),
+        "the new mutant's finding names its tip: {}",
+        worker.2.detail
+    );
+    team.shutdown().await;
+}
+
+/// Cleanup skips a worker whose proof is running and says so with the proof's
+/// refusal text; the checkout survives (finding cleanupDuringProof).
+#[tokio::test]
+async fn cleanup_skips_a_proving_worker() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveCleanup1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    // cleanup_workspace loads the ledger from disk, so the fixture's
+    // Completed status must be persisted for the worker to reach the
+    // cleanup eligibility checks.
+    team.persist().await.expect("persist the ledger");
+    assert!(team.proof_ctx().proving.hold_for_test(&worker_id));
+    let report = team.cleanup().await.expect("cleanup runs");
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|entry| entry.contains(&proving::proving_error(&worker_id))),
+        "the skipped worker is reported with the proving text: {:?}",
+        report.skipped
+    );
+    assert!(
+        worker.worktree.join("fix.rs").exists(),
+        "the proved checkout is not removed"
+    );
+    team.shutdown().await;
+}
+
+/// The claim's second look: a job whose worker became busy under the claim
+/// ends with the skip notice and never runs its proof (finding
+/// engineTurnUnderClaim).
+#[tokio::test]
+async fn job_skips_when_worker_became_busy() {
+    let (_root, _state, _config, team, worker_id) =
+        scripted_proof_fixture("proveBusyMidJob1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    });
+    let prove_calls = proofs.prove_calls.clone();
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    // The scripted turn ends Completed, which triggers its owed proof: wait
+    // for that one to finish and release its claim before the test holds
+    // the claim and flips the busy flag.
+    manual_pump_worker(&team, &worker, None, false).await;
+    eventually(|| async {
+        (prove_calls.load(Ordering::SeqCst) == 1).then_some(())
+    })
+    .await;
+    eventually(|| async {
+        (!team.proof_ctx().proving.is_active(&worker_id)).then_some(())
+    })
+    .await;
+    assert!(team.proof_ctx().proving.hold_for_test(&worker_id));
+    team.live
+        .lock()
+        .await
+        .get(&worker_id)
+        .expect("the live session")
+        .busy
+        .store(true, Ordering::SeqCst);
+    let notice = team.proof_ctx().run_regression(&worker_id).await;
+    assert!(
+        notice.contains("skipped: the worker started a turn"),
+        "the skip notice names what happened: {notice}"
+    );
+    assert_eq!(
+        prove_calls.load(Ordering::SeqCst),
+        1,
+        "the busy job never ran its proof"
+    );
+    team.live
+        .lock()
+        .await
+        .get(&worker_id)
+        .expect("the live session")
+        .busy
+        .store(false, Ordering::SeqCst);
+    team.shutdown().await;
+}
+
+/// A review whose findings list does not mention an open proof finding keeps
+/// it: Mnemo2 generated it, and only the proof or an explicit resolution
+/// closes it (finding reviewDropsProofFindings).
+#[tokio::test]
+async fn review_keeps_unmentioned_proof_findings() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveReviewKeep1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    team.update_worker(&worker_id, |current| {
+        current.findings.push(Finding {
+            id: proving::NOT_RED_ID.to_string(),
+            severity: "high".to_string(),
+            title: "The regression test passes without the fix".to_string(),
+            detail: format!("tip {tip}\nthe test does not reproduce the defect"),
+            file: "fix.rs".to_string(),
+            line: 0,
+            status: "open".to_string(),
+            fix_commit: None,
+            evidence: None,
+            justification: None,
+            category: None,
+            enforce: None,
+        });
+    })
+    .await;
+    team.review(
+        &worker_id,
+        "the lead's fresh review".into(),
+        vec![open_finding("lead-finding")],
+        evidence(),
+    )
+    .await
+    .expect("the review records");
+    let reviewed = team.worker(&worker_id).await.expect("worker");
+    assert!(
+        reviewed
+            .findings
+            .iter()
+            .any(|finding| finding.id == "lead-finding"),
+        "the lead's finding is recorded: {:?}",
+        reviewed.findings
+    );
+    let kept = reviewed
+        .findings
+        .iter()
+        .find(|finding| finding.id == proving::NOT_RED_ID)
+        .expect("the unmentioned proof finding survives the review");
+    assert_eq!(kept.status, "open", "the proof finding stays open");
+    team.shutdown().await;
+}
+
+// --- The mutation-lifecycle delta fixes: mutantCloseOnEmpty, mutantCapClose,
+// mutantMoreStale, mutantWontfixReopen ---
+
+/// One scripted mutation round: run it and wait for its claim to drop, so the
+/// next round's claim is never refused.
+async fn run_mutation_round(
+    team: &Arc<TeamRuntime>,
+    worker_id: &str,
+    mutants: Vec<proof::Mutant>,
+) {
+    team.set_proof_runner_for_test(Arc::new(ScriptedProofs::with_mutants(mutants)));
+    team.mutation_check_tool(worker_id)
+        .await
+        .expect("start the mutation run");
+    // `spawn` claims before it returns, so the release is what to wait for.
+    eventually(|| async {
+        (!team.proof_ctx().proving.is_active(worker_id)).then_some(())
+    })
+    .await;
+}
+
+/// A mutant the scripted run reports.
+fn scripted_mutant(line: u32, text: &str) -> proof::Mutant {
+    proof::Mutant {
+        file: "src/fix.rs".to_string(),
+        line,
+        text: text.to_string(),
+    }
+}
+
+/// A run that catches everything closes the previous run's mutant findings —
+/// they are no longer reported — and records the clean check (findings
+/// mutantCloseOnEmpty and mutantMoreStale).
+#[tokio::test]
+async fn empty_mutation_run_closes_previous_mutants() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantEmpty1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    run_mutation_round(
+        &team,
+        &worker_id,
+        vec![scripted_mutant(1, "x == 1"), scripted_mutant(2, "y == 2")],
+    )
+    .await;
+    run_mutation_round(&team, &worker_id, Vec::new()).await;
+    let worker = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            let closed = worker.findings.iter().filter(|finding| {
+                finding.id.starts_with("mutant-") && finding.status == "fixed"
+            });
+            let clean = worker
+                .checks
+                .iter()
+                .any(|check| check.name == proving::MUTATION_CLEAN_CHECK && check.status == "passed");
+            (closed.count() == 2 && clean).then_some(worker)
+        })
+    })
+    .await;
+    for finding in worker
+        .findings
+        .iter()
+        .filter(|finding| finding.id.starts_with("mutant-"))
+    {
+        assert_eq!(
+            finding.evidence.as_deref(),
+            Some(format!("not reported at tip {tip}").as_str()),
+            "the closed mutant names the tip that caught it: {finding:?}"
+        );
+    }
+    assert!(
+        worker
+            .checks
+            .iter()
+            .any(|check| check.name == proving::MUTATION_CLEAN_CHECK && check.status == "passed"),
+        "the clean check is recorded"
+    );
+    team.shutdown().await;
+}
+
+/// A mutant still uncaught past the 20-finding cap is not closed: the reported
+/// set is every mutant of the run, not the capped list (finding mutantCapClose).
+#[tokio::test]
+async fn mutant_past_cap_is_not_closed() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantCap1").await;
+    // Run 1: three mutants, A first, so its finding exists and is open.
+    run_mutation_round(
+        &team,
+        &worker_id,
+        vec![
+            scripted_mutant(1, "a == 1"),
+            scripted_mutant(2, "b == 2"),
+            scripted_mutant(3, "c == 3"),
+        ],
+    )
+    .await;
+    let first = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| finding.title == "No test catches: a == 1")
+                .filter(|finding| finding.status == "open")
+                .cloned()
+        })
+    })
+    .await;
+    // Run 2: 21 mutants with A LAST, so A is past the cap and gets no finding
+    // of its own this run.
+    let mut mutants: Vec<proof::Mutant> = (10..30)
+        .map(|line| scripted_mutant(line, &format!("m{line} == {line}")))
+        .collect();
+    mutants.truncate(20);
+    mutants.push(scripted_mutant(1, "a == 1"));
+    assert_eq!(mutants.len(), 21);
+    run_mutation_round(&team, &worker_id, mutants).await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let after = worker
+        .findings
+        .iter()
+        .find(|finding| finding.id == first.id)
+        .expect("A's finding survives the second run");
+    assert_eq!(
+        after.status, "open",
+        "a mutant past the cap is still uncaught: {after:?}"
+    );
+    assert!(
+        worker
+            .findings
+            .iter()
+            .any(|finding| finding.id == "mutant-more" && finding.status == "open"),
+        "the overflowing run keeps its overflow finding: {:?}",
+        worker.findings
+    );
+    team.shutdown().await;
+}
+
+/// The overflow marker closes when a run no longer overflows (finding
+/// mutantMoreStale).
+#[tokio::test]
+async fn mutant_more_closes_when_overflow_ends() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantMore1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let overflow: Vec<proof::Mutant> = (100..125)
+        .map(|line| scripted_mutant(line, &format!("o{line} == {line}")))
+        .collect();
+    assert_eq!(overflow.len(), 25);
+    run_mutation_round(&team, &worker_id, overflow).await;
+    let marker = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| finding.id == "mutant-more")
+                .filter(|finding| finding.status == "open")
+                .cloned()
+        })
+    })
+    .await;
+    assert!(
+        marker.title.contains("5 more uncaught changes"),
+        "{marker:?}"
+    );
+    // 15 mutants: no overflow any more.
+    let fits: Vec<proof::Mutant> = (100..115)
+        .map(|line| scripted_mutant(line, &format!("o{line} == {line}")))
+        .collect();
+    run_mutation_round(&team, &worker_id, fits).await;
+    let closed = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| finding.id == "mutant-more")
+                .filter(|finding| finding.status == "fixed")
+                .cloned()
+        })
+    })
+    .await;
+    assert_eq!(
+        closed.evidence.as_deref(),
+        Some(format!("not reported at tip {tip}").as_str()),
+        "{closed:?}"
+    );
+    team.shutdown().await;
+}
+
+/// A mutant finding the lead resolved wontfix is never reopened by a later
+/// run: the justification is about that code change, which its id names
+/// (finding mutantWontfixReopen).
+#[tokio::test]
+async fn wontfix_mutant_survives_rerun() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantWontfix1").await;
+    run_mutation_round(&team, &worker_id, vec![scripted_mutant(1, "a == 1")]).await;
+    let open = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| {
+                    finding.title == "No test catches: a == 1" && finding.status == "open"
+                })
+                .cloned()
+        })
+    })
+    .await;
+    team.update_worker(&worker_id, |current| {
+        if let Some(finding) = current
+            .findings
+            .iter_mut()
+            .find(|finding| finding.id == open.id)
+        {
+            finding.status = "wontfix".to_string();
+            finding.justification = Some("the branch is unreachable under test".to_string());
+        }
+    })
+    .await;
+    // The same mutant reported again.
+    run_mutation_round(&team, &worker_id, vec![scripted_mutant(1, "a == 1")]).await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let after = worker
+        .findings
+        .iter()
+        .find(|finding| finding.id == open.id)
+        .expect("the finding survives");
+    assert_eq!(after.status, "wontfix", "{after:?}");
+    assert_eq!(
+        after.justification.as_deref(),
+        Some("the branch is unreachable under test"),
+        "the lead's justification is untouched"
     );
     team.shutdown().await;
 }

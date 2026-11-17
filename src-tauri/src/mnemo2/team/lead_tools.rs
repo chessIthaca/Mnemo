@@ -116,6 +116,20 @@ impl TeamRuntime {
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
+                name: "team_prove_regression".to_string(),
+                description: "Prove a bug-fixing worker's regression test fails without its fix, in the worker's own checkout while it is idle. The outcome arrives as the check 'regression test fails without the fix', as the finding 'regression-not-red' when the test still passes without the fix, or as 'regression-proof-inconclusive' when the run could not decide, plus a notice. Refused unless the worker is idle and its plan is bug_fixing with a regression test. Returns at once; the proof runs in the background and team_message, team_resume, team_route_fix, review_fix and team_merge are refused for that worker until it finishes.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_mutation_check".to_string(),
+                description: "Run the project's mutation command over one worker's change diff and report every changed line that no test catches as a low-severity 'No test catches: ...' finding. Refused with 'configure [mutation] in .coding/checks.toml' when the project configured no mutation command, and refused while the worker is busy. Returns at once; the run is expensive (minutes to hours) and finishes with a notice.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
                 name: "team_message".to_string(),
                 description: "Send a message to a worker; a busy worker receives it as a steer.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"text":{"type":"string"}},"required":["worker_id","text"]}),
@@ -392,6 +406,20 @@ impl TeamRuntime {
                 fold_request,
                 explicit_model,
             );
+        }
+        if name == "team_prove_regression" || name == "team_mutation_check" {
+            let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
+                return ToolResult::error(format!("{name} requires a 'worker_id' string"));
+            };
+            let result = if name == "team_prove_regression" {
+                self.prove_regression_tool(worker_id).await
+            } else {
+                self.mutation_check_tool(worker_id).await
+            };
+            return match result {
+                Ok(text) => ToolResult::success(text),
+                Err(error) => ToolResult::error(error),
+            };
         }
         if name == "team_status" {
             let plan_id = args

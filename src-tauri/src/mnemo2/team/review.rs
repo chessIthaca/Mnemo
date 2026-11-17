@@ -56,7 +56,7 @@ impl<'a> CheckRecorder<'a> {
         }
     }
 
-    async fn record_at_tip(&self, worker_id: &str, check: WorkerCheck) -> Result<(), String> {
+    pub(super) async fn record_at_tip(&self, worker_id: &str, check: WorkerCheck) -> Result<(), String> {
         let mut records = self.records.lock().await;
         let worker = records
             .iter_mut()
@@ -276,7 +276,26 @@ impl TeamRuntime {
                 evidence: Some(evidence),
                 lane: Some(lane.answer()),
             });
-            worker.findings = findings;
+            // Mnemo2's proof findings (regression-*, mutant-*) close only
+            // through the proof or an explicit resolution, never by omission
+            // in a later review list (finding reviewDropsProofFindings):
+            // re-attach the open ones the lead's list did not name.
+            let named: std::collections::HashSet<String> =
+                findings.iter().map(|finding| finding.id.clone()).collect();
+            let mut merged = findings;
+            merged.extend(
+                worker
+                    .findings
+                    .iter()
+                    .filter(|finding| {
+                        finding.status == "open"
+                            && (finding.id.starts_with("regression-")
+                                || finding.id.starts_with("mutant-"))
+                            && !named.contains(&finding.id)
+                    })
+                    .cloned(),
+            );
+            worker.findings = merged;
             worker.review_rounds += 1;
             // Remember the worker's turn count with this review, so the next
             // one can tell a worker round from a lead review_fix round.
@@ -445,6 +464,7 @@ impl TeamRuntime {
         new_string: &str,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         let worker = self.worker(worker_id).await?;
         if worker.status != WorkerStatus::InReview {
             return Err("review_fix requires a worker in review".to_string());
@@ -784,6 +804,7 @@ impl TeamRuntime {
         tier: Option<&str>,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         let worker = self.worker(worker_id).await?;
         // Audits only ever produce findings; they never receive them.
         debug_assert_ne!(

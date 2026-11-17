@@ -491,7 +491,9 @@ fn tail(text: &str, limit: usize) -> String {
 
 /// Restore a checkout to `tip` and verify it: a hard reset plus `clean -ffd`
 /// (never `-x`, so the ignored build cache the proof relied on survives).
-async fn restore_checkout(checkout: &Path, tip: &str) -> Result<(), String> {
+/// The repair hook in [`super::proving`] runs this too, for a proof a hard
+/// kill interrupted.
+pub(super) async fn restore_checkout(checkout: &Path, tip: &str) -> Result<(), String> {
     let reset = git(checkout, &["reset", "--hard", tip]).await?;
     if !reset.status.success() {
         return Err(git_error(&["reset", "--hard", tip], &reset));

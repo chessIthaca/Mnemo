@@ -98,6 +98,10 @@ const WINDOWS_CFG_FILES: &[(&str, &str)] = &[
         "case-insensitive path comparison, junction detection",
     ),
     (
+        "src-tauri/src/mnemo2/team/proof.rs",
+        "PowerShell vs sh proof shell, Job Object vs process-group kill",
+    ),
+    (
         "src-tauri/src/mnemo2/team/tests.rs",
         "junction creation, held-checkout fallback test",
     ),

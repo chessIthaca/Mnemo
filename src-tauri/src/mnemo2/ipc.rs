@@ -533,6 +533,9 @@ pub async fn project_cleanup(
         &root,
         &state_dir,
         &crate::mnemo2::dispatch_routing::dispatch_routing_log_path(),
+        // No runtime is open at the start screen, so no proof can be
+        // running: an empty proving list (finding cleanupDuringProof).
+        &[],
     )
     .await;
     project::detach(&root);

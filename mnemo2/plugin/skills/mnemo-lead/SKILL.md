@@ -96,6 +96,7 @@ A worker's turn ends with a "finished its turn" notice. Then:
    - the worker in review, with a review of the exact current tip and complete evidence;
    - no open finding;
    - at least one check, and every check passed on that tip;
+   - for a bug fix whose diff adds the plan's `regression_test`, the check `regression test fails without the fix` at that tip. Mnemo2 proves it after the worker's turn; `team_prove_regression` reruns it on demand (for example after recording `regression_test` late), no proof may be running for the worker, and the only waiver is a proof finding resolved `wontfix` with a written reason — a finding closed `fixed` never waives;
    - the worker idle with a clean worktree;
    - a clean, non-main lead checkout.
 

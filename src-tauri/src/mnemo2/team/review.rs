@@ -293,6 +293,12 @@ impl TeamRuntime {
         if let Err(err) = logged {
             eprintln!("findings ledger: could not append rows for worker {worker_id}: {err}");
         }
+        // A category that has now reached its third worker becomes one backlog
+        // item proposing a guard; a failure is logged, never the review's.
+        let proposed = findings_ledger::propose_recurring(&self.workspace_root, &updated.findings);
+        if let Err(err) = proposed {
+            eprintln!("findings ledger: could not propose a guard for worker {worker_id}: {err}");
+        }
         let updated = match downshift {
             Some((row, closed)) => self.settle_fix_downshift(worker_id, row, closed).await?,
             None => updated,

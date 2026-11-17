@@ -4652,8 +4652,106 @@ async fn team_review_answer_lists_finding_categories() {
     fixture.team.shutdown().await;
 }
 
-/// Every review of a worker is a review round, and a finding routed back
-/// to it is a fix round (plan 40eef714 step 4).
+/// A review answer says when a category has now come up in its third worker's
+/// review, and that review adds exactly one backlog proposal for a guard
+/// (plan 3c2ec71c step 2).
+#[tokio::test]
+async fn third_worker_with_category_proposes_a_guard() {
+    use crate::mnemo2::dispatch_routing::{save_routing_settings, RoutingMode, RoutingSettings};
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    save_routing_settings(
+        config.path(),
+        &RoutingSettings {
+            mode: RoutingMode::Off,
+            ..RoutingSettings::default()
+        },
+    )
+    .expect("routing settings");
+    let mut records = Vec::new();
+    // Distinct in their first 8 chars: that prefix names the branch/worktree.
+    for id in ["thrdwkr1", "thrdwkr2", "thrdwkr3", "thrdwkr4"] {
+        let record = worker(root.path(), id);
+        provision_agent_worktree(
+            root.path().to_path_buf(),
+            record.id.clone(),
+            "main".to_string(),
+        )
+        .await
+        .expect("worker checkout");
+        records.push(record);
+    }
+    let team = open_test_team_with_config(
+        root.path(),
+        state.path(),
+        records.clone(),
+        config.path(),
+    )
+    .await;
+    let review = |record: &WorkerRecord| {
+        json!({
+            "worker_id": record.id,
+            "summary": "checked the diff",
+            "findings": [{
+                "title": "vacuous assert",
+                "detail": "asserts true",
+                "file": "src/lib.rs",
+                "severity": "low",
+                "category": "vacuous-test",
+                "enforce": "test"
+            }],
+            "evidence": serde_json::to_value(evidence()).expect("evidence"),
+        })
+    };
+    let backlog = root.path().join(".coding").join("backlog.jsonl");
+    let marker = "[finding-category:vacuous-test]";
+    for record in &records[..2] {
+        let answer = team.handle_lead_host_tool("team_review", review(record)).await;
+        assert!(answer.success, "{answer:?}");
+        assert!(
+            !answer.output.contains("Finding category 'vacuous-test'"),
+            "two workers are not a pattern yet: {}",
+            answer.output
+        );
+    }
+    assert!(!backlog.exists(), "two workers propose nothing");
+    let answer = team.handle_lead_host_tool("team_review", review(&records[2])).await;
+    assert!(answer.success, "{answer:?}");
+    assert!(
+        answer.output.contains(
+            "Finding category 'vacuous-test' has now come up in 3 reviews; \
+             a backlog item proposes enforcing it."
+        ),
+        "{}",
+        answer.output
+    );
+    let proposals: Vec<String> = std::fs::read_to_string(&backlog)
+        .expect("backlog file")
+        .lines()
+        .filter(|line| line.contains(marker))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(proposals.len(), 1, "{proposals:?}");
+    let answer = team.handle_lead_host_tool("team_review", review(&records[3])).await;
+    assert!(answer.success, "{answer:?}");
+    assert!(
+        answer.output.contains(
+            "Finding category 'vacuous-test' has now come up in 4 reviews; \
+             a backlog item proposes enforcing it."
+        ),
+        "{}",
+        answer.output
+    );
+    let after = std::fs::read_to_string(&backlog).expect("backlog file");
+    assert_eq!(
+        after.lines().filter(|line| line.contains(marker)).count(),
+        1,
+        "a fourth worker adds no second proposal"
+    );
+    team.shutdown().await;
+}
 #[tokio::test]
 async fn review_and_fix_rounds_are_counted() {
     let root = tempfile::tempdir().expect("workspace");

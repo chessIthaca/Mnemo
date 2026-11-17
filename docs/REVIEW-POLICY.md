@@ -68,6 +68,15 @@ itself with `review_fix` (one replacement in one non-test source file); larger
 fixes go back to the worker with `team_route_fix`, which hands it every open
 finding at once.
 
+Each finding can name its kind (`category`, a short kebab-case slug reused
+across reviews) and where the mistake could be stopped for good (`enforce`:
+`code`, `build`, `test`, or `review` when only a person can judge it). Mnemo2
+keeps a findings ledger at `.coding/reviews/findings.jsonl` and, when one
+category has come up in three workers' reviews with a `code`, `build` or `test`
+enforcement, proposes a guard as a single backlog item whose text ends with
+`[finding-category:<category>]`. The lesson then belongs in the code or the
+build, not in another review; nothing is corrected a fourth time by hand.
+
 ## Risk and independent audit
 
 The lead marks shared contracts, persistence, concurrency, security, and large

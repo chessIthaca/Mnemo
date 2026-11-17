@@ -215,6 +215,10 @@ pub struct Step {
 }impl PlanFile {
     /// Parse a plan from markdown text.
     pub fn parse(text: &str) -> Result<Self> {
+        // A leading UTF-8 byte-order mark (Windows tools write one) would
+        // hide the `# Plan:` heading and the `## ` section headers; drop only
+        // that first character, never one mid-text.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut title = String::new();
         let mut goal = String::new();
         let mut context = String::new();
@@ -628,5 +632,19 @@ mod tests {
         // An older plan file has neither section.
         let old = PlanFile::parse("# Plan: T\n\n## Goal\nG\n\n## Steps\n- [ ] 1. one\n").unwrap();
         assert!(old.decisions.is_none() && old.progress.is_none() && old.interfaces.is_none());
+    }
+
+    #[test]
+    fn plan_parse_accepts_a_leading_byte_order_mark() {
+        // A mark in front of the `# Plan:` heading must not cost the title —
+        // the same plan parses identically with and without it.
+        let text = "# Plan: T\n\n## Goal\nG\n\n## Steps\n- [ ] 1. one\n- [ ] 2. two\n";
+        let plain = PlanFile::parse(text).unwrap();
+        let marked_text = format!("\u{feff}{text}");
+        let marked = PlanFile::parse(&marked_text).expect("a leading BOM must not break the parse");
+        assert_eq!(plain.title, "T");
+        assert_eq!(marked.title, plain.title);
+        assert_eq!(marked.steps.len(), plain.steps.len());
+        assert_eq!(marked.steps.len(), 2);
     }
 }

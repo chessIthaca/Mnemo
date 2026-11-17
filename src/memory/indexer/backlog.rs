@@ -73,9 +73,13 @@ pub(super) fn scan_backlog(
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
-    let items = match parse_backlog_lines(&text) {
+    // A leading UTF-8 byte-order mark (Windows tools write one) would make the
+    // first jsonl line — and the legacy envelope — unparseable. Drop only that
+    // first character so both parse paths below read the same text.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let items = match parse_backlog_lines(text) {
         Some(items) => items,
-        None => match serde_json::from_str::<BacklogFile>(&text) {
+        None => match serde_json::from_str::<BacklogFile>(text) {
             Ok(file) => file.items,
             Err(e) => {
                 errors.push(format!("backlog {}: unparseable: {e}", path.display()));
@@ -126,4 +130,25 @@ fn parse_backlog_lines(text: &str) -> Option<Vec<BacklogEntry>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_backlog_accepts_a_leading_byte_order_mark() {
+        // A mark at the very start of the jsonl file must not hide line 1.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backlog.jsonl");
+        let line = r#"{"id":"953c3481","text":"Fix the BOM indexing bug","status":"pending"}"#;
+        std::fs::write(&path, format!("\u{feff}{line}\n")).unwrap();
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        scan_backlog(&path, &mut out, &mut errors, &MemorySearchConfig::default());
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "backlog:953c3481");
+        assert!(out[0].content.contains("Fix the BOM indexing bug"));
+    }
 }

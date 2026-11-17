@@ -449,6 +449,8 @@ mod tests {
             fix_commit: None,
             evidence: (status == "fixed").then(|| "test passes".to_string()),
             justification: (status == "wontfix").then(|| "out of scope".to_string()),
+            category: None,
+            enforce: None,
         }
     }
 

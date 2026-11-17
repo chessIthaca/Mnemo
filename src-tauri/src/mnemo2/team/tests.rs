@@ -3977,6 +3977,8 @@ fn reviewed_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
             fix_commit: None,
             evidence: None,
             justification: None,
+            category: None,
+            enforce: None,
         },
         Finding {
             id: "finding2".to_string(),
@@ -3989,6 +3991,8 @@ fn reviewed_worker(root: &std::path::Path, id: &str) -> WorkerRecord {
             fix_commit: Some("1234567890abcdef".to_string()),
             evidence: None,
             justification: None,
+            category: None,
+            enforce: None,
         },
     ];
     worker.checks = vec![WorkerCheck {
@@ -4467,6 +4471,8 @@ fn open_finding(id: &str) -> Finding {
         fix_commit: None,
         evidence: None,
         justification: None,
+        category: None,
+        enforce: None,
     }
 }
 
@@ -4567,6 +4573,83 @@ fn lead_model(model: &str) -> LeadModel {
         reasoning_efforts: Vec::new(),
         default_effort: None,
     }
+}
+
+/// Every newly recorded finding lands in the workspace findings ledger, and
+/// re-recording the same review appends nothing (plan 3c2ec71c step 1).
+#[tokio::test]
+async fn review_appends_findings_ledger_rows() {
+    use crate::mnemo2::dispatch_routing::RoutingMode;
+    let fixture = review_fixture(RoutingMode::Off, "ledger000001").await;
+    let mut finding = open_finding("finding1");
+    finding.category = Some("vacuous-test".to_string());
+    finding.enforce = Some("test".to_string());
+    fixture
+        .team
+        .review(
+            &fixture.record.id,
+            "first pass".into(),
+            vec![finding.clone()],
+            evidence(),
+        )
+        .await
+        .expect("record the review");
+    let path = fixture._root.path().join(".coding/reviews/findings.jsonl");
+    let rows = std::fs::read_to_string(&path).expect("findings ledger");
+    let rows: Vec<serde_json::Value> = rows
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("ledger row"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["worker_id"], fixture.record.id.as_str());
+    assert_eq!(rows[0]["finding_id"], "finding1");
+    assert_eq!(rows[0]["category"], "vacuous-test");
+    assert_eq!(rows[0]["enforce"], "test");
+    assert_eq!(rows[0]["tier"], "high");
+    fixture
+        .team
+        .review(
+            &fixture.record.id,
+            "second pass".into(),
+            vec![finding],
+            evidence(),
+        )
+        .await
+        .expect("re-record the same finding");
+    let rows = std::fs::read_to_string(&path).expect("findings ledger");
+    assert_eq!(rows.lines().count(), 1, "the same review appends nothing");
+    fixture.team.shutdown().await;
+}
+
+/// A review's answer tells the lead which finding categories are in use, so
+/// it can reuse one instead of inventing a slug (plan 3c2ec71c step 1).
+#[tokio::test]
+async fn team_review_answer_lists_finding_categories() {
+    use crate::mnemo2::dispatch_routing::RoutingMode;
+    let fixture = review_fixture(RoutingMode::Off, "category000001").await;
+    let args = json!({
+        "worker_id": fixture.record.id,
+        "summary": "checked the diff",
+        "findings": [{
+            "title": "vacuous assert",
+            "detail": "asserts true",
+            "file": "src/lib.rs",
+            "severity": "low",
+            "category": "vacuous-test",
+            "enforce": "test"
+        }],
+        "evidence": serde_json::to_value(evidence()).expect("evidence"),
+    });
+    let answer = fixture.team.handle_lead_host_tool("team_review", args).await;
+    assert!(answer.success, "{answer:?}");
+    assert!(
+        answer
+            .output
+            .contains("Finding categories in use: vacuous-test (1)"),
+        "{}",
+        answer.output
+    );
+    fixture.team.shutdown().await;
 }
 
 /// Every review of a worker is a review round, and a finding routed back
@@ -8793,6 +8876,40 @@ async fn tier_is_optional_only_in_auto_mode() {
     }
 }
 
+/// The lead's `team_review` schema offers a finding category and its
+/// enforcement home, both optional (plan 3c2ec71c step 1).
+#[tokio::test]
+async fn team_review_schema_offers_finding_category_and_enforce() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let review = team
+        .lead_host_tools()
+        .into_iter()
+        .find(|tool| tool.name == "team_review")
+        .expect("team_review");
+    let finding = &review.parameters["properties"]["findings"]["items"];
+    let properties = &finding["properties"];
+    let category = &properties["category"];
+    assert_eq!(category["type"], json!("string"), "{category}");
+    assert!(
+        category["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("kebab-case")),
+        "{category}"
+    );
+    let enforce = &properties["enforce"];
+    assert_eq!(
+        enforce["enum"],
+        json!(["code", "build", "test", "review"]),
+        "{enforce}"
+    );
+    let required = finding["required"].as_array().expect("required fields");
+    assert!(!required.contains(&json!("category")), "category stays optional");
+    assert!(!required.contains(&json!("enforce")), "enforce stays optional");
+    team.shutdown().await;
+}
 
 /// `team_dispatch` offers `review_risk`: a lead that follows the schema can
 /// only request the high-risk audit gate if the parameter is declared.

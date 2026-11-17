@@ -6,6 +6,8 @@
 //! is offered, the executor for lead tool calls, and the answer builders
 //! (`team_status`, worker answers) they return.
 
+use std::path::Path;
+
 use mnemo::headless::HostToolSpec;
 use mnemo::memory::transcript_index::{
     SyncReport, TranscriptHit, TranscriptIndex, TranscriptSource,
@@ -17,6 +19,7 @@ use serde_json::{json, Value};
 use crate::mnemo2::dispatch_routing::RoutingMode;
 use crate::mnemo2::phase3::{self, ReviewEvidence};
 
+use super::findings_ledger;
 use super::record::{ChangeSource, MessageSender, WorkerRecord};
 use super::routing::tier_ids;
 use super::dispatch::{dispatch_result, DispatchRequest, DispatchSource, PlanRef};
@@ -168,7 +171,9 @@ impl TeamRuntime {
                             "severity":{"type":"string","enum":crate::mnemo2::phase3::FINDING_SEVERITIES,"description":"Every open finding blocks the merge, whatever its severity."},
                             "status":{"type":"string","enum":crate::mnemo2::phase3::FINDING_STATUSES,"default":"open"},
                             "evidence":{"type":"string","description":"Required when status is fixed."},
-                            "justification":{"type":"string","description":"Required when status is wontfix."}
+                            "justification":{"type":"string","description":"Required when status is wontfix."},
+                            "category":{"type":"string","description":"Optional kebab-case name for the kind of mistake, reused across reviews so Mnemo2 can count it (for example vacuous-test, missing-error-path, docs-out-of-sync). Reuse a category from the list in earlier team_review results when one fits."},
+                            "enforce":{"type":"string","enum":["code","build","test","review"],"description":"Optional: where this kind of mistake could be stopped for good. code: a type or API that makes it impossible to write; build: a lint or policy test that fails the build; test: a test or check that catches it; review: only a person can judge it."}
                         },
                         "required":["title","detail","file","severity"]
                     }},
@@ -546,7 +551,13 @@ impl TeamRuntime {
             "team_revert_merge" => self.revert_merge_as(worker_id, true).await,
             _ => Err(format!("unknown team host tool '{name}'")),
         };
-        worker_result(result, name)
+        let mut answer = worker_result(result, name);
+        if name == "team_review" && answer.success {
+            if let Some(line) = finding_categories_line(&self.workspace_root) {
+                answer.output = format!("{}\n{line}", answer.output);
+            }
+        }
+        answer
     }
 
     /// `session_search`: search the past worker and lead transcripts, or read
@@ -860,4 +871,20 @@ fn worker_result(result: Result<WorkerRecord, String>, action: &str) -> ToolResu
         Ok(worker) => worker_answer(&worker, action),
         Err(err) => team_tool_error(err),
     }
+}
+
+/// The finding categories in use and their worker counts, for the lead
+/// reading a fresh review; `None` until some review names a category.
+fn finding_categories_line(root: &Path) -> Option<String> {
+    let counts = findings_ledger::category_counts(&findings_ledger::read_rows(root));
+    if counts.is_empty() {
+        return None;
+    }
+    let listed = counts
+        .iter()
+        .take(10)
+        .map(|(category, count)| format!("{category} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("Finding categories in use: {listed}"))
 }

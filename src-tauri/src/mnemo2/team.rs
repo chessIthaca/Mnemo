@@ -41,6 +41,7 @@ mod deletion;
 mod dispatch;
 mod escalation;
 mod external_lead;
+mod findings_ledger;
 mod guardrails;
 mod lead_tools;
 mod merge;

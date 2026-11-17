@@ -291,8 +291,12 @@ only the app.
    closes live worker sessions while retaining their work. Token and cost
    figures are telemetry; there is no agent token or cost budget.
 8. Open the side panel from the top bar on any main tab, then switch between
-   **Browser / Diff / Plan / Files / Git / Trace / Graph / Memory**; the panel is
-   resizable on desktop and full-screen on narrow layouts.
+   **Browser / Diff / Plan / Files / Git / Trace / Graph / Memory / Quality**; the
+   panel is resizable on desktop and full-screen on narrow layouts. The Quality
+   tab shows how merged work held up per tier and per model over a 7, 30 or 90
+   day window: merges, first-pass share, fix rounds, findings, reverts, later
+   bug-fix merges touching the same files, cost per merge and the most
+   recurring review finding categories.
 
 ## Review and merge policy
 

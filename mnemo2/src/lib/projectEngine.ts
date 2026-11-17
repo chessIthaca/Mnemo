@@ -25,7 +25,8 @@ export interface ProjectPreferences {
     | "git"
     | "trace"
     | "graph"
-    | "memory";
+    | "memory"
+    | "quality";
   workbench_width: number;
   browser_url: string;
   diff_worker_id: string | null;

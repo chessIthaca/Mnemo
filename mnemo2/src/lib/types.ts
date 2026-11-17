@@ -6,7 +6,16 @@ import type { TraceEntry } from "./trace";
 
 export type Route = "start" | "lead" | "team" | "cost" | "plans";
 
-export type WorkbenchTab = "browser" | "diff" | "plan" | "files" | "git" | "trace" | "graph" | "memory";
+export type WorkbenchTab =
+  | "browser"
+  | "diff"
+  | "plan"
+  | "files"
+  | "git"
+  | "trace"
+  | "graph"
+  | "memory"
+  | "quality";
 
 /** One "open this file" request handed from another view to the Files tab. */
 export interface WorkbenchFileRequest {

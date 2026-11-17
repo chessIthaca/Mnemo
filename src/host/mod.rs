@@ -17,6 +17,7 @@ pub mod embed_download;
 pub mod index_progress;
 pub mod laya;
 pub mod maintenance;
+pub mod memory_watcher;
 pub mod notifier;
 pub mod rewire;
 pub mod runtime;

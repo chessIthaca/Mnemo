@@ -112,6 +112,12 @@ pub struct Brain {
     /// is never read by name (it exists purely for its Drop semantics), so it
     /// is underscore-prefixed rather than `#[allow(dead_code)]`ed.
     pub _graph_watcher: Option<crate::codegraph::watcher::GraphWatcher>,
+    /// The derived-memory-index OS file watcher — held only to keep the watch
+    /// alive for the app's lifetime (dropping it stops watching). `None` when
+    /// no memory store is wired or the watcher failed to start. Like
+    /// [`Brain::_graph_watcher`] it is never read by name (it exists purely
+    /// for its Drop semantics), hence the underscore prefix.
+    pub _memory_watcher: Option<crate::host::memory_watcher::MemoryWatcher>,
 }
 
 /// The shared wiring tail (3a.4): everything from an EXPLICIT config dir +
@@ -1154,6 +1160,30 @@ pub(crate) fn wire_brain(
         }
     });
 
+    // Start the derived-memory-index OS file watcher so `memory_search` picks
+    // up a `.coding/` write from ANY source (a hand edit, a git merge, a plan
+    // tool in another process, an agent writing OpenSpec specs) within a
+    // couple of seconds — no restart, and no reconcile splash dialog: the live
+    // pass is silent by design (the startup events are unchanged). Best-effort:
+    // a start failure logs + disables live refresh, never fatal. The handle
+    // MUST live on Brain — dropping it stops the watch.
+    let memory_watcher = store_trait.clone().and_then(|store| {
+        match crate::host::memory_watcher::MemoryWatcher::spawn(
+            store,
+            workspace.state_dir.clone(),
+            std::time::Duration::from_millis(1500),
+        ) {
+            Ok(w) => {
+                eprintln!("memory: file watcher started (live index refresh)");
+                Some(w)
+            }
+            Err(e) => {
+                eprintln!("memory: file watcher failed to start: {e}; live refresh disabled");
+                None
+            }
+        }
+    });
+
     Ok(Brain {
         factory,
         memory_store: store_trait,
@@ -1174,6 +1204,7 @@ pub(crate) fn wire_brain(
         pending_model_download: pending_download,
         pending_model_load: pending_load,
         _graph_watcher: graph_watcher,
+        _memory_watcher: memory_watcher,
     })
 }
 

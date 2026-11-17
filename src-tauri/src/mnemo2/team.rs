@@ -751,8 +751,25 @@ impl TeamRuntime {
             .parent()
             .map(Path::to_path_buf)
             .ok_or_else(|| "the team ledger has no parent directory".to_string())?;
-        let report = cleanup_workspace(&self.workspace_root, &state_dir, &self.routing_log_path)
-            .await?;
+        // The workers whose proofs are running right now (finding
+        // cleanupDuringProof), read under this cleanup's merge lock: a
+        // claim holds the same lock, so no proof can start while the list
+        // is built or used.
+        let proving: Vec<String> = {
+            let records = self.records.lock().await;
+            records
+                .iter()
+                .filter(|worker| self.proving.is_active(&worker.id))
+                .map(|worker| worker.id.clone())
+                .collect()
+        };
+        let report = cleanup_workspace(
+            &self.workspace_root,
+            &state_dir,
+            &self.routing_log_path,
+            &proving,
+        )
+        .await?;
         let restored = self.persistence.load()?.unwrap_or_default();
         *self.records.lock().await = restored.workers;
         Ok(report)

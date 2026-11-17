@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Carsten Hess
-// SPDX-License-Identifier: MIT.
+// SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
 //! The team's side of the two proofs: when they run, what they block, and what
@@ -314,19 +314,7 @@ impl ProofCtx {
             let Some(worker) = records.iter().find(|worker| worker.id == worker_id) else {
                 return Err(format!("unknown worker '{worker_id}'"));
             };
-            (
-                worker.worktree.clone(),
-                matches!(
-                    worker.status,
-                    WorkerStatus::Completed
-                        | WorkerStatus::InReview
-                        | WorkerStatus::Idle
-                        | WorkerStatus::Interrupted
-                        | WorkerStatus::Stopped
-                        | WorkerStatus::Failed
-                        | WorkerStatus::Conflict
-                ),
-            )
+            (worker.worktree.clone(), claimable_status(&worker.status))
         };
         if !claimable {
             return Err(format!(
@@ -458,6 +446,20 @@ impl ProofCtx {
                         existing.file = finding.file;
                         existing.line = finding.line;
                         changed.push(existing.clone());
+                    } else if existing.status != "open" && reopen_closed(existing, &finding) {
+                        // A proof at a new tip re-opens what an earlier tip
+                        // closed (finding staleWaiver): the closure described
+                        // that tip; the new detail names this one.
+                        existing.status = "open".to_string();
+                        existing.detail = finding.detail;
+                        existing.title = finding.title;
+                        existing.severity = finding.severity;
+                        existing.file = finding.file;
+                        existing.line = finding.line;
+                        existing.fix_commit = None;
+                        existing.evidence = None;
+                        existing.justification = None;
+                        changed.push(existing.clone());
                     }
                     continue;
                 }
@@ -508,6 +510,46 @@ impl ProofCtx {
         Ok(())
     }
 
+    /// Close the mutant findings this run did not report again (finding
+    /// mutantIds): a mutant that is caught now — or that left the diff — is
+    /// fixed, with the tip that stopped reporting it. `mutant-more` is the
+    /// overflow marker, not a mutant: it is replaced each run and never
+    /// closed here.
+    async fn close_absent_mutants(
+        &self,
+        worker_id: &str,
+        reported: &[String],
+        tip: &str,
+    ) -> Result<(), String> {
+        let evidence = format!("not reported at tip {tip}");
+        let mut closed = false;
+        {
+            let mut records = self.records.lock().await;
+            let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
+                return Ok(());
+            };
+            if matches!(worker.status, WorkerStatus::Merging | WorkerStatus::Merged) {
+                return Ok(());
+            }
+            for finding in worker.findings.iter_mut() {
+                if finding.status == "open"
+                    && finding.id.starts_with("mutant-")
+                    && finding.id != "mutant-more"
+                    && !reported.iter().any(|id| id == &finding.id)
+                {
+                    finding.status = "fixed".to_string();
+                    finding.fix_commit = Some(tip.to_string());
+                    finding.evidence = Some(evidence.clone());
+                    closed = true;
+                }
+            }
+        }
+        if closed {
+            save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await?;
+        }
+        Ok(())
+    }
+
     /// Set the worker's error and tell the lead: a restore that failed leaves
     /// the checkout in an unknown state, which no check may report as proof.
     async fn fail(&self, worker_id: &str, error: &str) {
@@ -530,8 +572,27 @@ impl ProofCtx {
         }
     }
 
+    /// The claim's second look (finding engineTurnUnderClaim): the engine can
+    /// start a steer follow-up on its own while the claim is held, so each
+    /// job re-checks — under the merge lock, immediately before its long run
+    /// — that the worker is still idle and claimable. The engine's own
+    /// clean-tree precondition remains the second line of defence.
+    async fn still_claimable(&self, worker_id: &str) -> bool {
+        let _lock = self.merge_lock.lock().await;
+        {
+            let records = self.records.lock().await;
+            let Some(worker) = records.iter().find(|worker| worker.id == worker_id) else {
+                return false;
+            };
+            if !claimable_status(&worker.status) {
+                return false;
+            }
+        }
+        !self.worker_busy(worker_id).await
+    }
+
     /// Prove the plan's regression test red at the worker's current tip.
-    async fn run_regression(&self, worker_id: &str) -> String {
+    pub(super) async fn run_regression(&self, worker_id: &str) -> String {
         match self.prove_red(worker_id).await {
             Ok(notice) => notice,
             Err(error) => {
@@ -568,7 +629,16 @@ impl ProofCtx {
             cfg,
             test: test.clone(),
         };
-        let outcome = self.runner.prove(request).await?;
+        let outcome = if !self.still_claimable(worker_id).await {
+            // The claim never saw this turn: the job ends here, records
+            // nothing, and that turn's own end triggers the proofs again
+            // (finding engineTurnUnderClaim).
+            return Ok(format!(
+                "regression proof for {worker_id} skipped: the worker started a turn"
+            ));
+        } else {
+            self.runner.prove(request).await?
+        };
         if !checkout_at(&worker.worktree, &tip).await {
             return Ok(format!(
                 "regression proof for {worker_id} discarded: the tip moved while it ran"
@@ -674,7 +744,13 @@ impl ProofCtx {
             cfg,
             worker_id: worker_id.to_string(),
         };
-        let mutants = self.runner.mutate(request).await?;
+        let mutants = if !self.still_claimable(worker_id).await {
+            return Ok(format!(
+                "mutation check for {worker_id} skipped: the worker started a turn"
+            ));
+        } else {
+            self.runner.mutate(request).await?
+        };
         if !checkout_at(&worker.worktree, &tip).await {
             return Ok(format!(
                 "mutation check for {worker_id} discarded: the tip moved while it ran"
@@ -688,8 +764,10 @@ impl ProofCtx {
             ));
         }
         let fallback = self.fallback_file(&worker).await;
-        let findings = mutant_findings(&mutants, &fallback);
+        let findings = mutant_findings(&mutants, &tip, &fallback);
+        let reported: Vec<String> = findings.iter().map(|finding| finding.id.clone()).collect();
         self.open_findings(worker_id, findings).await?;
+        self.close_absent_mutants(worker_id, &reported, &tip).await?;
         Ok(format!(
             "mutation check for {worker_id}: {} uncaught changes, findings opened",
             mutants.len()
@@ -762,12 +840,13 @@ impl ProofCtx {
             .checks
             .iter()
             .any(|check| check.name == RED_CHECK && check.status == "passed" && check.tip == tip);
-        // Only a wontfix — a written reason — waives the gate (finding
-        // proofPerTip): a finding closed `fixed` must be backed by the red
-        // check at the tip being merged.
+        // Only a wontfix whose tip line names the tip being merged waives
+        // the gate (finding staleWaiver): a wontfix written for an earlier
+        // tip does not cover a later one.
         proof.regression_waived = worker.findings.iter().any(|finding| {
             matches!(finding.id.as_str(), NOT_RED_ID | INCONCLUSIVE_ID)
                 && finding.status == "wontfix"
+                && proof_finding_tip(finding) == Some(tip)
         });
         proof
     }
@@ -952,20 +1031,68 @@ fn proof_finding_tip(finding: &Finding) -> Option<&str> {
     finding.detail.lines().next()?.strip_prefix("tip ")
 }
 
-/// The findings a mutation run opens: one per missed mutant, capped, with one
-/// extra finding listing the rest.
-fn mutant_findings(mutants: &[Mutant], fallback: &str) -> Vec<Finding> {
+/// Whether a status the claim accepts: settled, never mid-turn (finding
+/// claimRace).
+fn claimable_status(status: &WorkerStatus) -> bool {
+    matches!(
+        status,
+        WorkerStatus::Completed
+            | WorkerStatus::InReview
+            | WorkerStatus::Idle
+            | WorkerStatus::Interrupted
+            | WorkerStatus::Stopped
+            | WorkerStatus::Failed
+            | WorkerStatus::Conflict
+    )
+}
+
+/// Whether a closed finding re-opens for this run's result (finding
+/// staleWaiver): a proof finding only when the tip its detail names differs
+/// from the tip the new result names — a wontfix written for one tip must
+/// survive a tool re-run at that same tip — and a mutant finding whenever it
+/// is reported again, because a mutant's lifecycle is per-run (finding
+/// mutantIds).
+fn reopen_closed(existing: &Finding, finding: &Finding) -> bool {
+    if matches!(finding.id.as_str(), NOT_RED_ID | INCONCLUSIVE_ID) {
+        return proof_finding_tip(existing)
+            .is_some_and(|closed_tip| Some(closed_tip) != proof_finding_tip(finding));
+    }
+    true
+}
+
+/// A mutant finding's stable id: the first 8 hex digits of an FNV-1a 64-bit
+/// hash of `file` + newline + `text` (finding mutantIds) — the same content
+/// is the same uncaught change across runs, and a run that reports it again
+/// finds its finding instead of opening a twin. `DefaultHasher` is not
+/// stable across releases, so the hash is inline.
+pub(super) fn mutant_id(file: &str, text: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in format!("{file}\n{text}").as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    let hex = format!("{hash:016x}");
+    format!("mutant-{}", &hex[..8])
+}
+
+/// The findings a mutation run reports: one per missed mutant, identified by
+/// its content, capped, with one overflow finding listing the rest. The
+/// detail's first line is the tip (finding mutantIds), so a later run's
+/// update and close decisions can tell runs apart.
+fn mutant_findings(mutants: &[Mutant], tip: &str, fallback: &str) -> Vec<Finding> {
     let mut findings: Vec<Finding> = mutants
         .iter()
         .take(MUTANT_CAP)
-        .enumerate()
-        .map(|(index, mutant)| Finding {
-            id: format!("mutant-{}", index + 1),
+        .map(|mutant| Finding {
+            id: mutant_id(&mutant.file, &mutant.text),
             severity: "low".to_string(),
             title: format!("No test catches: {}", mutant.text),
-            detail: "Mnemo2 changed this code and every test still passed. Add a test that \
-                     fails for this change, or resolve wontfix with why it does not matter."
-                .to_string(),
+            detail: format!(
+                "tip {tip}\nMnemo2 changed this code and every test still passed. Add a test \
+                 that fails for this change, or resolve wontfix with why it does not matter."
+            ),
             file: if mutant.file.is_empty() {
                 fallback.to_string()
             } else {
@@ -993,7 +1120,9 @@ fn mutant_findings(mutants: &[Mutant], fallback: &str) -> Vec<Finding> {
                 "{} more uncaught changes",
                 mutants.len().saturating_sub(MUTANT_CAP)
             ),
-            detail: rest.join("\n"),
+            detail: format!("tip {tip}
+{}", rest.join("
+")),
             file: fallback.to_string(),
             line: 0,
             status: "open".to_string(),

@@ -47,6 +47,9 @@ mod lead_tools;
 mod merge;
 mod nudge;
 mod persistence;
+// Public: the proof engine's contract is part of the crate's API, so a step
+// that adds it before the team calls it does not trip the dead-code lint.
+pub mod proof;
 mod pump;
 mod record;
 mod review;

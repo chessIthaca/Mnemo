@@ -504,7 +504,7 @@ impl LayaManager {
         #[cfg(windows)]
         let job = {
             use std::os::windows::io::AsRawHandle as _;
-            let job = KillOnCloseJob::assign(child.as_raw_handle());
+            let job = KillOnCloseJob::assign_raw(child.as_raw_handle());
             if job.is_none() {
                 eprintln!(
                     "warning: could not assign laya-serve to a kill-on-close job; \

@@ -1037,7 +1037,7 @@ impl TreeKillGuard {
             // process is already gone and there is nothing to own. A failed
             // job setup leaves the guard inert, preserving the pre-fix
             // behaviour (only kill_on_drop of the shell).
-            let job = child.raw_handle().and_then(KillOnCloseJob::assign);
+            let job = child.raw_handle().and_then(KillOnCloseJob::assign_raw);
             Self { job }
         }
         #[cfg(unix)]

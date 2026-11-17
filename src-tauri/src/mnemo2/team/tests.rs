@@ -13252,3 +13252,237 @@ async fn review_keeps_unmentioned_proof_findings() {
     assert_eq!(kept.status, "open", "the proof finding stays open");
     team.shutdown().await;
 }
+
+// --- The mutation-lifecycle delta fixes: mutantCloseOnEmpty, mutantCapClose,
+// mutantMoreStale, mutantWontfixReopen ---
+
+/// One scripted mutation round: run it and wait for its claim to drop, so the
+/// next round's claim is never refused.
+async fn run_mutation_round(
+    team: &Arc<TeamRuntime>,
+    worker_id: &str,
+    mutants: Vec<proof::Mutant>,
+) {
+    team.set_proof_runner_for_test(Arc::new(ScriptedProofs::with_mutants(mutants)));
+    team.mutation_check_tool(worker_id)
+        .await
+        .expect("start the mutation run");
+    // `spawn` claims before it returns, so the release is what to wait for.
+    eventually(|| async {
+        (!team.proof_ctx().proving.is_active(worker_id)).then_some(())
+    })
+    .await;
+}
+
+/// A mutant the scripted run reports.
+fn scripted_mutant(line: u32, text: &str) -> proof::Mutant {
+    proof::Mutant {
+        file: "src/fix.rs".to_string(),
+        line,
+        text: text.to_string(),
+    }
+}
+
+/// A run that catches everything closes the previous run's mutant findings —
+/// they are no longer reported — and records the clean check (findings
+/// mutantCloseOnEmpty and mutantMoreStale).
+#[tokio::test]
+async fn empty_mutation_run_closes_previous_mutants() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantEmpty1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    run_mutation_round(
+        &team,
+        &worker_id,
+        vec![scripted_mutant(1, "x == 1"), scripted_mutant(2, "y == 2")],
+    )
+    .await;
+    run_mutation_round(&team, &worker_id, Vec::new()).await;
+    let worker = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            let closed = worker.findings.iter().filter(|finding| {
+                finding.id.starts_with("mutant-") && finding.status == "fixed"
+            });
+            let clean = worker
+                .checks
+                .iter()
+                .any(|check| check.name == proving::MUTATION_CLEAN_CHECK && check.status == "passed");
+            (closed.count() == 2 && clean).then_some(worker)
+        })
+    })
+    .await;
+    for finding in worker
+        .findings
+        .iter()
+        .filter(|finding| finding.id.starts_with("mutant-"))
+    {
+        assert_eq!(
+            finding.evidence.as_deref(),
+            Some(format!("not reported at tip {tip}").as_str()),
+            "the closed mutant names the tip that caught it: {finding:?}"
+        );
+    }
+    assert!(
+        worker
+            .checks
+            .iter()
+            .any(|check| check.name == proving::MUTATION_CLEAN_CHECK && check.status == "passed"),
+        "the clean check is recorded"
+    );
+    team.shutdown().await;
+}
+
+/// A mutant still uncaught past the 20-finding cap is not closed: the reported
+/// set is every mutant of the run, not the capped list (finding mutantCapClose).
+#[tokio::test]
+async fn mutant_past_cap_is_not_closed() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantCap1").await;
+    // Run 1: three mutants, A first, so its finding exists and is open.
+    run_mutation_round(
+        &team,
+        &worker_id,
+        vec![
+            scripted_mutant(1, "a == 1"),
+            scripted_mutant(2, "b == 2"),
+            scripted_mutant(3, "c == 3"),
+        ],
+    )
+    .await;
+    let first = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| finding.title == "No test catches: a == 1")
+                .filter(|finding| finding.status == "open")
+                .cloned()
+        })
+    })
+    .await;
+    // Run 2: 21 mutants with A LAST, so A is past the cap and gets no finding
+    // of its own this run.
+    let mut mutants: Vec<proof::Mutant> = (10..30)
+        .map(|line| scripted_mutant(line, &format!("m{line} == {line}")))
+        .collect();
+    mutants.truncate(20);
+    mutants.push(scripted_mutant(1, "a == 1"));
+    assert_eq!(mutants.len(), 21);
+    run_mutation_round(&team, &worker_id, mutants).await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let after = worker
+        .findings
+        .iter()
+        .find(|finding| finding.id == first.id)
+        .expect("A's finding survives the second run");
+    assert_eq!(
+        after.status, "open",
+        "a mutant past the cap is still uncaught: {after:?}"
+    );
+    assert!(
+        worker
+            .findings
+            .iter()
+            .any(|finding| finding.id == "mutant-more" && finding.status == "open"),
+        "the overflowing run keeps its overflow finding: {:?}",
+        worker.findings
+    );
+    team.shutdown().await;
+}
+
+/// The overflow marker closes when a run no longer overflows (finding
+/// mutantMoreStale).
+#[tokio::test]
+async fn mutant_more_closes_when_overflow_ends() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantMore1").await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let overflow: Vec<proof::Mutant> = (100..125)
+        .map(|line| scripted_mutant(line, &format!("o{line} == {line}")))
+        .collect();
+    assert_eq!(overflow.len(), 25);
+    run_mutation_round(&team, &worker_id, overflow).await;
+    let marker = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| finding.id == "mutant-more")
+                .filter(|finding| finding.status == "open")
+                .cloned()
+        })
+    })
+    .await;
+    assert!(
+        marker.title.contains("5 more uncaught changes"),
+        "{marker:?}"
+    );
+    // 15 mutants: no overflow any more.
+    let fits: Vec<proof::Mutant> = (100..115)
+        .map(|line| scripted_mutant(line, &format!("o{line} == {line}")))
+        .collect();
+    run_mutation_round(&team, &worker_id, fits).await;
+    let closed = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| finding.id == "mutant-more")
+                .filter(|finding| finding.status == "fixed")
+                .cloned()
+        })
+    })
+    .await;
+    assert_eq!(
+        closed.evidence.as_deref(),
+        Some(format!("not reported at tip {tip}").as_str()),
+        "{closed:?}"
+    );
+    team.shutdown().await;
+}
+
+/// A mutant finding the lead resolved wontfix is never reopened by a later
+/// run: the justification is about that code change, which its id names
+/// (finding mutantWontfixReopen).
+#[tokio::test]
+async fn wontfix_mutant_survives_rerun() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantWontfix1").await;
+    run_mutation_round(&team, &worker_id, vec![scripted_mutant(1, "a == 1")]).await;
+    let open = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .iter()
+                .find(|finding| {
+                    finding.title == "No test catches: a == 1" && finding.status == "open"
+                })
+                .cloned()
+        })
+    })
+    .await;
+    team.update_worker(&worker_id, |current| {
+        if let Some(finding) = current
+            .findings
+            .iter_mut()
+            .find(|finding| finding.id == open.id)
+        {
+            finding.status = "wontfix".to_string();
+            finding.justification = Some("the branch is unreachable under test".to_string());
+        }
+    })
+    .await;
+    // The same mutant reported again.
+    run_mutation_round(&team, &worker_id, vec![scripted_mutant(1, "a == 1")]).await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let after = worker
+        .findings
+        .iter()
+        .find(|finding| finding.id == open.id)
+        .expect("the finding survives");
+    assert_eq!(after.status, "wontfix", "{after:?}");
+    assert_eq!(
+        after.justification.as_deref(),
+        Some("the branch is unreachable under test"),
+        "the lead's justification is untouched"
+    );
+    team.shutdown().await;
+}

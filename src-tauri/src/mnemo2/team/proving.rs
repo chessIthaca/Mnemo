@@ -510,11 +510,13 @@ impl ProofCtx {
         Ok(())
     }
 
-    /// Close the mutant findings this run did not report again (finding
-    /// mutantIds): a mutant that is caught now — or that left the diff — is
-    /// fixed, with the tip that stopped reporting it. `mutant-more` is the
-    /// overflow marker, not a mutant: it is replaced each run and never
-    /// closed here.
+    /// Close the mutant findings this run did not report again (findings
+    /// mutantIds, mutantMoreStale): a mutant that is caught now — or that
+    /// left the diff — is fixed, with the tip that stopped reporting it. The
+    /// overflow marker `mutant-more` is swept the same way: a run that no
+    /// longer overflows reports it no longer, so it closes; a run that still
+    /// overflows lists it in `reported` and it is updated instead. A finding
+    /// the lead resolved as wontfix is not touched: only an open one closes.
     async fn close_absent_mutants(
         &self,
         worker_id: &str,
@@ -534,7 +536,6 @@ impl ProofCtx {
             for finding in worker.findings.iter_mut() {
                 if finding.status == "open"
                     && finding.id.starts_with("mutant-")
-                    && finding.id != "mutant-more"
                     && !reported.iter().any(|id| id == &finding.id)
                 {
                     finding.status = "fixed".to_string();
@@ -757,6 +758,10 @@ impl ProofCtx {
             ));
         }
         if mutants.is_empty() {
+            // Nothing is uncaught now: every open mutant finding — the
+            // overflow marker included — is fixed at this tip (findings
+            // mutantCloseOnEmpty and mutantMoreStale).
+            self.close_absent_mutants(worker_id, &[], &tip).await?;
             self.record_check(worker_id, MUTATION_CLEAN_CHECK, None, &tip)
                 .await?;
             return Ok(format!(
@@ -765,7 +770,18 @@ impl ProofCtx {
         }
         let fallback = self.fallback_file(&worker).await;
         let findings = mutant_findings(&mutants, &tip, &fallback);
-        let reported: Vec<String> = findings.iter().map(|finding| finding.id.clone()).collect();
+        // The reported set is every mutant of the run, not the capped
+        // findings list: a mutant past the cap is still uncaught, and
+        // closing it would claim a fix that did not happen (finding
+        // mutantCapClose). The overflow marker counts as reported while the
+        // run overflows, so it is updated rather than closed.
+        let mut reported: Vec<String> = mutants
+            .iter()
+            .map(|mutant| mutant_id(&mutant.file, &mutant.text))
+            .collect();
+        if mutants.len() > MUTANT_CAP {
+            reported.push("mutant-more".to_string());
+        }
         self.open_findings(worker_id, findings).await?;
         self.close_absent_mutants(worker_id, &reported, &tip).await?;
         Ok(format!(
@@ -1046,18 +1062,23 @@ fn claimable_status(status: &WorkerStatus) -> bool {
     )
 }
 
-/// Whether a closed finding re-opens for this run's result (finding
-/// staleWaiver): a proof finding only when the tip its detail names differs
-/// from the tip the new result names — a wontfix written for one tip must
-/// survive a tool re-run at that same tip — and a mutant finding whenever it
-/// is reported again, because a mutant's lifecycle is per-run (finding
-/// mutantIds).
+/// Whether a closed finding re-opens for this run's result.
+///
+/// A proof finding (finding staleWaiver) re-opens only when the tip its
+/// detail names differs from the tip the new result names — a wontfix written
+/// for one tip must survive a tool re-run at that same tip.
+///
+/// A mutant finding (finding mutantWontfixReopen) re-opens when it was closed
+/// `fixed` and is reported again: the fix did not hold. A mutant finding the
+/// lead resolved `wontfix` is never reopened — the justification is about that
+/// specific code change, which its content id names, so a later run reporting
+/// the same change again reports nothing new.
 fn reopen_closed(existing: &Finding, finding: &Finding) -> bool {
     if matches!(finding.id.as_str(), NOT_RED_ID | INCONCLUSIVE_ID) {
         return proof_finding_tip(existing)
             .is_some_and(|closed_tip| Some(closed_tip) != proof_finding_tip(finding));
     }
-    true
+    existing.status != "wontfix"
 }
 
 /// A mutant finding's stable id: the first 8 hex digits of an FNV-1a 64-bit

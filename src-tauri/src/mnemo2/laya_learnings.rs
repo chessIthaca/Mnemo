@@ -260,7 +260,11 @@ fn row_plan_id(line: &str) -> Option<String> {
 
 /// Whether a routing row belongs to the project whose plans live in
 /// `plans_dir`: its plan id is a plain file stem and the plan file exists.
-fn is_project_row(line: &str, plans_dir: &Path) -> bool {
+///
+/// Shared with the quality report, which reads the machine-wide routing log and
+/// must count only this project's rows, the same test the learnings export uses
+/// to decide which rows travel with the repository.
+pub(crate) fn is_project_row(line: &str, plans_dir: &Path) -> bool {
     let Some(plan_id) = row_plan_id(line) else {
         return false;
     };

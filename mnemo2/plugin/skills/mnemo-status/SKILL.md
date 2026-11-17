@@ -16,3 +16,4 @@ Read-only: change no Mnemo state. The only action allowed is starting the backgr
    - What to do next, in one line (for example "review worker X", "restart the waiter", "nothing pending").
 3. If workers are active and no background waiter is running in this session, say so and start one as the `mnemo-lead` skill describes.
 4. If the Mnemo tools are missing or Mnemo2 cannot be reached, say so in one sentence and ask the user how to proceed. Do not guess the state from Git or files.
+5. If the user asks whether a tier or model is actually doing well, call `team_quality` (optionally with `window_days`) and report its per-tier and per-model lines.

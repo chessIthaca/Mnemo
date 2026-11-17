@@ -191,7 +191,11 @@ only the app.
 - **Host tools.** The lead gets `team_dispatch`, `team_message`, `team_status`,
   `team_stop`, `team_resume`, `team_compact`, `team_review`, `team_check`,
   `team_resolve_finding`, `review_fix`, `team_route_fix`, `team_audit_dispatch`,
-  `team_merge`, and `team_revert_merge`. Dispatch accepts a caller-stable worker
+  `team_merge`, `team_revert_merge`, and `team_quality`. `team_quality` reports,
+  per final tier and per model, how often merged work was first-pass, how many
+  fix rounds and findings it took, how often it was reverted and how often a
+  bug-fix plan merged the same files soon after — the evidence for tier and
+  model choices. Dispatch accepts a caller-stable worker
   ID, an optional `review_risk` (`standard`/`high`), and returns a
   model-facing JSON receipt with its real ID/status. Its `model` parameter is
   an enum of the exact configured `endpoint/model` specs. Retrying that ID with the

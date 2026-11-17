@@ -248,6 +248,15 @@ impl TeamRuntime {
                 timeout_ms: Some(120_000),
             },
             HostToolSpec {
+                name: "team_quality".to_string(),
+                description: "Whether merged work holds up, per tier and per model: merges, first-pass share, average fix rounds and findings, high findings, reverts, merges a later bug-fix plan changed the same files for, and cost per merge. Read-only; use it when deciding a tier or model on evidence rather than on impressions.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "window_days":{"type":"integer","description":"Days back from now to count merges over (default 30)."}
+                }}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(30_000),
+            },
+            HostToolSpec {
                 name: "session_search".to_string(),
                 description: "Search what actually happened in past worker and lead conversations: the ground truth behind a memory record, a plan or a merge. Use memory_search first for decisions and root causes; use this to check a claim or see what was tried. With query it returns matching messages; with worker and seq and no query it returns that one message.".to_string(),
                 parameters: json!({"type":"object","properties":{
@@ -418,6 +427,29 @@ impl TeamRuntime {
             };
             return match result {
                 Ok(text) => ToolResult::success(text),
+                Err(error) => ToolResult::error(error),
+            };
+        }
+        if name == "team_quality" {
+            let window_days = args
+                .get("window_days")
+                .and_then(Value::as_u64)
+                .and_then(|days| u32::try_from(days).ok())
+                .unwrap_or(crate::mnemo2::quality::DEFAULT_WINDOW_DAYS);
+            return match crate::mnemo2::quality::report(
+                self.workspace_root.clone(),
+                window_days,
+            )
+            .await
+            {
+                Ok(report) => {
+                    let text = crate::mnemo2::quality::summary(&report);
+                    let data = serde_json::to_value(&report).unwrap_or(Value::Null);
+                    ToolResult::success(text.clone()).with_data(json!({
+                        "summary": text,
+                        "report": data,
+                    }))
+                }
                 Err(error) => ToolResult::error(error),
             };
         }

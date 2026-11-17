@@ -58,3 +58,41 @@ async fn memory_search_finds_a_requirement_by_its_scenario_text() {
         "scenario-only vocabulary must retrieve the requirement: {hits:?}"
     );
 }
+
+#[tokio::test]
+async fn index_derived_indexes_a_spec_saved_with_a_byte_order_mark() {
+    // PowerShell 5's `Set-Content -Encoding utf8` writes EF BB BF; the mark
+    // must not cost the spec its parse and its memory row.
+    const SPEC: &str = "# Dispatch routing\n\n## Purpose\nHow dispatch chooses a worker.\n\n## Requirements\n\n### Requirement: Model changes are training labels\nThe system SHALL append a reroute row for every model change.\n\n#### Scenario: Routing off\n- **WHEN** the quixotic routing switch is off\n- **THEN** one reroute row is appended\n";
+    let dir = tempdir().unwrap();
+    let spec_dir = dir.path().join(".coding/openspec/specs/dispatch-routing");
+    std::fs::create_dir_all(&spec_dir).unwrap();
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(SPEC.as_bytes());
+    std::fs::write(spec_dir.join("spec.md"), bytes).unwrap();
+
+    let store = make_store();
+    let report = index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.indexed, 1, "errors: {:?}", report.errors);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        b"openspec:dispatch-routing/Model changes are training labels",
+    )
+    .to_string();
+    let memory = store
+        .get_memory(&id)
+        .await
+        .unwrap()
+        .expect("a spec saved with a BOM is indexed");
+    assert_eq!(memory.record_type, MemoryRecordType::Spec);
+    assert!(memory.content.contains("Scenario: Routing off"));
+}

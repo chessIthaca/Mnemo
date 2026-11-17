@@ -291,6 +291,9 @@ pub fn parse_file(rel_path: &str, contents: &str) -> Option<KnowledgeRecord> {
     let record_type = record_type_for_dir(dir)?;
     let slug = file.strip_suffix(".md")?.to_string();
 
+    // A leading UTF-8 byte-order mark (Windows tools write one) would hide
+    // the `+++` front-matter fence; drop only that first character.
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
     let (front, body) = split_front_matter(contents);
     // Unparseable TOML degrades to defaults — one bad block must never fail
     // the whole record (mirrors the indexer's per-file error containment).
@@ -1201,6 +1204,24 @@ mod tests {
         // No front-matter created → the slug's date prefix is the fallback.
         assert_eq!(rec.created.as_deref(), Some("2026-08-23"));
         assert!(rec.body.contains("Working branches"));
+    }
+
+    #[test]
+    fn parse_file_accepts_a_leading_byte_order_mark() {
+        // A mark in front of the front-matter fence must not make it
+        // unrecognized: the record keeps its title and type either way.
+        let plain = parse_file("decision/2026-08-23-typed-records-as-files.md", FULL).unwrap();
+        let marked_text = format!("\u{feff}{FULL}");
+        let marked = parse_file(
+            "decision/2026-08-23-typed-records-as-files.md",
+            &marked_text,
+        )
+        .expect("a leading BOM must not break the front-matter parse");
+        assert_eq!(marked.title, plain.title);
+        assert_eq!(marked.title, "Typed records as files");
+        assert_eq!(marked.record_type, plain.record_type);
+        assert_eq!(marked.status, plain.status);
+        assert_eq!(marked.supersedes, plain.supersedes);
     }
 
     #[test]

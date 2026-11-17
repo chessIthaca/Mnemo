@@ -827,7 +827,12 @@ pub fn summarize_rows(rows: &[dispatch_routing::DispatchRoutingRow]) -> RoutingL
                 summary.nudges += 1;
                 nudged.insert(worker_id.as_str());
             }
-            Row::LeadOverride { .. } | Row::NudgeIgnored { .. } | Row::Outcome { .. } => {}
+            Row::LeadOverride { .. }
+            | Row::NudgeIgnored { .. }
+            | Row::Outcome { .. }
+            // A revert is a merge-quality fact, not a Laya decision: it never
+            // moves a routing number (plan dac2028d).
+            | Row::Reverted { .. } => {}
         }
     }
     summary.nudges_acted_on = nudged.intersection(&acted).count();
@@ -1441,6 +1446,7 @@ simple = ["ep1/exec-model"]
             audits: 0,
             cost_micros: 0,
             label: label.map(str::to_string),
+            merge_commit: None,
         }
     }
 

@@ -724,6 +724,26 @@ pub enum DispatchRoutingRow {
         /// The derived training label ([`outcome_label`]), absent for a
         /// worker that did not merge.
         label: Option<String>,
+        /// The merge commit on the lead branch, present only for a worker
+        /// whose status is `merged`; absent on rows written before the field
+        /// existed, so an old line still parses (plan dac2028d).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        merge_commit: Option<String>,
+    },
+    /// A merged worker's merge was later reverted on the lead branch: the
+    /// merge did not hold up (plan dac2028d). Pairs with the worker's
+    /// `outcome` row by `worker_id`; never a training label.
+    Reverted {
+        /// Unix milliseconds when the revert landed.
+        ts: u64,
+        /// The worker whose merge was reverted.
+        worker_id: String,
+        /// The plan the step belongs to.
+        plan_id: String,
+        /// The 1-based step number in the plan.
+        step: usize,
+        /// The commit that reverted the merge on the lead branch.
+        revert_commit: String,
     },
 }
 
@@ -737,7 +757,8 @@ impl DispatchRoutingRow {
             | Self::UserReroute { worker_id, .. }
             | Self::Nudge { worker_id, .. }
             | Self::NudgeIgnored { worker_id, .. }
-            | Self::Outcome { worker_id, .. } => *worker_id = id.to_string(),
+            | Self::Outcome { worker_id, .. }
+            | Self::Reverted { worker_id, .. } => *worker_id = id.to_string(),
         }
     }
 }
@@ -1413,6 +1434,14 @@ high = "high"
                 audits: 0,
                 cost_micros: 12_345,
                 label: Some("high".into()),
+                merge_commit: Some("c0ffee00".into()),
+            },
+            DispatchRoutingRow::Reverted {
+                ts: 1_700_000_000_007,
+                worker_id: "worker-1".into(),
+                plan_id: "2ba2168a".into(),
+                step: 3,
+                revert_commit: "c0ffee01".into(),
             },
         ]
     }
@@ -1437,6 +1466,7 @@ high = "high"
             "nudge",
             "nudge_ignored",
             "outcome",
+            "reverted",
         ];
         for ((line, expected), tag) in lines.iter().zip(&rows).zip(tags) {
             let value: serde_json::Value = serde_json::from_str(line).expect("value");
@@ -1444,6 +1474,150 @@ high = "high"
             let parsed: DispatchRoutingRow = serde_json::from_str(line).expect("row");
             assert_eq!(&parsed, expected, "event: {tag}");
         }
+    }
+
+    #[test]
+    fn outcome_row_carries_merge_commit() {
+        let row = DispatchRoutingRow::Outcome {
+            ts: 1_700_000_000_005,
+            worker_id: "worker-1".into(),
+            plan_id: "2ba2168a".into(),
+            step: 3,
+            status: "merged".into(),
+            final_tier: "high".into(),
+            models_used: vec!["endpoint/model-a".into()],
+            review_rounds: 1,
+            fix_rounds: 0,
+            findings: 0,
+            findings_high: 0,
+            audits: 0,
+            cost_micros: 1,
+            label: Some("high".into()),
+            merge_commit: Some("c0ffee00".into()),
+        };
+        let line = serde_json::to_string(&row).expect("serialize the row");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("row json");
+        assert_eq!(value["merge_commit"], "c0ffee00");
+        assert_eq!(
+            serde_json::from_str::<DispatchRoutingRow>(&line).expect("parse the row"),
+            row
+        );
+    }
+
+    /// A log line written before `merge_commit` existed still parses: the
+    /// field defaults, it is never required (plan dac2028d).
+    #[test]
+    fn old_outcome_row_without_merge_commit_parses() {
+        let old = concat!(
+            r#"{"event":"outcome","ts":1700000000005,"worker_id":"worker-1","#,
+            r#""plan_id":"2ba2168a","step":3,"status":"merged","final_tier":"high","#,
+            r#""models_used":["endpoint/model-a"],"review_rounds":1,"fix_rounds":0,"#,
+            r#""findings":0,"findings_high":0,"audits":0,"cost_micros":1,"label":"high"}"#,
+        );
+        let parsed: DispatchRoutingRow = serde_json::from_str(old).expect("an old line parses");
+        let DispatchRoutingRow::Outcome {
+            merge_commit, status, ..
+        } = &parsed
+        else {
+            panic!("an outcome row: {parsed:?}");
+        };
+        assert_eq!(status, "merged");
+        assert_eq!(*merge_commit, None);
+
+        // Re-serializing it writes no `merge_commit` key either.
+        let line = serde_json::to_string(&parsed).expect("serialize");
+        assert!(
+            !line.contains("merge_commit"),
+            "an absent commit is skipped, not null: {line}"
+        );
+    }
+
+    /// A `reverted` row survives a serde round trip with its envelope and the
+    /// revert commit intact (plan dac2028d).
+    #[test]
+    fn reverted_row_roundtrips() {
+        let row = DispatchRoutingRow::Reverted {
+            ts: 1_700_000_000_007,
+            worker_id: "worker-1".into(),
+            plan_id: "2ba2168a".into(),
+            step: 3,
+            revert_commit: "c0ffee01".into(),
+        };
+        let line = serde_json::to_string(&row).expect("serialize the row");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("row json");
+        assert_eq!(value["event"], "reverted");
+        assert_eq!(value["worker_id"], "worker-1");
+        assert_eq!(value["revert_commit"], "c0ffee01");
+        assert_eq!(
+            serde_json::from_str::<DispatchRoutingRow>(&line).expect("parse the row"),
+            row
+        );
+    }
+
+    /// Every reader of the log treats a `reverted` row as a non-label: one
+    /// reverted row leaves the eval cases, the Laya page summary and the kNN
+    /// index byte-for-byte the same (plan dac2028d).
+    #[tokio::test]
+    async fn training_readers_ignore_reverted_rows() {
+        let route = route_row();
+        let outcome = DispatchRoutingRow::Outcome {
+            ts: 1_700_000_000_006,
+            worker_id: "worker-1".into(),
+            plan_id: "2ba2168a".into(),
+            step: 3,
+            status: "merged".into(),
+            final_tier: "high".into(),
+            models_used: vec!["endpoint/model-a".into()],
+            review_rounds: 1,
+            fix_rounds: 0,
+            findings: 0,
+            findings_high: 0,
+            audits: 0,
+            cost_micros: 1,
+            label: Some("high".into()),
+            merge_commit: Some("c0ffee00".into()),
+        };
+        let reverted = DispatchRoutingRow::Reverted {
+            ts: 1_700_000_000_007,
+            worker_id: "worker-1".into(),
+            plan_id: "2ba2168a".into(),
+            step: 3,
+            revert_commit: "c0ffee01".into(),
+        };
+
+        // The offline eval and the Laya page summary.
+        let labelled = vec![route.clone(), outcome.clone()];
+        let cases = crate::mnemo2::route_eval::outcome_cases(&labelled);
+        assert_eq!(cases.len(), 1, "the fixture yields one labelled case");
+        let summary = crate::mnemo2::laya_settings::summarize_rows(&labelled);
+        let mut with_revert = labelled.clone();
+        with_revert.push(reverted.clone());
+        assert_eq!(
+            crate::mnemo2::route_eval::outcome_cases(&with_revert),
+            cases,
+            "the eval mines no case from a revert"
+        );
+        assert_eq!(
+            crate::mnemo2::laya_settings::summarize_rows(&with_revert),
+            summary,
+            "the page summary counts no revert"
+        );
+
+        // The kNN overlay indexes no label from it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut paths = Vec::new();
+        for name in ["plain", "with-revert"] {
+            let path = dir.path().join(name).join("dispatch_routing.jsonl");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("log dir");
+            mnemo::agent::model_routing::append_row(&path, &route);
+            mnemo::agent::model_routing::append_row(&path, &outcome);
+            paths.push(path);
+        }
+        mnemo::agent::model_routing::append_row(&paths[1], &reverted);
+        let plain = overlay(paths[0].parent().expect("dir"), Arc::new(TokenEmbedder::new()));
+        let reverted_knn = overlay(paths[1].parent().expect("dir"), Arc::new(TokenEmbedder::new()));
+        assert_eq!(plain.indexed_rows().await, 1, "the fixture indexes one worker");
+        assert_eq!(reverted_knn.indexed_rows().await, 1);
     }
 
     /// A history holding one reroute from `from` to `to`.

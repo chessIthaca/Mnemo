@@ -145,12 +145,35 @@ describe("Workbench", () => {
 
     const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
     const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
-    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Git", "Trace", "Graph", "Memory"]);
+    expect(labels).toEqual([
+      "Browser",
+      "Diff",
+      "Plan",
+      "Files",
+      "Git",
+      "Trace",
+      "Graph",
+      "Memory",
+      "Quality",
+    ]);
     expect(within(strip).getByRole("button", { name: "Files" }).getAttribute("aria-pressed")).toBe("true");
 
     // The body switch renders the tree, which lists only the project root.
     expect(await screen.findByRole("button", { name: "src" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Files" })).toBeTruthy();
+  });
+
+  it("opens the Quality tab in the strip and mounts the quality view", async () => {
+    actions.openWorkbench("quality");
+    render(Workbench);
+
+    const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
+    expect(within(strip).getByRole("button", { name: "Quality" }).getAttribute("aria-pressed")).toBe("true");
+    // The body switch hosts the view; outside the desktop host it says so.
+    expect(screen.getByRole("region", { name: "Quality" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Quality" })).toBeTruthy();
+    expect(screen.getByText("The Quality tab is available in the desktop app.")).toBeTruthy();
+    expect(state().workbenchTab).toBe("quality");
   });
 
   it("opens the Trace tab in the strip and lists the shared request log", async () => {
@@ -203,7 +226,17 @@ describe("Workbench", () => {
 
     const strip = screen.getByRole("navigation", { name: "Workbench tabs" });
     const labels = within(strip).getAllByRole("button").map((button) => button.textContent?.trim());
-    expect(labels).toEqual(["Browser", "Diff", "Plan", "Files", "Git", "Trace", "Graph", "Memory"]);
+    expect(labels).toEqual([
+      "Browser",
+      "Diff",
+      "Plan",
+      "Files",
+      "Git",
+      "Trace",
+      "Graph",
+      "Memory",
+      "Quality",
+    ]);
     expect(within(strip).getByRole("button", { name: "Trace" }).getAttribute("aria-pressed")).toBe("true");
 
     // The panel hosts the full Trace view now, not the old compact summary.

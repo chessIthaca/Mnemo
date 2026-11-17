@@ -44,7 +44,7 @@ The loop, enforced end to end: **plan → dispatch → checks → review → mer
 | **Knowledge graph** | Tree-sitter parses 12 languages (Rust, TS/TSX, JS, Python, Go, Java, C/C++, C#, Ruby, PHP, HTML) into a per-project SQLite graph: callers, callees, imports, blast radius, shortest paths. |
 | **Safety first** | Approval gates on mutations, git merge and push always gated, a path sandbox, and `.coding/` state protected from the file tools. |
 | **Token-optimizer levers** | Seven context-economy levers, on by default (Settings → Savings): outline-first reads, command-output compression with credential redaction, archive and expand, compaction survival, a context-quality score, lean-output nudges and recall delta. The Savings card on the Cost tab shows what they saved. |
-| **Desktop shell** | Tauri 2 app for Windows and macOS: lead chat, Team (mission control), Cost, Graph and Plans tabs, a side panel (Browser, Diff, Plan, Files, Git, Trace, Graph, Memory) and MCP servers. The Browser pane is WebView2 on Windows. |
+| **Desktop shell** | Tauri 2 app for Windows and macOS: lead chat, Team (mission control), Cost, Graph and Plans tabs, a side panel (Browser, Diff, Plan, Files, Git, Trace, Graph, Memory, Quality) and MCP servers. The Browser pane is WebView2 on Windows. |
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
 

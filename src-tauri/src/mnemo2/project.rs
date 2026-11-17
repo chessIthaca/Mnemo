@@ -76,10 +76,10 @@ impl ProjectRecord {
 
 /// The Workbench tabs a project may persist, in strip order.
 ///
-/// The Files, Git, Trace, Graph and Memory steps appended theirs here, next to
-/// these, so the stored tab and the frontend's `WorkbenchTab` union stay one
-/// decision. Trace, Graph and Memory are the panel's wide tabs.
-pub const WORKBENCH_TABS: [&str; 8] = [
+/// The Files, Git, Trace, Graph, Memory and Quality steps appended theirs here,
+/// next to these, so the stored tab and the frontend's `WorkbenchTab` union stay
+/// one decision. Trace, Graph, Memory and Quality are the panel's wide tabs.
+pub const WORKBENCH_TABS: [&str; 9] = [
     "browser",
     "diff",
     "plan",
@@ -88,6 +88,7 @@ pub const WORKBENCH_TABS: [&str; 8] = [
     "trace",
     "graph",
     "memory",
+    "quality",
 ];
 
 /// The narrowest workbench width that may be persisted, in CSS pixels.
@@ -114,8 +115,8 @@ const MAX_BOARD_WIDTH: u32 = 8_192;
 pub struct ProjectPreferences {
     /// Whether the workbench was open.
     pub workbench_open: bool,
-    /// `browser`, `diff`, `plan`, `files`, `git`, `trace`, `graph` or `memory`,
-    /// one of [`WORKBENCH_TABS`].
+    /// `browser`, `diff`, `plan`, `files`, `git`, `trace`, `graph`, `memory` or
+    /// `quality`, one of [`WORKBENCH_TABS`].
     pub workbench_tab: String,
     /// Saved desktop width in CSS pixels.
     pub workbench_width: u32,
@@ -126,8 +127,8 @@ pub struct ProjectPreferences {
     /// Saved mission-control worker-list width in CSS pixels; `None` keeps
     /// the default proportion between the list and the worker output.
     pub board_width: Option<u32>,
-    /// Saved width of the wide panel tabs (Trace, Graph, Memory) in CSS pixels;
-    /// `None` follows the window.
+    /// Saved width of the wide panel tabs (Trace, Graph, Memory, Quality) in CSS
+    /// pixels; `None` follows the window.
     pub workbench_wide_width: Option<u32>,
 }
 
@@ -745,6 +746,10 @@ mod tests {
         assert!(
             WORKBENCH_TABS.contains(&"memory"),
             "the Memory tab is part of the persisted set"
+        );
+        assert!(
+            WORKBENCH_TABS.contains(&"quality"),
+            "the Quality tab is part of the persisted set"
         );
         let unknown = ProjectPreferences {
             workbench_tab: "console".to_string(),

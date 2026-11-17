@@ -40,7 +40,7 @@ export function panelCoversMain(windowWidth: number): boolean {
 }
 
 /** The panel tabs with several columns of their own: they need more room than a diff. */
-const WIDE_WORKBENCH_TABS: readonly WorkbenchTab[] = ["trace", "graph", "memory"];
+const WIDE_WORKBENCH_TABS: readonly WorkbenchTab[] = ["trace", "graph", "memory", "quality"];
 
 /** Whether this panel tab is one of the wide ones. */
 export function isWideWorkbenchTab(tab: WorkbenchTab): boolean {

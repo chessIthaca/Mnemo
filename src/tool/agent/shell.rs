@@ -33,6 +33,11 @@
 //! schema always advertised it, and a call without it is rejected with a
 //! clear error.
 //!
+//! CHECK NOTES (plan 0ff83146): a check command that ran in a form the host
+//! cannot count, a counted run that changed the tree it measured, and a
+//! shell-side file write each prepend a note saying what to do instead — same
+//! shape as the nudges above (displayed `output` only, raw `data` untouched).
+//!
 //! TREE OWNERSHIP (plan bfe2b09f): the post-exit reader join is bounded by
 //! [`READER_JOIN_GRACE`], and no process a command starts outlives the
 //! call — a backgrounded dev server that inherited the pipes used to hang
@@ -132,6 +137,38 @@ const READER_JOIN_GRACE: Duration = Duration::from_secs(3);
 const BACKGROUND_HOLD_NOTE: &str = "NOTE: a background process started by the command \
      kept the output pipe open; it was stopped and the captured output may be \
      truncated.\n";
+
+/// Plan 0ff83146: the note prepended when an allow-listed check command ran
+/// inside a longer command line, so the run cannot count as that check.
+/// `command` is the check the worker meant to record; the text spells out the
+/// three conditions the host measures (the exact command line, the checkout
+/// root, nothing piped/chained/redirected) so the retry is right the first
+/// time. Like the nudges above it shapes only the displayed `output`; the raw
+/// stdout/stderr in `data` stay note-free.
+fn check_not_counted_note(command: &str) -> String {
+    format!(
+        "NOTE: this run does not count as the `{command}` check. Mnemo2 counts a check only \
+         when that exact command is the whole command line, run from the checkout root, with \
+         nothing piped, chained or redirected. Run `{command}` alone to record it.\n"
+    )
+}
+
+/// Plan 0ff83146: the note prepended to a COUNTED run that changed the tree it
+/// just measured — a check that edits tracked files can never certify a later
+/// commit, so the worker is told to commit or revert and run it again.
+fn check_tree_changed_note(command: &str) -> String {
+    format!(
+        "NOTE: this run of `{command}` changed tracked files, so it does not count as a \
+         check. Commit or revert those changes, then run it again.\n"
+    )
+}
+
+/// Plan 0ff83146: the note prepended when the command writes files through the
+/// shell. The file tools show a diff and keep line endings; a shell write is a
+/// last resort the worker must justify.
+const SHELL_FILE_WRITE_NOTE: &str = "NOTE: change files with file_edit or file_write, not the \
+     shell: they show the diff and keep line endings. A shell write is a last resort; say why \
+     in your report.\n";
 /// Whether the command redirects stdout/stderr to a null sink — `>$null`,
 /// `>/dev/null`, or `>nul` (PowerShell / POSIX / cmd forms; `2>$null`,
 /// `1>$null`, `2>&1>$null` all contain one of these substrings). C4: the
@@ -210,6 +247,30 @@ fn is_grep_family(command: &str) -> bool {
             "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" | "findstr" | "select-string" | "sls"
         ) || (first == "git" && tokens.next() == Some("grep"))
     })
+}
+
+/// Plan 0ff83146: the allow-listed check command a longer command line
+/// mentions — the LONGEST one when several match — or `None` when the run
+/// names no check at all. Such a run is never measured (see
+/// [`ShellTool::measures_check`]), so the caller has to say so.
+fn mentioned_check<'a>(check_commands: &'a [String], command: &str) -> Option<&'a str> {
+    check_commands
+        .iter()
+        .filter(|allowed| command.contains(allowed.as_str()))
+        .max_by_key(|allowed| allowed.len())
+        .map(|allowed| allowed.as_str())
+}
+
+/// Plan 0ff83146: whether the command writes files through the shell —
+/// `Set-Content`/`Add-Content`/`Out-File`, `sed -i`, a `>>` append, or a `tee`
+/// pipe. ASCII case-insensitive. `tee` counts only as a whole command word (a
+/// leading `tee ` or a `| tee ` segment), so `guarantee` never fires.
+fn looks_like_shell_file_write(command: &str) -> bool {
+    let lowered = command.to_ascii_lowercase();
+    const TOKENS: [&str; 5] = ["set-content", "add-content", "out-file", "sed -i", ">>"];
+    TOKENS.iter().any(|token| lowered.contains(token))
+        || lowered.contains("| tee ")
+        || lowered.trim_start().starts_with("tee ")
 }
 
 /// Rewrite bash-style `&&` / `||` chaining into PowerShell 5.1-compatible
@@ -843,6 +904,40 @@ impl Tool for ShellTool {
                 // drop) and that the captured output may be truncated.
                 if background_held {
                     combined.insert_str(0, BACKGROUND_HOLD_NOTE);
+                }
+                // Plan 0ff83146: say what the tool itself measured, at the
+                // moment of the mistake, so no rule has to ask for it. These
+                // lead the output — inserted last, in reverse: from the top
+                // the order is CHECK_NOT_COUNTED, CHECK_TREE_CHANGED,
+                // SHELL_FILE_WRITE, then the notes above. Like the nudges they
+                // shape only the displayed `output`; raw `data` stays
+                // note-free.
+                if looks_like_shell_file_write(&args.command) {
+                    combined.insert_str(0, SHELL_FILE_WRITE_NOTE);
+                }
+                let check_command = validated_check_command(&args.command);
+                let tree_changed = matches!(
+                    (tree_before.as_deref(), tree_after.as_deref()),
+                    (Some(before), Some(after)) if before != after
+                );
+                // A measured run that changed the tree it measured cannot
+                // certify a later commit; an unmeasured one that merely
+                // MENTIONS a check command was not recorded at all.
+                let changed_check = if measure_tree && tree_changed {
+                    check_command
+                } else {
+                    None
+                };
+                let uncounted_check = if measure_tree {
+                    None
+                } else {
+                    mentioned_check(&self.check_commands, &args.command)
+                };
+                if let Some(command) = changed_check {
+                    combined.insert_str(0, &check_tree_changed_note(command));
+                }
+                if let Some(command) = uncounted_check {
+                    combined.insert_str(0, &check_not_counted_note(command));
                 }
                 // Cap the displayed output to prevent unbounded context (M3).
                 // Preserve full raw data for the LLM's structured `data` field.
@@ -2455,5 +2550,90 @@ mod tests {
         let data = result.data.expect("data");
         assert!(data.get("tree_before").is_none(), "{data}");
         assert!(data.get("tree_after").is_none(), "{data}");
+    }
+
+    /// Plan 0ff83146: an allow-listed check command run inside a longer
+    /// command line cannot count — the result says so at the top and names the
+    /// command to run alone. It rides even a failing run (this one is outside
+    /// a checkout, so `git status` itself errors).
+    #[tokio::test]
+    async fn uncounted_check_run_gets_a_note() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path()).with_check_commands(vec!["git status".to_string()]);
+        let result = tool
+            .execute(json!({"command": "git status; echo done", "purpose": "chained check"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result
+                .output
+                .starts_with("NOTE: this run does not count as the `git status` check"),
+            "{}",
+            result.output
+        );
+    }
+
+    /// Plan 0ff83146: the counted form (the exact command, at the checkout
+    /// root) is not nagged about — the note is for the form that cannot count.
+    #[tokio::test]
+    async fn counted_check_run_gets_no_uncounted_note() {
+        let dir = tempdir().unwrap();
+        git_repo(dir.path());
+        let tool = tool_in(dir.path()).with_check_commands(vec!["git status".to_string()]);
+        let result = tool
+            .execute(json!({"command": "git status", "purpose": "counted check"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(!result.output.contains("does not count"), "{}", result.output);
+    }
+
+    /// Plan 0ff83146: a COUNTED run that changed tracked files cannot certify
+    /// the commit being checked, and the result says so.
+    #[tokio::test]
+    async fn check_run_that_edits_files_gets_tree_note() {
+        let dir = tempdir().unwrap();
+        git_repo(dir.path());
+        let command = "git config --file tracked.txt test.value changed";
+        let tool = tool_in(dir.path()).with_check_commands(vec![command.to_string()]);
+        let result = tool
+            .execute(json!({"command": command, "purpose": "change the tree"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("changed tracked files"),
+            "{}",
+            result.output
+        );
+    }
+
+    /// Plan 0ff83146: writing a file through the shell gets the file-tools
+    /// note — and a `tee` inside an ordinary word does not.
+    #[tokio::test]
+    async fn shell_file_write_gets_a_note() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let write = if cfg!(target_os = "windows") {
+            "Set-Content x.txt hi"
+        } else {
+            "echo hi >> x.txt"
+        };
+        let result = tool
+            .execute(json!({"command": write, "purpose": "write a file"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("change files with file_edit"),
+            "{}",
+            result.output
+        );
+        let unrelated = tool
+            .execute(json!({"command": "echo guarantee", "purpose": "no write"}))
+            .await;
+        assert!(unrelated.success, "{}", unrelated.output);
+        assert!(
+            !unrelated.output.contains("change files with file_edit"),
+            "{}",
+            unrelated.output
+        );
     }
 }

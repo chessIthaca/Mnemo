@@ -505,11 +505,29 @@ mod tests {
     /// The indexer's own writes (`knowledge/INDEX.md`, `memory.db-wal`) must
     /// not trigger a pass: the live reconcile writes those itself, and
     /// reacting to them would loop forever.
+    ///
+    /// The `plans/p1.md` probe is what makes the assertion real, and it was
+    /// added after a review finding on this exact test: on an EMPTY corpus a
+    /// triggered pass indexes nothing and leaves the state table empty, so the
+    /// test passed even against a filter that accepted everything. Fails when
+    /// [`is_memory_source_path`] is temporarily made to accept every path
+    /// (verified red that way, then reverted).
     #[tokio::test]
     async fn memory_watcher_ignores_its_own_index_writes() {
         let dir = tempdir().unwrap();
         let state_dir = dir.path().join(".coding");
         std::fs::create_dir_all(state_dir.join("knowledge")).unwrap();
+        std::fs::create_dir_all(state_dir.join("plans")).unwrap();
+        // The probe source: written BEFORE the watcher starts, so no event
+        // announces it and it is still UNINDEXED once watching begins. Any
+        // pass the indexer's own writes triggered below would index it and
+        // leave `plan:p1` in the state table — with an empty corpus the
+        // assertion would hold even against a filter that accepts everything.
+        std::fs::write(
+            state_dir.join("plans/p1.md"),
+            "# Plan: unindexed probe\n\n## Goal\nMust stay unindexed.\n\n- [ ] 1. step\n",
+        )
+        .unwrap();
 
         let store = Arc::new(MemoryStore::open_in_memory(hash_embedder()).unwrap());
         let trait_store: Arc<dyn MemoryStoreTrait> = store.clone();
@@ -526,9 +544,11 @@ mod tests {
 
         // Well past the 100ms debounce — a pass would have run by then.
         tokio::time::sleep(Duration::from_millis(600)).await;
+        let keys = store.index_state_keys().await.unwrap();
         assert!(
-            store.index_state_keys().await.unwrap().is_empty(),
-            "the indexer's own writes must not trigger a reconcile pass"
+            keys.is_empty(),
+            "the indexer's own writes must not trigger a reconcile pass \
+             (it indexed {keys:?} — the unindexed plans/p1.md probe proves a pass ran)"
         );
     }
 }

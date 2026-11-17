@@ -17,8 +17,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use mnemo::app::backlog::BacklogItem;
 use serde::{Deserialize, Serialize};
 
+use crate::mnemo2::backlog;
 use crate::mnemo2::phase3::{self, Finding};
 
 use super::record::WorkerRecord;
@@ -152,6 +154,170 @@ pub(crate) fn category_counts(rows: &[FindingRow]) -> Vec<(String, usize)> {
     counts
 }
 
+/// How many distinct workers one category has to come up in before Mnemo2
+/// stops correcting it review by review and proposes enforcing it instead.
+pub(crate) const RECURRENCE_THRESHOLD: usize = 3;
+
+/// The marker line a recurrence proposal's text ends with. A category is
+/// proposed once; the marker is how a later read tells that it was, and how
+/// the item's plan is found from the category.
+pub(crate) fn proposal_marker(category: &str) -> String {
+    format!("[finding-category:{category}]")
+}
+
+/// The categories a set of findings carries, in the order they appear, with
+/// repeats dropped.
+fn finding_categories(findings: &[Finding]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut categories = Vec::new();
+    for category in findings.iter().filter_map(|finding| finding.category.as_deref()) {
+        if seen.insert(category) {
+            categories.push(category.to_string());
+        }
+    }
+    categories
+}
+
+/// The latest ledger row of one category — the one whose `enforce` counts.
+fn latest_row<'a>(rows: &'a [FindingRow], category: &str) -> Option<&'a FindingRow> {
+    rows.iter()
+        .rev()
+        .find(|row| row.category.as_deref() == Some(category))
+}
+
+/// How a proposal suggests stopping the mistake for good, or `None` when only
+/// a reviewer can judge it (or the lead said nothing).
+fn enforce_wording(enforce: &str) -> Option<&'static str> {
+    match enforce {
+        "code" => Some("a type or API that makes the mistake impossible to write"),
+        "build" => Some("a lint or policy test that fails the build"),
+        "test" => Some("a test or check that catches it"),
+        _ => None,
+    }
+}
+
+/// `true` when one live backlog item already carries this category's marker.
+fn already_proposed(items: &[BacklogItem], category: &str) -> bool {
+    let marker = proposal_marker(category);
+    items.iter().any(|item| item.text.contains(&marker))
+}
+
+/// The live backlog items of a workspace.
+fn live_items(root: &Path) -> Vec<BacklogItem> {
+    backlog::read_items(&backlog::backlog_file(root))
+}
+
+/// The backlog text proposing a guard for one category: one line per worker
+/// that hit it, newest first, and where the mistake could be stopped.
+fn proposal_text(category: &str, wording: &str, rows: &[FindingRow]) -> String {
+    let mut seen = HashSet::new();
+    let mut workers = Vec::new();
+    for row in rows.iter().rev() {
+        if row.category.as_deref() != Some(category) {
+            continue;
+        }
+        if !seen.insert(row.worker_id.as_str()) {
+            continue;
+        }
+        workers.push(format!("- {}: {} ({})", row.worker_id, row.title, row.file));
+    }
+    let count = workers.len();
+    let workers = workers.join("\n");
+    let marker = proposal_marker(category);
+    format!(
+        "Stop '{category}' mistakes for good (seen in {count} reviews)\n\n\
+         The same kind of review finding keeps coming back:\n{workers}\n\n\
+         Suggested enforcement: {wording}. Plan this to add the guard, then cite it \
+         in the finding's category so later reviews can check it.\n\n\
+         {marker}"
+    )
+}
+
+/// Propose a guard for every category this review's findings carry that has
+/// now come up in exactly [`RECURRENCE_THRESHOLD`] distinct workers, when the
+/// latest row names `code`, `build` or `test` as where it could be stopped.
+///
+/// The proposal is ONE backlog item whose text ends with
+/// [`proposal_marker`]; a live item that already carries the marker means the
+/// category was proposed before, so nothing is added again. Runs on the lead's
+/// workspace root, after the review's own rows are in the ledger.
+pub(crate) fn propose_recurring(root: &Path, findings: &[Finding]) -> Result<(), String> {
+    let categories = finding_categories(findings);
+    if categories.is_empty() {
+        return Ok(());
+    }
+    let rows = read_rows(root);
+    let counts = category_counts(&rows);
+    let items = live_items(root);
+    for category in categories {
+        let count = count_of(&counts, &category);
+        if count != RECURRENCE_THRESHOLD {
+            continue;
+        }
+        let Some(enforce) = latest_row(&rows, &category).and_then(|row| row.enforce.as_deref())
+        else {
+            continue;
+        };
+        let Some(wording) = enforce_wording(enforce) else {
+            continue;
+        };
+        if already_proposed(&items, &category) {
+            continue;
+        }
+        let text = proposal_text(&category, wording, &rows);
+        backlog::add_item(&backlog::backlog_file(root), &text)?;
+    }
+    Ok(())
+}
+
+/// The count of one category in [`category_counts`]' output, or 0.
+fn count_of(counts: &[(String, usize)], category: &str) -> usize {
+    counts
+        .iter()
+        .find(|(name, _)| name == category)
+        .map(|(_, count)| *count)
+        .unwrap_or(0)
+}
+
+/// One line per category this review's findings carry that has come up in
+/// [`RECURRENCE_THRESHOLD`] or more workers' reviews, for the review's answer.
+///
+/// A category whose proposal exists says so; otherwise the line points the
+/// lead at enforcing it by hand (above the threshold nothing new is proposed).
+pub(crate) fn recurrence_lines(root: &Path, findings: &[Finding]) -> Vec<String> {
+    let categories = finding_categories(findings);
+    if categories.is_empty() {
+        return Vec::new();
+    }
+    let rows = read_rows(root);
+    let counts = category_counts(&rows);
+    let items = live_items(root);
+    let mut lines = Vec::new();
+    for category in categories {
+        let count = count_of(&counts, &category);
+        if count < RECURRENCE_THRESHOLD {
+            continue;
+        }
+        if already_proposed(&items, &category) {
+            lines.push(format!(
+                "Finding category '{category}' has now come up in {count} reviews; a backlog item proposes enforcing it."
+            ));
+            continue;
+        }
+        lines.push(
+            match latest_row(&rows, &category).and_then(|row| row.enforce.as_deref()) {
+                Some(enforce) => format!(
+                    "Finding category '{category}' has come up in {count} reviews; consider enforcing it (enforce: {enforce})."
+                ),
+                None => format!(
+                    "Finding category '{category}' has come up in {count} reviews; consider enforcing it."
+                ),
+            },
+        );
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +411,104 @@ mod tests {
         assert_eq!(rows.len(), 1, "the malformed line is skipped");
         assert_eq!(rows[0].finding_id, "F-1");
         assert_eq!(rows[0].category, None);
+    }
+
+    /// One review as the runtime records it: the ledger rows, then the
+    /// recurrence check. Returns the findings the review carried.
+    fn record_review(root: &Path, worker_id: &str, category: &str, enforce: &str) -> Vec<Finding> {
+        let worker = test_worker_record(worker_id);
+        let mut open = finding("F-1", Some(category));
+        open.enforce = Some(enforce.to_string());
+        let findings = std::slice::from_ref(&open).to_vec();
+        append_new(root, &worker, &findings).expect("ledger row");
+        propose_recurring(root, &findings).expect("recurrence check");
+        findings
+    }
+
+    /// The workspace's live backlog items, read from disk.
+    fn backlog_items(root: &Path) -> Vec<BacklogItem> {
+        backlog::read_items(&backlog::backlog_file(root))
+    }
+
+    #[test]
+    fn third_worker_with_category_adds_one_backlog_item() {
+        let root = tempfile::tempdir().expect("workspace");
+        for worker in ["worker01", "worker02"] {
+            record_review(root.path(), worker, "vacuous-test", "test");
+        }
+        assert!(
+            backlog_items(root.path()).is_empty(),
+            "two workers are a coincidence, not a pattern"
+        );
+        let findings = record_review(root.path(), "worker03", "vacuous-test", "test");
+        let items = backlog_items(root.path());
+        assert_eq!(items.len(), 1, "the third worker proposes the guard once");
+        let text = &items[0].text;
+        assert!(
+            text.starts_with("Stop 'vacuous-test' mistakes for good (seen in 3 reviews)"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(&proposal_marker("vacuous-test")),
+            "the item ends with the category marker: {text}"
+        );
+        assert!(
+            text.contains(
+                "- worker03: the unchecked path (src/lib.rs)\n\
+                 - worker02: the unchecked path (src/lib.rs)\n\
+                 - worker01: the unchecked path (src/lib.rs)"
+            ),
+            "one line per worker, newest first: {text}"
+        );
+        assert!(
+            text.contains(
+                "Suggested enforcement: a test or check that catches it. Plan this to add \
+                 the guard, then cite it in the finding's category so later reviews can check it."
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            recurrence_lines(root.path(), &findings),
+            vec![
+                "Finding category 'vacuous-test' has now come up in 3 reviews; \
+                 a backlog item proposes enforcing it."
+                    .to_string()
+            ]
+        );
+        let findings = record_review(root.path(), "worker04", "vacuous-test", "test");
+        assert_eq!(
+            backlog_items(root.path()).len(),
+            1,
+            "a fourth worker does not add a second item"
+        );
+        assert_eq!(
+            recurrence_lines(root.path(), &findings),
+            vec![
+                "Finding category 'vacuous-test' has now come up in 4 reviews; \
+                 a backlog item proposes enforcing it."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn review_category_does_not_propose() {
+        let root = tempfile::tempdir().expect("workspace");
+        let mut findings = Vec::new();
+        for worker in ["worker01", "worker02", "worker03"] {
+            findings = record_review(root.path(), worker, "taste-call", "review");
+        }
+        assert!(
+            backlog_items(root.path()).is_empty(),
+            "only a person can judge this one, so nothing is proposed"
+        );
+        assert_eq!(
+            recurrence_lines(root.path(), &findings),
+            vec![
+                "Finding category 'taste-call' has come up in 3 reviews; \
+                 consider enforcing it (enforce: review)."
+                    .to_string()
+            ]
+        );
     }
 }

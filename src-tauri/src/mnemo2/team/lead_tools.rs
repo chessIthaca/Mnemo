@@ -551,10 +551,22 @@ impl TeamRuntime {
             "team_revert_merge" => self.revert_merge_as(worker_id, true).await,
             _ => Err(format!("unknown team host tool '{name}'")),
         };
+        let reviewed = result.as_ref().ok().cloned();
         let mut answer = worker_result(result, name);
         if name == "team_review" && answer.success {
             if let Some(line) = finding_categories_line(&self.workspace_root) {
                 answer.output = format!("{}\n{line}", answer.output);
+            }
+            // A category that keeps coming back is one line in the answer, so
+            // the lead reads "this is now a proposal" instead of reviewing it
+            // for the fourth time.
+            if let Some(reviewed) = &reviewed {
+                let lines =
+                    findings_ledger::recurrence_lines(&self.workspace_root, &reviewed.findings);
+                for line in lines {
+                    answer.output.push('\n');
+                    answer.output.push_str(&line);
+                }
             }
         }
         answer

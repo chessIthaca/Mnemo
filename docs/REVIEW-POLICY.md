@@ -75,7 +75,7 @@ keeps a findings ledger at `.coding/reviews/findings.jsonl` and, when one
 category has come up in three workers' reviews with a `code`, `build` or `test`
 enforcement, proposes a guard as a single backlog item whose text ends with
 `[finding-category:<category>]`. The lesson then belongs in the code or the
-build, not in another review; nothing is corrected a fourth time by hand.
+build, not in another review.
 
 ## Risk and independent audit
 

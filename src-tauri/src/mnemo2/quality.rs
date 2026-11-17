@@ -435,10 +435,19 @@ fn window_categories(root: &Path, start: u64, now_ms: u64) -> Vec<(String, u32)>
         .collect()
 }
 
+/// Whether `commit` is a plain hex commit id — 7 to 64 ASCII hex digits, the
+/// only shape passed to git as a revision. A commit id cannot look like an
+/// option (`--output=…`), so anything else is never handed to git.
+fn is_plain_commit_id(commit: &str) -> bool {
+    commit.len() >= 7 && commit.len() <= 64 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Each merge commit's changed files relative to its first parent, cached per
 /// commit so the report asks git once. A commit this checkout does not have
 /// (a shallow clone, another computer's merge not fetched yet) yields `None`,
-/// and its task drops out of the follow-up signal only.
+/// and its task drops out of the follow-up signal only. So does a commit id
+/// that is not plain hex: the routing log is union-merged from other computers,
+/// and a log-supplied string must never reach git as an option.
 async fn changed_files_commits(
     root: PathBuf,
     commits: Vec<String>,
@@ -449,20 +458,25 @@ async fn changed_files_commits(
         if cache.contains_key(&commit) {
             continue;
         }
+        if !is_plain_commit_id(&commit) {
+            cache.insert(commit, None);
+            continue;
+        }
         let first_parent = format!("{commit}^1");
-        let files = match phase3::git_value(root, &["diff", "--name-only", &first_parent, &commit])
-            .await
-        {
-            Ok(output) => Some(
-                output
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<String>>(),
-            ),
-            Err(_) => None,
-        };
+        let files =
+            match phase3::git_value(root, &["diff", "--name-only", &first_parent, &commit, "--"])
+                .await
+            {
+                Ok(output) => Some(
+                    output
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<String>>(),
+                ),
+                Err(_) => None,
+            };
         cache.insert(commit, files);
     }
     cache
@@ -538,6 +552,35 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000_000;
+
+    /// Run git in the fixture repository and assert it succeeded.
+    async fn run_git(root: &Path, args: &[&str]) {
+        let output = phase3::git(root, args).await.expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A repository with one commit, plus that commit's id.
+    async fn one_commit_repo() -> (tempfile::TempDir, String) {
+        let root = tempfile::tempdir().expect("repo");
+        run_git(root.path(), &["init", "-b", "main"]).await;
+        run_git(root.path(), &["config", "user.name", "Quality Test"]).await;
+        run_git(
+            root.path(),
+            &["config", "user.email", "quality@example.invalid"],
+        )
+        .await;
+        std::fs::write(root.path().join("seed.md"), "seed\n").expect("seed file");
+        run_git(root.path(), &["add", "seed.md"]).await;
+        run_git(root.path(), &["commit", "-m", "seed"]).await;
+        let commit = phase3::git_value(root.path(), &["rev-parse", "HEAD"])
+            .await
+            .expect("head commit");
+        (root, commit)
+    }
 
     /// A merged outcome row, built field by field: the defaults are a clean
     /// first-pass merge on the `routine` tier.
@@ -805,6 +848,44 @@ mod tests {
         assert_eq!(report.missing_merge_commit, 1);
         // They still count for every other metric.
         assert_eq!(report.by_tier[0].merged, 2);
+    }
+
+    #[tokio::test]
+    async fn changed_files_rejects_option_like_commit() {
+        // A crafted routing-log row must never reach git as an option:
+        // `--output=…` makes `git diff` write a file wherever it names.
+        let (root, _head) = one_commit_repo().await;
+        let leak = root.path().join("leak.txt");
+        let commit = format!("--output={}", leak.display());
+        let cache = changed_files_commits(root.path().to_path_buf(), vec![commit.clone()]).await;
+        assert!(
+            matches!(cache.get(&commit), Some(None)),
+            "an option-like commit must count like an unknown commit: {cache:?}"
+        );
+        assert!(
+            !leak.exists(),
+            "git wrote {} from a log-supplied commit",
+            leak.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_files_accepts_a_real_commit() {
+        // A real hex commit id still reaches git and yields its changed files.
+        let (root, _seed) = one_commit_repo().await;
+        std::fs::write(root.path().join("changed.rs"), "pub fn changed() {}\n")
+            .expect("write the change");
+        run_git(root.path(), &["add", "changed.rs"]).await;
+        run_git(root.path(), &["commit", "-m", "change"]).await;
+        let tip = phase3::git_value(root.path(), &["rev-parse", "HEAD"])
+            .await
+            .expect("tip commit");
+        let cache = changed_files_commits(root.path().to_path_buf(), vec![tip.clone()]).await;
+        assert_eq!(
+            cache.get(&tip),
+            Some(&Some(vec!["changed.rs".to_string()])),
+            "a real commit's changed files: {cache:?}"
+        );
     }
 
     #[test]

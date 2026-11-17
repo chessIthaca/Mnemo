@@ -634,6 +634,11 @@ impl TeamRuntime {
                             | WorkerStatus::Interrupted
                     )
                 {
+                    // A re-dispatch starts a turn in the worker's checkout, so
+                    // it is refused while a proof owns that checkout — checked
+                    // under this dispatch's merge lock, like every other turn
+                    // start (finding claimRace).
+                    self.proving_guard(id)?;
                     if !existing.worktree.is_dir() {
                         return Err(format!("worker '{id}' has no recoverable worktree"));
                     }

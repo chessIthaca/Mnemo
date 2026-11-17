@@ -402,6 +402,19 @@ const FOLLOW_UP_GRACE: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(60)
 };
 
+/// Fire the turn-end proofs off the pump: the trigger never delays the event
+/// loop behind a proof decision, and the pump keeps folding this worker's
+/// events while the proof runs. Every path that settles a turn as Completed
+/// calls this — the natural finished turn, a parked steered turn end, and the
+/// follow-up deadline below (F4/F5).
+async fn fire_turn_end_proofs(proof: &super::proving::ProofCtx, worker_id: &str) {
+    let proof = proof.clone();
+    let proved_worker = worker_id.to_string();
+    tokio::spawn(async move {
+        super::proving::spawn_turn_proofs(&proof, proved_worker).await;
+    });
+}
+
 // Each parameter is one shared worker handle — the pump's wiring stays flat.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn pump_worker(
@@ -542,6 +555,14 @@ pub(super) async fn pump_worker(
                             generation,
                             event,
                         });
+                    }
+                    if completed {
+                        // F5 (steerTimeoutTrigger): this deadline settled the
+                        // steered turn end as this worker's finished turn, so
+                        // it owes its proofs like any other turn end — this
+                        // branch continues and never reaches the trigger
+                        // below.
+                        fire_turn_end_proofs(&proof, &worker_id).await;
                     }
                     continue;
                 }
@@ -763,6 +784,10 @@ pub(super) async fn pump_worker(
             None
         };
         let mut terminal = false;
+        // Whether the event left the worker's record reading Completed (F4
+        // parkedTrigger): only a turn that ended Completed has finished work
+        // to prove. Read under the records lock below.
+        let mut completed_turn_end = false;
         let mut refresh = false;
         let mut changed = false;
         let mut telemetry = false;
@@ -1176,6 +1201,7 @@ pub(super) async fn pump_worker(
                     }
                     _ => {}
                 }
+                completed_turn_end = matches!(worker.status, WorkerStatus::Completed);
             }
         }
         // An audit that ended its turn without a message_parent report (bug
@@ -1222,13 +1248,13 @@ pub(super) async fn pump_worker(
             )
             .await;
             // The turn is over: prove what it owes while nothing else may
-            // touch the checkout. The trigger runs off the pump, so the
-            // finished event is never delayed behind a proof decision.
-            let proof = proof.clone();
-            let proved_worker = worker_id.clone();
-            tokio::spawn(async move {
-                super::proving::spawn_turn_proofs(&proof, proved_worker).await;
-            });
+            // touch the checkout — but only when the turn ended Completed (F4
+            // parkedTrigger): a LimitReached park or an interrupted exit has
+            // not finished the work, and its resume would run under the
+            // proof's checkout.
+            if completed_turn_end {
+                fire_turn_end_proofs(&proof, &worker_id).await;
+            }
         }
         // A suppressed repeated report is not forwarded (plan 9a6cffc1):
         // no TeamEvent means the runtime never turns it into a lead

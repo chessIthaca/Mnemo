@@ -887,7 +887,17 @@ impl TeamRuntime {
         let mut stopped: Vec<(usize, WorkerDeletion)> = Vec::new();
         for (position, preview) in previews.into_iter().enumerate() {
             match Self::deletion_decision(&preview, discard_work) {
-                Ok(()) => stopped.push((position, preview)),
+                Ok(()) => match self.proving_guard(&preview.worker_id) {
+                    // A proof is mutating or restoring this worker's
+                    // checkout right now: deleting the worker — and its
+                    // checkout — under it is refused with the proof's
+                    // refusal text (finding deleteDuringProof).
+                    Ok(()) => stopped.push((position, preview)),
+                    Err(error) => {
+                        outcomes[position].error = Some(error.clone());
+                        on_result(outcomes[position].clone());
+                    }
+                },
                 Err(error) => {
                     outcomes[position].error = Some(error.clone());
                     on_result(outcomes[position].clone());

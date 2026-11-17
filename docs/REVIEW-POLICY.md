@@ -70,7 +70,9 @@ the project configured `[mutation]` in `.coding/checks.toml`, it also reports
 every changed line no test catches as a low `No test catches: ...` finding.
 Both are ordinary checks and findings: open ones block the merge, and the merge
 gate refuses a bug fix whose regression test has not been proven red at the tip
-being merged. `team_prove_regression` and `team_mutation_check` rerun either
+being merged. Only a proof finding resolved `wontfix`, with a written reason,
+waives that refusal — a finding closed `fixed` never does: fixed must be shown
+by the red check. `team_prove_regression` and `team_mutation_check` rerun either
 proof on demand; while a proof runs, `team_message`, `team_resume`,
 `team_route_fix`, `review_fix` and `team_merge` refuse for that worker with a
 message naming the proof.

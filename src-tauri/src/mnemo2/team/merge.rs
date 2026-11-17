@@ -310,7 +310,6 @@ impl TeamRuntime {
 
     /// `by_lead` is true when the lead itself asked, from inside its turn.
     pub(super) async fn merge_as(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
-        self.proving_guard(worker_id)?;
         let worker = self.merge_locked(worker_id, by_lead).await?;
         self.after_merge(&worker).await;
         self.signal_board_changed();
@@ -319,6 +318,7 @@ impl TeamRuntime {
 
     async fn merge_locked(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         // An audit worker is a read-only reviewer: it is never mergeable in ANY
         // state, so this refusal comes before every other gate. A still-running
         // audit (or a differently-named lead branch) must not mask the reason.

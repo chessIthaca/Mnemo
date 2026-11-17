@@ -444,8 +444,8 @@ impl TeamRuntime {
         old_string: &str,
         new_string: &str,
     ) -> Result<WorkerRecord, String> {
-        self.proving_guard(worker_id)?;
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         let worker = self.worker(worker_id).await?;
         if worker.status != WorkerStatus::InReview {
             return Err("review_fix requires a worker in review".to_string());
@@ -784,8 +784,8 @@ impl TeamRuntime {
         finding_id: &str,
         tier: Option<&str>,
     ) -> Result<WorkerRecord, String> {
-        self.proving_guard(worker_id)?;
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         let worker = self.worker(worker_id).await?;
         // Audits only ever produce findings; they never receive them.
         debug_assert_ne!(

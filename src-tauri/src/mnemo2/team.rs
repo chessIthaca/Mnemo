@@ -418,6 +418,11 @@ impl TeamRuntime {
                 .collect();
             recover_worker(&options.workspace_root, worker, &other_worktrees).await?;
         }
+        // A proof a hard kill interrupted leaves its checkout reverse-applied;
+        // the claim marker names the tip to repair it back to (finding
+        // restartWhileProving). Safe before anything else runs: no proof is
+        // live at open.
+        proving::repair_interrupted_proofs(&options.workspace_root, &workers).await;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (signals, _) = broadcast::channel(EVENT_BUFFER);
         let routing_log_path = options.routing_log_path.clone().unwrap_or_else(
@@ -586,12 +591,16 @@ impl TeamRuntime {
             proving: self.proving.clone(),
             board: self.board(),
             runner: Arc::clone(&*self.proofs.read().unwrap_or_else(|e| e.into_inner())),
+            merge_lock: self.merge_lock.clone(),
+            live: self.live.clone(),
         }
     }
 
     /// The refusal an entry point returns while a proof owns the worker's
     /// checkout. Every path that would move that checkout, or start a turn in
-    /// it, must ask this first.
+    /// it, must ask this **after** it takes the merge lock (finding
+    /// claimRace): a claim holds the same lock while it decides, so the check
+    /// and the claim are serialized and one of them always sees the other.
     pub(super) fn proving_guard(&self, worker_id: &str) -> Result<(), String> {
         if self.proving.is_active(worker_id) {
             return Err(proving::proving_error(worker_id));

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Carsten Hess
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT.
 // See LICENSE in the repository root.
 
 //! The team's side of the two proofs: when they run, what they block, and what
@@ -10,9 +10,15 @@
 //! a red check, keeps a worker whose tests are being proved out of every action
 //! that would move its checkout, and turns each outcome into the check or the
 //! finding the merge gate reads.
+//!
+//! Two race findings shaped the claim: [`ProofCtx::claim_idle`] holds the merge
+//! lock while it decides, so a worker whose turn just started can never be
+//! proved underneath itself (claimRace), and one claim runs every job the turn
+//! owes, in sequence, so the second job is never dropped (secondJobDropped).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
@@ -31,7 +37,7 @@ use super::proof::{self, Mutant, MutationCfg, RedOutcome, RegressionCfg};
 use super::pump::save_workers;
 use super::record::{WorkerCheck, WorkerRecord, WorkerStatus};
 use super::review::CheckRecorder;
-use super::{now_key, BoardSignal, TeamRuntime};
+use super::{now_key, BoardSignal, LiveWorker, TeamRuntime};
 
 /// The name of the check a red check records.
 pub(super) const RED_CHECK: &str = "regression test fails without the fix";
@@ -44,6 +50,10 @@ pub(super) const INCONCLUSIVE_ID: &str = "regression-proof-inconclusive";
 /// How many missed mutants are reported one by one; the rest go in one
 /// `mutant-more` finding.
 pub(super) const MUTANT_CAP: usize = 20;
+/// The folder a running proof's claim marker lives in (finding
+/// restartWhileProving): `.coding/mnemo2/` is per-instance state, gitignored,
+/// so a hard kill mid-proof leaves the marker for the next open to repair from.
+const MARKER_DIR: &str = ".coding/mnemo2/proving";
 
 /// The worker ids whose proofs are running right now.
 ///
@@ -65,7 +75,7 @@ impl Proving {
     }
 
     /// Hold a worker's claim for the rest of the test. Tests only: production
-    /// claims through [`ProofCtx::spawn`], which releases on drop.
+    /// claims through [`ProofCtx::claim_idle`], which releases on drop.
     #[cfg(test)]
     pub(super) fn hold_for_test(&self, worker_id: &str) -> bool {
         self.ids
@@ -74,8 +84,8 @@ impl Proving {
             .insert(worker_id.to_string())
     }
 
-    /// Claim `worker_id` for one proof run, or `None` when it is already
-    /// claimed. The claim is released when the guard drops.
+    /// Claim `worker_id`, or `None` when it is already claimed. The claim is
+    /// released when the guard drops.
     fn claim(&self, worker_id: &str) -> Option<ProvingGuard> {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         if !ids.insert(worker_id.to_string()) {
@@ -84,6 +94,7 @@ impl Proving {
         Some(ProvingGuard {
             proving: self.clone(),
             worker_id: worker_id.to_string(),
+            marker: None,
         })
     }
 
@@ -95,14 +106,21 @@ impl Proving {
     }
 }
 
-/// The claim one running proof holds; dropping it frees the worker.
+/// The claim one running proof holds; dropping it frees the worker and removes
+/// the claim marker.
 struct ProvingGuard {
     proving: Proving,
     worker_id: String,
+    /// The claim marker this proof wrote; removed here, whatever ended the
+    /// proof (finding restartWhileProving).
+    marker: Option<PathBuf>,
 }
 
 impl Drop for ProvingGuard {
     fn drop(&mut self) {
+        if let Some(marker) = &self.marker {
+            let _ = std::fs::remove_file(marker);
+        }
         self.proving.release(&self.worker_id);
     }
 }
@@ -110,6 +128,14 @@ impl Drop for ProvingGuard {
 /// The refusal every entry point that would move a proved checkout returns.
 pub(super) fn proving_error(worker_id: &str) -> String {
     format!("Mnemo2 is proving {worker_id}'s tests; wait for its notice")
+}
+
+/// The claim marker of one running proof: `<workspace_root>/<MARKER_DIR>/
+/// <worker_id>.json`.
+fn marker_path(workspace_root: &Path, worker_id: &str) -> PathBuf {
+    workspace_root
+        .join(MARKER_DIR)
+        .join(format!("{worker_id}.json"))
 }
 
 /// The out-of-process work one red check needs.
@@ -202,7 +228,9 @@ pub(super) struct MergeProof {
     pub(super) regression_required: bool,
     /// The tip carries the passed red check.
     pub(super) regression_proven: bool,
-    /// The lead resolved the proof finding with a written reason instead.
+    /// The lead resolved the proof finding as wontfix, with a written reason.
+    /// Only that waives the gate: a finding closed `fixed` must be backed by
+    /// the red check at the tip being merged (finding proofPerTip).
     pub(super) regression_waived: bool,
 }
 
@@ -228,6 +256,11 @@ pub(crate) struct ProofCtx {
     pub(super) board: Option<Arc<PlanBoard>>,
     /// The proof commands.
     pub(super) runner: Arc<dyn ProofRunner>,
+    /// The merge lock: the same lock every entry point that starts a turn or
+    /// moves a checkout takes (finding claimRace).
+    pub(super) merge_lock: Arc<Mutex<()>>,
+    /// The live sessions, for the busy test [`ProofCtx::worker_busy`].
+    pub(super) live: Arc<Mutex<HashMap<String, LiveWorker>>>,
 }
 
 impl ProofCtx {
@@ -255,22 +288,108 @@ impl ProofCtx {
         Some((plan.kind, plan.regression_test))
     }
 
-    /// Start `job` for `worker_id` in the background, or refuse silently when a
-    /// proof is already running for it. The claim is taken here, before the
-    /// task is spawned, so two triggers can never both start.
-    pub(super) fn spawn(&self, worker_id: &str, job: ProofJob) -> Result<(), String> {
-        let Some(guard) = self.proving.claim(worker_id) else {
+    /// The same busy test [`TeamRuntime::worker_is_busy`] uses: the live
+    /// session's own flag, which the pump holds while a turn runs.
+    async fn worker_busy(&self, worker_id: &str) -> bool {
+        self.live
+            .lock()
+            .await
+            .get(worker_id)
+            .is_some_and(|live| live.busy.load(Ordering::SeqCst))
+    }
+
+    /// Claim `worker_id` for one proof run, or refuse: the claim holds the
+    /// merge lock while it decides, so a turn that just started can never be
+    /// proved underneath itself — every entry point that starts a turn takes
+    /// the same lock before it moves the checkout, so it either sees this
+    /// claim and refused, or this claim sees its turn and refuses (finding
+    /// claimRace).
+    async fn claim_idle(&self, worker_id: &str) -> Result<ProvingGuard, String> {
+        let _lock = self.merge_lock.lock().await;
+        if self.proving.is_active(worker_id) {
+            return Err(proving_error(worker_id));
+        }
+        let (worktree, claimable) = {
+            let records = self.records.lock().await;
+            let Some(worker) = records.iter().find(|worker| worker.id == worker_id) else {
+                return Err(format!("unknown worker '{worker_id}'"));
+            };
+            (
+                worker.worktree.clone(),
+                matches!(
+                    worker.status,
+                    WorkerStatus::Completed
+                        | WorkerStatus::InReview
+                        | WorkerStatus::Idle
+                        | WorkerStatus::Interrupted
+                        | WorkerStatus::Stopped
+                        | WorkerStatus::Failed
+                        | WorkerStatus::Conflict
+                ),
+            )
+        };
+        if !claimable {
+            return Err(format!(
+                "worker '{worker_id}' is busy; the proof runs in its checkout while it is idle"
+            ));
+        }
+        if self.worker_busy(worker_id).await {
+            return Err(format!(
+                "worker '{worker_id}' is busy; the proof runs in its checkout while it is idle"
+            ));
+        }
+        let Some(mut guard) = self.proving.claim(worker_id) else {
             return Err(proving_error(worker_id));
         };
+        // The marker names the tip to repair this checkout back to if a hard
+        // kill interrupts the proof (finding restartWhileProving). A claim
+        // that cannot write it is refused: without the marker the repair hook
+        // below has nothing to repair from.
+        let tip = match phase3::git_value(&worktree, &["rev-parse", "HEAD"]).await {
+            Ok(tip) => tip,
+            Err(error) => {
+                return Err(format!("worker '{worker_id}': {error}"));
+            }
+        };
+        let marker = marker_path(&self.workspace_root, worker_id);
+        let payload = serde_json::json!({
+            "tip": tip,
+            "checkout": worktree.to_string_lossy(),
+        });
+        let written = std::fs::create_dir_all(marker.parent().unwrap_or(marker.as_path()))
+            .and_then(|()| std::fs::write(&marker, payload.to_string()));
+        if let Err(error) = written {
+            return Err(format!(
+                "worker '{worker_id}' could not write its proof marker: {error}"
+            ));
+        }
+        guard.marker = Some(marker);
+        Ok(guard)
+    }
+
+    /// Start the owed `jobs` for `worker_id` in the background, under one
+    /// claim, in order: the red check first, then the mutation check (finding
+    /// secondJobDropped — two claims ran the first job and silently dropped
+    /// the second). Each job ends with its own notice.
+    pub(super) async fn spawn(&self, worker_id: &str, jobs: &[ProofJob]) -> Result<(), String> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let guard = self.claim_idle(worker_id).await?;
         let ctx = self.clone();
         let id = worker_id.to_string();
+        let jobs = jobs.to_vec();
         tokio::spawn(async move {
+            // One claim runs every owed job in sequence: the claim is held
+            // for both, and the busy guard keeps the checkout still.
             let _guard = guard;
-            let notice = match job {
-                ProofJob::Regression => ctx.run_regression(&id).await,
-                ProofJob::Mutation => ctx.run_mutation(&id).await,
-            };
-            ctx.notice(format!("proof:{id}:{}", now_key()), notice);
+            for job in jobs {
+                let notice = match job {
+                    ProofJob::Regression => ctx.run_regression(&id).await,
+                    ProofJob::Mutation => ctx.run_mutation(&id).await,
+                };
+                ctx.notice(format!("proof:{id}:{}", now_key()), notice);
+            }
         });
         Ok(())
     }
@@ -303,8 +422,11 @@ impl ProofCtx {
 
     /// Open `findings` on the worker and log them to the findings ledger.
     ///
-    /// An id the worker already carries is left alone: a proof that runs twice
-    /// at one tip must not open the same finding twice.
+    /// A proof finding whose id already exists is updated in place when it is
+    /// open at an older tip (finding proofPerTip): its detail's tip line
+    /// names the tip its proof ran at, so a later tip reports again instead of
+    /// being silently skipped. A closed finding is left alone — its
+    /// resolution is the lead's, not the proof's.
     async fn open_findings(
         &self,
         worker_id: &str,
@@ -313,7 +435,7 @@ impl ProofCtx {
         if findings.is_empty() {
             return Ok(());
         }
-        let mut opened = Vec::new();
+        let mut changed = Vec::new();
         {
             let mut records = self.records.lock().await;
             let worker = records
@@ -324,24 +446,66 @@ impl ProofCtx {
                 return Ok(());
             }
             for finding in findings {
-                if worker
+                if let Some(existing) = worker
                     .findings
-                    .iter()
-                    .any(|existing| existing.id == finding.id)
+                    .iter_mut()
+                    .find(|existing| existing.id == finding.id)
                 {
+                    if existing.status == "open" && existing.detail != finding.detail {
+                        existing.detail = finding.detail;
+                        existing.title = finding.title;
+                        existing.severity = finding.severity;
+                        existing.file = finding.file;
+                        existing.line = finding.line;
+                        changed.push(existing.clone());
+                    }
                     continue;
                 }
-                opened.push(finding.clone());
+                changed.push(finding.clone());
                 worker.findings.push(finding);
             }
         }
-        if opened.is_empty() {
+        if changed.is_empty() {
             return Ok(());
         }
         if let Ok(worker) = self.worker(worker_id).await {
-            let _ = findings_ledger::append_new(&self.workspace_root, &worker, &opened);
+            let _ = findings_ledger::append_new(&self.workspace_root, &worker, &changed);
         }
         save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await
+    }
+
+    /// Close every open proof finding as fixed: a red check at `tip` proves
+    /// what the open finding said was unproven (finding proofPerTip). The
+    /// evidence names the tip, like the finding's own tip line.
+    async fn close_proof_findings(&self, worker_id: &str, tip: &str) -> Result<(), String> {
+        let evidence = format!("proven red at tip {tip}");
+        let mut closed = false;
+        {
+            let mut records = self.records.lock().await;
+            let Some(worker) = records
+                .iter_mut()
+                .find(|worker| worker.id == worker_id)
+            else {
+                return Ok(());
+            };
+            if matches!(worker.status, WorkerStatus::Merging | WorkerStatus::Merged) {
+                return Ok(());
+            }
+            for finding in worker.findings.iter_mut() {
+                if matches!(finding.id.as_str(), NOT_RED_ID | INCONCLUSIVE_ID)
+                    && finding.status == "open"
+                {
+                    finding.status = "fixed".to_string();
+                    finding.fix_commit = Some(tip.to_string());
+                    finding.evidence = Some(evidence.clone());
+                    closed = true;
+                }
+            }
+        }
+        if closed {
+            save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await?;
+        }
+        Ok(())
     }
 
     /// Set the worker's error and tell the lead: a restore that failed leaves
@@ -353,8 +517,7 @@ impl ProofCtx {
                 worker.error = Some(error.to_string());
             }
         }
-        let _ =
-            save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await;
+        let _ = save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await;
     }
 
     /// The file a finding names when the proof cannot name one itself: the plan
@@ -424,17 +587,23 @@ impl ProofCtx {
                 let detail = format!("{test}\n{}", output_tail(&output));
                 self.record_check(worker_id, RED_CHECK, Some(detail), &tip)
                     .await?;
+                // A red check proves what an open proof finding said was
+                // unproven: close it as fixed, at this tip.
+                self.close_proof_findings(worker_id, &tip).await?;
                 Ok(format!(
                     "regression proof for {worker_id}: red (fails without the fix)"
                 ))
             }
             RedOutcome::NotRed { output } => {
+                // The detail's first line is the tip (finding proofPerTip):
+                // the finding describes this tip's proof, and a later tip
+                // re-reports instead of being skipped.
                 let finding = Finding {
                     id: NOT_RED_ID.to_string(),
                     severity: "high".to_string(),
                     title: "The regression test passes without the fix".to_string(),
                     detail: format!(
-                        "{}\nthe test does not reproduce the defect",
+                        "tip {tip}\n{}\nthe test does not reproduce the defect",
                         output_tail(&output)
                     ),
                     file,
@@ -456,7 +625,7 @@ impl ProofCtx {
                     id: INCONCLUSIVE_ID.to_string(),
                     severity: "low".to_string(),
                     title: "The regression test could not be proven red".to_string(),
-                    detail: reason.clone(),
+                    detail: format!("tip {tip}\n{reason}"),
                     file,
                     line: 0,
                     status: "open".to_string(),
@@ -527,9 +696,10 @@ impl ProofCtx {
         ))
     }
 
-    /// Whether this worker's tip still needs its regression test proven red:
-    /// the plan is a bug fix with a regression test, the worker's diff adds a
-    /// line carrying that test's name, and the tip carries no proof result yet.
+    /// Whether this worker's current tip still needs its regression test proven
+    /// red: the plan is a bug fix with a regression test, the worker's diff
+    /// adds a line carrying that test's name, and the tip carries no proof
+    /// result yet.
     pub(super) async fn regression_due(&self, worker: &WorkerRecord) -> bool {
         let Some((PlanKind::BugFixing, Some(test))) = self.worker_plan(worker).await else {
             return false;
@@ -537,25 +707,27 @@ impl ProofCtx {
         let Ok(tip) = phase3::tip(&worker.worktree).await else {
             return false;
         };
-        if self.tip_proven(worker, &tip) {
+        if Self::tip_proven(worker, &tip) {
             return false;
         }
         self.diff_adds(&tip, &test).await
     }
 
-    /// Whether the worker already carries a proof result for this tip.
-    fn tip_proven(&self, worker: &WorkerRecord, tip: &str) -> bool {
-        if worker.checks.iter().any(|check| {
-            check.name == RED_CHECK && check.status == "passed" && check.tip == tip
-        }) {
+    /// Whether the worker already carries a proof result for this tip: the
+    /// passed red check, or an open proof finding whose tip line names this
+    /// tip (finding proofPerTip).
+    fn tip_proven(worker: &WorkerRecord, tip: &str) -> bool {
+        if worker
+            .checks
+            .iter()
+            .any(|check| check.name == RED_CHECK && check.status == "passed" && check.tip == tip)
+        {
             return true;
         }
-        // An open proof finding is the result for this tip until the lead
-        // resolves it; a resolved one no longer blocks the gate, so a later
-        // turn proves again.
         worker.findings.iter().any(|finding| {
             matches!(finding.id.as_str(), NOT_RED_ID | INCONCLUSIVE_ID)
                 && finding.status == "open"
+                && proof_finding_tip(finding) == Some(tip)
         })
     }
 
@@ -586,14 +758,83 @@ impl ProofCtx {
             return proof;
         };
         proof.regression_required = self.diff_adds(tip, &test).await;
-        proof.regression_proven = worker.checks.iter().any(|check| {
-            check.name == RED_CHECK && check.status == "passed" && check.tip == tip
-        });
+        proof.regression_proven = worker
+            .checks
+            .iter()
+            .any(|check| check.name == RED_CHECK && check.status == "passed" && check.tip == tip);
+        // Only a wontfix — a written reason — waives the gate (finding
+        // proofPerTip): a finding closed `fixed` must be backed by the red
+        // check at the tip being merged.
         proof.regression_waived = worker.findings.iter().any(|finding| {
             matches!(finding.id.as_str(), NOT_RED_ID | INCONCLUSIVE_ID)
-                && finding.status != "open"
+                && finding.status == "wontfix"
         });
         proof
+    }
+}
+
+impl TeamRuntime {
+    /// Run the red check now, on the lead's request: the worker's plan may have
+    /// gained its `regression_test` after the worker's last turn, so no turn
+    /// end ever triggered it.
+    pub(super) async fn prove_regression_tool(&self, worker_id: &str) -> Result<String, String> {
+        let worker = self.worker(worker_id).await?;
+        if worker.kind != "implementation" {
+            return Err("only implementation workers are proven".to_string());
+        }
+        if matches!(worker.status, WorkerStatus::Merging | WorkerStatus::Merged) {
+            return Err(format!(
+                "worker '{worker_id}' is {:?}; its tip can no longer be proven",
+                worker.status
+            ));
+        }
+        if self.worker_is_busy(worker_id).await {
+            return Err(format!(
+                "worker '{worker_id}' is busy; the regression proof runs in its checkout while it is idle"
+            ));
+        }
+        let ctx = self.proof_ctx();
+        if !matches!(
+            ctx.worker_plan(&worker).await,
+            Some((PlanKind::BugFixing, Some(_)))
+        ) {
+            return Err(format!(
+                "worker '{worker_id}' has no bug_fixing plan with a regression test; record one with plan_update, then prove it"
+            ));
+        }
+        ctx.spawn(worker_id, &[ProofJob::Regression]).await?;
+        Ok(format!(
+            "regression proof started for {worker_id}; it finishes with a notice and records a check or finding"
+        ))
+    }
+
+    /// Run the mutation check now, on the lead's request.
+    pub(super) async fn mutation_check_tool(&self, worker_id: &str) -> Result<String, String> {
+        if proof::load_proof_config(&self.workspace_root)
+            .mutation
+            .is_none()
+        {
+            return Err("configure [mutation] in .coding/checks.toml".to_string());
+        }
+        let worker = self.worker(worker_id).await?;
+        if worker.kind != "implementation" {
+            return Err("only implementation workers are proven".to_string());
+        }
+        if matches!(worker.status, WorkerStatus::Merging | WorkerStatus::Merged) {
+            return Err(format!(
+                "worker '{worker_id}' is {:?}; its tip can no longer be mutated",
+                worker.status
+            ));
+        }
+        if self.worker_is_busy(worker_id).await {
+            return Err(format!(
+                "worker '{worker_id}' is busy; the mutation check copies its checkout while it is idle"
+            ));
+        }
+        self.proof_ctx().spawn(worker_id, &[ProofJob::Mutation]).await?;
+        Ok(format!(
+            "mutation check started for {worker_id}; it finishes with a notice and opens a finding per uncaught change"
+        ))
     }
 }
 
@@ -603,6 +844,11 @@ impl ProofCtx {
 /// test; the mutation check runs for a high-risk worker when the project
 /// configured it. Both run in the background: the pump must keep folding the
 /// worker's events.
+///
+/// The dues are computed first and the claim comes last (finding claimRace): a
+/// turn that started in between makes the idle claim fail — and that turn's
+/// own end triggers the proofs again. Both owed jobs run under one claim, in
+/// sequence (finding secondJobDropped).
 pub(super) async fn spawn_turn_proofs(ctx: &ProofCtx, worker_id: String) {
     let Ok(worker) = ctx.worker(&worker_id).await else {
         return;
@@ -613,15 +859,97 @@ pub(super) async fn spawn_turn_proofs(ctx: &ProofCtx, worker_id: String) {
     let red_due = ctx.regression_due(&worker).await;
     let mutation_due = worker.review_risk == "high"
         && proof::load_proof_config(&ctx.workspace_root).mutation.is_some();
-    if !red_due && !mutation_due {
-        return;
-    }
+    let mut jobs = Vec::new();
     if red_due {
-        let _ = ctx.spawn(&worker_id, ProofJob::Regression);
+        jobs.push(ProofJob::Regression);
     }
     if mutation_due {
-        let _ = ctx.spawn(&worker_id, ProofJob::Mutation);
+        jobs.push(ProofJob::Mutation);
     }
+    if jobs.is_empty() {
+        return;
+    }
+    let _ = ctx.spawn(&worker_id, &jobs).await;
+}
+
+/// Repair checkouts a hard kill left reverse-applied (finding
+/// restartWhileProving): every claim writes a marker naming the tip it repairs
+/// its checkout back to, and deletes it when the proof ends. A marker that
+/// survived a kill is processed here, at open:
+///
+/// - a checkout its worker record no longer owns is never touched;
+/// - a checkout whose HEAD moved past the marker's tip is never touched;
+/// - a checkout still at the marker's tip and dirty is restored with the same
+///   restore the proof itself uses (`git reset --hard <tip>`, `git clean -ffd`,
+///   never `-x`), and the repair logs one line.
+///
+/// The marker is deleted once processed.
+pub(super) async fn repair_interrupted_proofs(workspace_root: &Path, workers: &[WorkerRecord]) {
+    let Ok(entries) = std::fs::read_dir(workspace_root.join(MARKER_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let Ok(marker) = serde_json::from_str::<serde_json::Value>(&text) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let (Some(tip), Some(checkout)) = (
+            marker.get("tip").and_then(serde_json::Value::as_str),
+            marker.get("checkout").and_then(serde_json::Value::as_str),
+        ) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let checkout = PathBuf::from(checkout);
+        let Some(worker) = workers
+            .iter()
+            .find(|worker| same_path(&worker.worktree, &checkout))
+        else {
+            // No worker record owns this checkout: the worker was deleted, so
+            // its proof contract ended with it. The marker goes; the checkout
+            // is never touched.
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let head = phase3::git_value(&checkout, &["rev-parse", "HEAD"])
+            .await
+            .unwrap_or_default();
+        let dirty = phase3::git_value(&checkout, &["status", "--porcelain", "-uall"])
+            .await
+            .unwrap_or_default();
+        if head == tip && !dirty.is_empty() {
+            let id = &worker.id;
+            match proof::restore_checkout(&checkout, tip).await {
+                Ok(()) => eprintln!(
+                    "mnemo2: repaired the checkout of {id}, left reverse-applied by a proof a hard kill interrupted (back to {tip})"
+                ),
+                Err(error) => eprintln!(
+                    "mnemo2: the checkout of {id} could not be repaired after an interrupted proof: {error}"
+                ),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Whether two paths name the same place, canonicalized when they both exist
+/// so separator and symlink differences do not split a match.
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// The tip a proof finding's detail names, as its first line (finding
+/// proofPerTip): a proof finding describes the tip whose proof produced it.
+fn proof_finding_tip(finding: &Finding) -> Option<&str> {
+    finding.detail.lines().next()?.strip_prefix("tip ")
 }
 
 /// The findings a mutation run opens: one per missed mutant, capped, with one
@@ -728,63 +1056,4 @@ fn output_tail(output: &str) -> String {
         .collect();
     let start = lines.len().saturating_sub(KEPT);
     lines[start..].join("\n")
-}
-
-impl TeamRuntime {
-    /// Run the red check now, on the lead's request: the worker's plan may have
-    /// gained its `regression_test` after the worker's last turn, so no turn
-    /// end ever triggered it.
-    pub(super) async fn prove_regression_tool(&self, worker_id: &str) -> Result<String, String> {
-        let worker = self.worker(worker_id).await?;
-        if matches!(worker.status, WorkerStatus::Merging | WorkerStatus::Merged) {
-            return Err(format!(
-                "worker '{worker_id}' is {:?}; its tip can no longer be proven",
-                worker.status
-            ));
-        }
-        if self.worker_is_busy(worker_id).await {
-            return Err(format!(
-                "worker '{worker_id}' is busy; the regression proof runs in its checkout while it is idle"
-            ));
-        }
-        let ctx = self.proof_ctx();
-        if !matches!(
-            ctx.worker_plan(&worker).await,
-            Some((PlanKind::BugFixing, Some(_)))
-        ) {
-            return Err(format!(
-                "worker '{worker_id}' has no bug_fixing plan with a regression test; record one with plan_update, then prove it"
-            ));
-        }
-        ctx.spawn(worker_id, ProofJob::Regression)?;
-        Ok(format!(
-            "regression proof started for {worker_id}; it finishes with a notice and records a check or finding"
-        ))
-    }
-
-    /// Run the mutation check now, on the lead's request.
-    pub(super) async fn mutation_check_tool(&self, worker_id: &str) -> Result<String, String> {
-        if proof::load_proof_config(&self.workspace_root)
-            .mutation
-            .is_none()
-        {
-            return Err("configure [mutation] in .coding/checks.toml".to_string());
-        }
-        let worker = self.worker(worker_id).await?;
-        if matches!(worker.status, WorkerStatus::Merging | WorkerStatus::Merged) {
-            return Err(format!(
-                "worker '{worker_id}' is {:?}; its tip can no longer be mutated",
-                worker.status
-            ));
-        }
-        if self.worker_is_busy(worker_id).await {
-            return Err(format!(
-                "worker '{worker_id}' is busy; the mutation check copies its checkout while it is idle"
-            ));
-        }
-        self.proof_ctx().spawn(worker_id, ProofJob::Mutation)?;
-        Ok(format!(
-            "mutation check started for {worker_id}; it finishes with a notice and opens a finding per uncaught change"
-        ))
-    }
 }

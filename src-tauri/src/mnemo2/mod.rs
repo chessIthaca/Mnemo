@@ -178,6 +178,10 @@ pub mod memory_maintenance;
 /// be looked up.
 pub mod ui_log;
 
+/// Does merged work hold up? The per-model and per-tier quality report over
+/// the routing log (plan dac2028d): first-pass share, fix rounds, reverts and
+/// bug-fix follow-ups.
+pub mod quality;
 
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView, which also exposes `__TAURI_INTERNALS__`.
@@ -768,6 +772,7 @@ pub fn run() {
             backlog::backlog_set_deferred,
             backlog::backlog_set_done,
             backlog::backlog_clear_finished,
+            quality::quality_report,
             backlog::plan_this,
             ipc::settings_endpoints,
             ipc::settings_upsert_endpoint,

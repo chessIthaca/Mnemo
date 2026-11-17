@@ -145,6 +145,13 @@ pub(super) fn outcome_row(record: &WorkerRecord, status: &str) -> Option<Dispatc
         record.fix_rounds,
         high_findings,
     );
+    // Only a merged worker has a merge commit on the lead branch; every other
+    // terminal status leaves the field absent (plan dac2028d).
+    let merge_commit = if status == "merged" {
+        record.merge.as_ref().map(|merge| merge.commit.clone())
+    } else {
+        None
+    };
     Some(DispatchRoutingRow::Outcome {
         ts: unix_ms(),
         worker_id: record.id.clone(),
@@ -160,6 +167,7 @@ pub(super) fn outcome_row(record: &WorkerRecord, status: &str) -> Option<Dispatc
         audits: record.audits as usize,
         cost_micros: record.cost_micros.unwrap_or(0),
         label: label.map(|(label, _)| label.to_string()),
+        merge_commit,
     })
 }
 

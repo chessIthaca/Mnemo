@@ -8353,6 +8353,109 @@ async fn merge_appends_an_outcome_with_the_derived_label() {
     team.shutdown().await;
 }
 
+/// A revert appends a `reverted` row that pairs with the merge's `outcome`
+/// row, which carries the merge commit (plan dac2028d).
+#[tokio::test]
+async fn revert_merge_appends_a_reverted_row() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mut worker = worker(root.path(), "00000002000000000003");
+    worker.status = WorkerStatus::InReview;
+    worker.plan_id = Some("plan0001".into());
+    worker.plan_step = Some(0);
+    worker.tier = Some("routine".into());
+    worker.model = Some("test/scripted-average".into());
+    // A reroute keeps the terminal outcome row logged in the default mode.
+    worker.reroutes = vec![DispatchRoutingRow::LeadReroute {
+        ts: 1,
+        worker_id: worker.id.clone(),
+        plan_id: "plan0001".into(),
+        step: 1,
+        from_tier: "routine".into(),
+        to_tier: "high".into(),
+        from_model: Some("test/scripted-average".into()),
+        to_model: Some("test/scripted-difficult".into()),
+        status: "idle".into(),
+        review_rounds: 0,
+        fix_rounds: 0,
+        nudged: false,
+    }];
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        worker.id.clone(),
+        "wt/mnemo".to_string(),
+    )
+    .await
+    .expect("provision the worker checkout");
+    std::fs::write(worker.worktree.join("merged.txt"), "merged\n").expect("worker change");
+    run_git(&worker.worktree, &["add", "merged.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&worker.worktree).await.expect("worker tip");
+    worker.checks = vec![WorkerCheck {
+        name: "cargo test --workspace".into(),
+        status: "passed".into(),
+        detail: None,
+        tip: tip.clone(),
+    }];
+    worker.review = Some(ReviewRecord {
+        summary: "reviewed".into(),
+        tip,
+        reviewed_at_ms: 1,
+        evidence: Some(evidence()),
+        lane: None,
+    });
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+    let merged = team.merge(&worker.id).await.expect("merge the worker");
+    let merge_commit = merged
+        .merge
+        .as_ref()
+        .expect("merge record")
+        .commit
+        .clone();
+    let reverted = team
+        .revert_merge(&worker.id)
+        .await
+        .expect("revert the merge");
+    let revert_commit = reverted
+        .merge
+        .as_ref()
+        .and_then(|merge| merge.revert_commit.clone())
+        .expect("the revert commit is recorded");
+    let rows: Vec<DispatchRoutingRow> =
+        std::fs::read_to_string(state.path().join("dispatch_routing.jsonl"))
+            .expect("the routing log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("routing row"))
+            .collect();
+    assert!(
+        matches!(
+            rows.as_slice(),
+            [
+                DispatchRoutingRow::Outcome {
+                    merge_commit: Some(row_merge),
+                    step: 1,
+                    ..
+                },
+                DispatchRoutingRow::Reverted {
+                    worker_id,
+                    plan_id,
+                    step,
+                    revert_commit: row_revert,
+                    ..
+                }
+            ] if worker_id == &worker.id
+                && plan_id == "plan0001"
+                && *step == 1
+                && row_merge == &merge_commit
+                && row_revert == &revert_commit
+        ),
+        "the merge outcome then its revert: {rows:?}"
+    );
+    team.shutdown().await;
+}
+
 /// A project that keeps `.coding/laya` carries its decisions in git: the
 /// merge refreshes the bundle with the outcome row it just appended.
 #[tokio::test]

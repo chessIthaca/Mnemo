@@ -580,6 +580,8 @@ fn convert_legacy_row_tiers(row: &mut DispatchRoutingRow) -> bool {
             changed |= convert_legacy_tier(final_tier);
             changed |= convert_legacy_optional_tier(label);
         }
+        // A revert row carries no tier ids (plan dac2028d).
+        DispatchRoutingRow::Reverted { .. } => {}
     }
     changed
 }
